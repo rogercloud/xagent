@@ -47,9 +47,6 @@ from .pattern.react import ReActPattern, ReActStepType
 from .precondition import PreconditionResolver
 from .runner import AgentRunner
 
-# Tools
-from .tools.agent_tool import AgentTool, CompactMode, QueryStepTool
-
 # Utilities
 from .utils.context_builder import ContextBuilder, StepExecutionResult
 
@@ -71,10 +68,6 @@ __all__ = [
     "StepStatus",
     "ExecutionPhase",
     "StepInjection",
-    # Agent as Tool support
-    "AgentTool",
-    "CompactMode",
-    "QueryStepTool",
     # Utilities
     "ContextBuilder",
     "StepExecutionResult",
