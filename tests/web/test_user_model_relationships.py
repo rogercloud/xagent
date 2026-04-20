@@ -115,44 +115,6 @@ class TestUserModelRelationships:
         assert len(regular_user.user_models) == 1
         assert regular_user.user_models[0].model_id == sample_model.id
 
-    def test_shared_model_access(
-        self, db_session, admin_user, regular_user, sample_model
-    ):
-        """Test shared model access control"""
-        # Admin creates shared model
-        admin_user_model = UserModel(
-            user_id=admin_user.id,
-            model_id=sample_model.id,
-            is_owner=True,
-            can_edit=True,
-            can_delete=True,
-            is_shared=True,  # Admin shares the model
-        )
-        db_session.add(admin_user_model)
-
-        # Regular user gets access to shared model
-        regular_user_model = UserModel(
-            user_id=regular_user.id,
-            model_id=sample_model.id,
-            is_owner=False,
-            can_edit=False,
-            can_delete=False,
-            is_shared=True,
-        )
-        db_session.add(regular_user_model)
-        db_session.commit()
-
-        # Verify permissions
-        assert admin_user_model.is_owner is True
-        assert admin_user_model.can_edit is True
-        assert admin_user_model.can_delete is True
-        assert admin_user_model.is_shared is True
-
-        assert regular_user_model.is_owner is False
-        assert regular_user_model.can_edit is False
-        assert regular_user_model.can_delete is False
-        assert regular_user_model.is_shared is True
-
     def test_user_default_model_configuration(
         self, db_session, regular_user, sample_model
     ):

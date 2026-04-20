@@ -30,7 +30,7 @@ from ..auth_config import (
 from ..auth_dependencies import get_current_user
 from ..models.database import get_db
 from ..models.system_setting import SystemSetting
-from ..models.user import User, UserDefaultModel, UserModel
+from ..models.user import User
 from ..models.user_oauth import UserOAuth
 
 auth_router = APIRouter(prefix="/api/auth", tags=["Authentication"])
@@ -315,12 +315,12 @@ async def update_register_switch(
     )
 
 
-def create_user(
-    db: Session, username: str, password: str, inherit_defaults: bool = False
-) -> User:
+def create_user(db: Session, username: str, password: str) -> User:
     """Create a new user without default model configurations
 
-    Users will use admin's defaults via fallback logic until they set their own.
+    Users will use admin's defaults via dynamic fallback logic until they set their own.
+    No pre-creation of UserModel or UserDefaultModel records — shared model visibility
+    is determined at read time via _get_visible_user_ids().
     """
     password_hash = hash_password(password)
     user = User(username=username, password_hash=password_hash)
@@ -328,116 +328,9 @@ def create_user(
     db.flush()  # Get the user ID without committing
     db.refresh(user)
 
-    # Always grant access to shared models first
-    _grant_shared_model_access(db, user)
-
-    # Inherit default model configurations from admin if requested
-    # Default is now False - users should use fallback logic
-    if inherit_defaults:
-        _inherit_admin_defaults(db, user)
-
     # Commit everything together
     db.commit()
     return user
-
-
-def _grant_shared_model_access(db: Session, new_user: User) -> None:
-    """Grant access to admin's shared models (but not default configurations)"""
-    try:
-        # Get admin user
-        admin_user = db.query(User).filter(User.is_admin).first()
-        if not admin_user:
-            return
-
-        # Grant access to all shared models
-        shared_models = (
-            db.query(UserModel)
-            .filter(UserModel.user_id == admin_user.id, UserModel.is_shared)
-            .all()
-        )
-
-        for shared_model in shared_models:
-            # Check if user already has access to this model (any configuration)
-            existing_access = (
-                db.query(UserModel)
-                .filter(
-                    UserModel.user_id == new_user.id,
-                    UserModel.model_id == shared_model.model_id,
-                )
-                .first()
-            )
-
-            # Only create new access if user doesn't already have this model
-            if not existing_access:
-                # Grant read-only access to shared model
-                user_access = UserModel(
-                    user_id=new_user.id,
-                    model_id=shared_model.model_id,
-                    is_owner=False,
-                    can_edit=False,
-                    can_delete=False,
-                    is_shared=True,
-                )
-                db.add(user_access)
-
-    except Exception as e:
-        # Log error but don't fail user creation
-        import logging
-
-        logger = logging.getLogger(__name__)
-        logger.error(
-            f"Error granting shared model access for user {new_user.username}: {e}"
-        )
-        # Don't rollback here, let the main transaction handle it
-
-
-def _inherit_admin_defaults(db: Session, new_user: User) -> None:
-    """Inherit admin's default model configurations (legacy function for backward compatibility)"""
-    try:
-        # Get admin user
-        admin_user = db.query(User).filter(User.is_admin).first()
-        if not admin_user:
-            return
-
-        # _grant_shared_model_access is called first in create_user to ensure
-        # user has access to models before creating default configurations
-
-        # Then, inherit admin's default model configurations
-        admin_defaults = (
-            db.query(UserDefaultModel)
-            .filter(UserDefaultModel.user_id == admin_user.id)
-            .all()
-        )
-
-        for admin_default in admin_defaults:
-            # Check if new user has access to the model
-            user_model = (
-                db.query(UserModel)
-                .filter(
-                    UserModel.user_id == new_user.id,
-                    UserModel.model_id == admin_default.model_id,
-                )
-                .first()
-            )
-
-            # Only create default config if user has access to the model
-            if user_model:
-                new_default = UserDefaultModel(
-                    user_id=new_user.id,
-                    model_id=admin_default.model_id,
-                    config_type=admin_default.config_type,
-                )
-                db.add(new_default)
-
-    except Exception as e:
-        # Log error but don't fail user creation
-        import logging
-
-        logger = logging.getLogger(__name__)
-        logger.error(
-            f"Error inheriting admin defaults for user {new_user.username}: {e}"
-        )
-        # Don't rollback here, let the main transaction handle it
 
 
 def get_user_by_username(db: Session, username: str) -> Optional[User]:
@@ -552,9 +445,7 @@ async def register(
             return RegisterResponse(success=False, message="Registration is disabled")
 
         # Create new user with inherited defaults
-        user = create_user(
-            db, request.username, request.password, inherit_defaults=True
-        )
+        user = create_user(db, request.username, request.password)
 
         return RegisterResponse(
             success=True,

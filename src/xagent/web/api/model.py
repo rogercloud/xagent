@@ -37,6 +37,29 @@ from ..user_isolated_memory import UserContext
 
 logger = logging.getLogger(__name__)
 
+# ---------------------------------------------------------------------------
+# Hook infrastructure for dynamic model sharing
+# ---------------------------------------------------------------------------
+
+_can_share_hook = None  # (user: User) -> bool
+
+
+def set_can_share_hook(hook):
+    """Set a custom hook that determines whether a user can share models."""
+    global _can_share_hook
+    _can_share_hook = hook
+
+
+def _can_user_share(user: User) -> bool:
+    """Check whether *user* is allowed to share models.
+
+    Without a hook this falls back to ``user.is_admin`` (legacy behaviour).
+    """
+    if _can_share_hook is not None:
+        return _can_share_hook(user)
+    return user.is_admin
+
+
 # Create router
 model_router = APIRouter(prefix="/api/models", tags=["models"])
 
@@ -50,7 +73,14 @@ def _decode_model_identifier(model_id: str) -> str:
 def _resolve_accessible_model(
     db: Session, user: User, model_id: str
 ) -> tuple[CoreStorage, DBModel, UserModel]:
-    """Resolve a model and the current user's access relationship."""
+    """Resolve a model and the current user's access relationship.
+
+    Two-step lookup:
+    1. Check if the user owns the model (UserModel.user_id == user.id).
+    2. If not, check if any visible user shares this model.
+    """
+
+    from ..services.model_service import _get_visible_user_ids
 
     decoded_model_id = _decode_model_identifier(model_id)
     model_storage = CoreStorage(db, DBModel)
@@ -58,21 +88,42 @@ def _resolve_accessible_model(
     if not db_model:
         raise HTTPException(status_code=404, detail="Model not found")
 
+    # Step 1: own UserModel
     user_model = (
         db.query(UserModel)
         .filter(UserModel.model_id == db_model.id, UserModel.user_id == user.id)
         .first()
     )
-    if not user_model:
-        raise HTTPException(status_code=404, detail="Model not found or access denied")
+    if user_model:
+        return model_storage, db_model, user_model
 
-    return model_storage, db_model, user_model
+    # Step 2: shared from visible users
+    visible_ids = _get_visible_user_ids(db, user.id)
+    shared = (
+        db.query(UserModel)
+        .filter(
+            UserModel.model_id == db_model.id,
+            UserModel.user_id.in_(visible_ids),
+            UserModel.is_shared.is_(True),
+        )
+        .first()
+    )
+    if shared:
+        return model_storage, db_model, shared
+
+    raise HTTPException(status_code=404, detail="Model not found or access denied")
 
 
 def _serialize_model_with_access(
-    db_model: DBModel, user_model: UserModel
+    db_model: DBModel, user_model: UserModel, requesting_user_id: Optional[int] = None
 ) -> dict[str, Any]:
     """Build a model response payload with user access info."""
+
+    is_owner = (
+        user_model.user_id == requesting_user_id
+        if requesting_user_id is not None
+        else user_model.is_owner
+    )
 
     return {
         "id": db_model.id,
@@ -88,9 +139,9 @@ def _serialize_model_with_access(
         "created_at": db_model.created_at.isoformat() if db_model.created_at else None,
         "updated_at": db_model.updated_at.isoformat() if db_model.updated_at else None,
         "is_active": db_model.is_active,
-        "is_owner": user_model.is_owner,
-        "can_edit": user_model.can_edit,
-        "can_delete": user_model.can_delete,
+        "is_owner": is_owner,
+        "can_edit": is_owner and user_model.can_edit,
+        "can_delete": is_owner and user_model.can_delete,
         "is_shared": user_model.is_shared,
     }
 
@@ -215,8 +266,8 @@ async def create_model(
     if model_storage.exists(model.model_id):
         raise HTTPException(status_code=400, detail="Model ID already exists")
 
-    # Only admin can share models with all users
-    if model.share_with_users and not user.is_admin:
+    # Only users with sharing permission can share models
+    if model.share_with_users and not _can_user_share(user):
         raise HTTPException(
             status_code=403,
             detail="Only administrators can share models with all users",
@@ -286,32 +337,19 @@ async def create_model(
     assert db_model
 
     # Create user model relationship
+    is_share: bool = model.share_with_users and _can_user_share(user)
     user_model = UserModel(
         user_id=user.id,
         model_id=db_model.id,
         is_owner=True,
         can_edit=True,
         can_delete=True,
-        is_shared=model.share_with_users and user.is_admin,
+        is_shared=is_share,
     )
     db.add(user_model)
     db.commit()
 
-    is_share: bool = model.share_with_users and bool(user.is_admin)
-    # If admin is sharing the model, create relationships for all users
-    if is_share:
-        all_users = db.query(User).filter(User.id != user.id).all()
-        for other_user in all_users:
-            shared_user_model = UserModel(
-                user_id=other_user.id,
-                model_id=db_model.id,
-                is_owner=False,
-                can_edit=False,
-                can_delete=False,
-                is_shared=True,
-            )
-            db.add(shared_user_model)
-        db.commit()
+    # No pre-creation for other users — dynamic discovery handles visibility.
 
     assert db_model
 
@@ -352,11 +390,21 @@ async def list_models(
 ) -> List[ModelWithAccessInfo]:
     """List all model configurations accessible to the current user"""
 
-    # Get models that user has access to (owned or shared)
+    from sqlalchemy import and_, or_
+
+    from ..services.model_service import _get_visible_user_ids
+
+    # Get models that user has access to (owned or shared from visible users)
+    visible_ids = _get_visible_user_ids(db, user.id)
     query = (
         db.query(DBModel, UserModel)
         .join(UserModel, DBModel.id == UserModel.model_id)
-        .filter(UserModel.user_id == user.id)
+        .filter(
+            or_(
+                UserModel.user_id == user.id,
+                and_(UserModel.user_id.in_(visible_ids), UserModel.is_shared.is_(True)),
+            )
+        )
     )
     if model_provider:
         query = query.filter(DBModel.model_provider == model_provider)
@@ -371,6 +419,7 @@ async def list_models(
 
     result = []
     for db_model, user_model in models:
+        is_owner = user_model.user_id == user.id
         model_data = {
             "id": db_model.id,
             "model_id": db_model.model_id,
@@ -389,9 +438,9 @@ async def list_models(
             if db_model.updated_at
             else None,
             "is_active": db_model.is_active,
-            "is_owner": user_model.is_owner,
-            "can_edit": user_model.can_edit,
-            "can_delete": user_model.can_delete,
+            "is_owner": is_owner,
+            "can_edit": is_owner and user_model.can_edit,
+            "can_delete": is_owner and user_model.can_delete,
             "is_shared": user_model.is_shared,
         }
         result.append(ModelWithAccessInfo.model_validate(model_data))
@@ -406,6 +455,10 @@ async def get_user_default_models(
     """Get all user's default model configurations with per-type admin fallback"""
 
     try:
+        from sqlalchemy import and_, or_
+
+        from ..services.model_service import _get_visible_user_ids
+
         # Get all possible config types
         all_config_types = [
             "general",
@@ -433,6 +486,7 @@ async def get_user_default_models(
             user_defaults_by_type[str(ud.config_type)] = ud
 
         result = []
+        visible_ids = _get_visible_user_ids(db, user.id)
 
         # Process each config type
         for config_type in all_config_types:
@@ -440,16 +494,23 @@ async def get_user_default_models(
                 # User has their own default for this type
                 ud = user_defaults_by_type[config_type]
 
-                # Get user model relationship for access info
+                # Get user model relationship for access info (two-step: own or shared)
                 user_model = (
                     db.query(UserModel)
                     .filter(
-                        UserModel.user_id == user.id, UserModel.model_id == ud.model_id
+                        UserModel.model_id == ud.model_id,
+                        or_(
+                            UserModel.user_id == user.id,
+                            and_(
+                                UserModel.user_id.in_(visible_ids), UserModel.is_shared
+                            ),
+                        ),
                     )
                     .first()
                 )
 
                 if user_model:
+                    is_owner = user_model.user_id == user.id
                     model_data = {
                         "id": ud.id,
                         "user_id": ud.user_id,
@@ -479,73 +540,69 @@ async def get_user_default_models(
                             if user_model.model.updated_at
                             else None,
                             "is_active": user_model.model.is_active,
-                            "is_owner": user_model.is_owner,
-                            "can_edit": user_model.can_edit,
-                            "can_delete": user_model.can_delete,
+                            "is_owner": is_owner,
+                            "can_edit": is_owner and user_model.can_edit,
+                            "can_delete": is_owner and user_model.can_delete,
                             "is_shared": user_model.is_shared,
                         },
                     }
                     result.append(model_data)
             else:
-                # User has no default for this type, try admin fallback
-                admin_user = db.query(User).filter(User.is_admin).first()
-                if admin_user:
-                    admin_default = (
-                        db.query(UserDefaultModel)
-                        .join(DBModel, UserDefaultModel.model_id == DBModel.id)
-                        .join(
-                            UserModel, UserDefaultModel.model_id == UserModel.model_id
-                        )
-                        .filter(
-                            UserDefaultModel.user_id == admin_user.id,
-                            UserDefaultModel.config_type == config_type,
-                            DBModel.is_active,
-                            UserModel.is_shared,
-                        )
-                        .first()
+                # User has no default for this type, try visible users' shared defaults
+                admin_default = (
+                    db.query(UserDefaultModel)
+                    .join(DBModel, UserDefaultModel.model_id == DBModel.id)
+                    .join(UserModel, UserDefaultModel.model_id == UserModel.model_id)
+                    .filter(
+                        UserDefaultModel.user_id.in_(visible_ids),
+                        UserDefaultModel.config_type == config_type,
+                        DBModel.is_active,
+                        UserModel.is_shared,
+                    )
+                    .first()
+                )
+
+                if admin_default:
+                    logger.info(
+                        f"User {user.username} has no {config_type} default, using visible user default for display"
                     )
 
-                    if admin_default:
-                        logger.info(
-                            f"User {user.username} has no {config_type} default, using admin default for display"
-                        )
-
-                        model_data = {
-                            "id": admin_default.id,
-                            "user_id": admin_default.user_id,
-                            "model_id": admin_default.model_id,
-                            "config_type": admin_default.config_type,
-                            "created_at": admin_default.created_at.isoformat()
-                            if admin_default.created_at
+                    model_data = {
+                        "id": admin_default.id,
+                        "user_id": admin_default.user_id,
+                        "model_id": admin_default.model_id,
+                        "config_type": admin_default.config_type,
+                        "created_at": admin_default.created_at.isoformat()
+                        if admin_default.created_at
+                        else None,
+                        "updated_at": admin_default.updated_at.isoformat()
+                        if admin_default.updated_at
+                        else None,
+                        "model": {
+                            "id": admin_default.model.id,
+                            "model_id": admin_default.model.model_id,
+                            "category": admin_default.model.category,
+                            "model_provider": admin_default.model.model_provider,
+                            "model_name": admin_default.model.model_name,
+                            "base_url": admin_default.model.base_url,
+                            "temperature": admin_default.model.temperature,
+                            "dimension": admin_default.model.dimension,
+                            "abilities": admin_default.model.abilities,
+                            "description": admin_default.model.description,
+                            "created_at": admin_default.model.created_at.isoformat()
+                            if admin_default.model.created_at
                             else None,
-                            "updated_at": admin_default.updated_at.isoformat()
-                            if admin_default.updated_at
+                            "updated_at": admin_default.model.updated_at.isoformat()
+                            if admin_default.model.updated_at
                             else None,
-                            "model": {
-                                "id": admin_default.model.id,
-                                "model_id": admin_default.model.model_id,
-                                "category": admin_default.model.category,
-                                "model_provider": admin_default.model.model_provider,
-                                "model_name": admin_default.model.model_name,
-                                "base_url": admin_default.model.base_url,
-                                "temperature": admin_default.model.temperature,
-                                "dimension": admin_default.model.dimension,
-                                "abilities": admin_default.model.abilities,
-                                "description": admin_default.model.description,
-                                "created_at": admin_default.model.created_at.isoformat()
-                                if admin_default.model.created_at
-                                else None,
-                                "updated_at": admin_default.model.updated_at.isoformat()
-                                if admin_default.model.updated_at
-                                else None,
-                                "is_active": admin_default.model.is_active,
-                                "is_owner": False,  # Admin models are not owned by non-admin users
-                                "can_edit": False,
-                                "can_delete": False,
-                                "is_shared": True,
-                            },
-                        }
-                        result.append(model_data)
+                            "is_active": admin_default.model.is_active,
+                            "is_owner": False,
+                            "can_edit": False,
+                            "can_delete": False,
+                            "is_shared": True,
+                        },
+                    }
+                    result.append(model_data)
 
         return result
     except Exception as e:
@@ -562,18 +619,7 @@ async def get_model_by_path(
 
     _, db_model, user_model = _resolve_accessible_model(db, user, model_id)
     return ModelWithAccessInfo.model_validate(
-        _serialize_model_with_access(db_model, user_model)
-    )
-
-
-@model_router.get("/{model_id}", response_model=ModelWithAccessInfo)
-async def get_model(
-    model_id: str, db: Session = Depends(get_db), user: User = Depends(get_current_user)
-) -> ModelWithAccessInfo:
-    """Get a specific model configuration"""
-    _, db_model, user_model = _resolve_accessible_model(db, user, model_id)
-    return ModelWithAccessInfo.model_validate(
-        _serialize_model_with_access(db_model, user_model)
+        _serialize_model_with_access(db_model, user_model, requesting_user_id=user.id)
     )
 
 
@@ -588,94 +634,6 @@ async def update_model_by_path(
 
     return await update_model(model_id, model_update, db, user)
 
-
-@model_router.put("/{model_id}", response_model=ModelWithAccessInfo)
-async def update_model(
-    model_id: str,
-    model_update: ModelUpdate,
-    db: Session = Depends(get_db),
-    user: User = Depends(get_current_user),
-) -> ModelWithAccessInfo:
-    """Update a model configuration"""
-    _, _, user_model = _resolve_accessible_model(db, user, model_id)
-
-    if not user_model.can_edit:
-        raise HTTPException(status_code=403, detail="No permission to edit this model")
-
-    # Get the database model
-    db_model = user_model.model
-
-    # Handle admin sharing updates
-    if model_update.share_with_users is not None:
-        # Only check admin permission when enabling sharing (share_with_users=True)
-        # Allow non-admin users to disable sharing (share_with_users=False)
-        if model_update.share_with_users and not user.is_admin:
-            raise HTTPException(
-                status_code=403, detail="Only administrators can enable global sharing"
-            )
-
-        # Update sharing status
-        if model_update.share_with_users:
-            # Enable sharing: update all existing records to shared=True
-            db.query(UserModel).filter(UserModel.model_id == db_model.id).update(
-                {"is_shared": True}
-            )
-
-            # Create relationships for users who don't have access
-            existing_user_ids = [
-                um.user_id
-                for um in db.query(UserModel)
-                .filter(UserModel.model_id == db_model.id)
-                .all()
-            ]
-
-            all_users = db.query(User).filter(User.id.notin_(existing_user_ids)).all()
-            for other_user in all_users:
-                shared_user_model = UserModel(
-                    user_id=other_user.id,
-                    model_id=db_model.id,
-                    is_owner=False,
-                    can_edit=False,
-                    can_delete=False,
-                    is_shared=True,
-                )
-                db.add(shared_user_model)
-        else:
-            # Disable sharing:
-            # 1. Update owner's record to shared=False
-            db.query(UserModel).filter(
-                UserModel.model_id == db_model.id, UserModel.is_owner.is_(True)
-            ).update({"is_shared": False})
-
-            # 2. Delete all non-owner records (revoke access)
-            db.query(UserModel).filter(
-                UserModel.model_id == db_model.id, UserModel.is_owner.is_(False)
-            ).delete()
-
-    # Update model configuration in-place
-    update_data = model_update.model_dump(exclude_unset=True)
-    for field, value in update_data.items():
-        # Don't update api_key with empty string unless explicitly needed, but allow setting to empty if intended
-        # We will keep the previous behavior: skip empty strings for api_key updates to prevent accidental wiping.
-        if field == "api_key" and value == "":
-            continue
-        # Skip share_with_users as it's handled separately
-        if field == "share_with_users":
-            continue
-        # Only set fields that exist on the model
-        if hasattr(db_model, field):
-            setattr(db_model, field, value)
-
-    # Commit database changes
-    db.commit()
-    db.refresh(db_model)
-
-    # Return updated model with access info
-    return ModelWithAccessInfo.model_validate(
-        _serialize_model_with_access(db_model, user_model)
-    )
-
-
 @model_router.delete("/by-id/{model_id:path}")
 async def delete_model_by_path(
     model_id: str, db: Session = Depends(get_db), user: User = Depends(get_current_user)
@@ -683,32 +641,6 @@ async def delete_model_by_path(
     """Delete a model configuration, including slash-containing model IDs."""
 
     return await delete_model(model_id, db, user)
-
-
-@model_router.delete("/{model_id}")
-async def delete_model(
-    model_id: str, db: Session = Depends(get_db), user: User = Depends(get_current_user)
-) -> dict:
-    """Delete a model configuration"""
-    model_storage, _, user_model = _resolve_accessible_model(db, user, model_id)
-
-    if not user_model.can_delete:
-        raise HTTPException(
-            status_code=403, detail="No permission to delete this model"
-        )
-
-    # Delete all user model relationships
-    db.query(UserModel).filter(UserModel.model_id == user_model.model.id).delete()
-
-    # Delete all user default model configurations
-    db.query(UserDefaultModel).filter(
-        UserDefaultModel.model_id == user_model.model.id
-    ).delete()
-
-    # Delete the model using CoreStorage
-    model_storage.delete(user_model.model.model_id)
-
-    return {"message": "Model deleted successfully"}
 
 
 @model_router.post("/test-connection", response_model=ModelTestResponse)
@@ -871,8 +803,6 @@ async def test_model_connection(
             message="Connection failed",
             error=safe_error,
         )
-
-
 @model_router.post("/test", response_model=List[ModelTestResponse])
 async def test_models(
     test_request: Optional[ModelTestRequest] = None,
@@ -880,7 +810,12 @@ async def test_models(
     user: User = Depends(get_current_user),
 ) -> List[ModelTestResponse]:
     """Test model configurations"""
+    from sqlalchemy import and_, or_
+
+    from ..services.model_service import _get_visible_user_ids
+
     model_storage = CoreStorage(db, DBModel)
+    visible_ids = _get_visible_user_ids(db, user.id)
 
     if test_request and test_request.model_ids:
         # Test specific models that user has access to
@@ -890,7 +825,13 @@ async def test_models(
             .filter(
                 DBModel.model_id.in_(test_request.model_ids),
                 DBModel.is_active,
-                UserModel.user_id == user.id,
+                or_(
+                    UserModel.user_id == user.id,
+                    and_(
+                        UserModel.user_id.in_(visible_ids),
+                        UserModel.is_shared.is_(True),
+                    ),
+                ),
             )
             .all()
         )
@@ -899,7 +840,16 @@ async def test_models(
         models = (
             db.query(DBModel)
             .join(UserModel, DBModel.id == UserModel.model_id)
-            .filter(DBModel.is_active, UserModel.user_id == user.id)
+            .filter(
+                DBModel.is_active,
+                or_(
+                    UserModel.user_id == user.id,
+                    and_(
+                        UserModel.user_id.in_(visible_ids),
+                        UserModel.is_shared.is_(True),
+                    ),
+                ),
+            )
             .all()
         )
 
@@ -991,11 +941,21 @@ async def list_model_categories(
 ) -> dict:
     """List all model categories accessible to the current user"""
 
+    from sqlalchemy import and_, or_
+
+    from ..services.model_service import _get_visible_user_ids
+
     # Get distinct categories from user's accessible models
+    visible_ids = _get_visible_user_ids(db, user.id)
     categories = (
         db.query(DBModel.category)
         .join(UserModel, DBModel.id == UserModel.model_id)
-        .filter(UserModel.user_id == user.id)
+        .filter(
+            or_(
+                UserModel.user_id == user.id,
+                and_(UserModel.user_id.in_(visible_ids), UserModel.is_shared.is_(True)),
+            )
+        )
         .filter(DBModel.is_active)
         .distinct()
         .all()
@@ -1013,11 +973,21 @@ async def list_model_providers(
 ) -> dict:
     """List all model providers accessible to the current user"""
 
+    from sqlalchemy import and_, or_
+
+    from ..services.model_service import _get_visible_user_ids
+
     # Get distinct providers from user's accessible models
+    visible_ids = _get_visible_user_ids(db, user.id)
     providers = (
         db.query(DBModel.model_provider)
         .join(UserModel, DBModel.id == UserModel.model_id)
-        .filter(UserModel.user_id == user.id)
+        .filter(
+            or_(
+                UserModel.user_id == user.id,
+                and_(UserModel.user_id.in_(visible_ids), UserModel.is_shared.is_(True)),
+            )
+        )
         .filter(DBModel.is_active)
         .distinct()
         .all()
@@ -1035,11 +1005,21 @@ async def list_model_abilities(
 ) -> dict:
     """List all model abilities across accessible models"""
 
+    from sqlalchemy import and_, or_
+
+    from ..services.model_service import _get_visible_user_ids
+
     # Get all models to collect abilities
+    visible_ids = _get_visible_user_ids(db, user.id)
     models = (
         db.query(DBModel)
         .join(UserModel, DBModel.id == UserModel.model_id)
-        .filter(UserModel.user_id == user.id)
+        .filter(
+            or_(
+                UserModel.user_id == user.id,
+                and_(UserModel.user_id.in_(visible_ids), UserModel.is_shared.is_(True)),
+            )
+        )
         .filter(DBModel.is_active)
         .all()
     )
@@ -1061,11 +1041,21 @@ async def get_models_summary(
 ) -> dict:
     """Get summary statistics of accessible models"""
 
+    from sqlalchemy import and_, or_
+
+    from ..services.model_service import _get_visible_user_ids
+
     # Get all accessible models
+    visible_ids = _get_visible_user_ids(db, user.id)
     models = (
         db.query(DBModel)
         .join(UserModel, DBModel.id == UserModel.model_id)
-        .filter(UserModel.user_id == user.id)
+        .filter(
+            or_(
+                UserModel.user_id == user.id,
+                and_(UserModel.user_id.in_(visible_ids), UserModel.is_shared.is_(True)),
+            )
+        )
         .filter(DBModel.is_active)
         .all()
     )
@@ -1123,11 +1113,20 @@ async def get_default_model(
     if not user_default:
         return None
 
-    # Get user model relationship for access info
+    # Get user model relationship for access info (two-step: own or shared)
+    from sqlalchemy import and_, or_
+
+    from ..services.model_service import _get_visible_user_ids
+
+    visible_ids = _get_visible_user_ids(db, user.id)
     user_model = (
         db.query(UserModel)
         .filter(
-            UserModel.user_id == user.id, UserModel.model_id == user_default.model_id
+            UserModel.model_id == user_default.model_id,
+            or_(
+                UserModel.user_id == user.id,
+                and_(UserModel.user_id.in_(visible_ids), UserModel.is_shared),
+            ),
         )
         .first()
     )
@@ -1135,6 +1134,7 @@ async def get_default_model(
     if not user_model:
         return None
 
+    is_owner = user_model.user_id == user.id
     model_data = {
         "id": user_default.model.id,
         "model_id": user_default.model.model_id,
@@ -1153,9 +1153,9 @@ async def get_default_model(
         if user_default.model.updated_at
         else None,
         "is_active": user_default.model.is_active,
-        "is_owner": user_model.is_owner,
-        "can_edit": user_model.can_edit,
-        "can_delete": user_model.can_delete,
+        "is_owner": is_owner,
+        "can_edit": is_owner and user_model.can_edit,
+        "can_delete": is_owner and user_model.can_delete,
         "is_shared": user_model.is_shared,
     }
 
@@ -1183,11 +1183,20 @@ async def get_general_default_model(
     if not user_default:
         return None
 
-    # Get user model relationship for access info
+    # Get user model relationship for access info (two-step: own or shared)
+    from sqlalchemy import and_, or_
+
+    from ..services.model_service import _get_visible_user_ids
+
+    visible_ids = _get_visible_user_ids(db, user.id)
     user_model = (
         db.query(UserModel)
         .filter(
-            UserModel.user_id == user.id, UserModel.model_id == user_default.model_id
+            UserModel.model_id == user_default.model_id,
+            or_(
+                UserModel.user_id == user.id,
+                and_(UserModel.user_id.in_(visible_ids), UserModel.is_shared),
+            ),
         )
         .first()
     )
@@ -1195,6 +1204,7 @@ async def get_general_default_model(
     if not user_model:
         return None
 
+    is_owner = user_model.user_id == user.id
     model_data = {
         "id": user_default.model.id,
         "model_id": user_default.model.model_id,
@@ -1213,9 +1223,9 @@ async def get_general_default_model(
         if user_default.model.updated_at
         else None,
         "is_active": user_default.model.is_active,
-        "is_owner": user_model.is_owner,
-        "can_edit": user_model.can_edit,
-        "can_delete": user_model.can_delete,
+        "is_owner": is_owner,
+        "can_edit": is_owner and user_model.can_edit,
+        "can_delete": is_owner and user_model.can_delete,
         "is_shared": user_model.is_shared,
     }
 
@@ -1243,11 +1253,20 @@ async def get_small_fast_default_model(
     if not user_default:
         return None
 
-    # Get user model relationship for access info
+    # Get user model relationship for access info (two-step: own or shared)
+    from sqlalchemy import and_, or_
+
+    from ..services.model_service import _get_visible_user_ids
+
+    visible_ids = _get_visible_user_ids(db, user.id)
     user_model = (
         db.query(UserModel)
         .filter(
-            UserModel.user_id == user.id, UserModel.model_id == user_default.model_id
+            UserModel.model_id == user_default.model_id,
+            or_(
+                UserModel.user_id == user.id,
+                and_(UserModel.user_id.in_(visible_ids), UserModel.is_shared),
+            ),
         )
         .first()
     )
@@ -1255,6 +1274,7 @@ async def get_small_fast_default_model(
     if not user_model:
         return None
 
+    is_owner = user_model.user_id == user.id
     model_data = {
         "id": user_default.model.id,
         "model_id": user_default.model.model_id,
@@ -1273,9 +1293,9 @@ async def get_small_fast_default_model(
         if user_default.model.updated_at
         else None,
         "is_active": user_default.model.is_active,
-        "is_owner": user_model.is_owner,
-        "can_edit": user_model.can_edit,
-        "can_delete": user_model.can_delete,
+        "is_owner": is_owner,
+        "can_edit": is_owner and user_model.can_edit,
+        "can_delete": is_owner and user_model.can_delete,
         "is_shared": user_model.is_shared,
     }
 
@@ -1303,11 +1323,20 @@ async def get_visual_default_model(
     if not user_default:
         return None
 
-    # Get user model relationship for access info
+    # Get user model relationship for access info (two-step: own or shared)
+    from sqlalchemy import and_, or_
+
+    from ..services.model_service import _get_visible_user_ids
+
+    visible_ids = _get_visible_user_ids(db, user.id)
     user_model = (
         db.query(UserModel)
         .filter(
-            UserModel.user_id == user.id, UserModel.model_id == user_default.model_id
+            UserModel.model_id == user_default.model_id,
+            or_(
+                UserModel.user_id == user.id,
+                and_(UserModel.user_id.in_(visible_ids), UserModel.is_shared),
+            ),
         )
         .first()
     )
@@ -1315,6 +1344,7 @@ async def get_visual_default_model(
     if not user_model:
         return None
 
+    is_owner = user_model.user_id == user.id
     model_data = {
         "id": user_default.model.id,
         "model_id": user_default.model.model_id,
@@ -1333,9 +1363,9 @@ async def get_visual_default_model(
         if user_default.model.updated_at
         else None,
         "is_active": user_default.model.is_active,
-        "is_owner": user_model.is_owner,
-        "can_edit": user_model.can_edit,
-        "can_delete": user_model.can_delete,
+        "is_owner": is_owner,
+        "can_edit": is_owner and user_model.can_edit,
+        "can_delete": is_owner and user_model.can_delete,
         "is_shared": user_model.is_shared,
     }
 
@@ -1363,11 +1393,20 @@ async def get_compact_default_model(
     if not user_default:
         return None
 
-    # Get user model relationship for access info
+    # Get user model relationship for access info (two-step: own or shared)
+    from sqlalchemy import and_, or_
+
+    from ..services.model_service import _get_visible_user_ids
+
+    visible_ids = _get_visible_user_ids(db, user.id)
     user_model = (
         db.query(UserModel)
         .filter(
-            UserModel.user_id == user.id, UserModel.model_id == user_default.model_id
+            UserModel.model_id == user_default.model_id,
+            or_(
+                UserModel.user_id == user.id,
+                and_(UserModel.user_id.in_(visible_ids), UserModel.is_shared),
+            ),
         )
         .first()
     )
@@ -1375,6 +1414,7 @@ async def get_compact_default_model(
     if not user_model:
         return None
 
+    is_owner = user_model.user_id == user.id
     model_data = {
         "id": user_default.model.id,
         "model_id": user_default.model.model_id,
@@ -1393,9 +1433,9 @@ async def get_compact_default_model(
         if user_default.model.updated_at
         else None,
         "is_active": user_default.model.is_active,
-        "is_owner": user_model.is_owner,
-        "can_edit": user_model.can_edit,
-        "can_delete": user_model.can_delete,
+        "is_owner": is_owner,
+        "can_edit": is_owner and user_model.can_edit,
+        "can_delete": is_owner and user_model.can_delete,
         "is_shared": user_model.is_shared,
     }
 
@@ -1423,11 +1463,20 @@ async def get_embedding_default_model(
     if not user_default:
         return None
 
-    # Get user model relationship for access info
+    # Get user model relationship for access info (two-step: own or shared)
+    from sqlalchemy import and_, or_
+
+    from ..services.model_service import _get_visible_user_ids
+
+    visible_ids = _get_visible_user_ids(db, user.id)
     user_model = (
         db.query(UserModel)
         .filter(
-            UserModel.user_id == user.id, UserModel.model_id == user_default.model_id
+            UserModel.model_id == user_default.model_id,
+            or_(
+                UserModel.user_id == user.id,
+                and_(UserModel.user_id.in_(visible_ids), UserModel.is_shared),
+            ),
         )
         .first()
     )
@@ -1435,6 +1484,7 @@ async def get_embedding_default_model(
     if not user_model:
         return None
 
+    is_owner = user_model.user_id == user.id
     model_data = {
         "id": user_default.model.id,
         "model_id": user_default.model.model_id,
@@ -1453,9 +1503,9 @@ async def get_embedding_default_model(
         if user_default.model.updated_at
         else None,
         "is_active": user_default.model.is_active,
-        "is_owner": user_model.is_owner,
-        "can_edit": user_model.can_edit,
-        "can_delete": user_model.can_delete,
+        "is_owner": is_owner,
+        "can_edit": is_owner and user_model.can_edit,
+        "can_delete": is_owner and user_model.can_delete,
         "is_shared": user_model.is_shared,
     }
 
@@ -1473,10 +1523,21 @@ async def set_user_default_model(
 ) -> UserDefaultModelResponse:
     """Set a user's default model configuration"""
 
-    # Check if user has access to the model
+    from sqlalchemy import and_, or_
+
+    from ..services.model_service import _get_visible_user_ids
+
+    # Check if user has access to the model (own or shared from visible users)
+    visible_ids = _get_visible_user_ids(db, user.id)
     user_model = (
         db.query(UserModel)
-        .filter(UserModel.user_id == user.id, UserModel.model_id == config.model_id)
+        .filter(
+            UserModel.model_id == config.model_id,
+            or_(
+                UserModel.user_id == user.id,
+                and_(UserModel.user_id.in_(visible_ids), UserModel.is_shared),
+            ),
+        )
         .first()
     )
 
@@ -1596,6 +1657,179 @@ async def delete_user_default_model(
     db.commit()
 
     return {"message": "Default configuration deleted successfully"}
+
+
+# ---------------------------------------------------------------------------
+# Catch-all /{model_id} routes — MUST come after all fixed-path routes to
+# avoid matching "categories", "providers", "summary", etc.
+# ---------------------------------------------------------------------------
+
+
+@model_router.get("/{model_id}", response_model=ModelWithAccessInfo)
+async def get_model(
+    model_id: str, db: Session = Depends(get_db), user: User = Depends(get_current_user)
+) -> ModelWithAccessInfo:
+    """Get a specific model configuration"""
+    _, db_model, user_model = _resolve_accessible_model(db, user, model_id)
+    return ModelWithAccessInfo.model_validate(
+        _serialize_model_with_access(db_model, user_model, requesting_user_id=user.id)
+    )
+
+
+@model_router.put("/{model_id}", response_model=ModelWithAccessInfo)
+async def update_model(
+    model_id: str,
+    model_update: ModelUpdate,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> ModelWithAccessInfo:
+    """Update a model configuration"""
+    _, db_model_ref, user_model = _resolve_accessible_model(db, user, model_id)
+
+    # Permission: only owner can edit
+    if user_model.user_id != user.id or not user_model.can_edit:
+        raise HTTPException(status_code=403, detail="No permission to edit this model")
+
+    # Get the database model
+    db_model = user_model.model
+
+    # Constraint 2: shared models cannot change category or abilities
+    is_shared = (
+        db.query(UserModel)
+        .filter(
+            UserModel.model_id == db_model.id,
+            UserModel.is_shared == True,  # noqa: E712
+        )
+        .first()
+    )
+    if is_shared:
+        locked = []
+        if (
+            model_update.category is not None
+            and model_update.category != db_model.category
+        ):
+            locked.append("category")
+        if model_update.abilities is not None and set(model_update.abilities) != set(
+            db_model.abilities or []
+        ):
+            locked.append("abilities")
+        if locked:
+            raise HTTPException(
+                409,
+                detail=f"Cannot change {' and '.join(locked)} of a shared model. Un-share first.",
+            )
+
+    # Handle sharing updates
+    if model_update.share_with_users is not None:
+        # Only check sharing permission when enabling sharing
+        if model_update.share_with_users and not _can_user_share(user):
+            raise HTTPException(
+                status_code=403, detail="Only administrators can enable global sharing"
+            )
+
+        # Update sharing status
+        if model_update.share_with_users:
+            # Enable sharing: just update owner's record to shared=True
+            db.query(UserModel).filter(
+                UserModel.model_id == db_model.id,
+                UserModel.user_id == user.id,
+            ).update({"is_shared": True})
+        else:
+            # Constraint 1: owner cannot un-share own default model
+            owner_defaults = (
+                db.query(UserDefaultModel)
+                .filter(
+                    UserDefaultModel.model_id == db_model.id,
+                    UserDefaultModel.user_id == user.id,
+                )
+                .count()
+            )
+            if owner_defaults > 0:
+                raise HTTPException(
+                    409,
+                    detail="Cannot un-share: you have this model as your default. Change default first.",
+                )
+
+            # Disable sharing:
+            # 1. Update owner's record to shared=False
+            db.query(UserModel).filter(
+                UserModel.model_id == db_model.id, UserModel.user_id == user.id
+            ).update({"is_shared": False})
+
+            # 2. Delete all non-owner UserModel records
+            db.query(UserModel).filter(
+                UserModel.model_id == db_model.id, UserModel.is_owner.is_(False)
+            ).delete()
+
+            # 3. Clean up non-owner UserDefaultModel records
+            db.query(UserDefaultModel).filter(
+                UserDefaultModel.model_id == db_model.id,
+                UserDefaultModel.user_id != user.id,
+            ).delete()
+
+    # Update model configuration in-place
+    update_data = model_update.model_dump(exclude_unset=True)
+    for field, value in update_data.items():
+        # Don't update api_key with empty string
+        if field == "api_key" and value == "":
+            continue
+        # Skip share_with_users as it's handled separately
+        if field == "share_with_users":
+            continue
+        # Only set fields that exist on the model
+        if hasattr(db_model, field):
+            setattr(db_model, field, value)
+
+    # Commit database changes
+    db.commit()
+    db.refresh(db_model)
+
+    # Return updated model with access info
+    return ModelWithAccessInfo.model_validate(
+        _serialize_model_with_access(db_model, user_model, requesting_user_id=user.id)
+    )
+
+
+@model_router.delete("/{model_id}")
+async def delete_model(
+    model_id: str, db: Session = Depends(get_db), user: User = Depends(get_current_user)
+) -> dict:
+    """Delete a model configuration"""
+    model_storage, _, user_model = _resolve_accessible_model(db, user, model_id)
+
+    # Permission: only owner can delete
+    if user_model.user_id != user.id or not user_model.can_delete:
+        raise HTTPException(
+            status_code=403, detail="No permission to delete this model"
+        )
+
+    # Constraint 1: owner cannot delete own default model
+    owner_defaults = (
+        db.query(UserDefaultModel)
+        .filter(
+            UserDefaultModel.model_id == user_model.model.id,
+            UserDefaultModel.user_id == user.id,
+        )
+        .count()
+    )
+    if owner_defaults > 0:
+        raise HTTPException(
+            409,
+            detail="Cannot delete: you have this model as your default. Change default first.",
+        )
+
+    # Delete all user model relationships
+    db.query(UserModel).filter(UserModel.model_id == user_model.model.id).delete()
+
+    # Delete all user default model configurations
+    db.query(UserDefaultModel).filter(
+        UserDefaultModel.model_id == user_model.model.id
+    ).delete()
+
+    # Delete the model using CoreStorage
+    model_storage.delete(user_model.model.model_id)
+
+    return {"message": "Model deleted successfully"}
 
 
 # Public endpoints (no authentication required)
@@ -1784,16 +2018,25 @@ async def fetch_multiple_providers_models(
     to fetch available models from each provider.
     """
 
+    # Get all models configured for the user (own or shared from visible users)
+    from sqlalchemy import and_, or_
+
     from ..services.model_list_service import (
         PROVIDER_FETCHERS,
         fetch_models_from_provider,
     )
+    from ..services.model_service import _get_visible_user_ids
 
-    # Get all models configured for the user
+    visible_ids = _get_visible_user_ids(db, user.id)
     user_models = (
         db.query(DBModel)
         .join(UserModel, DBModel.id == UserModel.model_id)
-        .filter(UserModel.user_id == user.id)
+        .filter(
+            or_(
+                UserModel.user_id == user.id,
+                and_(UserModel.user_id.in_(visible_ids), UserModel.is_shared.is_(True)),
+            )
+        )
         .filter(DBModel.is_active)
         .filter(DBModel.api_key.isnot(None))
         .all()

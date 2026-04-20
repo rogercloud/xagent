@@ -461,6 +461,7 @@ class UserAwareModelStorage:
                 logger.info(
                     f"Checking user access: user_id={user_id}, model_id={db_model.id}"
                 )
+                # Step 1: own UserModel
                 user_model = (
                     self.db.query(UserModel)
                     .filter(
@@ -469,6 +470,20 @@ class UserAwareModelStorage:
                     )
                     .first()
                 )
+                # Step 2: shared from visible users
+                if not user_model:
+                    from .model_service import _get_visible_user_ids
+
+                    visible_ids = _get_visible_user_ids(self.db, user_id)
+                    user_model = (
+                        self.db.query(UserModel)
+                        .filter(
+                            UserModel.model_id == db_model.id,
+                            UserModel.user_id.in_(visible_ids),
+                            UserModel.is_shared.is_(True),
+                        )
+                        .first()
+                    )
 
                 if not user_model:
                     logger.warning(
@@ -509,16 +524,18 @@ class UserAwareModelStorage:
             # Try to get user-specific defaults first
             if user_id:
                 # Get general default model
+                from ..models.model import Model as DBModel
+
                 general_default = (
                     self.db.query(UserDefaultModel)
                     .join(
-                        UserModel,
-                        UserDefaultModel.model_id == UserModel.model_id,
+                        DBModel,
+                        UserDefaultModel.model_id == DBModel.id,
                     )
                     .filter(
                         UserDefaultModel.user_id == user_id,
                         UserDefaultModel.config_type == "general",
-                        UserModel.user_id == user_id,
+                        DBModel.is_active,
                     )
                     .first()
                 )
@@ -533,13 +550,13 @@ class UserAwareModelStorage:
                 fast_default = (
                     self.db.query(UserDefaultModel)
                     .join(
-                        UserModel,
-                        UserDefaultModel.model_id == UserModel.model_id,
+                        DBModel,
+                        UserDefaultModel.model_id == DBModel.id,
                     )
                     .filter(
                         UserDefaultModel.user_id == user_id,
                         UserDefaultModel.config_type == "small_fast",
-                        UserModel.user_id == user_id,
+                        DBModel.is_active,
                     )
                     .first()
                 )
@@ -552,13 +569,13 @@ class UserAwareModelStorage:
                 vision_default = (
                     self.db.query(UserDefaultModel)
                     .join(
-                        UserModel,
-                        UserDefaultModel.model_id == UserModel.model_id,
+                        DBModel,
+                        UserDefaultModel.model_id == DBModel.id,
                     )
                     .filter(
                         UserDefaultModel.user_id == user_id,
                         UserDefaultModel.config_type == "visual",
-                        UserModel.user_id == user_id,
+                        DBModel.is_active,
                     )
                     .first()
                 )
@@ -571,13 +588,13 @@ class UserAwareModelStorage:
                 compact_default = (
                     self.db.query(UserDefaultModel)
                     .join(
-                        UserModel,
-                        UserDefaultModel.model_id == UserModel.model_id,
+                        DBModel,
+                        UserDefaultModel.model_id == DBModel.id,
                     )
                     .filter(
                         UserDefaultModel.user_id == user_id,
                         UserDefaultModel.config_type == "compact",
-                        UserModel.user_id == user_id,
+                        DBModel.is_active,
                     )
                     .first()
                 )
@@ -588,9 +605,12 @@ class UserAwareModelStorage:
                     )
                     compact_llm = self.core_storage.create_llm_instance(model_config)
 
-            # If user-specific defaults are not complete, try admin shared defaults
+            # If user-specific defaults are not complete, try visible users' shared defaults
             if not default_llm or not fast_llm or not vision_llm or not compact_llm:
-                # Get admin defaults (shared models)
+                from .model_service import _get_visible_user_ids
+
+                visible_ids = _get_visible_user_ids(self.db, user_id)
+                # Get visible users' shared defaults
                 admin_defaults = (
                     self.db.query(UserDefaultModel)
                     .join(
@@ -602,6 +622,7 @@ class UserAwareModelStorage:
                             ["general", "small_fast", "visual", "compact"]
                         ),
                         UserModel.is_shared,
+                        UserDefaultModel.user_id.in_(visible_ids),
                     )
                     .all()
                 )

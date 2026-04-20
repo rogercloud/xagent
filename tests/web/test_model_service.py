@@ -9,13 +9,7 @@ from sqlalchemy.orm import sessionmaker
 from xagent.web.models.database import Base
 from xagent.web.models.model import Model
 from xagent.web.models.user import User
-from xagent.web.services.model_service import (
-    get_compact_model,
-    get_default_model,
-    get_default_vision_model,
-    get_embedding_model,
-    get_fast_model,
-)
+from xagent.web.services.model_service import get_default_model
 
 # Test database setup - use in-memory database
 SQLALCHEMY_DATABASE_URL = "sqlite:///:memory:"
@@ -107,11 +101,17 @@ class TestModelService:
             mock_create.assert_called_once_with(mock_user_default.model)
 
     def test_get_default_model_admin_shared(self):
-        """Test getting admin shared default model"""
+        """Test getting admin shared default model — admin fallback uses _get_visible_user_ids."""
         with (
             patch("xagent.web.models.database.get_db") as mock_get_db,
             patch("xagent.web.services.llm_utils._create_llm_instance") as mock_create,
+            patch(
+                "xagent.web.services.model_service._get_visible_user_ids"
+            ) as mock_visible,
         ):
+            # _get_visible_user_ids returns admin user IDs
+            mock_visible.return_value = [1]
+
             # Setup mock database session
             mock_db = MagicMock()
             mock_get_db.return_value = iter([mock_db])
@@ -132,135 +132,38 @@ class TestModelService:
 
             assert result == mock_llm
             mock_create.assert_called_once()
+            # Verify _get_visible_user_ids was called for admin fallback
+            mock_visible.assert_called_with(mock_db, 2)
 
     def test_get_default_model_no_user_id(self):
-        """Test getting default model without user ID - should return None"""
-        with patch("xagent.web.models.database.get_db") as mock_get_db:
-            # Setup mock database session
-            mock_db = MagicMock()
-            mock_get_db.return_value = iter([mock_db])
-
-            # Setup query to return no shared defaults
-            mock_db.query.return_value.join.return_value.filter.return_value.all.return_value = []
-
-            result = get_default_model()
-            assert result is None
-
-    def test_get_default_vision_model(self):
-        """Test getting vision model"""
+        """Test getting default model without user ID - falls through to visible users fallback."""
         with (
             patch("xagent.web.models.database.get_db") as mock_get_db,
             patch("xagent.web.services.llm_utils._create_llm_instance") as mock_create,
+            patch(
+                "xagent.web.services.model_service._get_visible_user_ids"
+            ) as mock_visible,
         ):
-            # Setup mock database session
+            mock_visible.return_value = [1]
+
             mock_db = MagicMock()
             mock_get_db.return_value = iter([mock_db])
 
-            # Create mock vision default
-            mock_vision_default = MagicMock()
-            mock_vision_default.user_id = 1
-            mock_vision_default.config_type = "visual"
-            mock_vision_default.model = MagicMock()
-            mock_vision_default.model.model_id = "vision-model"
+            # No user-specific default
+            mock_query_result = MagicMock()
+            mock_query_result.first.return_value = None
+            mock_query_result.all.return_value = [MagicMock()]
+            mock_db.query.return_value.join.return_value.filter.return_value = (
+                mock_query_result
+            )
 
-            # Setup query result
-            mock_db.query.return_value.join.return_value.filter.return_value.first.return_value = mock_vision_default
-
-            # Setup mock LLM creation
             mock_llm = MagicMock()
             mock_create.return_value = mock_llm
 
-            result = get_default_vision_model(1)
+            result = get_default_model(None)
 
             assert result == mock_llm
-            mock_create.assert_called_once_with(mock_vision_default.model)
-
-    def test_get_fast_model(self):
-        """Test getting fast model"""
-        with (
-            patch("xagent.web.models.database.get_db") as mock_get_db,
-            patch("xagent.web.services.llm_utils._create_llm_instance") as mock_create,
-        ):
-            # Setup mock database session
-            mock_db = MagicMock()
-            mock_get_db.return_value = iter([mock_db])
-
-            # Create mock fast default
-            mock_fast_default = MagicMock()
-            mock_fast_default.user_id = 1
-            mock_fast_default.config_type = "small_fast"
-            mock_fast_default.model = MagicMock()
-            mock_fast_default.model.model_id = "fast-model"
-
-            # Setup query result
-            mock_db.query.return_value.join.return_value.filter.return_value.first.return_value = mock_fast_default
-
-            # Setup mock LLM creation
-            mock_llm = MagicMock()
-            mock_create.return_value = mock_llm
-
-            result = get_fast_model(1)
-
-            assert result == mock_llm
-            mock_create.assert_called_once_with(mock_fast_default.model)
-
-    def test_get_compact_model(self):
-        """Test getting compact model"""
-        with (
-            patch("xagent.web.models.database.get_db") as mock_get_db,
-            patch("xagent.web.services.llm_utils._create_llm_instance") as mock_create,
-        ):
-            # Setup mock database session
-            mock_db = MagicMock()
-            mock_get_db.return_value = iter([mock_db])
-
-            # Create mock compact default
-            mock_compact_default = MagicMock()
-            mock_compact_default.user_id = 1
-            mock_compact_default.config_type = "compact"
-            mock_compact_default.model = MagicMock()
-            mock_compact_default.model.model_id = "compact-model"
-
-            # Setup query result
-            mock_db.query.return_value.join.return_value.filter.return_value.first.return_value = mock_compact_default
-
-            # Setup mock LLM creation
-            mock_llm = MagicMock()
-            mock_create.return_value = mock_llm
-
-            result = get_compact_model(1)
-
-            assert result == mock_llm
-            mock_create.assert_called_once_with(mock_compact_default.model)
-
-    def test_get_embedding_model(self):
-        """Test getting embedding model"""
-        with (
-            patch("xagent.web.models.database.get_db") as mock_get_db,
-            patch("xagent.web.services.llm_utils._create_llm_instance") as mock_create,
-        ):
-            # Setup mock database session
-            mock_db = MagicMock()
-            mock_get_db.return_value = iter([mock_db])
-
-            # Create mock embedding default
-            mock_embedding_default = MagicMock()
-            mock_embedding_default.user_id = 1
-            mock_embedding_default.config_type = "embedding"
-            mock_embedding_default.model = MagicMock()
-            mock_embedding_default.model.model_id = "embedding-model"
-
-            # Setup query result
-            mock_db.query.return_value.join.return_value.filter.return_value.first.return_value = mock_embedding_default
-
-            # Setup mock LLM creation
-            mock_llm = MagicMock()
-            mock_create.return_value = mock_llm
-
-            result = get_embedding_model(1)
-
-            assert result == mock_llm
-            mock_create.assert_called_once_with(mock_embedding_default.model)
+            mock_visible.assert_called_with(mock_db, None)
 
     def test_get_default_model_no_configuration(self):
         """Test getting default model when no configuration exists - should return None"""
@@ -277,11 +180,16 @@ class TestModelService:
             assert result is None
 
     def test_model_service_multiple_users(self):
-        """Test model service with multiple users"""
+        """Test model service with multiple users — both fall through to admin shared default."""
         with (
             patch("xagent.web.models.database.get_db") as mock_get_db,
             patch("xagent.web.services.llm_utils._create_llm_instance") as mock_create,
+            patch(
+                "xagent.web.services.model_service._get_visible_user_ids"
+            ) as mock_visible,
         ):
+            mock_visible.return_value = [1]  # admin user ID is visible to everyone
+
             # Setup mock database session - create a new session for each call
             mock_db1 = MagicMock()
             mock_db2 = MagicMock()
@@ -315,3 +223,5 @@ class TestModelService:
 
             # Should have been called twice (once for each user)
             assert mock_create.call_count == 2
+            # _get_visible_user_ids should have been called for both users
+            assert mock_visible.call_count == 2

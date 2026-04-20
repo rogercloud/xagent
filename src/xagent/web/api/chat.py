@@ -1504,14 +1504,28 @@ async def create_task(
             if not db_model:
                 return None
 
-            has_access = (
+            # Two-step access check: own → shared from visible users
+            own_model = (
                 db.query(UserModel)
                 .filter(
                     UserModel.user_id == int(user.id), UserModel.model_id == db_model.id
                 )
                 .first()
-                is not None
             )
+            if not own_model:
+                from ..services.model_service import _get_visible_user_ids
+
+                visible_ids = _get_visible_user_ids(db, user.id)
+                own_model = (
+                    db.query(UserModel)
+                    .filter(
+                        UserModel.model_id == db_model.id,
+                        UserModel.user_id.in_(visible_ids),
+                        UserModel.is_shared.is_(True),
+                    )
+                    .first()
+                )
+            has_access = own_model is not None
             if not has_access:
                 return None
 
@@ -1523,16 +1537,19 @@ async def create_task(
             ]
 
         def _get_default_internal_model_ids() -> Dict[str, Optional[str]]:
+            from ..models.model import Model as DBModel
+            from ..services.model_service import _get_visible_user_ids
+
             config_types = ["general", "small_fast", "visual", "compact"]
             defaults: Dict[str, Optional[str]] = {ct: None for ct in config_types}
 
-            # User-specific defaults (only if user has access via UserModel).
+            # User-specific defaults (Mode A: use DBModel JOIN).
             user_defaults = (
                 db.query(UserDefaultModel)
-                .join(UserModel, UserDefaultModel.model_id == UserModel.model_id)
+                .join(DBModel, UserDefaultModel.model_id == DBModel.id)
                 .filter(
                     UserDefaultModel.user_id == int(user.id),
-                    UserModel.user_id == int(user.id),
+                    DBModel.is_active,
                     UserDefaultModel.config_type.in_(config_types),
                 )
                 .all()
@@ -1542,14 +1559,16 @@ async def create_task(
                     config_type = cast(str, row.config_type)
                     defaults[config_type] = str(row.model.model_id)
 
-            # Fill missing defaults from shared admin defaults.
+            # Fill missing defaults from visible users' shared defaults.
             if any(defaults[ct] is None for ct in config_types):
+                visible_ids = _get_visible_user_ids(db, user.id)
                 shared_defaults = (
                     db.query(UserDefaultModel)
                     .join(UserModel, UserDefaultModel.model_id == UserModel.model_id)
                     .filter(
                         UserDefaultModel.config_type.in_(config_types),
                         UserModel.is_shared,
+                        UserDefaultModel.user_id.in_(visible_ids),
                     )
                     .all()
                 )

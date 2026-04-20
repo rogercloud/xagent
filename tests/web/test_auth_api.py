@@ -170,6 +170,8 @@ class TestAuthAPI:
 
     def test_register_success(self, test_db, test_user_data):
         """Test successful user registration"""
+        from xagent.web.models.user import UserDefaultModel, UserModel
+
         setup_first_admin()
         response = client.post("/api/auth/register", json=test_user_data)
         print(f"Response status: {response.status_code}")
@@ -181,6 +183,25 @@ class TestAuthAPI:
         assert data["user"]["username"] == test_user_data["username"]
         assert "id" in data["user"]
         assert "createdAt" in data["user"]
+
+        # Verify registration does NOT create UserModel or UserDefaultModel
+        # (dynamic model sharing: no pre-creation on register)
+        db = TestingSessionLocal()
+        new_user = (
+            db.query(User).filter(User.username == test_user_data["username"]).first()
+        )
+        assert new_user is not None
+        user_models = db.query(UserModel).filter(UserModel.user_id == new_user.id).all()
+        assert len(user_models) == 0, "Registration should not create UserModel records"
+        user_defaults = (
+            db.query(UserDefaultModel)
+            .filter(UserDefaultModel.user_id == new_user.id)
+            .all()
+        )
+        assert len(user_defaults) == 0, (
+            "Registration should not create UserDefaultModel records"
+        )
+        db.close()
 
     def test_register_duplicate_username(self, test_db, test_user_data):
         """Test registration with duplicate username"""

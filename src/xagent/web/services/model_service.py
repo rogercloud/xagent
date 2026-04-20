@@ -22,6 +22,35 @@ from ...core.model.image.xinference import XinferenceImageModel
 
 logger = logging.getLogger(__name__)
 
+# ---------------------------------------------------------------------------
+# Hook infrastructure for dynamic model sharing
+# ---------------------------------------------------------------------------
+
+_visible_user_ids_hook = None  # (db: Session, user_id: int) -> list[int]
+
+
+def set_visible_user_ids_hook(hook):
+    """Set a custom hook that returns user IDs whose models are visible."""
+    global _visible_user_ids_hook
+    _visible_user_ids_hook = hook
+
+
+def _get_visible_user_ids(db: Session, user_id: Optional[int] = None) -> list[int]:
+    """Return user IDs whose shared models are visible to *user_id*.
+
+    Without a hook this returns all admin user IDs (legacy behaviour).
+    When *user_id* is ``None`` (standalone / non-web context), only admin IDs
+    are returned so that standalone callers fall back to admin defaults safely.
+
+    Hook implementers MUST handle ``user_id=None`` gracefully — e.g. treat it
+    as an unauthenticated context and return only system-admin IDs.
+    """
+    if _visible_user_ids_hook is not None:
+        return _visible_user_ids_hook(db, user_id)
+    from ..models.user import User
+
+    return [uid for (uid,) in db.query(User.id).filter(User.is_admin).all()]
+
 
 def get_default_vision_model(user_id: Optional[int] = None) -> Optional[BaseLLM]:
     """
@@ -36,7 +65,8 @@ def get_default_vision_model(user_id: Optional[int] = None) -> Optional[BaseLLM]
     try:
         # Try to get from database (requires web context)
         from ..models.database import get_db
-        from ..models.user import User, UserDefaultModel, UserModel
+        from ..models.model import Model as DBModel
+        from ..models.user import UserDefaultModel, UserModel
         from .llm_utils import _create_llm_instance
 
         # This won't work in non-web contexts, so we'll fallback to environment
@@ -48,11 +78,11 @@ def get_default_vision_model(user_id: Optional[int] = None) -> Optional[BaseLLM]
             if user_id:
                 vision_default = (
                     db.query(UserDefaultModel)
-                    .join(UserModel, UserDefaultModel.model_id == UserModel.model_id)
+                    .join(DBModel, UserDefaultModel.model_id == DBModel.id)
                     .filter(
                         UserDefaultModel.user_id == user_id,
                         UserDefaultModel.config_type == "visual",
-                        UserModel.user_id == user_id,
+                        DBModel.is_active,
                     )
                     .first()
                 )
@@ -60,16 +90,14 @@ def get_default_vision_model(user_id: Optional[int] = None) -> Optional[BaseLLM]
                 if vision_default and vision_default.model:
                     return _create_llm_instance(vision_default.model)
 
-            # Fallback to admin defaults first, then other shared defaults
+            # Fallback to visible users' shared defaults
             admin_vision_defaults = (
                 db.query(UserDefaultModel)
                 .join(UserModel, UserDefaultModel.model_id == UserModel.model_id)
                 .filter(
                     UserDefaultModel.config_type == "visual",
                     UserModel.is_shared,
-                    UserDefaultModel.user_id.in_(
-                        db.query(User.id).filter(User.is_admin)
-                    ),
+                    UserDefaultModel.user_id.in_(_get_visible_user_ids(db, user_id)),
                 )
                 .limit(1)
                 .all()
@@ -77,18 +105,6 @@ def get_default_vision_model(user_id: Optional[int] = None) -> Optional[BaseLLM]
 
             if admin_vision_defaults:
                 return _create_llm_instance(admin_vision_defaults[0].model)
-
-            # If no admin defaults, fallback to any shared defaults
-            vision_models = (
-                db.query(UserDefaultModel)
-                .join(UserModel, UserDefaultModel.model_id == UserModel.model_id)
-                .filter(UserDefaultModel.config_type == "visual", UserModel.is_shared)
-                .limit(1)
-                .all()
-            )
-
-            if vision_models:
-                return _create_llm_instance(vision_models[0].model)
 
         except Exception as e:
             logger.warning(f"Failed to get vision model from database: {e}")
@@ -113,7 +129,8 @@ def get_default_model(user_id: Optional[int] = None) -> Optional[BaseLLM]:
     """
     try:
         from ..models.database import get_db
-        from ..models.user import User, UserDefaultModel, UserModel
+        from ..models.model import Model as DBModel
+        from ..models.user import UserDefaultModel, UserModel
         from .llm_utils import _create_llm_instance
 
         try:
@@ -123,11 +140,11 @@ def get_default_model(user_id: Optional[int] = None) -> Optional[BaseLLM]:
             if user_id:
                 general_default = (
                     db.query(UserDefaultModel)
-                    .join(UserModel, UserDefaultModel.model_id == UserModel.model_id)
+                    .join(DBModel, UserDefaultModel.model_id == DBModel.id)
                     .filter(
                         UserDefaultModel.user_id == user_id,
                         UserDefaultModel.config_type == "general",
-                        UserModel.user_id == user_id,
+                        DBModel.is_active,
                     )
                     .first()
                 )
@@ -135,16 +152,14 @@ def get_default_model(user_id: Optional[int] = None) -> Optional[BaseLLM]:
                 if general_default and general_default.model:
                     return _create_llm_instance(general_default.model)
 
-            # Fallback to admin defaults first, then other shared defaults
+            # Fallback to visible users' shared defaults
             admin_defaults = (
                 db.query(UserDefaultModel)
                 .join(UserModel, UserDefaultModel.model_id == UserModel.model_id)
                 .filter(
                     UserDefaultModel.config_type == "general",
                     UserModel.is_shared,
-                    UserDefaultModel.user_id.in_(
-                        db.query(User.id).filter(User.is_admin)
-                    ),
+                    UserDefaultModel.user_id.in_(_get_visible_user_ids(db, user_id)),
                 )
                 .limit(1)
                 .all()
@@ -152,18 +167,6 @@ def get_default_model(user_id: Optional[int] = None) -> Optional[BaseLLM]:
 
             if admin_defaults:
                 return _create_llm_instance(admin_defaults[0].model)
-
-            # If no admin defaults, fallback to any shared defaults
-            shared_defaults = (
-                db.query(UserDefaultModel)
-                .join(UserModel, UserDefaultModel.model_id == UserModel.model_id)
-                .filter(UserDefaultModel.config_type == "general", UserModel.is_shared)
-                .limit(1)
-                .all()
-            )
-
-            if shared_defaults:
-                return _create_llm_instance(shared_defaults[0].model)
 
         except Exception as e:
             logger.warning(f"Failed to get default model from database: {e}")
@@ -188,7 +191,8 @@ def get_fast_model(user_id: Optional[int] = None) -> Optional[BaseLLM]:
     """
     try:
         from ..models.database import get_db
-        from ..models.user import User, UserDefaultModel, UserModel
+        from ..models.model import Model as DBModel
+        from ..models.user import UserDefaultModel, UserModel
         from .llm_utils import _create_llm_instance
 
         try:
@@ -198,11 +202,11 @@ def get_fast_model(user_id: Optional[int] = None) -> Optional[BaseLLM]:
             if user_id:
                 fast_default = (
                     db.query(UserDefaultModel)
-                    .join(UserModel, UserDefaultModel.model_id == UserModel.model_id)
+                    .join(DBModel, UserDefaultModel.model_id == DBModel.id)
                     .filter(
                         UserDefaultModel.user_id == user_id,
                         UserDefaultModel.config_type == "small_fast",
-                        UserModel.user_id == user_id,
+                        DBModel.is_active,
                     )
                     .first()
                 )
@@ -210,16 +214,14 @@ def get_fast_model(user_id: Optional[int] = None) -> Optional[BaseLLM]:
                 if fast_default and fast_default.model:
                     return _create_llm_instance(fast_default.model)
 
-            # Fallback to admin defaults first, then other shared defaults
+            # Fallback to visible users' shared defaults
             admin_fast_defaults = (
                 db.query(UserDefaultModel)
                 .join(UserModel, UserDefaultModel.model_id == UserModel.model_id)
                 .filter(
                     UserDefaultModel.config_type == "small_fast",
                     UserModel.is_shared,
-                    UserDefaultModel.user_id.in_(
-                        db.query(User.id).filter(User.is_admin)
-                    ),
+                    UserDefaultModel.user_id.in_(_get_visible_user_ids(db, user_id)),
                 )
                 .limit(1)
                 .all()
@@ -227,20 +229,6 @@ def get_fast_model(user_id: Optional[int] = None) -> Optional[BaseLLM]:
 
             if admin_fast_defaults:
                 return _create_llm_instance(admin_fast_defaults[0].model)
-
-            # If no admin defaults, fallback to any shared defaults
-            shared_defaults = (
-                db.query(UserDefaultModel)
-                .join(UserModel, UserDefaultModel.model_id == UserModel.model_id)
-                .filter(
-                    UserDefaultModel.config_type == "small_fast", UserModel.is_shared
-                )
-                .limit(1)
-                .all()
-            )
-
-            if shared_defaults:
-                return _create_llm_instance(shared_defaults[0].model)
 
         except Exception as e:
             logger.warning(f"Failed to get fast model from database: {e}")
@@ -265,7 +253,8 @@ def get_compact_model(user_id: Optional[int] = None) -> Optional[BaseLLM]:
     """
     try:
         from ..models.database import get_db
-        from ..models.user import User, UserDefaultModel, UserModel
+        from ..models.model import Model as DBModel
+        from ..models.user import UserDefaultModel, UserModel
         from .llm_utils import _create_llm_instance
 
         try:
@@ -275,11 +264,11 @@ def get_compact_model(user_id: Optional[int] = None) -> Optional[BaseLLM]:
             if user_id:
                 compact_default = (
                     db.query(UserDefaultModel)
-                    .join(UserModel, UserDefaultModel.model_id == UserModel.model_id)
+                    .join(DBModel, UserDefaultModel.model_id == DBModel.id)
                     .filter(
                         UserDefaultModel.user_id == user_id,
                         UserDefaultModel.config_type == "compact",
-                        UserModel.user_id == user_id,
+                        DBModel.is_active,
                     )
                     .first()
                 )
@@ -287,16 +276,14 @@ def get_compact_model(user_id: Optional[int] = None) -> Optional[BaseLLM]:
                 if compact_default and compact_default.model:
                     return _create_llm_instance(compact_default.model)
 
-            # Fallback to admin defaults first, then other shared defaults
+            # Fallback to visible users' shared defaults
             admin_compact_defaults = (
                 db.query(UserDefaultModel)
                 .join(UserModel, UserDefaultModel.model_id == UserModel.model_id)
                 .filter(
                     UserDefaultModel.config_type == "compact",
                     UserModel.is_shared,
-                    UserDefaultModel.user_id.in_(
-                        db.query(User.id).filter(User.is_admin)
-                    ),
+                    UserDefaultModel.user_id.in_(_get_visible_user_ids(db, user_id)),
                 )
                 .limit(1)
                 .all()
@@ -304,18 +291,6 @@ def get_compact_model(user_id: Optional[int] = None) -> Optional[BaseLLM]:
 
             if admin_compact_defaults:
                 return _create_llm_instance(admin_compact_defaults[0].model)
-
-            # If no admin defaults, fallback to any shared defaults
-            shared_defaults = (
-                db.query(UserDefaultModel)
-                .join(UserModel, UserDefaultModel.model_id == UserModel.model_id)
-                .filter(UserDefaultModel.config_type == "compact", UserModel.is_shared)
-                .limit(1)
-                .all()
-            )
-
-            if shared_defaults:
-                return _create_llm_instance(shared_defaults[0].model)
 
         except Exception as e:
             logger.warning(f"Failed to get compact model from database: {e}")
@@ -340,7 +315,8 @@ def get_embedding_model(user_id: Optional[int] = None) -> Optional[BaseLLM]:
     """
     try:
         from ..models.database import get_db
-        from ..models.user import User, UserDefaultModel, UserModel
+        from ..models.model import Model as DBModel
+        from ..models.user import UserDefaultModel, UserModel
         from .llm_utils import _create_llm_instance
 
         try:
@@ -350,11 +326,11 @@ def get_embedding_model(user_id: Optional[int] = None) -> Optional[BaseLLM]:
             if user_id:
                 embedding_default = (
                     db.query(UserDefaultModel)
-                    .join(UserModel, UserDefaultModel.model_id == UserModel.model_id)
+                    .join(DBModel, UserDefaultModel.model_id == DBModel.id)
                     .filter(
                         UserDefaultModel.user_id == user_id,
                         UserDefaultModel.config_type == "embedding",
-                        UserModel.user_id == user_id,
+                        DBModel.is_active,
                     )
                     .first()
                 )
@@ -362,16 +338,14 @@ def get_embedding_model(user_id: Optional[int] = None) -> Optional[BaseLLM]:
                 if embedding_default and embedding_default.model:
                     return _create_llm_instance(embedding_default.model)
 
-            # Fallback to admin defaults first, then other shared defaults
+            # Fallback to visible users' shared defaults
             admin_embedding_defaults = (
                 db.query(UserDefaultModel)
                 .join(UserModel, UserDefaultModel.model_id == UserModel.model_id)
                 .filter(
                     UserDefaultModel.config_type == "embedding",
                     UserModel.is_shared,
-                    UserDefaultModel.user_id.in_(
-                        db.query(User.id).filter(User.is_admin)
-                    ),
+                    UserDefaultModel.user_id.in_(_get_visible_user_ids(db, user_id)),
                 )
                 .limit(1)
                 .all()
@@ -379,20 +353,6 @@ def get_embedding_model(user_id: Optional[int] = None) -> Optional[BaseLLM]:
 
             if admin_embedding_defaults:
                 return _create_llm_instance(admin_embedding_defaults[0].model)
-
-            # If no admin defaults, fallback to any shared defaults
-            shared_defaults = (
-                db.query(UserDefaultModel)
-                .join(UserModel, UserDefaultModel.model_id == UserModel.model_id)
-                .filter(
-                    UserDefaultModel.config_type == "embedding", UserModel.is_shared
-                )
-                .limit(1)
-                .all()
-            )
-
-            if shared_defaults:
-                return _create_llm_instance(shared_defaults[0].model)
 
         except Exception as e:
             logger.warning(f"Failed to get embedding model from database: {e}")
@@ -584,7 +544,7 @@ def get_default_image_generate_model(
         from ...core.model.image.adapter import get_image_model_instance
         from ..models.database import get_db
         from ..models.model import Model as DBModel
-        from ..models.user import User, UserDefaultModel, UserModel
+        from ..models.user import UserDefaultModel, UserModel
 
         try:
             db = next(get_db())
@@ -593,12 +553,11 @@ def get_default_image_generate_model(
             if user_id:
                 image_default = (
                     db.query(UserDefaultModel)
-                    .join(UserModel, UserDefaultModel.model_id == UserModel.model_id)
-                    .join(DBModel, UserModel.model_id == DBModel.id)
+                    .join(DBModel, UserDefaultModel.model_id == DBModel.id)
                     .filter(
                         UserDefaultModel.user_id == user_id,
                         UserDefaultModel.config_type == "image",
-                        UserModel.user_id == user_id,
+                        DBModel.is_active,
                         cast(DBModel.abilities, String).contains('"generate"'),
                     )
                     .first()
@@ -612,7 +571,7 @@ def get_default_image_generate_model(
                     except Exception as e:
                         logger.warning(f"Failed to create image model instance: {e}")
 
-            # Fallback to admin defaults first, then other shared defaults
+            # Fallback to visible users' shared defaults
             admin_image_defaults = (
                 db.query(UserDefaultModel)
                 .join(UserModel, UserDefaultModel.model_id == UserModel.model_id)
@@ -620,9 +579,7 @@ def get_default_image_generate_model(
                 .filter(
                     UserDefaultModel.config_type == "image",
                     UserModel.is_shared,
-                    UserDefaultModel.user_id.in_(
-                        db.query(User.id).filter(User.is_admin)
-                    ),
+                    UserDefaultModel.user_id.in_(_get_visible_user_ids(db, user_id)),
                     cast(DBModel.abilities, String).contains('"generate"'),
                 )
                 .limit(1)
@@ -636,30 +593,6 @@ def get_default_image_generate_model(
                         instance,
                         "model_id",
                         str(admin_image_defaults[0].model.model_id),
-                    )
-                    return instance
-                except Exception as e:
-                    logger.warning(f"Failed to create image model instance: {e}")
-
-            # If no admin defaults, fallback to any shared defaults
-            shared_defaults = (
-                db.query(UserDefaultModel)
-                .join(UserModel, UserDefaultModel.model_id == UserModel.model_id)
-                .join(DBModel, UserModel.model_id == DBModel.id)
-                .filter(
-                    UserDefaultModel.config_type == "image",
-                    UserModel.is_shared,
-                    cast(DBModel.abilities, String).contains('"generate"'),
-                )
-                .limit(1)
-                .all()
-            )
-
-            if shared_defaults:
-                try:
-                    instance = get_image_model_instance(shared_defaults[0].model)
-                    setattr(
-                        instance, "model_id", str(shared_defaults[0].model.model_id)
                     )
                     return instance
                 except Exception as e:
@@ -693,7 +626,7 @@ def get_default_image_edit_model(
         from ...core.model.image.adapter import get_image_model_instance
         from ..models.database import get_db
         from ..models.model import Model as DBModel
-        from ..models.user import User, UserDefaultModel, UserModel
+        from ..models.user import UserDefaultModel, UserModel
 
         try:
             db = next(get_db())
@@ -702,12 +635,11 @@ def get_default_image_edit_model(
             if user_id:
                 image_default = (
                     db.query(UserDefaultModel)
-                    .join(UserModel, UserDefaultModel.model_id == UserModel.model_id)
-                    .join(DBModel, UserModel.model_id == DBModel.id)
+                    .join(DBModel, UserDefaultModel.model_id == DBModel.id)
                     .filter(
                         UserDefaultModel.user_id == user_id,
                         UserDefaultModel.config_type == "image_edit",
-                        UserModel.user_id == user_id,
+                        DBModel.is_active,
                     )
                     .first()
                 )
@@ -720,16 +652,14 @@ def get_default_image_edit_model(
                     except Exception as e:
                         logger.warning(f"Failed to create image model instance: {e}")
 
-            # Fallback to admin defaults first, then other shared defaults
+            # Fallback to visible users' shared defaults
             admin_image_defaults = (
                 db.query(UserDefaultModel)
                 .join(UserModel, UserDefaultModel.model_id == UserModel.model_id)
                 .filter(
                     UserDefaultModel.config_type == "image_edit",
                     UserModel.is_shared,
-                    UserDefaultModel.user_id.in_(
-                        db.query(User.id).filter(User.is_admin)
-                    ),
+                    UserDefaultModel.user_id.in_(_get_visible_user_ids(db, user_id)),
                 )
                 .limit(1)
                 .all()
@@ -742,28 +672,6 @@ def get_default_image_edit_model(
                         instance,
                         "model_id",
                         str(admin_image_defaults[0].model.model_id),
-                    )
-                    return instance
-                except Exception as e:
-                    logger.warning(f"Failed to create image model instance: {e}")
-
-            # If no admin defaults, fallback to any shared defaults
-            shared_defaults = (
-                db.query(UserDefaultModel)
-                .join(UserModel, UserDefaultModel.model_id == UserModel.model_id)
-                .filter(
-                    UserDefaultModel.config_type == "image_edit",
-                    UserModel.is_shared,
-                )
-                .limit(1)
-                .all()
-            )
-
-            if shared_defaults:
-                try:
-                    instance = get_image_model_instance(shared_defaults[0].model)
-                    setattr(
-                        instance, "model_id", str(shared_defaults[0].model.model_id)
                     )
                     return instance
                 except Exception as e:
@@ -792,7 +700,8 @@ def get_default_embedding_model(user_id: Optional[int] = None) -> Optional[str]:
         The embedding model ID or None if not available
     """
     from ..models.database import get_db
-    from ..models.user import User, UserDefaultModel, UserModel
+    from ..models.model import Model as DBModel
+    from ..models.user import UserDefaultModel, UserModel
 
     db = next(get_db())
 
@@ -800,11 +709,11 @@ def get_default_embedding_model(user_id: Optional[int] = None) -> Optional[str]:
     if user_id:
         embedding_default = (
             db.query(UserDefaultModel)
-            .join(UserModel, UserDefaultModel.model_id == UserModel.model_id)
+            .join(DBModel, UserDefaultModel.model_id == DBModel.id)
             .filter(
                 UserDefaultModel.user_id == user_id,
                 UserDefaultModel.config_type == "embedding",
-                UserModel.user_id == user_id,
+                DBModel.is_active,
             )
             .first()
         )
@@ -812,14 +721,14 @@ def get_default_embedding_model(user_id: Optional[int] = None) -> Optional[str]:
         if embedding_default and embedding_default.model:
             return str(embedding_default.model.model_id)
 
-    # Admin defaults
+    # Visible users' shared defaults
     admin_embedding_defaults = (
         db.query(UserDefaultModel)
         .join(UserModel, UserDefaultModel.model_id == UserModel.model_id)
         .filter(
             UserDefaultModel.config_type == "embedding",
             UserModel.is_shared,
-            UserDefaultModel.user_id.in_(db.query(User.id).filter(User.is_admin)),
+            UserDefaultModel.user_id.in_(_get_visible_user_ids(db, user_id)),
         )
         .limit(1)
         .all()
@@ -827,18 +736,6 @@ def get_default_embedding_model(user_id: Optional[int] = None) -> Optional[str]:
 
     if admin_embedding_defaults:
         return str(admin_embedding_defaults[0].model.model_id)
-
-    # Any shared defaults
-    embedding_models = (
-        db.query(UserDefaultModel)
-        .join(UserModel, UserDefaultModel.model_id == UserModel.model_id)
-        .filter(UserDefaultModel.config_type == "embedding", UserModel.is_shared)
-        .limit(1)
-        .all()
-    )
-
-    if embedding_models:
-        return str(embedding_models[0].model.model_id)
 
     return None
 
@@ -968,7 +865,7 @@ def get_default_asr_model(user_id: Optional[int] = None) -> Optional[Any]:
         from ...core.model.asr.adapter import get_asr_model_instance
         from ..models.database import get_db
         from ..models.model import Model as DBModel
-        from ..models.user import User, UserDefaultModel, UserModel
+        from ..models.user import UserDefaultModel, UserModel
 
         try:
             db = next(get_db())
@@ -977,12 +874,11 @@ def get_default_asr_model(user_id: Optional[int] = None) -> Optional[Any]:
             if user_id:
                 asr_default = (
                     db.query(UserDefaultModel)
-                    .join(UserModel, UserDefaultModel.model_id == UserModel.model_id)
-                    .join(DBModel, UserModel.model_id == DBModel.id)
+                    .join(DBModel, UserDefaultModel.model_id == DBModel.id)
                     .filter(
                         UserDefaultModel.user_id == user_id,
                         UserDefaultModel.config_type == "asr",
-                        UserModel.user_id == user_id,
+                        DBModel.is_active,
                     )
                     .first()
                 )
@@ -993,7 +889,7 @@ def get_default_asr_model(user_id: Optional[int] = None) -> Optional[Any]:
                     except Exception as e:
                         logger.warning(f"Failed to create ASR model instance: {e}")
 
-            # Admin defaults
+            # Visible users' shared defaults
             admin_asr_defaults = (
                 db.query(UserDefaultModel)
                 .join(UserModel, UserDefaultModel.model_id == UserModel.model_id)
@@ -1001,9 +897,7 @@ def get_default_asr_model(user_id: Optional[int] = None) -> Optional[Any]:
                 .filter(
                     UserDefaultModel.config_type == "asr",
                     UserModel.is_shared,
-                    UserDefaultModel.user_id.in_(
-                        db.query(User.id).filter(User.is_admin)
-                    ),
+                    UserDefaultModel.user_id.in_(_get_visible_user_ids(db, user_id)),
                 )
                 .limit(1)
                 .all()
@@ -1012,22 +906,6 @@ def get_default_asr_model(user_id: Optional[int] = None) -> Optional[Any]:
             if admin_asr_defaults:
                 try:
                     return get_asr_model_instance(admin_asr_defaults[0].model)
-                except Exception as e:
-                    logger.warning(f"Failed to create ASR model instance: {e}")
-
-            # Any shared defaults
-            asr_models = (
-                db.query(UserDefaultModel)
-                .join(UserModel, UserDefaultModel.model_id == UserModel.model_id)
-                .join(DBModel, UserModel.model_id == DBModel.id)
-                .filter(UserDefaultModel.config_type == "asr", UserModel.is_shared)
-                .limit(1)
-                .all()
-            )
-
-            if asr_models:
-                try:
-                    return get_asr_model_instance(asr_models[0].model)
                 except Exception as e:
                     logger.warning(f"Failed to create ASR model instance: {e}")
 
@@ -1054,7 +932,7 @@ def get_default_tts_model(user_id: Optional[int] = None) -> Optional[Any]:
         from ...core.model.tts.adapter import get_tts_model_instance
         from ..models.database import get_db
         from ..models.model import Model as DBModel
-        from ..models.user import User, UserDefaultModel, UserModel
+        from ..models.user import UserDefaultModel, UserModel
 
         try:
             db = next(get_db())
@@ -1063,12 +941,11 @@ def get_default_tts_model(user_id: Optional[int] = None) -> Optional[Any]:
             if user_id:
                 tts_default = (
                     db.query(UserDefaultModel)
-                    .join(UserModel, UserDefaultModel.model_id == UserModel.model_id)
-                    .join(DBModel, UserModel.model_id == DBModel.id)
+                    .join(DBModel, UserDefaultModel.model_id == DBModel.id)
                     .filter(
                         UserDefaultModel.user_id == user_id,
                         UserDefaultModel.config_type == "tts",
-                        UserModel.user_id == user_id,
+                        DBModel.is_active,
                     )
                     .first()
                 )
@@ -1079,7 +956,7 @@ def get_default_tts_model(user_id: Optional[int] = None) -> Optional[Any]:
                     except Exception as e:
                         logger.warning(f"Failed to create TTS model instance: {e}")
 
-            # Admin defaults
+            # Visible users' shared defaults
             admin_tts_defaults = (
                 db.query(UserDefaultModel)
                 .join(UserModel, UserDefaultModel.model_id == UserModel.model_id)
@@ -1087,9 +964,7 @@ def get_default_tts_model(user_id: Optional[int] = None) -> Optional[Any]:
                 .filter(
                     UserDefaultModel.config_type == "tts",
                     UserModel.is_shared,
-                    UserDefaultModel.user_id.in_(
-                        db.query(User.id).filter(User.is_admin)
-                    ),
+                    UserDefaultModel.user_id.in_(_get_visible_user_ids(db, user_id)),
                 )
                 .limit(1)
                 .all()
@@ -1098,22 +973,6 @@ def get_default_tts_model(user_id: Optional[int] = None) -> Optional[Any]:
             if admin_tts_defaults:
                 try:
                     return get_tts_model_instance(admin_tts_defaults[0].model)
-                except Exception as e:
-                    logger.warning(f"Failed to create TTS model instance: {e}")
-
-            # Any shared defaults
-            tts_models = (
-                db.query(UserDefaultModel)
-                .join(UserModel, UserDefaultModel.model_id == UserModel.model_id)
-                .join(DBModel, UserModel.model_id == DBModel.id)
-                .filter(UserDefaultModel.config_type == "tts", UserModel.is_shared)
-                .limit(1)
-                .all()
-            )
-
-            if tts_models:
-                try:
-                    return get_tts_model_instance(tts_models[0].model)
                 except Exception as e:
                     logger.warning(f"Failed to create TTS model instance: {e}")
 

@@ -418,12 +418,15 @@ class CreateAgentTool(AbstractBaseTool):
                 ).model_dump()
 
             # Get user's default model configuration
+            from .....web.models.model import Model as DBModel
+            from .....web.services.model_service import _get_visible_user_ids
+
             user_defaults = (
                 self._db.query(UserDefaultModel)
-                .join(UserModel, UserDefaultModel.model_id == UserModel.model_id)
+                .join(DBModel, UserDefaultModel.model_id == DBModel.id)
                 .filter(
                     UserDefaultModel.user_id == self._user_id,
-                    UserModel.user_id == self._user_id,
+                    DBModel.is_active,
                 )
                 .all()
             )
@@ -445,13 +448,15 @@ class CreateAgentTool(AbstractBaseTool):
                 if t not in models_config
             ]
             if missing_types:
-                # Fill missing with admin shared defaults
+                # Fill missing with visible users' shared defaults
+                visible_ids = _get_visible_user_ids(self._db, self._user_id)
                 admin_defaults = (
                     self._db.query(UserDefaultModel)
                     .join(UserModel, UserDefaultModel.model_id == UserModel.model_id)
                     .filter(
                         UserDefaultModel.config_type.in_(missing_types),
                         UserModel.is_shared,
+                        UserDefaultModel.user_id.in_(visible_ids),
                     )
                     .all()
                 )
