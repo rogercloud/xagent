@@ -1515,7 +1515,7 @@ async def create_task(
             if not own_model:
                 from ..services.model_service import _get_visible_user_ids
 
-                visible_ids = _get_visible_user_ids(db, user.id)
+                visible_ids = _get_visible_user_ids(db, int(user.id))
                 own_model = (
                     db.query(UserModel)
                     .filter(
@@ -1561,7 +1561,7 @@ async def create_task(
 
             # Fill missing defaults from visible users' shared defaults.
             if any(defaults[ct] is None for ct in config_types):
-                visible_ids = _get_visible_user_ids(db, user.id)
+                visible_ids = _get_visible_user_ids(db, int(user.id))
                 shared_defaults = (
                     db.query(UserDefaultModel)
                     .join(UserModel, UserDefaultModel.model_id == UserModel.model_id)

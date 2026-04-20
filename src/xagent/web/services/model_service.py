@@ -29,7 +29,7 @@ logger = logging.getLogger(__name__)
 _visible_user_ids_hook = None  # (db: Session, user_id: int) -> list[int]
 
 
-def set_visible_user_ids_hook(hook):
+def set_visible_user_ids_hook(hook: Any) -> None:
     """Set a custom hook that returns user IDs whose models are visible."""
     global _visible_user_ids_hook
     _visible_user_ids_hook = hook
@@ -46,7 +46,7 @@ def _get_visible_user_ids(db: Session, user_id: Optional[int] = None) -> list[in
     as an unauthenticated context and return only system-admin IDs.
     """
     if _visible_user_ids_hook is not None:
-        return _visible_user_ids_hook(db, user_id)
+        return list(_visible_user_ids_hook(db, user_id))
     from ..models.user import User
 
     return [uid for (uid,) in db.query(User.id).filter(User.is_admin).all()]

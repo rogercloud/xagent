@@ -18,7 +18,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from xagent.web.api.auth import auth_router
-from xagent.web.api.model import _can_user_share, set_can_share_hook, model_router
+from xagent.web.api.model import _can_user_share, model_router, set_can_share_hook
 from xagent.web.models.database import Base, get_db, get_engine
 from xagent.web.services.model_service import (
     _get_visible_user_ids,
@@ -162,9 +162,7 @@ def sample_model_data():
 class TestHookInfrastructure:
     """Test _get_visible_user_ids and _can_user_share hooks."""
 
-    def test_get_visible_user_ids_default_returns_admin_ids(
-        self, test_db, admin_user
-    ):
+    def test_get_visible_user_ids_default_returns_admin_ids(self, test_db, admin_user):
         """Without hook, returns all admin user IDs."""
         db = next(get_db())
         result = _get_visible_user_ids(db, admin_user["id"])
@@ -209,7 +207,9 @@ class TestHookInfrastructure:
 class TestModeBAccessVerification:
     """Test two-step lookup: own → shared from visible users."""
 
-    def test_resolve_accessible_model_own(self, test_db, admin_headers, sample_model_data):
+    def test_resolve_accessible_model_own(
+        self, test_db, admin_headers, sample_model_data
+    ):
         """Step 1: owner accesses their own model."""
         create_response = client.post(
             "/api/models/", json=sample_model_data, headers=admin_headers
@@ -238,7 +238,9 @@ class TestModeBAccessVerification:
         assert response.status_code == 200
         assert response.json()["is_owner"] is False
 
-    def test_resolve_accessible_model_no_access(self, test_db, regular_headers, admin_headers, sample_model_data):
+    def test_resolve_accessible_model_no_access(
+        self, test_db, regular_headers, admin_headers, sample_model_data
+    ):
         """Two-step both miss: returns 404."""
         # Admin creates a private model
         create_response = client.post(
@@ -433,7 +435,6 @@ class TestModeCModelListing:
         assert response.status_code == 200
         data = response.json()
         assert data["total_models"] >= 1
-
 
 
 # ===========================================================================
@@ -651,7 +652,9 @@ class TestUnshareCleanup:
         )
 
         # Verify regular user has a default
-        defaults_before = client.get("/api/models/user-default", headers=regular_headers)
+        defaults_before = client.get(
+            "/api/models/user-default", headers=regular_headers
+        )
         assert any(d["config_type"] == "general" for d in defaults_before.json())
 
         # Admin un-shares
@@ -689,9 +692,7 @@ class TestUnshareCleanup:
         )
 
         # Admin un-shares (remove the default first to avoid constraint)
-        client.delete(
-            "/api/models/user-default/general", headers=admin_headers
-        )
+        client.delete("/api/models/user-default/general", headers=admin_headers)
 
         update_response = client.put(
             f"/api/models/{model_id_str}",
@@ -739,9 +740,7 @@ class TestUnshareCleanup:
         )
 
         # Admin un-shares first model (needs to remove admin's own default first)
-        client.delete(
-            "/api/models/user-default/general", headers=admin_headers
-        )
+        client.delete("/api/models/user-default/general", headers=admin_headers)
         # Set second model as admin's default
         client.post(
             "/api/models/user-default",
@@ -813,7 +812,9 @@ class TestStaticCodeCleanup:
         from xagent.web.models.user import UserModel
 
         model_db_id = create_response.json()["id"]
-        user_models = db.query(UserModel).filter(UserModel.model_id == model_db_id).all()
+        user_models = (
+            db.query(UserModel).filter(UserModel.model_id == model_db_id).all()
+        )
         db.close()
 
         # Only one UserModel — the owner's
@@ -845,7 +846,9 @@ class TestStaticCodeCleanup:
         db = next(get_db())
         from xagent.web.models.user import UserModel
 
-        user_models = db.query(UserModel).filter(UserModel.model_id == model_db_id).all()
+        user_models = (
+            db.query(UserModel).filter(UserModel.model_id == model_db_id).all()
+        )
         db.close()
 
         assert len(user_models) == 1
@@ -883,30 +886,37 @@ class TestModeADefaultLookup:
 
         # Verify the user has a default but NO own UserModel for this model
         db = next(get_db())
-        from xagent.web.models.user import UserModel, UserDefaultModel
+        from xagent.web.models.user import User, UserDefaultModel, UserModel
 
-        regular_user_id = regular_headers  # Need to get user_id
-        # Get user ID from login response or from DB
-        from xagent.web.models.user import User
         regular = db.query(User).filter(User.username == "regularuser").first()
         assert regular is not None
 
         # User has a UserDefaultModel pointing to the shared model
-        user_default = db.query(UserDefaultModel).filter(
-            UserDefaultModel.user_id == regular.id,
-            UserDefaultModel.config_type == "general",
-        ).first()
+        user_default = (
+            db.query(UserDefaultModel)
+            .filter(
+                UserDefaultModel.user_id == regular.id,
+                UserDefaultModel.config_type == "general",
+            )
+            .first()
+        )
         assert user_default is not None
 
         # User does NOT have their own UserModel (only admin has one)
-        own_user_model = db.query(UserModel).filter(
-            UserModel.user_id == regular.id,
-            UserModel.model_id == model_db_id,
-        ).first()
+        own_user_model = (
+            db.query(UserModel)
+            .filter(
+                UserModel.user_id == regular.id,
+                UserModel.model_id == model_db_id,
+            )
+            .first()
+        )
         assert own_user_model is None  # No pre-created UserModel
 
         # Despite no own UserModel, user-default endpoint should return the default
-        defaults_response = client.get("/api/models/user-default", headers=regular_headers)
+        defaults_response = client.get(
+            "/api/models/user-default", headers=regular_headers
+        )
         assert defaults_response.status_code == 200
         data = defaults_response.json()
         general = [d for d in data if d.get("config_type") == "general"]
@@ -938,7 +948,9 @@ class TestModeADefaultLookup:
         )
 
         # Regular user should NOT see admin's private model in user-defaults
-        defaults_response = client.get("/api/models/user-default", headers=regular_headers)
+        defaults_response = client.get(
+            "/api/models/user-default", headers=regular_headers
+        )
         assert defaults_response.status_code == 200
         data = defaults_response.json()
         general = [d for d in data if d.get("config_type") == "general"]
@@ -957,7 +969,9 @@ class TestModeADefaultLookup:
         assert create_response.status_code == 200
 
         # Regular user has no default
-        defaults_response = client.get("/api/models/user-default", headers=regular_headers)
+        defaults_response = client.get(
+            "/api/models/user-default", headers=regular_headers
+        )
         assert defaults_response.status_code == 200
         data = defaults_response.json()
         general = [d for d in data if d.get("config_type") == "general"]

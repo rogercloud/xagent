@@ -44,7 +44,7 @@ logger = logging.getLogger(__name__)
 _can_share_hook = None  # (user: User) -> bool
 
 
-def set_can_share_hook(hook):
+def set_can_share_hook(hook: Any) -> None:
     """Set a custom hook that determines whether a user can share models."""
     global _can_share_hook
     _can_share_hook = hook
@@ -56,8 +56,8 @@ def _can_user_share(user: User) -> bool:
     Without a hook this falls back to ``user.is_admin`` (legacy behaviour).
     """
     if _can_share_hook is not None:
-        return _can_share_hook(user)
-    return user.is_admin
+        return bool(_can_share_hook(user))
+    return bool(user.is_admin)
 
 
 # Create router
@@ -98,7 +98,7 @@ def _resolve_accessible_model(
         return model_storage, db_model, user_model
 
     # Step 2: shared from visible users
-    visible_ids = _get_visible_user_ids(db, user.id)
+    visible_ids = _get_visible_user_ids(db, int(user.id))
     shared = (
         db.query(UserModel)
         .filter(
@@ -395,7 +395,7 @@ async def list_models(
     from ..services.model_service import _get_visible_user_ids
 
     # Get models that user has access to (owned or shared from visible users)
-    visible_ids = _get_visible_user_ids(db, user.id)
+    visible_ids = _get_visible_user_ids(db, int(user.id))
     query = (
         db.query(DBModel, UserModel)
         .join(UserModel, DBModel.id == UserModel.model_id)
@@ -486,7 +486,7 @@ async def get_user_default_models(
             user_defaults_by_type[str(ud.config_type)] = ud
 
         result = []
-        visible_ids = _get_visible_user_ids(db, user.id)
+        visible_ids = _get_visible_user_ids(db, int(user.id))
 
         # Process each config type
         for config_type in all_config_types:
@@ -619,7 +619,9 @@ async def get_model_by_path(
 
     _, db_model, user_model = _resolve_accessible_model(db, user, model_id)
     return ModelWithAccessInfo.model_validate(
-        _serialize_model_with_access(db_model, user_model, requesting_user_id=user.id)
+        _serialize_model_with_access(
+            db_model, user_model, requesting_user_id=int(user.id)
+        )
     )
 
 
@@ -815,7 +817,7 @@ async def test_models(
     from ..services.model_service import _get_visible_user_ids
 
     model_storage = CoreStorage(db, DBModel)
-    visible_ids = _get_visible_user_ids(db, user.id)
+    visible_ids = _get_visible_user_ids(db, int(user.id))
 
     if test_request and test_request.model_ids:
         # Test specific models that user has access to
@@ -946,7 +948,7 @@ async def list_model_categories(
     from ..services.model_service import _get_visible_user_ids
 
     # Get distinct categories from user's accessible models
-    visible_ids = _get_visible_user_ids(db, user.id)
+    visible_ids = _get_visible_user_ids(db, int(user.id))
     categories = (
         db.query(DBModel.category)
         .join(UserModel, DBModel.id == UserModel.model_id)
@@ -978,7 +980,7 @@ async def list_model_providers(
     from ..services.model_service import _get_visible_user_ids
 
     # Get distinct providers from user's accessible models
-    visible_ids = _get_visible_user_ids(db, user.id)
+    visible_ids = _get_visible_user_ids(db, int(user.id))
     providers = (
         db.query(DBModel.model_provider)
         .join(UserModel, DBModel.id == UserModel.model_id)
@@ -1010,7 +1012,7 @@ async def list_model_abilities(
     from ..services.model_service import _get_visible_user_ids
 
     # Get all models to collect abilities
-    visible_ids = _get_visible_user_ids(db, user.id)
+    visible_ids = _get_visible_user_ids(db, int(user.id))
     models = (
         db.query(DBModel)
         .join(UserModel, DBModel.id == UserModel.model_id)
@@ -1046,7 +1048,7 @@ async def get_models_summary(
     from ..services.model_service import _get_visible_user_ids
 
     # Get all accessible models
-    visible_ids = _get_visible_user_ids(db, user.id)
+    visible_ids = _get_visible_user_ids(db, int(user.id))
     models = (
         db.query(DBModel)
         .join(UserModel, DBModel.id == UserModel.model_id)
@@ -1118,7 +1120,7 @@ async def get_default_model(
 
     from ..services.model_service import _get_visible_user_ids
 
-    visible_ids = _get_visible_user_ids(db, user.id)
+    visible_ids = _get_visible_user_ids(db, int(user.id))
     user_model = (
         db.query(UserModel)
         .filter(
@@ -1188,7 +1190,7 @@ async def get_general_default_model(
 
     from ..services.model_service import _get_visible_user_ids
 
-    visible_ids = _get_visible_user_ids(db, user.id)
+    visible_ids = _get_visible_user_ids(db, int(user.id))
     user_model = (
         db.query(UserModel)
         .filter(
@@ -1258,7 +1260,7 @@ async def get_small_fast_default_model(
 
     from ..services.model_service import _get_visible_user_ids
 
-    visible_ids = _get_visible_user_ids(db, user.id)
+    visible_ids = _get_visible_user_ids(db, int(user.id))
     user_model = (
         db.query(UserModel)
         .filter(
@@ -1328,7 +1330,7 @@ async def get_visual_default_model(
 
     from ..services.model_service import _get_visible_user_ids
 
-    visible_ids = _get_visible_user_ids(db, user.id)
+    visible_ids = _get_visible_user_ids(db, int(user.id))
     user_model = (
         db.query(UserModel)
         .filter(
@@ -1398,7 +1400,7 @@ async def get_compact_default_model(
 
     from ..services.model_service import _get_visible_user_ids
 
-    visible_ids = _get_visible_user_ids(db, user.id)
+    visible_ids = _get_visible_user_ids(db, int(user.id))
     user_model = (
         db.query(UserModel)
         .filter(
@@ -1468,7 +1470,7 @@ async def get_embedding_default_model(
 
     from ..services.model_service import _get_visible_user_ids
 
-    visible_ids = _get_visible_user_ids(db, user.id)
+    visible_ids = _get_visible_user_ids(db, int(user.id))
     user_model = (
         db.query(UserModel)
         .filter(
@@ -1528,7 +1530,7 @@ async def set_user_default_model(
     from ..services.model_service import _get_visible_user_ids
 
     # Check if user has access to the model (own or shared from visible users)
-    visible_ids = _get_visible_user_ids(db, user.id)
+    visible_ids = _get_visible_user_ids(db, int(user.id))
     user_model = (
         db.query(UserModel)
         .filter(
@@ -1672,7 +1674,9 @@ async def get_model(
     """Get a specific model configuration"""
     _, db_model, user_model = _resolve_accessible_model(db, user, model_id)
     return ModelWithAccessInfo.model_validate(
-        _serialize_model_with_access(db_model, user_model, requesting_user_id=user.id)
+        _serialize_model_with_access(
+            db_model, user_model, requesting_user_id=int(user.id)
+        )
     )
 
 
@@ -1786,7 +1790,9 @@ async def update_model(
 
     # Return updated model with access info
     return ModelWithAccessInfo.model_validate(
-        _serialize_model_with_access(db_model, user_model, requesting_user_id=user.id)
+        _serialize_model_with_access(
+            db_model, user_model, requesting_user_id=int(user.id)
+        )
     )
 
 
@@ -2027,7 +2033,7 @@ async def fetch_multiple_providers_models(
     )
     from ..services.model_service import _get_visible_user_ids
 
-    visible_ids = _get_visible_user_ids(db, user.id)
+    visible_ids = _get_visible_user_ids(db, int(user.id))
     user_models = (
         db.query(DBModel)
         .join(UserModel, DBModel.id == UserModel.model_id)
