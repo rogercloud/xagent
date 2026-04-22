@@ -379,7 +379,7 @@ class TestModeCModelListing:
         assert shared[0]["is_shared"] is True
 
     def test_test_models_includes_shared(
-        self, test_db, admin_headers, regular_headers, sample_model_data
+        self, test_db, admin_headers, regular_headers, sample_model_data, monkeypatch
     ):
         """test endpoint finds shared models."""
         sample_model_data["share_with_users"] = True
@@ -388,10 +388,20 @@ class TestModeCModelListing:
         )
         assert create_response.status_code == 200
 
-        # Test without specific model_ids — should include shared models
+        # Avoid real network calls — we only need to verify the shared model is selected
+        async def fake_chat(*args, **kwargs):
+            return "ok"
+
+        monkeypatch.setattr(
+            "xagent.web.services.llm_utils.create_base_llm",
+            lambda config: type("FakeLLM", (), {"chat": fake_chat})(),
+        )
+
         response = client.post("/api/models/test", headers=regular_headers)
         assert response.status_code == 200
-        # Results will be "failed" since we can't actually call the API, but model should be found
+        data = response.json()
+        assert any(m["model_id"] == sample_model_data["model_id"] for m in data)
+        assert all(m["status"] == "passed" for m in data)
 
     def test_list_model_categories_includes_shared(
         self, test_db, admin_headers, regular_headers, sample_model_data
@@ -455,6 +465,38 @@ class TestPermissionChecks:
         response = client.post(
             "/api/models/", json=sample_model_data, headers=admin_headers
         )
+        assert response.status_code == 403
+
+    def test_non_owner_cannot_update_shared_model(
+        self, test_db, admin_headers, regular_headers, sample_model_data
+    ):
+        """Non-owner gets 403 when trying to edit a shared model."""
+        sample_model_data["share_with_users"] = True
+        create_response = client.post(
+            "/api/models/", json=sample_model_data, headers=admin_headers
+        )
+        assert create_response.status_code == 200
+        model_id_str = create_response.json()["model_id"]
+
+        response = client.put(
+            f"/api/models/{model_id_str}",
+            json={"temperature": 0.1},
+            headers=regular_headers,
+        )
+        assert response.status_code == 403
+
+    def test_non_owner_cannot_delete_shared_model(
+        self, test_db, admin_headers, regular_headers, sample_model_data
+    ):
+        """Non-owner gets 403 when trying to delete a shared model."""
+        sample_model_data["share_with_users"] = True
+        create_response = client.post(
+            "/api/models/", json=sample_model_data, headers=admin_headers
+        )
+        assert create_response.status_code == 200
+        model_id_str = create_response.json()["model_id"]
+
+        response = client.delete(f"/api/models/{model_id_str}", headers=regular_headers)
         assert response.status_code == 403
 
 

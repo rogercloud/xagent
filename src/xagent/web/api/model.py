@@ -390,21 +390,17 @@ async def list_models(
 ) -> List[ModelWithAccessInfo]:
     """List all model configurations accessible to the current user"""
 
-    from sqlalchemy import and_, or_
-
-    from ..services.model_service import _get_visible_user_ids
+    from ..services.model_service import (
+        _get_visible_user_ids,
+        build_user_model_visibility_filter,
+    )
 
     # Get models that user has access to (owned or shared from visible users)
     visible_ids = _get_visible_user_ids(db, int(user.id))
     query = (
         db.query(DBModel, UserModel)
         .join(UserModel, DBModel.id == UserModel.model_id)
-        .filter(
-            or_(
-                UserModel.user_id == user.id,
-                and_(UserModel.user_id.in_(visible_ids), UserModel.is_shared.is_(True)),
-            )
-        )
+        .filter(build_user_model_visibility_filter(int(user.id), visible_ids))
     )
     if model_provider:
         query = query.filter(DBModel.model_provider == model_provider)
@@ -455,9 +451,10 @@ async def get_user_default_models(
     """Get all user's default model configurations with per-type admin fallback"""
 
     try:
-        from sqlalchemy import and_, or_
-
-        from ..services.model_service import _get_visible_user_ids
+        from ..services.model_service import (
+            _get_visible_user_ids,
+            build_user_model_visibility_filter,
+        )
 
         # Get all possible config types
         all_config_types = [
@@ -499,12 +496,7 @@ async def get_user_default_models(
                     db.query(UserModel)
                     .filter(
                         UserModel.model_id == ud.model_id,
-                        or_(
-                            UserModel.user_id == user.id,
-                            and_(
-                                UserModel.user_id.in_(visible_ids), UserModel.is_shared
-                            ),
-                        ),
+                        build_user_model_visibility_filter(int(user.id), visible_ids),
                     )
                     .first()
                 )
@@ -557,7 +549,7 @@ async def get_user_default_models(
                         UserDefaultModel.user_id.in_(visible_ids),
                         UserDefaultModel.config_type == config_type,
                         DBModel.is_active,
-                        UserModel.is_shared,
+                        UserModel.is_shared.is_(True),
                     )
                     .first()
                 )
@@ -635,6 +627,7 @@ async def update_model_by_path(
     """Update a model configuration, including slash-containing model IDs."""
 
     return await update_model(model_id, model_update, db, user)
+
 
 @model_router.delete("/by-id/{model_id:path}")
 async def delete_model_by_path(
@@ -805,6 +798,8 @@ async def test_model_connection(
             message="Connection failed",
             error=safe_error,
         )
+
+
 @model_router.post("/test", response_model=List[ModelTestResponse])
 async def test_models(
     test_request: Optional[ModelTestRequest] = None,
@@ -812,9 +807,11 @@ async def test_models(
     user: User = Depends(get_current_user),
 ) -> List[ModelTestResponse]:
     """Test model configurations"""
-    from sqlalchemy import and_, or_
 
-    from ..services.model_service import _get_visible_user_ids
+    from ..services.model_service import (
+        _get_visible_user_ids,
+        build_user_model_visibility_filter,
+    )
 
     model_storage = CoreStorage(db, DBModel)
     visible_ids = _get_visible_user_ids(db, int(user.id))
@@ -827,13 +824,7 @@ async def test_models(
             .filter(
                 DBModel.model_id.in_(test_request.model_ids),
                 DBModel.is_active,
-                or_(
-                    UserModel.user_id == user.id,
-                    and_(
-                        UserModel.user_id.in_(visible_ids),
-                        UserModel.is_shared.is_(True),
-                    ),
-                ),
+                build_user_model_visibility_filter(int(user.id), visible_ids),
             )
             .all()
         )
@@ -844,13 +835,7 @@ async def test_models(
             .join(UserModel, DBModel.id == UserModel.model_id)
             .filter(
                 DBModel.is_active,
-                or_(
-                    UserModel.user_id == user.id,
-                    and_(
-                        UserModel.user_id.in_(visible_ids),
-                        UserModel.is_shared.is_(True),
-                    ),
-                ),
+                build_user_model_visibility_filter(int(user.id), visible_ids),
             )
             .all()
         )
@@ -943,21 +928,17 @@ async def list_model_categories(
 ) -> dict:
     """List all model categories accessible to the current user"""
 
-    from sqlalchemy import and_, or_
-
-    from ..services.model_service import _get_visible_user_ids
+    from ..services.model_service import (
+        _get_visible_user_ids,
+        build_user_model_visibility_filter,
+    )
 
     # Get distinct categories from user's accessible models
     visible_ids = _get_visible_user_ids(db, int(user.id))
     categories = (
         db.query(DBModel.category)
         .join(UserModel, DBModel.id == UserModel.model_id)
-        .filter(
-            or_(
-                UserModel.user_id == user.id,
-                and_(UserModel.user_id.in_(visible_ids), UserModel.is_shared.is_(True)),
-            )
-        )
+        .filter(build_user_model_visibility_filter(int(user.id), visible_ids))
         .filter(DBModel.is_active)
         .distinct()
         .all()
@@ -975,21 +956,17 @@ async def list_model_providers(
 ) -> dict:
     """List all model providers accessible to the current user"""
 
-    from sqlalchemy import and_, or_
-
-    from ..services.model_service import _get_visible_user_ids
+    from ..services.model_service import (
+        _get_visible_user_ids,
+        build_user_model_visibility_filter,
+    )
 
     # Get distinct providers from user's accessible models
     visible_ids = _get_visible_user_ids(db, int(user.id))
     providers = (
         db.query(DBModel.model_provider)
         .join(UserModel, DBModel.id == UserModel.model_id)
-        .filter(
-            or_(
-                UserModel.user_id == user.id,
-                and_(UserModel.user_id.in_(visible_ids), UserModel.is_shared.is_(True)),
-            )
-        )
+        .filter(build_user_model_visibility_filter(int(user.id), visible_ids))
         .filter(DBModel.is_active)
         .distinct()
         .all()
@@ -1007,21 +984,17 @@ async def list_model_abilities(
 ) -> dict:
     """List all model abilities across accessible models"""
 
-    from sqlalchemy import and_, or_
-
-    from ..services.model_service import _get_visible_user_ids
+    from ..services.model_service import (
+        _get_visible_user_ids,
+        build_user_model_visibility_filter,
+    )
 
     # Get all models to collect abilities
     visible_ids = _get_visible_user_ids(db, int(user.id))
     models = (
         db.query(DBModel)
         .join(UserModel, DBModel.id == UserModel.model_id)
-        .filter(
-            or_(
-                UserModel.user_id == user.id,
-                and_(UserModel.user_id.in_(visible_ids), UserModel.is_shared.is_(True)),
-            )
-        )
+        .filter(build_user_model_visibility_filter(int(user.id), visible_ids))
         .filter(DBModel.is_active)
         .all()
     )
@@ -1043,21 +1016,17 @@ async def get_models_summary(
 ) -> dict:
     """Get summary statistics of accessible models"""
 
-    from sqlalchemy import and_, or_
-
-    from ..services.model_service import _get_visible_user_ids
+    from ..services.model_service import (
+        _get_visible_user_ids,
+        build_user_model_visibility_filter,
+    )
 
     # Get all accessible models
     visible_ids = _get_visible_user_ids(db, int(user.id))
     models = (
         db.query(DBModel)
         .join(UserModel, DBModel.id == UserModel.model_id)
-        .filter(
-            or_(
-                UserModel.user_id == user.id,
-                and_(UserModel.user_id.in_(visible_ids), UserModel.is_shared.is_(True)),
-            )
-        )
+        .filter(build_user_model_visibility_filter(int(user.id), visible_ids))
         .filter(DBModel.is_active)
         .all()
     )
@@ -1116,19 +1085,18 @@ async def get_default_model(
         return None
 
     # Get user model relationship for access info (two-step: own or shared)
-    from sqlalchemy import and_, or_
 
-    from ..services.model_service import _get_visible_user_ids
+    from ..services.model_service import (
+        _get_visible_user_ids,
+        build_user_model_visibility_filter,
+    )
 
     visible_ids = _get_visible_user_ids(db, int(user.id))
     user_model = (
         db.query(UserModel)
         .filter(
             UserModel.model_id == user_default.model_id,
-            or_(
-                UserModel.user_id == user.id,
-                and_(UserModel.user_id.in_(visible_ids), UserModel.is_shared),
-            ),
+            build_user_model_visibility_filter(int(user.id), visible_ids),
         )
         .first()
     )
@@ -1186,19 +1154,18 @@ async def get_general_default_model(
         return None
 
     # Get user model relationship for access info (two-step: own or shared)
-    from sqlalchemy import and_, or_
 
-    from ..services.model_service import _get_visible_user_ids
+    from ..services.model_service import (
+        _get_visible_user_ids,
+        build_user_model_visibility_filter,
+    )
 
     visible_ids = _get_visible_user_ids(db, int(user.id))
     user_model = (
         db.query(UserModel)
         .filter(
             UserModel.model_id == user_default.model_id,
-            or_(
-                UserModel.user_id == user.id,
-                and_(UserModel.user_id.in_(visible_ids), UserModel.is_shared),
-            ),
+            build_user_model_visibility_filter(int(user.id), visible_ids),
         )
         .first()
     )
@@ -1256,19 +1223,18 @@ async def get_small_fast_default_model(
         return None
 
     # Get user model relationship for access info (two-step: own or shared)
-    from sqlalchemy import and_, or_
 
-    from ..services.model_service import _get_visible_user_ids
+    from ..services.model_service import (
+        _get_visible_user_ids,
+        build_user_model_visibility_filter,
+    )
 
     visible_ids = _get_visible_user_ids(db, int(user.id))
     user_model = (
         db.query(UserModel)
         .filter(
             UserModel.model_id == user_default.model_id,
-            or_(
-                UserModel.user_id == user.id,
-                and_(UserModel.user_id.in_(visible_ids), UserModel.is_shared),
-            ),
+            build_user_model_visibility_filter(int(user.id), visible_ids),
         )
         .first()
     )
@@ -1326,19 +1292,18 @@ async def get_visual_default_model(
         return None
 
     # Get user model relationship for access info (two-step: own or shared)
-    from sqlalchemy import and_, or_
 
-    from ..services.model_service import _get_visible_user_ids
+    from ..services.model_service import (
+        _get_visible_user_ids,
+        build_user_model_visibility_filter,
+    )
 
     visible_ids = _get_visible_user_ids(db, int(user.id))
     user_model = (
         db.query(UserModel)
         .filter(
             UserModel.model_id == user_default.model_id,
-            or_(
-                UserModel.user_id == user.id,
-                and_(UserModel.user_id.in_(visible_ids), UserModel.is_shared),
-            ),
+            build_user_model_visibility_filter(int(user.id), visible_ids),
         )
         .first()
     )
@@ -1396,19 +1361,18 @@ async def get_compact_default_model(
         return None
 
     # Get user model relationship for access info (two-step: own or shared)
-    from sqlalchemy import and_, or_
 
-    from ..services.model_service import _get_visible_user_ids
+    from ..services.model_service import (
+        _get_visible_user_ids,
+        build_user_model_visibility_filter,
+    )
 
     visible_ids = _get_visible_user_ids(db, int(user.id))
     user_model = (
         db.query(UserModel)
         .filter(
             UserModel.model_id == user_default.model_id,
-            or_(
-                UserModel.user_id == user.id,
-                and_(UserModel.user_id.in_(visible_ids), UserModel.is_shared),
-            ),
+            build_user_model_visibility_filter(int(user.id), visible_ids),
         )
         .first()
     )
@@ -1466,19 +1430,18 @@ async def get_embedding_default_model(
         return None
 
     # Get user model relationship for access info (two-step: own or shared)
-    from sqlalchemy import and_, or_
 
-    from ..services.model_service import _get_visible_user_ids
+    from ..services.model_service import (
+        _get_visible_user_ids,
+        build_user_model_visibility_filter,
+    )
 
     visible_ids = _get_visible_user_ids(db, int(user.id))
     user_model = (
         db.query(UserModel)
         .filter(
             UserModel.model_id == user_default.model_id,
-            or_(
-                UserModel.user_id == user.id,
-                and_(UserModel.user_id.in_(visible_ids), UserModel.is_shared),
-            ),
+            build_user_model_visibility_filter(int(user.id), visible_ids),
         )
         .first()
     )
@@ -1525,9 +1488,10 @@ async def set_user_default_model(
 ) -> UserDefaultModelResponse:
     """Set a user's default model configuration"""
 
-    from sqlalchemy import and_, or_
-
-    from ..services.model_service import _get_visible_user_ids
+    from ..services.model_service import (
+        _get_visible_user_ids,
+        build_user_model_visibility_filter,
+    )
 
     # Check if user has access to the model (own or shared from visible users)
     visible_ids = _get_visible_user_ids(db, int(user.id))
@@ -1535,10 +1499,7 @@ async def set_user_default_model(
         db.query(UserModel)
         .filter(
             UserModel.model_id == config.model_id,
-            or_(
-                UserModel.user_id == user.id,
-                and_(UserModel.user_id.in_(visible_ids), UserModel.is_shared),
-            ),
+            build_user_model_visibility_filter(int(user.id), visible_ids),
         )
         .first()
     )
@@ -1702,7 +1663,7 @@ async def update_model(
         db.query(UserModel)
         .filter(
             UserModel.model_id == db_model.id,
-            UserModel.is_shared == True,  # noqa: E712
+            UserModel.is_shared.is_(True) == True,  # noqa: E712
         )
         .first()
     )
@@ -2025,24 +1986,21 @@ async def fetch_multiple_providers_models(
     """
 
     # Get all models configured for the user (own or shared from visible users)
-    from sqlalchemy import and_, or_
 
     from ..services.model_list_service import (
         PROVIDER_FETCHERS,
         fetch_models_from_provider,
     )
-    from ..services.model_service import _get_visible_user_ids
+    from ..services.model_service import (
+        _get_visible_user_ids,
+        build_user_model_visibility_filter,
+    )
 
     visible_ids = _get_visible_user_ids(db, int(user.id))
     user_models = (
         db.query(DBModel)
         .join(UserModel, DBModel.id == UserModel.model_id)
-        .filter(
-            or_(
-                UserModel.user_id == user.id,
-                and_(UserModel.user_id.in_(visible_ids), UserModel.is_shared.is_(True)),
-            )
-        )
+        .filter(build_user_model_visibility_filter(int(user.id), visible_ids))
         .filter(DBModel.is_active)
         .filter(DBModel.api_key.isnot(None))
         .all()

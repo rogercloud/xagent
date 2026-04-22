@@ -52,6 +52,22 @@ def _get_visible_user_ids(db: Session, user_id: Optional[int] = None) -> list[in
     return [uid for (uid,) in db.query(User.id).filter(User.is_admin).all()]
 
 
+def build_user_model_visibility_filter(user_id: int, visible_ids: list[int]) -> Any:
+    """Return SQLAlchemy filter for UserModel rows visible to *user_id*.
+
+    The filter matches rows owned by *user_id* OR rows that are shared
+    and owned by any user in *visible_ids*.
+    """
+    from sqlalchemy import and_, or_
+
+    from ..models.user import UserModel
+
+    return or_(
+        UserModel.user_id == user_id,
+        and_(UserModel.user_id.in_(visible_ids), UserModel.is_shared.is_(True)),
+    )
+
+
 def get_default_vision_model(user_id: Optional[int] = None) -> Optional[BaseLLM]:
     """
     Get the default vision model for a specific user.
@@ -96,7 +112,7 @@ def get_default_vision_model(user_id: Optional[int] = None) -> Optional[BaseLLM]
                 .join(UserModel, UserDefaultModel.model_id == UserModel.model_id)
                 .filter(
                     UserDefaultModel.config_type == "visual",
-                    UserModel.is_shared,
+                    UserModel.is_shared.is_(True),
                     UserDefaultModel.user_id.in_(_get_visible_user_ids(db, user_id)),
                 )
                 .limit(1)
@@ -158,7 +174,7 @@ def get_default_model(user_id: Optional[int] = None) -> Optional[BaseLLM]:
                 .join(UserModel, UserDefaultModel.model_id == UserModel.model_id)
                 .filter(
                     UserDefaultModel.config_type == "general",
-                    UserModel.is_shared,
+                    UserModel.is_shared.is_(True),
                     UserDefaultModel.user_id.in_(_get_visible_user_ids(db, user_id)),
                 )
                 .limit(1)
@@ -220,7 +236,7 @@ def get_fast_model(user_id: Optional[int] = None) -> Optional[BaseLLM]:
                 .join(UserModel, UserDefaultModel.model_id == UserModel.model_id)
                 .filter(
                     UserDefaultModel.config_type == "small_fast",
-                    UserModel.is_shared,
+                    UserModel.is_shared.is_(True),
                     UserDefaultModel.user_id.in_(_get_visible_user_ids(db, user_id)),
                 )
                 .limit(1)
@@ -282,7 +298,7 @@ def get_compact_model(user_id: Optional[int] = None) -> Optional[BaseLLM]:
                 .join(UserModel, UserDefaultModel.model_id == UserModel.model_id)
                 .filter(
                     UserDefaultModel.config_type == "compact",
-                    UserModel.is_shared,
+                    UserModel.is_shared.is_(True),
                     UserDefaultModel.user_id.in_(_get_visible_user_ids(db, user_id)),
                 )
                 .limit(1)
@@ -344,7 +360,7 @@ def get_embedding_model(user_id: Optional[int] = None) -> Optional[BaseLLM]:
                 .join(UserModel, UserDefaultModel.model_id == UserModel.model_id)
                 .filter(
                     UserDefaultModel.config_type == "embedding",
-                    UserModel.is_shared,
+                    UserModel.is_shared.is_(True),
                     UserDefaultModel.user_id.in_(_get_visible_user_ids(db, user_id)),
                 )
                 .limit(1)
@@ -578,7 +594,7 @@ def get_default_image_generate_model(
                 .join(DBModel, UserModel.model_id == DBModel.id)
                 .filter(
                     UserDefaultModel.config_type == "image",
-                    UserModel.is_shared,
+                    UserModel.is_shared.is_(True),
                     UserDefaultModel.user_id.in_(_get_visible_user_ids(db, user_id)),
                     cast(DBModel.abilities, String).contains('"generate"'),
                 )
@@ -658,7 +674,7 @@ def get_default_image_edit_model(
                 .join(UserModel, UserDefaultModel.model_id == UserModel.model_id)
                 .filter(
                     UserDefaultModel.config_type == "image_edit",
-                    UserModel.is_shared,
+                    UserModel.is_shared.is_(True),
                     UserDefaultModel.user_id.in_(_get_visible_user_ids(db, user_id)),
                 )
                 .limit(1)
@@ -727,7 +743,7 @@ def get_default_embedding_model(user_id: Optional[int] = None) -> Optional[str]:
         .join(UserModel, UserDefaultModel.model_id == UserModel.model_id)
         .filter(
             UserDefaultModel.config_type == "embedding",
-            UserModel.is_shared,
+            UserModel.is_shared.is_(True),
             UserDefaultModel.user_id.in_(_get_visible_user_ids(db, user_id)),
         )
         .limit(1)
@@ -896,7 +912,7 @@ def get_default_asr_model(user_id: Optional[int] = None) -> Optional[Any]:
                 .join(DBModel, UserModel.model_id == DBModel.id)
                 .filter(
                     UserDefaultModel.config_type == "asr",
-                    UserModel.is_shared,
+                    UserModel.is_shared.is_(True),
                     UserDefaultModel.user_id.in_(_get_visible_user_ids(db, user_id)),
                 )
                 .limit(1)
@@ -963,7 +979,7 @@ def get_default_tts_model(user_id: Optional[int] = None) -> Optional[Any]:
                 .join(DBModel, UserModel.model_id == DBModel.id)
                 .filter(
                     UserDefaultModel.config_type == "tts",
-                    UserModel.is_shared,
+                    UserModel.is_shared.is_(True),
                     UserDefaultModel.user_id.in_(_get_visible_user_ids(db, user_id)),
                 )
                 .limit(1)

@@ -621,7 +621,7 @@ class UserAwareModelStorage:
                         UserDefaultModel.config_type.in_(
                             ["general", "small_fast", "visual", "compact"]
                         ),
-                        UserModel.is_shared,
+                        UserModel.is_shared.is_(True),
                         UserDefaultModel.user_id.in_(visible_ids),
                     )
                     .all()

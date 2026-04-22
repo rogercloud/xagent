@@ -25,6 +25,7 @@ from ..models.user import User
 from ..schemas.chat import TaskCreateRequest, TaskCreateResponse
 from ..services.chat_history_service import load_task_transcript
 from ..services.llm_utils import resolve_llms_from_names
+from ..services.model_service import _get_visible_user_ids
 from ..services.task_execution_context_service import (
     load_task_execution_recovery_state,
 )
@@ -1513,8 +1514,6 @@ async def create_task(
                 .first()
             )
             if not own_model:
-                from ..services.model_service import _get_visible_user_ids
-
                 visible_ids = _get_visible_user_ids(db, int(user.id))
                 own_model = (
                     db.query(UserModel)
@@ -1538,7 +1537,6 @@ async def create_task(
 
         def _get_default_internal_model_ids() -> Dict[str, Optional[str]]:
             from ..models.model import Model as DBModel
-            from ..services.model_service import _get_visible_user_ids
 
             config_types = ["general", "small_fast", "visual", "compact"]
             defaults: Dict[str, Optional[str]] = {ct: None for ct in config_types}
@@ -1567,7 +1565,7 @@ async def create_task(
                     .join(UserModel, UserDefaultModel.model_id == UserModel.model_id)
                     .filter(
                         UserDefaultModel.config_type.in_(config_types),
-                        UserModel.is_shared,
+                        UserModel.is_shared.is_(True),
                         UserDefaultModel.user_id.in_(visible_ids),
                     )
                     .all()
