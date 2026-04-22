@@ -315,8 +315,11 @@ def _extract_single_file_from_tar(
 
 def _archive_path_exists(container: Container, remote_path: str) -> bool:
     """Check file existence."""
-    result = container.exec_run(["test", "-e", remote_path], stdout=False, stderr=False)
-    return cast(int, result.exit_code) == 0
+    try:
+        container.get_archive(remote_path)
+        return True
+    except NotFound:
+        return False
 
 
 @dataclass
