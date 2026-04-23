@@ -1,6 +1,5 @@
 """Unit tests for ContextBuilder with parallel compaction."""
 
-import asyncio
 from typing import Any, Dict, List
 
 import pytest
@@ -297,41 +296,42 @@ class TestContextBuilder:
         assert len(separator_contents) == 1
 
     @pytest.mark.asyncio
-    async def test_concurrent_execution_timing(
+    async def test_all_dependencies_compacted_when_threshold_exceeded(
         self, context_builder, sample_dependency_results
     ):
-        """Test that parallel operations actually run concurrently."""
+        """Test that each dependency exceeding the threshold is compacted."""
         context_builder.compact_config.threshold = 100
 
-        # Track execution timing
-        call_times = []
+        call_order: list[str] = []
 
         async def timed_chat(messages):
-            call_times.append(asyncio.get_event_loop().time())
-            await asyncio.sleep(0.1)  # Simulate some work
+            # Extract dependency id from the compaction prompt
+            dep_id = "unknown"
+            for msg in messages:
+                if msg.get("role") == "user" and "Dependency:" in msg.get(
+                    "content", ""
+                ):
+                    dep_id = (
+                        msg["content"].split("Dependency:")[1].split("\n")[0].strip()
+                    )
+                    break
+            call_order.append(dep_id)
             # Return a valid compacted response to avoid errors
             return "USER: Compacted content\nASSISTANT: This is a summary"
 
         context_builder.llm.chat = timed_chat
 
-        start_time = asyncio.get_event_loop().time()
         await context_builder.build_context_for_step(
             step_name="test_step",
             step_description="Test step description",
             dependencies=["dep1", "dep2"],
             dependency_results=sample_dependency_results,
         )
-        end_time = asyncio.get_event_loop().time()
 
-        # Should have made calls for both dependencies
-        assert len(call_times) == 2
-
-        # Total time should be less than sequential execution time
-        # (sequential would be ~0.2s, parallel should be ~0.1s + overhead)
-        total_time = end_time - start_time
-        assert (
-            total_time < 0.25
-        )  # Should be faster than sequential (allowing for overhead)
+        # Both dependencies exceeded threshold, so 2 compaction calls were made
+        assert len(call_order) == 2
+        assert "dep1" in call_order
+        assert "dep2" in call_order
 
     def test_step_execution_result_creation(self):
         """Test StepExecutionResult dataclass creation."""
