@@ -359,7 +359,11 @@ async def startup_event() -> None:
                 logger.warning("Could not fix file_id nullability: %s", e)
 
             # Check if documents table exists and needs backfill
+            documents_table = None
             try:
+                from ..core.tools.core.RAG_tools.LanceDB.schema_manager import (
+                    _safe_close_table,
+                )
                 from ..core.tools.core.RAG_tools.utils.lancedb_query_utils import (
                     query_to_list,
                 )
@@ -445,6 +449,8 @@ async def startup_event() -> None:
             except Exception as e:
                 # Documents table might not exist yet
                 logger.debug("Could not check documents table: %s", e)
+            finally:
+                _safe_close_table(documents_table)
         except Exception as e:
             logger.warning(
                 "Could not check documents table backfill status: %s. "

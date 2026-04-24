@@ -7,6 +7,8 @@ import pyarrow as pa  # type: ignore
 import pyarrow.compute as pc  # type: ignore
 from lancedb.db import DBConnection
 
+from ..utils.lancedb_query_utils import list_table_names
+
 logger = logging.getLogger(__name__)
 
 __all__ = [
@@ -23,10 +25,18 @@ __all__ = [
 ]
 
 
+def _safe_close_table(table: Any) -> None:
+    """Close a LanceDB table if it supports close()."""
+    if table is not None and hasattr(table, "close"):
+        try:
+            table.close()
+        except Exception:
+            pass
+
+
 def _table_exists(conn: DBConnection, name: str) -> bool:
     try:
-        conn.open_table(name)
-        return True
+        return name in list_table_names(conn)
     except Exception:
         return False
 
@@ -47,6 +57,7 @@ def _validate_schema_fields(
     if not _table_exists(conn, table_name):
         return
 
+    table = None
     try:
         table = conn.open_table(table_name)
         existing_schema = table.schema
@@ -67,7 +78,6 @@ def _validate_schema_fields(
             logger.error(error_msg)
             raise ValueError(error_msg)
     except ValueError:
-        # Re-raise ValueError (our validation error)
         raise
     except Exception as e:
         # Log other errors but don't fail - schema validation is best-effort
@@ -75,6 +85,8 @@ def _validate_schema_fields(
             f"Could not validate schema for table '{table_name}': {e}. "
             f"Proceeding with table creation/usage."
         )
+    finally:
+        _safe_close_table(table)
 
 
 def _create_table(conn: DBConnection, name: str, schema: object | None = None) -> None:
@@ -151,48 +163,57 @@ def _migrate_table_user_id_to_int64(conn: DBConnection, table_name: str) -> None
     If conversion fails for any row, raise ``ValueError`` and ask user to re-upload.
     """
     table = conn.open_table(table_name)
-    schema = table.schema
-    if "user_id" not in schema.names:
-        return
-
-    user_id_type = str(schema.field("user_id").type).lower()
-    if "int" in user_id_type:
-        return
-
-    logger.info(
-        "Migrating table '%s': converting user_id from %s to int64",
-        table_name,
-        user_id_type,
-    )
-    arrow_table = table.to_arrow()
-    user_id_idx = arrow_table.schema.get_field_index("user_id")
-    user_id_col = arrow_table.column(user_id_idx)
-
     try:
-        converted_user_id = pc.cast(user_id_col, pa.int64(), safe=True)
-    except Exception as exc:
-        invalid_examples = _extract_invalid_user_id_examples(user_id_col)
-        examples_text = ", ".join(invalid_examples) if invalid_examples else "N/A"
-        raise ValueError(
-            f"Failed to migrate table '{table_name}': user_id contains non-integer values. "
-            f"Examples: {examples_text}. Please re-upload documents."
-        ) from exc
+        schema = table.schema
+        if "user_id" not in schema.names:
+            return
 
-    migrated_table = arrow_table.set_column(
-        user_id_idx, pa.field("user_id", pa.int64()), converted_user_id
-    )
-    target_schema = _build_schema_with_int64_user_id(migrated_table.schema)
-    migrated_table = migrated_table.cast(target_schema, safe=False)
+        user_id_type = str(schema.field("user_id").type).lower()
+        if "int" in user_id_type:
+            return
 
-    drop_table_fn = getattr(conn, "drop_table", None)
-    if drop_table_fn is None:
-        raise ValueError(
-            "Current LanceDB connection does not support drop_table; "
-            "cannot complete user_id schema migration safely. Please re-upload documents."
+        logger.info(
+            "Migrating table '%s': converting user_id from %s to int64",
+            table_name,
+            user_id_type,
         )
-    drop_table_fn(table_name)
-    conn.create_table(table_name, data=migrated_table)
-    _validate_user_id_int64(conn.open_table(table_name), table_name)
+        arrow_table = table.to_arrow()
+        user_id_idx = arrow_table.schema.get_field_index("user_id")
+        user_id_col = arrow_table.column(user_id_idx)
+
+        try:
+            converted_user_id = pc.cast(user_id_col, pa.int64(), safe=True)
+        except Exception as exc:
+            invalid_examples = _extract_invalid_user_id_examples(user_id_col)
+            examples_text = ", ".join(invalid_examples) if invalid_examples else "N/A"
+            raise ValueError(
+                f"Failed to migrate table '{table_name}': user_id contains non-integer values. "
+                f"Examples: {examples_text}. Please re-upload documents."
+            ) from exc
+
+        migrated_table = arrow_table.set_column(
+            user_id_idx, pa.field("user_id", pa.int64()), converted_user_id
+        )
+        target_schema = _build_schema_with_int64_user_id(migrated_table.schema)
+        migrated_table = migrated_table.cast(target_schema, safe=False)
+
+        drop_table_fn = getattr(conn, "drop_table", None)
+        if drop_table_fn is None:
+            raise ValueError(
+                "Current LanceDB connection does not support drop_table; "
+                "cannot complete user_id schema migration safely. Please re-upload documents."
+            )
+        drop_table_fn(table_name)
+        conn.create_table(table_name, data=migrated_table)
+    finally:
+        _safe_close_table(table)
+
+    # Validate the recreated table
+    new_table = conn.open_table(table_name)
+    try:
+        _validate_user_id_int64(new_table, table_name)
+    finally:
+        _safe_close_table(new_table)
 
 
 def ensure_documents_table(conn: DBConnection) -> None:
@@ -213,6 +234,7 @@ def ensure_documents_table(conn: DBConnection) -> None:
 
     # Automatic migration for existing tables missing 'user_id' or 'file_id'
     if _table_exists(conn, "documents"):
+        table = None
         try:
             table = conn.open_table("documents")
             if "user_id" not in table.schema.names:
@@ -227,13 +249,22 @@ def ensure_documents_table(conn: DBConnection) -> None:
                     "Migrating 'documents' table: adding missing 'file_id' column"
                 )
                 table.add_columns({"file_id": "cast(null as string)"})
-
-            _migrate_table_user_id_to_int64(conn, "documents")
-            _validate_user_id_int64(conn.open_table("documents"), "documents")
         except ValueError:
+            _safe_close_table(table)
             raise
         except Exception as e:
+            _safe_close_table(table)
             logger.warning(f"Failed to check/migrate 'documents' table schema: {e}")
+        else:
+            _safe_close_table(table)
+
+        _migrate_table_user_id_to_int64(conn, "documents")
+
+        val_table = conn.open_table("documents")
+        try:
+            _validate_user_id_int64(val_table, "documents")
+        finally:
+            _safe_close_table(val_table)
 
     _create_table(conn, "documents", schema=schema)
     # Note: backfill of file_id and user_id is now handled by standalone migration script:
@@ -257,17 +288,28 @@ def ensure_parses_table(conn: DBConnection) -> None:
 
     # Automatic migration for existing tables missing 'user_id'
     if _table_exists(conn, "parses"):
+        table = None
         try:
             table = conn.open_table("parses")
             if "user_id" not in table.schema.names:
                 logger.info("Migrating 'parses' table: adding missing 'user_id' column")
                 table.add_columns({"user_id": "cast(null as bigint)"})
-            _migrate_table_user_id_to_int64(conn, "parses")
-            _validate_user_id_int64(conn.open_table("parses"), "parses")
         except ValueError:
+            _safe_close_table(table)
             raise
         except Exception as e:
+            _safe_close_table(table)
             logger.warning(f"Failed to check/migrate 'parses' table schema: {e}")
+        else:
+            _safe_close_table(table)
+
+        _migrate_table_user_id_to_int64(conn, "parses")
+
+        val_table = conn.open_table("parses")
+        try:
+            _validate_user_id_int64(val_table, "parses")
+        finally:
+            _safe_close_table(val_table)
 
     _create_table(conn, "parses", schema=schema)
 
@@ -302,7 +344,12 @@ def ensure_chunks_table(conn: DBConnection) -> None:
     _validate_schema_fields(conn, "chunks", required_fields)
     if _table_exists(conn, "chunks"):
         _migrate_table_user_id_to_int64(conn, "chunks")
-        _validate_user_id_int64(conn.open_table("chunks"), "chunks")
+
+        val_table = conn.open_table("chunks")
+        try:
+            _validate_user_id_int64(val_table, "chunks")
+        finally:
+            _safe_close_table(val_table)
 
     schema = pa.schema(
         [
@@ -362,7 +409,12 @@ def ensure_embeddings_table(
     _validate_schema_fields(conn, table_name, required_fields)
     if _table_exists(conn, table_name):
         _migrate_table_user_id_to_int64(conn, table_name)
-        _validate_user_id_int64(conn.open_table(table_name), table_name)
+
+        val_table = conn.open_table(table_name)
+        try:
+            _validate_user_id_int64(val_table, table_name)
+        finally:
+            _safe_close_table(val_table)
 
     # Support dynamic vector dimension: if provided, create a FixedSizeList; otherwise allow variable-length
     vector_field_type = (
@@ -439,6 +491,7 @@ def ensure_prompt_templates_table(conn: DBConnection) -> None:
 
     # Automatic migration for existing tables missing 'user_id'
     if _table_exists(conn, table_name):
+        table = None
         try:
             table = conn.open_table(table_name)
             if "user_id" not in table.schema.names:
@@ -446,12 +499,22 @@ def ensure_prompt_templates_table(conn: DBConnection) -> None:
                     f"Migrating '{table_name}' table: adding missing 'user_id' column"
                 )
                 table.add_columns({"user_id": "cast(null as bigint)"})
-            _migrate_table_user_id_to_int64(conn, table_name)
-            _validate_user_id_int64(conn.open_table(table_name), table_name)
         except ValueError:
+            _safe_close_table(table)
             raise
         except Exception as e:
+            _safe_close_table(table)
             logger.warning(f"Failed to check/migrate '{table_name}' table schema: {e}")
+        else:
+            _safe_close_table(table)
+
+        _migrate_table_user_id_to_int64(conn, table_name)
+
+        val_table = conn.open_table(table_name)
+        try:
+            _validate_user_id_int64(val_table, table_name)
+        finally:
+            _safe_close_table(val_table)
 
     _create_table(conn, table_name, schema=schema)
 
@@ -479,6 +542,7 @@ def ensure_ingestion_runs_table(conn: DBConnection) -> None:
 
     # Automatic migration for existing tables missing 'user_id'
     if _table_exists(conn, "ingestion_runs"):
+        table = None
         try:
             table = conn.open_table("ingestion_runs")
             if "user_id" not in table.schema.names:
@@ -486,14 +550,24 @@ def ensure_ingestion_runs_table(conn: DBConnection) -> None:
                     "Migrating 'ingestion_runs' table: adding missing 'user_id' column"
                 )
                 table.add_columns({"user_id": "cast(null as bigint)"})
-            _migrate_table_user_id_to_int64(conn, "ingestion_runs")
-            _validate_user_id_int64(conn.open_table("ingestion_runs"), "ingestion_runs")
         except ValueError:
+            _safe_close_table(table)
             raise
         except Exception as e:
+            _safe_close_table(table)
             logger.warning(
                 f"Failed to check/migrate 'ingestion_runs' table schema: {e}"
             )
+        else:
+            _safe_close_table(table)
+
+        _migrate_table_user_id_to_int64(conn, "ingestion_runs")
+
+        val_table = conn.open_table("ingestion_runs")
+        try:
+            _validate_user_id_int64(val_table, "ingestion_runs")
+        finally:
+            _safe_close_table(val_table)
 
     _create_table(conn, "ingestion_runs", schema=schema)
 
@@ -535,6 +609,7 @@ def check_table_needs_migration(conn: DBConnection, table_name: str) -> bool:
     if not _table_exists(conn, table_name):
         return False
 
+    table = None
     try:
         table = conn.open_table(table_name)
         existing_schema = table.schema
@@ -550,6 +625,8 @@ def check_table_needs_migration(conn: DBConnection, table_name: str) -> bool:
             e,
         )
         return False
+    finally:
+        _safe_close_table(table)
 
 
 def ensure_collection_metadata_table(conn: DBConnection) -> None:

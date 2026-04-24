@@ -233,6 +233,7 @@ def _mark_uploaded_file_for_reindex(file_id: str) -> bool:
     """Clear ingestion run markers so changed file can be re-indexed."""
     try:
         from ...core.tools.core.RAG_tools.LanceDB.schema_manager import (
+            _safe_close_table,
             ensure_documents_table,
             ensure_ingestion_runs_table,
         )
@@ -245,27 +246,33 @@ def _mark_uploaded_file_for_reindex(file_id: str) -> bool:
         conn = get_connection_from_env()
         ensure_documents_table(conn)
         ensure_ingestion_runs_table(conn)
-        documents_table = conn.open_table("documents")
-        ingestion_runs_table = conn.open_table("ingestion_runs")
+        documents_table = None
+        ingestion_runs_table = None
+        try:
+            documents_table = conn.open_table("documents")
+            ingestion_runs_table = conn.open_table("ingestion_runs")
 
-        safe_file_id = escape_lancedb_string(file_id)
-        rows = query_to_list(
-            documents_table.search()
-            .where(f"file_id = '{safe_file_id}'")
-            .select(["collection", "doc_id"])
-            .limit(-1)
-        )
-        for row in rows:
-            collection = str(row.get("collection") or "").strip()
-            doc_id = str(row.get("doc_id") or "").strip()
-            if not collection or not doc_id:
-                continue
-            safe_collection = escape_lancedb_string(collection)
-            safe_doc_id = escape_lancedb_string(doc_id)
-            ingestion_runs_table.delete(
-                f"collection = '{safe_collection}' and doc_id = '{safe_doc_id}'"
+            safe_file_id = escape_lancedb_string(file_id)
+            rows = query_to_list(
+                documents_table.search()
+                .where(f"file_id = '{safe_file_id}'")
+                .select(["collection", "doc_id"])
+                .limit(-1)
             )
-        return True
+            for row in rows:
+                collection = str(row.get("collection") or "").strip()
+                doc_id = str(row.get("doc_id") or "").strip()
+                if not collection or not doc_id:
+                    continue
+                safe_collection = escape_lancedb_string(collection)
+                safe_doc_id = escape_lancedb_string(doc_id)
+                ingestion_runs_table.delete(
+                    f"collection = '{safe_collection}' and doc_id = '{safe_doc_id}'"
+                )
+            return True
+        finally:
+            _safe_close_table(documents_table)
+            _safe_close_table(ingestion_runs_table)
     except Exception as exc:  # noqa: BLE001
         logger.warning(
             "Failed to mark uploaded file for re-index: file_id=%s, error=%s",

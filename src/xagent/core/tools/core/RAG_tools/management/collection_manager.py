@@ -16,6 +16,7 @@ import pyarrow as pa  # type: ignore
 
 from ..core.parser_registry import get_supported_parsers, validate_parser_compatibility
 from ..core.schemas import CollectionInfo
+from ..LanceDB.schema_manager import _safe_close_table
 from ..storage.factory import get_metadata_store, get_vector_index_store
 from ..utils.model_resolver import resolve_embedding_adapter
 from ..utils.tag_mapping import register_tag_mapping
@@ -256,6 +257,7 @@ class CollectionManager:
                 # Table might already exist, continue
         else:
             # Table exists: ensure it has the "owners" column (schema compat; column is not maintained)
+            table = None
             try:
                 table = conn.open_table("collection_metadata")
                 if hasattr(table, "schema") and table.schema is not None:
@@ -271,6 +273,8 @@ class CollectionManager:
                 logger.debug(
                     "Could not migrate collection_metadata schema (add owners): %s", e
                 )
+            finally:
+                _safe_close_table(table)
 
     async def initialize_collection_embedding(
         self, collection_name: str, embedding_model_id: str

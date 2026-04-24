@@ -52,17 +52,24 @@ class LanceDBMetadataStore(MetadataStore):
         return self._conn
 
     async def get_collection(self, collection_name: str) -> CollectionInfo:
+        from ..LanceDB.schema_manager import _safe_close_table
+
         conn = await self._get_connection()
         table = conn.open_table("collection_metadata")
-        safe_name = escape_lancedb_string(collection_name)
-        result = table.search().where(f"name = '{safe_name}'").to_arrow()
-        if len(result) == 0:
-            raise ValueError(f"Collection '{collection_name}' not found")
-        # Convert Arrow table to list of dicts and take first row
-        data = result.to_pylist()[0]
-        return CollectionInfo.from_storage(data)
+        try:
+            safe_name = escape_lancedb_string(collection_name)
+            result = table.search().where(f"name = '{safe_name}'").to_arrow()
+            if len(result) == 0:
+                raise ValueError(f"Collection '{collection_name}' not found")
+            # Convert Arrow table to list of dicts and take first row
+            data = result.to_pylist()[0]
+            return CollectionInfo.from_storage(data)
+        finally:
+            _safe_close_table(table)
 
     async def save_collection(self, collection: CollectionInfo) -> None:
+        from ..LanceDB.schema_manager import _safe_close_table
+
         conn = await self._get_connection()
         await self.ensure_collection_metadata_table()
 
@@ -70,11 +77,14 @@ class LanceDBMetadataStore(MetadataStore):
         data["updated_at"] = datetime.now(timezone.utc).replace(tzinfo=None)
 
         table = conn.open_table("collection_metadata")
-        safe_name = escape_lancedb_string(collection.name)
-        existing = table.search().where(f"name = '{safe_name}'").to_arrow()
-        if len(existing) > 0:
-            table.delete(f"name = '{safe_name}'")
-        table.add([data])
+        try:
+            safe_name = escape_lancedb_string(collection.name)
+            existing = table.search().where(f"name = '{safe_name}'").to_arrow()
+            if len(existing) > 0:
+                table.delete(f"name = '{safe_name}'")
+            table.add([data])
+        finally:
+            _safe_close_table(table)
 
     async def ensure_collection_metadata_table(self) -> None:
         conn = await self._get_connection()
@@ -114,6 +124,9 @@ class LanceDBMetadataStore(MetadataStore):
                 logger.debug("collection_metadata create_table no-op/failure: %s", exc)
         else:
             # Backward compatibility: old tables may miss "owners".
+            from ..LanceDB.schema_manager import _safe_close_table
+
+            table = None
             try:
                 table = conn.open_table("collection_metadata")
                 table_schema = getattr(table, "schema", None)
@@ -129,6 +142,8 @@ class LanceDBMetadataStore(MetadataStore):
                 logger.debug(
                     "collection_metadata add owners column skipped/failed: %s", exc
                 )
+            finally:
+                _safe_close_table(table)
 
     async def save_collection_config(
         self,
@@ -137,31 +152,39 @@ class LanceDBMetadataStore(MetadataStore):
         user_id: int,
     ) -> None:
         """Save collection ingestion configuration to LanceDB."""
-        from ..LanceDB.schema_manager import ensure_collection_config_table
+        from ..LanceDB.schema_manager import (
+            _safe_close_table,
+            ensure_collection_config_table,
+        )
 
         conn = await self._get_connection()
         ensure_collection_config_table(conn)
 
         table = conn.open_table("collection_config")
-        safe_collection = escape_lancedb_string(collection)
-
-        # Delete existing config for this collection and user
         try:
-            table.delete(f"collection = '{safe_collection}' AND user_id = {user_id}")
-        except Exception as exc:
-            logger.debug("Error deleting old config: %s", exc)
+            safe_collection = escape_lancedb_string(collection)
 
-        # Insert new config
-        now = datetime.now(timezone.utc).replace(tzinfo=None)
-        data = [
-            {
-                "collection": collection,
-                "config_json": config_json,
-                "updated_at": now,
-                "user_id": user_id,
-            }
-        ]
-        table.add(data)
+            # Delete existing config for this collection and user
+            try:
+                table.delete(
+                    f"collection = '{safe_collection}' AND user_id = {user_id}"
+                )
+            except Exception as exc:
+                logger.debug("Error deleting old config: %s", exc)
+
+            # Insert new config
+            now = datetime.now(timezone.utc).replace(tzinfo=None)
+            data = [
+                {
+                    "collection": collection,
+                    "config_json": config_json,
+                    "updated_at": now,
+                    "user_id": user_id,
+                }
+            ]
+            table.add(data)
+        finally:
+            _safe_close_table(table)
 
     async def get_collection_config(
         self,
@@ -184,8 +207,12 @@ class LanceDBMetadataStore(MetadataStore):
         Returns:
             Config JSON string if found, None otherwise.
         """
-        from ..LanceDB.schema_manager import ensure_collection_config_table
+        from ..LanceDB.schema_manager import (
+            _safe_close_table,
+            ensure_collection_config_table,
+        )
 
+        table = None
         try:
             conn = await self._get_connection()
             ensure_collection_config_table(conn)
@@ -218,6 +245,8 @@ class LanceDBMetadataStore(MetadataStore):
         except Exception as exc:
             logger.debug("Error reading collection config: %s", exc)
             return None
+        finally:
+            _safe_close_table(table)
 
     def get_raw_connection(self) -> DBConnection:
         """Get the underlying LanceDB connection.
@@ -304,31 +333,37 @@ class LanceDBVectorIndexStore(VectorIndexStore):
             is_admin=is_admin,
         )
 
+        from ..LanceDB.schema_manager import _safe_close_table
+
         conn = self._get_connection()
         ensure_documents_table(conn)
         table = conn.open_table("documents")
-
-        raw_records = query_to_list(
-            table.search().where(combined_filter).limit(max_results)
-            if combined_filter
-            else table.search().limit(max_results)
-        )
-
-        records: List[DocumentRecord] = []
-        for item in raw_records:
-            raw_doc_id = item.get("doc_id")
-            if not raw_doc_id:
-                continue
-            records.append(
-                DocumentRecord(
-                    doc_id=str(raw_doc_id),
-                    file_id=str(item["file_id"]) if item.get("file_id") else None,
-                    source_path=(
-                        str(item["source_path"]) if item.get("source_path") else None
-                    ),
-                )
+        try:
+            raw_records = query_to_list(
+                table.search().where(combined_filter).limit(max_results)
+                if combined_filter
+                else table.search().limit(max_results)
             )
-        return records
+
+            records: List[DocumentRecord] = []
+            for item in raw_records:
+                raw_doc_id = item.get("doc_id")
+                if not raw_doc_id:
+                    continue
+                records.append(
+                    DocumentRecord(
+                        doc_id=str(raw_doc_id),
+                        file_id=str(item["file_id"]) if item.get("file_id") else None,
+                        source_path=(
+                            str(item["source_path"])
+                            if item.get("source_path")
+                            else None
+                        ),
+                    )
+                )
+            return records
+        finally:
+            _safe_close_table(table)
 
     def count_documents_grouped_by_collection(
         self,
@@ -341,37 +376,43 @@ class LanceDBVectorIndexStore(VectorIndexStore):
         if not names:
             return {}
 
+        from ..LanceDB.schema_manager import _safe_close_table
+
         conn = self._get_connection()
         ensure_documents_table(conn)
         table = conn.open_table("documents")
+        try:
+            collection_expr: list[FilterExpression] = [
+                FilterCondition("collection", FilterOperator.EQ, name) for name in names
+            ]
+            base_filter = self.build_filter_expression(
+                filters=collection_expr,
+                user_id=user_id,
+                is_admin=is_admin,
+            )
+            if not base_filter:
+                return {}
 
-        collection_expr: list[FilterExpression] = [
-            FilterCondition("collection", FilterOperator.EQ, name) for name in names
-        ]
-        base_filter = self.build_filter_expression(
-            filters=collection_expr,
-            user_id=user_id,
-            is_admin=is_admin,
-        )
-        if not base_filter:
-            return {}
-
-        rows = query_to_list(
-            table.search().where(base_filter).select(["collection"]).limit(-1)
-        )
-        counts: Dict[str, int] = {}
-        for row in rows:
-            name = str(row.get("collection") or "")
-            if not name:
-                continue
-            counts[name] = counts.get(name, 0) + 1
-        return counts
+            rows = query_to_list(
+                table.search().where(base_filter).select(["collection"]).limit(-1)
+            )
+            counts: Dict[str, int] = {}
+            for row in rows:
+                name = str(row.get("collection") or "")
+                if not name:
+                    continue
+                counts[name] = counts.get(name, 0) + 1
+            return counts
+        finally:
+            _safe_close_table(table)
 
     def rename_collection_data(
         self,
         collection_name: str,
         new_name: str,
     ) -> List[str]:
+        from ..LanceDB.schema_manager import _safe_close_table
+
         warnings: List[str] = []
         safe_old_name = escape_lancedb_string(collection_name)
         conn = self._get_connection()
@@ -382,6 +423,7 @@ class LanceDBVectorIndexStore(VectorIndexStore):
                 "chunks",
             } and not table_name.startswith("embeddings_"):
                 continue
+            table = None
             try:
                 table = conn.open_table(table_name)
                 table.update(
@@ -392,6 +434,8 @@ class LanceDBVectorIndexStore(VectorIndexStore):
                 message = f"Failed to update '{table_name}': {exc}"
                 logger.warning(message)
                 warnings.append(message)
+            finally:
+                _safe_close_table(table)
         return warnings
 
     def list_table_names(self) -> Sequence[str]:
@@ -404,7 +448,10 @@ class LanceDBVectorIndexStore(VectorIndexStore):
 
     def get_vector_dimension(self, table_name: str) -> Optional[int]:
         """Get the vector dimension from a table's schema."""
+        from ..LanceDB.schema_manager import _safe_close_table
+
         conn = self._get_connection()
+        table = None
         try:
             table = conn.open_table(table_name)
             schema = table.schema
@@ -415,6 +462,8 @@ class LanceDBVectorIndexStore(VectorIndexStore):
                     return cast(int, vector_type.list_size)
         except Exception as exc:  # noqa: BLE001
             logger.debug("Failed to get vector dimension for %s: %s", table_name, exc)
+        finally:
+            _safe_close_table(table)
         return None
 
     def open_embeddings_table(self, model_tag: str) -> Tuple[Any, str]:
@@ -483,6 +532,7 @@ class LanceDBVectorIndexStore(VectorIndexStore):
     ) -> Dict[str, int]:
         """Delete all data for a collection from vector-side tables."""
         from ..LanceDB.schema_manager import (
+            _safe_close_table,
             ensure_chunks_table,
             ensure_documents_table,
             ensure_parses_table,
@@ -499,6 +549,7 @@ class LanceDBVectorIndexStore(VectorIndexStore):
 
         # Delete from core tables
         for table_name in ["documents", "parses", "chunks"]:
+            table = None
             try:
                 table = conn.open_table(table_name)
                 original_count = table.count_rows()
@@ -508,11 +559,14 @@ class LanceDBVectorIndexStore(VectorIndexStore):
                     deleted_counts[table_name] = deleted_count
             except Exception as exc:  # noqa: BLE001
                 logger.warning("Failed to delete from '%s': %s", table_name, exc)
+            finally:
+                _safe_close_table(table)
 
         # Delete embeddings data
         for table_name in self.list_table_names():
             if not table_name.startswith("embeddings_"):
                 continue
+            table = None
             try:
                 table = conn.open_table(table_name)
                 original_count = table.count_rows()
@@ -522,6 +576,8 @@ class LanceDBVectorIndexStore(VectorIndexStore):
                     deleted_counts[table_name] = deleted_count
             except Exception as exc:  # noqa: BLE001
                 logger.warning("Failed to delete from '%s': %s", table_name, exc)
+            finally:
+                _safe_close_table(table)
 
         return deleted_counts
 
@@ -597,6 +653,7 @@ class LanceDBVectorIndexStore(VectorIndexStore):
     ) -> Dict[str, int]:
         """Aggregate statistics for a single document."""
         from ..LanceDB.schema_manager import (
+            _safe_close_table,
             ensure_chunks_table,
             ensure_documents_table,
             ensure_parses_table,
@@ -616,11 +673,14 @@ class LanceDBVectorIndexStore(VectorIndexStore):
         base_filter = f"collection = '{safe_collection}' AND doc_id = '{safe_doc_id}'"
 
         def _count_table(table_name: str) -> int:
+            table = None
             try:
                 table = conn.open_table(table_name)
                 return int(table.count_rows(base_filter))
             except Exception:  # noqa: BLE001
                 return 0
+            finally:
+                _safe_close_table(table)
 
         stats["documents"] = _count_table("documents")
         stats["parses"] = _count_table("parses")
@@ -658,12 +718,15 @@ class LanceDBVectorIndexStore(VectorIndexStore):
             IVF_HNSW_SQ = "IVF_HNSW_SQ"
             IVF_PQ = "IVF_PQ"
 
+        from ..LanceDB.schema_manager import _safe_close_table
+
         conn = self._get_connection()
         table_name = f"embeddings_{to_model_tag(model_tag)}"
 
         if readonly:
             # In readonly mode, check if FTS index exists without creating any indexes
             fts_enabled = False
+            table = None
             try:
                 table = conn.open_table(table_name)
                 indexes = table.list_indices()
@@ -672,6 +735,8 @@ class LanceDBVectorIndexStore(VectorIndexStore):
                 )
             except Exception as e:
                 logger.debug("Unable to check FTS index status in readonly mode: %s", e)
+            finally:
+                _safe_close_table(table)
 
             return IndexResult(
                 status="readonly",
@@ -758,35 +823,38 @@ class LanceDBVectorIndexStore(VectorIndexStore):
                 f"Vector index check failed for {table_name}: {str(e)}"
             )
 
-        # Check actual FTS index status (not just whether we tried to create it)
-        fts_enabled = False
         try:
-            indexes = table.list_indices()
-            fts_enabled = any(
-                idx.index_type == "FTS" and "text" in idx.columns for idx in indexes
-            )
-        except Exception as e:
-            logger.warning(f"Failed to check FTS index status: {e}")
-
-        # FTS Index Management (if enabled)
-        if policy.fts_enabled and not fts_enabled:
+            # Check actual FTS index status (not just whether we tried to create it)
+            fts_enabled = False
             try:
-                fts_params = {"with_position": True, **(policy.fts_params or {})}
-                table.create_fts_index("text", replace=True, **fts_params)
-                logger.info("Created FTS index on 'text' column for %s", table_name)
-                # Re-check FTS status after creation
-                try:
-                    indexes = table.list_indices()
-                    fts_enabled = any(
-                        idx.index_type == "FTS" and "text" in idx.columns
-                        for idx in indexes
-                    )
-                except Exception:
-                    pass
-            except Exception as e:
-                logger.warning(
-                    f"FTS index creation/check failed for {table_name}: {str(e)}"
+                indexes = table.list_indices()
+                fts_enabled = any(
+                    idx.index_type == "FTS" and "text" in idx.columns for idx in indexes
                 )
+            except Exception as e:
+                logger.warning(f"Failed to check FTS index status: {e}")
+
+            # FTS Index Management (if enabled)
+            if policy.fts_enabled and not fts_enabled:
+                try:
+                    fts_params = {"with_position": True, **(policy.fts_params or {})}
+                    table.create_fts_index("text", replace=True, **fts_params)
+                    logger.info("Created FTS index on 'text' column for %s", table_name)
+                    # Re-check FTS status after creation
+                    try:
+                        indexes = table.list_indices()
+                        fts_enabled = any(
+                            idx.index_type == "FTS" and "text" in idx.columns
+                            for idx in indexes
+                        )
+                    except Exception:
+                        pass
+                except Exception as e:
+                    logger.warning(
+                        f"FTS index creation/check failed for {table_name}: {str(e)}"
+                    )
+        finally:
+            _safe_close_table(table)
 
         return IndexResult(
             status=vector_index_status,
@@ -800,6 +868,9 @@ class LanceDBVectorIndexStore(VectorIndexStore):
         self, table_name: str, total_upserted: int, policy: IndexPolicy
     ) -> bool:
         """Determine if reindex should be triggered (sync)."""
+        from ..LanceDB.schema_manager import _safe_close_table
+
+        table = None
         try:
             conn = self._get_connection()
             table = conn.open_table(table_name)
@@ -834,9 +905,14 @@ class LanceDBVectorIndexStore(VectorIndexStore):
         except Exception as e:
             logger.error(f"Failed to check reindex status for {table_name}: {e}")
             return False
+        finally:
+            _safe_close_table(table)
 
     def trigger_reindex(self, table_name: str) -> bool:
         """Trigger reindex operation on the table (sync)."""
+        from ..LanceDB.schema_manager import _safe_close_table
+
+        table = None
         try:
             logger.info("Triggering reindex for %s", table_name)
             conn = self._get_connection()
@@ -847,6 +923,8 @@ class LanceDBVectorIndexStore(VectorIndexStore):
         except Exception as e:  # noqa: BLE001
             logger.warning("Reindex failed for %s: %s", table_name, e)
             return False
+        finally:
+            _safe_close_table(table)
 
     async def should_reindex_async(
         self, table_name: str, total_upserted: int, policy: IndexPolicy
@@ -911,6 +989,7 @@ class LanceDBVectorIndexStore(VectorIndexStore):
         Yields backend-specific batch objects (e.g., PyArrow RecordBatch).
         """
         from ..LanceDB.schema_manager import (
+            _safe_close_table,
             ensure_chunks_table,
             ensure_documents_table,
             ensure_parses_table,
@@ -926,6 +1005,7 @@ class LanceDBVectorIndexStore(VectorIndexStore):
         elif table_name == "chunks":
             ensure_chunks_table(conn)
 
+        table = None
         try:
             table = conn.open_table(table_name)
         except Exception as exc:
@@ -960,59 +1040,62 @@ class LanceDBVectorIndexStore(VectorIndexStore):
                 return pa.RecordBatch.from_arrays([], [])
             return pa.RecordBatch.from_arrays(arrays, names)
 
-        # Preferred path: streaming batches directly from LanceDB
         try:
-            if combined_filter:
-                for raw_batch in table.to_batches(
-                    filter=combined_filter, batch_size=batch_size
-                ):
-                    batch = raw_batch
-                    if columns is not None:
-                        batch = _select_columns(batch, columns)
-                    if batch.num_rows > 0:
-                        yield batch
-            else:
-                for raw_batch in table.to_batches(batch_size=batch_size):
-                    batch = raw_batch
-                    if columns is not None:
-                        batch = _select_columns(batch, columns)
-                    if batch.num_rows > 0:
-                        yield batch
-            return
-        except Exception as exc:
-            logger.debug(
-                "Batch streaming unavailable for table '%s': %s", table_name, exc
-            )
-
-        # Arrow fallback: materialize table as Arrow then iterate
-        try:
-            # Note: LanceDB's to_arrow() doesn't accept filter parameter
-            # Use search().where().to_arrow() instead
-            if combined_filter:
-                arrow_table = table.search().where(combined_filter).to_arrow()
-            else:
-                arrow_table = table.to_arrow()
-        except Exception as exc:
-            logger.debug(
-                "Unable to read table '%s' via to_arrow(): %s", table_name, exc
-            )
-            return
-
-        if columns is not None:
+            # Preferred path: streaming batches directly from LanceDB
             try:
-                arrow_table = arrow_table.select(columns)
+                if combined_filter:
+                    for raw_batch in table.to_batches(
+                        filter=combined_filter, batch_size=batch_size
+                    ):
+                        batch = raw_batch
+                        if columns is not None:
+                            batch = _select_columns(batch, columns)
+                        if batch.num_rows > 0:
+                            yield batch
+                else:
+                    for raw_batch in table.to_batches(batch_size=batch_size):
+                        batch = raw_batch
+                        if columns is not None:
+                            batch = _select_columns(batch, columns)
+                        if batch.num_rows > 0:
+                            yield batch
+                return
             except Exception as exc:
                 logger.debug(
-                    "Table '%s' missing expected columns %s: %s",
-                    table_name,
-                    columns,
-                    exc,
+                    "Batch streaming unavailable for table '%s': %s", table_name, exc
+                )
+
+            # Arrow fallback: materialize table as Arrow then iterate
+            try:
+                # Note: LanceDB's to_arrow() doesn't accept filter parameter
+                # Use search().where().to_arrow() instead
+                if combined_filter:
+                    arrow_table = table.search().where(combined_filter).to_arrow()
+                else:
+                    arrow_table = table.to_arrow()
+            except Exception as exc:
+                logger.debug(
+                    "Unable to read table '%s' via to_arrow(): %s", table_name, exc
                 )
                 return
 
-        for batch in arrow_table.to_batches(max_chunksize=batch_size):
-            if batch.num_rows > 0:
-                yield batch
+            if columns is not None:
+                try:
+                    arrow_table = arrow_table.select(columns)
+                except Exception as exc:
+                    logger.debug(
+                        "Table '%s' missing expected columns %s: %s",
+                        table_name,
+                        columns,
+                        exc,
+                    )
+                    return
+
+            for batch in arrow_table.to_batches(max_chunksize=batch_size):
+                if batch.num_rows > 0:
+                    yield batch
+        finally:
+            _safe_close_table(table)
 
     def count_rows(
         self,
@@ -1027,6 +1110,7 @@ class LanceDBVectorIndexStore(VectorIndexStore):
             DatabaseOperationError: If table cannot be opened or count fails.
         """
         from ..core.exceptions import DatabaseOperationError
+        from ..LanceDB.schema_manager import _safe_close_table
 
         conn = self._get_connection()
 
@@ -1058,6 +1142,8 @@ class LanceDBVectorIndexStore(VectorIndexStore):
             raise DatabaseOperationError(
                 f"Failed to count rows in table '{table_name}': {exc}"
             ) from exc
+        finally:
+            _safe_close_table(table)
 
     def aggregate_document_counts(
         self,
@@ -1126,14 +1212,18 @@ class LanceDBVectorIndexStore(VectorIndexStore):
         if not records:
             return
 
+        from ..LanceDB.schema_manager import _safe_close_table
+
         conn = self._get_connection()
         ensure_documents_table(conn)
         table = conn.open_table("documents")
-
-        # Use merge_insert for efficient upsert
-        table.merge_insert(
-            ["collection", "doc_id"]
-        ).when_matched_update_all().when_not_matched_insert_all().execute(records)
+        try:
+            # Use merge_insert for efficient upsert
+            table.merge_insert(
+                ["collection", "doc_id"]
+            ).when_matched_update_all().when_not_matched_insert_all().execute(records)
+        finally:
+            _safe_close_table(table)
 
     def upsert_parses(self, records: List[Dict[str, Any]]) -> None:
         """Upsert parse records to LanceDB.
@@ -1146,14 +1236,18 @@ class LanceDBVectorIndexStore(VectorIndexStore):
         if not records:
             return
 
+        from ..LanceDB.schema_manager import _safe_close_table
+
         conn = self._get_connection()
         ensure_parses_table(conn)
         table = conn.open_table("parses")
-
-        # Use merge_insert for efficient upsert
-        table.merge_insert(
-            ["collection", "doc_id", "parse_hash"]
-        ).when_matched_update_all().when_not_matched_insert_all().execute(records)
+        try:
+            # Use merge_insert for efficient upsert
+            table.merge_insert(
+                ["collection", "doc_id", "parse_hash"]
+            ).when_matched_update_all().when_not_matched_insert_all().execute(records)
+        finally:
+            _safe_close_table(table)
 
     def upsert_chunks(self, records: List[Dict[str, Any]]) -> None:
         """Upsert chunk records to LanceDB.
@@ -1166,14 +1260,18 @@ class LanceDBVectorIndexStore(VectorIndexStore):
         if not records:
             return
 
+        from ..LanceDB.schema_manager import _safe_close_table
+
         conn = self._get_connection()
         ensure_chunks_table(conn)
         table = conn.open_table("chunks")
-
-        # Use merge_insert for efficient upsert
-        table.merge_insert(
-            ["collection", "doc_id", "parse_hash", "chunk_id"]
-        ).when_matched_update_all().when_not_matched_insert_all().execute(records)
+        try:
+            # Use merge_insert for efficient upsert
+            table.merge_insert(
+                ["collection", "doc_id", "parse_hash", "chunk_id"]
+            ).when_matched_update_all().when_not_matched_insert_all().execute(records)
+        finally:
+            _safe_close_table(table)
 
     def upsert_embeddings(self, model_tag: str, records: List[Dict[str, Any]]) -> None:
         """Upsert embedding records to LanceDB with fallback pattern.
@@ -1191,6 +1289,8 @@ class LanceDBVectorIndexStore(VectorIndexStore):
 
         if not records:
             return
+
+        from ..LanceDB.schema_manager import _safe_close_table
 
         conn = self._get_connection()
         table_name = f"embeddings_{to_model_tag(model_tag)}"
@@ -1243,6 +1343,8 @@ class LanceDBVectorIndexStore(VectorIndexStore):
                     add_error,
                 )
                 raise
+        finally:
+            _safe_close_table(table)
 
     # --- Sync search methods (Phase 1A Option C) ---
 
@@ -1270,6 +1372,8 @@ class LanceDBVectorIndexStore(VectorIndexStore):
             has_filters=filters is not None,
         )
 
+        from ..LanceDB.schema_manager import _safe_close_table
+
         conn = self._get_connection()
 
         # Open table (no legacy fallback at abstraction layer - handled by caller)
@@ -1279,37 +1383,40 @@ class LanceDBVectorIndexStore(VectorIndexStore):
             logger.debug("Unable to open table '%s': %s", table_name, exc)
             return []
 
-        # Build filter expression
-        backend_filter = self.build_filter_expression(
-            filters, user_id=user_id, is_admin=is_admin
-        )
-
-        # Build search query
-        search_query = table.search(
-            query_vector,
-            vector_column_name=vector_column_name,
-        )
-
-        if backend_filter:
-            search_query = search_query.where(backend_filter)
-
-        search_query = search_query.limit(top_k)
-
         try:
-            # Use query_to_list for three-tier fallback (to_arrow, to_list, to_pandas)
-            raw_results = query_to_list(search_query)
-
-            # Log performance metric
-            log_performance(
-                "search_vectors_complete",
-                result_count=len(raw_results),
-                table_name=table_name,
+            # Build filter expression
+            backend_filter = self.build_filter_expression(
+                filters, user_id=user_id, is_admin=is_admin
             )
-            return raw_results
 
-        except Exception as exc:
-            logger.error("Sync vector search failed: %s", exc)
-            return []
+            # Build search query
+            search_query = table.search(
+                query_vector,
+                vector_column_name=vector_column_name,
+            )
+
+            if backend_filter:
+                search_query = search_query.where(backend_filter)
+
+            search_query = search_query.limit(top_k)
+
+            try:
+                # Use query_to_list for three-tier fallback (to_arrow, to_list, to_pandas)
+                raw_results = query_to_list(search_query)
+
+                # Log performance metric
+                log_performance(
+                    "search_vectors_complete",
+                    result_count=len(raw_results),
+                    table_name=table_name,
+                )
+                return raw_results
+
+            except Exception as exc:
+                logger.error("Sync vector search failed: %s", exc)
+                return []
+        finally:
+            _safe_close_table(table)
 
     # --- Async method implementations (Phase 1A Option C) ---
 
@@ -1336,30 +1443,28 @@ class LanceDBVectorIndexStore(VectorIndexStore):
         )
 
         async_conn = await self._get_async_connection()
+        from ..LanceDB.schema_manager import _safe_close_table
 
+        table = None
         try:
             table = await async_conn.open_table(table_name)
-        except Exception as exc:
-            logger.debug("Unable to open table '%s': %s", table_name, exc)
-            return []
 
-        # Build filter expression
-        backend_filter = self.build_filter_expression(
-            filters, user_id=None, is_admin=False
-        )
+            # Build filter expression
+            backend_filter = self.build_filter_expression(
+                filters, user_id=None, is_admin=False
+            )
 
-        # Build search query
-        search_query = table.search(
-            query_vector,
-            vector_column_name=vector_column_name,
-        )
+            # Build search query
+            search_query = table.search(
+                query_vector,
+                vector_column_name=vector_column_name,
+            )
 
-        if backend_filter:
-            search_query = search_query.where(backend_filter)
+            if backend_filter:
+                search_query = search_query.where(backend_filter)
 
-        search_query = search_query.limit(top_k)
+            search_query = search_query.limit(top_k)
 
-        try:
             # Async search returns Arrow table
             results_table = await search_query.to_arrow()
 
@@ -1382,10 +1487,11 @@ class LanceDBVectorIndexStore(VectorIndexStore):
                 table_name=table_name,
             )
             return results
-
         except Exception as exc:
             logger.error("Async vector search failed: %s", exc)
             return []
+        finally:
+            _safe_close_table(table)
 
     async def search_fts_async(
         self,
@@ -1401,31 +1507,29 @@ class LanceDBVectorIndexStore(VectorIndexStore):
         Returns native Arrow format converted to list of dicts.
         """
         async_conn = await self._get_async_connection()
+        from ..LanceDB.schema_manager import _safe_close_table
 
+        table = None
         try:
             table = await async_conn.open_table(table_name)
-        except Exception as exc:
-            logger.debug("Unable to open table '%s': %s", table_name, exc)
-            return []
 
-        # Build filter expression
-        backend_filter = self.build_filter_expression(
-            filters, user_id=None, is_admin=False
-        )
+            # Build filter expression
+            backend_filter = self.build_filter_expression(
+                filters, user_id=None, is_admin=False
+            )
 
-        # Build FTS search query
-        # Note: LanceDB async API supports query_type="fts"
-        search_query = table.search(
-            query_text,
-            query_type="fts",
-        )
+            # Build FTS search query
+            # Note: LanceDB async API supports query_type="fts"
+            search_query = table.search(
+                query_text,
+                query_type="fts",
+            )
 
-        if backend_filter:
-            search_query = search_query.where(backend_filter)
+            if backend_filter:
+                search_query = search_query.where(backend_filter)
 
-        search_query = search_query.limit(top_k)
+            search_query = search_query.limit(top_k)
 
-        try:
             # Async FTS search returns Arrow table
             results_table = await search_query.to_arrow()
 
@@ -1445,6 +1549,8 @@ class LanceDBVectorIndexStore(VectorIndexStore):
         except Exception as exc:
             logger.error("Async FTS search failed: %s", exc)
             return []
+        finally:
+            _safe_close_table(table)
 
     async def iter_batches_async(
         self,
@@ -1469,44 +1575,42 @@ class LanceDBVectorIndexStore(VectorIndexStore):
         )
 
         async_conn = await self._get_async_connection()
+        from ..LanceDB.schema_manager import _safe_close_table
 
+        table = None
         try:
             table = await async_conn.open_table(table_name)
-        except Exception as exc:
-            logger.debug("Unable to open table '%s': %s", table_name, exc)
-            return
 
-        # Build filter expression using common function (includes validation)
-        combined_filter = None
-        if filters:
-            filter_expr_obj = build_filter_from_dict(filters)
-            combined_filter = self.build_filter_expression(
-                filters=filter_expr_obj,
-                user_id=user_id,
-                is_admin=is_admin,
-            )
-        else:
-            # Just apply user filter
-            combined_filter = UserPermissions.get_user_filter(user_id, is_admin)
+            # Build filter expression using common function (includes validation)
+            combined_filter = None
+            if filters:
+                filter_expr_obj = build_filter_from_dict(filters)
+                combined_filter = self.build_filter_expression(
+                    filters=filter_expr_obj,
+                    user_id=user_id,
+                    is_admin=is_admin,
+                )
+            else:
+                # Just apply user filter
+                combined_filter = UserPermissions.get_user_filter(user_id, is_admin)
 
-        # Helper method to select columns from a batch
-        def _select_columns(batch: Any, cols: Optional[Sequence[str]]) -> Any:
-            if cols is None:
-                return batch
-            arrays = []
-            names = []
-            for col_name in cols:
-                idx = batch.schema.get_field_index(col_name)
-                if idx != -1:
-                    arrays.append(batch.column(idx))
-                    names.append(col_name)
-            if not arrays:
-                return pa.RecordBatch.from_arrays([], [])
-            return pa.RecordBatch.from_arrays(arrays, names)
+            # Helper method to select columns from a batch
+            def _select_columns(batch: Any, cols: Optional[Sequence[str]]) -> Any:
+                if cols is None:
+                    return batch
+                arrays = []
+                names = []
+                for col_name in cols:
+                    idx = batch.schema.get_field_index(col_name)
+                    if idx != -1:
+                        arrays.append(batch.column(idx))
+                        names.append(col_name)
+                if not arrays:
+                    return pa.RecordBatch.from_arrays([], [])
+                return pa.RecordBatch.from_arrays(arrays, names)
 
-        try:
             # Use LanceDB async to_batches() with column projection for efficiency
-            # Note: LanceDB to_batches supports columns parameter to avoid reading unused columns
+            # Note: LanceDB to_batches supports columns parameter to avoid reading all data
             if combined_filter:
                 async for batch in table.to_batches(
                     filter=combined_filter,
@@ -1526,6 +1630,8 @@ class LanceDBVectorIndexStore(VectorIndexStore):
             logger.debug(
                 "Async batch iteration failed for table '%s': %s", table_name, exc
             )
+        finally:
+            _safe_close_table(table)
 
     async def count_rows_async(
         self,
@@ -1536,27 +1642,25 @@ class LanceDBVectorIndexStore(VectorIndexStore):
     ) -> int:
         """Count rows in a table with optional filters using async LanceDB API."""
         async_conn = await self._get_async_connection()
+        from ..LanceDB.schema_manager import _safe_close_table
 
+        table = None
         try:
             table = await async_conn.open_table(table_name)
-        except Exception as exc:
-            logger.debug("Unable to open table '%s': %s", table_name, exc)
-            return 0
 
-        # Build filter expression using common function (includes validation)
-        combined_filter = None
-        if filters:
-            filter_expr_obj = build_filter_from_dict(filters)
-            combined_filter = self.build_filter_expression(
-                filters=filter_expr_obj,
-                user_id=user_id,
-                is_admin=is_admin,
-            )
-        else:
-            # Just apply user filter
-            combined_filter = UserPermissions.get_user_filter(user_id, is_admin)
+            # Build filter expression using common function (includes validation)
+            combined_filter = None
+            if filters:
+                filter_expr_obj = build_filter_from_dict(filters)
+                combined_filter = self.build_filter_expression(
+                    filters=filter_expr_obj,
+                    user_id=user_id,
+                    is_admin=is_admin,
+                )
+            else:
+                # Just apply user filter
+                combined_filter = UserPermissions.get_user_filter(user_id, is_admin)
 
-        try:
             if combined_filter:
                 count = int(await table.count_rows(combined_filter))
             else:
@@ -1573,6 +1677,8 @@ class LanceDBVectorIndexStore(VectorIndexStore):
         except Exception as exc:
             logger.debug("Failed to count rows in '%s': %s", table_name, exc)
             return 0
+        finally:
+            _safe_close_table(table)
 
     async def get_vector_dimension_async(self, table_name: str) -> Optional[int]:
         """Get the vector dimension from a table's schema (async).
@@ -1602,15 +1708,21 @@ class LanceDBVectorIndexStore(VectorIndexStore):
         sync_conn = self._get_connection()
         ensure_documents_table(sync_conn)
 
-        table = await async_conn.open_table("documents")
+        from ..LanceDB.schema_manager import _safe_close_table
 
-        # Use merge_insert for efficient upsert
-        await (
-            table.merge_insert(["collection", "doc_id"])
-            .when_matched_update_all()
-            .when_not_matched_insert_all()
-            .execute(records)
-        )
+        table = None
+        try:
+            table = await async_conn.open_table("documents")
+
+            # Use merge_insert for efficient upsert
+            await (
+                table.merge_insert(["collection", "doc_id"])
+                .when_matched_update_all()
+                .when_not_matched_insert_all()
+                .execute(records)
+            )
+        finally:
+            _safe_close_table(table)
 
     async def upsert_chunks_async(self, records: List[Dict[str, Any]]) -> None:
         """Upsert chunk records using async LanceDB API."""
@@ -1625,15 +1737,21 @@ class LanceDBVectorIndexStore(VectorIndexStore):
         sync_conn = self._get_connection()
         ensure_chunks_table(sync_conn)
 
-        table = await async_conn.open_table("chunks")
+        from ..LanceDB.schema_manager import _safe_close_table
 
-        # Use merge_insert for efficient upsert
-        await (
-            table.merge_insert(["collection", "doc_id", "parse_hash", "chunk_id"])
-            .when_matched_update_all()
-            .when_not_matched_insert_all()
-            .execute(records)
-        )
+        table = None
+        try:
+            table = await async_conn.open_table("chunks")
+
+            # Use merge_insert for efficient upsert
+            await (
+                table.merge_insert(["collection", "doc_id", "parse_hash", "chunk_id"])
+                .when_matched_update_all()
+                .when_not_matched_insert_all()
+                .execute(records)
+            )
+        finally:
+            _safe_close_table(table)
 
     async def upsert_embeddings_async(
         self, model_tag: str, records: List[Dict[str, Any]]
@@ -1664,15 +1782,21 @@ class LanceDBVectorIndexStore(VectorIndexStore):
         ensure_embeddings_table(
             sync_conn, to_model_tag(model_tag), vector_dim=vector_dim
         )
-        table = await async_conn.open_table(table_name)
+        from ..LanceDB.schema_manager import _safe_close_table
 
-        # Use merge_insert for efficient upsert
-        await (
-            table.merge_insert(["collection", "doc_id", "chunk_id"])
-            .when_matched_update_all()
-            .when_not_matched_insert_all()
-            .execute(records)
-        )
+        table = None
+        try:
+            table = await async_conn.open_table(table_name)
+
+            # Use merge_insert for efficient upsert
+            await (
+                table.merge_insert(["collection", "doc_id", "chunk_id"])
+                .when_matched_update_all()
+                .when_not_matched_insert_all()
+                .execute(records)
+            )
+        finally:
+            _safe_close_table(table)
 
 
 # ============================================================================
@@ -1726,6 +1850,9 @@ class LanceDBIngestionStatusStore(IngestionStatusStore):
         user_id: Optional[int] = None,
     ) -> None:
         """Write ingestion status record (sync)."""
+        from ..LanceDB.schema_manager import _safe_close_table
+
+        table = None
         try:
             conn = self._get_sync_connection()
             self._ensure_ingestion_runs_table(conn)
@@ -1753,6 +1880,8 @@ class LanceDBIngestionStatusStore(IngestionStatusStore):
         except Exception as e:
             logger.error(f"Failed to write ingestion status: {e}")
             raise
+        finally:
+            _safe_close_table(table)
 
     def load_ingestion_status(
         self,
@@ -1762,6 +1891,9 @@ class LanceDBIngestionStatusStore(IngestionStatusStore):
         is_admin: bool = False,
     ) -> List[Dict[str, Any]]:
         """Load ingestion status records (sync)."""
+        from ..LanceDB.schema_manager import _safe_close_table
+
+        table = None
         try:
             conn = self._get_sync_connection()
             self._ensure_ingestion_runs_table(conn)
@@ -1784,6 +1916,8 @@ class LanceDBIngestionStatusStore(IngestionStatusStore):
         except Exception as e:
             logger.error(f"Failed to load ingestion status: {e}")
             raise
+        finally:
+            _safe_close_table(table)
 
     def clear_ingestion_status(
         self,
@@ -1793,6 +1927,9 @@ class LanceDBIngestionStatusStore(IngestionStatusStore):
         is_admin: bool = False,
     ) -> None:
         """Remove ingestion status record (sync)."""
+        from ..LanceDB.schema_manager import _safe_close_table
+
+        table = None
         try:
             conn = self._get_sync_connection()
             self._ensure_ingestion_runs_table(conn)
@@ -1809,6 +1946,8 @@ class LanceDBIngestionStatusStore(IngestionStatusStore):
         except Exception as e:
             logger.error(f"Failed to clear ingestion status: {e}")
             raise
+        finally:
+            _safe_close_table(table)
 
     # --- Async methods ---
 
@@ -1954,52 +2093,57 @@ class LanceDBPromptTemplateStore(PromptTemplateStore):
         """Save or update a prompt template (sync)."""
         import uuid
 
+        from ..LanceDB.schema_manager import _safe_close_table
+
         conn = self._get_sync_connection()
         self._ensure_table()
         table = conn.open_table("prompt_templates")
 
-        # Generate new template ID
-        template_id = str(uuid.uuid4())
-        now = datetime.now(timezone.utc).replace(tzinfo=None)
+        try:
+            # Generate new template ID
+            template_id = str(uuid.uuid4())
+            now = datetime.now(timezone.utc).replace(tzinfo=None)
 
-        # Check for existing templates with same name to get next version
-        base_filter = f"name == '{escape_lancedb_string(name)}'"
-        if user_id is not None:
-            base_filter += f" AND user_id == {user_id}"
+            # Check for existing templates with same name to get next version
+            base_filter = f"name == '{escape_lancedb_string(name)}'"
+            if user_id is not None:
+                base_filter += f" AND user_id == {user_id}"
 
-        existing = table.search().where(base_filter).to_arrow()
-        if len(existing) > 0:
-            import pyarrow.compute as pc  # type: ignore[import-not-found]
+            existing = table.search().where(base_filter).to_arrow()
+            if len(existing) > 0:
+                import pyarrow.compute as pc  # type: ignore[import-not-found]
 
-            max_version = pc.max(existing["version"]).as_py()
-            new_version = max_version + 1
+                max_version = pc.max(existing["version"]).as_py()
+                new_version = max_version + 1
 
-            # Mark previous versions as not latest
-            for row in existing.to_pylist():
-                if row["is_latest"]:
-                    table.update(
-                        where=f"id == '{row['id']}'",
-                        values={"is_latest": False},
-                    )
-        else:
-            new_version = 1
+                # Mark previous versions as not latest
+                for row in existing.to_pylist():
+                    if row["is_latest"]:
+                        table.update(
+                            where=f"id == '{row['id']}'",
+                            values={"is_latest": False},
+                        )
+            else:
+                new_version = 1
 
-        # Create new template record
-        record = {
-            "id": template_id,
-            "name": name,
-            "template": template,
-            "version": new_version,
-            "is_latest": True,
-            "metadata": metadata or "",
-            "user_id": user_id or 0,
-            "created_at": now,
-            "updated_at": now,
-        }
+            # Create new template record
+            record = {
+                "id": template_id,
+                "name": name,
+                "template": template,
+                "version": new_version,
+                "is_latest": True,
+                "metadata": metadata or "",
+                "user_id": user_id or 0,
+                "created_at": now,
+                "updated_at": now,
+            }
 
-        table.add([record])
-        logger.info("Saved prompt template: %s (version %d)", name, new_version)
-        return template_id
+            table.add([record])
+            logger.info("Saved prompt template: %s (version %d)", name, new_version)
+            return template_id
+        finally:
+            _safe_close_table(table)
 
     def get_prompt_template(
         self,
@@ -2007,31 +2151,36 @@ class LanceDBPromptTemplateStore(PromptTemplateStore):
         user_id: Optional[int] = None,
     ) -> Optional[Dict[str, Any]]:
         """Get a prompt template by ID (sync)."""
+        from ..LanceDB.schema_manager import _safe_close_table
+
         conn = self._get_sync_connection()
         self._ensure_table()
         table = conn.open_table("prompt_templates")
 
-        base_filter = f"id == '{escape_lancedb_string(template_id)}'"
-        if user_id is not None:
-            base_filter += f" AND user_id == {user_id}"
+        try:
+            base_filter = f"id == '{escape_lancedb_string(template_id)}'"
+            if user_id is not None:
+                base_filter += f" AND user_id == {user_id}"
 
-        result = table.search().where(base_filter).to_arrow()
-        if len(result) == 0:
-            return None
+            result = table.search().where(base_filter).to_arrow()
+            if len(result) == 0:
+                return None
 
-        # Convert Arrow table to list of dicts and take first row
-        row = result.to_pylist()[0]
-        return {
-            "id": row["id"],
-            "name": row["name"],
-            "template": row["template"],
-            "version": int(row["version"]),
-            "is_latest": bool(row["is_latest"]),
-            "metadata": row["metadata"],
-            "user_id": int(row["user_id"]) if row["user_id"] else None,
-            "created_at": row["created_at"],
-            "updated_at": row["updated_at"],
-        }
+            # Convert Arrow table to list of dicts and take first row
+            row = result.to_pylist()[0]
+            return {
+                "id": row["id"],
+                "name": row["name"],
+                "template": row["template"],
+                "version": int(row["version"]),
+                "is_latest": bool(row["is_latest"]),
+                "metadata": row["metadata"],
+                "user_id": int(row["user_id"]) if row["user_id"] else None,
+                "created_at": row["created_at"],
+                "updated_at": row["updated_at"],
+            }
+        finally:
+            _safe_close_table(table)
 
     def get_latest_prompt_template(
         self,
@@ -2039,31 +2188,38 @@ class LanceDBPromptTemplateStore(PromptTemplateStore):
         user_id: Optional[int] = None,
     ) -> Optional[Dict[str, Any]]:
         """Get the latest version of a prompt template by name (sync)."""
+        from ..LanceDB.schema_manager import _safe_close_table
+
         conn = self._get_sync_connection()
         self._ensure_table()
         table = conn.open_table("prompt_templates")
 
-        base_filter = f"name == '{escape_lancedb_string(name)}' AND is_latest == true"
-        if user_id is not None:
-            base_filter += f" AND user_id == {user_id}"
+        try:
+            base_filter = (
+                f"name == '{escape_lancedb_string(name)}' AND is_latest == true"
+            )
+            if user_id is not None:
+                base_filter += f" AND user_id == {user_id}"
 
-        result = table.search().where(base_filter).to_arrow()
-        if len(result) == 0:
-            return None
+            result = table.search().where(base_filter).to_arrow()
+            if len(result) == 0:
+                return None
 
-        # Convert Arrow table to list of dicts and take first row
-        row = result.to_pylist()[0]
-        return {
-            "id": row["id"],
-            "name": row["name"],
-            "template": row["template"],
-            "version": int(row["version"]),
-            "is_latest": bool(row["is_latest"]),
-            "metadata": row["metadata"],
-            "user_id": int(row["user_id"]) if row["user_id"] else None,
-            "created_at": row["created_at"],
-            "updated_at": row["updated_at"],
-        }
+            # Convert Arrow table to list of dicts and take first row
+            row = result.to_pylist()[0]
+            return {
+                "id": row["id"],
+                "name": row["name"],
+                "template": row["template"],
+                "version": int(row["version"]),
+                "is_latest": bool(row["is_latest"]),
+                "metadata": row["metadata"],
+                "user_id": int(row["user_id"]) if row["user_id"] else None,
+                "created_at": row["created_at"],
+                "updated_at": row["updated_at"],
+            }
+        finally:
+            _safe_close_table(table)
 
     def list_prompt_templates(
         self,
@@ -2073,44 +2229,49 @@ class LanceDBPromptTemplateStore(PromptTemplateStore):
         limit: int = 100,
     ) -> List[Dict[str, Any]]:
         """List prompt templates with optional filtering (sync)."""
+        from ..LanceDB.schema_manager import _safe_close_table
+
         conn = self._get_sync_connection()
         self._ensure_table()
         table = conn.open_table("prompt_templates")
 
-        filters = []
-        if name_filter:
-            filters.append(f"name LIKE '%{escape_lancedb_string(name_filter)}%'")
-        if latest_only:
-            filters.append("is_latest == true")
-        if user_id is not None:
-            filters.append(f"user_id == {user_id}")
+        try:
+            filters = []
+            if name_filter:
+                filters.append(f"name LIKE '%{escape_lancedb_string(name_filter)}%'")
+            if latest_only:
+                filters.append("is_latest == true")
+            if user_id is not None:
+                filters.append(f"user_id == {user_id}")
 
-        filter_expr = " AND ".join(filters) if filters else None
+            filter_expr = " AND ".join(filters) if filters else None
 
-        query = table.search()
-        if filter_expr:
-            query = query.where(filter_expr)
+            query = table.search()
+            if filter_expr:
+                query = query.where(filter_expr)
 
-        result = query.limit(limit).to_arrow()
-        templates = []
-        for row_dict in result.to_pylist():
-            templates.append(
-                {
-                    "id": row_dict["id"],
-                    "name": row_dict["name"],
-                    "template": row_dict["template"],
-                    "version": int(row_dict["version"]),
-                    "is_latest": bool(row_dict["is_latest"]),
-                    "metadata": row_dict["metadata"],
-                    "user_id": int(row_dict["user_id"])
-                    if row_dict["user_id"]
-                    else None,
-                    "created_at": row_dict["created_at"],
-                    "updated_at": row_dict["updated_at"],
-                }
-            )
+            result = query.limit(limit).to_arrow()
+            templates = []
+            for row_dict in result.to_pylist():
+                templates.append(
+                    {
+                        "id": row_dict["id"],
+                        "name": row_dict["name"],
+                        "template": row_dict["template"],
+                        "version": int(row_dict["version"]),
+                        "is_latest": bool(row_dict["is_latest"]),
+                        "metadata": row_dict["metadata"],
+                        "user_id": int(row_dict["user_id"])
+                        if row_dict["user_id"]
+                        else None,
+                        "created_at": row_dict["created_at"],
+                        "updated_at": row_dict["updated_at"],
+                    }
+                )
 
-        return templates
+            return templates
+        finally:
+            _safe_close_table(table)
 
     def delete_prompt_template(
         self,
@@ -2121,43 +2282,48 @@ class LanceDBPromptTemplateStore(PromptTemplateStore):
 
         Updates is_latest flag for remaining versions if latest version is deleted.
         """
+        from ..LanceDB.schema_manager import _safe_close_table
+
         conn = self._get_sync_connection()
         self._ensure_table()
         table = conn.open_table("prompt_templates")
 
-        base_filter = f"id == '{escape_lancedb_string(template_id)}'"
-        if user_id is not None:
-            base_filter += f" AND user_id == {user_id}"
-
-        # Check if exists and get info
-        result = table.search().where(base_filter).to_arrow()
-        if len(result) == 0:
-            return False
-
-        # Check if this was the latest version and get the name
-        # Convert Arrow table to list of dicts and take first row
-        row_dict = result.to_pylist()[0]
-        was_latest = row_dict["is_latest"]
-        template_name = row_dict["name"]
-
-        table.delete(base_filter)
-
-        # If we deleted the latest version, update the latest flag for the remaining versions
-        if was_latest:
-            name_filter = f"name == '{escape_lancedb_string(template_name)}'"
+        try:
+            base_filter = f"id == '{escape_lancedb_string(template_id)}'"
             if user_id is not None:
-                name_filter += f" AND user_id == {user_id}"
+                base_filter += f" AND user_id == {user_id}"
 
-            remaining_versions = table.search().where(name_filter).to_arrow()
-            if len(remaining_versions) > 0:
-                import pyarrow.compute as pc
+            # Check if exists and get info
+            result = table.search().where(base_filter).to_arrow()
+            if len(result) == 0:
+                return False
 
-                max_version = pc.max(remaining_versions["version"]).as_py()
-                update_filter = f"{name_filter} AND version == {max_version}"
-                table.update(where=update_filter, values={"is_latest": True})
+            # Check if this was the latest version and get the name
+            # Convert Arrow table to list of dicts and take first row
+            row_dict = result.to_pylist()[0]
+            was_latest = row_dict["is_latest"]
+            template_name = row_dict["name"]
 
-        logger.info("Deleted prompt template: %s", template_id)
-        return True
+            table.delete(base_filter)
+
+            # If we deleted the latest version, update the latest flag for the remaining versions
+            if was_latest:
+                name_filter = f"name == '{escape_lancedb_string(template_name)}'"
+                if user_id is not None:
+                    name_filter += f" AND user_id == {user_id}"
+
+                remaining_versions = table.search().where(name_filter).to_arrow()
+                if len(remaining_versions) > 0:
+                    import pyarrow.compute as pc
+
+                    max_version = pc.max(remaining_versions["version"]).as_py()
+                    update_filter = f"{name_filter} AND version == {max_version}"
+                    table.update(where=update_filter, values={"is_latest": True})
+
+            logger.info("Deleted prompt template: %s", template_id)
+            return True
+        finally:
+            _safe_close_table(table)
 
     def update_metadata(
         self,
@@ -2166,31 +2332,36 @@ class LanceDBPromptTemplateStore(PromptTemplateStore):
         user_id: Optional[int] = None,
     ) -> Optional[Dict[str, Any]]:
         """Update metadata only, keeping same version and ID (sync)."""
+        from ..LanceDB.schema_manager import _safe_close_table
+
         conn = self._get_sync_connection()
         self._ensure_table()
         table = conn.open_table("prompt_templates")
 
-        base_filter = f"id == '{escape_lancedb_string(template_id)}'"
-        if user_id is not None:
-            base_filter += f" AND user_id == {user_id}"
+        try:
+            base_filter = f"id == '{escape_lancedb_string(template_id)}'"
+            if user_id is not None:
+                base_filter += f" AND user_id == {user_id}"
 
-        # Check if exists
-        result = table.search().where(base_filter).to_arrow()
-        if len(result) == 0:
-            return None
+            # Check if exists
+            result = table.search().where(base_filter).to_arrow()
+            if len(result) == 0:
+                return None
 
-        # Update metadata
-        table.update(
-            where=base_filter,
-            values={
-                "metadata": metadata or "",
-                "updated_at": datetime.now(timezone.utc).replace(tzinfo=None),
-            },
-        )
-        logger.info("Updated metadata for prompt template: %s", template_id)
+            # Update metadata
+            table.update(
+                where=base_filter,
+                values={
+                    "metadata": metadata or "",
+                    "updated_at": datetime.now(timezone.utc).replace(tzinfo=None),
+                },
+            )
+            logger.info("Updated metadata for prompt template: %s", template_id)
 
-        # Return updated template
-        return self.get_prompt_template(template_id, user_id)
+            # Return updated template
+            return self.get_prompt_template(template_id, user_id)
+        finally:
+            _safe_close_table(table)
 
     def delete_by_name(
         self,
@@ -2203,54 +2374,60 @@ class LanceDBPromptTemplateStore(PromptTemplateStore):
         Handles is_latest flag updates for remaining versions.
         """
         from ..core.exceptions import DocumentNotFoundError
+        from ..LanceDB.schema_manager import _safe_close_table
 
         conn = self._get_sync_connection()
         self._ensure_table()
         table = conn.open_table("prompt_templates")
 
-        escaped_name = escape_lancedb_string(name)
-        base_filter = f"name == '{escaped_name}'"
-        if user_id is not None:
-            base_filter += f" AND user_id == {user_id}"
+        try:
+            escaped_name = escape_lancedb_string(name)
+            base_filter = f"name == '{escaped_name}'"
+            if user_id is not None:
+                base_filter += f" AND user_id == {user_id}"
 
-        if version is not None:
-            # Delete specific version
-            version_filter = f"{base_filter} AND version == {version}"
-            result = table.search().where(version_filter).to_arrow()
-            if len(result) == 0:
-                raise DocumentNotFoundError(
-                    f"Prompt template '{name}' version {version} not found."
-                )
-
-            # Convert Arrow table to list of dicts and take first row
-            row_dict = result.to_pylist()[0]
-            was_latest = row_dict["is_latest"]
-            table.delete(version_filter)
-
-            # If we deleted the latest version, update the latest flag
-            if was_latest:
-                remaining = table.search().where(base_filter).to_arrow()
-                if len(remaining) > 0:
-                    import pyarrow.compute as pc
-
-                    max_version = pc.max(remaining["version"]).as_py()
-                    table.update(
-                        where=f"{base_filter} AND version == {max_version}",
-                        values={"is_latest": True},
+            if version is not None:
+                # Delete specific version
+                version_filter = f"{base_filter} AND version == {version}"
+                result = table.search().where(version_filter).to_arrow()
+                if len(result) == 0:
+                    raise DocumentNotFoundError(
+                        f"Prompt template '{name}' version {version} not found."
                     )
 
-            logger.info("Deleted prompt template '%s' version %d", name, version)
-            return 1
-        else:
-            # Delete all versions
-            result = table.search().where(base_filter).to_arrow()
-            if len(result) == 0:
-                raise DocumentNotFoundError(f"Prompt template '{name}' not found.")
+                # Convert Arrow table to list of dicts and take first row
+                row_dict = result.to_pylist()[0]
+                was_latest = row_dict["is_latest"]
+                table.delete(version_filter)
 
-            count = len(result)
-            table.delete(base_filter)
-            logger.info("Deleted all %d versions of prompt template '%s'", count, name)
-            return count
+                # If we deleted the latest version, update the latest flag
+                if was_latest:
+                    remaining = table.search().where(base_filter).to_arrow()
+                    if len(remaining) > 0:
+                        import pyarrow.compute as pc
+
+                        max_version = pc.max(remaining["version"]).as_py()
+                        table.update(
+                            where=f"{base_filter} AND version == {max_version}",
+                            values={"is_latest": True},
+                        )
+
+                logger.info("Deleted prompt template '%s' version %d", name, version)
+                return 1
+            else:
+                # Delete all versions
+                result = table.search().where(base_filter).to_arrow()
+                if len(result) == 0:
+                    raise DocumentNotFoundError(f"Prompt template '{name}' not found.")
+
+                count = len(result)
+                table.delete(base_filter)
+                logger.info(
+                    "Deleted all %d versions of prompt template '%s'", count, name
+                )
+                return count
+        finally:
+            _safe_close_table(table)
 
     def get_versions_by_name(
         self,
@@ -2259,34 +2436,39 @@ class LanceDBPromptTemplateStore(PromptTemplateStore):
         limit: int = 100,
     ) -> List[Dict[str, Any]]:
         """Get all versions of a template by name (sync)."""
+        from ..LanceDB.schema_manager import _safe_close_table
+
         conn = self._get_sync_connection()
         self._ensure_table()
         table = conn.open_table("prompt_templates")
 
-        base_filter = f"name == '{escape_lancedb_string(name)}'"
-        if user_id is not None:
-            base_filter += f" AND user_id == {user_id}"
+        try:
+            base_filter = f"name == '{escape_lancedb_string(name)}'"
+            if user_id is not None:
+                base_filter += f" AND user_id == {user_id}"
 
-        result = table.search().where(base_filter).limit(limit).to_arrow()
-        templates = []
-        for row_dict in result.to_pylist():
-            templates.append(
-                {
-                    "id": row_dict["id"],
-                    "name": row_dict["name"],
-                    "template": row_dict["template"],
-                    "version": int(row_dict["version"]),
-                    "is_latest": bool(row_dict["is_latest"]),
-                    "metadata": row_dict["metadata"],
-                    "user_id": int(row_dict["user_id"])
-                    if row_dict["user_id"]
-                    else None,
-                    "created_at": row_dict["created_at"],
-                    "updated_at": row_dict["updated_at"],
-                }
-            )
+            result = table.search().where(base_filter).limit(limit).to_arrow()
+            templates = []
+            for row_dict in result.to_pylist():
+                templates.append(
+                    {
+                        "id": row_dict["id"],
+                        "name": row_dict["name"],
+                        "template": row_dict["template"],
+                        "version": int(row_dict["version"]),
+                        "is_latest": bool(row_dict["is_latest"]),
+                        "metadata": row_dict["metadata"],
+                        "user_id": int(row_dict["user_id"])
+                        if row_dict["user_id"]
+                        else None,
+                        "created_at": row_dict["created_at"],
+                        "updated_at": row_dict["updated_at"],
+                    }
+                )
 
-        return templates
+            return templates
+        finally:
+            _safe_close_table(table)
 
     # --- Async methods (delegate to sync) ---
 
@@ -2414,51 +2596,58 @@ class LanceDBMainPointerStore(MainPointerStore):
                 "Schema migration required for multi-tenancy support."
             )
 
+        from ..LanceDB.schema_manager import _safe_close_table
+
         conn = self._get_sync_connection()
         self._ensure_table()
         table = conn.open_table("main_pointers")
 
-        normalized_tag = self._normalize_model_tag(model_tag)
-        now = datetime.now(timezone.utc).replace(tzinfo=None)
+        try:
+            normalized_tag = self._normalize_model_tag(model_tag)
+            now = datetime.now(timezone.utc).replace(tzinfo=None)
 
-        # Check if pointer already exists to preserve created_at
-        existing = self.get_main_pointer(collection, doc_id, step_type, model_tag)
+            # Check if pointer already exists to preserve created_at
+            existing = self.get_main_pointer(collection, doc_id, step_type, model_tag)
 
-        created_at = existing["created_at"] if existing else now
+            created_at = existing["created_at"] if existing else now
 
-        # Prepare data for merge_insert
-        update_data: Dict[str, List[Any]] = {
-            "collection": [collection],
-            "doc_id": [doc_id],
-            "step_type": [step_type],
-            "model_tag": [normalized_tag],
-            "semantic_id": [semantic_id],
-            "technical_id": [technical_id],
-            "created_at": [created_at],
-            "updated_at": [now],
-            "operator": [operator or "unknown"],
-        }
-        # Convert dict of lists to list of dicts for merge_insert
-        records = [
-            {key: values[idx] for key, values in update_data.items()}
-            for idx in range(len(update_data["collection"]))
-        ]
+            # Prepare data for merge_insert
+            update_data: Dict[str, List[Any]] = {
+                "collection": [collection],
+                "doc_id": [doc_id],
+                "step_type": [step_type],
+                "model_tag": [normalized_tag],
+                "semantic_id": [semantic_id],
+                "technical_id": [technical_id],
+                "created_at": [created_at],
+                "updated_at": [now],
+                "operator": [operator or "unknown"],
+            }
+            # Convert dict of lists to list of dicts for merge_insert
+            records = [
+                {key: values[idx] for key, values in update_data.items()}
+                for idx in range(len(update_data["collection"]))
+            ]
 
-        (
-            table.merge_insert(on=["collection", "doc_id", "step_type", "model_tag"])
-            .when_matched_update_all()
-            .when_not_matched_insert_all()
-            .execute(records)
-        )
+            (
+                table.merge_insert(
+                    on=["collection", "doc_id", "step_type", "model_tag"]
+                )
+                .when_matched_update_all()
+                .when_not_matched_insert_all()
+                .execute(records)
+            )
 
-        logger.info(
-            "Set main pointer for %s/%s/%s to %s (semantic: %s)",
-            collection,
-            doc_id,
-            step_type,
-            technical_id,
-            semantic_id,
-        )
+            logger.info(
+                "Set main pointer for %s/%s/%s to %s (semantic: %s)",
+                collection,
+                doc_id,
+                step_type,
+                technical_id,
+                semantic_id,
+            )
+        finally:
+            _safe_close_table(table)
 
     def get_main_pointer(
         self,
@@ -2476,80 +2665,89 @@ class LanceDBMainPointerStore(MainPointerStore):
                 "Schema migration required for multi-tenancy support."
             )
 
+        from ..LanceDB.schema_manager import _safe_close_table
+
         conn = self._get_sync_connection()
         self._ensure_table()
         table = conn.open_table("main_pointers")
 
-        # Build filter expression using FilterCondition
-        base_conditions: List[FilterCondition] = [
-            FilterCondition(
-                field="collection", operator=FilterOperator.EQ, value=collection
-            ),
-            FilterCondition(field="doc_id", operator=FilterOperator.EQ, value=doc_id),
-            FilterCondition(
-                field="step_type", operator=FilterOperator.EQ, value=step_type
-            ),
-        ]
-
-        normalized_tag = self._normalize_model_tag(model_tag)
-        if normalized_tag == "":
-            # Check for both empty string AND NULL (backward compatibility)
-            model_tag_null_cond = FilterCondition(
-                field="model_tag", operator=FilterOperator.IS_NULL, value=None
-            )
-            model_tag_empty_cond = FilterCondition(
-                field="model_tag", operator=FilterOperator.EQ, value=""
-            )
-            # Combine as: (base) AND (model_tag IS NULL OR model_tag == '')
-            model_tag_filter: FilterExpression = (
-                model_tag_null_cond,
-                model_tag_empty_cond,
-            )  # OR tuple
-            filter_expr: FilterExpression = (
-                *base_conditions,
-                model_tag_filter,
-            )  # AND tuple
-        else:
-            base_conditions.append(
+        try:
+            # Build filter expression using FilterCondition
+            base_conditions: List[FilterCondition] = [
                 FilterCondition(
-                    field="model_tag", operator=FilterOperator.EQ, value=normalized_tag
+                    field="collection", operator=FilterOperator.EQ, value=collection
+                ),
+                FilterCondition(
+                    field="doc_id", operator=FilterOperator.EQ, value=doc_id
+                ),
+                FilterCondition(
+                    field="step_type", operator=FilterOperator.EQ, value=step_type
+                ),
+            ]
+
+            normalized_tag = self._normalize_model_tag(model_tag)
+            if normalized_tag == "":
+                # Check for both empty string AND NULL (backward compatibility)
+                model_tag_null_cond = FilterCondition(
+                    field="model_tag", operator=FilterOperator.IS_NULL, value=None
                 )
-            )
-            filter_expr = tuple(base_conditions)  # AND tuple
+                model_tag_empty_cond = FilterCondition(
+                    field="model_tag", operator=FilterOperator.EQ, value=""
+                )
+                # Combine as: (base) AND (model_tag IS NULL OR model_tag == '')
+                model_tag_filter: FilterExpression = (
+                    model_tag_null_cond,
+                    model_tag_empty_cond,
+                )  # OR tuple
+                filter_expr: FilterExpression = (
+                    *base_conditions,
+                    model_tag_filter,
+                )  # AND tuple
+            else:
+                base_conditions.append(
+                    FilterCondition(
+                        field="model_tag",
+                        operator=FilterOperator.EQ,
+                        value=normalized_tag,
+                    )
+                )
+                filter_expr = tuple(base_conditions)  # AND tuple
 
-        # Translate to LanceDB syntax using shared utility
-        filter_str = translate_filter_expression(filter_expr)
+            # Translate to LanceDB syntax using shared utility
+            filter_str = translate_filter_expression(filter_expr)
 
-        result = table.search().where(filter_str).to_arrow()
+            result = table.search().where(filter_str).to_arrow()
 
-        if len(result) == 0:
-            return None
+            if len(result) == 0:
+                return None
 
-        # Return the first result, preferring non-NULL model_tag if multiple found
-        if len(result) > 1:
-            import pyarrow.compute as pc
+            # Return the first result, preferring non-NULL model_tag if multiple found
+            if len(result) > 1:
+                import pyarrow.compute as pc
 
-            # Sort by model_tag descending (NULLs last)
-            sort_indices = pc.sort_indices(
-                result, sort_keys=[("model_tag", "descending")]
-            )
-            result = result.take(sort_indices)
+                # Sort by model_tag descending (NULLs last)
+                sort_indices = pc.sort_indices(
+                    result, sort_keys=[("model_tag", "descending")]
+                )
+                result = result.take(sort_indices)
 
-        # Convert Arrow table to list of dicts and take first row
-        row_dict = result.to_pylist()[0]
-        return {
-            "collection": row_dict["collection"],
-            "doc_id": row_dict["doc_id"],
-            "step_type": row_dict["step_type"],
-            "model_tag": row_dict["model_tag"]
-            if row_dict["model_tag"] is not None
-            else None,
-            "semantic_id": row_dict["semantic_id"],
-            "technical_id": row_dict["technical_id"],
-            "created_at": row_dict["created_at"],
-            "updated_at": row_dict["updated_at"],
-            "operator": row_dict["operator"],
-        }
+            # Convert Arrow table to list of dicts and take first row
+            row_dict = result.to_pylist()[0]
+            return {
+                "collection": row_dict["collection"],
+                "doc_id": row_dict["doc_id"],
+                "step_type": row_dict["step_type"],
+                "model_tag": row_dict["model_tag"]
+                if row_dict["model_tag"] is not None
+                else None,
+                "semantic_id": row_dict["semantic_id"],
+                "technical_id": row_dict["technical_id"],
+                "created_at": row_dict["created_at"],
+                "updated_at": row_dict["updated_at"],
+                "operator": row_dict["operator"],
+            }
+        finally:
+            _safe_close_table(table)
 
     def list_main_pointers(
         self,
@@ -2566,41 +2764,46 @@ class LanceDBMainPointerStore(MainPointerStore):
                 "Schema migration required for multi-tenancy support."
             )
 
+        from ..LanceDB.schema_manager import _safe_close_table
+
         conn = self._get_sync_connection()
         self._ensure_table()
         table = conn.open_table("main_pointers")
 
-        filters_dict = {"collection": collection}
-        if doc_id is not None:
-            filters_dict["doc_id"] = doc_id
+        try:
+            filters_dict = {"collection": collection}
+            if doc_id is not None:
+                filters_dict["doc_id"] = doc_id
 
-        filter_expr = build_lancedb_filter_expression(filters_dict)
+            filter_expr = build_lancedb_filter_expression(filters_dict)
 
-        # First check if any pointers exist using efficient count_rows
-        if table.search().where(filter_expr).count_rows() == 0:
-            return []
+            # First check if any pointers exist using efficient count_rows
+            if table.search().where(filter_expr).count_rows() == 0:
+                return []
 
-        result = table.search().where(filter_expr).limit(limit).to_arrow()
+            result = table.search().where(filter_expr).limit(limit).to_arrow()
 
-        pointers = []
-        for row_dict in result.to_pylist():
-            pointers.append(
-                {
-                    "collection": row_dict["collection"],
-                    "doc_id": row_dict["doc_id"],
-                    "step_type": row_dict["step_type"],
-                    "model_tag": row_dict["model_tag"]
-                    if row_dict["model_tag"] is not None
-                    else None,
-                    "semantic_id": row_dict["semantic_id"],
-                    "technical_id": row_dict["technical_id"],
-                    "created_at": row_dict["created_at"],
-                    "updated_at": row_dict["updated_at"],
-                    "operator": row_dict["operator"],
-                }
-            )
+            pointers = []
+            for row_dict in result.to_pylist():
+                pointers.append(
+                    {
+                        "collection": row_dict["collection"],
+                        "doc_id": row_dict["doc_id"],
+                        "step_type": row_dict["step_type"],
+                        "model_tag": row_dict["model_tag"]
+                        if row_dict["model_tag"] is not None
+                        else None,
+                        "semantic_id": row_dict["semantic_id"],
+                        "technical_id": row_dict["technical_id"],
+                        "created_at": row_dict["created_at"],
+                        "updated_at": row_dict["updated_at"],
+                        "operator": row_dict["operator"],
+                    }
+                )
 
-        return pointers
+            return pointers
+        finally:
+            _safe_close_table(table)
 
     def delete_main_pointer(
         self,
@@ -2618,58 +2821,69 @@ class LanceDBMainPointerStore(MainPointerStore):
                 "Schema migration required for multi-tenancy support."
             )
 
+        from ..LanceDB.schema_manager import _safe_close_table
+
         conn = self._get_sync_connection()
         self._ensure_table()
         table = conn.open_table("main_pointers")
 
-        # Build filter expression using FilterCondition
-        base_conditions: List[FilterCondition] = [
-            FilterCondition(
-                field="collection", operator=FilterOperator.EQ, value=collection
-            ),
-            FilterCondition(field="doc_id", operator=FilterOperator.EQ, value=doc_id),
-            FilterCondition(
-                field="step_type", operator=FilterOperator.EQ, value=step_type
-            ),
-        ]
-
-        normalized_tag = self._normalize_model_tag(model_tag)
-        if normalized_tag == "":
-            # Check for both empty string AND NULL (backward compatibility)
-            model_tag_null_cond = FilterCondition(
-                field="model_tag", operator=FilterOperator.IS_NULL, value=None
-            )
-            model_tag_empty_cond = FilterCondition(
-                field="model_tag", operator=FilterOperator.EQ, value=""
-            )
-            # Combine as: (base) AND (model_tag IS NULL OR model_tag == '')
-            model_tag_filter: FilterExpression = (
-                model_tag_null_cond,
-                model_tag_empty_cond,
-            )  # OR tuple
-            filter_expr: FilterExpression = (
-                *base_conditions,
-                model_tag_filter,
-            )  # AND tuple
-        else:
-            base_conditions.append(
+        try:
+            # Build filter expression using FilterCondition
+            base_conditions: List[FilterCondition] = [
                 FilterCondition(
-                    field="model_tag", operator=FilterOperator.EQ, value=normalized_tag
+                    field="collection", operator=FilterOperator.EQ, value=collection
+                ),
+                FilterCondition(
+                    field="doc_id", operator=FilterOperator.EQ, value=doc_id
+                ),
+                FilterCondition(
+                    field="step_type", operator=FilterOperator.EQ, value=step_type
+                ),
+            ]
+
+            normalized_tag = self._normalize_model_tag(model_tag)
+            if normalized_tag == "":
+                # Check for both empty string AND NULL (backward compatibility)
+                model_tag_null_cond = FilterCondition(
+                    field="model_tag", operator=FilterOperator.IS_NULL, value=None
                 )
+                model_tag_empty_cond = FilterCondition(
+                    field="model_tag", operator=FilterOperator.EQ, value=""
+                )
+                # Combine as: (base) AND (model_tag IS NULL OR model_tag == '')
+                model_tag_filter: FilterExpression = (
+                    model_tag_null_cond,
+                    model_tag_empty_cond,
+                )  # OR tuple
+                filter_expr: FilterExpression = (
+                    *base_conditions,
+                    model_tag_filter,
+                )  # AND tuple
+            else:
+                base_conditions.append(
+                    FilterCondition(
+                        field="model_tag",
+                        operator=FilterOperator.EQ,
+                        value=normalized_tag,
+                    )
+                )
+                filter_expr = tuple(base_conditions)  # AND tuple
+
+            # Translate to LanceDB syntax using shared utility
+            filter_str = translate_filter_expression(filter_expr)
+
+            # Check if exists
+            result = table.search().where(filter_str).to_arrow()
+            if len(result) == 0:
+                return False
+
+            table.delete(filter_str)
+            logger.info(
+                "Deleted main pointer for %s/%s/%s", collection, doc_id, step_type
             )
-            filter_expr = tuple(base_conditions)  # AND tuple
-
-        # Translate to LanceDB syntax using shared utility
-        filter_str = translate_filter_expression(filter_expr)
-
-        # Check if exists
-        result = table.search().where(filter_str).to_arrow()
-        if len(result) == 0:
-            return False
-
-        table.delete(filter_str)
-        logger.info("Deleted main pointer for %s/%s/%s", collection, doc_id, step_type)
-        return True
+            return True
+        finally:
+            _safe_close_table(table)
 
     # --- Async methods (delegate to sync) ---
 

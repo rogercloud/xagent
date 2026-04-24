@@ -38,7 +38,7 @@ from ..core.schemas import (
     IndexOperation,
 )
 from ..LanceDB.model_tag_utils import to_model_tag
-from ..LanceDB.schema_manager import ensure_embeddings_table
+from ..LanceDB.schema_manager import _safe_close_table, ensure_embeddings_table
 from ..storage.factory import get_vector_index_store
 from ..utils.metadata_utils import deserialize_metadata, serialize_metadata
 
@@ -423,27 +423,30 @@ def _validate_and_prepare_table(
             existing_tables = list(conn_any.table_names())
         if table_name in existing_tables:
             existing_table = conn.open_table(table_name)
-            vector_field = existing_table.schema.field("vector")
-            if hasattr(vector_field.type, "list_size"):
-                existing_dim = vector_field.type.list_size
-                if existing_dim != vector_dim:
+            try:
+                vector_field = existing_table.schema.field("vector")
+                if hasattr(vector_field.type, "list_size"):
+                    existing_dim = vector_field.type.list_size
+                    if existing_dim != vector_dim:
+                        logger.warning(
+                            "Dropping table %s due to vector dimension mismatch: existing=%s, new=%s",
+                            table_name,
+                            existing_dim,
+                            vector_dim,
+                        )
+                        drop_fn = getattr(conn_any, "drop_table", None)
+                        if callable(drop_fn):
+                            drop_fn(table_name)
+                else:
                     logger.warning(
-                        "Dropping table %s due to vector dimension mismatch: existing=%s, new=%s",
+                        "Dropping table %s due to incompatible vector field type",
                         table_name,
-                        existing_dim,
-                        vector_dim,
                     )
                     drop_fn = getattr(conn_any, "drop_table", None)
                     if callable(drop_fn):
                         drop_fn(table_name)
-            else:
-                logger.warning(
-                    "Dropping table %s due to incompatible vector field type",
-                    table_name,
-                )
-                drop_fn = getattr(conn_any, "drop_table", None)
-                if callable(drop_fn):
-                    drop_fn(table_name)
+            finally:
+                _safe_close_table(existing_table)
     except Exception as schema_check_error:  # noqa: BLE001
         logger.warning("Error checking table schema: %s", schema_check_error)
         try:

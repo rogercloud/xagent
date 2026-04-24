@@ -20,6 +20,7 @@ import lancedb
 from lancedb.db import DBConnection
 
 from ...config import get_lancedb_path, get_storage_root
+from ...core.tools.core.RAG_tools.LanceDB.schema_manager import _safe_close_table
 from .base import VectorStore
 
 logger = logging.getLogger(__name__)
@@ -246,8 +247,9 @@ class LanceDBVectorStore(VectorStore):
 
     def _ensure_table(self) -> None:
         """Ensure the vector table exists."""
+        table = None
         try:
-            self._conn.open_table(self._collection_name)
+            table = self._conn.open_table(self._collection_name)
         except Exception as e:
             logger.debug(
                 "Table %s does not exist or open failed (%s), creating new table.",
@@ -267,6 +269,8 @@ class LanceDBVectorStore(VectorStore):
             table = self._conn.create_table(self._collection_name, data=sample_data)
             # Remove sample data
             table.delete("id = 'sample'")
+        finally:
+            _safe_close_table(table)
 
     def add_vectors(
         self,
@@ -306,8 +310,12 @@ class LanceDBVectorStore(VectorStore):
             data.append(record)
 
         # Insert data
-        table = self._conn.open_table(self._collection_name)
-        table.add(data)
+        table = None
+        try:
+            table = self._conn.open_table(self._collection_name)
+            table.add(data)
+        finally:
+            _safe_close_table(table)
 
         return ids
 
@@ -321,6 +329,7 @@ class LanceDBVectorStore(VectorStore):
         Returns:
             True if deletion was successful
         """
+        table = None
         try:
             table = self._conn.open_table(self._collection_name)
 
@@ -332,6 +341,8 @@ class LanceDBVectorStore(VectorStore):
         except Exception as e:
             logger.error("Failed to delete vectors: %s", e)
             return False
+        finally:
+            _safe_close_table(table)
 
     def search_vectors(
         self,
@@ -352,34 +363,39 @@ class LanceDBVectorStore(VectorStore):
         """
         import json
 
-        table = self._conn.open_table(self._collection_name)
+        table = None
+        try:
+            table = self._conn.open_table(self._collection_name)
 
-        # Perform vector search, explicitly specify vector column
-        results = (
-            table.search(query_vector, vector_column_name="vector")
-            .limit(top_k)
-            .to_pandas()
-        )
+            # Perform vector search, explicitly specify vector column
+            results = (
+                table.search(query_vector, vector_column_name="vector")
+                .limit(top_k)
+                .to_pandas()
+            )
 
-        # Format results
-        formatted_results = []
-        for _, row in results.iterrows():
-            try:
-                metadata = json.loads(row["metadata"]) if row["metadata"] else {}
-            except (json.JSONDecodeError, TypeError):
-                metadata = {}
+            # Format results
+            formatted_results = []
+            for _, row in results.iterrows():
+                try:
+                    metadata = json.loads(row["metadata"]) if row["metadata"] else {}
+                except (json.JSONDecodeError, TypeError):
+                    metadata = {}
 
-            result = {
-                "id": row["id"],
-                "score": float(row["_distance"]) if "_distance" in row else 0.0,
-                "metadata": metadata,
-            }
-            formatted_results.append(result)
+                result = {
+                    "id": row["id"],
+                    "score": float(row["_distance"]) if "_distance" in row else 0.0,
+                    "metadata": metadata,
+                }
+                formatted_results.append(result)
 
-        return formatted_results
+            return formatted_results
+        finally:
+            _safe_close_table(table)
 
     def clear(self) -> None:
         """Clear all vectors and metadata from the store."""
+        table = None
         try:
             # Try to delete all records
             table = self._conn.open_table(self._collection_name)
@@ -388,6 +404,8 @@ class LanceDBVectorStore(VectorStore):
             logger.error("Failed to clear vector store: %s", e)
             # Table doesn't exist, just ensure it's created
             self._ensure_table()
+        finally:
+            _safe_close_table(table)
 
     def get_raw_connection(self) -> DBConnection:
         """

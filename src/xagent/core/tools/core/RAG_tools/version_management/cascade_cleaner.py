@@ -13,6 +13,7 @@ from typing_extensions import Literal
 
 from ..core.exceptions import CascadeCleanupError
 from ..LanceDB.schema_manager import (
+    _safe_close_table,
     ensure_chunks_table,
     ensure_documents_table,
     ensure_ingestion_runs_table,
@@ -57,6 +58,7 @@ def _build_collection_filter(
     Adds user_id filtering only when the target table contains a user_id column.
     """
     base: Dict[str, str] = {"collection": collection}
+    table = None
     try:
         table = conn.open_table(table_name)
         if not is_admin and user_id is not None:
@@ -72,6 +74,8 @@ def _build_collection_filter(
     except Exception:
         # If table introspection fails, keep tenant-safe fallback.
         return build_lancedb_filter_expression(base, user_id=user_id, is_admin=is_admin)
+    finally:
+        _safe_close_table(table)
 
 
 def _build_document_filter(
@@ -85,6 +89,7 @@ def _build_document_filter(
 ) -> str:
     """Build a safe filter for document-scoped deletion."""
     base: Dict[str, str] = {"collection": collection, "doc_id": doc_id}
+    table = None
     try:
         table = conn.open_table(table_name)
         if not is_admin and user_id is not None:
@@ -100,6 +105,8 @@ def _build_document_filter(
     except Exception:
         # If table introspection fails, keep tenant-safe fallback.
         return build_lancedb_filter_expression(base, user_id=user_id, is_admin=is_admin)
+    finally:
+        _safe_close_table(table)
 
 
 def _append_user_filter_if_needed(
@@ -113,6 +120,7 @@ def _append_user_filter_if_needed(
     """Append user_id filter when non-admin and table contains user_id."""
     if is_admin or user_id is None:
         return base_expr
+    table = None
     try:
         table = conn.open_table(table_name)
         if _table_has_column(table, "user_id"):
@@ -121,6 +129,8 @@ def _append_user_filter_if_needed(
             )
     except Exception:
         return base_expr
+    finally:
+        _safe_close_table(table)
     return base_expr
 
 
@@ -141,6 +151,7 @@ def _append_user_filter_for_embeddings_if_needed(
         target_tables = [t for t in target_tables if t == f"embeddings_{model_tag}"]
     if not target_tables:
         return base_expr
+    table = None
     try:
         table = conn.open_table(target_tables[0])
         if not _table_has_column(table, "user_id"):
@@ -148,6 +159,8 @@ def _append_user_filter_for_embeddings_if_needed(
         return f"{base_expr} AND {build_user_id_filter_for_table(table, int(user_id))}"
     except Exception:
         return base_expr
+    finally:
+        _safe_close_table(table)
 
 
 def _get_table_names(conn: Any) -> list[str]:
@@ -184,8 +197,12 @@ def _plan_by_predicates(
     # If predicates explicitly include embeddings tables, plan them first.
     for t in table_names:
         if t.startswith("embeddings_") and t in table_to_filter:
-            table = conn.open_table(t)
-            counts[t] = _safe_count_rows(table, table_to_filter[t])
+            table = None
+            try:
+                table = conn.open_table(t)
+                counts[t] = _safe_count_rows(table, table_to_filter[t])
+            finally:
+                _safe_close_table(table)
 
     for table_name, filt in table_to_filter.items():
         # Special fan-out handling for embeddings preview like deleter
@@ -198,18 +215,26 @@ def _plan_by_predicates(
                     t for t in all_embed_tables if t == f"embeddings_{model_tag}"
                 ]
             for t in all_embed_tables:
-                table = conn.open_table(t)
-                count = _safe_count_rows(table, filt)
-                total += count
+                table = None
+                try:
+                    table = conn.open_table(t)
+                    count = _safe_count_rows(table, filt)
+                    total += count
+                finally:
+                    _safe_close_table(table)
             counts[table_name] = total
             continue
 
         if table_name not in table_names:
             counts[table_name] = 0
             continue
-        table = conn.open_table(table_name)
-        count = _safe_count_rows(table, filt)
-        counts[table_name] = count
+        table = None
+        try:
+            table = conn.open_table(table_name)
+            count = _safe_count_rows(table, filt)
+            counts[table_name] = count
+        finally:
+            _safe_close_table(table)
     return counts
 
 
@@ -235,12 +260,16 @@ def _delete_by_predicates(
         if not t.startswith("embeddings_") or t not in table_to_filter:
             continue
         filt = table_to_filter[t]
-        table = conn.open_table(t)
-        cnt = _safe_count_rows(table, filt)
-        if cnt > 0:
-            table.delete(filt)
-            logger.info(f"Cascade cleanup: deleted {cnt} rows from {t}")
-        deleted[t] = cnt
+        table = None
+        try:
+            table = conn.open_table(t)
+            cnt = _safe_count_rows(table, filt)
+            if cnt > 0:
+                table.delete(filt)
+                logger.info(f"Cascade cleanup: deleted {cnt} rows from {t}")
+            deleted[t] = cnt
+        finally:
+            _safe_close_table(table)
 
     order = [
         # embeddings handled specially below (fan-out across many tables)
@@ -267,11 +296,15 @@ def _delete_by_predicates(
             target_tables = all_embed_tables
 
         for t in target_tables:
-            table = conn.open_table(t)
-            cnt = _safe_count_rows(table, filt)
-            if cnt > 0:
-                table.delete(filt)
-            total += cnt
+            table = None
+            try:
+                table = conn.open_table(t)
+                cnt = _safe_count_rows(table, filt)
+                if cnt > 0:
+                    table.delete(filt)
+                total += cnt
+            finally:
+                _safe_close_table(table)
         deleted["embeddings"] = total
         if total > 0:
             logger.info(f"Cascade cleanup: deleted {total} rows from embeddings tables")
@@ -280,12 +313,16 @@ def _delete_by_predicates(
     for name in order[1:]:
         if name in table_to_filter and name in table_names:
             filt = table_to_filter[name]
-            table = conn.open_table(name)
-            cnt = _safe_count_rows(table, filt)
-            if cnt > 0:
-                table.delete(filt)
-                logger.info(f"Cascade cleanup: deleted {cnt} rows from {name}")
-            deleted[name] = cnt
+            table = None
+            try:
+                table = conn.open_table(name)
+                cnt = _safe_count_rows(table, filt)
+                if cnt > 0:
+                    table.delete(filt)
+                    logger.info(f"Cascade cleanup: deleted {cnt} rows from {name}")
+                deleted[name] = cnt
+            finally:
+                _safe_close_table(table)
 
     # Finally, handle any remaining custom tables once
     for name, filt in table_to_filter.items():
@@ -304,12 +341,16 @@ def _delete_by_predicates(
         if name not in table_names:
             deleted[name] = 0
             continue
-        table = conn.open_table(name)
-        cnt = _safe_count_rows(table, filt)
-        if cnt > 0:
-            table.delete(filt)
-            logger.info(f"Cascade cleanup: deleted {cnt} rows from {name}")
-        deleted[name] = cnt
+        table = None
+        try:
+            table = conn.open_table(name)
+            cnt = _safe_count_rows(table, filt)
+            if cnt > 0:
+                table.delete(filt)
+                logger.info(f"Cascade cleanup: deleted {cnt} rows from {name}")
+            deleted[name] = cnt
+        finally:
+            _safe_close_table(table)
 
     return deleted
 

@@ -12,6 +12,7 @@ from ...providers.vector_store.lancedb import (
 from ..model.embedding import BaseEmbedding, DashScopeEmbedding
 from ..model.embedding.adapter import create_embedding_adapter
 from ..model.model import EmbeddingModelConfig
+from ..tools.core.RAG_tools.LanceDB.schema_manager import _safe_close_table
 from .base import MemoryStore
 from .core import MemoryNote, MemoryResponse
 
@@ -75,6 +76,7 @@ class LanceDBMemoryStore(MemoryStore):
 
     def _ensure_table_schema(self) -> None:
         """Ensure the table has the correct schema for memory storage."""
+        table = None
         try:
             conn = self._vector_store.get_raw_connection()
             table = conn.open_table(self._collection_name)
@@ -88,23 +90,28 @@ class LanceDBMemoryStore(MemoryStore):
                 logger.warning(
                     f"Table {self._collection_name} has incompatible schema, recreating"
                 )
+                inner_table = None
                 try:
                     # Try to drop the table if the method exists
                     if hasattr(conn, "drop_table"):
                         conn.drop_table(self._collection_name)
                     else:
                         # Alternative: try to use delete all records instead
-                        table = conn.open_table(self._collection_name)
-                        table.delete()
+                        inner_table = conn.open_table(self._collection_name)
+                        inner_table.delete()
                 except Exception:
                     # If drop fails, continue with recreation
                     pass
+                finally:
+                    _safe_close_table(inner_table)
                 self._create_empty_table()
 
         except Exception:
             # Table doesn't exist, create it with basic schema
             logger.info(f"Creating table {self._collection_name} with basic schema")
             self._create_empty_table()
+        finally:
+            _safe_close_table(table)
 
     def _create_empty_table(self) -> None:
         """Create an empty table with the correct schema."""
@@ -259,53 +266,61 @@ class LanceDBMemoryStore(MemoryStore):
 
             # Add to vector store - use a consistent approach
             conn = self._vector_store.get_raw_connection()
-            table = conn.open_table(self._collection_name)
-
-            # Prepare record for insertion
-            record = {
-                "id": data["id"],
-                "text": data["text"],
-                "metadata": data["metadata"],
-            }
-
-            # Add vector if available
-            if data["vector"]:
-                record["vector"] = data["vector"]
-
-            # Try to add the record, recreate table if schema mismatch
+            table = None
             try:
-                table.add([record])
-            except Exception as add_error:
-                logger.warning(
-                    f"Failed to add record due to schema mismatch: {add_error}"
-                )
-                # Recreate table and try again
-                logger.info("Recreating table with fresh schema")
-                try:
-                    # Try to drop the table if the method exists
-                    if hasattr(conn, "drop_table"):
-                        conn.drop_table(self._collection_name)
-                    else:
-                        # Alternative: try to use delete all records instead
-                        table = conn.open_table(self._collection_name)
-                        table.delete()
-                except Exception:
-                    # If drop fails, continue with recreation
-                    pass
-                self._create_empty_table()
                 table = conn.open_table(self._collection_name)
 
-                # After recreating, check if we should include vector
-                # Get current table schema
-                df = table.search().limit(1).to_pandas()
-                if not df.empty and "vector" not in df.columns:
-                    # New table doesn't have vector column, remove vector from record
-                    record_without_vector = {
-                        k: v for k, v in record.items() if k != "vector"
-                    }
-                    table.add([record_without_vector])
-                else:
+                # Prepare record for insertion
+                record = {
+                    "id": data["id"],
+                    "text": data["text"],
+                    "metadata": data["metadata"],
+                }
+
+                # Add vector if available
+                if data["vector"]:
+                    record["vector"] = data["vector"]
+
+                # Try to add the record, recreate table if schema mismatch
+                try:
                     table.add([record])
+                except Exception as add_error:
+                    logger.warning(
+                        f"Failed to add record due to schema mismatch: {add_error}"
+                    )
+                    # Recreate table and try again
+                    logger.info("Recreating table with fresh schema")
+                    inner_table = None
+                    try:
+                        # Try to drop the table if the method exists
+                        if hasattr(conn, "drop_table"):
+                            conn.drop_table(self._collection_name)
+                        else:
+                            # Alternative: try to use delete all records instead
+                            inner_table = conn.open_table(self._collection_name)
+                            inner_table.delete()
+                    except Exception:
+                        # If drop fails, continue with recreation
+                        pass
+                    finally:
+                        _safe_close_table(inner_table)
+                    self._create_empty_table()
+                    _safe_close_table(table)
+                    table = conn.open_table(self._collection_name)
+
+                    # After recreating, check if we should include vector
+                    # Get current table schema
+                    df = table.search().limit(1).to_pandas()
+                    if not df.empty and "vector" not in df.columns:
+                        # New table doesn't have vector column, remove vector from record
+                        record_without_vector = {
+                            k: v for k, v in record.items() if k != "vector"
+                        }
+                        table.add([record_without_vector])
+                    else:
+                        table.add([record])
+            finally:
+                _safe_close_table(table)
 
             return MemoryResponse(success=True, memory_id=data["id"])
 
@@ -319,6 +334,7 @@ class LanceDBMemoryStore(MemoryStore):
 
     def get(self, note_id: str) -> MemoryResponse:
         """Retrieve a memory note by its ID."""
+        table = None
         try:
             table = self._vector_store.get_raw_connection().open_table(
                 self._collection_name
@@ -351,6 +367,8 @@ class LanceDBMemoryStore(MemoryStore):
                 error=f"Failed to get memory: {str(e)}",
                 memory_id=note_id,
             )
+        finally:
+            _safe_close_table(table)
 
     def update(self, note: MemoryNote) -> MemoryResponse:
         """Update an existing memory note."""
@@ -408,6 +426,7 @@ class LanceDBMemoryStore(MemoryStore):
         similarity_threshold: Optional[float] = None,
     ) -> list[MemoryNote]:
         """Search memory notes by query text with optional filters."""
+        table = None
         try:
             table = self._vector_store.get_raw_connection().open_table(
                 self._collection_name
@@ -513,6 +532,8 @@ class LanceDBMemoryStore(MemoryStore):
         except Exception as e:
             logger.error(f"Failed to search memories with query '{query[:50]}...': {e}")
             return []
+        finally:
+            _safe_close_table(table)
 
     def clear(self) -> None:
         """Clear all memory notes from the store."""

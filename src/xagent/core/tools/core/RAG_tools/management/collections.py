@@ -35,6 +35,7 @@ from ..core.schemas import (
     ListCollectionsResult,
 )
 from ..LanceDB.model_tag_utils import embeddings_table_name
+from ..LanceDB.schema_manager import _safe_close_table
 from ..management.status import (
     clear_ingestion_status,
     load_ingestion_status,
@@ -87,6 +88,7 @@ def _iter_batches(
         stacklevel=2,
     )
 
+    table = None
     try:
         table = conn.open_table(table_name)
     except Exception as exc:  # noqa: BLE001 - convert to warning
@@ -95,18 +97,37 @@ def _iter_batches(
         warnings.append(message)
         return
 
-    column_list = list(columns) if columns is not None else None
-
-    # Apply user filter for multi-tenancy
-    user_filter = UserPermissions.get_user_filter(user_id, is_admin)
-
-    # Preferred path: streaming batches directly from LanceDB
     try:
-        # Use filter if provided (for multi-tenancy)
-        if user_filter is not None:
-            for raw_batch in table.to_batches(
-                filter=user_filter, batch_size=batch_size
-            ):
+        column_list = list(columns) if columns is not None else None
+
+        # Apply user filter for multi-tenancy
+        user_filter = UserPermissions.get_user_filter(user_id, is_admin)
+
+        # Preferred path: streaming batches directly from LanceDB
+        try:
+            # Use filter if provided (for multi-tenancy)
+            if user_filter is not None:
+                for raw_batch in table.to_batches(
+                    filter=user_filter, batch_size=batch_size
+                ):
+                    batch = raw_batch
+                    if column_list is not None:
+                        arrays = []
+                        names = []
+                        for col_name in column_list:
+                            idx = batch.schema.get_field_index(col_name)
+                            if idx == -1:
+                                continue
+                            arrays.append(batch.column(idx))
+                            names.append(col_name)
+                        if not arrays:
+                            continue
+                        batch = pa.RecordBatch.from_arrays(arrays, names=names)
+                    if batch.num_rows > 0:
+                        yield batch
+                return
+
+            for raw_batch in table.to_batches(batch_size=batch_size):
                 batch = raw_batch
                 if column_list is not None:
                     arrays = []
@@ -123,77 +144,63 @@ def _iter_batches(
                 if batch.num_rows > 0:
                     yield batch
             return
-
-        for raw_batch in table.to_batches(batch_size=batch_size):
-            batch = raw_batch
-            if column_list is not None:
-                arrays = []
-                names = []
-                for col_name in column_list:
-                    idx = batch.schema.get_field_index(col_name)
-                    if idx == -1:
-                        continue
-                    arrays.append(batch.column(idx))
-                    names.append(col_name)
-                if not arrays:
-                    continue
-                batch = pa.RecordBatch.from_arrays(arrays, names=names)
-            if batch.num_rows > 0:
-                yield batch
-        return
-    except Exception as exc:  # noqa: BLE001 - continue to Arrow fallback
-        logger.debug("Batch streaming unavailable for table '%s': %s", table_name, exc)
-
-    # Arrow fallback: materialize table as Arrow then iterate
-    try:
-        arrow_table = table.to_arrow()
-    except Exception as exc:  # noqa: BLE001
-        message = f"Unable to read table '{table_name}' via to_arrow(): {exc}"
-        logger.warning(message)
-        warnings.append(message)
-        return
-
-    # Apply user filter on Arrow table if needed
-    if user_filter is not None and "user_id" in arrow_table.schema.names:
-        try:
-            # Parse filter and apply to Arrow table
-            # Simple filter parsing for "user_id == X" or "user_id IS NULL"
-            import re
-
-            if UserPermissions.is_no_access_filter(user_filter):
-                # Explicit unauthenticated no-access marker: return empty result directly.
-                arrow_table = arrow_table.slice(0, 0)
-            elif "user_id IS NULL" in user_filter:
-                # Filter for NULL user_id
-                mask = pa.compute.is_null(arrow_table["user_id"])
-                arrow_table = arrow_table.filter(mask)
-            elif "user_id ==" in user_filter:
-                # Filter for specific user_id
-                match = re.search(r"user_id == '?(-?\d+)'?", user_filter)
-                if match:
-                    user_val = int(match.group(1))
-                    mask = pa.compute.equal(
-                        arrow_table["user_id"], pa.scalar(user_val, type=pa.int64())
-                    )
-                    arrow_table = arrow_table.filter(mask)
-        except Exception as filter_exc:
-            logger.warning("Failed to apply user filter on Arrow table: %s", filter_exc)
-            # Continue without filter if filtering fails
-
-    if column_list is not None:
-        try:
-            arrow_table = arrow_table.select(column_list)
-        except Exception as exc:  # noqa: BLE001
-            message = (
-                f"Table '{table_name}' missing expected columns {column_list}: {exc}"
+        except Exception as exc:  # noqa: BLE001 - continue to Arrow fallback
+            logger.debug(
+                "Batch streaming unavailable for table '%s': %s", table_name, exc
             )
+
+        # Arrow fallback: materialize table as Arrow then iterate
+        try:
+            arrow_table = table.to_arrow()
+        except Exception as exc:  # noqa: BLE001
+            message = f"Unable to read table '{table_name}' via to_arrow(): {exc}"
             logger.warning(message)
             warnings.append(message)
             return
 
-    for batch in arrow_table.to_batches(max_chunksize=batch_size):
-        if batch.num_rows > 0:
-            yield batch
+        # Apply user filter on Arrow table if needed
+        if user_filter is not None and "user_id" in arrow_table.schema.names:
+            try:
+                # Parse filter and apply to Arrow table
+                # Simple filter parsing for "user_id == X" or "user_id IS NULL"
+                import re
+
+                if UserPermissions.is_no_access_filter(user_filter):
+                    # Explicit unauthenticated no-access marker: return empty result directly.
+                    arrow_table = arrow_table.slice(0, 0)
+                elif "user_id IS NULL" in user_filter:
+                    # Filter for NULL user_id
+                    mask = pa.compute.is_null(arrow_table["user_id"])
+                    arrow_table = arrow_table.filter(mask)
+                elif "user_id ==" in user_filter:
+                    # Filter for specific user_id
+                    match = re.search(r"user_id == '?(-?\d+)'?", user_filter)
+                    if match:
+                        user_val = int(match.group(1))
+                        mask = pa.compute.equal(
+                            arrow_table["user_id"], pa.scalar(user_val, type=pa.int64())
+                        )
+                        arrow_table = arrow_table.filter(mask)
+            except Exception as filter_exc:
+                logger.warning(
+                    "Failed to apply user filter on Arrow table: %s", filter_exc
+                )
+                # Continue without filter if filtering fails
+
+        if column_list is not None:
+            try:
+                arrow_table = arrow_table.select(column_list)
+            except Exception as exc:  # noqa: BLE001
+                message = f"Table '{table_name}' missing expected columns {column_list}: {exc}"
+                logger.warning(message)
+                warnings.append(message)
+                return
+
+        for batch in arrow_table.to_batches(max_chunksize=batch_size):
+            if batch.num_rows > 0:
+                yield batch
+    finally:
+        _safe_close_table(table)
 
 
 def _count_rows(
@@ -226,6 +233,7 @@ def _count_rows(
         stacklevel=2,
     )
 
+    table = None
     try:
         table = conn.open_table(table_name)
     except Exception as exc:  # noqa: BLE001 - convert to warning
@@ -243,6 +251,8 @@ def _count_rows(
         logger.warning(message)
         warnings.append(message)
         return 0
+    finally:
+        _safe_close_table(table)
 
 
 def _list_table_names(conn: DBConnection, warnings: List[str]) -> List[str]:

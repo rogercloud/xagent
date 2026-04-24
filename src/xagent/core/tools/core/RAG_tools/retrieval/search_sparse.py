@@ -14,6 +14,7 @@ from ..core.schemas import (
     SearchWarning,
     SparseSearchResponse,
 )
+from ..LanceDB.schema_manager import _safe_close_table
 from ..storage.contracts import FilterExpression
 from ..storage.factory import (
     get_vector_index_store,
@@ -52,6 +53,7 @@ def search_sparse(
             )
         )
 
+    table = None
     try:
         vector_store = get_vector_index_store()
 
@@ -210,6 +212,8 @@ def search_sparse(
             query_text=query_text,
             status="failed",
         )
+    finally:
+        _safe_close_table(table)
 
 
 def _substring_fallback(
@@ -538,6 +542,7 @@ async def _substring_fallback_async(
     if filters:
         query_filters.update(filters)
 
+    _table = None
     try:
         # Open embeddings table with legacy fallback
         _table, table_name = vector_store.open_embeddings_table(model_tag)
@@ -610,5 +615,7 @@ async def _substring_fallback_async(
 
     except Exception as exc:
         logger.error("Async substring fallback failed: %s", exc)
+    finally:
+        _safe_close_table(_table)
 
     return results

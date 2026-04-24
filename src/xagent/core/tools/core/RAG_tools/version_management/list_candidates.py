@@ -11,6 +11,7 @@ from typing import Any, Dict, List, Optional, Union
 
 from ..core.exceptions import DatabaseOperationError, VersionManagementError
 from ..core.schemas import StepType
+from ..LanceDB.schema_manager import _safe_close_table
 from ..storage.factory import get_vector_store_raw_connection
 from ..utils.lancedb_query_utils import query_to_list
 from ..utils.string_utils import build_lancedb_filter_expression
@@ -67,10 +68,14 @@ def _query_table(
     """
     if table_name not in connection.table_names():
         return []
-    table = connection.open_table(table_name)
+    table = None
+    try:
+        table = connection.open_table(table_name)
 
-    filter_expr = build_lancedb_filter_expression(filters)
-    return query_to_list(table.search().where(filter_expr))
+        filter_expr = build_lancedb_filter_expression(filters)
+        return query_to_list(table.search().where(filter_expr))
+    finally:
+        _safe_close_table(table)
 
 
 def _generate_semantic_id(

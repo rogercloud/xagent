@@ -12,7 +12,10 @@ from typing import Any, Dict, List, Optional, Union
 from sqlalchemy.orm import Session
 
 from ...config import get_uploads_dir
-from ...core.tools.core.RAG_tools.LanceDB.schema_manager import ensure_documents_table
+from ...core.tools.core.RAG_tools.LanceDB.schema_manager import (
+    _safe_close_table,
+    ensure_documents_table,
+)
 from ...core.tools.core.RAG_tools.management.status import load_ingestion_status
 from ...core.tools.core.RAG_tools.storage.contracts import DocumentRecord
 from ...core.tools.core.RAG_tools.utils.lancedb_query_utils import query_to_list
@@ -125,21 +128,27 @@ def list_documents_for_user(
     """Load KB document metadata rows for a user."""
     conn = get_connection_from_env()
     ensure_documents_table(conn)
-    table = conn.open_table("documents")
+    table = None
+    try:
+        table = conn.open_table("documents")
 
-    base_filter = ""
-    if collection_name:
-        base_filter = build_lancedb_filter_expression({"collection": collection_name})
-    user_filter = UserPermissions.get_user_filter(user_id, is_admin=is_admin)
-    combined_filter = (
-        f"({base_filter}) and ({user_filter})"
-        if user_filter and base_filter
-        else (user_filter or base_filter)
-    )
-    query = table.search()
-    if combined_filter:
-        query = query.where(combined_filter)
-    return query_to_list(query.limit(10000))
+        base_filter = ""
+        if collection_name:
+            base_filter = build_lancedb_filter_expression(
+                {"collection": collection_name}
+            )
+        user_filter = UserPermissions.get_user_filter(user_id, is_admin=is_admin)
+        combined_filter = (
+            f"({base_filter}) and ({user_filter})"
+            if user_filter and base_filter
+            else (user_filter or base_filter)
+        )
+        query = table.search()
+        if combined_filter:
+            query = query.where(combined_filter)
+        return query_to_list(query.limit(10000))
+    finally:
+        _safe_close_table(table)
 
 
 def build_uploaded_filename_map(
@@ -312,76 +321,81 @@ def aggregate_uploaded_file_statuses(
     # Cache miss - compute from database
     conn = get_connection_from_env()
     ensure_documents_table(conn)
-    documents_table = conn.open_table("documents")
-    user_filter = UserPermissions.get_user_filter(user_id, is_admin=is_admin)
+    documents_table = None
+    try:
+        documents_table = conn.open_table("documents")
+        user_filter = UserPermissions.get_user_filter(user_id, is_admin=is_admin)
 
-    doc_refs_by_file_id: Dict[str, List[tuple[str, str]]] = {
-        file_id: [] for file_id in normalized_file_ids
-    }
-    for offset in range(0, len(normalized_file_ids), _FILE_STATUS_BATCH_SIZE):
-        batch = normalized_file_ids[offset : offset + _FILE_STATUS_BATCH_SIZE]
-        base_filter = _build_file_id_in_filter(batch)
-        combined_filter = _combine_lancedb_filters(base_filter, user_filter)
-
-        query = documents_table.search()
-        if combined_filter:
-            query = query.where(combined_filter)
-        rows = query_to_list(
-            query.select(["file_id", "collection", "doc_id"]).limit(-1)
-        )
-        for row in rows:
-            file_id = str(row.get("file_id") or "").strip()
-            collection = str(row.get("collection") or "").strip()
-            doc_id = str(row.get("doc_id") or "").strip()
-            if file_id and collection and doc_id and file_id in doc_refs_by_file_id:
-                doc_refs_by_file_id[file_id].append((collection, doc_id))
-
-    collections = sorted(
-        {
-            collection
-            for doc_refs in doc_refs_by_file_id.values()
-            for collection, _ in doc_refs
+        doc_refs_by_file_id: Dict[str, List[tuple[str, str]]] = {
+            file_id: [] for file_id in normalized_file_ids
         }
-    )
-    status_by_doc: Dict[tuple[str, str], str] = {}
-    for collection in collections:
-        for entry in load_ingestion_status(
-            collection=collection,
-            user_id=user_id,
-            is_admin=is_admin,
-        ):
-            doc_id = str(entry.get("doc_id") or "").strip()
-            status = str(entry.get("status") or "").strip().lower()
-            if doc_id and status:
-                status_by_doc[(collection, doc_id)] = status
+        for offset in range(0, len(normalized_file_ids), _FILE_STATUS_BATCH_SIZE):
+            batch = normalized_file_ids[offset : offset + _FILE_STATUS_BATCH_SIZE]
+            base_filter = _build_file_id_in_filter(batch)
+            combined_filter = _combine_lancedb_filters(base_filter, user_filter)
 
-    status_map: Dict[str, str] = {}
-    for file_id, doc_refs in doc_refs_by_file_id.items():
-        if not doc_refs:
+            query = documents_table.search()
+            if combined_filter:
+                query = query.where(combined_filter)
+            rows = query_to_list(
+                query.select(["file_id", "collection", "doc_id"]).limit(-1)
+            )
+            for row in rows:
+                file_id = str(row.get("file_id") or "").strip()
+                collection = str(row.get("collection") or "").strip()
+                doc_id = str(row.get("doc_id") or "").strip()
+                if file_id and collection and doc_id and file_id in doc_refs_by_file_id:
+                    doc_refs_by_file_id[file_id].append((collection, doc_id))
+
+        collections = sorted(
+            {
+                collection
+                for doc_refs in doc_refs_by_file_id.values()
+                for collection, _ in doc_refs
+            }
+        )
+        status_by_doc: Dict[tuple[str, str], str] = {}
+        for collection in collections:
+            for entry in load_ingestion_status(
+                collection=collection,
+                user_id=user_id,
+                is_admin=is_admin,
+            ):
+                doc_id = str(entry.get("doc_id") or "").strip()
+                status = str(entry.get("status") or "").strip().lower()
+                if doc_id and status:
+                    status_by_doc[(collection, doc_id)] = status
+
+        status_map: Dict[str, str] = {}
+        for file_id, doc_refs in doc_refs_by_file_id.items():
+            if not doc_refs:
+                status_map[file_id] = "UNKNOWN"
+                continue
+
+            statuses = [
+                status_by_doc.get((collection, doc_id), "")
+                for collection, doc_id in doc_refs
+            ]
+            if any(status == "running" for status in statuses):
+                status_map[file_id] = "RUNNING"
+                continue
+
+            has_failed = any(status == "failed" for status in statuses)
+            has_success = any(status == "success" for status in statuses)
+            if has_failed and not has_success:
+                status_map[file_id] = "FAILED"
+                continue
+            if has_success:
+                status_map[file_id] = "SUCCESS"
+                continue
             status_map[file_id] = "UNKNOWN"
-            continue
 
-        statuses = [
-            status_by_doc.get((collection, doc_id), "")
-            for collection, doc_id in doc_refs
-        ]
-        if any(status == "running" for status in statuses):
-            status_map[file_id] = "RUNNING"
-            continue
+        # Store in cache for future requests
+        if use_cache:
+            _file_status_cache.put(user_id, normalized_file_ids, status_map)
 
-        has_failed = any(status == "failed" for status in statuses)
-        has_success = any(status == "success" for status in statuses)
-        if has_failed and not has_success:
-            status_map[file_id] = "FAILED"
-            continue
-        if has_success:
-            status_map[file_id] = "SUCCESS"
-            continue
-        status_map[file_id] = "UNKNOWN"
-
-    # Store in cache for future requests
-    if use_cache:
-        _file_status_cache.put(user_id, normalized_file_ids, status_map)
+    finally:
+        _safe_close_table(documents_table)
 
     return status_map
 
@@ -414,135 +428,139 @@ def reconcile_uploaded_files(
     cleanup_errors = 0
     conn = get_connection_from_env()
     ensure_documents_table(conn)
-    documents_table = conn.open_table("documents")
-    for record in uploaded_files:
-        scanned += 1
-        file_id = str(record.file_id)
-        status = status_map.get(file_id, "UNKNOWN")
-        if status not in {"FAILED", "UNKNOWN", "RUNNING"}:
-            continue
-
-        created_at = getattr(record, "created_at", None)
-        if created_at is not None and getattr(created_at, "tzinfo", None) is None:
-            created_at = created_at.replace(tzinfo=timezone.utc)
-        if created_at is not None and created_at > cutoff:
-            continue
-
-        # Log warning for RUNNING files as they may indicate crashed ingestion
-        if status == "RUNNING":
-            logger.warning(
-                "Found stale RUNNING file (possible crashed ingestion): file_id=%s, created_at=%s",
-                file_id,
-                created_at,
-            )
-
-        stale_candidates += 1
-        if not delete_stale:
-            continue
-
-        safe_file_id = escape_lancedb_string(file_id)
-        # Query documents table to get (collection, doc_id) pairs for cascade deletion
-        try:
-            doc_rows = query_to_list(
-                documents_table.search()
-                .where(f"file_id = '{safe_file_id}'")
-                .select(["collection", "doc_id"])
-                .limit(-1)
-            )
-        except Exception as exc:  # noqa: BLE001
-            cleanup_errors += 1
-            logger.error(
-                "Failed to query documents for stale file_id=%s: %s",
-                file_id,
-                exc,
-            )
-            continue
-
-        # Cascade delete all related data for each (collection, doc_id) pair
-        # Note: We use cascade_delete for complete cleanup across all tables
-        # (parses, chunks, embeddings_*, main_pointers, ingestion_runs, documents)
-        cascade_deleted = 0
-        cascade_error = False
-        for row in doc_rows:
-            collection = str(row.get("collection") or "").strip()
-            doc_id = str(row.get("doc_id") or "").strip()
-            if not collection or not doc_id:
+    documents_table = None
+    try:
+        documents_table = conn.open_table("documents")
+        for record in uploaded_files:
+            scanned += 1
+            file_id = str(record.file_id)
+            status = status_map.get(file_id, "UNKNOWN")
+            if status not in {"FAILED", "UNKNOWN", "RUNNING"}:
                 continue
 
-            try:
-                deleted_counts = cascade_delete(
-                    target="document",
-                    collection=collection,
-                    doc_id=doc_id,
-                    user_id=user_id,
-                    is_admin=is_admin,
-                    preview_only=False,
-                    confirm=True,
-                )
-                cascade_deleted += sum(int(v) for v in deleted_counts.values())
-                logger.info(
-                    "Cascade deleted %d rows for stale document: collection=%s, doc_id=%s, file_id=%s",
-                    sum(deleted_counts.values()),
-                    collection,
-                    doc_id,
+            created_at = getattr(record, "created_at", None)
+            if created_at is not None and getattr(created_at, "tzinfo", None) is None:
+                created_at = created_at.replace(tzinfo=timezone.utc)
+            if created_at is not None and created_at > cutoff:
+                continue
+
+            # Log warning for RUNNING files as they may indicate crashed ingestion
+            if status == "RUNNING":
+                logger.warning(
+                    "Found stale RUNNING file (possible crashed ingestion): file_id=%s, created_at=%s",
                     file_id,
+                    created_at,
+                )
+
+            stale_candidates += 1
+            if not delete_stale:
+                continue
+
+            safe_file_id = escape_lancedb_string(file_id)
+            # Query documents table to get (collection, doc_id) pairs for cascade deletion
+            try:
+                doc_rows = query_to_list(
+                    documents_table.search()
+                    .where(f"file_id = '{safe_file_id}'")
+                    .select(["collection", "doc_id"])
+                    .limit(-1)
                 )
             except Exception as exc:  # noqa: BLE001
-                cascade_error = True
                 cleanup_errors += 1
                 logger.error(
-                    "Failed to cascade delete for stale document: collection=%s, doc_id=%s, file_id=%s: %s",
-                    collection,
-                    doc_id,
+                    "Failed to query documents for stale file_id=%s: %s",
                     file_id,
                     exc,
                 )
+                continue
 
-        # If cascade delete failed, skip deleting the UploadedFile record
-        # to maintain consistency (file record still references the documents)
-        if cascade_error:
-            logger.warning(
-                "Skipping UploadedFile deletion due to cascade delete errors: file_id=%s",
-                file_id,
-            )
-            continue
+            # Cascade delete all related data for each (collection, doc_id) pair
+            # Note: We use cascade_delete for complete cleanup across all tables
+            # (parses, chunks, embeddings_*, main_pointers, ingestion_runs, documents)
+            cascade_deleted = 0
+            cascade_error = False
+            for row in doc_rows:
+                collection = str(row.get("collection") or "").strip()
+                doc_id = str(row.get("doc_id") or "").strip()
+                if not collection or not doc_id:
+                    continue
 
-        # After relational/vector cleanup succeeds, delete physical file.
-        file_path = Path(str(record.storage_path))
-        uploads_root = get_uploads_dir().resolve()
-        try:
-            resolved_path = file_path.resolve()
-            resolved_path.relative_to(uploads_root)
-        except ValueError:
-            logger.warning(
-                "Skipping stale file cleanup outside uploads root: %s",
-                file_path,
-            )
-        else:
-            if resolved_path.exists() and resolved_path.is_file():
                 try:
-                    resolved_path.unlink()
-                except OSError as exc:
+                    deleted_counts = cascade_delete(
+                        target="document",
+                        collection=collection,
+                        doc_id=doc_id,
+                        user_id=user_id,
+                        is_admin=is_admin,
+                        preview_only=False,
+                        confirm=True,
+                    )
+                    cascade_deleted += sum(int(v) for v in deleted_counts.values())
+                    logger.info(
+                        "Cascade deleted %d rows for stale document: collection=%s, doc_id=%s, file_id=%s",
+                        sum(deleted_counts.values()),
+                        collection,
+                        doc_id,
+                        file_id,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    cascade_error = True
                     cleanup_errors += 1
                     logger.error(
-                        "Failed to delete stale file %s for file_id=%s: %s",
-                        resolved_path,
+                        "Failed to cascade delete for stale document: collection=%s, doc_id=%s, file_id=%s: %s",
+                        collection,
+                        doc_id,
                         file_id,
                         exc,
                     )
-                    continue
 
-        # Finally delete the UploadedFile record
-        db.delete(record)
-        deleted += 1
-        logger.info(
-            "Deleted stale UploadedFile record: file_id=%s (cascade deleted %d related rows)",
-            file_id,
-            cascade_deleted,
-        )
+            # If cascade delete failed, skip deleting the UploadedFile record
+            # to maintain consistency (file record still references the documents)
+            if cascade_error:
+                logger.warning(
+                    "Skipping UploadedFile deletion due to cascade delete errors: file_id=%s",
+                    file_id,
+                )
+                continue
 
-    if delete_stale and deleted > 0:
-        db.commit()
+            # After relational/vector cleanup succeeds, delete physical file.
+            file_path = Path(str(record.storage_path))
+            uploads_root = get_uploads_dir().resolve()
+            try:
+                resolved_path = file_path.resolve()
+                resolved_path.relative_to(uploads_root)
+            except ValueError:
+                logger.warning(
+                    "Skipping stale file cleanup outside uploads root: %s",
+                    file_path,
+                )
+            else:
+                if resolved_path.exists() and resolved_path.is_file():
+                    try:
+                        resolved_path.unlink()
+                    except OSError as exc:
+                        cleanup_errors += 1
+                        logger.error(
+                            "Failed to delete stale file %s for file_id=%s: %s",
+                            resolved_path,
+                            file_id,
+                            exc,
+                        )
+                        continue
+
+            # Finally delete the UploadedFile record
+            db.delete(record)
+            deleted += 1
+            logger.info(
+                "Deleted stale UploadedFile record: file_id=%s (cascade deleted %d related rows)",
+                file_id,
+                cascade_deleted,
+            )
+
+        if delete_stale and deleted > 0:
+            db.commit()
+    finally:
+        _safe_close_table(documents_table)
 
     return {
         "scanned": scanned,

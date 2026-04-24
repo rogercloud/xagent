@@ -9,6 +9,7 @@ from typing import Any, Dict, Optional, Tuple, cast
 import pyarrow as pa  # type: ignore
 
 from ..LanceDB.model_tag_utils import to_model_tag
+from ..LanceDB.schema_manager import _safe_close_table
 from ..storage.factory import get_vector_store_raw_connection
 from .string_utils import escape_lancedb_string
 from .tag_mapping import register_tag_mapping
@@ -181,6 +182,7 @@ def _infer_embedding_config_from_collection(
                 f"Checking table '{table_name}' for collection '{collection_name}'"
             )
 
+            table = None
             try:
                 table = conn.open_table(table_name)
 
@@ -241,6 +243,8 @@ def _infer_embedding_config_from_collection(
             except Exception as e:
                 logger.debug(f"Error opening table '{table_name}': {e}")
                 continue
+            finally:
+                _safe_close_table(table)
 
         if not model_stats:
             logger.info(
@@ -445,6 +449,8 @@ def migrate_embeddings_table(
         }
 
     rows_migrated = 0
+    legacy_table = None
+    target_table = None
 
     try:
         # Check if legacy table exists
@@ -496,9 +502,12 @@ def migrate_embeddings_table(
                     }
             except Exception as e:
                 logger.warning("Could not validate target table dimension: %s", e)
+            finally:
+                _safe_close_table(target_table)
 
         # Ensure target table exists (create if needed)
         ensure_embeddings_table(conn, to_model_tag(cleaned), vector_dim=vector_dim)
+        _safe_close_table(target_table)
         target_table = conn.open_table(primary_table_name)
 
         # Use merge_insert for idempotent, non-destructive migration
@@ -588,11 +597,14 @@ def migrate_embeddings_table(
 
     finally:
         # Release lock
+        _safe_close_table(legacy_table)
+        _safe_close_table(target_table)
         _release_migration_lock(lock_fd)
 
 
 def _table_exists(conn: Any, table_name: str) -> bool:
     """Check if a table exists in the database."""
+    table = None
     try:
         # Try to get table schema
         table_names_fn = getattr(conn, "table_names", None)
@@ -601,10 +613,12 @@ def _table_exists(conn: Any, table_name: str) -> bool:
             return table_name in table_names
         else:
             # Fallback: try to open the table
-            conn.open_table(table_name)
+            table = conn.open_table(table_name)
             return True
     except Exception:
         return False
+    finally:
+        _safe_close_table(table)
 
 
 def _get_vector_dimension_from_table(table: Any) -> Optional[int]:
