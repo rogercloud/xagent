@@ -68,6 +68,54 @@ def build_user_model_visibility_filter(user_id: int, visible_ids: list[int]) -> 
     )
 
 
+def _is_model_visible_to_user(
+    db: Session, model_id: Any, user_id: Optional[int] = None
+) -> bool:
+    """Check whether a DBModel row is visible to *user_id*.
+
+    Returns True when the user has an own ``is_owner`` UserModel **or**
+    when a shared UserModel exists from a visible user.  In non-web /
+    standalone contexts (*user_id* is None) visibility is always granted.
+    """
+    if user_id is None:
+        return True
+    try:
+        from ..models.user import UserModel
+
+        # Step 1: user's own (owner) UserModel
+        own = (
+            db.query(UserModel)
+            .filter(
+                UserModel.model_id == model_id,
+                UserModel.user_id == user_id,
+                UserModel.is_owner.is_(True),
+            )
+            .first()
+        )
+        if own is not None:
+            return True
+
+        # Step 2: shared from visible users
+        visible_ids = _get_visible_user_ids(db, user_id)
+        shared = (
+            db.query(UserModel)
+            .filter(
+                UserModel.model_id == model_id,
+                UserModel.user_id.in_(visible_ids),
+                UserModel.is_shared.is_(True),
+            )
+            .first()
+        )
+        return shared is not None
+    except Exception:
+        logger.warning(
+            "Visibility check failed for model_id=%s user_id=%s — defaulting to visible",
+            model_id,
+            user_id,
+        )
+        return True
+
+
 def get_default_vision_model(user_id: Optional[int] = None) -> Optional[BaseLLM]:
     """
     Get the default vision model for a specific user.
@@ -104,7 +152,8 @@ def get_default_vision_model(user_id: Optional[int] = None) -> Optional[BaseLLM]
                 )
 
                 if vision_default and vision_default.model:
-                    return _create_llm_instance(vision_default.model)
+                    if _is_model_visible_to_user(db, vision_default.model.id, user_id):
+                        return _create_llm_instance(vision_default.model)
 
             # Fallback to visible users' shared defaults
             admin_vision_defaults = (
@@ -166,7 +215,8 @@ def get_default_model(user_id: Optional[int] = None) -> Optional[BaseLLM]:
                 )
 
                 if general_default and general_default.model:
-                    return _create_llm_instance(general_default.model)
+                    if _is_model_visible_to_user(db, general_default.model.id, user_id):
+                        return _create_llm_instance(general_default.model)
 
             # Fallback to visible users' shared defaults
             admin_defaults = (
@@ -228,7 +278,8 @@ def get_fast_model(user_id: Optional[int] = None) -> Optional[BaseLLM]:
                 )
 
                 if fast_default and fast_default.model:
-                    return _create_llm_instance(fast_default.model)
+                    if _is_model_visible_to_user(db, fast_default.model.id, user_id):
+                        return _create_llm_instance(fast_default.model)
 
             # Fallback to visible users' shared defaults
             admin_fast_defaults = (
@@ -290,7 +341,8 @@ def get_compact_model(user_id: Optional[int] = None) -> Optional[BaseLLM]:
                 )
 
                 if compact_default and compact_default.model:
-                    return _create_llm_instance(compact_default.model)
+                    if _is_model_visible_to_user(db, compact_default.model.id, user_id):
+                        return _create_llm_instance(compact_default.model)
 
             # Fallback to visible users' shared defaults
             admin_compact_defaults = (
@@ -352,7 +404,10 @@ def get_embedding_model(user_id: Optional[int] = None) -> Optional[BaseLLM]:
                 )
 
                 if embedding_default and embedding_default.model:
-                    return _create_llm_instance(embedding_default.model)
+                    if _is_model_visible_to_user(
+                        db, embedding_default.model.id, user_id
+                    ):
+                        return _create_llm_instance(embedding_default.model)
 
             # Fallback to visible users' shared defaults
             admin_embedding_defaults = (
@@ -580,12 +635,17 @@ def get_default_image_generate_model(
                 )
 
                 if image_default and image_default.model:
-                    try:
-                        instance = get_image_model_instance(image_default.model)
-                        setattr(instance, "model_id", str(image_default.model.model_id))
-                        return instance
-                    except Exception as e:
-                        logger.warning(f"Failed to create image model instance: {e}")
+                    if _is_model_visible_to_user(db, image_default.model.id, user_id):
+                        try:
+                            instance = get_image_model_instance(image_default.model)
+                            setattr(
+                                instance, "model_id", str(image_default.model.model_id)
+                            )
+                            return instance
+                        except Exception as e:
+                            logger.warning(
+                                f"Failed to create image model instance: {e}"
+                            )
 
             # Fallback to visible users' shared defaults
             admin_image_defaults = (
@@ -661,12 +721,17 @@ def get_default_image_edit_model(
                 )
 
                 if image_default and image_default.model:
-                    try:
-                        instance = get_image_model_instance(image_default.model)
-                        setattr(instance, "model_id", str(image_default.model.model_id))
-                        return instance
-                    except Exception as e:
-                        logger.warning(f"Failed to create image model instance: {e}")
+                    if _is_model_visible_to_user(db, image_default.model.id, user_id):
+                        try:
+                            instance = get_image_model_instance(image_default.model)
+                            setattr(
+                                instance, "model_id", str(image_default.model.model_id)
+                            )
+                            return instance
+                        except Exception as e:
+                            logger.warning(
+                                f"Failed to create image model instance: {e}"
+                            )
 
             # Fallback to visible users' shared defaults
             admin_image_defaults = (
@@ -735,7 +800,8 @@ def get_default_embedding_model(user_id: Optional[int] = None) -> Optional[str]:
         )
 
         if embedding_default and embedding_default.model:
-            return str(embedding_default.model.model_id)
+            if _is_model_visible_to_user(db, embedding_default.model.id, user_id):
+                return str(embedding_default.model.model_id)
 
     # Visible users' shared defaults
     admin_embedding_defaults = (
@@ -900,10 +966,11 @@ def get_default_asr_model(user_id: Optional[int] = None) -> Optional[Any]:
                 )
 
                 if asr_default and asr_default.model:
-                    try:
-                        return get_asr_model_instance(asr_default.model)
-                    except Exception as e:
-                        logger.warning(f"Failed to create ASR model instance: {e}")
+                    if _is_model_visible_to_user(db, asr_default.model.id, user_id):
+                        try:
+                            return get_asr_model_instance(asr_default.model)
+                        except Exception as e:
+                            logger.warning(f"Failed to create ASR model instance: {e}")
 
             # Visible users' shared defaults
             admin_asr_defaults = (
@@ -967,10 +1034,11 @@ def get_default_tts_model(user_id: Optional[int] = None) -> Optional[Any]:
                 )
 
                 if tts_default and tts_default.model:
-                    try:
-                        return get_tts_model_instance(tts_default.model)
-                    except Exception as e:
-                        logger.warning(f"Failed to create TTS model instance: {e}")
+                    if _is_model_visible_to_user(db, tts_default.model.id, user_id):
+                        try:
+                            return get_tts_model_instance(tts_default.model)
+                        except Exception as e:
+                            logger.warning(f"Failed to create TTS model instance: {e}")
 
             # Visible users' shared defaults
             admin_tts_defaults = (

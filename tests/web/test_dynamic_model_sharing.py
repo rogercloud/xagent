@@ -1091,3 +1091,155 @@ class TestModeAMultipleUsers:
         assert len(general2) == 1
         assert general2[0]["model"]["model_id"] == sample_model_data["model_id"]
         assert general2[0]["model"]["is_owner"] is False
+
+
+# ===========================================================================
+# 11. Legacy Data Compatibility
+# ===========================================================================
+
+
+class TestLegacyDataCompatibility:
+    """Tests for legacy UserModel rows (pre-created with is_owner=False)."""
+
+    def test_legacy_non_owner_row_not_treated_as_own(
+        self, test_db, admin_headers, regular_headers, sample_model_data
+    ):
+        """A legacy UserModel with is_owner=False is not treated as ownership —
+        verified via list_models. The model is visible through the legacy row
+        but is_owner is correctly False."""
+        # Admin creates a private model
+        create_response = client.post(
+            "/api/models/", json=sample_model_data, headers=admin_headers
+        )
+        assert create_response.status_code == 200
+        model_db_id = create_response.json()["id"]
+
+        # Simulate a legacy non-owner UserModel for the regular user
+        db = next(get_db())
+        from xagent.web.models.user import User, UserModel
+
+        regular = db.query(User).filter(User.username == "regularuser").first()
+        assert regular is not None
+        legacy_row = UserModel(
+            user_id=regular.id,
+            model_id=model_db_id,
+            is_owner=False,
+            is_shared=False,
+        )
+        db.add(legacy_row)
+        db.commit()
+        db.close()
+
+        # Regular user sees the model via legacy row, but is_owner=False
+        list_response = client.get("/api/models/", headers=regular_headers)
+        assert list_response.status_code == 200
+        data = list_response.json()
+        found = [m for m in data if m["model_id"] == sample_model_data["model_id"]]
+        assert len(found) == 1
+        assert found[0]["is_owner"] is False
+
+    def test_legacy_duplicate_rows_deduped_in_list(
+        self, test_db, admin_headers, regular_headers, sample_model_data
+    ):
+        """When both a legacy (is_owner=False, is_shared=True) and a real owner
+        UserModel exist, list_models returns exactly one row with correct ownership."""
+        sample_model_data["share_with_users"] = False
+        create_response = client.post(
+            "/api/models/", json=sample_model_data, headers=admin_headers
+        )
+        assert create_response.status_code == 200
+
+        # Regular user's own model via API (creates is_owner=True UserModel)
+        own_data = dict(sample_model_data)
+        own_data["model_id"] = "regular-owned-model"
+        own_create = client.post("/api/models/", json=own_data, headers=regular_headers)
+        assert own_create.status_code == 200
+
+        # Admin sees exactly one row for their own model
+        list_response = client.get("/api/models/", headers=admin_headers)
+        assert list_response.status_code == 200
+        data = list_response.json()
+        admin_models = [
+            m for m in data if m["model_id"] == sample_model_data["model_id"]
+        ]
+        assert len(admin_models) == 1
+        assert admin_models[0]["is_owner"] is True
+
+
+# ===========================================================================
+# 12. Stale Default Visibility
+# ===========================================================================
+
+
+class TestGetUserDefaultModelsStaleSkip:
+    """Tests for stale UserDefaultModel visibility."""
+
+    def test_skips_stale_user_default_and_falls_back(
+        self, test_db, admin_headers, regular_headers, sample_model_data
+    ):
+        """When user's default points to a model no longer visible,
+        get_user_default_models falls back to admin shared defaults."""
+        # Admin creates a shared model and another as fallback
+        sample_model_data["share_with_users"] = True
+        create_response = client.post(
+            "/api/models/", json=sample_model_data, headers=admin_headers
+        )
+        assert create_response.status_code == 200
+        model_db_id = create_response.json()["id"]
+        model_id_str = create_response.json()["model_id"]
+
+        # Admin sets this as own default
+        client.post(
+            "/api/models/user-default",
+            json={"model_id": model_db_id, "config_type": "general"},
+            headers=admin_headers,
+        )
+
+        # Regular user sets it as own default too
+        client.post(
+            "/api/models/user-default",
+            json={"model_id": model_db_id, "config_type": "general"},
+            headers=regular_headers,
+        )
+
+        # Verify regular user sees the default
+        defaults_before = client.get(
+            "/api/models/user-default", headers=regular_headers
+        )
+        general_before = [
+            d for d in defaults_before.json() if d.get("config_type") == "general"
+        ]
+        assert len(general_before) == 1
+
+        # Admin un-shares the model (remove admin's own default first to avoid constraint)
+        client.delete("/api/models/user-default/general", headers=admin_headers)
+        # Create a second model as admin's new default
+        second_model_data = dict(sample_model_data)
+        second_model_data["model_id"] = "fallback-model"
+        second_model_data["share_with_users"] = True
+        second_create = client.post(
+            "/api/models/", json=second_model_data, headers=admin_headers
+        )
+        assert second_create.status_code == 200
+        second_model_db_id = second_create.json()["id"]
+        client.post(
+            "/api/models/user-default",
+            json={"model_id": second_model_db_id, "config_type": "general"},
+            headers=admin_headers,
+        )
+        # Now un-share first model
+        unshare_response = client.put(
+            f"/api/models/{model_id_str}",
+            json={"share_with_users": False},
+            headers=admin_headers,
+        )
+        assert unshare_response.status_code == 200
+
+        # Regular user's stale default should be skipped; falls back to admin's new default
+        defaults_after = client.get("/api/models/user-default", headers=regular_headers)
+        general_after = [
+            d for d in defaults_after.json() if d.get("config_type") == "general"
+        ]
+        assert len(general_after) == 1
+        assert general_after[0]["model"]["model_id"] == "fallback-model"
+        assert general_after[0]["model"]["is_owner"] is False

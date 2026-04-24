@@ -1509,7 +1509,9 @@ async def create_task(
             own_model = (
                 db.query(UserModel)
                 .filter(
-                    UserModel.user_id == int(user.id), UserModel.model_id == db_model.id
+                    UserModel.user_id == int(user.id),
+                    UserModel.model_id == db_model.id,
+                    UserModel.is_owner.is_(True),
                 )
                 .first()
             )

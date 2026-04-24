@@ -8,7 +8,10 @@ from typing import TYPE_CHECKING, Any, Mapping, Optional, Type
 from pydantic import BaseModel, Field
 
 from .....config import get_uploads_dir
-from .....web.services.model_service import _get_visible_user_ids
+from .....web.services.model_service import (
+    _get_visible_user_ids,
+    _is_model_visible_to_user,
+)
 from ....utils.type_check import ensure_list
 from .base import AbstractBaseTool, ToolCategory, ToolVisibility
 
@@ -440,6 +443,14 @@ class CreateAgentTool(AbstractBaseTool):
                     "visual",
                     "compact",
                 ]:
+                    if default.model:
+                        try:
+                            if not _is_model_visible_to_user(
+                                self._db, default.model.id, self._user_id
+                            ):
+                                continue
+                        except Exception:
+                            pass
                     models_config[default.config_type] = default.model_id
 
             missing_types = [

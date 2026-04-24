@@ -225,3 +225,53 @@ class TestModelService:
             assert mock_create.call_count == 2
             # _get_visible_user_ids should have been called for both users
             assert mock_visible.call_count == 2
+
+    def test_get_default_model_stale_default_skipped(self):
+        """Stale user default (model no longer visible) falls through to admin fallback."""
+        with (
+            patch("xagent.web.models.database.get_db") as mock_get_db,
+            patch("xagent.web.services.llm_utils._create_llm_instance") as mock_create,
+            patch(
+                "xagent.web.services.model_service._get_visible_user_ids"
+            ) as mock_visible,
+            patch(
+                "xagent.web.services.model_service._is_model_visible_to_user"
+            ) as mock_visibility,
+        ):
+            mock_visible.return_value = [1]
+            mock_visibility.return_value = False  # model NOT visible — stale
+
+            mock_db = MagicMock()
+            mock_get_db.return_value = iter([mock_db])
+
+            # UserDefaultModel found, but visibility check fails
+            mock_user_default = MagicMock()
+            mock_user_default.user_id = 42
+            mock_user_default.config_type = "general"
+            mock_user_default.model = MagicMock()
+            mock_user_default.model.id = 42
+
+            mock_first_result = MagicMock()
+            mock_first_result.first.return_value = mock_user_default
+            mock_all_result = MagicMock()
+            mock_all_result.all.return_value = [MagicMock()]
+
+            # Two filter calls: one for user-specific (returns None after visibility fails),
+            # then admin fallback
+            mock_db.query.return_value.join.return_value.filter.side_effect = [
+                mock_first_result,  # user-specific query
+                mock_all_result,  # admin fallback query
+            ]
+
+            mock_llm = MagicMock()
+            mock_create.return_value = mock_llm
+
+            result = get_default_model(42)
+
+            assert result == mock_llm
+            # Visibility check was called
+            mock_visibility.assert_called_once_with(mock_db, 42, 42)
+            # Admin fallback was used (create_llm called)
+            mock_create.assert_called_once()
+            # _get_visible_user_ids was called for admin fallback
+            mock_visible.assert_called_with(mock_db, 42)

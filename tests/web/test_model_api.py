@@ -353,34 +353,6 @@ class TestModelAPI:
         assert len(data) == 1
         assert data[0]["model_id"] == sample_model_data["model_id"]
 
-    def test_get_shared_models(
-        self,
-        test_db,
-        admin_user,
-        admin_headers,
-        regular_user,
-        regular_headers,
-        sample_model_data,
-    ):
-        """Test getting shared models"""
-        # Admin creates a shared model
-        sample_model_data["share_with_users"] = True
-        create_response = client.post(
-            "/api/models/", json=sample_model_data, headers=admin_headers
-        )
-        assert create_response.status_code == 200
-
-        # Regular user should see the shared model
-        response = client.get("/api/models/", headers=regular_headers)
-        assert response.status_code == 200
-        data = response.json()
-        assert len(data) == 1
-        assert data[0]["model_id"] == sample_model_data["model_id"]
-        assert data[0]["is_shared"] is True
-        assert data[0]["is_owner"] is False  # Regular user is not owner
-        assert data[0]["can_edit"] is False  # Regular user cannot edit
-        assert data[0]["can_delete"] is False  # Regular user cannot delete
-
     def test_get_model_by_id(
         self, test_db, regular_user, regular_headers, sample_model_data
     ):
@@ -420,33 +392,6 @@ class TestModelAPI:
         data = response.json()
         assert data["temperature"] == 0.8
         assert data["description"] == "Updated description"
-
-    def test_update_shared_model_as_non_owner_fails(
-        self,
-        test_db,
-        admin_user,
-        admin_headers,
-        regular_user,
-        regular_headers,
-        sample_model_data,
-    ):
-        """Test that non-owner cannot update shared model"""
-        # Admin creates a shared model
-        sample_model_data["share_with_users"] = True
-        create_response = client.post(
-            "/api/models/", json=sample_model_data, headers=admin_headers
-        )
-        assert create_response.status_code == 200
-        model_id_str = create_response.json()["model_id"]
-
-        # Regular user tries to update
-        update_data = {"temperature": 0.8}
-        response = client.put(
-            f"/api/models/{model_id_str}", json=update_data, headers=regular_headers
-        )
-        assert response.status_code == 403
-        data = response.json()
-        assert "No permission to edit this model" in data["detail"]
 
     def test_delete_model_as_owner(
         self, test_db, regular_user, regular_headers, sample_model_data
@@ -529,30 +474,6 @@ class TestModelAPI:
         assert delete_response.status_code == 200
         assert delete_response.json()["message"] == "Model deleted successfully"
 
-    def test_delete_shared_model_as_non_owner_fails(
-        self,
-        test_db,
-        admin_user,
-        admin_headers,
-        regular_user,
-        regular_headers,
-        sample_model_data,
-    ):
-        """Test that non-owner cannot delete shared model"""
-        # Admin creates a shared model
-        sample_model_data["share_with_users"] = True
-        create_response = client.post(
-            "/api/models/", json=sample_model_data, headers=admin_headers
-        )
-        assert create_response.status_code == 200
-        model_id_str = create_response.json()["model_id"]
-
-        # Regular user tries to delete
-        response = client.delete(f"/api/models/{model_id_str}", headers=regular_headers)
-        assert response.status_code == 403
-        data = response.json()
-        assert "No permission to delete this model" in data["detail"]
-
     def test_get_nonexistent_model(self, test_db, regular_user, regular_headers):
         """Test getting non-existent model"""
         response = client.get("/api/models/99999", headers=regular_headers)
@@ -612,17 +533,22 @@ class TestModelAPI:
         )
         assert response.status_code == 200
 
-        # Create another user and verify they don't see the first user's private model
+        # Create another user
         user2_data = {"username": "user2", "password": "password2"}
         user2_response = client.post("/api/auth/register", json=user2_data)
         assert user2_response.status_code == 200
-        assert user2_response.json().get("success") is True
+
+        # Login as user2
+        login2 = client.post(
+            "/api/auth/login", json={"username": "user2", "password": "password2"}
+        )
+        user2_headers = {"Authorization": f"Bearer {login2.json()['access_token']}"}
 
         # User2 should not see user1's private model
-        models_response = client.get("/api/models/", headers=regular_headers)
+        models_response = client.get("/api/models/", headers=user2_headers)
         assert models_response.status_code == 200
         data = models_response.json()
-        assert len(data) == 1  # User should still see their own model
+        assert len(data) == 0  # User2 shouldn't see user1's private model
 
     def test_model_with_abilities(
         self, test_db, regular_user, regular_headers, sample_model_data

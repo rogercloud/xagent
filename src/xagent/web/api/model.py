@@ -91,7 +91,11 @@ def _resolve_accessible_model(
     # Step 1: own UserModel
     user_model = (
         db.query(UserModel)
-        .filter(UserModel.model_id == db_model.id, UserModel.user_id == user.id)
+        .filter(
+            UserModel.model_id == db_model.id,
+            UserModel.user_id == user.id,
+            UserModel.is_owner.is_(True),
+        )
         .first()
     )
     if user_model:
@@ -120,7 +124,7 @@ def _serialize_model_with_access(
     """Build a model response payload with user access info."""
 
     is_owner = (
-        user_model.user_id == requesting_user_id
+        user_model.is_owner and user_model.user_id == requesting_user_id
         if requesting_user_id is not None
         else user_model.is_owner
     )
@@ -397,10 +401,28 @@ async def list_models(
 
     # Get models that user has access to (owned or shared from visible users)
     visible_ids = _get_visible_user_ids(db, int(user.id))
+
+    # Correlated subquery: for each DBModel, pick exactly one UserModel row,
+    # preferring the user's own row (deduplicates legacy shared data).
+    best_user_model_id = (
+        db.query(UserModel.id)
+        .filter(
+            UserModel.model_id == DBModel.id,
+            build_user_model_visibility_filter(int(user.id), visible_ids),
+        )
+        .order_by(
+            (UserModel.user_id == user.id).desc(),
+            UserModel.is_owner.desc(),
+        )
+        .limit(1)
+        .correlate(DBModel)
+        .scalar_subquery()
+    )
+
     query = (
         db.query(DBModel, UserModel)
         .join(UserModel, DBModel.id == UserModel.model_id)
-        .filter(build_user_model_visibility_filter(int(user.id), visible_ids))
+        .filter(UserModel.id == best_user_model_id)
     )
     if model_provider:
         query = query.filter(DBModel.model_provider == model_provider)
@@ -415,7 +437,7 @@ async def list_models(
 
     result = []
     for db_model, user_model in models:
-        is_owner = user_model.user_id == user.id
+        is_owner = user_model.is_owner and user_model.user_id == user.id
         model_data = {
             "id": db_model.id,
             "model_id": db_model.model_id,
@@ -487,6 +509,7 @@ async def get_user_default_models(
 
         # Process each config type
         for config_type in all_config_types:
+            user_model = None
             if config_type in user_defaults_by_type:
                 # User has their own default for this type
                 ud = user_defaults_by_type[config_type]
@@ -502,7 +525,7 @@ async def get_user_default_models(
                 )
 
                 if user_model:
-                    is_owner = user_model.user_id == user.id
+                    is_owner = user_model.is_owner and user_model.user_id == user.id
                     model_data = {
                         "id": ud.id,
                         "user_id": ud.user_id,
@@ -539,8 +562,10 @@ async def get_user_default_models(
                         },
                     }
                     result.append(model_data)
-            else:
-                # User has no default for this type, try visible users' shared defaults
+                    continue
+
+            if not user_model:
+                # User has no default for this type (or it's stale), try visible users' shared defaults
                 admin_default = (
                     db.query(UserDefaultModel)
                     .join(DBModel, UserDefaultModel.model_id == DBModel.id)

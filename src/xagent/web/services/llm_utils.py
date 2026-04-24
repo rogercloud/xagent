@@ -461,12 +461,13 @@ class UserAwareModelStorage:
                 logger.info(
                     f"Checking user access: user_id={user_id}, model_id={db_model.id}"
                 )
-                # Step 1: own UserModel
+                # Step 1: own UserModel (must be owner)
                 user_model = (
                     self.db.query(UserModel)
                     .filter(
                         UserModel.user_id == user_id,
                         UserModel.model_id == db_model.id,
+                        UserModel.is_owner.is_(True),
                     )
                     .first()
                 )
@@ -541,10 +542,21 @@ class UserAwareModelStorage:
                 )
 
                 if general_default and general_default.model:
-                    model_config = self.core_storage.load(
-                        general_default.model.model_id
-                    )
-                    default_llm = self.core_storage.create_llm_instance(model_config)
+                    try:
+                        from .model_service import _is_model_visible_to_user
+
+                        visible = _is_model_visible_to_user(
+                            self.db, general_default.model.id, user_id
+                        )
+                    except Exception:
+                        visible = True
+                    if visible:
+                        model_config = self.core_storage.load(
+                            general_default.model.model_id
+                        )
+                        default_llm = self.core_storage.create_llm_instance(
+                            model_config
+                        )
 
                 # Get small/fast model
                 fast_default = (
@@ -562,8 +574,19 @@ class UserAwareModelStorage:
                 )
 
                 if fast_default and fast_default.model:
-                    model_config = self.core_storage.load(fast_default.model.model_id)
-                    fast_llm = self.core_storage.create_llm_instance(model_config)
+                    try:
+                        from .model_service import _is_model_visible_to_user
+
+                        visible = _is_model_visible_to_user(
+                            self.db, fast_default.model.id, user_id
+                        )
+                    except Exception:
+                        visible = True
+                    if visible:
+                        model_config = self.core_storage.load(
+                            fast_default.model.model_id
+                        )
+                        fast_llm = self.core_storage.create_llm_instance(model_config)
 
                 # Get vision model
                 vision_default = (
@@ -581,8 +604,19 @@ class UserAwareModelStorage:
                 )
 
                 if vision_default and vision_default.model:
-                    model_config = self.core_storage.load(vision_default.model.model_id)
-                    vision_llm = self.core_storage.create_llm_instance(model_config)
+                    try:
+                        from .model_service import _is_model_visible_to_user
+
+                        visible = _is_model_visible_to_user(
+                            self.db, vision_default.model.id, user_id
+                        )
+                    except Exception:
+                        visible = True
+                    if visible:
+                        model_config = self.core_storage.load(
+                            vision_default.model.model_id
+                        )
+                        vision_llm = self.core_storage.create_llm_instance(model_config)
 
                 # Get compact model
                 compact_default = (
@@ -600,10 +634,21 @@ class UserAwareModelStorage:
                 )
 
                 if compact_default and compact_default.model:
-                    model_config = self.core_storage.load(
-                        compact_default.model.model_id
-                    )
-                    compact_llm = self.core_storage.create_llm_instance(model_config)
+                    try:
+                        from .model_service import _is_model_visible_to_user
+
+                        visible = _is_model_visible_to_user(
+                            self.db, compact_default.model.id, user_id
+                        )
+                    except Exception:
+                        visible = True
+                    if visible:
+                        model_config = self.core_storage.load(
+                            compact_default.model.model_id
+                        )
+                        compact_llm = self.core_storage.create_llm_instance(
+                            model_config
+                        )
 
             # If user-specific defaults are not complete, try visible users' shared defaults
             if not default_llm or not fast_llm or not vision_llm or not compact_llm:

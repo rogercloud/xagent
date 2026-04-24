@@ -81,10 +81,28 @@ class DynamicMemoryStoreManager:
                             .first()
                         )
                         if embedding_model:
-                            logger.info(
-                                f"Found user's default embedding model: {embedding_model.model_id}"
-                            )
-                            return embedding_model
+                            try:
+                                from .services.model_service import (
+                                    _is_model_visible_to_user,
+                                )
+
+                                if not _is_model_visible_to_user(
+                                    db, embedding_model.id, user_id
+                                ):
+                                    logger.warning(
+                                        f"User default embedding model {user_default.model_id} is no longer visible"
+                                    )
+                                    # fall through to system fallback
+                                else:
+                                    logger.info(
+                                        f"Found user's default embedding model: {embedding_model.model_id}"
+                                    )
+                                    return embedding_model
+                            except Exception:
+                                logger.info(
+                                    f"Found user's default embedding model: {embedding_model.model_id}"
+                                )
+                                return embedding_model
                         else:
                             logger.warning(
                                 f"User default embedding model {user_default.model_id} not found or inactive"
