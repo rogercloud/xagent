@@ -506,7 +506,7 @@ async def _load_collection_ingestion_configs(
 
 
 async def list_collections(
-    user_id: Optional[int] = None, is_admin: bool = False
+    user_id: Optional[int] = None, is_admin: bool = False, force_realtime: bool = False
 ) -> ListCollectionsResult:
     """List all knowledge base collections along with aggregated statistics.
 
@@ -527,12 +527,7 @@ async def list_collections(
     warnings: List[str] = []
 
     try:
-        # Use storage abstraction for aggregation
         vector_store = get_vector_index_store()
-        stats: Dict[str, Dict[str, int]] = vector_store.aggregate_collection_stats(
-            user_id=user_id,
-            is_admin=is_admin,
-        )
 
         document_names: Dict[str, Set[str]] = defaultdict(set)
         owners: Dict[str, Set[int]] = defaultdict(set)
@@ -583,68 +578,141 @@ async def list_collections(
                 )
             )
 
-        def _collect_document_names() -> None:
-            for batch in vector_store.iter_batches(
-                table_name="documents",
-                columns=[
-                    "collection",
-                    "source_path",
-                    "doc_id",
-                    "file_id",
-                    "user_id",
-                ],
+        # Step 1: Scan documents table once to get collection list,
+        # document names, and owners (real-time, user-filtered).
+        for batch in vector_store.iter_batches(
+            table_name="documents",
+            columns=[
+                "collection",
+                "source_path",
+                "doc_id",
+                "file_id",
+                "user_id",
+            ],
+            user_id=user_id,
+            is_admin=is_admin,
+        ):
+            collection_idx = batch.schema.get_field_index("collection")
+            source_idx = batch.schema.get_field_index("source_path")
+            doc_id_idx = batch.schema.get_field_index("doc_id")
+            file_id_idx = batch.schema.get_field_index("file_id")
+            user_idx = batch.schema.get_field_index("user_id")
+            if collection_idx == -1:
+                continue
+            collection_array = batch.column(collection_idx)
+            source_array = (
+                batch.column(source_idx)
+                if source_idx != -1
+                else pa.array([None] * batch.num_rows)
+            )
+            doc_id_array = (
+                batch.column(doc_id_idx)
+                if doc_id_idx != -1
+                else pa.array([None] * batch.num_rows)
+            )
+            file_id_array = (
+                batch.column(file_id_idx)
+                if file_id_idx != -1
+                else pa.array([None] * batch.num_rows)
+            )
+            user_array = (
+                batch.column(user_idx)
+                if user_idx != -1
+                else pa.array([None] * batch.num_rows)
+            )
+            for idx in range(batch.num_rows):
+                collection_raw = collection_array[idx].as_py()
+                if not collection_raw:
+                    continue
+                collection_key = str(collection_raw)
+                _add_document_entry(
+                    collection_key,
+                    source_array[idx].as_py(),
+                    doc_id_array[idx].as_py(),
+                    file_id_array[idx].as_py(),
+                )
+                user_val = user_array[idx].as_py()
+                if user_val is not None:
+                    try:
+                        owners[collection_key].add(int(user_val))
+                    except (TypeError, ValueError):
+                        pass
+
+        collection_keys = sorted(document_names.keys())
+
+        # Step 2: Get stats. Try metadata cache first; fallback to realtime scan.
+        stats: Dict[str, Dict[str, int]] = {}
+        if not force_realtime:
+            try:
+                from ..storage.factory import get_metadata_store
+
+                metadata_store = get_metadata_store()
+                cached = await metadata_store.list_collections()
+                for info in cached:
+                    if info.name in collection_keys or is_admin:
+                        stats[info.name] = {
+                            "documents": info.documents,
+                            "parses": info.parses,
+                            "chunks": info.chunks,
+                            "embeddings": info.embeddings,
+                        }
+            except Exception as exc:
+                logger.debug(
+                    "Metadata cache unavailable, falling back to realtime: %s", exc
+                )
+
+        # Fallback to realtime aggregation for missing collections or cache failure
+        used_realtime = False
+        if (
+            force_realtime
+            or not stats
+            or any(key not in stats for key in collection_keys)
+        ):
+            used_realtime = True
+            realtime_stats = vector_store.aggregate_collection_stats(
                 user_id=user_id,
                 is_admin=is_admin,
-            ):
-                collection_idx = batch.schema.get_field_index("collection")
-                source_idx = batch.schema.get_field_index("source_path")
-                doc_id_idx = batch.schema.get_field_index("doc_id")
-                file_id_idx = batch.schema.get_field_index("file_id")
-                user_idx = batch.schema.get_field_index("user_id")
-                if collection_idx == -1:
-                    continue
-                collection_array = batch.column(collection_idx)
-                source_array = (
-                    batch.column(source_idx)
-                    if source_idx != -1
-                    else pa.array([None] * batch.num_rows)
-                )
-                doc_id_array = (
-                    batch.column(doc_id_idx)
-                    if doc_id_idx != -1
-                    else pa.array([None] * batch.num_rows)
-                )
-                file_id_array = (
-                    batch.column(file_id_idx)
-                    if file_id_idx != -1
-                    else pa.array([None] * batch.num_rows)
-                )
-                user_array = (
-                    batch.column(user_idx)
-                    if user_idx != -1
-                    else pa.array([None] * batch.num_rows)
-                )
-                for idx in range(batch.num_rows):
-                    collection_raw = collection_array[idx].as_py()
-                    if not collection_raw:
-                        continue
-                    collection_key = str(collection_raw)
-                    _add_document_entry(
-                        collection_key,
-                        source_array[idx].as_py(),
-                        doc_id_array[idx].as_py(),
-                        file_id_array[idx].as_py(),
+            )
+            for key in collection_keys:
+                if key not in stats:
+                    stats[key] = realtime_stats.get(
+                        key,
+                        {
+                            "documents": 0,
+                            "parses": 0,
+                            "chunks": 0,
+                            "embeddings": 0,
+                        },
                     )
-                    user_val = user_array[idx].as_py()
-                    if user_val is not None:
-                        try:
-                            owners[collection_key].add(int(user_val))
-                        except (TypeError, ValueError):
-                            pass
 
-        _collect_document_names()
+        # Async write stats back to metadata cache for next request
+        if used_realtime:
+            try:
+                from ..storage.factory import get_metadata_store
 
-        collection_keys = sorted(stats.keys() | document_names.keys())
+                metadata_store = get_metadata_store()
+                for collection in collection_keys:
+                    info = CollectionInfo(
+                        name=collection,
+                        documents=stats[collection]["documents"],
+                        parses=stats[collection]["parses"],
+                        chunks=stats[collection]["chunks"],
+                        embeddings=stats[collection]["embeddings"],
+                        processed_documents=stats[collection]["parses"],
+                        document_names=sorted(document_names.get(collection, set())),
+                        document_metadata=sorted(
+                            document_metadata.get(collection, []),
+                            key=lambda item: (
+                                item.filename,
+                                item.file_id or "",
+                                item.doc_id or "",
+                            ),
+                        ),
+                        owners=sorted(owners.get(collection, set())),
+                    )
+                    await metadata_store.save_collection(info)
+            except Exception as exc:
+                logger.debug("Failed to cache collection metadata: %s", exc)
 
         # Load configs for collections (admin sees cross-tenant configs)
         collection_configs: Dict[str, IngestionConfig] = {}

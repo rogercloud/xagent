@@ -647,7 +647,8 @@ async def rebuild_collection_metadata() -> None:
     from . import collections
 
     # Get all existing collections (use is_admin=True to bypass user filtering)
-    result = await collections.list_collections(is_admin=True)
+    # force_realtime=True to avoid reading stale metadata cache.
+    result = await collections.list_collections(is_admin=True, force_realtime=True)
 
     if result.status != "success":
         logger.error(f"Failed to list collections: {result.message}")

@@ -94,3 +94,154 @@ async def test_handle_kb_exceptions_maps_unknown_errors_to_500() -> None:
     assert exc_info.value.status_code == 500
     assert isinstance(exc_info.value.detail, str)
     assert exc_info.value.detail.startswith("服务器内部错误:")
+
+
+# --- delete_collection_api metadata cleanup Tests ---
+
+_FACTORY_PATH = "xagent.core.tools.core.RAG_tools.storage.factory.get_metadata_store"
+
+
+@pytest.mark.asyncio
+async def test_delete_collection_api_cleans_metadata_cache() -> None:
+    """After successful deletion, metadata_store.delete_collection() should be called."""
+    from unittest.mock import AsyncMock, MagicMock, patch
+
+    from xagent.web.api.kb import delete_collection_api
+    from xagent.web.models.user import User
+
+    mock_user = MagicMock(spec=User)
+    mock_user.id = 1
+    mock_user.is_admin = True
+    mock_db = MagicMock()
+
+    mock_metadata_store = MagicMock()
+    mock_metadata_store.delete_collection = AsyncMock()
+
+    _fake_delete_result = MagicMock()
+    _fake_delete_result.status = "success"
+    _fake_delete_result.affected_documents = 1
+    _fake_delete_result.deleted_counts = {"documents": 1}
+
+    with (
+        patch("xagent.web.api.kb.delete_collection_physical_dir"),
+        patch(
+            "xagent.web.api.kb.get_vector_index_store",
+            return_value=MagicMock(),
+        ),
+        patch(
+            "xagent.core.tools.core.RAG_tools.management.collections.delete_collection",
+            return_value=_fake_delete_result,
+        ),
+        patch(
+            "xagent.web.api.kb.delete_collection_uploaded_files",
+            return_value=None,
+        ),
+        patch(
+            _FACTORY_PATH,
+            return_value=mock_metadata_store,
+        ),
+    ):
+        await delete_collection_api(
+            collection_name="test_collection_abc",
+            _user=mock_user,
+            db=mock_db,
+        )
+
+    mock_metadata_store.delete_collection.assert_awaited_once_with(
+        "test_collection_abc"
+    )
+
+
+@pytest.mark.asyncio
+async def test_delete_collection_api_metadata_error_not_fatal() -> None:
+    """If metadata_store.delete_collection() fails, the API should still return success."""
+    from unittest.mock import AsyncMock, MagicMock, patch
+
+    from xagent.web.api.kb import delete_collection_api
+    from xagent.web.models.user import User
+
+    mock_user = MagicMock(spec=User)
+    mock_user.id = 1
+    mock_user.is_admin = True
+    mock_db = MagicMock()
+
+    mock_metadata_store = MagicMock()
+    mock_metadata_store.delete_collection = AsyncMock(
+        side_effect=RuntimeError("metadata store unreachable")
+    )
+
+    _fake_delete_result = MagicMock()
+    _fake_delete_result.status = "success"
+    _fake_delete_result.affected_documents = 1
+    _fake_delete_result.deleted_counts = {"documents": 1}
+
+    with (
+        patch("xagent.web.api.kb.delete_collection_physical_dir"),
+        patch(
+            "xagent.web.api.kb.get_vector_index_store",
+            return_value=MagicMock(),
+        ),
+        patch(
+            "xagent.core.tools.core.RAG_tools.management.collections.delete_collection",
+            return_value=_fake_delete_result,
+        ),
+        patch(
+            "xagent.web.api.kb.delete_collection_uploaded_files",
+            return_value=None,
+        ),
+        patch(
+            _FACTORY_PATH,
+            return_value=mock_metadata_store,
+        ),
+    ):
+        result = await delete_collection_api(
+            collection_name="test_collection",
+            _user=mock_user,
+            db=mock_db,
+        )
+
+    # Should not raise — error is logged but swallowed
+    assert result.status == "success"
+
+
+@pytest.mark.asyncio
+async def test_delete_collection_api_failed_no_metadata_cleanup() -> None:
+    """If deletion fails (not success/partial_success), metadata should NOT be cleaned."""
+    from unittest.mock import AsyncMock, MagicMock, patch
+
+    from xagent.web.api.kb import delete_collection_api
+    from xagent.web.models.user import User
+
+    mock_user = MagicMock(spec=User)
+    mock_user.id = 1
+    mock_user.is_admin = True
+    mock_db = MagicMock()
+
+    mock_metadata_store = MagicMock()
+    mock_metadata_store.delete_collection = AsyncMock()
+
+    class _FakeErrorResult:
+        status = "error"
+        affected_documents = 0
+        deleted_counts = {}
+        physical_cleanup = {}
+        uploaded_file_cleanup = None
+        uploads_cleanup = {}
+
+    with (
+        patch(
+            "xagent.web.api.kb._perform_kb_collection_delete",
+            return_value=_FakeErrorResult(),
+        ),
+        patch(
+            _FACTORY_PATH,
+            return_value=mock_metadata_store,
+        ),
+    ):
+        await delete_collection_api(
+            collection_name="test_collection",
+            _user=mock_user,
+            db=mock_db,
+        )
+
+    mock_metadata_store.delete_collection.assert_not_awaited()

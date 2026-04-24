@@ -6,6 +6,7 @@ import pyarrow as pa
 
 from xagent.core.tools.core.RAG_tools.LanceDB.model_tag_utils import to_model_tag
 from xagent.core.tools.core.RAG_tools.LanceDB.schema_manager import (
+    _table_exists,
     check_table_needs_migration,
     ensure_chunks_table,
     ensure_documents_table,
@@ -470,3 +471,64 @@ def test_backfill_user_id_uses_batched_updates(tmp_path: Path, monkeypatch) -> N
 
     # 120 rows, chunk size 50 => 3 batched updates expected for a single group.
     assert update_calls["count"] == 3
+
+
+# --- _table_exists Tests ---
+
+
+def test_table_exists_uses_list_table_names_not_open_table(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """_table_exists should use list_table_names() instead of open_table().
+
+    This verifies the fix that avoids opening file descriptors on every
+    table existence check. list_table_names() is a metadata-only operation.
+    """
+    from unittest.mock import patch
+
+    db_dir = tmp_path / "db"
+    monkeypatch.setenv("LANCEDB_DIR", str(db_dir))
+    conn = get_vector_store_raw_connection()
+
+    # Create a real table
+    ensure_documents_table(conn)
+
+    # Verify _table_exists returns True for existing table
+    assert _table_exists(conn, "documents") is True
+
+    # Verify _table_exists returns False for non-existent table
+    assert _table_exists(conn, "nonexistent") is False
+
+    # Verify open_table is NOT called during _table_exists
+    with patch.object(conn, "open_table", wraps=conn.open_table) as spy:
+        _table_exists(conn, "documents")
+        spy.assert_not_called()
+
+
+def test_table_exists_with_embeddings_table(tmp_path: Path, monkeypatch) -> None:
+    """_table_exists should work correctly with embeddings tables."""
+    db_dir = tmp_path / "db"
+    monkeypatch.setenv("LANCEDB_DIR", str(db_dir))
+
+    conn = get_vector_store_raw_connection()
+    model_tag = to_model_tag("test-model-v1")
+    table_name = f"embeddings_{model_tag}"
+
+    # Table doesn't exist yet
+    assert _table_exists(conn, table_name) is False
+
+    # Create the table
+    ensure_embeddings_table(conn, model_tag, vector_dim=128)
+
+    # Now it exists
+    assert _table_exists(conn, table_name) is True
+
+
+def test_table_exists_empty_database(tmp_path: Path, monkeypatch) -> None:
+    """_table_exists should return False for all tables on empty database."""
+    db_dir = tmp_path / "db"
+    monkeypatch.setenv("LANCEDB_DIR", str(db_dir))
+    conn = get_vector_store_raw_connection()
+
+    for name in ["documents", "parses", "chunks", "embeddings_any"]:
+        assert _table_exists(conn, name) is False

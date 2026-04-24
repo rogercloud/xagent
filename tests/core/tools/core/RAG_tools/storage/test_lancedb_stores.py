@@ -1852,3 +1852,417 @@ async def test_get_vector_dimension_async_delegates_to_sync(
     dimension = await store.get_vector_dimension_async("embeddings_async_test")
 
     assert dimension == 768
+
+
+# --- _get_table cache Tests ---
+
+
+@patch(
+    "xagent.core.tools.core.RAG_tools.storage.lancedb_stores.get_connection_from_env"
+)
+def test_get_table_cache_miss_calls_open_table(mock_get_connection: Mock) -> None:
+    """_get_table should call open_table on cache miss."""
+    mock_conn = Mock()
+    mock_get_connection.return_value = mock_conn
+    mock_table = Mock()
+    mock_conn.open_table.return_value = mock_table
+
+    store = LanceDBVectorIndexStore()
+    table = store._get_table("documents")
+
+    assert table is mock_table
+    mock_conn.open_table.assert_called_once_with("documents")
+
+
+@patch(
+    "xagent.core.tools.core.RAG_tools.storage.lancedb_stores.get_connection_from_env"
+)
+def test_get_table_cache_hit_skips_open_table(mock_get_connection: Mock) -> None:
+    """_get_table should not call open_table on cache hit."""
+    mock_conn = Mock()
+    mock_get_connection.return_value = mock_conn
+    mock_table = Mock()
+    mock_conn.open_table.return_value = mock_table
+
+    store = LanceDBVectorIndexStore()
+    first = store._get_table("documents")
+    second = store._get_table("documents")
+
+    assert first is second is mock_table
+    mock_conn.open_table.assert_called_once()
+
+
+@patch(
+    "xagent.core.tools.core.RAG_tools.storage.lancedb_stores.get_connection_from_env"
+)
+def test_get_table_cache_multiple_tables(mock_get_connection: Mock) -> None:
+    """_get_table should cache multiple different tables independently."""
+    mock_conn = Mock()
+    mock_get_connection.return_value = mock_conn
+    mock_docs = Mock()
+    mock_parses = Mock()
+    mock_conn.open_table.side_effect = [mock_docs, mock_parses]
+
+    store = LanceDBVectorIndexStore()
+    docs = store._get_table("documents")
+    parses = store._get_table("parses")
+
+    assert docs is mock_docs
+    assert parses is mock_parses
+    assert mock_conn.open_table.call_count == 2
+    assert store._get_table("documents") is mock_docs  # still cached
+    assert mock_conn.open_table.call_count == 2  # no additional call
+
+
+# --- invalidate_table_cache Tests ---
+
+
+@patch(
+    "xagent.core.tools.core.RAG_tools.storage.lancedb_stores.get_connection_from_env"
+)
+def test_invalidate_cache_all_clears_everything(
+    mock_get_connection: Mock,
+) -> None:
+    """invalidate_table_cache() should clear the entire cache when no arg given."""
+    mock_conn = Mock()
+    mock_get_connection.return_value = mock_conn
+    mock_conn.open_table.side_effect = [Mock(), Mock(), Mock()]
+
+    store = LanceDBVectorIndexStore()
+    store._get_table("documents")
+    store._get_table("parses")
+    assert len(store._table_cache) == 2
+
+    store.invalidate_table_cache()
+    assert len(store._table_cache) == 0
+
+    # Subsequent access re-opens
+    store._get_table("documents")
+    assert mock_conn.open_table.call_count == 3  # 2 initial + 1 re-open
+
+
+@patch(
+    "xagent.core.tools.core.RAG_tools.storage.lancedb_stores.get_connection_from_env"
+)
+def test_invalidate_cache_by_name_only_removes_one(
+    mock_get_connection: Mock,
+) -> None:
+    """invalidate_table_cache('name') should only remove that entry."""
+    mock_conn = Mock()
+    mock_get_connection.return_value = mock_conn
+    mock_conn.open_table.side_effect = [Mock(), Mock(), Mock()]
+
+    store = LanceDBVectorIndexStore()
+    store._get_table("documents")
+    store._get_table("parses")
+    assert len(store._table_cache) == 2
+
+    store.invalidate_table_cache("documents")
+    assert len(store._table_cache) == 1
+    assert "documents" not in store._table_cache
+    assert "parses" in store._table_cache
+
+    # Re-access evicted table
+    store._get_table("documents")
+    assert mock_conn.open_table.call_count == 3
+
+
+@patch(
+    "xagent.core.tools.core.RAG_tools.storage.lancedb_stores.get_connection_from_env"
+)
+def test_invalidate_cache_unknown_name_noop(mock_get_connection: Mock) -> None:
+    """invalidate_table_cache('unknown') should not raise or affect cache."""
+    mock_conn = Mock()
+    mock_get_connection.return_value = mock_conn
+    mock_conn.open_table.return_value = Mock()
+
+    store = LanceDBVectorIndexStore()
+    store._get_table("documents")
+    assert len(store._table_cache) == 1
+
+    store.invalidate_table_cache("nonexistent")
+    assert len(store._table_cache) == 1
+
+
+# --- LRU Eviction Tests ---
+
+
+@patch(
+    "xagent.core.tools.core.RAG_tools.storage.lancedb_stores.get_connection_from_env"
+)
+def test_lru_eviction_at_maxsize(mock_get_connection: Mock) -> None:
+    """Cache should evict oldest entry when exceeding _TABLE_CACHE_MAXSIZE (64)."""
+    mock_conn = Mock()
+    mock_get_connection.return_value = mock_conn
+    mock_conn.open_table.return_value = Mock()
+
+    store = LanceDBVectorIndexStore()
+    maxsize = store._TABLE_CACHE_MAXSIZE
+
+    # Fill cache to exactly maxsize
+    for i in range(maxsize):
+        store._get_table(f"table_{i}")
+    assert len(store._table_cache) == maxsize
+
+    # Insert one more — oldest should be evicted
+    store._get_table("overflow_table")
+    assert len(store._table_cache) == maxsize
+    assert "table_0" not in store._table_cache
+    assert "overflow_table" in store._table_cache
+
+
+@patch(
+    "xagent.core.tools.core.RAG_tools.storage.lancedb_stores.get_connection_from_env"
+)
+def test_lru_access_refreshes_position(mock_get_connection: Mock) -> None:
+    """Accessing a cached table should move it to the end (most-recently-used)."""
+    mock_conn = Mock()
+    mock_get_connection.return_value = mock_conn
+    mock_conn.open_table.return_value = Mock()
+
+    store = LanceDBVectorIndexStore()
+    maxsize = store._TABLE_CACHE_MAXSIZE
+
+    # Fill cache, with table_0 first
+    for i in range(maxsize):
+        store._get_table(f"table_{i}")
+
+    # Access table_0 — should move to MRU end
+    store._get_table("table_0")
+
+    # Insert one more — table_1 (now the oldest) should be evicted, not table_0
+    store._get_table("overflow_table")
+    assert len(store._table_cache) == maxsize
+    assert "table_0" in store._table_cache  # still alive (was refreshed)
+    assert "table_1" not in store._table_cache  # became oldest and evicted
+
+
+# --- _count_collections_fast / aggregate_collection_stats Tests ---
+
+
+@patch(
+    "xagent.core.tools.core.RAG_tools.storage.lancedb_stores.get_connection_from_env"
+)
+def test_aggregate_collection_stats_basic(mock_get_connection: Mock) -> None:
+    """aggregate_collection_stats should return per-collection counts."""
+    import pyarrow as pa
+
+    mock_conn = Mock()
+    mock_get_connection.return_value = mock_conn
+
+    # Build Arrow tables for documents, parses, chunks
+    docs_tbl = pa.table({"collection": ["col_a", "col_a", "col_b"]})
+    parses_tbl = pa.table({"collection": ["col_a"]})
+    chunks_tbl = pa.table({"collection": ["col_a", "col_a", "col_b", "col_b"]})
+
+    # Mock open_table to return different Arrow tables based on table name
+    def mock_search(table_name):
+        mock_result = Mock()
+        # Set up search().where().select().limit().to_arrow() chain
+        mock_chain = Mock()
+        if table_name == "documents":
+            mock_chain.to_arrow.return_value = docs_tbl
+        elif table_name == "parses":
+            mock_chain.to_arrow.return_value = parses_tbl
+        elif table_name == "chunks":
+            mock_chain.to_arrow.return_value = chunks_tbl
+        else:
+            mock_chain.to_arrow.return_value = pa.table({"collection": []})
+        mock_result.search.return_value = mock_chain
+        return mock_result
+
+    mock_table = Mock()
+    mock_table.search = Mock()
+    mock_conn.open_table.return_value = mock_table
+
+    # Patch the search().where().select().limit().to_arrow() chain for each table
+    def build_chains(table_name):
+        if table_name == "documents":
+            tbl = docs_tbl
+        elif table_name == "parses":
+            tbl = parses_tbl
+        elif table_name == "chunks":
+            tbl = chunks_tbl
+        else:
+            tbl = pa.table({"collection": []})
+        chain = Mock()
+        chain.select.return_value = chain
+        chain.where.return_value = chain
+        chain.limit.return_value = chain
+        chain.to_arrow.return_value = tbl
+        return chain
+
+    chains = {}
+    for name in ["documents", "parses", "chunks"]:
+        chains[name] = build_chains(name)
+
+    # The table is cached; the _get_table returns the mock_table,
+    # and the code calls mock_table.search() to start the chain
+    mock_table.search.side_effect = (
+        lambda: chains.get(
+            # Figure out which table name from the cache — use a side effect approach
+            # Since _get_table caches by name, we need a smarter mock
+        )
+    )
+
+    # Update: simplify — just use MagicMock with per-table chains
+    mock_conn.open_table.side_effect = lambda name: _make_mock_for(name)
+
+    def _make_mock_for(name):
+        t = Mock()
+        t.search.return_value = chains[name]
+        return t
+
+    store = LanceDBVectorIndexStore()
+    # Prime cache with mock tables
+    for name in ["documents", "parses", "chunks"]:
+        store._table_cache[name] = _make_mock_for(name)
+
+    # Mock list_table_names to return no extra embeddings tables
+    store.list_table_names = Mock(return_value=[])
+
+    stats = store.aggregate_collection_stats(user_id=None, is_admin=True)
+
+    assert "col_a" in stats
+    assert "col_b" in stats
+    assert stats["col_a"]["documents"] == 2
+    assert stats["col_a"]["parses"] == 1
+    assert stats["col_a"]["chunks"] == 2
+    assert stats["col_b"]["documents"] == 1
+    assert stats["col_b"]["parses"] == 0
+    assert stats["col_b"]["chunks"] == 2
+
+
+@patch(
+    "xagent.core.tools.core.RAG_tools.storage.lancedb_stores.get_connection_from_env"
+)
+def test_count_collections_fast_with_user_filter(mock_get_connection: Mock) -> None:
+    """_count_collections_fast should apply user_id filter when not admin."""
+    import pyarrow as pa
+
+    mock_conn = Mock()
+    mock_get_connection.return_value = mock_conn
+
+    tbl = pa.table(
+        {
+            "collection": ["col_a", "col_a", "col_b"],
+            "user_id": [1, 2, 3],
+        }
+    )
+
+    chain = Mock()
+    chain.select.return_value = chain
+    chain.where.return_value = chain
+    chain.limit.return_value = chain
+    chain.to_arrow.return_value = tbl
+
+    mock_table = Mock()
+    mock_table.search.return_value = chain
+    mock_conn.open_table.return_value = mock_table
+
+    store = LanceDBVectorIndexStore()
+    store._table_cache["documents"] = mock_table
+
+    stats: dict = {}
+    store._count_collections_fast(
+        "documents", "documents", stats, user_id=1, is_admin=False
+    )
+
+    # Verify that the where filter was applied
+    chain.where.assert_called_once()
+
+
+@patch(
+    "xagent.core.tools.core.RAG_tools.storage.lancedb_stores.get_connection_from_env"
+)
+def test_count_collections_fast_admin_no_filter(mock_get_connection: Mock) -> None:
+    """_count_collections_fast should not apply user filter when is_admin=True."""
+    import pyarrow as pa
+
+    mock_conn = Mock()
+    mock_get_connection.return_value = mock_conn
+
+    tbl = pa.table(
+        {
+            "collection": ["col_a", "col_a", "col_b"],
+            "user_id": [1, 2, 3],
+        }
+    )
+
+    chain = Mock()
+    chain.select.return_value = chain
+    chain.where.return_value = chain
+    chain.limit.return_value = chain
+    chain.to_arrow.return_value = tbl
+
+    mock_table = Mock()
+    mock_table.search.return_value = chain
+    mock_conn.open_table.return_value = mock_table
+
+    store = LanceDBVectorIndexStore()
+    store._table_cache["documents"] = mock_table
+
+    stats: dict = {}
+    store._count_collections_fast(
+        "documents", "documents", stats, user_id=None, is_admin=True
+    )
+
+    # For admin, the where filter should NOT be called (get_user_filter returns "")
+    chain.where.assert_not_called()
+
+
+@patch(
+    "xagent.core.tools.core.RAG_tools.storage.lancedb_stores.get_connection_from_env"
+)
+def test_count_collections_fast_empty_table(mock_get_connection: Mock) -> None:
+    """_count_collections_fast should handle empty Arrow table gracefully."""
+    import pyarrow as pa
+
+    mock_conn = Mock()
+    mock_get_connection.return_value = mock_conn
+
+    empty_tbl = pa.table({"collection": pa.array([], type=pa.string())})
+
+    chain = Mock()
+    chain.select.return_value = chain
+    chain.where.return_value = chain
+    chain.limit.return_value = chain
+    chain.to_arrow.return_value = empty_tbl
+
+    mock_table = Mock()
+    mock_table.search.return_value = chain
+    mock_conn.open_table.return_value = mock_table
+
+    store = LanceDBVectorIndexStore()
+    store._table_cache["documents"] = mock_table
+
+    stats: dict = {}
+    store._count_collections_fast(
+        "documents", "documents", stats, user_id=None, is_admin=True
+    )
+
+    # Empty table should produce no stats entries
+    assert stats == {}
+
+
+@patch(
+    "xagent.core.tools.core.RAG_tools.storage.lancedb_stores.get_connection_from_env"
+)
+def test_count_collections_fast_error_graceful(mock_get_connection: Mock) -> None:
+    """_count_collections_fast should not raise on error, just log debug."""
+    mock_conn = Mock()
+    mock_get_connection.return_value = mock_conn
+
+    mock_table = Mock()
+    mock_table.search.side_effect = Exception("LanceDB read error")
+    mock_conn.open_table.return_value = mock_table
+
+    store = LanceDBVectorIndexStore()
+    store._table_cache["documents"] = mock_table
+
+    stats: dict = {}
+    # Should not raise
+    store._count_collections_fast(
+        "documents", "documents", stats, user_id=None, is_admin=True
+    )
+    assert stats == {}

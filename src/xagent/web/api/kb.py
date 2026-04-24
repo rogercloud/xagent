@@ -1746,12 +1746,21 @@ async def delete_collection_api(
     Raises:
         HTTPException: If physical deletion fails (prevents database deletion)
     """
-    return _perform_kb_collection_delete(
+    result = _perform_kb_collection_delete(
         collection_name,
         int(_user.id),
         bool(_user.is_admin),
         db,
     )
+    if result.status in ("success", "partial_success"):
+        try:
+            from ...core.tools.core.RAG_tools.storage.factory import get_metadata_store
+
+            metadata_store = get_metadata_store()
+            await metadata_store.delete_collection(collection_name)
+        except Exception as exc:
+            logger.debug("Failed to delete collection metadata: %s", exc)
+    return result
 
 
 @kb_router.post(
@@ -1795,6 +1804,15 @@ async def batch_delete_collections_api(
                 result = _perform_kb_collection_delete(name, user_id, is_admin, db)
                 if result.status in ("success", "partial_success"):
                     deleted.append(name)
+                    try:
+                        from ...core.tools.core.RAG_tools.storage.factory import (
+                            get_metadata_store,
+                        )
+
+                        metadata_store = get_metadata_store()
+                        await metadata_store.delete_collection(name)
+                    except Exception as exc:
+                        logger.debug("Failed to delete collection metadata: %s", exc)
                 else:
                     failed.append(
                         BatchDeleteFailureItem(

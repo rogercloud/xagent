@@ -458,6 +458,30 @@ async def startup_event() -> None:
                 e,
             )
 
+    # Periodic collection metadata rebuild to keep cache in sync
+    async def run_metadata_rebuild_background() -> None:
+        import os
+
+        interval_hours = float(os.getenv("XAGENT_METADATA_REBUILD_INTERVAL_HOURS", "6"))
+        interval_seconds = interval_hours * 3600
+        while True:
+            try:
+                await asyncio.sleep(interval_seconds)
+                from xagent.core.tools.core.RAG_tools.management.collection_manager import (
+                    rebuild_collection_metadata,
+                )
+
+                await rebuild_collection_metadata()
+                logger.info("Periodic collection metadata rebuild completed")
+            except Exception as e:
+                logger.warning("Collection metadata rebuild failed: %s", e)
+
+    asyncio.create_task(run_metadata_rebuild_background())
+    logger.info(
+        "Started background collection metadata rebuild task (interval=%sh)",
+        os.getenv("XAGENT_METADATA_REBUILD_INTERVAL_HOURS", "6"),
+    )
+
     # Warmup sandbox manager
     from .sandbox_manager import get_sandbox_manager
 

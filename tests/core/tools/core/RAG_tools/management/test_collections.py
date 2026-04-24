@@ -437,3 +437,141 @@ def test_e2e_register_and_list_documents_with_legacy_empty_string_file_id(
     assert list_result.status == "success"
     listed_ids = {doc.doc_id for doc in list_result.documents}
     assert reg_result["doc_id"] in listed_ids
+
+
+# --- list_collections force_realtime Tests ---
+
+
+@pytest.mark.asyncio
+async def test_list_collections_force_realtime_bypasses_cache(
+    temp_lancedb_dir: str,
+) -> None:
+    """force_realtime=True should skip metadata cache and use realtime aggregation."""
+    now = datetime.now(timezone.utc)
+    collection = "realtime_test"
+
+    _insert_documents(
+        [
+            {
+                "collection": collection,
+                "doc_id": "doc-1",
+                "source_path": "/path/doc.pdf",
+                "file_type": "pdf",
+                "content_hash": "hash-1",
+                "uploaded_at": now,
+                "title": "Doc",
+                "language": "en",
+            }
+        ]
+    )
+
+    result = await list_collections(user_id=None, is_admin=True, force_realtime=True)
+
+    assert result.status == "success"
+    assert result.total_count == 1
+    assert result.collections[0].name == collection
+    assert result.collections[0].documents == 1
+
+
+@pytest.mark.asyncio
+async def test_list_collections_cache_filled_by_subsequent_call(
+    temp_lancedb_dir: str,
+) -> None:
+    """After a force_realtime call fills the cache, subsequent call should use it."""
+    now = datetime.now(timezone.utc)
+    collection = "cache_fill_test"
+
+    _insert_documents(
+        [
+            {
+                "collection": collection,
+                "doc_id": "doc-1",
+                "source_path": "/path/doc.pdf",
+                "file_type": "pdf",
+                "content_hash": "hash-1",
+                "uploaded_at": now,
+                "title": "Doc",
+                "language": "en",
+            }
+        ]
+    )
+
+    # First call with force_realtime fills the metadata cache
+    result1 = await list_collections(user_id=None, is_admin=True, force_realtime=True)
+    assert result1.status == "success"
+    assert result1.total_count == 1
+
+    # Second normal call should hit the cache
+    result2 = await list_collections(user_id=None, is_admin=True)
+    assert result2.status == "success"
+    assert result2.total_count == 1
+    assert result2.collections[0].name == collection
+    assert result2.collections[0].documents == 1
+
+
+@pytest.mark.asyncio
+async def test_list_collections_cache_miss_uses_realtime(
+    temp_lancedb_dir: str,
+) -> None:
+    """When metadata cache misses (no cached data), list_collections falls back to realtime aggregation."""
+    collection = "miss_test"
+
+    _insert_documents(
+        [
+            {
+                "collection": collection,
+                "doc_id": "doc-1",
+                "source_path": "/path/doc.pdf",
+                "file_type": "pdf",
+                "content_hash": "hash-1",
+                "uploaded_at": datetime.now(timezone.utc),
+                "title": "Doc",
+                "language": "en",
+            }
+        ]
+    )
+
+    # No prior cache population — should fallback to realtime successfully
+    result = await list_collections(user_id=None, is_admin=True)
+    assert result.status == "success"
+    assert result.total_count >= 1
+
+    names = [c.name for c in result.collections]
+    assert collection in names
+
+
+# --- delete_collection metadata cleanup Tests ---
+
+
+@pytest.mark.asyncio
+async def test_delete_collection_clears_metadata_cache(temp_lancedb_dir: str) -> None:
+    """After deleting a collection, metadata cache should not return it."""
+    now = datetime.now(timezone.utc)
+    collection = "to_delete_test"
+
+    _insert_documents(
+        [
+            {
+                "collection": collection,
+                "doc_id": "doc-1",
+                "source_path": "/path/doc.pdf",
+                "file_type": "pdf",
+                "content_hash": "hash-1",
+                "uploaded_at": now,
+                "title": "Doc",
+                "language": "en",
+            }
+        ]
+    )
+
+    # Populate metadata cache first
+    await list_collections(user_id=None, is_admin=True, force_realtime=True)
+
+    # Delete the collection
+    del_result = delete_collection(collection, user_id=None, is_admin=True)
+    assert del_result.status == "success"
+
+    # Metadata cache should no longer include the deleted collection
+    result = await list_collections(user_id=None, is_admin=True)
+    remaining = [c.name for c in result.collections]
+    assert collection not in remaining

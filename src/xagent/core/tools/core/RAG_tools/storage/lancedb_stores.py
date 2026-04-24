@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections import defaultdict
+from collections import OrderedDict, defaultdict
 from datetime import datetime, timezone
 from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple, cast
 
@@ -66,6 +66,33 @@ class LanceDBMetadataStore(MetadataStore):
             return CollectionInfo.from_storage(data)
         finally:
             _safe_close_table(table)
+
+    async def list_collections(self) -> list[CollectionInfo]:
+        """List all collections from metadata table."""
+        conn = await self._get_connection()
+        await self.ensure_collection_metadata_table()
+
+        try:
+            table = conn.open_table("collection_metadata")
+            result = table.search().to_arrow()
+            if len(result) == 0:
+                return []
+            return [CollectionInfo.from_storage(row) for row in result.to_pylist()]
+        except Exception as exc:
+            logger.debug("Failed to list collections from metadata: %s", exc)
+            return []
+
+    async def delete_collection(self, collection_name: str) -> None:
+        """Delete a collection entry from metadata table."""
+        conn = await self._get_connection()
+        await self.ensure_collection_metadata_table()
+
+        try:
+            table = conn.open_table("collection_metadata")
+            safe_name = escape_lancedb_string(collection_name)
+            table.delete(f"name = '{safe_name}'")
+        except Exception as exc:
+            logger.debug("Failed to delete collection metadata: %s", exc)
 
     async def save_collection(self, collection: CollectionInfo) -> None:
         from ..LanceDB.schema_manager import _safe_close_table
@@ -271,15 +298,37 @@ class LanceDBVectorIndexStore(VectorIndexStore):
     Both sync and async methods return native Arrow format for efficient zero-copy operations.
     """
 
+    _TABLE_CACHE_MAXSIZE = 64
+
     def __init__(self) -> None:
         self._conn: Optional[DBConnection] = None
         self._async_conn: Optional[Any] = None  # AsyncConnection
         self._async_lock = asyncio.Lock()  # Protect async connection initialization
+        self._table_cache: OrderedDict[str, Any] = OrderedDict()
 
     def _get_connection(self) -> DBConnection:
         if self._conn is None:
             self._conn = get_connection_from_env()
         return self._conn
+
+    def _get_table(self, table_name: str) -> Any:
+        """Get cached table handle to avoid repeated open_table()."""
+        cached = self._table_cache.get(table_name)
+        if cached is not None:
+            self._table_cache.move_to_end(table_name)
+            return cached
+        table = self._get_connection().open_table(table_name)
+        self._table_cache[table_name] = table
+        if len(self._table_cache) > self._TABLE_CACHE_MAXSIZE:
+            self._table_cache.popitem(last=False)
+        return table
+
+    def invalidate_table_cache(self, table_name: str | None = None) -> None:
+        """Clear table cache after drop/delete to avoid stale handles."""
+        if table_name is None:
+            self._table_cache.clear()
+        else:
+            self._table_cache.pop(table_name, None)
 
     async def _get_async_connection(self) -> Any:
         """Get or create async LanceDB connection with thread-safe initialization."""
@@ -551,7 +600,7 @@ class LanceDBVectorIndexStore(VectorIndexStore):
         for table_name in ["documents", "parses", "chunks"]:
             table = None
             try:
-                table = conn.open_table(table_name)
+                table = self._get_table(table_name)
                 original_count = table.count_rows()
                 table.delete(f"collection = '{safe_collection}'")
                 deleted_count = original_count - table.count_rows()
@@ -568,7 +617,7 @@ class LanceDBVectorIndexStore(VectorIndexStore):
                 continue
             table = None
             try:
-                table = conn.open_table(table_name)
+                table = self._get_table(table_name)
                 original_count = table.count_rows()
                 table.delete(f"collection = '{safe_collection}'")
                 deleted_count = original_count - table.count_rows()
@@ -579,7 +628,52 @@ class LanceDBVectorIndexStore(VectorIndexStore):
             finally:
                 _safe_close_table(table)
 
+        self.invalidate_table_cache()
         return deleted_counts
+
+    def _count_collections_fast(
+        self,
+        table_name: str,
+        stat_key: str,
+        stats: Dict[str, Dict[str, int]],
+        user_id: Optional[int] = None,
+        is_admin: bool = False,
+    ) -> None:
+        """Count records per collection using PyArrow C++ value_counts.
+
+        Avoids iter_batches overhead and Python-level row iteration.
+        """
+        try:
+            table = self._get_table(table_name)
+            combined_filter = UserPermissions.get_user_filter(user_id, is_admin)
+
+            if combined_filter:
+                arrow_table = (
+                    table.search()
+                    .where(combined_filter)
+                    .select(["collection"])
+                    .limit(None)
+                    .to_arrow()
+                )
+            else:
+                arrow_table = (
+                    table.search().select(["collection"]).limit(None).to_arrow()
+                )
+
+            if arrow_table.num_rows == 0:
+                return
+
+            counts = arrow_table.column("collection").value_counts()
+            for collection, count in zip(counts.field(0), counts.field(1)):
+                c = str(collection.as_py())
+                if c:
+                    stats.setdefault(
+                        c,
+                        {"documents": 0, "parses": 0, "chunks": 0, "embeddings": 0},
+                    )
+                    stats[c][stat_key] = count.as_py()
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("Failed to fast-count table '%s': %s", table_name, exc)
 
     def aggregate_collection_stats(
         self,
@@ -601,46 +695,18 @@ class LanceDBVectorIndexStore(VectorIndexStore):
         ensure_parses_table(conn)
         ensure_chunks_table(conn)
 
-        def _count_table(table_name: str, stat_key: str) -> None:
-            """Count records per collection using batched streaming to avoid OOM."""
-            try:
-                # Use iter_batches for memory-efficient streaming with default batch_size=1000
-                for batch in self.iter_batches(
-                    table_name=table_name,
-                    columns=["collection"],  # Only need collection column
-                    user_id=user_id,
-                    is_admin=is_admin,
-                ):
-                    # Extract collection column from PyArrow RecordBatch
-                    collection_idx = batch.schema.get_field_index("collection")
-                    if collection_idx == -1:
-                        continue
-
-                    collection_array = batch.column(collection_idx)
-                    for i in range(batch.num_rows):
-                        collection = str(collection_array[i].as_py())
-                        if collection:
-                            if collection not in stats:
-                                stats[collection] = {
-                                    "documents": 0,
-                                    "parses": 0,
-                                    "chunks": 0,
-                                    "embeddings": 0,
-                                }
-                            stats[collection][stat_key] += 1
-            except Exception as exc:  # noqa: BLE001
-                logger.debug("Failed to count table '%s': %s", table_name, exc)
-
         # Count documents, parses, and chunks
-        _count_table("documents", "documents")
-        _count_table("parses", "parses")
-        _count_table("chunks", "chunks")
+        self._count_collections_fast("documents", "documents", stats, user_id, is_admin)
+        self._count_collections_fast("parses", "parses", stats, user_id, is_admin)
+        self._count_collections_fast("chunks", "chunks", stats, user_id, is_admin)
 
         # Count embeddings from all embeddings_* tables
         for table_name in self.list_table_names():
             if not table_name.startswith("embeddings_"):
                 continue
-            _count_table(table_name, "embeddings")
+            self._count_collections_fast(
+                table_name, "embeddings", stats, user_id, is_admin
+            )
 
         return stats
 
@@ -1007,7 +1073,7 @@ class LanceDBVectorIndexStore(VectorIndexStore):
 
         table = None
         try:
-            table = conn.open_table(table_name)
+            table = self._get_table(table_name)
         except Exception as exc:
             logger.debug("Unable to open table '%s': %s", table_name, exc)
             return
@@ -1112,10 +1178,8 @@ class LanceDBVectorIndexStore(VectorIndexStore):
         from ..core.exceptions import DatabaseOperationError
         from ..LanceDB.schema_manager import _safe_close_table
 
-        conn = self._get_connection()
-
         try:
-            table = conn.open_table(table_name)
+            table = self._get_table(table_name)
         except Exception as exc:
             raise DatabaseOperationError(
                 f"Failed to open table '{table_name}': {exc}"

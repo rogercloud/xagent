@@ -307,6 +307,14 @@ class MetadataStore(ABC):
         """Create or update collection metadata."""
 
     @abstractmethod
+    async def delete_collection(self, collection_name: str) -> None:
+        """Delete collection metadata entry."""
+
+    @abstractmethod
+    async def list_collections(self) -> Sequence[CollectionInfo]:
+        """List all collections from metadata table."""
+
+    @abstractmethod
     async def ensure_collection_metadata_table(self) -> None:
         """Ensure control-plane metadata table exists."""
 
