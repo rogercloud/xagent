@@ -313,6 +313,8 @@ class LanceDBVectorIndexStore(VectorIndexStore):
 
     def _get_table(self, table_name: str) -> Any:
         """Get cached table handle to avoid repeated open_table()."""
+        from ..LanceDB.schema_manager import _safe_close_table
+
         cached = self._table_cache.get(table_name)
         if cached is not None:
             self._table_cache.move_to_end(table_name)
@@ -320,15 +322,25 @@ class LanceDBVectorIndexStore(VectorIndexStore):
         table = self._get_connection().open_table(table_name)
         self._table_cache[table_name] = table
         if len(self._table_cache) > self._TABLE_CACHE_MAXSIZE:
-            self._table_cache.popitem(last=False)
+            _evicted_name, _evicted_table = self._table_cache.popitem(last=False)
+            _safe_close_table(_evicted_table)
         return table
 
     def invalidate_table_cache(self, table_name: str | None = None) -> None:
-        """Clear table cache after drop/delete to avoid stale handles."""
+        """Clear table cache after drop/delete to avoid stale handles.
+
+        Cached handles are closed before removal so underlying file
+        descriptors are released promptly.
+        """
+        from ..LanceDB.schema_manager import _safe_close_table
+
         if table_name is None:
+            for _name, _table in list(self._table_cache.items()):
+                _safe_close_table(_table)
             self._table_cache.clear()
         else:
-            self._table_cache.pop(table_name, None)
+            _table = self._table_cache.pop(table_name, None)
+            _safe_close_table(_table)
 
     async def _get_async_connection(self) -> Any:
         """Get or create async LanceDB connection with thread-safe initialization."""
@@ -581,7 +593,6 @@ class LanceDBVectorIndexStore(VectorIndexStore):
     ) -> Dict[str, int]:
         """Delete all data for a collection from vector-side tables."""
         from ..LanceDB.schema_manager import (
-            _safe_close_table,
             ensure_chunks_table,
             ensure_documents_table,
             ensure_parses_table,
@@ -596,9 +607,8 @@ class LanceDBVectorIndexStore(VectorIndexStore):
         ensure_parses_table(conn)
         ensure_chunks_table(conn)
 
-        # Delete from core tables
+        # Delete from core tables (use cached handles; do NOT close them)
         for table_name in ["documents", "parses", "chunks"]:
-            table = None
             try:
                 table = self._get_table(table_name)
                 original_count = table.count_rows()
@@ -608,14 +618,11 @@ class LanceDBVectorIndexStore(VectorIndexStore):
                     deleted_counts[table_name] = deleted_count
             except Exception as exc:  # noqa: BLE001
                 logger.warning("Failed to delete from '%s': %s", table_name, exc)
-            finally:
-                _safe_close_table(table)
 
-        # Delete embeddings data
+        # Delete embeddings data (use cached handles; do NOT close them)
         for table_name in self.list_table_names():
             if not table_name.startswith("embeddings_"):
                 continue
-            table = None
             try:
                 table = self._get_table(table_name)
                 original_count = table.count_rows()
@@ -625,9 +632,8 @@ class LanceDBVectorIndexStore(VectorIndexStore):
                     deleted_counts[table_name] = deleted_count
             except Exception as exc:  # noqa: BLE001
                 logger.warning("Failed to delete from '%s': %s", table_name, exc)
-            finally:
-                _safe_close_table(table)
 
+        # Clear cache so subsequent reads see the deletion and fd is released
         self.invalidate_table_cache()
         return deleted_counts
 
@@ -1055,7 +1061,6 @@ class LanceDBVectorIndexStore(VectorIndexStore):
         Yields backend-specific batch objects (e.g., PyArrow RecordBatch).
         """
         from ..LanceDB.schema_manager import (
-            _safe_close_table,
             ensure_chunks_table,
             ensure_documents_table,
             ensure_parses_table,
@@ -1106,62 +1111,59 @@ class LanceDBVectorIndexStore(VectorIndexStore):
                 return pa.RecordBatch.from_arrays([], [])
             return pa.RecordBatch.from_arrays(arrays, names)
 
+        # Preferred path: streaming batches directly from LanceDB
         try:
-            # Preferred path: streaming batches directly from LanceDB
+            if combined_filter:
+                for raw_batch in table.to_batches(
+                    filter=combined_filter, batch_size=batch_size
+                ):
+                    batch = raw_batch
+                    if columns is not None:
+                        batch = _select_columns(batch, columns)
+                    if batch.num_rows > 0:
+                        yield batch
+            else:
+                for raw_batch in table.to_batches(batch_size=batch_size):
+                    batch = raw_batch
+                    if columns is not None:
+                        batch = _select_columns(batch, columns)
+                    if batch.num_rows > 0:
+                        yield batch
+            return
+        except Exception as exc:
+            logger.debug(
+                "Batch streaming unavailable for table '%s': %s", table_name, exc
+            )
+
+        # Arrow fallback: materialize table as Arrow then iterate
+        try:
+            # Note: LanceDB's to_arrow() doesn't accept filter parameter
+            # Use search().where().to_arrow() instead
+            if combined_filter:
+                arrow_table = table.search().where(combined_filter).to_arrow()
+            else:
+                arrow_table = table.to_arrow()
+        except Exception as exc:
+            logger.debug(
+                "Unable to read table '%s' via to_arrow(): %s", table_name, exc
+            )
+            return
+
+        if columns is not None:
             try:
-                if combined_filter:
-                    for raw_batch in table.to_batches(
-                        filter=combined_filter, batch_size=batch_size
-                    ):
-                        batch = raw_batch
-                        if columns is not None:
-                            batch = _select_columns(batch, columns)
-                        if batch.num_rows > 0:
-                            yield batch
-                else:
-                    for raw_batch in table.to_batches(batch_size=batch_size):
-                        batch = raw_batch
-                        if columns is not None:
-                            batch = _select_columns(batch, columns)
-                        if batch.num_rows > 0:
-                            yield batch
-                return
+                arrow_table = arrow_table.select(columns)
             except Exception as exc:
                 logger.debug(
-                    "Batch streaming unavailable for table '%s': %s", table_name, exc
-                )
-
-            # Arrow fallback: materialize table as Arrow then iterate
-            try:
-                # Note: LanceDB's to_arrow() doesn't accept filter parameter
-                # Use search().where().to_arrow() instead
-                if combined_filter:
-                    arrow_table = table.search().where(combined_filter).to_arrow()
-                else:
-                    arrow_table = table.to_arrow()
-            except Exception as exc:
-                logger.debug(
-                    "Unable to read table '%s' via to_arrow(): %s", table_name, exc
+                    "Table '%s' missing expected columns %s: %s",
+                    table_name,
+                    columns,
+                    exc,
                 )
                 return
 
-            if columns is not None:
-                try:
-                    arrow_table = arrow_table.select(columns)
-                except Exception as exc:
-                    logger.debug(
-                        "Table '%s' missing expected columns %s: %s",
-                        table_name,
-                        columns,
-                        exc,
-                    )
-                    return
-
-            for batch in arrow_table.to_batches(max_chunksize=batch_size):
-                if batch.num_rows > 0:
-                    yield batch
-        finally:
-            _safe_close_table(table)
+        for batch in arrow_table.to_batches(max_chunksize=batch_size):
+            if batch.num_rows > 0:
+                yield batch
 
     def count_rows(
         self,
@@ -1176,7 +1178,6 @@ class LanceDBVectorIndexStore(VectorIndexStore):
             DatabaseOperationError: If table cannot be opened or count fails.
         """
         from ..core.exceptions import DatabaseOperationError
-        from ..LanceDB.schema_manager import _safe_close_table
 
         try:
             table = self._get_table(table_name)
@@ -1206,8 +1207,6 @@ class LanceDBVectorIndexStore(VectorIndexStore):
             raise DatabaseOperationError(
                 f"Failed to count rows in table '{table_name}': {exc}"
             ) from exc
-        finally:
-            _safe_close_table(table)
 
     def aggregate_document_counts(
         self,
@@ -1288,6 +1287,7 @@ class LanceDBVectorIndexStore(VectorIndexStore):
             ).when_matched_update_all().when_not_matched_insert_all().execute(records)
         finally:
             _safe_close_table(table)
+        self.invalidate_table_cache("documents")
 
     def upsert_parses(self, records: List[Dict[str, Any]]) -> None:
         """Upsert parse records to LanceDB.
@@ -1312,6 +1312,7 @@ class LanceDBVectorIndexStore(VectorIndexStore):
             ).when_matched_update_all().when_not_matched_insert_all().execute(records)
         finally:
             _safe_close_table(table)
+        self.invalidate_table_cache("parses")
 
     def upsert_chunks(self, records: List[Dict[str, Any]]) -> None:
         """Upsert chunk records to LanceDB.
@@ -1336,6 +1337,7 @@ class LanceDBVectorIndexStore(VectorIndexStore):
             ).when_matched_update_all().when_not_matched_insert_all().execute(records)
         finally:
             _safe_close_table(table)
+        self.invalidate_table_cache("chunks")
 
     def upsert_embeddings(self, model_tag: str, records: List[Dict[str, Any]]) -> None:
         """Upsert embedding records to LanceDB with fallback pattern.
@@ -1409,6 +1411,7 @@ class LanceDBVectorIndexStore(VectorIndexStore):
                 raise
         finally:
             _safe_close_table(table)
+        self.invalidate_table_cache(table_name)
 
     # --- Sync search methods (Phase 1A Option C) ---
 
