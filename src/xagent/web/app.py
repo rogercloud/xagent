@@ -476,11 +476,16 @@ async def startup_event() -> None:
             except Exception as e:
                 logger.warning("Collection metadata rebuild failed: %s", e)
 
-    asyncio.create_task(run_metadata_rebuild_background())
-    logger.info(
-        "Started background collection metadata rebuild task (interval=%sh)",
-        os.getenv("XAGENT_METADATA_REBUILD_INTERVAL_HOURS", "6"),
-    )
+    if not os.getenv("PYTEST_CURRENT_TEST"):
+        app.state.metadata_rebuild_task = asyncio.create_task(
+            run_metadata_rebuild_background()
+        )
+        logger.info(
+            "Started background collection metadata rebuild task (interval=%sh)",
+            os.getenv("XAGENT_METADATA_REBUILD_INTERVAL_HOURS", "6"),
+        )
+    else:
+        logger.info("Skipping background metadata rebuild (test environment)")
 
     # Warmup sandbox manager
     from .sandbox_manager import get_sandbox_manager
@@ -523,6 +528,14 @@ async def shutdown_event() -> None:
         with suppress(asyncio.CancelledError):
             await _migration_task
     _migration_task = None
+
+    # Cancel metadata rebuild background task
+    if hasattr(app.state, "metadata_rebuild_task"):
+        task = app.state.metadata_rebuild_task
+        if task and not task.done():
+            task.cancel()
+            with suppress(asyncio.CancelledError):
+                await task
 
     # Shutdown Telegram channel if enabled
     try:
