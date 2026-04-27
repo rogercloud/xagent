@@ -331,6 +331,7 @@ class _SandboxControl:
     new_operations_paused: bool = False
     deleted: bool = False
     file_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    exec_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     cond: asyncio.Condition = field(default_factory=asyncio.Condition)
 
     async def acquire_operation(self) -> None:
@@ -473,9 +474,14 @@ class DockerSandbox(Sandbox):
         *args: str,
         env: Optional[dict[str, str]] = None,
     ) -> ExecResult:
-        """Execute a shell command inside the sandbox."""
+        """Execute a shell command inside the sandbox.
+
+        Exec calls are serialized per sandbox to avoid Docker SDK stream
+        corruption when concurrent execs read from the same container socket.
+        """
         async with self._control.operation():
-            return await self._exec_in_container(command, *args, env=env)
+            async with self._control.exec_lock:
+                return await self._exec_in_container(command, *args, env=env)
 
     async def run_code(
         self,
