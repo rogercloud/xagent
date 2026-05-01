@@ -397,6 +397,92 @@ class TestGetConfiguredDefaults:
             mock_default_llm,
         )
 
+    def test_stale_user_default_falls_back_to_admin(
+        self, storage, mock_db, mock_core_storage, monkeypatch
+    ):
+        """When user default exists but visibility check fails, fall back to admin shared."""
+        mock_admin_llm = Mock()
+        mock_user_model = Mock(model_id="user-stale-model")
+        mock_admin_model = Mock(model_id="admin-shared-model")
+        mock_config = Mock(spec=ChatModelConfig)
+
+        # _get_visible_user_ids returns admin
+        monkeypatch.setattr(
+            "xagent.web.services.model_service._get_visible_user_ids",
+            lambda db, user_id: [1],
+        )
+        # _is_model_visible_to_user always returns False (stale defaults)
+        monkeypatch.setattr(
+            "xagent.web.services.model_service._is_model_visible_to_user",
+            lambda db, model_id, user_id: False,
+        )
+
+        # User has defaults for all 4 types — but all fail visibility
+        mock_general = Mock(
+            spec=UserDefaultModel, model=mock_user_model, config_type="general"
+        )
+        mock_fast = Mock(
+            spec=UserDefaultModel, model=mock_user_model, config_type="small_fast"
+        )
+        mock_vision = Mock(
+            spec=UserDefaultModel, model=mock_user_model, config_type="visual"
+        )
+        mock_compact = Mock(
+            spec=UserDefaultModel, model=mock_user_model, config_type="compact"
+        )
+
+        mock_query = mock_db.query.return_value
+        mock_join = mock_query.join.return_value
+        mock_filter = mock_join.filter.return_value
+        mock_filter.first.side_effect = [
+            mock_general,
+            mock_fast,
+            mock_vision,
+            mock_compact,
+        ]
+
+        # Admin shared defaults available
+        mock_admin_general = Mock(
+            spec=UserDefaultModel, model=mock_admin_model, config_type="general"
+        )
+        mock_admin_fast = Mock(
+            spec=UserDefaultModel, model=mock_admin_model, config_type="small_fast"
+        )
+        mock_admin_vision = Mock(
+            spec=UserDefaultModel, model=mock_admin_model, config_type="visual"
+        )
+        mock_admin_compact = Mock(
+            spec=UserDefaultModel, model=mock_admin_model, config_type="compact"
+        )
+        mock_filter.all.return_value = [
+            mock_admin_general,
+            mock_admin_fast,
+            mock_admin_vision,
+            mock_admin_compact,
+        ]
+
+        def load_side_effect(model_id):
+            return mock_config
+
+        def create_instance_side_effect(config):
+            return mock_admin_llm
+
+        mock_core_storage.load.side_effect = load_side_effect
+        mock_core_storage.create_llm_instance.side_effect = create_instance_side_effect
+
+        result = storage.get_configured_defaults(user_id=1)
+
+        # All should come from admin fallback, not user defaults
+        assert result == (
+            mock_admin_llm,
+            mock_admin_llm,
+            mock_admin_llm,
+            mock_admin_llm,
+        )
+        # load + create_llm called 4 times (all admin fallback)
+        assert mock_core_storage.load.call_count == 4
+        assert mock_core_storage.create_llm_instance.call_count == 4
+
     def test_handles_exception_gracefully(
         self, storage, mock_db, mock_core_storage, monkeypatch
     ):

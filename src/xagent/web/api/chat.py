@@ -1554,10 +1554,13 @@ async def create_task(
                 )
                 .all()
             )
+            from ..services.model_service import _is_model_visible_to_user
+
             for row in user_defaults:
                 if row.model:
-                    config_type = cast(str, row.config_type)
-                    defaults[config_type] = str(row.model.model_id)
+                    if _is_model_visible_to_user(db, row.model.id, int(user.id)):
+                        config_type = cast(str, row.config_type)
+                        defaults[config_type] = str(row.model.model_id)
 
             # Fill missing defaults from visible users' shared defaults.
             if any(defaults[ct] is None for ct in config_types):

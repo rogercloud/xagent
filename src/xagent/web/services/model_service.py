@@ -109,11 +109,11 @@ def _is_model_visible_to_user(
         return shared is not None
     except Exception:
         logger.warning(
-            "Visibility check failed for model_id=%s user_id=%s — defaulting to visible",
+            "Visibility check failed for model_id=%s user_id=%s — defaulting to hidden",
             model_id,
             user_id,
         )
-        return True
+        return False
 
 
 def get_default_vision_model(user_id: Optional[int] = None) -> Optional[BaseLLM]:

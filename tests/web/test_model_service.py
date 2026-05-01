@@ -9,7 +9,10 @@ from sqlalchemy.orm import sessionmaker
 from xagent.web.models.database import Base
 from xagent.web.models.model import Model
 from xagent.web.models.user import User
-from xagent.web.services.model_service import get_default_model
+from xagent.web.services.model_service import (
+    _is_model_visible_to_user,
+    get_default_model,
+)
 
 # Test database setup - use in-memory database
 SQLALCHEMY_DATABASE_URL = "sqlite:///:memory:"
@@ -226,6 +229,18 @@ class TestModelService:
             # _get_visible_user_ids should have been called for both users
             assert mock_visible.call_count == 2
 
+    def test_is_model_visible_to_user_fails_closed_on_exception(self):
+        """Visibility check must return False (deny) when the query raises."""
+        with patch(
+            "xagent.web.services.model_service._get_visible_user_ids"
+        ) as mock_visible:
+            mock_visible.side_effect = RuntimeError("DB connection lost")
+            mock_db = MagicMock()
+            # Ownership check (step 1) returns None so code reaches step 2
+            mock_db.query.return_value.filter.return_value.first.return_value = None
+            result = _is_model_visible_to_user(mock_db, 1, 1)
+            assert result is False
+
     def test_get_default_model_stale_default_skipped(self):
         """Stale user default (model no longer visible) falls through to admin fallback."""
         with (
@@ -275,3 +290,63 @@ class TestModelService:
             mock_create.assert_called_once()
             # _get_visible_user_ids was called for admin fallback
             mock_visible.assert_called_with(mock_db, 42)
+
+    def test_embedding_model_stale_default_falls_through_to_system(self, monkeypatch):
+        """Stale embedding default (not visible) must fall through to system fallback."""
+        from contextvars import copy_context
+
+        from xagent.web.user_isolated_memory import current_user_id
+
+        mock_db = MagicMock()
+
+        def mock_get_db():
+            yield mock_db
+
+        # Set up user context
+        ctx = copy_context()
+        ctx.run(current_user_id.set, 1)
+
+        def run_in_context():
+            # Build mock system fallback model
+            system_fallback = MagicMock()
+            system_fallback.model_id = "system-embedding-model"
+
+            # user_default query returns a row
+            mock_user_default = MagicMock()
+            mock_user_default.model_id = 99
+
+            # embedding_model query returns the stale model
+            stale_embedding = MagicMock()
+            stale_embedding.id = 99
+            stale_embedding.model_id = "stale-embedding-model"
+
+            # Mock query chain:
+            # 1st call: UserDefaultModel.filter().first() → user_default
+            # 2nd call: DBModel.filter().first() → stale_embedding (stale, visibility fails)
+            # 3rd call: DBModel.filter().first() → system_fallback
+            mock_filter = mock_db.query.return_value.filter.return_value
+            mock_filter.first.side_effect = [
+                mock_user_default,
+                stale_embedding,
+                system_fallback,
+            ]
+
+            monkeypatch.setattr(
+                "xagent.web.services.model_service._is_model_visible_to_user",
+                lambda db, model_id, user_id: False,
+            )
+            monkeypatch.setattr(
+                "xagent.web.dynamic_memory_store.get_db",
+                mock_get_db,
+            )
+
+            from xagent.web.dynamic_memory_store import DynamicMemoryStoreManager
+
+            manager = DynamicMemoryStoreManager()
+            result = manager._get_embedding_model_from_db()
+
+            # Must fall through to system fallback, not stale model
+            assert result is system_fallback
+            assert result.model_id == "system-embedding-model"
+
+        ctx.run(run_in_context)

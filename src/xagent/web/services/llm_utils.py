@@ -542,15 +542,11 @@ class UserAwareModelStorage:
                 )
 
                 if general_default and general_default.model:
-                    try:
-                        from .model_service import _is_model_visible_to_user
+                    from .model_service import _is_model_visible_to_user
 
-                        visible = _is_model_visible_to_user(
-                            self.db, general_default.model.id, user_id
-                        )
-                    except Exception:
-                        visible = True
-                    if visible:
+                    if _is_model_visible_to_user(
+                        self.db, general_default.model.id, user_id
+                    ):
                         model_config = self.core_storage.load(
                             general_default.model.model_id
                         )
@@ -574,15 +570,11 @@ class UserAwareModelStorage:
                 )
 
                 if fast_default and fast_default.model:
-                    try:
-                        from .model_service import _is_model_visible_to_user
+                    from .model_service import _is_model_visible_to_user
 
-                        visible = _is_model_visible_to_user(
-                            self.db, fast_default.model.id, user_id
-                        )
-                    except Exception:
-                        visible = True
-                    if visible:
+                    if _is_model_visible_to_user(
+                        self.db, fast_default.model.id, user_id
+                    ):
                         model_config = self.core_storage.load(
                             fast_default.model.model_id
                         )
@@ -604,15 +596,11 @@ class UserAwareModelStorage:
                 )
 
                 if vision_default and vision_default.model:
-                    try:
-                        from .model_service import _is_model_visible_to_user
+                    from .model_service import _is_model_visible_to_user
 
-                        visible = _is_model_visible_to_user(
-                            self.db, vision_default.model.id, user_id
-                        )
-                    except Exception:
-                        visible = True
-                    if visible:
+                    if _is_model_visible_to_user(
+                        self.db, vision_default.model.id, user_id
+                    ):
                         model_config = self.core_storage.load(
                             vision_default.model.model_id
                         )
@@ -634,15 +622,11 @@ class UserAwareModelStorage:
                 )
 
                 if compact_default and compact_default.model:
-                    try:
-                        from .model_service import _is_model_visible_to_user
+                    from .model_service import _is_model_visible_to_user
 
-                        visible = _is_model_visible_to_user(
-                            self.db, compact_default.model.id, user_id
-                        )
-                    except Exception:
-                        visible = True
-                    if visible:
+                    if _is_model_visible_to_user(
+                        self.db, compact_default.model.id, user_id
+                    ):
                         model_config = self.core_storage.load(
                             compact_default.model.model_id
                         )
