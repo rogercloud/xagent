@@ -438,11 +438,11 @@ def get_embedding_model(user_id: Optional[int] = None) -> Optional[BaseLLM]:
 
 def get_vision_model(db: Session, user_id: Optional[int] = None) -> Optional[BaseLLM]:
     """
-    Get vision model from database.
+    Get vision model from database filtered by current user visibility.
 
     Args:
         db: Database session
-        user_id: User ID (currently ignored as models are shared)
+        user_id: User ID for visibility filtering. If None, all models are visible.
 
     Returns:
         Vision model instance or None if not found
@@ -454,7 +454,7 @@ def get_vision_model(db: Session, user_id: Optional[int] = None) -> Optional[Bas
         from .llm_utils import _create_llm_instance
 
         # Query models that have vision ability in their abilities JSON field
-        db_model = (
+        db_models = (
             db.query(DBModel)
             .filter(
                 DBModel.category == "llm",
@@ -464,10 +464,14 @@ def get_vision_model(db: Session, user_id: Optional[int] = None) -> Optional[Bas
                     cast(DBModel.abilities, String).like('%"vision"%'),
                 ),
             )
-            .first()
+            .all()
         )
 
-        if db_model:
+        for db_model in db_models:
+            if user_id is not None and not _is_model_visible_to_user(
+                db, db_model.id, user_id
+            ):
+                continue
             return _create_llm_instance(db_model)
         return None
 
@@ -488,11 +492,11 @@ def _add_image_model_with_id(
 
 def get_image_models(db: Session, user_id: Optional[int] = None) -> Dict[str, Any]:
     """
-    Get image models from database.
+    Get image models from database filtered by current user visibility.
 
     Args:
         db: Database session
-        user_id: User ID (currently ignored as models are shared)
+        user_id: User ID for visibility filtering. If None, all models are visible.
 
     Returns:
         Dictionary of image model instances
@@ -512,6 +516,11 @@ def get_image_models(db: Session, user_id: Optional[int] = None) -> Dict[str, An
         )
 
         for db_model in db_models:
+            if user_id is not None and not _is_model_visible_to_user(
+                db, db_model.id, user_id
+            ):
+                continue
+
             if not (
                 api_key := str(db_model.api_key)
                 if db_model.api_key is not None
@@ -823,10 +832,10 @@ def get_default_embedding_model(user_id: Optional[int] = None) -> Optional[str]:
 
 
 def _get_models_by_category(
-    db: Session, ability: str, model_type: str
+    db: Session, ability: str, model_type: str, user_id: Optional[int] = None
 ) -> Dict[str, Any]:
     """
-    Get models by category and ability from database.
+    Get models by category and ability from database filtered by visibility.
 
     Generic helper function to load models (ASR, TTS, etc.) from database.
 
@@ -834,6 +843,7 @@ def _get_models_by_category(
         db: Database session
         ability: Model ability to filter by (e.g., "asr", "tts")
         model_type: Model type for error messages (e.g., "ASR", "TTS")
+        user_id: User ID for visibility filtering. If None, all models are visible.
 
     Returns:
         Dictionary of model instances
@@ -852,6 +862,10 @@ def _get_models_by_category(
         )
 
         for db_model in db_models:
+            if user_id is not None and not _is_model_visible_to_user(
+                db, db_model.id, user_id
+            ):
+                continue
             abilities: Any = getattr(db_model, "abilities", None)
             if isinstance(abilities, str):
                 try:
@@ -907,30 +921,30 @@ def _get_models_by_category(
 
 def get_asr_models(db: Session, user_id: Optional[int] = None) -> Dict[str, Any]:
     """
-    Get ASR (speech-to-text) models from database.
+    Get ASR (speech-to-text) models from database filtered by visibility.
 
     Args:
         db: Database session
-        user_id: User ID (currently ignored as models are shared)
+        user_id: User ID for visibility filtering. If None, all models are visible.
 
     Returns:
         Dictionary of ASR model instances
     """
-    return _get_models_by_category(db, "asr", "ASR")
+    return _get_models_by_category(db, "asr", "ASR", user_id=user_id)
 
 
 def get_tts_models(db: Session, user_id: Optional[int] = None) -> Dict[str, Any]:
     """
-    Get TTS (text-to-speech) models from database.
+    Get TTS (text-to-speech) models from database filtered by visibility.
 
     Args:
         db: Database session
-        user_id: User ID (currently ignored as models are shared)
+        user_id: User ID for visibility filtering. If None, all models are visible.
 
     Returns:
         Dictionary of TTS model instances
     """
-    return _get_models_by_category(db, "tts", "TTS")
+    return _get_models_by_category(db, "tts", "TTS", user_id=user_id)
 
 
 def get_default_asr_model(user_id: Optional[int] = None) -> Optional[Any]:

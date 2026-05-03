@@ -11,7 +11,11 @@ from xagent.web.models.model import Model
 from xagent.web.models.user import User
 from xagent.web.services.model_service import (
     _is_model_visible_to_user,
+    get_asr_models,
     get_default_model,
+    get_image_models,
+    get_tts_models,
+    get_vision_model,
 )
 
 # Test database setup - use in-memory database
@@ -292,7 +296,7 @@ class TestModelService:
             mock_visible.assert_called_with(mock_db, 42)
 
     def test_embedding_model_stale_default_falls_through_to_system(self, monkeypatch):
-        """Stale embedding default (not visible) must fall through to system fallback."""
+        """Stale embedding default (not visible) must fall through to visible system fallback."""
         from contextvars import copy_context
 
         from xagent.web.user_isolated_memory import current_user_id
@@ -307,8 +311,9 @@ class TestModelService:
         ctx.run(current_user_id.set, 1)
 
         def run_in_context():
-            # Build mock system fallback model
+            # Build mock visible system fallback model
             system_fallback = MagicMock()
+            system_fallback.id = 200
             system_fallback.model_id = "system-embedding-model"
 
             # user_default query returns a row
@@ -323,13 +328,242 @@ class TestModelService:
             # Mock query chain:
             # 1st call: UserDefaultModel.filter().first() → user_default
             # 2nd call: DBModel.filter().first() → stale_embedding (stale, visibility fails)
-            # 3rd call: DBModel.filter().first() → system_fallback
+            # 3rd call: DBModel.filter().all() → [system_fallback]
             mock_filter = mock_db.query.return_value.filter.return_value
             mock_filter.first.side_effect = [
                 mock_user_default,
                 stale_embedding,
-                system_fallback,
             ]
+            mock_filter.all.return_value = [system_fallback]
+
+            monkeypatch.setattr(
+                "xagent.web.services.model_service._is_model_visible_to_user",
+                lambda db, model_id, user_id: model_id != 99,
+            )
+            monkeypatch.setattr(
+                "xagent.web.dynamic_memory_store.get_db",
+                mock_get_db,
+            )
+
+            from xagent.web.dynamic_memory_store import DynamicMemoryStoreManager
+
+            manager = DynamicMemoryStoreManager()
+            result = manager._get_embedding_model_from_db()
+
+            # Must fall through to system fallback, not stale model
+            assert result is system_fallback
+            assert result.model_id == "system-embedding-model"
+
+        ctx.run(run_in_context)
+
+    def test_get_vision_model_filters_by_visibility(self):
+        """get_vision_model returns the first visible vision-capable model."""
+        with (
+            patch(
+                "xagent.web.services.model_service._is_model_visible_to_user"
+            ) as mock_visibility,
+            patch("xagent.web.services.llm_utils._create_llm_instance") as mock_create,
+        ):
+            mock_db = MagicMock()
+
+            # Two vision-capable models
+            visible_model = MagicMock()
+            visible_model.id = 1
+            invisible_model = MagicMock()
+            invisible_model.id = 2
+
+            mock_db.query.return_value.filter.return_value.all.return_value = [
+                visible_model,
+                invisible_model,
+            ]
+
+            # First model is visible, second is not
+            mock_visibility.side_effect = [True, False]
+            mock_llm = MagicMock()
+            mock_create.return_value = mock_llm
+
+            result = get_vision_model(mock_db, user_id=42)
+
+            assert result == mock_llm
+            mock_create.assert_called_once_with(visible_model)
+            assert mock_visibility.call_count == 1  # stops after first visible
+
+    def test_get_vision_model_returns_none_when_no_visible(self):
+        """get_vision_model returns None when no vision model is visible."""
+        with patch(
+            "xagent.web.services.model_service._is_model_visible_to_user"
+        ) as mock_visibility:
+            mock_db = MagicMock()
+
+            invisible_model = MagicMock()
+            invisible_model.id = 1
+            mock_db.query.return_value.filter.return_value.all.return_value = [
+                invisible_model
+            ]
+            mock_visibility.return_value = False
+
+            result = get_vision_model(mock_db, user_id=42)
+
+            assert result is None
+
+    def test_get_image_models_filters_by_visibility(self):
+        """get_image_models excludes image models not visible to the user."""
+        with (
+            patch(
+                "xagent.web.services.model_service._is_model_visible_to_user"
+            ) as mock_visibility,
+            patch(
+                "xagent.web.services.model_service.DashScopeImageModel"
+            ) as mock_dashscope,
+        ):
+            mock_db = MagicMock()
+
+            visible_model = MagicMock()
+            visible_model.id = 1
+            visible_model.api_key = "key1"
+            visible_model.base_url = "http://url1"
+            visible_model.model_provider = "dashscope"
+            visible_model.model_name = "visible-model"
+            visible_model.model_id = "mid-1"
+            visible_model.abilities = ["generate"]
+
+            invisible_model = MagicMock()
+            invisible_model.id = 2
+            invisible_model.api_key = "key2"
+            invisible_model.base_url = "http://url2"
+            invisible_model.model_provider = "dashscope"
+            invisible_model.model_name = "invisible-model"
+            invisible_model.model_id = "mid-2"
+            invisible_model.abilities = ["generate"]
+
+            mock_db.query.return_value.filter.return_value.all.return_value = [
+                visible_model,
+                invisible_model,
+            ]
+
+            mock_visibility.side_effect = [True, False]
+            mock_instance = MagicMock()
+            mock_dashscope.return_value = mock_instance
+
+            result = get_image_models(mock_db, user_id=42)
+
+            assert len(result) == 1
+            assert "mid-1" in result
+            assert "mid-2" not in result
+
+    def test_get_asr_models_filters_by_visibility(self):
+        """get_asr_models excludes speech models not visible to the user."""
+        with (
+            patch(
+                "xagent.web.services.model_service._is_model_visible_to_user"
+            ) as mock_visibility,
+            patch(
+                "xagent.core.model.asr.adapter.get_asr_model_instance"
+            ) as mock_asr_instance,
+        ):
+            mock_db = MagicMock()
+
+            visible_model = MagicMock()
+            visible_model.id = 1
+            visible_model.abilities = ["asr"]
+            visible_model.api_key = "key1"
+            visible_model.base_url = "http://url1"
+            visible_model.model_provider = "xinference"
+            visible_model.model_name = "visible-asr"
+
+            invisible_model = MagicMock()
+            invisible_model.id = 2
+            invisible_model.abilities = ["asr"]
+            invisible_model.api_key = "key2"
+            invisible_model.base_url = "http://url2"
+            invisible_model.model_provider = "xinference"
+            invisible_model.model_name = "invisible-asr"
+
+            mock_db.query.return_value.filter.return_value.all.return_value = [
+                visible_model,
+                invisible_model,
+            ]
+
+            mock_visibility.side_effect = [True, False]
+            mock_instance = MagicMock()
+            mock_asr_instance.return_value = mock_instance
+
+            result = get_asr_models(mock_db, user_id=42)
+
+            assert len(result) == 1
+            assert "visible-asr" in result
+            assert "invisible-asr" not in result
+
+    def test_get_tts_models_filters_by_visibility(self):
+        """get_tts_models excludes speech models not visible to the user."""
+        with (
+            patch(
+                "xagent.web.services.model_service._is_model_visible_to_user"
+            ) as mock_visibility,
+            patch(
+                "xagent.core.model.tts.adapter.get_tts_model_instance"
+            ) as mock_tts_instance,
+        ):
+            mock_db = MagicMock()
+
+            visible_model = MagicMock()
+            visible_model.id = 1
+            visible_model.abilities = ["tts"]
+            visible_model.api_key = "key1"
+            visible_model.base_url = "http://url1"
+            visible_model.model_provider = "xinference"
+            visible_model.model_name = "visible-tts"
+
+            invisible_model = MagicMock()
+            invisible_model.id = 2
+            invisible_model.abilities = ["tts"]
+            invisible_model.api_key = "key2"
+            invisible_model.base_url = "http://url2"
+            invisible_model.model_provider = "xinference"
+            invisible_model.model_name = "invisible-tts"
+
+            mock_db.query.return_value.filter.return_value.all.return_value = [
+                visible_model,
+                invisible_model,
+            ]
+
+            mock_visibility.side_effect = [True, False]
+            mock_instance = MagicMock()
+            mock_tts_instance.return_value = mock_instance
+
+            result = get_tts_models(mock_db, user_id=42)
+
+            assert len(result) == 1
+            assert "visible-tts" in result
+            assert "invisible-tts" not in result
+
+    def test_embedding_fallback_skips_invisible_returns_none(self, monkeypatch):
+        """System fallback returns None when no visible embedding model exists."""
+        from contextvars import copy_context
+
+        from xagent.web.user_isolated_memory import current_user_id
+
+        mock_db = MagicMock()
+
+        def mock_get_db():
+            yield mock_db
+
+        ctx = copy_context()
+        ctx.run(current_user_id.set, 1)
+
+        def run_in_context():
+            # No user default
+            mock_filter = mock_db.query.return_value.filter.return_value
+            mock_filter.first.return_value = None
+
+            # Two active embeddings, neither visible
+            embedding1 = MagicMock()
+            embedding1.id = 1
+            embedding1.model_id = "private-embed-1"
+            embedding2 = MagicMock()
+            embedding2.id = 2
+            embedding2.model_id = "private-embed-2"
+            mock_filter.all.return_value = [embedding1, embedding2]
 
             monkeypatch.setattr(
                 "xagent.web.services.model_service._is_model_visible_to_user",
@@ -345,8 +579,6 @@ class TestModelService:
             manager = DynamicMemoryStoreManager()
             result = manager._get_embedding_model_from_db()
 
-            # Must fall through to system fallback, not stale model
-            assert result is system_fallback
-            assert result.model_id == "system-embedding-model"
+            assert result is None
 
         ctx.run(run_in_context)
