@@ -287,6 +287,90 @@ class TestToolsAvailableAPI:
         assert categories["tool_without_metadata"] == "other"
         assert categories["tool_with_metadata"] == "basic"
 
+    def test_get_available_tools_applies_user_override(self):
+        """Test that user tool override hook affects /available response."""
+        from xagent.web.services.tool_credentials import set_user_tool_overrides_hook
+
+        set_user_tool_overrides_hook(
+            lambda db, user: {"browser_navigate": {"enabled": False}}
+        )
+        try:
+            login_response = client.post(
+                "/api/auth/login",
+                json={"username": "admin", "password": "admin123"},
+            )
+            assert login_response.status_code == 200
+            token = login_response.json()["access_token"]
+
+            response = client.get(
+                "/api/tools/available",
+                headers={"Authorization": f"Bearer {token}"},
+            )
+            assert response.status_code == 200
+            payload = response.json()
+
+            tool_map = {item["name"]: item for item in payload["tools"]}
+            assert "browser_navigate" in tool_map
+            assert tool_map["browser_navigate"]["enabled"] is False
+            assert tool_map["browser_navigate"]["status"] == "disabled"
+            assert tool_map["browser_navigate"]["status_reason"] == "Disabled by admin"
+        finally:
+            set_user_tool_overrides_hook(None)
+
+    def test_get_available_tools_override_does_not_mask_missing_model(
+        self, monkeypatch
+    ):
+        """Test that enabled=True override cannot mask resource-missing states."""
+        from xagent.web.services.tool_credentials import set_user_tool_overrides_hook
+
+        class _Category:
+            value = "vision"
+
+        class _Metadata:
+            category = _Category()
+
+        class _VisionTool:
+            name = "vision_test_tool"
+            description = ""
+            metadata = _Metadata()
+
+        async def mock_create_all_tools(config):
+            return [_VisionTool()]
+
+        monkeypatch.setattr(
+            "xagent.core.tools.adapters.vibe.factory.ToolFactory.create_all_tools",
+            mock_create_all_tools,
+        )
+        monkeypatch.setattr(
+            "xagent.web.tools.config.WebToolConfig.get_vision_model",
+            lambda self: None,
+        )
+
+        set_user_tool_overrides_hook(
+            lambda db, user: {"vision_test_tool": {"enabled": True}}
+        )
+        try:
+            login_response = client.post(
+                "/api/auth/login",
+                json={"username": "admin", "password": "admin123"},
+            )
+            assert login_response.status_code == 200
+            token = login_response.json()["access_token"]
+
+            response = client.get(
+                "/api/tools/available",
+                headers={"Authorization": f"Bearer {token}"},
+            )
+            assert response.status_code == 200
+            payload = response.json()
+
+            tool_map = {item["name"]: item for item in payload["tools"]}
+            assert "vision_test_tool" in tool_map
+            assert tool_map["vision_test_tool"]["status"] == "missing_model"
+            assert tool_map["vision_test_tool"]["enabled"] is False
+        finally:
+            set_user_tool_overrides_hook(None)
+
 
 class TestToolsGovernanceAPI:
     @pytest.fixture(autouse=True)
@@ -493,3 +577,47 @@ class TestToolsGovernanceAPI:
 
         assert configurable_resp.status_code == 403
         assert credential_resp.status_code == 403
+
+
+def test_user_tool_overrides_hook_noop_by_default():
+    """Without a hook set, get_user_tool_overrides returns an empty dict."""
+    from xagent.web.services.tool_credentials import get_user_tool_overrides
+
+    result = get_user_tool_overrides(db=None, user=None)
+    assert result == {}
+
+
+def test_user_tool_overrides_hook_returns_injected_data():
+    """When a hook is set, it returns the hook's result."""
+    from xagent.web.services.tool_credentials import (
+        get_user_tool_overrides,
+        set_user_tool_overrides_hook,
+    )
+
+    def my_hook(db, user):
+        return {
+            "calculator": {"enabled": False},
+            "web_search": {"config": {"api_key": "x"}},
+        }
+
+    set_user_tool_overrides_hook(my_hook)
+    try:
+        result = get_user_tool_overrides(db=None, user=None)
+        assert result["calculator"]["enabled"] is False
+        assert result["web_search"]["config"] == {"api_key": "x"}
+        assert "nonexistent" not in result
+    finally:
+        set_user_tool_overrides_hook(None)
+
+
+def test_user_tool_overrides_hook_reset_to_none():
+    """Setting hook to None restores default empty behavior."""
+    from xagent.web.services.tool_credentials import (
+        get_user_tool_overrides,
+        set_user_tool_overrides_hook,
+    )
+
+    set_user_tool_overrides_hook(lambda db, user: {"test": {"enabled": True}})
+    set_user_tool_overrides_hook(None)
+    result = get_user_tool_overrides(db=None, user=None)
+    assert result == {}

@@ -3,8 +3,9 @@ from __future__ import annotations
 import base64
 import hashlib
 import os
+from collections.abc import Iterable
 from datetime import datetime, timezone
-from typing import Any, Dict, Iterable, cast
+from typing import Any, Callable, cast
 
 from cryptography.fernet import Fernet, InvalidToken
 from sqlalchemy.engine import make_url
@@ -14,10 +15,27 @@ from sqlalchemy.orm.attributes import flag_modified
 from ..init_tool_configs import get_default_tool_configs
 from ..models.tool_config import ToolConfig, UserToolConfig
 
-ToolFieldSpec = Dict[str, Any]
+ToolFieldSpec = dict[str, Any]
+
+# Hook signature: (db: Session, user: Any) -> dict[str, {"enabled": bool|None}]
+# Returns per-user overrides for tool enable/disable.
+# Application layers can inject per-user tool policies via set_user_tool_overrides_hook().
+# NOTE: "config" override is reserved for future use and not yet implemented.
+_get_user_tool_overrides_hook: Callable[[Session, Any], dict] | None = None
 
 
-TOOL_CREDENTIAL_SPECS: Dict[str, Dict[str, ToolFieldSpec]] = {
+def set_user_tool_overrides_hook(hook: Callable[[Session, Any], dict] | None) -> None:
+    global _get_user_tool_overrides_hook
+    _get_user_tool_overrides_hook = hook
+
+
+def get_user_tool_overrides(db: Session, user: Any) -> dict:
+    if _get_user_tool_overrides_hook is not None:
+        return _get_user_tool_overrides_hook(db, user)
+    return {}
+
+
+TOOL_CREDENTIAL_SPECS: dict[str, dict[str, ToolFieldSpec]] = {
     "exa_web_search": {
         "api_key": {
             "secret": True,
@@ -470,7 +488,7 @@ def get_tool_credential_view(db: Session, tool_name: str) -> dict[str, Any]:
     config = db.query(ToolConfig).filter(ToolConfig.tool_name == tool_name).first()
     display_name = tool_name
     if config is not None and isinstance(getattr(config, "display_name", None), str):
-        display_name = str(getattr(config, "display_name"))
+        display_name = str(config.display_name)
     else:
         defaults = {item["tool_name"]: item for item in get_default_tool_configs()}
         display_name = str(defaults.get(tool_name, {}).get("display_name") or tool_name)
