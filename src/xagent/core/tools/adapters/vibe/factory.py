@@ -186,6 +186,17 @@ class ToolFactory:
                 "⚠️ allowed_tools is empty list - this will filter out all tools! If you want to allow all tools, set allowed_tools to None"
             )
 
+        # Filter out tools disabled by per-user hook policy
+        overrides = getattr(config, "get_user_tool_overrides", lambda: {})()
+        if overrides:
+            disabled_by_hook = {
+                name
+                for name, ov in overrides.items()
+                if ov and ov.get("enabled") is False
+            }
+            if disabled_by_hook:
+                tools = [tool for tool in tools if tool.name not in disabled_by_hook]
+
         # Wrap sandbox-enabled tools if sandbox is available
         sandbox = config.get_sandbox()
         if sandbox is not None:

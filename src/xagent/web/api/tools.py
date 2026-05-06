@@ -20,7 +20,6 @@ from ..services.tool_credentials import (
     clear_tool_credential,
     delete_sql_connection,
     get_tool_credential_view,
-    get_user_tool_overrides,
     list_configurable_tool_names,
     list_sql_connections,
     set_sql_connection,
@@ -205,15 +204,16 @@ async def get_available_tools(
 
     # Create a temporary request object (simulating WebToolConfig requirements)
     class MockRequest:
-        def __init__(self) -> None:
+        def __init__(self, user: User) -> None:
             self.credentials: Any | None = None
+            self.user = user
 
     # Create WebToolConfig, now includes MCP tools
     # Note: llm=None for tool listing (display only, no execution)
     current_user_id = _require_user_id(current_user)
     tool_config = WebToolConfig(
         db=db,
-        request=MockRequest(),
+        request=MockRequest(current_user),
         user_id=current_user_id,
         is_admin=bool(current_user.is_admin),
         llm=None,  # Not needed for tool listing
@@ -318,11 +318,7 @@ async def get_available_tools(
     # Apply per-user tool overrides (e.g. per-user enable/disable).
     # Only affects policy-based states; resource-missing states cannot be
     # overridden to "available".
-    try:
-        user_overrides = get_user_tool_overrides(db, current_user)
-    except Exception:
-        logger.exception("Failed to get user tool overrides, skipping")
-        user_overrides = {}
+    user_overrides = tool_config.get_user_tool_overrides()
     for tool_item in tools:
         tool_name = str(tool_item.get("name") or "")
         override = user_overrides.get(tool_name)

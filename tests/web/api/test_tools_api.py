@@ -288,7 +288,7 @@ class TestToolsAvailableAPI:
         assert categories["tool_with_metadata"] == "basic"
 
     def test_get_available_tools_applies_user_override(self):
-        """Test that user tool override hook affects /available response."""
+        """Test that user tool override hook filters disabled tools from /available."""
         from xagent.web.services.tool_credentials import set_user_tool_overrides_hook
 
         set_user_tool_overrides_hook(
@@ -309,11 +309,10 @@ class TestToolsAvailableAPI:
             assert response.status_code == 200
             payload = response.json()
 
-            tool_map = {item["name"]: item for item in payload["tools"]}
-            assert "browser_navigate" in tool_map
-            assert tool_map["browser_navigate"]["enabled"] is False
-            assert tool_map["browser_navigate"]["status"] == "disabled"
-            assert tool_map["browser_navigate"]["status_reason"] == "Disabled by admin"
+            tool_names = {item["name"] for item in payload["tools"]}
+            # browser_navigate is filtered out by the hook in both display
+            # and execution layers for consistency.
+            assert "browser_navigate" not in tool_names
         finally:
             set_user_tool_overrides_hook(None)
 
@@ -370,6 +369,45 @@ class TestToolsAvailableAPI:
             assert tool_map["vision_test_tool"]["enabled"] is False
         finally:
             set_user_tool_overrides_hook(None)
+
+    def test_get_available_tools_override_enables_globally_disabled_tool(self):
+        """Test that enabled=True override can re-enable a globally disabled tool."""
+        from xagent.web.services.tool_credentials import set_user_tool_overrides_hook
+
+        # Step 1: globally disable browser_navigate via admin API
+        headers = {"Authorization": f"Bearer {self._login_admin()}"}
+        put_resp = client.put(
+            "/api/tools/browser_navigate/enabled",
+            headers=headers,
+            json={"enabled": False},
+        )
+        assert put_resp.status_code == 200
+
+        # Step 2: set hook to re-enable it
+        set_user_tool_overrides_hook(
+            lambda db, user: {"browser_navigate": {"enabled": True}}
+        )
+        try:
+            response = client.get(
+                "/api/tools/available",
+                headers=headers,
+            )
+            assert response.status_code == 200
+            payload = response.json()
+
+            tool_map = {item["name"]: item for item in payload["tools"]}
+            assert "browser_navigate" in tool_map
+            assert tool_map["browser_navigate"]["enabled"] is True
+            assert tool_map["browser_navigate"]["status"] == "available"
+        finally:
+            set_user_tool_overrides_hook(None)
+
+    def _login_admin(self) -> str:
+        login_response = client.post(
+            "/api/auth/login", json={"username": "admin", "password": "admin123"}
+        )
+        assert login_response.status_code == 200
+        return login_response.json()["access_token"]
 
 
 class TestToolsGovernanceAPI:
