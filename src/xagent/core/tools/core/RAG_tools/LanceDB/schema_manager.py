@@ -97,7 +97,14 @@ def _create_table(conn: DBConnection, name: str, schema: object | None = None) -
     except Exception as e:
         # Concurrent creators may race between existence check and create_table.
         # Treat "already exists" as benign to keep ensure_* idempotent.
-        if "already exists" in str(e).lower():
+        msg = str(e).lower()
+        if "already exists" in msg:
+            return
+        # LanceDB can throw concurrent transaction conflicts under multi-threaded
+        # load (e.g. "Incompatible transaction: This Overwrite transaction is
+        # incompatible with concurrent transaction ...").  If the table now
+        # exists the race was benign; re-raise only if it genuinely failed.
+        if "incompatible transaction" in msg and _table_exists(conn, name):
             return
         raise
 
