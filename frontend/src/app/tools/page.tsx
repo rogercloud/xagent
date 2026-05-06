@@ -868,6 +868,7 @@ export default function ToolsPage() {
                 {configButtonLabel}
               </Button>
             )}
+            {isAdmin && (
             <Button
               variant="outline"
               size="sm"
@@ -878,6 +879,7 @@ export default function ToolsPage() {
               {isTogglePending && <Loader2 className="mr-2 h-4 w-4 animate-spin" />}
               {tool.enabled ? t('tools.policy.disableAction') : t('tools.policy.enableAction')}
             </Button>
+            )}
           </div>
         </CardContent>
       </Card>
