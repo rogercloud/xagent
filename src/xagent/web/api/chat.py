@@ -153,6 +153,7 @@ async def create_default_tools(
     tool_config = WebToolConfig(
         db=db,
         request=request,
+        user=user,
         llm=llm,
         user_id=int(user.id),
         is_admin=bool(user.is_admin),
@@ -662,6 +663,7 @@ class AgentServiceManager:
                     temp_config = WebToolConfig(
                         db=db,
                         request=self.request,
+                        user=user,
                         llm=task_llm,
                         user_id=int(user.id),
                         is_admin=bool(user.is_admin),

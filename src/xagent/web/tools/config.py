@@ -125,6 +125,7 @@ class WebToolConfig(BaseToolConfig):
         request: Any,
         user_id: Optional[int] = None,
         is_admin: bool = False,
+        user: Optional[Any] = None,
         workspace_config: Optional[Dict[str, Any]] = None,
         vision_model: Optional[Any] = None,
         llm: Optional[Any] = None,
@@ -164,8 +165,9 @@ class WebToolConfig(BaseToolConfig):
         self._allowed_tools = allowed_tools
         self._excluded_agent_id: Optional[int] = None
 
-        # Cache user object for hook queries
-        self._user = getattr(request, "user", None)
+        # Cache user object for hook queries.
+        # Use explicit user param first; fall back to request.user.
+        self._user = user if user is not None else getattr(request, "user", None)
         self._cached_tool_overrides: Optional[dict] = None
 
         # Sandbox instance - only store reference, lifecycle managed by upper layer
