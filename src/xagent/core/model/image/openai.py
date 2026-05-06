@@ -133,7 +133,7 @@ class OpenAIImageModel(BaseImageModel):
             size=self._normalize_size(size),  # pyright: ignore[reportArgumentType]
             response_format=response_format,
             **kwargs,
-        )  # type: ignore[call-overload]
+        )
 
         image_url = None
         if response.data:
@@ -187,7 +187,7 @@ class OpenAIImageModel(BaseImageModel):
                 size=self._normalize_size(kwargs.pop("size", "1024*1024")),  # pyright: ignore[reportArgumentType]
                 response_format=response_format,
                 **kwargs,
-            )  # type: ignore[call-overload]
+            )
         finally:
             for image_file in image_files:
                 try:
