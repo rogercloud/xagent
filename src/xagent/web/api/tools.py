@@ -227,10 +227,13 @@ async def get_available_tools(
     )
 
     # Use ToolFactory.create_all_tools() to get all tools
-    # This ensures consistency between backend execution and frontend display
+    # Pass apply_user_override_filter=False so that disabled tools remain in
+    # the list and can be shown as ``enabled=False`` in the UI.
     from ...core.tools.adapters.vibe.factory import ToolFactory
 
-    all_tools = await ToolFactory.create_all_tools(tool_config)
+    all_tools = await ToolFactory.create_all_tools(
+        tool_config, apply_user_override_filter=False
+    )
 
     # Helper function to get category from tool's metadata
     def get_tool_category(tool: Any) -> str:

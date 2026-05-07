@@ -158,7 +158,9 @@ class ToolFactory:
     """
 
     @staticmethod
-    async def create_all_tools(config: BaseToolConfig) -> List[Tool]:
+    async def create_all_tools(
+        config: BaseToolConfig, apply_user_override_filter: bool = True
+    ) -> List[Tool]:
         """
         Create all tools based on configuration.
 
@@ -167,6 +169,10 @@ class ToolFactory:
 
         Args:
             config: Tool configuration object
+            apply_user_override_filter: If True (default), tools disabled by the
+                per-user override hook are filtered out. Set to False for the
+                display layer so that disabled tools remain visible with
+                ``enabled=False``.
 
         Returns:
             List of configured tools
@@ -185,6 +191,20 @@ class ToolFactory:
             logger.warning(
                 "⚠️ allowed_tools is empty list - this will filter out all tools! If you want to allow all tools, set allowed_tools to None"
             )
+
+        # Filter out tools disabled by per-user hook policy (execution layer)
+        if apply_user_override_filter:
+            overrides = getattr(config, "get_user_tool_overrides", lambda: {})()
+            if overrides:
+                disabled_by_hook = {
+                    name
+                    for name, ov in overrides.items()
+                    if ov and ov.get("enabled") is False
+                }
+                if disabled_by_hook:
+                    tools = [
+                        tool for tool in tools if tool.name not in disabled_by_hook
+                    ]
 
         # Wrap sandbox-enabled tools if sandbox is available
         sandbox = config.get_sandbox()

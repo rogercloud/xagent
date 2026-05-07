@@ -269,7 +269,7 @@ class TestToolsAvailableAPI:
             metadata = _Metadata()
 
         # Mock async create_all_tools to return test tools
-        async def mock_create_all_tools(config):
+        async def mock_create_all_tools(config, apply_user_override_filter=True):
             return [_ToolWithoutMetadata(), _ToolWithMetadata()]
 
         monkeypatch.setattr(
@@ -288,7 +288,7 @@ class TestToolsAvailableAPI:
         assert categories["tool_with_metadata"] == "basic"
 
     def test_get_available_tools_applies_user_override(self):
-        """Test that user tool override hook filters disabled tools from /available."""
+        """Test that user tool override hook marks disabled tools in /available."""
         from xagent.web.services.tool_credentials import set_user_tool_overrides_hook
 
         set_user_tool_overrides_hook(
@@ -309,10 +309,11 @@ class TestToolsAvailableAPI:
             assert response.status_code == 200
             payload = response.json()
 
-            tool_names = {item["name"] for item in payload["tools"]}
-            # browser_navigate is filtered out by the hook in both display
-            # and execution layers for consistency.
-            assert "browser_navigate" not in tool_names
+            tool_map = {item["name"]: item for item in payload["tools"]}
+            # In the display layer the tool remains visible but is marked disabled.
+            assert "browser_navigate" in tool_map
+            assert tool_map["browser_navigate"]["enabled"] is False
+            assert tool_map["browser_navigate"]["status"] == "disabled"
         finally:
             set_user_tool_overrides_hook(None)
 
@@ -333,7 +334,7 @@ class TestToolsAvailableAPI:
             description = ""
             metadata = _Metadata()
 
-        async def mock_create_all_tools(config):
+        async def mock_create_all_tools(config, apply_user_override_filter=True):
             return [_VisionTool()]
 
         monkeypatch.setattr(
@@ -834,6 +835,56 @@ class TestWebToolConfigUserOverride:
             # Without explicit user, overrides are {} and filtering is skipped
             assert "browser_navigate" in tool_names, (
                 "No filtering when no user (existing behavior)"
+            )
+            assert "calculator" in tool_names
+        finally:
+            set_user_tool_overrides_hook(None)
+
+    @pytest.mark.asyncio
+    async def test_create_all_tools_keeps_disabled_when_filter_false(self):
+        """When apply_user_override_filter=False, disabled tools remain in the list.
+
+        This is the display-layer path: tools are visible so they can be
+        shown as ``enabled=False`` in the UI.
+        """
+        from unittest.mock import AsyncMock, MagicMock, patch
+
+        from xagent.core.tools.adapters.vibe.factory import ToolFactory
+        from xagent.web.services.tool_credentials import set_user_tool_overrides_hook
+        from xagent.web.tools.config import WebToolConfig
+
+        def _hook(db, user):
+            return {"browser_navigate": {"enabled": False}}
+
+        set_user_tool_overrides_hook(_hook)
+        try:
+            request_without_user = MagicMock()
+            del request_without_user.user
+
+            cfg = WebToolConfig(
+                db=MagicMock(),
+                request=request_without_user,
+                user=MagicMock(id=42),
+                user_id=42,
+                workspace_config={"base_dir": "/tmp", "task_id": "test"},
+            )
+
+            tool_browser = MagicMock()
+            tool_browser.name = "browser_navigate"
+            tool_calc = MagicMock()
+            tool_calc.name = "calculator"
+
+            with patch(
+                "xagent.core.tools.adapters.vibe.factory.ToolRegistry.create_registered_tools",
+                AsyncMock(return_value=[tool_browser, tool_calc]),
+            ):
+                result = await ToolFactory.create_all_tools(
+                    cfg, apply_user_override_filter=False
+                )
+
+            tool_names = [t.name for t in result]
+            assert "browser_navigate" in tool_names, (
+                "Disabled tool should remain when apply_user_override_filter=False"
             )
             assert "calculator" in tool_names
         finally:
