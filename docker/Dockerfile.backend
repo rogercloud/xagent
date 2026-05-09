@@ -139,7 +139,10 @@ COPY --from=backend-build /root/.cache/deepdoc /root/.cache/deepdoc
 
 # Copy frontend package files for npm tasks (e.g., PPTX generation)
 COPY frontend/package.json frontend/package-lock.json /opt/xagent/frontend/
-RUN cd /opt/xagent/frontend && npm ci \
+RUN cd /opt/xagent/frontend \
+    && npm config set fetch-retries 5 \
+    && npm config set fetch-retry-mintimeout 30000 \
+    && npm ci \
     && npm install -g pptxgenjs@4.0.1 \
     && python -m playwright install chromium \
     && chmod +x /opt/xagent/deploy/entrypoint.sh
