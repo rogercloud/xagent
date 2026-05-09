@@ -310,6 +310,43 @@ class SingleCallPattern(AgentPattern):
             },
         )
 
+        response: Any = None
+        llm_trace_sent = False
+
+        async def log_llm_completion(
+            response_payload: Any,
+            *,
+            success: bool = True,
+            error: Optional[str] = None,
+        ) -> None:
+            nonlocal llm_trace_sent
+            if llm_trace_sent:
+                return
+
+            await trace_action_end(
+                self.tracer,
+                task_id,
+                step_id,
+                TraceCategory.LLM,
+                data={
+                    "action": "LLM call completed",
+                    "model_name": getattr(
+                        self.llm, "model_name", type(self.llm).__name__
+                    ),
+                    "task_type": "SingleCall execution",
+                    "attempt": 1,
+                    "response_type": type(response_payload).__name__,
+                    "is_tool_call": isinstance(response_payload, dict)
+                    and response_payload.get("type") == "tool_call",
+                    "response": response_payload,
+                    "success": success,
+                    "error": error,
+                    "step_name": "main",
+                    "step_id": step_id,
+                },
+            )
+            llm_trace_sent = True
+
         try:
             # Clean messages
             cleaned_messages = clean_messages(messages)
@@ -321,6 +358,7 @@ class SingleCallPattern(AgentPattern):
                     self.__class__.__name__, "SingleCall pattern requires an LLM"
                 )
             response = await self.llm.chat(**chat_kwargs)
+            await log_llm_completion(response)
 
             logger.info(f"SingleCall LLM response type: {type(response)}")
 
@@ -428,6 +466,10 @@ class SingleCallPattern(AgentPattern):
 
         except Exception as e:
             logger.error(f"SingleCall execution failed: {e}")
+            try:
+                await log_llm_completion(response, success=False, error=str(e))
+            except Exception:
+                pass
             # Trace error
             await trace_error(
                 self.tracer,
@@ -618,6 +660,41 @@ IMPORTANT:
             },
         )
 
+        response: Any = None
+        llm_trace_sent = False
+
+        async def log_final_answer_llm_completion(
+            response_payload: Any,
+            *,
+            success: bool = True,
+            error: Optional[str] = None,
+        ) -> None:
+            nonlocal llm_trace_sent
+            if llm_trace_sent:
+                return
+
+            await trace_action_end(
+                self.tracer,
+                task_id,
+                step_id,
+                TraceCategory.LLM,
+                data={
+                    "action": "LLM call completed",
+                    "model_name": getattr(
+                        self.llm, "model_name", type(self.llm).__name__
+                    ),
+                    "task_type": "Final answer generation",
+                    "attempt": 2,
+                    "response_type": type(response_payload).__name__,
+                    "response": response_payload,
+                    "success": success,
+                    "error": error,
+                    "step_name": "main",
+                    "step_id": step_id,
+                },
+            )
+            llm_trace_sent = True
+
         try:
             # Clean messages
             cleaned_messages = clean_messages(messages)
@@ -629,6 +706,7 @@ IMPORTANT:
                     "LLM is required for final answer generation"
                 )
             response = await self.llm.chat(**chat_kwargs)
+            await log_final_answer_llm_completion(response)
 
             # Extract response content
             if isinstance(response, dict):
@@ -641,5 +719,11 @@ IMPORTANT:
 
         except Exception as e:
             logger.error(f"SingleCall failed to generate final answer: {e}")
+            try:
+                await log_final_answer_llm_completion(
+                    response, success=False, error=str(e)
+                )
+            except Exception:
+                pass
             # Fallback: return tool result directly
             return str(tool_content)

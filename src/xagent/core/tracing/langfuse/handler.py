@@ -46,7 +46,8 @@ class LangfuseTraceHandler(TraceHandler):
         }
         self._root_observation: Optional[Any] = None
         self._step_observations: dict[str, Any] = {}
-        self._action_observations: dict[str, Any] = {}
+        self._action_observations: dict[str, list[Any]] = {}
+        self._step_action_observations: dict[str, list[tuple[str, Any]]] = {}
         self._task_llm_observations: dict[str, Any] = {}
         self._closed = False
 
@@ -213,6 +214,8 @@ class LangfuseTraceHandler(TraceHandler):
 
         observation = self._step_observations.get(step_id)
         if observation is None:
+            if event.event_type.action == TraceAction.ERROR:
+                self._finish_open_action_from_step_error(event, data, metadata)
             self._record_event(client, root, event)
             return
 
@@ -227,6 +230,7 @@ class LangfuseTraceHandler(TraceHandler):
                 metadata=metadata,
                 output={"last_error": data},
             )
+            self._finish_open_action_from_step_error(event, data, metadata)
             self._record_event(client, observation, event)
             return
 
@@ -245,10 +249,14 @@ class LangfuseTraceHandler(TraceHandler):
             observation = self._start_child_observation(
                 client, parent, **observation_kwargs
             )
-            self._action_observations[key] = observation
+            self._action_observations.setdefault(key, []).append(observation)
+            step_key = event.step_id or "unknown-step"
+            self._step_action_observations.setdefault(step_key, []).append(
+                (key, observation)
+            )
             return
 
-        observation = self._action_observations.get(key)
+        observation = self._peek_action_observation(key)
         if observation is None:
             self._record_event(client, parent, event)
             return
@@ -257,7 +265,7 @@ class LangfuseTraceHandler(TraceHandler):
             update_kwargs = self._update_observation_kwargs(event, data, metadata)
             observation.update(**update_kwargs)
             observation.end()
-            self._action_observations.pop(key, None)
+            self._pop_action_observation(key, observation)
             return
 
         if event.event_type.action == TraceAction.ERROR:
@@ -266,7 +274,7 @@ class LangfuseTraceHandler(TraceHandler):
             update_kwargs["status_message"] = self._error_message(data)
             observation.update(**update_kwargs)
             observation.end()
-            self._action_observations.pop(key, None)
+            self._pop_action_observation(key, observation)
             return
 
         self._record_event(client, observation, event)
@@ -487,11 +495,12 @@ class LangfuseTraceHandler(TraceHandler):
         return root
 
     def _close_open_observations(self) -> None:
-        for observation in list(self._action_observations.values()):
-            try:
-                observation.end()
-            except Exception:
-                pass
+        for observations in list(self._action_observations.values()):
+            for observation in list(observations):
+                try:
+                    observation.end()
+                except Exception:
+                    pass
         self._action_observations.clear()
 
         for observation in list(self._task_llm_observations.values()):
@@ -507,3 +516,71 @@ class LangfuseTraceHandler(TraceHandler):
             except Exception:
                 pass
         self._step_observations.clear()
+        self._step_action_observations.clear()
+
+    def _peek_action_observation(self, key: str) -> Any:
+        observations = self._action_observations.get(key)
+        if not observations:
+            return None
+        return observations[-1]
+
+    def _pop_action_observation(self, key: str, observation: Any) -> None:
+        observations = self._action_observations.get(key)
+        if not observations:
+            return
+
+        try:
+            observations.remove(observation)
+        except ValueError:
+            return
+
+        if not observations:
+            self._action_observations.pop(key, None)
+
+        for step_id, step_observations in list(self._step_action_observations.items()):
+            self._step_action_observations[step_id] = [
+                pair for pair in step_observations if pair[1] is not observation
+            ]
+            if not self._step_action_observations[step_id]:
+                self._step_action_observations.pop(step_id, None)
+
+    def _peek_step_action_observation(self, step_id: str) -> tuple[str, Any] | None:
+        observations = self._step_action_observations.get(step_id)
+        if not observations:
+            return None
+        return observations[-1]
+
+    def _pop_step_action_observation(self, step_id: str, observation: Any) -> None:
+        observations = self._step_action_observations.get(step_id)
+        if not observations:
+            return
+
+        for index in range(len(observations) - 1, -1, -1):
+            key, candidate = observations[index]
+            if candidate is observation:
+                observations.pop(index)
+                break
+
+        if not observations:
+            self._step_action_observations.pop(step_id, None)
+
+    def _finish_open_action_from_step_error(
+        self,
+        event: TraceEvent,
+        data: Any,
+        metadata: dict[str, Any],
+    ) -> bool:
+        step_id = event.step_id or "unknown-step"
+        step_action = self._peek_step_action_observation(step_id)
+        if step_action is None:
+            return False
+
+        key, observation = step_action
+        update_kwargs = self._update_observation_kwargs(event, data, metadata)
+        update_kwargs["level"] = "ERROR"
+        update_kwargs["status_message"] = self._error_message(data)
+        observation.update(**update_kwargs)
+        observation.end()
+        self._pop_step_action_observation(step_id, observation)
+        self._pop_action_observation(key, observation)
+        return True

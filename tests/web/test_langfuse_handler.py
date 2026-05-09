@@ -12,6 +12,7 @@ from xagent.core.agent.trace import (
     Tracer,
     trace_action_end,
     trace_action_start,
+    trace_error,
     trace_task_completion,
     trace_task_start,
 )
@@ -99,3 +100,89 @@ async def test_langfuse_handler_records_task_and_tool_flow(
 async def test_langfuse_handler_disabled_without_env(mocker, langfuse_client_reset):
     mocker.patch("xagent.core.tracing.langfuse.client.Langfuse")
     assert create_langfuse_trace_handler(task_id="task-2") is None
+
+
+@pytest.mark.asyncio
+async def test_langfuse_handler_keeps_multiple_actions_with_same_key(
+    mocker, monkeypatch, langfuse_client_reset
+):
+    monkeypatch.setenv("LANGFUSE_PUBLIC_KEY", "test-public")
+    monkeypatch.setenv("LANGFUSE_SECRET_KEY", "test-secret")
+
+    _, mock_langfuse = create_langfuse_mock(mocker)
+    root = _make_observation(mocker, "trace-2", "root-2")
+    first_llm = _make_observation(mocker, "trace-2", "llm-1")
+    second_llm = _make_observation(mocker, "trace-2", "llm-2")
+    mock_langfuse.start_observation.side_effect = [root, first_llm, second_llm]
+
+    handler = create_langfuse_trace_handler(task_id="task-2")
+    assert handler is not None
+
+    tracer = Tracer()
+    tracer.add_handler(handler)
+
+    await trace_action_start(
+        tracer,
+        "task-2",
+        "step-1",
+        TraceCategory.LLM,
+        data={"model_name": "mock-model", "attempt": 1},
+    )
+    await trace_action_start(
+        tracer,
+        "task-2",
+        "step-1",
+        TraceCategory.LLM,
+        data={"model_name": "mock-model", "attempt": 2},
+    )
+
+    handler._close_open_observations()
+
+    first_llm.end.assert_called_once()
+    second_llm.end.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_langfuse_handler_closes_action_on_step_error(
+    mocker, monkeypatch, langfuse_client_reset
+):
+    monkeypatch.setenv("LANGFUSE_PUBLIC_KEY", "test-public")
+    monkeypatch.setenv("LANGFUSE_SECRET_KEY", "test-secret")
+
+    _, mock_langfuse = create_langfuse_mock(mocker)
+    root = _make_observation(mocker, "trace-3", "root-3")
+    tool_observation = _make_observation(mocker, "trace-3", "tool-1")
+    error_event = _make_observation(mocker, "trace-3", "error-event")
+    mock_langfuse.start_observation.side_effect = [
+        root,
+        tool_observation,
+        error_event,
+    ]
+
+    handler = create_langfuse_trace_handler(task_id="task-3")
+    assert handler is not None
+
+    tracer = Tracer()
+    tracer.add_handler(handler)
+
+    await trace_action_start(
+        tracer,
+        "task-3",
+        "step-1",
+        TraceCategory.TOOL,
+        data={"tool_name": "calculator", "tool_args": {"expression": "1/0"}},
+    )
+    await trace_error(
+        tracer,
+        "task-3",
+        "step-1",
+        error_type="ToolExecutionError",
+        error_message="division by zero",
+        data={"tool_name": "calculator", "tool_args": {"expression": "1/0"}},
+    )
+
+    tool_observation.update.assert_called_once()
+    tool_observation.end.assert_called_once()
+    update_kwargs = tool_observation.update.call_args.kwargs
+    assert update_kwargs["level"] == "ERROR"
+    assert update_kwargs["status_message"] == "division by zero"

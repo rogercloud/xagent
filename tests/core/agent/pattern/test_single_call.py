@@ -506,7 +506,14 @@ async def test_single_call_trace_compatibility(
     mock_llm, mock_tools, mock_memory, mock_context
 ):
     """Test that SingleCall pattern uses REACT trace category for frontend compatibility"""
-    from xagent.core.agent.trace import TraceEvent, TraceHandler, Tracer
+    from xagent.core.agent.trace import (
+        TraceAction,
+        TraceCategory,
+        TraceEvent,
+        TraceHandler,
+        Tracer,
+        TraceScope,
+    )
 
     # Create a custom handler to collect events
     collected_events = []
@@ -536,5 +543,16 @@ async def test_single_call_trace_compatibility(
         if hasattr(e, "data") and e.data.get("pattern") == "SingleCall"
     ]
     assert len(single_call_events) > 0, "No SingleCall pattern events found"
+
+    llm_end_events = [
+        e
+        for e in collected_events
+        if e.event_type.scope == TraceScope.ACTION
+        and e.event_type.category == TraceCategory.LLM
+        and e.event_type.action == TraceAction.END
+    ]
+    assert len(llm_end_events) == 2
+    assert [e.data.get("attempt") for e in llm_end_events] == [1, 2]
+    assert all(e.data.get("success") is True for e in llm_end_events)
 
     assert result["success"] is True
