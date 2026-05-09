@@ -11,6 +11,7 @@ from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from ..config import get_uploads_dir
+from ..core.tracing.langfuse import flush_langfuse, initialize_langfuse
 from .api.admin_mcp import admin_mcp_router
 from .api.admin_users import router as admin_users_router
 from .api.agents import router as agents_router
@@ -175,6 +176,8 @@ async def startup_event() -> None:
     logger.info("Initializing database...")
     init_db()
     logger.info("Database initialized successfully")
+
+    initialize_langfuse()
 
     # Initialize skill manager
     from ..skills.utils import create_skill_manager
@@ -520,6 +523,8 @@ async def startup_event() -> None:
 @app.on_event("shutdown")
 async def shutdown_event() -> None:
     global _migration_task
+
+    flush_langfuse()
 
     if _migration_task and not _migration_task.done():
         logger.info("Cancelling background LanceDB migration task...")

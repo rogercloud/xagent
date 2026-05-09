@@ -30,6 +30,7 @@ from ..models.task import Task
 from ..models.uploaded_file import UploadedFile
 from ..models.user import User
 from ..tools.config import WebToolConfig
+from ..tracing import create_ephemeral_tracer
 from ..user_isolated_memory import UserContext
 from ..utils.db_timezone import safe_timestamp_to_unix
 
@@ -2553,11 +2554,13 @@ async def handle_builder_chat(
         websocket.state.builder_task_id = f"builder_chat_{uuid.uuid4().hex[:8]}"
     builder_task_id = websocket.state.builder_task_id
 
-    from ...core.agent.trace import Tracer
-
-    builder_tracer = Tracer()
-    builder_tracer.add_handler(
-        SharedWebSocketTracer(websocket, builder_task_id, is_preview=False)
+    builder_tracer = create_ephemeral_tracer(
+        task_id=builder_task_id,
+        websocket_handler=SharedWebSocketTracer(
+            websocket, builder_task_id, is_preview=False
+        ),
+        user=user,
+        is_preview=False,
     )
 
     try:
@@ -3042,7 +3045,6 @@ async def handle_build_preview_execution(
     from sqlalchemy.orm import Session
 
     from ...core.agent.service import AgentService
-    from ...core.agent.trace import Tracer
     from ...core.memory.in_memory import InMemoryMemoryStore
     from ..models.database import get_db
     from ..models.model import Model as DBModel
@@ -3071,10 +3073,13 @@ async def handle_build_preview_execution(
     # Generate temporary task_id
     preview_task_id = f"build_preview_{uuid.uuid4().hex[:8]}"
 
-    # Create Tracer instance with WebSocket handler
-    preview_tracer = Tracer()
-    preview_tracer.add_handler(
-        SharedWebSocketTracer(websocket, preview_task_id, is_preview=True)
+    preview_tracer = create_ephemeral_tracer(
+        task_id=preview_task_id,
+        websocket_handler=SharedWebSocketTracer(
+            websocket, preview_task_id, is_preview=True
+        ),
+        user=user,
+        is_preview=True,
     )
 
     # Get database session

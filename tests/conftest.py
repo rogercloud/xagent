@@ -21,8 +21,8 @@ from openai.types.chat.chat_completion_message_tool_call import (
 )
 
 from xagent.core.model import ChatModelConfig, EmbeddingModelConfig, RerankModelConfig
-from xagent.core.observability.langfuse_tracer import init_tracer, reset_tracer
 from xagent.core.tools.core.RAG_tools.storage import reset_rag_storage_for_tests
+from xagent.core.tracing.langfuse import reset_langfuse_client
 
 # YAML entrypoint has been removed, commenting out these imports
 # from xagent.entrypoint.yaml.parser import MigrationManager
@@ -502,23 +502,11 @@ def sample_openai_model():
 
 
 @pytest.fixture
-def langfuse_tracer_reset():
-    """Fixture to reset Langfuse tracer before and after each test."""
-    reset_tracer()
+def langfuse_client_reset():
+    """Fixture to reset the shared Langfuse client before and after each test."""
+    reset_langfuse_client()
     yield
-    reset_tracer()
-
-
-@pytest.fixture
-def disabled_langfuse_config(temp_dir):
-    """Fixture providing temporary directory with disabled Langfuse config."""
-    config_data = {"enabled": False}
-    config_path = f"{temp_dir}/langfuse_config.json"
-    with open(config_path, "w") as f:
-        json.dump(config_data, f)
-
-    init_tracer(temp_dir)
-    yield temp_dir, config_path
+    reset_langfuse_client()
 
 
 @pytest.fixture

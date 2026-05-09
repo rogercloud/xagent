@@ -10,9 +10,7 @@ def create_langfuse_mock(mocker) -> tuple:
     Returns:
         tuple: (mock_langfuse_class, mock_langfuse_instance)
     """
-    mock_langfuse_class = mocker.patch(
-        "xagent.core.observability.langfuse_tracer.Langfuse"
-    )
+    mock_langfuse_class = mocker.patch("xagent.core.tracing.langfuse.client.Langfuse")
     mock_langfuse_instance = mocker.Mock()
     mock_langfuse_class.return_value = mock_langfuse_instance
     return mock_langfuse_class, mock_langfuse_instance
@@ -149,7 +147,7 @@ def create_mock_tool_calls(
 
 
 def create_temp_config_file(
-    temp_dir: str, config_data: Dict[str, Any], filename: str = "langfuse_config.json"
+    temp_dir: str, config_data: Dict[str, Any], filename: str = "config.json"
 ) -> str:
     """Create a temporary configuration file.
 
