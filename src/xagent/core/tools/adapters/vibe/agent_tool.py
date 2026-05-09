@@ -12,6 +12,7 @@ from .....web.services.model_service import (
     _get_visible_user_ids,
     _is_model_visible_to_user,
 )
+from ....tracing import create_agent_tracer
 from ....utils.type_check import ensure_list
 from .base import AbstractBaseTool, ToolCategory, ToolVisibility
 
@@ -1200,6 +1201,21 @@ class AgentTool(AbstractBaseTool):
                 workspace_base_dir=self._workspace_base_dir,
             )
 
+            tracer = create_agent_tracer(
+                task_id=execution_task_id,
+                user_id=self._user_id,
+                trace_name=f"xagent-agent-tool-{self._agent_id}",
+                session_id=self._task_id,
+                tags=["xagent", "agent-tool", "nested-agent"],
+                metadata={
+                    "source": "xagent-agent-tool",
+                    "task_id": execution_task_id,
+                    "parent_task_id": self._task_id,
+                    "agent_id": self._agent_id,
+                    "agent_name": agent.name,
+                },
+            )
+
             # Create agent service
             memory = InMemoryMemoryStore()
             agent_service = AgentService(
@@ -1215,7 +1231,7 @@ class AgentTool(AbstractBaseTool):
                 enable_workspace=True,
                 workspace_base_dir=self._workspace_base_dir,
                 task_id=execution_task_id,
-                tracer=None,
+                tracer=tracer,
             )
 
             # Build execution context

@@ -54,8 +54,10 @@ def get_langfuse_client() -> Optional[Langfuse]:
 
         try:
             host = (os.getenv("LANGFUSE_HOST") or "").strip() or None
-            client_kwargs = {"host": host} if host else {}
-            _LANGFUSE_CLIENT = Langfuse(**client_kwargs)
+            if host:
+                _LANGFUSE_CLIENT = Langfuse(host=host)
+            else:
+                _LANGFUSE_CLIENT = Langfuse()
             logger.info("Langfuse tracing initialized")
         except Exception as exc:
             logger.warning(f"Failed to initialize Langfuse client: {exc}")

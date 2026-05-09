@@ -13,6 +13,7 @@ from sqlalchemy.orm import Session
 from ...config import get_uploads_dir
 from ...core.agent.service import AgentService
 from ...core.memory.in_memory import InMemoryMemoryStore
+from ...core.tracing import create_agent_tracer
 from ...core.utils.type_check import ensure_list
 from ..auth_dependencies import get_current_user
 from ..models.agent import Agent, AgentStatus
@@ -838,7 +839,21 @@ async def preview_agent(
         else:  # fallback to balanced (react)
             use_dag_pattern = False
 
-        # Create agent service (no tracer - no database logging for preview)
+        tracer = create_agent_tracer(
+            task_id=preview_task_id,
+            user_id=int(current_user.id),
+            trace_name=f"xagent-web-agent-preview-{preview_task_id}",
+            session_id=preview_task_id,
+            tags=["xagent", "web", "preview", "agent-builder"],
+            metadata={
+                "source": "xagent-web",
+                "task_id": preview_task_id,
+                "is_preview": True,
+                "preview_transport": "rest",
+            },
+        )
+
+        # Create agent service (Langfuse only, no database/websocket logging)
         memory = InMemoryMemoryStore()
         agent_service = AgentService(
             name="preview_agent",
@@ -853,7 +868,7 @@ async def preview_agent(
             enable_workspace=True,  # Both patterns support workspace
             workspace_base_dir=str(get_uploads_dir() / "preview"),
             task_id=preview_task_id,  # Add task_id for proper tool initialization
-            tracer=None,  # No tracer for preview - don't log to database
+            tracer=tracer,
         )
 
         # Execute task with system prompt in context

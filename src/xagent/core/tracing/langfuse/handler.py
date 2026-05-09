@@ -40,7 +40,7 @@ class LangfuseTraceHandler(TraceHandler):
         self.session_id = session_id or f"task:{task_id}"
         self.tags = list(tags or ["xagent", "web"])
         self.metadata = {
-            "source": "xagent-web",
+            "source": "xagent",
             "task_id": task_id,
             **(metadata or {}),
         }
