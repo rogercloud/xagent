@@ -1,8 +1,14 @@
+import json
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from sqlalchemy.orm import Session
 
+from tests.utils.langfuse_execution_fakes import (
+    CalculatorTool,
+    DeterministicReActLLM,
+    FakeLangfuseClient,
+)
 from xagent.web.api.websocket import handle_build_preview_execution
 from xagent.web.models.model import Model as DBModel
 from xagent.web.models.user import User
@@ -179,3 +185,89 @@ async def test_websocket_build_preview_endpoint_pause_resume():
     resume_data = json.loads(send_text_calls[1][0][0])
     assert resume_data["type"] == "task_resumed"
     assert "timestamp" in resume_data
+
+
+@pytest.mark.asyncio
+async def test_handle_build_preview_execution_exports_langfuse_trace(
+    mocker, monkeypatch, langfuse_client_reset, tmp_path
+):
+    mock_websocket = AsyncMock()
+    mock_websocket.state = MagicMock()
+    mock_websocket.state.preview_history = []
+
+    user = MagicMock(spec=User)
+    user.id = 1
+    user.is_admin = False
+
+    message_data = {
+        "instructions": "preview instructions",
+        "execution_mode": "flash",
+        "models": {"general": 1},
+        "knowledge_bases": [],
+        "skills": [],
+        "tool_categories": [],
+        "message": "calculate 2 + 2",
+        "files": [],
+    }
+
+    mock_db = MagicMock(spec=Session)
+    mock_model = MagicMock(spec=DBModel)
+    mock_model.model_id = "test-model-id"
+    mock_db.query.return_value.filter.return_value.first.return_value = mock_model
+
+    monkeypatch.setenv("LANGFUSE_PUBLIC_KEY", "test-public")
+    monkeypatch.setenv("LANGFUSE_SECRET_KEY", "test-secret")
+    fake_client = FakeLangfuseClient()
+    mocker.patch(
+        "xagent.core.tracing.langfuse.client.Langfuse", return_value=fake_client
+    )
+
+    with (
+        patch("xagent.web.models.database.get_db", return_value=iter([mock_db])),
+        patch(
+            "xagent.web.services.llm_utils.UserAwareModelStorage"
+        ) as mock_storage_class,
+        patch(
+            "xagent.core.tools.adapters.vibe.factory.ToolFactory.create_all_tools",
+            new=AsyncMock(return_value=[CalculatorTool()]),
+        ),
+        patch(
+            "xagent.web.api.websocket.get_uploads_dir",
+            return_value=tmp_path / "uploads",
+        ),
+        patch(
+            "xagent.web.api.websocket.get_external_upload_dirs",
+            return_value=[],
+        ),
+    ):
+        mock_storage = MagicMock()
+        mock_storage.get_llm_by_name_with_access.return_value = DeterministicReActLLM()
+        mock_storage_class.return_value = mock_storage
+
+        await handle_build_preview_execution(mock_websocket, message_data, user)
+
+    sent_payloads = [
+        json.loads(call.args[0]) for call in mock_websocket.send_text.call_args_list
+    ]
+    assert any(payload["type"] == "preview_started" for payload in sent_payloads)
+    assert any(payload["type"] == "task_completed" for payload in sent_payloads)
+    assert any(payload["type"] == "trace_event" for payload in sent_payloads)
+
+    root_observations = [
+        observation
+        for observation in fake_client.observations
+        if observation.start_kwargs.get("as_type") == "agent"
+    ]
+    assert len(root_observations) == 1
+    root = root_observations[0]
+    assert root.ended is True
+    assert root.start_kwargs["metadata"]["is_preview"] is True
+    assert root.trace_updates[0]["session_id"].startswith("build_preview_")
+
+    generation_observations = [
+        observation
+        for observation in fake_client.observations
+        if observation.start_kwargs.get("as_type") == "generation"
+    ]
+    assert len(generation_observations) >= 1
+    assert all(observation.ended for observation in generation_observations)
