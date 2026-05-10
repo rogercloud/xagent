@@ -27,7 +27,8 @@ def create_langfuse_span_mock(mocker, langfuse_instance) -> object:
         Mock span object
     """
     mock_span = mocker.Mock()
-    # Support both v3 (start_span) and v4 (start_observation) APIs
+    # Xagent targets the v4 observation API and still exposes start_span on the
+    # mock to keep older tests tolerant of direct span helpers.
     langfuse_instance.start_span.return_value = mock_span
     langfuse_instance.start_observation.return_value = mock_span
     # Also add start_observation to the mock span for nested spans
