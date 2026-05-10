@@ -10,9 +10,17 @@ from .api.trace_handlers import DatabaseTraceHandler
 from .models.user import User
 
 
-def create_task_tracer(task_id: int, user: Optional[User] = None) -> Tracer:
+def create_task_tracer(
+    task_id: int,
+    user: Optional[User] = None,
+    user_id: Optional[int] = None,
+) -> Tracer:
     """Build the standard tracer stack for persisted web task execution."""
     from .api.ws_trace_handlers import WebSocketTraceHandler
+
+    resolved_user_id = user_id
+    if user is not None and user.id is not None:
+        resolved_user_id = int(user.id)
 
     return create_agent_tracer(
         handlers=[
@@ -21,7 +29,7 @@ def create_task_tracer(task_id: int, user: Optional[User] = None) -> Tracer:
             WebSocketTraceHandler(task_id),
         ],
         task_id=str(task_id),
-        user_id=int(user.id) if user and user.id is not None else None,
+        user_id=resolved_user_id,
         trace_name=f"xagent-web-task-{task_id}",
         session_id=f"task:{task_id}",
         tags=["xagent", "web", "task"],

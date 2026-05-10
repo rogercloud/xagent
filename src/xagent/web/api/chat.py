@@ -1292,7 +1292,10 @@ class AgentServiceManager:
 
             if tracer_events or plan_state:
                 # Create a minimal agent first
-                tracer = create_task_tracer(task_id)
+                tracer = create_task_tracer(
+                    task_id,
+                    user_id=int(user_id) if user_id is not None else None,
+                )
 
                 # Get LLM configuration from task database record
                 try:

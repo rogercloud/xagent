@@ -38,6 +38,21 @@ def test_create_task_tracer_with_langfuse(mocker, monkeypatch, langfuse_client_r
     assert any(isinstance(handler, LangfuseTraceHandler) for handler in tracer.handlers)
 
 
+def test_create_task_tracer_with_user_id(mocker, monkeypatch, langfuse_client_reset):
+    monkeypatch.setenv("LANGFUSE_PUBLIC_KEY", "test-public")
+    monkeypatch.setenv("LANGFUSE_SECRET_KEY", "test-secret")
+    create_langfuse_mock(mocker)
+
+    tracer = create_task_tracer(123, user_id=42)
+    langfuse_handler = next(
+        handler
+        for handler in tracer.handlers
+        if isinstance(handler, LangfuseTraceHandler)
+    )
+
+    assert langfuse_handler.user_id == "42"
+
+
 def test_create_ephemeral_tracer_with_langfuse(
     mocker, monkeypatch, langfuse_client_reset
 ):
