@@ -640,16 +640,18 @@ def check_langfuse_env():
     """Check required Langfuse environment variables - used by integration tests."""
     public_key = os.getenv("LANGFUSE_PUBLIC_KEY")
     secret_key = os.getenv("LANGFUSE_SECRET_KEY")
-    host = os.getenv("LANGFUSE_HOST")
+    base_url = os.getenv("LANGFUSE_BASE_URL") or os.getenv("LANGFUSE_HOST")
 
     if not public_key:
         pytest.fail("LANGFUSE_PUBLIC_KEY environment variable is required")
     if not secret_key:
         pytest.fail("LANGFUSE_SECRET_KEY environment variable is required")
-    if not host:
-        pytest.fail("LANGFUSE_HOST environment variable is required")
+    if not base_url:
+        pytest.fail(
+            "LANGFUSE_BASE_URL or LANGFUSE_HOST environment variable is required"
+        )
 
-    return public_key, secret_key, host
+    return public_key, secret_key, base_url
 
 
 @pytest.fixture

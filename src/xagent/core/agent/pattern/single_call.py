@@ -468,8 +468,8 @@ class SingleCallPattern(AgentPattern):
             logger.error(f"SingleCall execution failed: {e}")
             try:
                 await log_llm_completion(response, success=False, error=str(e))
-            except Exception:
-                pass
+            except Exception as log_exc:
+                logger.warning(f"Failed to log LLM completion error: {log_exc}")
             # Trace error
             await trace_error(
                 self.tracer,
@@ -723,7 +723,7 @@ IMPORTANT:
                 await log_final_answer_llm_completion(
                     response, success=False, error=str(e)
                 )
-            except Exception:
-                pass
+            except Exception as log_exc:
+                logger.warning(f"Failed to log LLM completion error: {log_exc}")
             # Fallback: return tool result directly
             return str(tool_content)

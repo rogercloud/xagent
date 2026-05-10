@@ -10,8 +10,8 @@ from tests.utils.langfuse_execution_fakes import (
     DeterministicReActLLM,
     DeterministicSingleCallLLM,
     DummyMemoryStore,
-    FakeLangfuseClient,
     FailingTool,
+    FakeLangfuseClient,
     WeatherTool,
     assert_handler_closed,
     find_trace_update,
@@ -29,7 +29,9 @@ from xagent.core.workspace import TaskWorkspace
 
 
 @pytest.fixture
-def fake_langfuse_client(mocker, monkeypatch, langfuse_client_reset) -> FakeLangfuseClient:
+def fake_langfuse_client(
+    mocker, monkeypatch, langfuse_client_reset
+) -> FakeLangfuseClient:
     monkeypatch.setenv("LANGFUSE_PUBLIC_KEY", "test-public")
     monkeypatch.setenv("LANGFUSE_SECRET_KEY", "test-secret")
     client = FakeLangfuseClient()
@@ -165,7 +167,9 @@ async def test_react_tool_success_exports_langfuse_trace(
         task_id="react-success",
     )
 
-    result = await agent_service.execute_task("calculate 2 + 2", task_id="react-success")
+    result = await agent_service.execute_task(
+        "calculate 2 + 2", task_id="react-success"
+    )
 
     assert result["success"] is True
     handler = get_langfuse_handler(tracer.handlers)
@@ -222,7 +226,9 @@ async def test_dag_plan_execute_exports_step_parented_observations(
     handler = get_langfuse_handler(tracer.handlers)
 
     step_observations = observations_by_type(fake_langfuse_client, "span")
-    step_names = [observation.start_kwargs.get("name") for observation in step_observations]
+    step_names = [
+        observation.start_kwargs.get("name") for observation in step_observations
+    ]
     assert "step_step1" in step_names
 
     step_observation = next(
@@ -235,8 +241,7 @@ async def test_dag_plan_execute_exports_step_parented_observations(
     child_observations = [
         observation
         for observation in fake_langfuse_client.observations
-        if observation.start_kwargs.get("trace_context", {}).get("parent_span_id")
-        == step_observation.id
+        if observation.parent_id == step_observation.id
     ]
     assert child_observations
     assert any(

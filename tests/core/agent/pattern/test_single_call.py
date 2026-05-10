@@ -10,6 +10,7 @@ from pydantic import BaseModel
 
 from xagent.core.agent.context import AgentContext
 from xagent.core.agent.pattern.single_call import SingleCallPattern
+from xagent.core.agent.trace import TraceAction, TraceCategory, TraceScope
 from xagent.core.memory.base import MemoryResponse, MemoryStore
 from xagent.core.model.chat.basic.base import BaseLLM
 from xagent.core.model.chat.types import ChunkType, StreamChunk
@@ -556,3 +557,93 @@ async def test_single_call_trace_compatibility(
     assert all(e.data.get("success") is True for e in llm_end_events)
 
     assert result["success"] is True
+
+
+@pytest.mark.asyncio
+async def test_single_call_logs_warning_when_failure_trace_logging_fails(
+    mocker, mock_tools, mock_memory, mock_context, caplog
+):
+    class ExplodingLLM(MockSingleCallLLM):
+        async def chat(self, messages: list[dict[str, str]], **kwargs) -> Any:
+            del messages, kwargs
+            raise RuntimeError("llm failure")
+
+    exploding_llm = ExplodingLLM()
+    pattern = SingleCallPattern(llm=exploding_llm)
+    mocker.patch(
+        "xagent.core.agent.pattern.single_call.trace_action_end",
+        side_effect=RuntimeError("trace end failure"),
+    )
+
+    caplog.set_level("WARNING")
+
+    result = await pattern.run(
+        task="Use test_tool",
+        memory=mock_memory,
+        tools=mock_tools,
+        context=mock_context,
+    )
+
+    assert result["success"] is False
+    assert "SingleCall execution failed: llm failure" in result["error"]
+    assert "Failed to log LLM completion error: trace end failure" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_single_call_logs_warning_when_final_answer_trace_logging_fails(
+    mocker, mock_tools, mock_memory, mock_context, caplog
+):
+    class FailingFinalAnswerLLM(MockSingleCallLLM):
+        async def chat(self, messages: list[dict[str, str]], **kwargs) -> Any:
+            self.call_count += 1
+            self.calls.append({"messages": messages, "kwargs": kwargs})
+            if self.call_count == 1:
+                return self.response
+            raise RuntimeError("final answer failure")
+
+    failing_llm = FailingFinalAnswerLLM(
+        response={
+            "type": "tool_call",
+            "tool_calls": [
+                {
+                    "function": {
+                        "name": "test_tool",
+                        "arguments": json.dumps({"arg1": "value1"}),
+                    }
+                }
+            ],
+        }
+    )
+    pattern = SingleCallPattern(llm=failing_llm)
+    original_trace_event = pattern.tracer.trace_event
+
+    async def flaky_trace_event(event_type, *args, **kwargs):
+        data = kwargs.get("data")
+        if (
+            event_type.scope == TraceScope.ACTION
+            and event_type.category == TraceCategory.LLM
+            and event_type.action == TraceAction.END
+            and isinstance(data, dict)
+            and data.get("attempt") == 2
+        ):
+            raise RuntimeError("trace end failure")
+        return await original_trace_event(event_type, *args, **kwargs)
+
+    mocker.patch.object(
+        pattern.tracer,
+        "trace_event",
+        side_effect=flaky_trace_event,
+    )
+
+    caplog.set_level("WARNING")
+
+    result = await pattern.run(
+        task="Use test_tool",
+        memory=mock_memory,
+        tools=mock_tools,
+        context=mock_context,
+    )
+
+    assert result["success"] is True
+    assert "Executed with args" in result["output"]
+    assert "Failed to log LLM completion error: trace end failure" in caplog.text

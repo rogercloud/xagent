@@ -3,10 +3,9 @@
 from __future__ import annotations
 
 import logging
-from typing import Any, Optional, cast
+from typing import Any, Optional, Protocol, cast
 
 from langfuse import Langfuse
-from langfuse._client.attributes import LangfuseOtelSpanAttributes
 
 from ...agent.trace import (
     TraceAction,
@@ -19,6 +18,13 @@ from .client import get_langfuse_client
 from .serialization import coerce_usage_details, serialize_for_langfuse
 
 logger = logging.getLogger(__name__)
+
+
+class LangfuseObservationLike(Protocol):
+    trace_id: str
+    id: str
+
+    def start_observation(self, **kwargs: Any) -> Any: ...
 
 
 class LangfuseTraceHandler(TraceHandler):
@@ -301,20 +307,11 @@ class LangfuseTraceHandler(TraceHandler):
     def _start_child_observation(
         self,
         client: Langfuse,
-        parent: Any,
+        parent: LangfuseObservationLike,
         **kwargs: Any,
     ) -> Any:
-        observation = client.start_observation(
-            trace_context={"trace_id": parent.trace_id, "parent_span_id": parent.id},
-            **kwargs,
-        )
-        otel_span = getattr(observation, "_otel_span", None)
-        if otel_span is not None:
-            try:
-                otel_span.set_attribute(LangfuseOtelSpanAttributes.AS_ROOT, False)
-            except Exception:
-                pass
-        return observation
+        del client
+        return parent.start_observation(**kwargs)
 
     def _start_observation_kwargs(
         self,
@@ -499,22 +496,24 @@ class LangfuseTraceHandler(TraceHandler):
             for observation in list(observations):
                 try:
                     observation.end()
-                except Exception:
-                    pass
+                except Exception as exc:
+                    logger.warning(
+                        f"Failed to close Langfuse action observation: {exc}"
+                    )
         self._action_observations.clear()
 
         for observation in list(self._task_llm_observations.values()):
             try:
                 observation.end()
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.warning(f"Failed to close Langfuse task LLM observation: {exc}")
         self._task_llm_observations.clear()
 
         for observation in list(self._step_observations.values()):
             try:
                 observation.end()
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.warning(f"Failed to close Langfuse step observation: {exc}")
         self._step_observations.clear()
         self._step_action_observations.clear()
 

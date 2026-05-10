@@ -25,15 +25,24 @@ class FakeOtelSpan:
 
 
 class FakeObservation:
-    def __init__(self, span_id: str, kwargs: dict[str, Any]) -> None:
+    def __init__(
+        self,
+        span_id: str,
+        kwargs: dict[str, Any],
+        *,
+        client: "FakeLangfuseClient",
+        parent_id: Optional[str] = None,
+    ) -> None:
         self.trace_id = "trace-1"
         self.id = span_id
+        self.parent_id = parent_id
         self.start_kwargs = kwargs
         self.updates: list[dict[str, Any]] = []
         self.trace_updates: list[dict[str, Any]] = []
         self.ended = False
         self.end_count = 0
         self._otel_span = FakeOtelSpan()
+        self._client = client
 
     def update(self, **kwargs: Any) -> None:
         self.updates.append(kwargs)
@@ -45,6 +54,9 @@ class FakeObservation:
         self.ended = True
         self.end_count += 1
 
+    def start_observation(self, **kwargs: Any) -> "FakeObservation":
+        return self._client.start_child_observation(parent=self, **kwargs)
+
 
 class FakeLangfuseClient:
     def __init__(self) -> None:
@@ -52,7 +64,21 @@ class FakeLangfuseClient:
         self.flushed = False
 
     def start_observation(self, **kwargs: Any) -> FakeObservation:
-        observation = FakeObservation(f"span-{len(self.observations) + 1}", kwargs)
+        observation = FakeObservation(
+            f"span-{len(self.observations) + 1}", kwargs, client=self
+        )
+        self.observations.append(observation)
+        return observation
+
+    def start_child_observation(
+        self, *, parent: FakeObservation, **kwargs: Any
+    ) -> FakeObservation:
+        observation = FakeObservation(
+            f"span-{len(self.observations) + 1}",
+            kwargs,
+            client=self,
+            parent_id=parent.id,
+        )
         self.observations.append(observation)
         return observation
 
@@ -249,9 +275,7 @@ class DeterministicSingleCallLLM(BaseLLM):
             }
         return {"type": "text", "content": self._final_answer}
 
-    async def stream_chat(
-        self, messages: list[dict[str, str]], **kwargs: Any
-    ) -> Any:
+    async def stream_chat(self, messages: list[dict[str, str]], **kwargs: Any) -> Any:
         del messages, kwargs
         yield StreamChunk(type=ChunkType.END)
 
@@ -289,9 +313,7 @@ class DeterministicReActLLM(BaseLLM):
             '"success":true,"error":null}'
         )
 
-    async def stream_chat(
-        self, messages: list[dict[str, str]], **kwargs: Any
-    ) -> Any:
+    async def stream_chat(self, messages: list[dict[str, str]], **kwargs: Any) -> Any:
         response = await self.chat(messages, **kwargs)
         has_tools = bool(kwargs.get("tools"))
         if has_tools:
@@ -332,7 +354,9 @@ class DeterministicDagLLM(BaseLLM):
         return False
 
     async def chat(self, messages: list[dict[str, str]], **kwargs: Any) -> Any:
-        content_blob = "\n".join(str(message.get("content", "")) for message in messages)
+        content_blob = "\n".join(
+            str(message.get("content", "")) for message in messages
+        )
         lowered = content_blob.lower()
         response_format = kwargs.get("response_format")
         output_config = kwargs.get("output_config")
@@ -451,9 +475,7 @@ class DeterministicDagLLM(BaseLLM):
             '"answer":"Weather is sunny in Singapore today","success":true,"error":null}'
         )
 
-    async def stream_chat(
-        self, messages: list[dict[str, str]], **kwargs: Any
-    ) -> Any:
+    async def stream_chat(self, messages: list[dict[str, str]], **kwargs: Any) -> Any:
         response = await self.chat(messages, **kwargs)
         if kwargs.get("tools"):
             parsed = json.loads(response)

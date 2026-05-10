@@ -53,9 +53,13 @@ def get_langfuse_client() -> Optional[Langfuse]:
             return None
 
         try:
-            host = (os.getenv("LANGFUSE_HOST") or "").strip() or None
-            if host:
-                _LANGFUSE_CLIENT = Langfuse(host=host)
+            base_url = (
+                (os.getenv("LANGFUSE_BASE_URL") or "").strip()
+                or (os.getenv("LANGFUSE_HOST") or "").strip()
+                or None
+            )
+            if base_url:
+                _LANGFUSE_CLIENT = Langfuse(base_url=base_url)
             else:
                 _LANGFUSE_CLIENT = Langfuse()
             logger.info("Langfuse tracing initialized")
