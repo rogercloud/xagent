@@ -26,7 +26,7 @@ export interface WorkforceManagerListItem {
 
 export interface WorkforceRunListItem {
   id: number
-  task_id: number
+  task_id: number | null
   status: string
   created_at: string | null
 }

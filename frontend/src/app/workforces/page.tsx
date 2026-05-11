@@ -139,7 +139,7 @@ export default function WorkforcesPage() {
                         </div>
                         {item.last_run ? (
                           <div className="text-xs text-muted-foreground">
-                            Last run #{item.last_run.id} · task #{item.last_run.task_id} · {item.last_run.status}
+                            Last run #{item.last_run.id}{item.last_run.task_id != null ? ` · task #${item.last_run.task_id}` : ""} · {item.last_run.status}
                           </div>
                         ) : (
                           <div className="text-xs text-muted-foreground">No runs yet</div>

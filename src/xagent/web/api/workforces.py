@@ -41,6 +41,7 @@ from ..services.workforce_workers import (
     create_workforce_worker,
     ensure_supported_source_type,
     list_template_summaries,
+    normalize_execution_mode,
 )
 
 router = APIRouter(prefix="/api/workforces", tags=["workforces"])
@@ -600,6 +601,10 @@ async def create_workforce_run(
     if len(task_title) > 50:
         task_title = task_title[:50] + "..."
 
+    execution_mode = normalize_execution_mode(
+        request.execution_mode or workforce.manager_agent.execution_mode or "balanced"
+    )
+
     task = Task(
         user_id=user.id,
         title=task_title,
@@ -609,9 +614,7 @@ async def create_workforce_run(
         agent_config=build_workforce_task_config(
             snapshot, selected_file_ids=request.files
         ),
-        execution_mode=request.execution_mode
-        or workforce.manager_agent.execution_mode
-        or "balanced",
+        execution_mode=execution_mode,
     )
     db.add(task)
     db.flush()
