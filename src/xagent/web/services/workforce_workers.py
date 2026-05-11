@@ -1,3 +1,4 @@
+import re
 from pathlib import Path
 from typing import Any, cast
 
@@ -13,6 +14,15 @@ from .workforce_access import ensure_agent_access
 from .workforce_snapshot import normalize_text
 
 _TEMPLATE_MANAGER = create_template_manager()
+
+_SAFE_TEMPLATE_ID_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_.-]*$")
+
+
+def _validate_template_id(template_id: str) -> None:
+    if not _SAFE_TEMPLATE_ID_RE.match(template_id):
+        raise HTTPException(
+            status_code=400, detail=f"Invalid template_id: {template_id}"
+        )
 
 
 def ensure_supported_source_type(source_type: str) -> None:
@@ -124,6 +134,7 @@ def create_agent_record(
 
 
 def load_template_detail(template_id: str) -> dict[str, Any]:
+    _validate_template_id(template_id)
     yaml_path = Path(_TEMPLATE_MANAGER.templates_root) / f"{template_id}.yaml"
     if not yaml_path.exists():
         raise HTTPException(status_code=404, detail="Template not found")

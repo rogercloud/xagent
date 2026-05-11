@@ -11,9 +11,11 @@ from xagent.web.models.user import User
 from xagent.web.models.workforce import Workforce, WorkforceAgent
 from xagent.web.services.workforce_runtime import _map_task_status
 from xagent.web.services.workforce_snapshot import (
+    _build_worker_tool_name,
     build_agent_tool_overrides,
     build_workforce_snapshot,
 )
+from xagent.web.services.workforce_workers import load_template_detail
 
 
 def _create_session() -> tuple[Session, str]:
@@ -165,3 +167,48 @@ def test_map_task_status_maps_paused() -> None:
     assert _map_task_status(TaskStatus.FAILED) == "failed"
     assert _map_task_status(None) is None
     assert _map_task_status("unknown") is None
+
+
+def test_build_worker_tool_name_truncates_long_alias() -> None:
+    normal = _build_worker_tool_name(1, "researcher")
+    assert normal == "call_workforce_worker_1_researcher"
+    assert len(normal) <= 64
+
+    long_alias = "a" * 100
+    truncated = _build_worker_tool_name(1, long_alias)
+    assert len(truncated) <= 64
+    assert truncated.startswith("call_workforce_worker_1_")
+
+    same_alias_second = _build_worker_tool_name(2, long_alias)
+    assert same_alias_second != truncated
+    assert same_alias_second.startswith("call_workforce_worker_2_")
+
+
+def test_load_template_detail_rejects_path_traversal() -> None:
+    traversal_ids = [
+        "../archived/foo",
+        "foo/bar",
+        "../../etc/passwd",
+        "foo\\bar",
+    ]
+    safe_ids = [
+        "valid_name",
+        "valid.name",
+    ]
+    for tid in traversal_ids:
+        try:
+            load_template_detail(tid)
+        except HTTPException as exc:
+            assert exc.status_code == 400, (
+                f"Expected 400 for {tid}, got {exc.status_code}"
+            )
+        else:
+            raise AssertionError(f"Expected HTTPException for template_id={tid}")
+
+    for tid in safe_ids:
+        try:
+            load_template_detail(tid)
+        except HTTPException as exc:
+            if exc.status_code == 400:
+                raise AssertionError(f"Safe template_id {tid} was rejected with 400")
+            # 404 is expected for non-existent template files

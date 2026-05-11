@@ -1,3 +1,4 @@
+import hashlib
 import re
 from typing import Any, cast
 
@@ -37,6 +38,30 @@ def slugify_name(value: str | None, fallback: str = "worker") -> str:
     base = (value or "").strip().lower()
     slug = re.sub(r"[^a-z0-9]+", "_", base).strip("_")
     return slug or fallback
+
+
+_MAX_TOOL_NAME_LENGTH = 64
+_TOOL_NAME_PREFIX = "call_workforce_worker_"
+
+
+def _build_worker_tool_name(worker_id: int, alias: str) -> str:
+    slug = slugify_name(alias)
+    raw = f"{_TOOL_NAME_PREFIX}{worker_id}_{slug}"
+    if len(raw) <= _MAX_TOOL_NAME_LENGTH:
+        return raw
+    worker_id_str = str(worker_id)
+    hash_suffix = "_" + hashlib.md5(slug.encode()).hexdigest()[:6]
+    available = (
+        _MAX_TOOL_NAME_LENGTH
+        - len(_TOOL_NAME_PREFIX)
+        - len(worker_id_str)
+        - len(hash_suffix)
+        - 1
+    )
+    if available < 4:
+        available = 4
+    truncated_slug = slug[:available]
+    return f"{_TOOL_NAME_PREFIX}{worker_id_str}_{truncated_slug}{hash_suffix}"
 
 
 def _sorted_workers(workforce: Workforce) -> list[WorkforceAgent]:
@@ -183,7 +208,7 @@ def build_workforce_snapshot(
                 "description": worker.agent.description,
                 "assignment_instructions": assignment_instructions,
                 "execution_mode": worker.agent.execution_mode,
-                "tool_name": f"call_workforce_worker_{worker.id}_{slugify_name(alias)}",
+                "tool_name": _build_worker_tool_name(cast(int, worker.id), alias),
                 "enabled": bool(worker.enabled),
             }
         )
