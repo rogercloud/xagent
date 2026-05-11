@@ -1,5 +1,6 @@
 import logging
-from typing import Any, Generator
+from collections.abc import Generator
+from typing import Any
 
 from sqlalchemy import Engine, create_engine
 from sqlalchemy.ext.declarative import declarative_base
@@ -58,6 +59,10 @@ def init_db(db_url: str | None = None) -> None:
         User,
         UserDefaultModel,
         UserModel,
+        Workforce,
+        WorkforceAgent,
+        WorkforceBuilderMessage,
+        WorkforceRun,
     )
     from .agent import Agent  # noqa: F401
     from .sandbox import SandboxInfo, SandboxSnapshot  # noqa: F401

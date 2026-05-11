@@ -8,7 +8,7 @@ and other web-specific sources.
 import logging
 import os
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any
 
 import httpx
 
@@ -23,9 +23,7 @@ from ..services.tool_credentials import (
 logger = logging.getLogger(__name__)
 
 
-async def refresh_oauth_token_if_needed(
-    db: Any, oauth_account: Any, provider_name: str
-) -> bool:
+async def refresh_oauth_token_if_needed(db: Any, oauth_account: Any, provider_name: str) -> bool:
     """Check if token is expired (or close to expiring) and refresh if needed."""
     if not oauth_account.expires_at:
         return True  # Assume valid if no expiration is set
@@ -42,9 +40,7 @@ async def refresh_oauth_token_if_needed(
         return True  # Token is still valid
 
     if not oauth_account.refresh_token:
-        logger.warning(
-            f"Token expired for {provider_name} but no refresh_token available."
-        )
+        logger.warning(f"Token expired for {provider_name} but no refresh_token available.")
         return False
 
     logger.info(f"Token expired for {provider_name}, attempting to refresh...")
@@ -53,9 +49,7 @@ async def refresh_oauth_token_if_needed(
         from ..models.oauth_provider import OAuthProvider
 
         provider_config = (
-            db.query(OAuthProvider)
-            .filter(OAuthProvider.provider_name == provider_name)
-            .first()
+            db.query(OAuthProvider).filter(OAuthProvider.provider_name == provider_name).first()
         )
         if not provider_config:
             logger.warning(f"Unknown provider for refresh: {provider_name}")
@@ -65,9 +59,7 @@ async def refresh_oauth_token_if_needed(
         client_secret = decrypt_value(provider_config.client_secret)
 
         if not client_id or not client_secret:
-            logger.warning(
-                f"{provider_name} OAuth not configured (missing CLIENT_ID or SECRET)."
-            )
+            logger.warning(f"{provider_name} OAuth not configured (missing CLIENT_ID or SECRET).")
             return False
 
         data = {
@@ -105,9 +97,7 @@ async def refresh_oauth_token_if_needed(
             logger.error(f"Failed to refresh {provider_name} token: {response.text}")
 
     except Exception as e:
-        logger.error(
-            f"Exception refreshing token for {provider_name}: {e}", exc_info=True
-        )
+        logger.error(f"Exception refreshing token for {provider_name}: {e}", exc_info=True)
 
     return False
 
@@ -116,33 +106,37 @@ class WebToolConfig(BaseToolConfig):
     """Web-specific tool configuration that loads from database."""
 
     @staticmethod
-    def _coerce_user_id(value: Any) -> Optional[int]:
+    def _coerce_user_id(value: Any) -> int | None:
         return value if isinstance(value, int) else None
 
     def __init__(
         self,
         db: Any,
         request: Any,
-        user_id: Optional[int] = None,
+        user_id: int | None = None,
         is_admin: bool = False,
-        user: Optional[Any] = None,
-        workspace_config: Optional[Dict[str, Any]] = None,
-        vision_model: Optional[Any] = None,
-        llm: Optional[Any] = None,
+        user: Any | None = None,
+        workspace_config: dict[str, Any] | None = None,
+        vision_model: Any | None = None,
+        llm: Any | None = None,
         include_mcp_tools: bool = True,
-        task_id: Optional[str] = None,
-        workspace_base_dir: Optional[str] = None,
+        task_id: str | None = None,
+        workspace_base_dir: str | None = None,
         browser_tools_enabled: bool = True,
-        allowed_collections: Optional[List[str]] = None,
-        allowed_skills: Optional[List[str]] = None,
-        allowed_tools: Optional[List[str]] = None,
-        sandbox: Optional[Any] = None,
+        allowed_collections: list[str] | None = None,
+        allowed_skills: list[str] | None = None,
+        allowed_tools: list[str] | None = None,
+        allowed_agent_ids: list[int] | None = None,
+        agent_tool_overrides: dict[int, dict[str, Any]] | None = None,
+        enable_global_agent_tools: bool = True,
+        allow_cross_user_agent_ids: bool = False,
+        parent_task_id: int | None = None,
+        parent_tracer: Any | None = None,
+        sandbox: Any | None = None,
     ):
         self.db = db
         self.request = request
-        self._user_id = (
-            user_id if user_id is not None else self._get_user_id_from_request(request)
-        )
+        self._user_id = user_id if user_id is not None else self._get_user_id_from_request(request)
         self._is_admin_value = is_admin or self._get_is_admin_from_request(request)
         # Initialize workspace_config with base_dir and task_id if provided
         if workspace_config is None:
@@ -164,28 +158,34 @@ class WebToolConfig(BaseToolConfig):
         self._allowed_collections = allowed_collections
         self._allowed_skills = allowed_skills
         self._allowed_tools = allowed_tools
-        self._delegate_agent_ids: Optional[List[int]] = None
-        self._excluded_agent_id: Optional[int] = None
+        self._delegate_agent_ids: list[int] | None = None
+        self._allowed_agent_ids = allowed_agent_ids
+        self._agent_tool_overrides = agent_tool_overrides or {}
+        self._enable_global_agent_tools = enable_global_agent_tools
+        self._allow_cross_user_agent_ids = allow_cross_user_agent_ids
+        self._parent_task_id = parent_task_id
+        self._parent_tracer = parent_tracer
+        self._excluded_agent_id: int | None = None
 
         # Cache user object for hook queries.
         # Use explicit user param first; fall back to request.user.
         self._user = user if user is not None else getattr(request, "user", None)
-        self._cached_tool_overrides: Optional[dict] = None
+        self._cached_tool_overrides: dict | None = None
 
         # Sandbox instance - only store reference, lifecycle managed by upper layer
-        self._sandbox: Optional[Any] = sandbox
+        self._sandbox: Any | None = sandbox
 
         # Cache for loaded configurations
-        self._cached_vision_config: Optional[Any] = None
-        self._cached_image_configs: Optional[Dict[str, Any]] = None
-        self._cached_image_generate_model: Optional[Any] = None
-        self._cached_image_edit_model: Optional[Any] = None
-        self._cached_asr_models: Optional[Dict[str, Any]] = None
-        self._cached_asr_model: Optional[Any] = None
-        self._cached_tts_models: Optional[Dict[str, Any]] = None
-        self._cached_tts_model: Optional[Any] = None
-        self._cached_mcp_configs: Optional[List[Dict[str, Any]]] = None
-        self._cached_embedding_model: Optional[str] = None
+        self._cached_vision_config: Any | None = None
+        self._cached_image_configs: dict[str, Any] | None = None
+        self._cached_image_generate_model: Any | None = None
+        self._cached_image_edit_model: Any | None = None
+        self._cached_asr_models: dict[str, Any] | None = None
+        self._cached_asr_model: Any | None = None
+        self._cached_tts_models: dict[str, Any] | None = None
+        self._cached_tts_model: Any | None = None
+        self._cached_mcp_configs: list[dict[str, Any]] | None = None
+        self._cached_embedding_model: str | None = None
 
     def _get_user_id_from_request(self, request: Any) -> int:
         """Extract user ID from request using JWT authentication."""
@@ -233,7 +233,7 @@ class WebToolConfig(BaseToolConfig):
             logger.warning(f"Failed to get is_admin from request: {e}")
             return False
 
-    def get_workspace_config(self) -> Optional[Dict[str, Any]]:
+    def get_workspace_config(self) -> dict[str, Any] | None:
         """Get workspace configuration."""
         return self._workspace_config
 
@@ -245,7 +245,7 @@ class WebToolConfig(BaseToolConfig):
         """Whether to include basic tools."""
         return True
 
-    def get_vision_model(self) -> Optional[Any]:
+    def get_vision_model(self) -> Any | None:
         """Get vision model, prioritizing explicitly provided model over database."""
         if hasattr(self, "_explicit_vision_model") and self._explicit_vision_model:
             return self._explicit_vision_model
@@ -254,25 +254,25 @@ class WebToolConfig(BaseToolConfig):
             self._cached_vision_config = self._load_vision_model()
         return self._cached_vision_config
 
-    def get_image_models(self) -> Dict[str, Any]:
+    def get_image_models(self) -> dict[str, Any]:
         """Load image models from database."""
         if self._cached_image_configs is None:
             self._cached_image_configs = self._load_image_models()
         return self._cached_image_configs
 
-    def get_image_generate_model(self) -> Optional[Any]:
+    def get_image_generate_model(self) -> Any | None:
         """Get default image generation model from database."""
         if self._cached_image_generate_model is None:
             self._cached_image_generate_model = self._load_image_generate_model()
         return self._cached_image_generate_model
 
-    def get_image_edit_model(self) -> Optional[Any]:
+    def get_image_edit_model(self) -> Any | None:
         """Get default image editing model from database."""
         if self._cached_image_edit_model is None:
             self._cached_image_edit_model = self._load_image_edit_model()
         return self._cached_image_edit_model
 
-    async def get_mcp_server_configs(self) -> List[Dict[str, Any]]:
+    async def get_mcp_server_configs(self) -> list[dict[str, Any]]:
         """Load MCP server configurations from database."""
         if not self._include_mcp_tools:
             return []
@@ -281,7 +281,7 @@ class WebToolConfig(BaseToolConfig):
             self._cached_mcp_configs = await self._load_mcp_server_configs()
         return self._cached_mcp_configs
 
-    def get_embedding_model(self) -> Optional[str]:
+    def get_embedding_model(self) -> str | None:
         """Load default embedding model ID from database."""
         if self._cached_embedding_model is None:
             self._cached_embedding_model = self._load_embedding_model()
@@ -291,19 +291,19 @@ class WebToolConfig(BaseToolConfig):
         """Whether to include browser automation tools."""
         return self._browser_tools_enabled
 
-    def get_task_id(self) -> Optional[str]:
+    def get_task_id(self) -> str | None:
         """Get task ID for session tracking."""
         return self._task_id
 
-    def get_allowed_collections(self) -> Optional[List[str]]:
+    def get_allowed_collections(self) -> list[str] | None:
         """Get allowed knowledge base collections. None means all collections are allowed."""
         return self._allowed_collections
 
-    def get_allowed_skills(self) -> Optional[List[str]]:
+    def get_allowed_skills(self) -> list[str] | None:
         """Get allowed skill names. None means all skills are allowed."""
         return self._allowed_skills
 
-    def get_allowed_tools(self) -> Optional[List[str]]:
+    def get_allowed_tools(self) -> list[str] | None:
         """Get allowed tool names. None means all tools are allowed."""
         return self._allowed_tools
 
@@ -325,15 +325,15 @@ class WebToolConfig(BaseToolConfig):
             self._cached_tool_overrides = {}
         return self._cached_tool_overrides
 
-    def get_excluded_agent_id(self) -> Optional[int]:
+    def get_excluded_agent_id(self) -> int | None:
         """Get agent ID to exclude from agent tools (to prevent self-calls)."""
         return getattr(self, "_excluded_agent_id", None)
 
-    def get_delegate_agent_ids(self) -> Optional[List[int]]:
+    def get_delegate_agent_ids(self) -> list[int] | None:
         """Get explicitly selected delegable agent IDs."""
         return getattr(self, "_delegate_agent_ids", None)
 
-    def get_user_id(self) -> Optional[int]:
+    def get_user_id(self) -> int | None:
         """Get current user ID for multi-tenancy."""
         return self._user_id
 
@@ -347,29 +347,44 @@ class WebToolConfig(BaseToolConfig):
 
     def get_enable_agent_tools(self) -> bool:
         """Whether to include published agents as tools."""
-        return True
+        return self._enable_global_agent_tools
 
-    def get_sandbox(self) -> Optional[Any]:
+    def get_allowed_agent_ids(self) -> list[int] | None:
+        return self._allowed_agent_ids
+
+    def get_agent_tool_overrides(self) -> dict[int, dict[str, Any]]:
+        return self._agent_tool_overrides
+
+    def get_allow_cross_user_agent_ids(self) -> bool:
+        return self._allow_cross_user_agent_ids
+
+    def get_parent_task_id(self) -> int | None:
+        return self._parent_task_id
+
+    def get_parent_tracer(self) -> Any | None:
+        return self._parent_tracer
+
+    def get_sandbox(self) -> Any | None:
         """Get sandbox instance. Returns None if not available."""
         return self._sandbox
 
-    def get_tool_credential(self, tool_name: str, field_name: str) -> Optional[str]:
+    def get_tool_credential(self, tool_name: str, field_name: str) -> str | None:
         return resolve_tool_credential(self.db, tool_name, field_name)
 
-    def get_sql_connections(self) -> Dict[str, str]:
+    def get_sql_connections(self) -> dict[str, str]:
         return get_sql_connection_map(self.db, self._user_id)
 
     def set_sandbox(self, sandbox: Any) -> None:
         """Set sandbox instance for this config."""
         self._sandbox = sandbox
 
-    def _load_embedding_model(self) -> Optional[str]:
+    def _load_embedding_model(self) -> str | None:
         """Load embedding model ID from database via model service."""
         from ...web.services.model_service import get_default_embedding_model
 
         return get_default_embedding_model(self._user_id)
 
-    def _load_vision_model(self) -> Optional[Any]:
+    def _load_vision_model(self) -> Any | None:
         """Load vision model from database via model service."""
         try:
             from ...web.services.model_service import get_default_vision_model
@@ -381,7 +396,7 @@ class WebToolConfig(BaseToolConfig):
             logger.warning(f"Failed to load vision model: {e}")
             return None
 
-    def _load_image_models(self) -> Dict[str, Any]:
+    def _load_image_models(self) -> dict[str, Any]:
         """Load image models from database via model service."""
         try:
             from ...web.services.model_service import get_image_models
@@ -394,7 +409,7 @@ class WebToolConfig(BaseToolConfig):
 
             return {}
 
-    def _load_image_generate_model(self) -> Optional[Any]:
+    def _load_image_generate_model(self) -> Any | None:
         """Load default image generation model from database via model service."""
         try:
             from ...web.services.model_service import get_default_image_generate_model
@@ -406,7 +421,7 @@ class WebToolConfig(BaseToolConfig):
             logger.warning(f"Failed to load default image generation model: {e}")
             return None
 
-    def _load_image_edit_model(self) -> Optional[Any]:
+    def _load_image_edit_model(self) -> Any | None:
         """Load default image editing model from database via model service."""
         try:
             from ...web.services.model_service import get_default_image_edit_model
@@ -418,13 +433,13 @@ class WebToolConfig(BaseToolConfig):
             logger.warning(f"Failed to load default image editing model: {e}")
             return None
 
-    def get_asr_models(self) -> Dict[str, Any]:
+    def get_asr_models(self) -> dict[str, Any]:
         """Load ASR models from database."""
         if self._cached_asr_models is None:
             self._cached_asr_models = self._load_asr_models()
         return self._cached_asr_models
 
-    def _load_asr_models(self) -> Dict[str, Any]:
+    def _load_asr_models(self) -> dict[str, Any]:
         """Load ASR models from database via model service."""
         try:
             from ...web.services.model_service import get_asr_models
@@ -436,13 +451,13 @@ class WebToolConfig(BaseToolConfig):
             logger.warning(f"Failed to load ASR models: {e}")
             return {}
 
-    def get_asr_model(self) -> Optional[Any]:
+    def get_asr_model(self) -> Any | None:
         """Get default ASR model from database."""
         if self._cached_asr_model is None:
             self._cached_asr_model = self._load_asr_model()
         return self._cached_asr_model
 
-    def _load_asr_model(self) -> Optional[Any]:
+    def _load_asr_model(self) -> Any | None:
         """Load default ASR model from database via model service."""
         try:
             from ...web.services.model_service import get_default_asr_model
@@ -454,13 +469,13 @@ class WebToolConfig(BaseToolConfig):
             logger.warning(f"Failed to load default ASR model: {e}")
             return None
 
-    def get_tts_models(self) -> Dict[str, Any]:
+    def get_tts_models(self) -> dict[str, Any]:
         """Load TTS models from database."""
         if self._cached_tts_models is None:
             self._cached_tts_models = self._load_tts_models()
         return self._cached_tts_models
 
-    def _load_tts_models(self) -> Dict[str, Any]:
+    def _load_tts_models(self) -> dict[str, Any]:
         """Load TTS models from database via model service."""
         try:
             from ...web.services.model_service import get_tts_models
@@ -472,17 +487,17 @@ class WebToolConfig(BaseToolConfig):
             logger.warning(f"Failed to load TTS models: {e}")
             return {}
 
-    def get_tts_model(self) -> Optional[Any]:
+    def get_tts_model(self) -> Any | None:
         """Get default TTS model from database."""
         if self._cached_tts_model is None:
             self._cached_tts_model = self._load_tts_model()
         return self._cached_tts_model
 
-    def get_llm(self) -> Optional[Any]:
+    def get_llm(self) -> Any | None:
         """Get LLM from constructor parameter."""
         return self._explicit_llm
 
-    def _load_tts_model(self) -> Optional[Any]:
+    def _load_tts_model(self) -> Any | None:
         """Load default TTS model from database via model service."""
         try:
             from ...web.services.model_service import get_default_tts_model
@@ -494,7 +509,7 @@ class WebToolConfig(BaseToolConfig):
             logger.warning(f"Failed to load default TTS model: {e}")
             return None
 
-    async def _load_mcp_server_configs(self) -> List[Dict[str, Any]]:
+    async def _load_mcp_server_configs(self) -> list[dict[str, Any]]:
         """Load MCP server configurations from database with user context."""
         logger = logging.getLogger(__name__)
         configs = []
@@ -510,9 +525,7 @@ class WebToolConfig(BaseToolConfig):
                 .all()
             )
 
-            logger.info(
-                f"Found {len(servers)} active MCP servers for user {self._user_id}"
-            )
+            logger.info(f"Found {len(servers)} active MCP servers for user {self._user_id}")
 
             for server in servers:
                 # Build config dict from server model
@@ -533,9 +546,7 @@ class WebToolConfig(BaseToolConfig):
                     from ...web.models.user_oauth import UserOAuth
 
                     app_info = get_app_by_name(self.db, str(server.name))
-                    provider_name = (
-                        app_info.get("provider") if app_info else server.name.lower()
-                    )
+                    provider_name = app_info.get("provider") if app_info else server.name.lower()
 
                     # Some oauth records might be saved with the app_id as provider instead of the general provider_name
                     # For example, "google-drive" instead of "google"
@@ -590,18 +601,14 @@ class WebToolConfig(BaseToolConfig):
 
                         if is_valid and app_info:
                             app_id = app_info.get("id")
-                            logger.info(
-                                f"OAUTH CONFIG: Mapping '{app_id}' to executable proxy"
-                            )
+                            logger.info(f"OAUTH CONFIG: Mapping '{app_id}' to executable proxy")
 
                             launch_config = app_info.get("launch_config")
                             if launch_config:
                                 config["transport"] = "stdio"
                                 transport_config["transport"] = "stdio"
                                 transport_config["command"] = launch_config["command"]
-                                transport_config["args"] = launch_config.get(
-                                    "args", []
-                                ).copy()
+                                transport_config["args"] = launch_config.get("args", []).copy()
 
                                 env = {}
                                 for env_key, token_type in launch_config.get(
@@ -612,13 +619,9 @@ class WebToolConfig(BaseToolConfig):
 
                                 env.update(
                                     {
-                                        "HTTPS_PROXY": os.environ.get(
-                                            "HTTPS_PROXY", ""
-                                        ),
+                                        "HTTPS_PROXY": os.environ.get("HTTPS_PROXY", ""),
                                         "HTTP_PROXY": os.environ.get("HTTP_PROXY", ""),
-                                        "https_proxy": os.environ.get(
-                                            "https_proxy", ""
-                                        ),
+                                        "https_proxy": os.environ.get("https_proxy", ""),
                                         "http_proxy": os.environ.get("http_proxy", ""),
                                     }
                                 )
@@ -640,9 +643,7 @@ class WebToolConfig(BaseToolConfig):
                                 }
 
                     else:
-                        logger.info(
-                            f"OAUTH CONFIG: No valid token found for '{provider_name}'."
-                        )
+                        logger.info(f"OAUTH CONFIG: No valid token found for '{provider_name}'.")
 
                 if server.transport == "stdio":
                     if server.command:
@@ -677,13 +678,9 @@ class WebToolConfig(BaseToolConfig):
                     if server.docker_image:
                         transport_config["docker_image"] = server.docker_image
                     if server.docker_environment:
-                        transport_config["docker_environment"] = (
-                            server.docker_environment
-                        )
+                        transport_config["docker_environment"] = server.docker_environment
                     if server.docker_working_dir:
-                        transport_config["docker_working_dir"] = (
-                            server.docker_working_dir
-                        )
+                        transport_config["docker_working_dir"] = server.docker_working_dir
                     if server.volumes:
                         transport_config["volumes"] = server.volumes
                     if server.bind_ports:
@@ -700,9 +697,7 @@ class WebToolConfig(BaseToolConfig):
                 config["allow_users"] = [str(self._user_id)]  # Only allow current user
 
                 configs.append(config)
-                logger.debug(
-                    f"Loaded MCP server config: {server.name} ({server.transport})"
-                )
+                logger.debug(f"Loaded MCP server config: {server.name} ({server.transport})")
 
         except Exception as e:
             logger.warning(f"Failed to load MCP server configs: {e}", exc_info=True)
@@ -710,7 +705,7 @@ class WebToolConfig(BaseToolConfig):
         logger.info(f"Loaded {len(configs)} MCP server configurations")
         return configs
 
-    def get_custom_api_configs(self) -> List[Dict[str, Any]]:
+    def get_custom_api_configs(self) -> list[dict[str, Any]]:
         """Get custom API configurations."""
         if not self._user_id:
             return []
@@ -748,7 +743,5 @@ class WebToolConfig(BaseToolConfig):
             return custom_api_configs
 
         except Exception as e:
-            logger.error(
-                f"Failed to get Custom API configs from database: {e}", exc_info=True
-            )
+            logger.error(f"Failed to get Custom API configs from database: {e}", exc_info=True)
             return []

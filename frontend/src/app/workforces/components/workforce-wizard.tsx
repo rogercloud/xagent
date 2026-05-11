@@ -1,0 +1,239 @@
+"use client"
+
+import { useEffect, useMemo, useState } from "react"
+import { useRouter } from "next/navigation"
+import { Button } from "@/components/ui/button"
+import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
+import { Input } from "@/components/ui/input"
+import { Label } from "@/components/ui/label"
+import { Textarea } from "@/components/ui/textarea"
+import {
+  createWorkforce,
+  listAgentOptions,
+  listWorkforceTemplates,
+} from "@/lib/workforces-api"
+import type {
+  WorkforceAgentOption,
+  WorkforceTemplateOption,
+  WorkforceWorkerDraft,
+} from "@/types/workforce"
+import { ManagerStep } from "./manager-step"
+import { ReviewStep } from "./review-step"
+import { WorkersStep } from "./workers-step"
+
+const STEPS = ["Basics", "Workers", "Review"] as const
+
+export function WorkforceWizard() {
+  const router = useRouter()
+  const [step, setStep] = useState(0)
+  const [loadingAgents, setLoadingAgents] = useState(true)
+  const [submitting, setSubmitting] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+  const [agents, setAgents] = useState<WorkforceAgentOption[]>([])
+  const [templates, setTemplates] = useState<WorkforceTemplateOption[]>([])
+
+  const [name, setName] = useState("")
+  const [description, setDescription] = useState("")
+  const [managerAgentId, setManagerAgentId] = useState("")
+  const [managerInstructions, setManagerInstructions] = useState("")
+  const [workers, setWorkers] = useState<WorkforceWorkerDraft[]>([])
+
+  const workersAreValid = useMemo(
+    () =>
+      workers.length > 0 &&
+      workers.every((worker) => {
+        if (!worker.assignment_instructions.trim()) return false
+        if (worker.source_type === "existing") return Boolean(worker.agent_id)
+        if (worker.source_type === "template") return Boolean(worker.template_id)
+        if (worker.source_type === "new") {
+          return Boolean(worker.agent?.name.trim() && worker.agent.instructions.trim())
+        }
+        return false
+      }),
+    [workers],
+  )
+
+  useEffect(() => {
+    const loadAgents = async () => {
+      try {
+        setLoadingAgents(true)
+        const [agentData, templateData] = await Promise.all([
+          listAgentOptions(),
+          listWorkforceTemplates(),
+        ])
+        setAgents(agentData)
+        setTemplates(templateData)
+      } catch (err) {
+        setError(err instanceof Error ? err.message : "Failed to load agents")
+      } finally {
+        setLoadingAgents(false)
+      }
+    }
+    void loadAgents()
+  }, [])
+
+  const canMoveForward = useMemo(() => {
+    if (step === 0) {
+      return Boolean(name.trim() && managerAgentId)
+    }
+    if (step === 1) {
+      return workersAreValid
+    }
+    return true
+  }, [step, name, managerAgentId, workersAreValid])
+
+  const handleCreate = async () => {
+    setSubmitting(true)
+    setError(null)
+    try {
+      const workforce = await createWorkforce({
+        name: name.trim(),
+        description: description.trim() || undefined,
+        manager_agent_id: Number(managerAgentId),
+        manager_instructions: managerInstructions.trim() || undefined,
+        status: "draft",
+        workers: workers.map((worker) => ({
+          source_type: worker.source_type,
+          agent_id: worker.agent_id,
+          template_id: worker.template_id,
+          agent: worker.agent
+            ? {
+                ...worker.agent,
+                name: worker.agent.name.trim(),
+                description: worker.agent.description.trim(),
+                instructions: worker.agent.instructions.trim(),
+              }
+            : undefined,
+          alias: worker.alias.trim() || undefined,
+          assignment_instructions: worker.assignment_instructions.trim(),
+          enabled: worker.enabled,
+          sort_order: worker.sort_order,
+        })),
+      })
+      router.push(`/workforces/${workforce.id}/builder`)
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed to create workforce")
+    } finally {
+      setSubmitting(false)
+    }
+  }
+
+  if (loadingAgents) {
+    return <div className="p-8 text-muted-foreground">Loading agents...</div>
+  }
+
+  return (
+    <div className="mx-auto flex w-full max-w-6xl flex-col gap-6 p-8">
+      <div>
+        <h1 className="text-3xl font-bold">Create Workforce</h1>
+        <p className="mt-2 text-muted-foreground">
+          Start with a manager, add workers, then review the orchestration before saving.
+        </p>
+      </div>
+
+      <div className="grid gap-3 md:grid-cols-3">
+        {STEPS.map((label, index) => (
+          <Card key={label} className={index === step ? "border-primary" : undefined}>
+            <CardContent className="flex items-center gap-3 p-4">
+              <div className="flex h-8 w-8 items-center justify-center rounded-full border text-sm font-medium">
+                {index + 1}
+              </div>
+              <div className="font-medium">{label}</div>
+            </CardContent>
+          </Card>
+        ))}
+      </div>
+
+      {step === 0 ? (
+        <div className="grid gap-6 lg:grid-cols-[1.2fr_0.8fr]">
+          <Card>
+            <CardHeader>
+              <CardTitle>Basics</CardTitle>
+            </CardHeader>
+            <CardContent className="space-y-4">
+              <div className="space-y-2">
+                <Label>Name</Label>
+                <Input
+                  value={name}
+                  onChange={(event) => setName(event.target.value)}
+                  placeholder="Marketing Launch Workforce"
+                />
+              </div>
+              <div className="space-y-2">
+                <Label>Description</Label>
+                <Textarea
+                  value={description}
+                  onChange={(event) => setDescription(event.target.value)}
+                  placeholder="Coordinate research, content, and launch tasks."
+                  rows={4}
+                />
+              </div>
+              <div className="space-y-2">
+                <Label>Manager Instructions</Label>
+                <Textarea
+                  value={managerInstructions}
+                  onChange={(event) => setManagerInstructions(event.target.value)}
+                  placeholder="Coordinate workers, reconcile conflicting outputs, and return a single answer."
+                  rows={5}
+                />
+              </div>
+            </CardContent>
+          </Card>
+          <ManagerStep
+            managerAgentId={managerAgentId}
+            onManagerAgentIdChange={setManagerAgentId}
+            agents={agents}
+          />
+        </div>
+      ) : null}
+
+      {step === 1 ? (
+        <WorkersStep
+          managerAgentId={managerAgentId}
+          agents={agents}
+          templates={templates}
+          workers={workers}
+          onWorkersChange={setWorkers}
+        />
+      ) : null}
+
+      {step === 2 ? (
+        <ReviewStep
+          name={name}
+          description={description}
+          managerAgentId={managerAgentId}
+          managerInstructions={managerInstructions}
+          workers={workers}
+          agents={agents}
+          templates={templates}
+        />
+      ) : null}
+
+      {error ? <div className="text-sm text-red-500">{error}</div> : null}
+
+      <div className="flex items-center justify-between">
+        <Button
+          variant="outline"
+          onClick={() => setStep((current) => Math.max(0, current - 1))}
+          disabled={step === 0 || submitting}
+        >
+          Back
+        </Button>
+        <div className="flex items-center gap-3">
+          {step < STEPS.length - 1 ? (
+            <Button onClick={() => setStep((current) => current + 1)} disabled={!canMoveForward}>
+              Next
+            </Button>
+          ) : (
+            <Button
+              onClick={handleCreate}
+              disabled={submitting || !canMoveForward || !workersAreValid}
+            >
+              {submitting ? "Creating..." : "Create Workforce"}
+            </Button>
+          )}
+        </div>
+      </div>
+    </div>
+  )
+}

@@ -34,6 +34,7 @@ from .api.text2sql import text2sql_router
 from .api.tools import tools_router
 from .api.websocket import ws_router
 from .api.widget import widget_router
+from .api.workforces import router as workforces_router
 from .dynamic_memory_store import get_memory_store
 from .logging_config import setup_logging
 from .models.database import init_db
@@ -53,9 +54,7 @@ uploads_dir.mkdir(parents=True, exist_ok=True)
 
 
 # FastAPI app creation here
-app = FastAPI(
-    title="xagent", description="The Agent Operating System", redirect_slashes=False
-)
+app = FastAPI(title="xagent", description="The Agent Operating System", redirect_slashes=False)
 
 # Track background migration task for graceful shutdown cleanup.
 _migration_task: asyncio.Task[None] | None = None
@@ -165,6 +164,7 @@ app.include_router(skills_router)
 app.include_router(system_router)
 app.include_router(templates_router)
 app.include_router(agents_router)
+app.include_router(workforces_router)
 app.include_router(channel_router, prefix="/api/channels", tags=["Channels"])
 app.include_router(widget_router)
 
@@ -186,9 +186,7 @@ async def startup_event() -> None:
     skill_manager = create_skill_manager()
     await skill_manager.initialize()
     app.state.skill_manager = skill_manager
-    logger.info(
-        f"Skill manager initialized with {len(await skill_manager.list_skills())} skills"
-    )
+    logger.info(f"Skill manager initialized with {len(await skill_manager.list_skills())} skills")
 
     # Initialize template manager
     from ..templates.utils import create_template_manager
@@ -212,9 +210,7 @@ async def startup_event() -> None:
     else:
         logger.info("Using in-memory store (no vector search capabilities)")
 
-    logger.info(
-        f"Memory store similarity threshold: {store_info['similarity_threshold']}"
-    )
+    logger.info(f"Memory store similarity threshold: {store_info['similarity_threshold']}")
 
     # Auto-migrate LanceDB tables if needed (for multi-tenancy support)
     # Controlled by LANCEDB_AUTO_MIGRATE environment variable (default: true)
@@ -299,9 +295,7 @@ async def startup_event() -> None:
 
                         # Log any skipped records
                         chunks_skipped = result.get("chunks", {}).get("skipped", 0)
-                        embeddings_skipped = result.get("embeddings", {}).get(
-                            "skipped", 0
-                        )
+                        embeddings_skipped = result.get("embeddings", {}).get("skipped", 0)
                         if chunks_skipped > 0 or embeddings_skipped > 0:
                             logger.warning(
                                 "Some records were skipped (no matching document): chunks=%s, embeddings=%s",
@@ -355,9 +349,7 @@ async def startup_event() -> None:
 
                 fix_result = fix_file_id_nullable(dry_run=False, conn=conn)
                 if fix_result.get("fixed"):
-                    logger.info(
-                        "Auto-fixed file_id column to nullable in documents table"
-                    )
+                    logger.info("Auto-fixed file_id column to nullable in documents table")
             except Exception as e:
                 logger.warning("Could not fix file_id nullability: %s", e)
 
@@ -375,16 +367,12 @@ async def startup_event() -> None:
 
                 # Check for empty string file_id values
                 empty_file_id_count = len(
-                    query_to_list(
-                        documents_table.search().where("file_id = ''").limit(1)
-                    )
+                    query_to_list(documents_table.search().where("file_id = ''").limit(1))
                 )
 
                 # Check for NULL user_id values
                 null_user_id_count = len(
-                    query_to_list(
-                        documents_table.search().where("user_id IS NULL").limit(1)
-                    )
+                    query_to_list(documents_table.search().where("user_id IS NULL").limit(1))
                 )
 
                 if empty_file_id_count > 0 or null_user_id_count > 0:
@@ -402,9 +390,7 @@ async def startup_event() -> None:
                         )
 
                         try:
-                            result = await asyncio.to_thread(
-                                backfill_all, dry_run=False, conn=conn
-                            )
+                            result = await asyncio.to_thread(backfill_all, dry_run=False, conn=conn)
                             logger.info("=" * 60)
                             logger.info("DOCUMENTS TABLE BACKFILL COMPLETED")
                             logger.info("=" * 60)
@@ -444,9 +430,7 @@ async def startup_event() -> None:
                             )
 
                     # Start background task
-                    _migration_task = asyncio.create_task(
-                        run_documents_backfill_background()
-                    )
+                    _migration_task = asyncio.create_task(run_documents_backfill_background())
                 else:
                     logger.info("Documents table backfill not needed")
             except Exception as e:
@@ -456,8 +440,7 @@ async def startup_event() -> None:
                 _safe_close_table(documents_table)
         except Exception as e:
             logger.warning(
-                "Could not check documents table backfill status: %s. "
-                "Application will continue.",
+                "Could not check documents table backfill status: %s. Application will continue.",
                 e,
             )
 
@@ -480,9 +463,7 @@ async def startup_event() -> None:
                 logger.warning("Collection metadata rebuild failed: %s", e)
 
     if not os.getenv("PYTEST_CURRENT_TEST"):
-        app.state.metadata_rebuild_task = asyncio.create_task(
-            run_metadata_rebuild_background()
-        )
+        app.state.metadata_rebuild_task = asyncio.create_task(run_metadata_rebuild_background())
         logger.info(
             "Started background collection metadata rebuild task (interval=%sh)",
             os.getenv("XAGENT_METADATA_REBUILD_INTERVAL_HOURS", "6"),

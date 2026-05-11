@@ -1,3 +1,4 @@
+import os
 import tempfile
 
 import pytest
@@ -5,11 +6,13 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import Session, sessionmaker
 
 from xagent.core.tools.adapters.vibe.agent_tool import (
+    AgentTool,
     create_agent_tools,
     get_published_agents_tools,
 )
 from xagent.web.models.agent import Agent, AgentStatus
 from xagent.web.models.database import Base
+from xagent.web.models.model import Model
 from xagent.web.models.user import User
 from xagent.web.tools.config import WebToolConfig
 
@@ -22,6 +25,13 @@ def _create_session() -> tuple[Session, str]:
     Base.metadata.create_all(bind=engine)
     SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
     return SessionLocal(), temp_db.name
+
+
+def _remove_db(path: str) -> None:
+    try:
+        os.remove(path)
+    except OSError:
+        pass
 
 
 def test_non_owner_cannot_see_other_users_published_agent_tools() -> None:
@@ -48,12 +58,7 @@ def test_non_owner_cannot_see_other_users_published_agent_tools() -> None:
         assert "call_agent_owner_published_agent" not in tool_names
     finally:
         db.close()
-        try:
-            import os
-
-            os.remove(db_path)
-        except OSError:
-            pass
+        _remove_db(db_path)
 
 
 def test_owner_sees_only_own_published_agents_not_drafts() -> None:
@@ -84,12 +89,7 @@ def test_owner_sees_only_own_published_agents_not_drafts() -> None:
         assert "call_agent_owner_draft_agent" not in tool_names
     finally:
         db.close()
-        try:
-            import os
-
-            os.remove(db_path)
-        except OSError:
-            pass
+        _remove_db(db_path)
 
 
 def test_allowed_agent_ids_include_only_selected_published_user_agents() -> None:
@@ -149,12 +149,51 @@ def test_allowed_agent_ids_include_only_selected_published_user_agents() -> None
         assert "call_agent_other_users_agent" not in tool_names
     finally:
         db.close()
-        try:
-            import os
+        _remove_db(db_path)
 
-            os.remove(db_path)
-        except OSError:
-            pass
+
+def test_allowed_agent_ids_can_cross_users_only_when_explicitly_enabled() -> None:
+    db, db_path = _create_session()
+    try:
+        owner = User(username="owner_cross", password_hash="x", is_admin=False)
+        runner = User(username="runner", password_hash="x", is_admin=False)
+        db.add_all([owner, runner])
+        db.commit()
+        db.refresh(owner)
+        db.refresh(runner)
+
+        published_agent = Agent(
+            user_id=owner.id,
+            name="Shared Workforce Worker",
+            status=AgentStatus.PUBLISHED,
+        )
+        db.add(published_agent)
+        db.commit()
+        db.refresh(published_agent)
+
+        blocked_tools = get_published_agents_tools(
+            db=db,
+            user_id=runner.id,
+            allowed_agent_ids=[published_agent.id],
+            enable_global_agent_tools=False,
+        )
+        assert "call_agent_shared_workforce_worker" not in {
+            tool.name for tool in blocked_tools
+        }
+
+        allowed_tools = get_published_agents_tools(
+            db=db,
+            user_id=runner.id,
+            allowed_agent_ids=[published_agent.id],
+            enable_global_agent_tools=False,
+            allow_cross_user_agent_ids=True,
+        )
+        assert "call_agent_shared_workforce_worker" in {
+            tool.name for tool in allowed_tools
+        }
+    finally:
+        db.close()
+        _remove_db(db_path)
 
 
 @pytest.mark.asyncio
@@ -185,9 +224,103 @@ async def test_create_agent_tools_treats_empty_delegate_allowlist_as_unrestricte
         assert "call_agent_default_published_agent" in tool_names
     finally:
         db.close()
-        try:
-            import os
+        _remove_db(db_path)
 
-            os.remove(db_path)
-        except OSError:
-            pass
+
+@pytest.mark.asyncio
+async def test_agent_tool_emits_workforce_delegation_trace_events(monkeypatch) -> None:
+    db, db_path = _create_session()
+    try:
+        user = User(username="trace-user", password_hash="x", is_admin=False)
+        db.add(user)
+        db.commit()
+        db.refresh(user)
+
+        model = Model(
+            model_id="fake-general",
+            model_provider="openai",
+            model_name="fake-general",
+            category="llm",
+        )
+        model.api_key = "fake-key"
+        db.add(model)
+        db.commit()
+        db.refresh(model)
+
+        agent = Agent(
+            user_id=user.id,
+            name="Trace Worker",
+            status=AgentStatus.PUBLISHED,
+            models={"general": model.id},
+        )
+        db.add(agent)
+        db.commit()
+        db.refresh(agent)
+
+        class FakeStorage:
+            def __init__(self, db):
+                self.db = db
+
+            def get_llm_by_name_with_access(self, model_id, user_id):
+                return object()
+
+        class FakeAgentService:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            async def execute_task(self, task, context=None, task_id=None):
+                return {"output": "worker output"}
+
+        class FakeTracer:
+            def __init__(self):
+                self.events = []
+
+            async def trace_event(
+                self, event_type, task_id=None, step_id=None, data=None, parent_id=None
+            ):
+                self.events.append(
+                    {
+                        "event_type": event_type.value,
+                        "task_id": task_id,
+                        "data": data or {},
+                    }
+                )
+
+        monkeypatch.setattr(
+            "xagent.web.services.llm_utils.UserAwareModelStorage",
+            FakeStorage,
+        )
+        monkeypatch.setattr(
+            "xagent.core.agent.service.AgentService",
+            FakeAgentService,
+        )
+
+        tracer = FakeTracer()
+        tool = AgentTool(
+            agent_id=agent.id,
+            agent_name=agent.name,
+            agent_description="Trace worker",
+            db=db,
+            user_id=user.id,
+            parent_task_id=123,
+            parent_tracer=tracer,
+            workforce_context={
+                "workforce_run_id": 456,
+                "worker_alias": "Researcher",
+            },
+        )
+
+        result = await tool.run_json_async({"task": "research"})
+
+        assert result["response"] == "worker output"
+        assert [event["data"]["event_type"] for event in tracer.events] == [
+            "workforce_delegation_start",
+            "workforce_delegation_end",
+        ]
+        assert tracer.events[0]["task_id"] == "123"
+        assert tracer.events[0]["data"]["workforce_run_id"] == 456
+        assert tracer.events[0]["data"]["worker_alias"] == "Researcher"
+        assert tracer.events[1]["data"]["output"] == "worker output"
+    finally:
+        db.close()
+        _remove_db(db_path)

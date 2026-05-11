@@ -3,7 +3,8 @@ Agent Tool - Convert published agents into callable tools
 """
 
 import logging
-from typing import TYPE_CHECKING, Any, Mapping, Optional, Type
+from collections.abc import Mapping
+from typing import TYPE_CHECKING, Any, Optional
 from uuid import uuid4
 
 from pydantic import BaseModel, Field, field_validator
@@ -13,7 +14,6 @@ from .....web.services.model_service import (
     _get_visible_user_ids,
     _is_model_visible_to_user,
 )
-from ....tracing import create_agent_tracer
 from ....utils.type_check import ensure_list
 from .base import AbstractBaseTool, ToolCategory, ToolVisibility
 
@@ -29,19 +29,19 @@ class CreateAgentToolArgs(BaseModel):
         description="IMPORTANT: Description of when to use this agent (e.g., 'Use this agent for data analysis tasks involving CSV files'). This helps users understand the agent's purpose and when to call it."
     )
     instructions: str = Field(description="System instructions/prompt for the agent")
-    tool_categories: Optional[list[str]] = Field(
+    tool_categories: list[str] | None = Field(
         default=None,
         description="List of tool categories to allow (e.g., ['file', 'knowledge']). If None, all tools are available",
     )
-    knowledge_bases: Optional[list[str]] = Field(
+    knowledge_bases: list[str] | None = Field(
         default=None,
         description="List of knowledge base names or IDs to associate with this agent. (optional)",
     )
-    skills: Optional[list[str]] = Field(
+    skills: list[str] | None = Field(
         default=None,
         description="List of skill names to allow. If None, all skills are available",
     )
-    execution_mode: Optional[str] = Field(
+    execution_mode: str | None = Field(
         default="balanced",
         description="Execution mode for the agent: 'flash', 'balanced' (default), 'think', or 'auto'.",
     )
@@ -61,9 +61,7 @@ class CreateAgentToolResult(BaseModel):
 
     agent_id: int = Field(description="The ID of the created agent")
     agent_name: str = Field(description="The name of the created agent")
-    tool_name: str = Field(
-        description="The tool name that can be used to call this agent"
-    )
+    tool_name: str = Field(description="The tool name that can be used to call this agent")
     markdown_link: str = Field(
         description="Markdown link to the agent (e.g., '[Agent Name](agent://123)')"
     )
@@ -75,30 +73,28 @@ class UpdateAgentToolArgs(BaseModel):
     """Arguments for updating an existing agent."""
 
     agent_id: int = Field(description="ID of the agent to update")
-    name: Optional[str] = Field(
-        default=None, description="New name for the agent (optional)"
-    )
-    description: Optional[str] = Field(
+    name: str | None = Field(default=None, description="New name for the agent (optional)")
+    description: str | None = Field(
         default=None,
         description="New description of when to use this agent (optional)",
     )
-    instructions: Optional[str] = Field(
+    instructions: str | None = Field(
         default=None,
         description="New system instructions/prompt for the agent (optional)",
     )
-    tool_categories: Optional[list[str]] = Field(
+    tool_categories: list[str] | None = Field(
         default=None,
         description="New list of tool categories to allow (optional). If None, existing value is kept",
     )
-    knowledge_bases: Optional[list[str]] = Field(
+    knowledge_bases: list[str] | None = Field(
         default=None,
         description="New list of knowledge base IDs or names to associate with this agent. (optional). If None, existing value is kept",
     )
-    skills: Optional[list[str]] = Field(
+    skills: list[str] | None = Field(
         default=None,
         description="New list of skill names to allow (optional). If None, existing value is kept",
     )
-    execution_mode: Optional[str] = Field(
+    execution_mode: str | None = Field(
         default=None,
         description="New execution mode for the agent: 'flash', 'balanced', 'think', or 'auto'.",
     )
@@ -118,9 +114,7 @@ class UpdateAgentToolResult(BaseModel):
 
     agent_id: int = Field(description="The ID of the updated agent")
     agent_name: str = Field(description="The name of the updated agent")
-    tool_name: str = Field(
-        description="The tool name that can be used to call this agent"
-    )
+    tool_name: str = Field(description="The tool name that can be used to call this agent")
     markdown_link: str = Field(
         description="Markdown link to the agent (e.g., '[Agent Name](agent://123)')"
     )
@@ -131,7 +125,7 @@ class UpdateAgentToolResult(BaseModel):
 class ListAgentsToolArgs(BaseModel):
     """Arguments for listing agents."""
 
-    status_filter: Optional[str] = Field(
+    status_filter: str | None = Field(
         default=None,
         description="Filter by agent status: 'draft', 'published', or 'archived'. If None, shows all agents",
     )
@@ -149,13 +143,13 @@ class AgentInfo(BaseModel):
     execution_mode: str = Field(
         description="Execution mode: flash, balanced, think, or auto"
     )
-    knowledge_bases: Optional[list[str]] = Field(
+    knowledge_bases: list[str] | None = Field(
         default=None, description="Associated knowledge bases"
     )
-    tool_categories: Optional[list[str]] = Field(
+    tool_categories: list[str] | None = Field(
         default=None, description="Allowed tool categories"
     )
-    skills: Optional[list[str]] = Field(default=None, description="Allowed skills")
+    skills: list[str] | None = Field(default=None, description="Allowed skills")
 
 
 class ListAgentsToolResult(BaseModel):
@@ -180,9 +174,7 @@ class AgentToolResult(BaseModel):
 
 
 class ListAvailableSkillsArgs(BaseModel):
-    query: Optional[str] = Field(
-        default=None, description="Optional search query to filter skills"
-    )
+    query: str | None = Field(default=None, description="Optional search query to filter skills")
 
 
 class ListAvailableSkillsResult(BaseModel):
@@ -197,9 +189,9 @@ class ListAvailableSkillsTool(AbstractBaseTool):
     def __init__(
         self,
         db: Any = None,
-        user_id: Optional[int] = None,
-        task_id: Optional[str] = None,
-        workspace_base_dir: Optional[str] = None,
+        user_id: int | None = None,
+        task_id: str | None = None,
+        workspace_base_dir: str | None = None,
     ):
         self._visibility = ToolVisibility.PUBLIC
 
@@ -211,10 +203,10 @@ class ListAvailableSkillsTool(AbstractBaseTool):
     def description(self) -> str:
         return "List all available skills that can be assigned to an agent."
 
-    def args_type(self) -> Type[BaseModel]:
+    def args_type(self) -> type[BaseModel]:
         return ListAvailableSkillsArgs
 
-    def return_type(self) -> Type[BaseModel]:
+    def return_type(self) -> type[BaseModel]:
         return ListAvailableSkillsResult
 
     def run_json_sync(self, args: Mapping[str, Any]) -> Any:
@@ -223,9 +215,7 @@ class ListAvailableSkillsTool(AbstractBaseTool):
     async def run_json_async(self, args: Mapping[str, Any]) -> Any:
         import os
 
-        skills_dir = os.path.join(
-            os.path.dirname(__file__), "../../../../skills/builtin"
-        )
+        skills_dir = os.path.join(os.path.dirname(__file__), "../../../../skills/builtin")
         available_skills = []
         if os.path.exists(skills_dir):
             for skill_dir in os.listdir(skills_dir):
@@ -236,7 +226,7 @@ class ListAvailableSkillsTool(AbstractBaseTool):
 
 
 class ListToolCategoriesArgs(BaseModel):
-    query: Optional[str] = Field(
+    query: str | None = Field(
         default=None, description="Optional search query to filter categories"
     )
 
@@ -253,9 +243,9 @@ class ListToolCategoriesTool(AbstractBaseTool):
     def __init__(
         self,
         db: Any = None,
-        user_id: Optional[int] = None,
-        task_id: Optional[str] = None,
-        workspace_base_dir: Optional[str] = None,
+        user_id: int | None = None,
+        task_id: str | None = None,
+        workspace_base_dir: str | None = None,
     ):
         self._visibility = ToolVisibility.PUBLIC
 
@@ -267,10 +257,10 @@ class ListToolCategoriesTool(AbstractBaseTool):
     def description(self) -> str:
         return "List all available tool categories that can be assigned to an agent."
 
-    def args_type(self) -> Type[BaseModel]:
+    def args_type(self) -> type[BaseModel]:
         return ListToolCategoriesArgs
 
-    def return_type(self) -> Type[BaseModel]:
+    def return_type(self) -> type[BaseModel]:
         return ListToolCategoriesResult
 
     def run_json_sync(self, args: Mapping[str, Any]) -> Any:
@@ -298,8 +288,8 @@ class CreateAgentTool(AbstractBaseTool):
         self,
         db: Any,
         user_id: int,
-        task_id: Optional[str] = None,
-        workspace_base_dir: Optional[str] = None,
+        task_id: str | None = None,
+        workspace_base_dir: str | None = None,
     ):
         """
         Initialize the create agent tool.
@@ -334,9 +324,7 @@ class CreateAgentTool(AbstractBaseTool):
         # Get available skills (from builtin skills directory)
         import os
 
-        skills_dir = os.path.join(
-            os.path.dirname(__file__), "../../../../skills/builtin"
-        )
+        skills_dir = os.path.join(os.path.dirname(__file__), "../../../../skills/builtin")
         available_skills = []
         if os.path.exists(skills_dir):
             for skill_dir in os.listdir(skills_dir):
@@ -376,11 +364,11 @@ class CreateAgentTool(AbstractBaseTool):
         """Tool tags."""
         return ["agent", "create"]
 
-    def args_type(self) -> Type[BaseModel]:
+    def args_type(self) -> type[BaseModel]:
         """Argument type."""
         return CreateAgentToolArgs
 
-    def return_type(self) -> Type[BaseModel]:
+    def return_type(self) -> type[BaseModel]:
         """Return type."""
         return CreateAgentToolResult
 
@@ -514,9 +502,7 @@ class CreateAgentTool(AbstractBaseTool):
                     models_config[default.config_type] = default.model_id
 
             missing_types = [
-                t
-                for t in ["general", "small_fast", "visual", "compact"]
-                if t not in models_config
+                t for t in ["general", "small_fast", "visual", "compact"] if t not in models_config
             ]
             if missing_types:
                 # Fill missing with visible users' shared defaults
@@ -533,9 +519,7 @@ class CreateAgentTool(AbstractBaseTool):
                 )
                 for admin_default in admin_defaults:
                     if admin_default.config_type not in models_config:
-                        models_config[admin_default.config_type] = (
-                            admin_default.model_id
-                        )
+                        models_config[admin_default.config_type] = admin_default.model_id
 
             execution_mode = args.get("execution_mode", "balanced")
             if execution_mode not in ["flash", "balanced", "think", "auto"]:
@@ -624,8 +608,8 @@ class UpdateAgentTool(AbstractBaseTool):
         self,
         db: Any,
         user_id: int,
-        task_id: Optional[str] = None,
-        workspace_base_dir: Optional[str] = None,
+        task_id: str | None = None,
+        workspace_base_dir: str | None = None,
     ):
         """
         Initialize the update agent tool.
@@ -660,9 +644,7 @@ class UpdateAgentTool(AbstractBaseTool):
         # Get available skills (from builtin skills directory)
         import os
 
-        skills_dir = os.path.join(
-            os.path.dirname(__file__), "../../../../skills/builtin"
-        )
+        skills_dir = os.path.join(os.path.dirname(__file__), "../../../../skills/builtin")
         available_skills = []
         if os.path.exists(skills_dir):
             for skill_dir in os.listdir(skills_dir):
@@ -703,11 +685,11 @@ class UpdateAgentTool(AbstractBaseTool):
         """Tool tags."""
         return ["agent", "update"]
 
-    def args_type(self) -> Type[BaseModel]:
+    def args_type(self) -> type[BaseModel]:
         """Argument type."""
         return UpdateAgentToolArgs
 
-    def return_type(self) -> Type[BaseModel]:
+    def return_type(self) -> type[BaseModel]:
         """Return type."""
         return UpdateAgentToolResult
 
@@ -800,9 +782,7 @@ class UpdateAgentTool(AbstractBaseTool):
 
             # Update instructions if provided
             new_instructions = (
-                args.get("instructions", "").strip()
-                if args.get("instructions")
-                else None
+                args.get("instructions", "").strip() if args.get("instructions") else None
             )
             if new_instructions:
                 agent.instructions = new_instructions
@@ -907,8 +887,8 @@ class ListAgentsTool(AbstractBaseTool):
         self,
         db: Any,
         user_id: int,
-        task_id: Optional[str] = None,
-        workspace_base_dir: Optional[str] = None,
+        task_id: str | None = None,
+        workspace_base_dir: str | None = None,
     ):
         """
         Initialize the list agents tool.
@@ -962,11 +942,11 @@ class ListAgentsTool(AbstractBaseTool):
         """Tool tags."""
         return ["agent", "list"]
 
-    def args_type(self) -> Type[BaseModel]:
+    def args_type(self) -> type[BaseModel]:
         """Argument type."""
         return ListAgentsToolArgs
 
-    def return_type(self) -> Type[BaseModel]:
+    def return_type(self) -> type[BaseModel]:
         """Return type."""
         return ListAgentsToolResult
 
@@ -1023,13 +1003,9 @@ class ListAgentsTool(AbstractBaseTool):
                 agent_infos.append(agent_info.model_dump())
 
             total_count = len(agent_infos)
-            filter_msg = (
-                f" (filtered by status: {status_filter})" if status_filter else ""
-            )
+            filter_msg = f" (filtered by status: {status_filter})" if status_filter else ""
 
-            logger.info(
-                f"Listed {total_count} agents for user {self._user_id}{filter_msg}"
-            )
+            logger.info(f"Listed {total_count} agents for user {self._user_id}{filter_msg}")
 
             return ListAgentsToolResult(
                 agents=agent_infos,
@@ -1070,8 +1046,13 @@ class AgentTool(AbstractBaseTool):
         agent_description: str,
         db: Any,
         user_id: int,
-        task_id: Optional[str] = None,
-        workspace_base_dir: Optional[str] = None,
+        task_id: str | None = None,
+        workspace_base_dir: str | None = None,
+        tool_name: str | None = None,
+        extra_system_prompt: str | None = None,
+        parent_task_id: int | None = None,
+        parent_tracer: Any | None = None,
+        workforce_context: dict[str, Any] | None = None,
     ):
         """
         Initialize an agent tool.
@@ -1091,6 +1072,11 @@ class AgentTool(AbstractBaseTool):
         self._db = db
         self._user_id = user_id
         self._task_id = task_id or f"agent_tool_{agent_id}"
+        self._tool_name = tool_name
+        self._extra_system_prompt = extra_system_prompt
+        self._parent_task_id = parent_task_id
+        self._parent_tracer = parent_tracer
+        self._workforce_context = workforce_context or {}
         if workspace_base_dir is None:
             workspace_base_dir = str(get_uploads_dir())
         self._workspace_base_dir = workspace_base_dir
@@ -1099,7 +1085,7 @@ class AgentTool(AbstractBaseTool):
     @property
     def name(self) -> str:
         """Tool name."""
-        return f"call_agent_{self._agent_name.lower().replace(' ', '_')}"
+        return self._tool_name or f"call_agent_{self._agent_name.lower().replace(' ', '_')}"
 
     @property
     def description(self) -> str:
@@ -1111,17 +1097,79 @@ class AgentTool(AbstractBaseTool):
         """Tool tags."""
         return ["agent", "delegation"]
 
-    def args_type(self) -> Type[BaseModel]:
+    def args_type(self) -> type[BaseModel]:
         """Argument type."""
         return AgentToolArgs
 
-    def return_type(self) -> Type[BaseModel]:
+    def return_type(self) -> type[BaseModel]:
         """Return type."""
         return AgentToolResult
 
     def run_json_sync(self, args: Mapping[str, Any]) -> Any:
         """Sync execution not supported."""
         raise NotImplementedError("AgentTool only supports async execution.")
+
+    def _build_delegation_trace_data(
+        self,
+        status: str,
+        execution_task_id: str | None = None,
+        output: str | None = None,
+        error: str | None = None,
+    ) -> dict[str, Any]:
+        data: dict[str, Any] = {
+            "event_type": f"workforce_delegation_{status}",
+            "agent_id": self._agent_id,
+            "agent_name": self._agent_name,
+            "tool_name": self.name,
+        }
+        data.update(self._workforce_context)
+        if execution_task_id:
+            data["worker_task_id"] = execution_task_id
+        if output is not None:
+            data["output"] = output[:2000]
+            data["output_length"] = len(output)
+        if error is not None:
+            data["error"] = error
+        return data
+
+    async def _trace_delegation(
+        self,
+        status: str,
+        execution_task_id: str | None = None,
+        output: str | None = None,
+        error: str | None = None,
+    ) -> None:
+        if (
+            self._parent_tracer is None
+            or self._parent_task_id is None
+            or not self._workforce_context
+        ):
+            return
+        try:
+            from .....core.agent.trace import (
+                TraceAction,
+                TraceCategory,
+                TraceEventType,
+                TraceScope,
+            )
+
+            action = {
+                "start": TraceAction.START,
+                "end": TraceAction.END,
+                "error": TraceAction.ERROR,
+            }[status]
+            await self._parent_tracer.trace_event(
+                TraceEventType(TraceScope.TASK, action, TraceCategory.GENERAL),
+                task_id=str(self._parent_task_id),
+                data=self._build_delegation_trace_data(
+                    status,
+                    execution_task_id=execution_task_id,
+                    output=output,
+                    error=error,
+                ),
+            )
+        except Exception:
+            logger.debug("Failed to emit workforce delegation trace", exc_info=True)
 
     async def run_json_async(self, args: Mapping[str, Any]) -> Any:
         """Execute the agent with the given task."""
@@ -1131,6 +1179,7 @@ class AgentTool(AbstractBaseTool):
         from .....web.tools.config import WebToolConfig
         from .....web.user_isolated_memory import UserContext
 
+        execution_task_id: str | None = None
         try:
             # Load agent from database - support both PUBLISHED and DRAFT
             agent = (
@@ -1143,12 +1192,13 @@ class AgentTool(AbstractBaseTool):
             )
 
             if not agent:
-                return AgentToolResult(
-                    response=f"Error: Agent {self._agent_id} not found"
-                ).model_dump()
+                error_msg = f"Error: Agent {self._agent_id} not found"
+                await self._trace_delegation("error", error=error_msg)
+                return AgentToolResult(response=error_msg).model_dump()
 
             # Generate unique task ID for this execution
             execution_task_id = f"agent_{self._agent_id}_{uuid.uuid4().hex[:8]}"
+            await self._trace_delegation("start", execution_task_id=execution_task_id)
 
             # Resolve models
             from .....core.agent.service import AgentService
@@ -1188,9 +1238,7 @@ class AgentTool(AbstractBaseTool):
 
                 if agent.models.get("visual"):
                     visual_model = (
-                        self._db.query(DBModel)
-                        .filter(DBModel.id == agent.models["visual"])
-                        .first()
+                        self._db.query(DBModel).filter(DBModel.id == agent.models["visual"]).first()
                     )
                     if visual_model:
                         vision_llm = storage.get_llm_by_name_with_access(
@@ -1209,9 +1257,11 @@ class AgentTool(AbstractBaseTool):
                         )
 
             if not default_llm:
-                return AgentToolResult(
-                    response=f"Error: No valid model configured for agent {agent.name}"
-                ).model_dump()
+                error_msg = f"Error: No valid model configured for agent {agent.name}"
+                await self._trace_delegation(
+                    "error", execution_task_id=execution_task_id, error=error_msg
+                )
+                return AgentToolResult(response=error_msg).model_dump()
 
             # Create tool config with allowed collections, skills, and tools
             class MinimalRequest:
@@ -1278,21 +1328,8 @@ class AgentTool(AbstractBaseTool):
                 allowed_tools=allowed_tools,
                 task_id=execution_task_id,
                 workspace_base_dir=self._workspace_base_dir,
-            )
-
-            tracer = create_agent_tracer(
-                task_id=execution_task_id,
-                user_id=self._user_id,
-                trace_name=f"xagent-agent-tool-{self._agent_id}",
-                session_id=self._task_id,
-                tags=["xagent", "agent-tool", "nested-agent"],
-                metadata={
-                    "source": "xagent-agent-tool",
-                    "task_id": execution_task_id,
-                    "parent_task_id": self._task_id,
-                    "agent_id": self._agent_id,
-                    "agent_name": agent.name,
-                },
+                allowed_agent_ids=[],
+                enable_global_agent_tools=False,
             )
 
             # Create agent service
@@ -1310,13 +1347,18 @@ class AgentTool(AbstractBaseTool):
                 enable_workspace=True,
                 workspace_base_dir=self._workspace_base_dir,
                 task_id=execution_task_id,
-                tracer=tracer,
+                tracer=None,
             )
 
             # Build execution context
             execution_context: dict[str, Any] = {}
+            prompt_parts = []
             if agent.instructions:
-                execution_context["system_prompt"] = agent.instructions
+                prompt_parts.append(agent.instructions)
+            if self._extra_system_prompt:
+                prompt_parts.append(self._extra_system_prompt)
+            if prompt_parts:
+                execution_context["system_prompt"] = "\n\n".join(prompt_parts)
 
             # Execute task
             with UserContext(self._user_id):
@@ -1330,11 +1372,17 @@ class AgentTool(AbstractBaseTool):
             logger.info(
                 f"Agent tool {self.name} executed successfully, output length: {len(output)}"
             )
+            await self._trace_delegation(
+                "end", execution_task_id=execution_task_id, output=str(output)
+            )
             return AgentToolResult(response=output).model_dump()
 
         except Exception as e:
             error_msg = f"Error executing agent {self._agent_id}: {str(e)}"
             logger.error(error_msg, exc_info=True)
+            await self._trace_delegation(
+                "error", execution_task_id=execution_task_id, error=error_msg
+            )
             return AgentToolResult(response=error_msg).model_dump()
 
 
@@ -1357,12 +1405,17 @@ def gen_agent_tool_name(agent_name: str) -> str:
 def get_published_agents_tools(
     db: Any,
     user_id: int,
-    task_id: Optional[str] = None,
-    workspace_base_dir: Optional[str] = None,
-    excluded_agent_id: Optional[int] = None,
+    task_id: str | None = None,
+    workspace_base_dir: str | None = None,
+    excluded_agent_id: int | None = None,
     include_draft: bool = False,
-    draft_agent_ids_to_include: Optional[list[int]] = None,
-    allowed_agent_ids: Optional[list[int]] = None,
+    draft_agent_ids_to_include: list[int] | None = None,
+    allowed_agent_ids: list[int] | None = None,
+    agent_tool_overrides: dict[int, dict[str, Any]] | None = None,
+    enable_global_agent_tools: bool = True,
+    allow_cross_user_agent_ids: bool = False,
+    parent_task_id: int | None = None,
+    parent_tracer: Any | None = None,
 ) -> list[AbstractBaseTool]:
     """
     Get tools for published (and optionally draft) agents.
@@ -1387,6 +1440,8 @@ def get_published_agents_tools(
         workspace_base_dir = str(get_uploads_dir())
 
     tools: list[AbstractBaseTool] = []
+    if not enable_global_agent_tools and not allowed_agent_ids:
+        return tools
 
     try:
         if allowed_agent_ids is not None:
@@ -1398,10 +1453,11 @@ def get_published_agents_tools(
             if not normalized_allowed_agent_ids:
                 return []
             query = db.query(Agent).filter(
-                Agent.user_id == user_id,
                 Agent.id.in_(normalized_allowed_agent_ids),
                 Agent.status.in_(["published"]),  # type: ignore[attr-defined]
             )
+            if not allow_cross_user_agent_ids:
+                query = query.filter(Agent.user_id == user_id)
         elif include_draft:
             # Include both PUBLISHED and DRAFT agents
             query = db.query(Agent).filter(
@@ -1448,8 +1504,11 @@ def get_published_agents_tools(
 
         for agent in agents:
             # Build description
-            description = agent.description or f"Call {agent.name} agent"
-            if agent.instructions:
+            override = (agent_tool_overrides or {}).get(int(agent.id), {})
+            description = override.get("description")
+            if not description:
+                description = agent.description or f"Call {agent.name} agent"
+            if not override.get("description") and agent.instructions:
                 # Add brief instructions to description
                 instructions_preview = agent.instructions[:200]
                 if len(agent.instructions) > 200:
@@ -1457,7 +1516,7 @@ def get_published_agents_tools(
                 description += f". Instructions: {instructions_preview}"
 
             # Add status indicator for draft agents
-            if agent.status == AgentStatus.DRAFT:
+            if not override.get("description") and agent.status == AgentStatus.DRAFT:
                 description = f"[DRAFT] {description}"
 
             tool = AgentTool(
@@ -1468,6 +1527,21 @@ def get_published_agents_tools(
                 user_id=user_id,
                 task_id=task_id,
                 workspace_base_dir=workspace_base_dir,
+                tool_name=override.get("tool_name"),
+                extra_system_prompt=override.get("extra_system_prompt"),
+                parent_task_id=parent_task_id,
+                parent_tracer=parent_tracer,
+                workforce_context={
+                    key: override[key]
+                    for key in (
+                        "workforce_run_id",
+                        "workforce_id",
+                        "workforce_name",
+                        "worker_member_id",
+                        "worker_alias",
+                    )
+                    if key in override
+                },
             )
             tools.append(tool)
             logger.debug(f"Created agent tool: {tool.name}")
@@ -1489,7 +1563,12 @@ if TYPE_CHECKING:
 @register_tool
 async def create_agent_tools(config: "WebToolConfig") -> list[AbstractBaseTool]:
     """Create tools from published agents."""
-    if not config.get_enable_agent_tools():
+    allowed_agent_ids = getattr(config, "get_allowed_agent_ids", lambda: None)()
+    delegate_agent_ids = config.get_delegate_agent_ids() if config else None
+    if allowed_agent_ids is None and delegate_agent_ids:
+        allowed_agent_ids = delegate_agent_ids
+    allow_cross_user_agent_ids = getattr(config, "get_allow_cross_user_agent_ids", lambda: False)()
+    if not config.get_enable_agent_tools() and not allowed_agent_ids:
         return []
 
     try:
@@ -1499,9 +1578,6 @@ async def create_agent_tools(config: "WebToolConfig") -> list[AbstractBaseTool]:
             return []
 
         excluded_agent_id = config.get_excluded_agent_id() if config else None
-        delegate_agent_ids = config.get_delegate_agent_ids() if config else None
-        if not delegate_agent_ids:
-            delegate_agent_ids = None
 
         return get_published_agents_tools(
             db=db,
@@ -1509,8 +1585,13 @@ async def create_agent_tools(config: "WebToolConfig") -> list[AbstractBaseTool]:
             task_id=config.get_task_id(),
             workspace_base_dir=None,  # Will use get_uploads_dir() default
             excluded_agent_id=excluded_agent_id,
-            include_draft=False,  # Only PUBLISHED agents by default
-            allowed_agent_ids=delegate_agent_ids,
+            include_draft=False,  # Only PUBLISHED agents
+            allowed_agent_ids=allowed_agent_ids,
+            agent_tool_overrides=getattr(config, "get_agent_tool_overrides", lambda: {})(),
+            enable_global_agent_tools=config.get_enable_agent_tools(),
+            allow_cross_user_agent_ids=allow_cross_user_agent_ids,
+            parent_task_id=getattr(config, "get_parent_task_id", lambda: None)(),
+            parent_tracer=getattr(config, "get_parent_tracer", lambda: None)(),
         )
     except Exception as e:
         logger.warning(f"Failed to create agent tools: {e}")
@@ -1550,9 +1631,7 @@ async def create_create_agent_tool(config: "WebToolConfig") -> list[AbstractBase
             workspace_base_dir=None,
         )
 
-        logger.debug(
-            f"Created CreateAgentTool and related list tools for user {user_id}"
-        )
+        logger.debug(f"Created CreateAgentTool and related list tools for user {user_id}")
         return [tool, list_skills_tool, list_categories_tool]
     except Exception as e:
         logger.warning(f"Failed to create CreateAgentTool: {e}")

@@ -60,6 +60,7 @@ const en = {
     history: "All Tasks",
     search: "Search Tasks",
     templates: "Templates",
+    workforces: "Workforces",
     channels: "Channels",
     more: "More",
     sections: {
@@ -3016,7 +3017,12 @@ Build when you need.`
     queryPrefix: "Query:",
     pathPrefix: "Path:",
     bashPrefix: "Bash:",
-    searchPrefix: "Search:"
+    searchPrefix: "Search:",
+    workforceDelegation: "Workforce Delegation",
+    delegateToWorker: "Delegate to {worker}",
+    workerReturned: "Worker returned result",
+    workerFailed: "Worker failed",
+    unknownWorker: "Unknown Worker"
   },
   deploy_agent: {
     title: "Deploy Agent",

@@ -60,6 +60,7 @@ const zh = {
     history: "全部任务",
     search: "搜索任务",
     templates: "模板",
+    workforces: "Workforces",
     channels: "渠道",
     more: "更多",
     sections: {
@@ -3016,7 +3017,12 @@ Build when you need.`
     queryPrefix: "查询:",
     pathPrefix: "路径:",
     bashPrefix: "Bash命令:",
-    searchPrefix: "搜索:"
+    searchPrefix: "搜索:",
+    workforceDelegation: "Workforce 委派",
+    delegateToWorker: "委派给 {worker}",
+    workerReturned: "Worker 已返回结果",
+    workerFailed: "Worker 执行失败",
+    unknownWorker: "未知 Worker"
   },
   deploy_agent: {
     title: "部署 Agent",

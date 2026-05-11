@@ -4,7 +4,7 @@ import asyncio
 import logging
 import os
 from pathlib import Path
-from typing import Any, Dict, List, Optional, cast
+from typing import Any, cast
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from sqlalchemy.orm import Session
@@ -47,6 +47,7 @@ from ..services.task_lease_service import (
     run_task_lease_heartbeat,
     stop_task_lease_heartbeat,
 )
+from ..services.workforce_runtime import is_verified_workforce_task
 from ..tools.config import WebToolConfig
 from ..tracing import create_task_tracer
 from ..user_isolated_memory import UserContext
@@ -58,7 +59,7 @@ logger = logging.getLogger(__name__)
 chat_router = APIRouter(prefix="/api/chat", tags=["chat"])
 
 
-def create_default_llm() -> Optional[BaseLLM]:
+def create_default_llm() -> BaseLLM | None:
     """Create a default LLM instance based on environment configuration"""
     try:
         # For OpenAI: allow empty string API key (use is not None check)
@@ -94,22 +95,16 @@ def create_default_llm() -> Optional[BaseLLM]:
         is_zhipu = (
             zhipu_base_url
             and any(
-                domain in zhipu_base_url.lower()
-                for domain in {"zhipu", "bigmodel.cn", "api.z.ai"}
+                domain in zhipu_base_url.lower() for domain in {"zhipu", "bigmodel.cn", "api.z.ai"}
             )
-        ) or (
-            zhipu_model
-            and any(zhipu_model.lower().strip() in x.lower() for x in zhipu_models)
-        )
+        ) or (zhipu_model and any(zhipu_model.lower().strip() in x.lower() for x in zhipu_models))
 
         if is_zhipu:
             if zhipu_api_key:
                 logger.info(f"Using Zhipu LLM with model: {zhipu_model}")
                 # Use automatic thinking mode (None) by default
                 thinking_mode_env = os.getenv("ZHIPU_THINKING_MODE", "auto").lower()
-                thinking_mode = (
-                    None if thinking_mode_env == "auto" else thinking_mode_env == "true"
-                )
+                thinking_mode = None if thinking_mode_env == "auto" else thinking_mode_env == "true"
                 return ZhipuLLM(
                     model_name=zhipu_model or "glm-4.7-flash",
                     api_key=zhipu_api_key,
@@ -150,7 +145,7 @@ def create_default_llm() -> Optional[BaseLLM]:
 
 
 def _build_allowed_external_dirs(
-    user_id: Optional[int], *, only_existing: bool = False
+    user_id: int | None, *, only_existing: bool = False
 ) -> list[str]:
     """Build the allowed_external_dirs list for AgentService / tool
     workspace_config.
@@ -177,16 +172,22 @@ def _build_allowed_external_dirs(
 async def create_default_tools(
     db: Session,
     request: Any = None,
-    user: Optional[User] = None,
-    task_id: Optional[str] = None,
-    allowed_collections: Optional[List[str]] = None,
-    allowed_skills: Optional[List[str]] = None,
-    allowed_tools: Optional[List[str]] = None,
-    excluded_agent_id: Optional[int] = None,
-    delegate_agent_ids: Optional[List[int]] = None,
-    vision_model: Optional[Any] = None,
-    sandbox: Optional[Any] = None,
-    llm: Optional[Any] = None,
+    user: User | None = None,
+    task_id: str | None = None,
+    allowed_collections: list[str] | None = None,
+    allowed_skills: list[str] | None = None,
+    allowed_tools: list[str] | None = None,
+    excluded_agent_id: int | None = None,
+    delegate_agent_ids: list[int] | None = None,
+    vision_model: Any | None = None,
+    sandbox: Any | None = None,
+    llm: Any | None = None,
+    allowed_agent_ids: list[int] | None = None,
+    agent_tool_overrides: dict[int, dict[str, Any]] | None = None,
+    enable_global_agent_tools: bool = True,
+    allow_cross_user_agent_ids: bool = False,
+    parent_task_id: int | None = None,
+    parent_tracer: Any | None = None,
 ) -> tuple[list[Any], Any]:
     """Create default tools and tool_config for AgentService using ToolFactory"""
     if not user:
@@ -213,15 +214,19 @@ async def create_default_tools(
             "task_id": task_id,
             "allowed_external_dirs": allowed_external_dirs,
         },
-        include_mcp_tools=bool(
-            allowed_tools and any(t.startswith("mcp_") for t in allowed_tools)
-        ),
+        include_mcp_tools=bool(allowed_tools and any(t.startswith("mcp_") for t in allowed_tools)),
         task_id=task_id,  # Pass task_id for browser session tracking
         browser_tools_enabled=True,  # Enable browser automation tools
         allowed_collections=allowed_collections,  # Agent Builder knowledge bases
         allowed_skills=allowed_skills,  # Agent Builder skills
         allowed_tools=allowed_tools,  # Agent Builder tool categories
         vision_model=vision_model,  # Pass task-specific vision model
+        allowed_agent_ids=allowed_agent_ids,
+        agent_tool_overrides=agent_tool_overrides,
+        enable_global_agent_tools=enable_global_agent_tools,
+        allow_cross_user_agent_ids=allow_cross_user_agent_ids,
+        parent_task_id=parent_task_id,
+        parent_tracer=parent_tracer,
     )
 
     # Store excluded_agent_id in tool_config for agent tool filtering
@@ -286,31 +291,27 @@ async def update_task_title_from_agent(
             old_title = task_record.title
             task_record.title = task_name
             db.commit()
-            logger.info(
-                f"Updated task {task_id} title from '{old_title}' to '{task_name}'"
-            )
+            logger.info(f"Updated task {task_id} title from '{old_title}' to '{task_name}'")
             return True
         else:
             logger.debug(f"Task title already matches: '{task_record.title}'")
             return False
 
     except Exception as e:
-        logger.error(
-            f"Failed to update task title for task {task_id}: {e}", exc_info=True
-        )
+        logger.error(f"Failed to update task title for task {task_id}: {e}", exc_info=True)
         return False
 
 
 class AgentServiceManager:
     """Manage AgentService instances for different tasks"""
 
-    def __init__(self, request: Optional[Any] = None) -> None:
-        self._agents: Dict[int, AgentService] = {}
-        self._sandboxes: Dict[int, Any] = {}  # user_id -> Sandbox instance
+    def __init__(self, request: Any | None = None) -> None:
+        self._agents: dict[int, AgentService] = {}
+        self._sandboxes: dict[int, Any] = {}  # user_id -> Sandbox instance
         self._default_llm = create_default_llm()
         self.request = request
 
-    def _get_task_llm_ids(self, task: Task, db: Session) -> List[Optional[str]]:
+    def _get_task_llm_ids(self, task: Task, db: Session) -> list[str | None]:
         """Return internal model_id identifiers for a task (never provider model_name)."""
         from ..services.llm_utils import CoreStorage, make_normalize_model_id
 
@@ -319,9 +320,7 @@ class AgentServiceManager:
         _normalize = make_normalize_model_id(core_storage)
 
         return [
-            _normalize(
-                getattr(task, "model_id", None), getattr(task, "model_name", None)
-            ),
+            _normalize(getattr(task, "model_id", None), getattr(task, "model_name", None)),
             _normalize(
                 getattr(task, "small_fast_model_id", None),
                 getattr(task, "small_fast_model_name", None),
@@ -337,7 +336,7 @@ class AgentServiceManager:
         ]
 
     def set_task_llms(
-        self, task_id: int, llm_ids: Optional[List[Optional[str]]], db: Session
+        self, task_id: int, llm_ids: list[str | None] | None, db: Session
     ) -> None:
         """Set LLM configuration for a specific task (configuration now stored in Task table)"""
         logger.info(f"set_task_llms called for task {task_id} with llm_ids: {llm_ids}")
@@ -358,15 +357,13 @@ class AgentServiceManager:
             )
 
     def set_task_memory_similarity_threshold(
-        self, task_id: int, threshold: Optional[float]
+        self, task_id: int, threshold: float | None
     ) -> None:
         """Set memory similarity threshold for a specific task's agent"""
         if task_id in self._agents:
             agent = self._agents[task_id]
             agent.memory_similarity_threshold = threshold
-            logger.info(
-                f"Set memory similarity threshold for task {task_id}: {threshold}"
-            )
+            logger.info(f"Set memory similarity threshold for task {task_id}: {threshold}")
         else:
             logger.warning(
                 f"Cannot set memory similarity threshold for non-existent task {task_id}"
@@ -387,9 +384,7 @@ class AgentServiceManager:
             f"Loaded {len(conversation_history)} persisted chat messages for task {task_id}"
         )
 
-    async def _load_persisted_execution_context(
-        self, task_id: int, db: Session
-    ) -> None:
+    async def _load_persisted_execution_context(self, task_id: int, db: Session) -> None:
         """Hydrate an agent with persisted reusable execution context."""
         agent = self._agents.get(task_id)
         if agent is None:
@@ -409,9 +404,7 @@ class AgentServiceManager:
         if skill_context:
             logger.info(f"Loaded recovered skill context for task {task_id}")
 
-    def _load_agent_builder_config(
-        self, agent: Agent, db: Session, user_id: int
-    ) -> dict:
+    def _load_agent_builder_config(self, agent: Agent, db: Session, user_id: int) -> dict:
         """Load all Agent Builder configuration.
 
         Returns dict with:
@@ -434,9 +427,7 @@ class AgentServiceManager:
         if agent.models:
             if agent.models.get("general"):
                 general_model = (
-                    db.query(DBModel)
-                    .filter(DBModel.id == agent.models["general"])
-                    .first()
+                    db.query(DBModel).filter(DBModel.id == agent.models["general"]).first()
                 )
                 if general_model:
                     default_llm = storage.get_llm_by_name_with_access(
@@ -445,9 +436,7 @@ class AgentServiceManager:
 
             if agent.models.get("small_fast"):
                 fast_model = (
-                    db.query(DBModel)
-                    .filter(DBModel.id == agent.models["small_fast"])
-                    .first()
+                    db.query(DBModel).filter(DBModel.id == agent.models["small_fast"]).first()
                 )
                 if fast_model:
                     fast_llm = storage.get_llm_by_name_with_access(
@@ -456,9 +445,7 @@ class AgentServiceManager:
 
             if agent.models.get("visual"):
                 visual_model = (
-                    db.query(DBModel)
-                    .filter(DBModel.id == agent.models["visual"])
-                    .first()
+                    db.query(DBModel).filter(DBModel.id == agent.models["visual"]).first()
                 )
                 if visual_model:
                     vision_llm = storage.get_llm_by_name_with_access(
@@ -467,9 +454,7 @@ class AgentServiceManager:
 
             if agent.models.get("compact"):
                 compact_model = (
-                    db.query(DBModel)
-                    .filter(DBModel.id == agent.models["compact"])
-                    .first()
+                    db.query(DBModel).filter(DBModel.id == agent.models["compact"]).first()
                 )
                 if compact_model:
                     compact_llm = storage.get_llm_by_name_with_access(
@@ -653,8 +638,8 @@ class AgentServiceManager:
     async def get_agent_for_task(
         self,
         task_id: int,
-        db: Optional[Session] = None,
-        user: Optional[User] = None,
+        db: Session | None = None,
+        user: User | None = None,
     ) -> AgentService:
         """Get or create AgentService instance for specific task"""
         if task_id not in self._agents:
@@ -666,9 +651,7 @@ class AgentServiceManager:
                     task = db.query(Task).filter(Task.id == task_id).first()
                     task_exists = task is not None
                 except Exception as e:
-                    logger.warning(
-                        f"Failed to check task existence for task {task_id}: {e}"
-                    )
+                    logger.warning(f"Failed to check task existence for task {task_id}: {e}")
                     task_exists = False
                     task = None
 
@@ -689,9 +672,7 @@ class AgentServiceManager:
                             f"Created new task record for task {task_id} with user_id={user.id}"
                         )
                     except Exception as e:
-                        logger.error(
-                            f"Failed to create task record for task {task_id}: {e}"
-                        )
+                        logger.error(f"Failed to create task record for task {task_id}: {e}")
             else:
                 should_reconstruct = task is not None and task.status in [
                     TaskStatus.RUNNING,
@@ -744,13 +725,9 @@ class AgentServiceManager:
                     if task.agent_type_enum == AgentType.TEXT2SQL:
                         logger.info(f"🎯 Creating Text2SQL agent for task {task.id}")
                         if user is not None:
-                            return await self._create_text2sql_agent(
-                                task, db, user, tracer
-                            )
+                            return await self._create_text2sql_agent(task, db, user, tracer)
                         else:
-                            raise ValueError(
-                                "User context is required for Text2SQL agent creation"
-                            )
+                            raise ValueError("User context is required for Text2SQL agent creation")
                     else:
                         logger.info(
                             f"❌ Task {task.id} is not Text2SQL, using standard agent creation"
@@ -771,11 +748,9 @@ class AgentServiceManager:
                     )
 
                     llm_ids = self._get_task_llm_ids(task, db)
-                    logger.info(
-                        f"Loading LLM configuration from task {task_id}: {llm_ids}"
-                    )
+                    logger.info(f"Loading LLM configuration from task {task_id}: {llm_ids}")
                     # Use user_id for model resolution if available
-                    user_id_for_resolution: Optional[int] = (
+                    user_id_for_resolution: int | None = (
                         int(user.id) if user and user.id is not None else None
                     )
                     task_llm, task_fast_llm, task_vision_llm, task_compact_llm = (
@@ -784,16 +759,10 @@ class AgentServiceManager:
 
                     # Override with Agent Builder configuration if task.agent_id exists
                     if task and task.agent_id and user:
-                        agent = (
-                            db.query(Agent).filter(Agent.id == task.agent_id).first()
-                        )
+                        agent = db.query(Agent).filter(Agent.id == task.agent_id).first()
                         if agent:
-                            logger.info(
-                                f"Task {task_id} using Agent Builder config: {agent.name}"
-                            )
-                            agent_config = self._load_agent_builder_config(
-                                agent, db, int(user.id)
-                            )
+                            logger.info(f"Task {task_id} using Agent Builder config: {agent.name}")
+                            agent_config = self._load_agent_builder_config(agent, db, int(user.id))
                             (
                                 task_llm,
                                 task_fast_llm,
@@ -829,9 +798,7 @@ class AgentServiceManager:
                     task_vision_llm = None
                     task_compact_llm = None
             except Exception as e:
-                logger.error(
-                    f"Failed to load LLM configuration from task {task_id} database: {e}"
-                )
+                logger.error(f"Failed to load LLM configuration from task {task_id} database: {e}")
                 # Fallback to defaults
                 task_llm = self._default_llm
                 task_fast_llm = None
@@ -845,19 +812,75 @@ class AgentServiceManager:
                     raise ValueError("User context is required for agent creation")
 
                 if not db:
-                    raise ValueError(
-                        "Database connection is required for agent creation"
-                    )
+                    raise ValueError("Database connection is required for agent creation")
 
                 # Check if task has an associated published agent that should be excluded from agent tools
                 excluded_agent_id = None
+                workforce_allowed_agent_ids: list[int] | None = None
+                workforce_agent_tool_overrides: dict[int, dict[str, Any]] | None = None
+                workforce_tool_names: set[str] = set()
+                workforce_manager_prompt: str | None = None
+                enable_global_agent_tools = True
+                allow_cross_user_agent_ids = False
+                if task and isinstance(task.agent_config, dict):
+                    raw_snapshot = task.agent_config.get("workforce_snapshot")
+                    workforce_run_id = task.agent_config.get("workforce_run_id")
+                    if isinstance(raw_snapshot, dict) and is_verified_workforce_task(
+                        db, task, workforce_run_id
+                    ):
+                        workers = raw_snapshot.get("workers", [])
+                        workforce_allowed_agent_ids = []
+                        workforce_agent_tool_overrides = {}
+                        allow_cross_user_agent_ids = True
+                        workforce = raw_snapshot.get("workforce", {}) or {}
+                        workforce_name = workforce.get("name", "Workforce")
+                        for worker in workers:
+                            if not isinstance(worker, dict):
+                                continue
+                            agent_id = worker.get("agent_id")
+                            if not isinstance(agent_id, int):
+                                continue
+                            if not worker.get("enabled", True):
+                                continue
+                            workforce_allowed_agent_ids.append(agent_id)
+                            alias = worker.get("alias") or worker.get("name")
+                            assignment_instructions = worker.get("assignment_instructions")
+                            description_parts = []
+                            if worker.get("description"):
+                                description_parts.append(str(worker["description"]))
+                            if alias:
+                                description_parts.append(f"Workforce role: {alias}.")
+                            if assignment_instructions:
+                                description_parts.append(f"Assignment: {assignment_instructions}")
+                            worker_prompt_parts = [
+                                f'You are being called as part of Workforce "{workforce_name}".',
+                                "",
+                                "Your assignment in this Workforce:",
+                                str(assignment_instructions or ""),
+                                "",
+                                "Stay within this assignment. Return your result to the Workforce Manager. Do not address the end user directly unless asked.",
+                            ]
+                            workforce_agent_tool_overrides[agent_id] = {
+                                "tool_name": worker.get("tool_name"),
+                                "description": " ".join(description_parts),
+                                "extra_system_prompt": "\n".join(worker_prompt_parts),
+                                "workforce_run_id": workforce_run_id,
+                                "workforce_id": workforce.get("id"),
+                                "workforce_name": workforce_name,
+                                "worker_member_id": worker.get("member_id"),
+                                "worker_alias": alias,
+                            }
+                            if isinstance(worker.get("tool_name"), str):
+                                workforce_tool_names.add(str(worker["tool_name"]))
+                        workforce_manager_prompt = (raw_snapshot.get("manager", {}) or {}).get(
+                            "runtime_prompt"
+                        )
+                        enable_global_agent_tools = False
                 if task and task.agent_id:
                     # Get the current agent to check if it's published
                     from ..models.agent import AgentStatus
 
-                    current_agent = (
-                        db.query(Agent).filter(Agent.id == task.agent_id).first()
-                    )
+                    current_agent = db.query(Agent).filter(Agent.id == task.agent_id).first()
                     if current_agent and current_agent.status == AgentStatus.PUBLISHED:
                         excluded_agent_id = int(current_agent.id)
                         logger.info(
@@ -873,9 +896,7 @@ class AgentServiceManager:
                     sandbox_mgr = get_sandbox_manager()
                     if sandbox_mgr:
                         try:
-                            sandbox = await sandbox_mgr.get_or_create_sandbox(
-                                "user", str(user_id)
-                            )
+                            sandbox = await sandbox_mgr.get_or_create_sandbox("user", str(user_id))
                             self._sandboxes[user_id] = sandbox
                         except Exception as e:
                             # Graceful degradation: tools will run locally without sandbox
@@ -915,9 +936,7 @@ class AgentServiceManager:
                     allowed_tools = []
 
                     for tool in all_tools:
-                        if hasattr(tool, "metadata") and hasattr(
-                            tool.metadata, "category"
-                        ):
+                        if hasattr(tool, "metadata") and hasattr(tool.metadata, "category"):
                             category = str(tool.metadata.category.value)
                             tool_name = getattr(tool, "name", None)
 
@@ -932,9 +951,7 @@ class AgentServiceManager:
                                         # Use the exact raw server name for prefix comparison, just replace spaces with underscores
                                         # as done in mcp_adapter.py (e.g. "LinkedIn" -> "LinkedIn", "Google Drive" -> "Google_Drive")
                                         server_name = (
-                                            tc.split(":", 1)[1]
-                                            .replace(" ", "_")
-                                            .replace("-", "_")
+                                            tc.split(":", 1)[1].replace(" ", "_").replace("-", "_")
                                         )
 
                                         # mcp_adapter prefix is f"mcp_{server_name}_" where server_name preserves original case
@@ -947,23 +964,20 @@ class AgentServiceManager:
                                 for tc in tool_categories:
                                     if tc.startswith("mcp:"):
                                         server_name = (
-                                            tc.split(":", 1)[1]
-                                            .replace(" ", "_")
-                                            .replace("-", "_")
+                                            tc.split(":", 1)[1].replace(" ", "_").replace("-", "_")
                                         )
                                         logger.info(
                                             f"Checking Custom API tool: '{tool_name}' vs 'api_{server_name}_call'"
                                         )
-                                        if (
-                                            tool_name.lower()
-                                            == f"api_{server_name.lower()}_call"
-                                        ):
+                                        if tool_name.lower() == f"api_{server_name.lower()}_call":
                                             allowed_tools.append(tool_name)
                                             break
 
                     logger.info(
                         f"Tool categories {tool_categories} mapped to {len(allowed_tools)} tools for task {task_id}"
                     )
+                if workforce_tool_names:
+                    allowed_tools = list(set(allowed_tools or []) | workforce_tool_names)
 
                 delegate_agent_ids = self._get_delegate_agent_ids(task)
 
@@ -973,9 +987,7 @@ class AgentServiceManager:
                     request=self.request,
                     user=user,
                     task_id=f"web_task_{task_id}",
-                    allowed_collections=agent_config["knowledge_bases"]
-                    if agent_config
-                    else None,
+                    allowed_collections=agent_config["knowledge_bases"] if agent_config else None,
                     allowed_skills=agent_config["skills"] if agent_config else None,
                     allowed_tools=allowed_tools,
                     excluded_agent_id=excluded_agent_id,
@@ -983,6 +995,12 @@ class AgentServiceManager:
                     vision_model=task_vision_llm,  # Pass task-specific vision model
                     sandbox=sandbox,
                     llm=task_llm,  # Pass task-specific LLM
+                    allowed_agent_ids=workforce_allowed_agent_ids,
+                    agent_tool_overrides=workforce_agent_tool_overrides,
+                    enable_global_agent_tools=enable_global_agent_tools,
+                    allow_cross_user_agent_ids=allow_cross_user_agent_ids,
+                    parent_task_id=task_id,
+                    parent_tracer=tracer,
                 )
 
                 with UserContext(int(user.id)):
@@ -990,13 +1008,9 @@ class AgentServiceManager:
                     agent_kwargs = {}
                     if task and task.agent_type == "text2sql" and task.agent_config:
                         config: dict[str, Any] = (
-                            task.agent_config
-                            if isinstance(task.agent_config, dict)
-                            else {}
+                            task.agent_config if isinstance(task.agent_config, dict) else {}
                         )
-                        logger.info(
-                            f"Extracting Text2SQL config: {list(config.keys())}"
-                        )
+                        logger.info(f"Extracting Text2SQL config: {list(config.keys())}")
                         agent_kwargs.update(
                             {
                                 "database_url": config.get("database_url"),
@@ -1008,12 +1022,8 @@ class AgentServiceManager:
                                 "available_tables": config.get("available_tables"),
                             }
                         )
-                        logger.info(
-                            f"Text2SQL kwargs prepared: {list(agent_kwargs.keys())}"
-                        )
-                        logger.info(
-                            f"Database URL: {config.get('database_url', 'NOT FOUND')}"
-                        )
+                        logger.info(f"Text2SQL kwargs prepared: {list(agent_kwargs.keys())}")
+                        logger.info(f"Database URL: {config.get('database_url', 'NOT FOUND')}")
 
                     # Unpack tools and tool_config from create_default_tools
                     tools_list, tool_config = tools
@@ -1021,15 +1031,15 @@ class AgentServiceManager:
                     # Get system prompt from agent config (if available)
                     from .agents import enhance_system_prompt_with_kb
 
-                    system_prompt = (
-                        agent_config.get("instructions") if agent_config else None
-                    )
-                    kb_list = (
-                        agent_config.get("knowledge_bases") if agent_config else None
-                    )
-                    system_prompt = enhance_system_prompt_with_kb(
-                        system_prompt, kb_list
-                    )
+                    system_prompt = agent_config.get("instructions") if agent_config else None
+                    kb_list = agent_config.get("knowledge_bases") if agent_config else None
+                    system_prompt = enhance_system_prompt_with_kb(system_prompt, kb_list)
+                    if workforce_manager_prompt:
+                        system_prompt = (
+                            f"{system_prompt}\n\n{workforce_manager_prompt}"
+                            if system_prompt
+                            else workforce_manager_prompt
+                        )
 
                     system_prompt = self._apply_delegate_prompt(
                         db=db,
@@ -1041,9 +1051,7 @@ class AgentServiceManager:
                     # Extract memory similarity threshold from agent config
                     memory_similarity_threshold = None
                     if agent_config and "memory_similarity_threshold" in agent_config:
-                        memory_similarity_threshold = agent_config[
-                            "memory_similarity_threshold"
-                        ]
+                        memory_similarity_threshold = agent_config["memory_similarity_threshold"]
 
                     # Build allowed external directories (user's upload directory for knowledge base files)
                     allowed_external_dirs = _build_allowed_external_dirs(
@@ -1063,9 +1071,7 @@ class AgentServiceManager:
                         memory=get_memory_store(),  # Use dynamic memory store for auto-switching
                         pattern=task_pattern,  # Use pattern instead of use_dag_pattern
                         tracer=tracer,
-                        agent_type=str(task.agent_type)
-                        if task and task.agent_type
-                        else "standard",
+                        agent_type=str(task.agent_type) if task and task.agent_type else "standard",
                         enable_workspace=True,  # Enable workspace functionality
                         workspace_base_dir=str(
                             get_uploads_dir() / f"user_{user.id}"
@@ -1079,9 +1085,7 @@ class AgentServiceManager:
 
                     selected_file_ids: list[str] = []
                     if task and isinstance(task.agent_config, dict):
-                        raw_selected_file_ids = task.agent_config.get(
-                            "selected_file_ids"
-                        )
+                        raw_selected_file_ids = task.agent_config.get("selected_file_ids")
                         if isinstance(raw_selected_file_ids, list):
                             selected_file_ids = [
                                 str(item)
@@ -1111,18 +1115,14 @@ class AgentServiceManager:
 
                             # Use the source file directly (user's upload directory) instead of copying
                             # This avoids duplicate files across the system
-                            workspace.register_file(
-                                str(source_path), file_id=selected_file_id
-                            )
+                            workspace.register_file(str(source_path), file_id=selected_file_id)
 
                 pattern_info = (
                     f"with DAG pattern and workspace using {llm_info}"
                     if use_dag
                     else "with workspace (no LLM configured)"
                 )
-                logger.info(
-                    f"Created new AgentService for task {task_id} {pattern_info}"
-                )
+                logger.info(f"Created new AgentService for task {task_id} {pattern_info}")
 
                 if task_exists and db is not None:
                     self._load_persisted_conversation_history(task_id, db)
@@ -1135,7 +1135,7 @@ class AgentServiceManager:
 
         return self._agents[task_id]
 
-    def remove_agent(self, task_id: int, user_id: Optional[int] = None) -> None:
+    def remove_agent(self, task_id: int, user_id: int | None = None) -> None:
         """Remove AgentService instance for completed task"""
         if task_id in self._agents:
             # Log workspace path before cleanup
@@ -1145,9 +1145,7 @@ class AgentServiceManager:
             else:
                 workspace_path = None
             if workspace_path:
-                logger.info(
-                    f"Deleting workspace path for task {task_id}: {workspace_path}"
-                )
+                logger.info(f"Deleting workspace path for task {task_id}: {workspace_path}")
 
             # Clean up workspace before removing agent
             self._agents[task_id].cleanup_workspace()
@@ -1165,11 +1163,11 @@ class AgentServiceManager:
         self,
         agent_service: "AgentService",
         task: str,
-        context: Optional[Dict[str, Any]] = None,
-        task_id: Optional[str] = None,
-        tracking_task_id: Optional[str] = None,
-        db_session: Optional[Any] = None,
-    ) -> Dict[str, Any]:
+        context: dict[str, Any] | None = None,
+        task_id: str | None = None,
+        tracking_task_id: str | None = None,
+        db_session: Any | None = None,
+    ) -> dict[str, Any]:
         """
         Execute task with automatic token tracking.
 
@@ -1215,9 +1213,7 @@ class AgentServiceManager:
                 await tracker.start_tracking()
                 logger.info(f"Started token tracking for task {tracker_task_id}")
             except Exception as e:
-                logger.warning(
-                    f"Failed to start token tracking for task {tracker_task_id}: {e}"
-                )
+                logger.warning(f"Failed to start token tracking for task {tracker_task_id}: {e}")
                 tracker = None
 
         try:
@@ -1226,17 +1222,13 @@ class AgentServiceManager:
             )
 
             # Execute the task
-            result = await agent_service.execute_task(
-                task=task, context=context, task_id=task_id
-            )
+            result = await agent_service.execute_task(task=task, context=context, task_id=task_id)
 
             logger.info("=== Task executed successfully, updating title if needed ===")
 
             # Update task title with generated task_name (clean architecture: Core provides API, Web handles DB)
             if db_session and task_id and result and result.get("success"):
-                await update_task_title_from_agent(
-                    agent_service, int(task_id), db_session
-                )
+                await update_task_title_from_agent(agent_service, int(task_id), db_session)
 
             return result
         finally:
@@ -1265,9 +1257,7 @@ class AgentServiceManager:
                         f"Failed to complete token tracking for task {tracker_task_id}: {e}"
                     )
 
-    def _cleanup_workspace_directory(
-        self, task_id: int, user_id: Optional[int] = None
-    ) -> None:
+    def _cleanup_workspace_directory(self, task_id: int, user_id: int | None = None) -> None:
         """Clean up workspace directory for a task when agent is not in memory"""
         from ...core.workspace import TaskWorkspace
 
@@ -1301,9 +1291,7 @@ class AgentServiceManager:
                 )
                 break
         else:
-            logger.info(
-                f"No workspace directory found for task {task_id} (user {user_id})"
-            )
+            logger.info(f"No workspace directory found for task {task_id} (user {user_id})")
 
     async def _create_text2sql_agent(
         self, task: Task, db: Session, user: User, tracer: Tracer
@@ -1326,21 +1314,17 @@ class AgentServiceManager:
 
             # Validate required configuration
             if not config.get("database_url"):
-                raise ValueError(
-                    "Text2SQL agent configuration must include 'database_url'"
-                )
+                raise ValueError("Text2SQL agent configuration must include 'database_url'")
 
             # Log configuration for debugging
-            logger.info(
-                f"Creating Text2SQL agent for task {task.id} with config: {config}"
-            )
+            logger.info(f"Creating Text2SQL agent for task {task.id} with config: {config}")
 
             llm_ids = self._get_task_llm_ids(task, db)
 
             # Use user_id for model resolution if available
             user_id_for_resolution = int(user.id) if user else None
-            task_llm, task_fast_llm, task_vision_llm, task_compact_llm = (
-                resolve_llms_from_names(llm_ids, db, user_id_for_resolution)
+            task_llm, task_fast_llm, task_vision_llm, task_compact_llm = resolve_llms_from_names(
+                llm_ids, db, user_id_for_resolution
             )
 
             # Use default LLM if no specific LLM configured
@@ -1422,22 +1406,18 @@ class AgentServiceManager:
         """Infer database type from connection URL"""
         if database_url.startswith("mysql://") or database_url.startswith("mysql2://"):
             return "MySQL"
-        elif database_url.startswith("postgresql://") or database_url.startswith(
-            "postgres://"
-        ):
+        elif database_url.startswith("postgresql://") or database_url.startswith("postgres://"):
             return "PostgreSQL"
         elif database_url.startswith("sqlite://"):
             return "SQLite"
-        elif database_url.startswith("sqlserver://") or database_url.startswith(
-            "mssql://"
-        ):
+        elif database_url.startswith("sqlserver://") or database_url.startswith("mssql://"):
             return "SQL Server"
         else:
             return "Unknown"
 
     async def _execute_text2sql_agent_directly(
         self, agent: Any, task: str, tracer: Any, task_id: str
-    ) -> Dict[str, Any]:
+    ) -> dict[str, Any]:
         """
         Execute Text2SQL agent directly using its own execute method.
 
@@ -1451,9 +1431,7 @@ class AgentServiceManager:
             # Normalize return format to match AgentService format
             return {
                 "status": "completed" if result.get("success") else "failed",
-                "output": result.get(
-                    "output", result.get("error", "No output provided")
-                ),
+                "output": result.get("output", result.get("error", "No output provided")),
                 "success": result.get("success", False),
                 "metadata": result.get(
                     "metadata",
@@ -1513,23 +1491,17 @@ class AgentServiceManager:
                         "event_type": event.event_type,
                         "task_id": str(event.task_id),
                         "step_id": event.step_id,
-                        "timestamp": event.timestamp.timestamp()
-                        if event.timestamp
-                        else None,
+                        "timestamp": event.timestamp.timestamp() if event.timestamp else None,
                         "data": event.data,
                         "parent_id": event.parent_event_id,
                     }
                 )
 
             # Get DAG execution data
-            dag_execution = (
-                db.query(DAGExecution).filter(DAGExecution.task_id == task_id).first()
-            )
+            dag_execution = db.query(DAGExecution).filter(DAGExecution.task_id == task_id).first()
             if dag_execution and dag_execution.current_plan:
                 plan_state = (
-                    dict(dag_execution.current_plan)
-                    if dag_execution.current_plan
-                    else None
+                    dict(dag_execution.current_plan) if dag_execution.current_plan else None
                 )
 
             if tracer_events or plan_state:
@@ -1564,9 +1536,7 @@ class AgentServiceManager:
                         )
                         llm_ids = self._get_task_llm_ids(task, db)
                         # Use user_id for model resolution if available
-                        user_id_for_resolution = (
-                            int(task.user_id) if task.user_id else None
-                        )
+                        user_id_for_resolution = int(task.user_id) if task.user_id else None
                         task_llm, task_fast_llm, task_vision_llm, task_compact_llm = (
                             resolve_llms_from_names(llm_ids, db, user_id_for_resolution)
                         )
@@ -1680,9 +1650,7 @@ class AgentServiceManager:
                             memory_similarity_threshold=memory_similarity_threshold,
                         )
                 else:
-                    raise ValueError(
-                        "User context is required for agent reconstruction"
-                    )
+                    raise ValueError("User context is required for agent reconstruction")
 
                 await self._agents[task_id].reconstruct_from_history(
                     str(task_id), tracer_events, plan_state
@@ -1690,31 +1658,25 @@ class AgentServiceManager:
                 self._load_persisted_conversation_history(task_id, db)
                 await self._load_persisted_execution_context(task_id, db)
 
-                logger.info(
-                    f"Successfully reconstructed agent for task {task_id} from history"
-                )
+                logger.info(f"Successfully reconstructed agent for task {task_id} from history")
             else:
-                logger.info(
-                    f"No historical data found for task {task_id}, will create new agent"
-                )
+                logger.info(f"No historical data found for task {task_id}, will create new agent")
                 # Don't create agent here, let the normal flow handle it
                 # Raise an exception to indicate reconstruction is not possible
                 raise ValueError(f"No historical data found for task {task_id}")
 
         except Exception as e:
-            logger.error(
-                f"Failed to reconstruct agent from history for task {task_id}: {e}"
-            )
+            logger.error(f"Failed to reconstruct agent from history for task {task_id}: {e}")
             raise
 
-    def get_agent_workspace_files(self, task_id: int) -> Dict[str, Any]:
+    def get_agent_workspace_files(self, task_id: int) -> dict[str, Any]:
         """Get workspace files for a task"""
         if task_id not in self._agents:
             raise ValueError(f"No agent found for task {task_id}")
 
         return self._agents[task_id].get_workspace_files()
 
-    def get_agent_output_files(self, task_id: int) -> List[Dict[str, Any]]:
+    def get_agent_output_files(self, task_id: int) -> list[dict[str, Any]]:
         """Get output files for a task"""
         if task_id not in self._agents:
             raise ValueError(f"No agent found for task {task_id}")
@@ -1795,25 +1757,17 @@ async def create_task(
                 file_paths.append(str(file_path))
 
                 if file_path.exists():
-                    file_info_list.append(
-                        f"File: {uploaded_file.filename} (Path: {file_path})"
-                    )
+                    file_info_list.append(f"File: {uploaded_file.filename} (Path: {file_path})")
                 else:
-                    file_info_list.append(
-                        f"File: {uploaded_file.filename} (File does not exist)"
-                    )
+                    file_info_list.append(f"File: {uploaded_file.filename} (File does not exist)")
 
             if file_info_list:
                 if task_description:
-                    task_description += "\n\nUploaded files:\n" + "\n".join(
-                        file_info_list
-                    )
+                    task_description += "\n\nUploaded files:\n" + "\n".join(file_info_list)
                 else:
-                    task_description = "File processing task:\n" + "\n".join(
-                        file_info_list
-                    )
+                    task_description = "File processing task:\n" + "\n".join(file_info_list)
 
-        delegate_agent_ids: Optional[list[int]] = None
+        delegate_agent_ids: list[int] | None = None
         if request.delegate_agent_ids:
             requested_delegate_ids = [
                 int(agent_id)
@@ -1848,8 +1802,8 @@ async def create_task(
         core_storage = CoreStorage(db, DBModel)
 
         def _to_internal_model_id_if_accessible(
-            model_ref: Optional[Any],
-        ) -> Optional[str]:
+            model_ref: Any | None,
+        ) -> str | None:
             if model_ref is None:
                 return None
             if isinstance(model_ref, str):
@@ -1888,16 +1842,14 @@ async def create_task(
 
             return str(db_model.model_id)
 
-        def _normalize_llm_refs(llm_refs: List[Optional[Any]]) -> List[Optional[str]]:
-            return [
-                _to_internal_model_id_if_accessible(model_ref) for model_ref in llm_refs
-            ]
+        def _normalize_llm_refs(llm_refs: list[Any | None]) -> list[str | None]:
+            return [_to_internal_model_id_if_accessible(model_ref) for model_ref in llm_refs]
 
-        def _get_default_internal_model_ids() -> Dict[str, Optional[str]]:
+        def _get_default_internal_model_ids() -> dict[str, str | None]:
             from ..models.model import Model as DBModel
 
             config_types = ["general", "small_fast", "visual", "compact"]
-            defaults: Dict[str, Optional[str]] = {ct: None for ct in config_types}
+            defaults: dict[str, str | None] = dict.fromkeys(config_types)
 
             # User-specific defaults (Mode A: use DBModel JOIN).
             user_defaults = (
@@ -1943,9 +1895,7 @@ async def create_task(
             # Fetch model configuration from agent
             agent_db = (
                 db.query(AgentModel)
-                .filter(
-                    AgentModel.id == request.agent_id, AgentModel.user_id == user.id
-                )
+                .filter(AgentModel.id == request.agent_id, AgentModel.user_id == user.id)
                 .first()
             )
             if agent_db and agent_db.models:
@@ -1982,10 +1932,10 @@ async def create_task(
         # Persist both:
         # - *_model_id: internal stable identifier (preferred for selection)
         # - *_model_name: provider-facing model name (useful for display/audit)
-        default_model_id: Optional[str] = None
-        fast_model_id: Optional[str] = None
-        visual_model_id: Optional[str] = None
-        compact_model_id: Optional[str] = None
+        default_model_id: str | None = None
+        fast_model_id: str | None = None
+        visual_model_id: str | None = None
+        compact_model_id: str | None = None
 
         if llm_ids_to_use and len(llm_ids_to_use) == 4:
             default_model_id = llm_ids_to_use[0]
@@ -2011,19 +1961,15 @@ async def create_task(
             try:
                 agent_type_enum = AgentType(request.agent_type)
             except ValueError:
-                logger.warning(
-                    f"Unknown agent_type '{request.agent_type}', using STANDARD"
-                )
+                logger.warning(f"Unknown agent_type '{request.agent_type}', using STANDARD")
                 agent_type_enum = AgentType.STANDARD
 
         # Convert examples to list of dicts if provided
         examples_data = None
         if request.examples:
-            examples_data = [
-                {"input": ex.input, "output": ex.output} for ex in request.examples
-            ]
+            examples_data = [{"input": ex.input, "output": ex.output} for ex in request.examples]
 
-        task_agent_config: Dict[str, Any] = {}
+        task_agent_config: dict[str, Any] = {}
         if isinstance(request.agent_config, dict):
             task_agent_config.update(request.agent_config)
         if selected_file_ids:
@@ -2086,9 +2032,7 @@ async def create_task(
             task_id=task.id,
             title=task.title,
             status=task.status.value,
-            created_at=format_datetime_for_api(task.created_at)
-            if task.created_at
-            else None,
+            created_at=format_datetime_for_api(task.created_at) if task.created_at else None,
             model_id=task.model_id,
             small_fast_model_id=task.small_fast_model_id,
             visual_model_id=task.visual_model_id,
@@ -2113,18 +2057,18 @@ async def create_task(
 async def get_tasks(
     page: int = 1,
     per_page: int = 10,
-    search: Optional[str] = None,
-    agent_type: Optional[str] = None,
-    exclude_agent_type: Optional[str] = None,
-    execution_mode: Optional[str] = None,
-    exclude_execution_mode: Optional[str] = None,
+    search: str | None = None,
+    agent_type: str | None = None,
+    exclude_agent_type: str | None = None,
+    execution_mode: str | None = None,
+    exclude_execution_mode: str | None = None,
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """Get tasks list with pagination"""
     try:
         # Run synchronous database queries in thread pool to avoid blocking event loop
-        def _get_tasks_sync() -> Dict[str, Any]:
+        def _get_tasks_sync() -> dict[str, Any]:
             # Build base query - filter by current user, unless admin
             if user.is_admin:
                 # Admin can see all tasks - include user relationship for admin
@@ -2148,8 +2092,7 @@ async def get_tasks(
                     if agent_type_enum.value == AgentType.STANDARD.value:
                         # For STANDARD agent type, include both 'standard' and NULL values
                         query = query.filter(
-                            (Task.agent_type == agent_type_enum.value)
-                            | (Task.agent_type.is_(None))
+                            (Task.agent_type == agent_type_enum.value) | (Task.agent_type.is_(None))
                         )
                     else:
                         # For other agent types, filter by exact value
@@ -2188,9 +2131,7 @@ async def get_tasks(
 
             # Apply pagination
             offset = (page - 1) * per_page
-            query = (
-                query.order_by(Task.created_at.desc()).offset(offset).limit(per_page)
-            )
+            query = query.order_by(Task.created_at.desc()).offset(offset).limit(per_page)
             tasks_query = query.all()
 
             # Batch fetch agents for tasks with agent_id
@@ -2242,9 +2183,7 @@ async def get_tasks(
                     # Include user information for admin users
                     if user.is_admin:
                         task_data["user_id"] = task.user_id
-                        task_data["username"] = (
-                            task.user.username if task.user else "Unknown"
-                        )
+                        task_data["username"] = task.user.username if task.user else "Unknown"
 
                     tasks.append(task_data)
                 except Exception as e:
@@ -2278,20 +2217,16 @@ async def get_tasks(
 @chat_router.get("/task/{task_id}")
 async def get_task(
     task_id: int, db: Session = Depends(get_db), user: User = Depends(get_current_user)
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """Get task details"""
     try:
         # Run synchronous database queries in thread pool to avoid blocking event loop
-        def _get_task_sync() -> Dict[str, Any]:
+        def _get_task_sync() -> dict[str, Any]:
             # Admin can see any task, regular users can only see their own
             if user.is_admin:
                 task = db.query(Task).filter(Task.id == task_id).first()
             else:
-                task = (
-                    db.query(Task)
-                    .filter(Task.id == task_id, Task.user_id == user.id)
-                    .first()
-                )
+                task = db.query(Task).filter(Task.id == task_id, Task.user_id == user.id).first()
             if not task:
                 raise HTTPException(status_code=404, detail="Task not found")
 
@@ -2311,9 +2246,7 @@ async def get_task(
             dag_data = None
             from ..models.task import DAGExecution
 
-            dag_execution = (
-                db.query(DAGExecution).filter(DAGExecution.task_id == task_id).first()
-            )
+            dag_execution = db.query(DAGExecution).filter(DAGExecution.task_id == task_id).first()
             if dag_execution:
                 dag_data = {
                     "phase": dag_execution.phase.value if dag_execution.phase else None,
@@ -2376,20 +2309,16 @@ async def get_task(
 @chat_router.get("/task/{task_id}/status")
 async def get_task_status(
     task_id: int, db: Session = Depends(get_db), user: User = Depends(get_current_user)
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """Get task status"""
     try:
         # Run synchronous database queries in thread pool to avoid blocking event loop
-        def _get_task_status_sync() -> Dict[str, Any]:
+        def _get_task_status_sync() -> dict[str, Any]:
             # Admin can see any task, regular users can only see their own
             if user.is_admin:
                 task = db.query(Task).filter(Task.id == task_id).first()
             else:
-                task = (
-                    db.query(Task)
-                    .filter(Task.id == task_id, Task.user_id == user.id)
-                    .first()
-                )
+                task = db.query(Task).filter(Task.id == task_id, Task.user_id == user.id).first()
             if not task:
                 raise HTTPException(status_code=404, detail="Task not found")
 
@@ -2464,11 +2393,7 @@ async def update_task(
         if user.is_admin:
             task = db.query(Task).filter(Task.id == task_id).first()
         else:
-            task = (
-                db.query(Task)
-                .filter(Task.id == task_id, Task.user_id == user.id)
-                .first()
-            )
+            task = db.query(Task).filter(Task.id == task_id, Task.user_id == user.id).first()
 
         if not task:
             raise HTTPException(status_code=404, detail="Task not found")
@@ -2490,7 +2415,7 @@ async def delete_task(
     request: Any = None,
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """Delete a task and all related data"""
     try:
         # Run synchronous database queries in thread pool to avoid blocking event loop
@@ -2499,11 +2424,7 @@ async def delete_task(
             if user.is_admin:
                 task = db.query(Task).filter(Task.id == task_id).first()
             else:
-                task = (
-                    db.query(Task)
-                    .filter(Task.id == task_id, Task.user_id == user.id)
-                    .first()
-                )
+                task = db.query(Task).filter(Task.id == task_id, Task.user_id == user.id).first()
             if not task:
                 raise HTTPException(status_code=404, detail="Task not found")
 
@@ -2513,9 +2434,7 @@ async def delete_task(
             # Delete DAG execution (if any)
             from ..models.task import DAGExecution
 
-            dag_execution = (
-                db.query(DAGExecution).filter(DAGExecution.task_id == task_id).first()
-            )
+            dag_execution = db.query(DAGExecution).filter(DAGExecution.task_id == task_id).first()
             if dag_execution:
                 db.delete(dag_execution)
 
@@ -2579,7 +2498,7 @@ async def get_task_workspace_files(
     request: Any = None,
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """Get all workspace files for a task"""
     try:
         # Run synchronous database queries in thread pool to avoid blocking event loop
@@ -2588,11 +2507,7 @@ async def get_task_workspace_files(
             if user.is_admin:
                 task = db.query(Task).filter(Task.id == task_id).first()
             else:
-                task = (
-                    db.query(Task)
-                    .filter(Task.id == task_id, Task.user_id == user.id)
-                    .first()
-                )
+                task = db.query(Task).filter(Task.id == task_id, Task.user_id == user.id).first()
             if not task:
                 raise HTTPException(status_code=404, detail="Task not found")
             return task
@@ -2621,7 +2536,7 @@ async def get_task_output_files(
     request: Any = None,
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """Get output files for a task"""
     try:
         # Run synchronous database queries in thread pool to avoid blocking event loop
@@ -2630,11 +2545,7 @@ async def get_task_output_files(
             if user.is_admin:
                 task = db.query(Task).filter(Task.id == task_id).first()
             else:
-                task = (
-                    db.query(Task)
-                    .filter(Task.id == task_id, Task.user_id == user.id)
-                    .first()
-                )
+                task = db.query(Task).filter(Task.id == task_id, Task.user_id == user.id).first()
             if not task:
                 raise HTTPException(status_code=404, detail="Task not found")
             return task

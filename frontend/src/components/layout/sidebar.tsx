@@ -45,6 +45,7 @@ import {
   Search,
   Globe,
   ChevronsUpDown,
+  Briefcase,
 } from "lucide-react"
 import {
   Dialog,
@@ -177,6 +178,13 @@ export const getNavigationGroupsForUser = (user: any): NavigationGroup[] => [
         href: "/templates",
         icon: LayoutTemplate,
         color: "text-purple-400"
+      },
+      {
+        name: "Workforces",
+        nameKey: "nav.workforces",
+        href: "/workforces",
+        icon: Briefcase,
+        color: "text-cyan-500"
       },
     ]
   },

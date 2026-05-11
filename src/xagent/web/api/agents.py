@@ -4,7 +4,6 @@ import logging
 import os
 import uuid
 from datetime import datetime
-from typing import Dict, List, Optional
 
 from fastapi import APIRouter, Body, Depends, HTTPException
 from pydantic import BaseModel, Field
@@ -20,6 +19,7 @@ from ..models.agent import Agent, AgentStatus
 from ..models.database import get_db
 from ..models.model import Model as DBModel
 from ..models.user import User
+from ..models.workforce import Workforce, WorkforceAgent
 from ..services.llm_utils import UserAwareModelStorage
 from ..tools.config import WebToolConfig
 from ..user_isolated_memory import UserContext
@@ -36,48 +36,42 @@ class AgentCreateRequest(BaseModel):
     """Request model for creating a new agent."""
 
     name: str = Field(..., min_length=1, max_length=200, description="Agent name")
-    description: Optional[str] = Field(None, description="Agent description")
-    instructions: Optional[str] = Field(None, description="System instructions/prompt")
-    execution_mode: Optional[str] = Field(
+    description: str | None = Field(None, description="Agent description")
+    instructions: str | None = Field(None, description="System instructions/prompt")
+    execution_mode: str | None = Field(
         "balanced", description="Execution mode: flash, balanced, think, or auto"
     )
-    models: Optional[dict] = Field(
+    models: dict | None = Field(
         None, description="Model config: {general, small_fast, visual, compact}"
     )
-    knowledge_bases: List[str] = Field(
-        default_factory=list, description="Knowledge base names"
-    )
-    skills: List[str] = Field(default_factory=list, description="Skill names")
-    tool_categories: List[str] = Field(
-        default_factory=list, description="Tool category names"
-    )
-    suggested_prompts: List[str] = Field(
+    knowledge_bases: list[str] = Field(default_factory=list, description="Knowledge base names")
+    skills: list[str] = Field(default_factory=list, description="Skill names")
+    tool_categories: list[str] = Field(default_factory=list, description="Tool category names")
+    suggested_prompts: list[str] = Field(
         default_factory=list, description="Suggested prompt examples for users"
     )
-    logo_base64: Optional[str] = Field(
-        None, description="Logo image as base64 data URL"
-    )
+    logo_base64: str | None = Field(None, description="Logo image as base64 data URL")
 
 
 class AgentUpdateRequest(BaseModel):
     """Request model for updating an agent."""
 
-    name: Optional[str] = Field(None, min_length=1, max_length=200)
-    description: Optional[str] = None
-    instructions: Optional[str] = None
-    execution_mode: Optional[str] = Field(
+    name: str | None = Field(None, min_length=1, max_length=200)
+    description: str | None = None
+    instructions: str | None = None
+    execution_mode: str | None = Field(
         None, description="Execution mode: flash, balanced, think, or auto"
     )
-    models: Optional[dict] = None
-    knowledge_bases: Optional[List[str]] = None
-    skills: Optional[List[str]] = None
-    tool_categories: Optional[List[str]] = None
-    suggested_prompts: Optional[List[str]] = Field(
+    models: dict | None = None
+    knowledge_bases: list[str] | None = None
+    skills: list[str] | None = None
+    tool_categories: list[str] | None = None
+    suggested_prompts: list[str] | None = Field(
         None, description="Suggested prompt examples for users"
     )
-    logo_base64: Optional[str] = None
-    widget_enabled: Optional[bool] = None
-    allowed_domains: Optional[List[str]] = None
+    logo_base64: str | None = None
+    widget_enabled: bool | None = None
+    allowed_domains: list[str] | None = None
 
 
 class AgentResponse(BaseModel):
@@ -86,21 +80,21 @@ class AgentResponse(BaseModel):
     id: int
     user_id: int
     name: str
-    description: Optional[str]
-    instructions: Optional[str]
+    description: str | None
+    instructions: str | None
     execution_mode: str
-    models: Optional[dict]
-    knowledge_bases: List[str]
-    skills: List[str]
-    tool_categories: List[str]
-    suggested_prompts: List[str]
-    logo_url: Optional[str]
+    models: dict | None
+    knowledge_bases: list[str]
+    skills: list[str]
+    tool_categories: list[str]
+    suggested_prompts: list[str]
+    logo_url: str | None
     status: str
-    published_at: Optional[str]
+    published_at: str | None
     created_at: str
     updated_at: str
     widget_enabled: bool
-    allowed_domains: List[str]
+    allowed_domains: list[str]
 
 
 class AgentListItem(BaseModel):
@@ -108,13 +102,13 @@ class AgentListItem(BaseModel):
 
     id: int
     name: str
-    description: Optional[str]
-    logo_url: Optional[str]
+    description: str | None
+    logo_url: str | None
     status: str
     created_at: str
     updated_at: str
     widget_enabled: bool
-    allowed_domains: List[str]
+    allowed_domains: list[str]
 
 
 class PublishResponse(BaseModel):
@@ -128,9 +122,7 @@ class OptimizeInstructionsRequest(BaseModel):
     """Request model for optimizing agent instructions."""
 
     instructions: str = Field(..., description="Draft instructions to optimize")
-    model_id: Optional[int] = Field(
-        None, description="Model ID to use for optimization"
-    )
+    model_id: int | None = Field(None, description="Model ID to use for optimization")
 
 
 KNOWLEDGE_TOOL_CATEGORY = "knowledge"
@@ -148,8 +140,8 @@ KB_PRIORITY_PROMPT = (
 
 
 def enhance_system_prompt_with_kb(
-    system_prompt: Optional[str], knowledge_bases: Optional[List[str]]
-) -> Optional[str]:
+    system_prompt: str | None, knowledge_bases: list[str] | None
+) -> str | None:
     """Append knowledge-base priority instructions when KBs are configured."""
     if not knowledge_bases:
         return system_prompt
@@ -170,9 +162,7 @@ def enhance_system_prompt_with_kb(
 # ===== Helper Functions =====
 
 
-def _validate_knowledge_base_tools(
-    knowledge_bases: List[str], tool_categories: List[str]
-) -> None:
+def _validate_knowledge_base_tools(knowledge_bases: list[str], tool_categories: list[str]) -> None:
     """Raise HTTPException if knowledge bases are selected without the knowledge tool category."""
     if knowledge_bases and KNOWLEDGE_TOOL_CATEGORY not in tool_categories:
         raise HTTPException(
@@ -181,7 +171,7 @@ def _validate_knowledge_base_tools(
         )
 
 
-def _save_logo(base64_data: Optional[str], agent_id: int) -> Optional[str]:
+def _save_logo(base64_data: str | None, agent_id: int) -> str | None:
     """Save logo image and return URL."""
     if not base64_data:
         return None
@@ -269,7 +259,7 @@ async def optimize_instructions(
     request: OptimizeInstructionsRequest,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
-) -> Dict[str, str]:
+) -> dict[str, str]:
     """Optimize agent instructions using an LLM."""
     try:
         # Get model storage
@@ -292,9 +282,7 @@ async def optimize_instructions(
             llm = default_llm
 
         if not llm:
-            raise HTTPException(
-                status_code=400, detail="No LLM available for optimization"
-            )
+            raise HTTPException(status_code=400, detail="No LLM available for optimization")
 
         # Construct prompt
         system_prompt = (
@@ -304,7 +292,9 @@ async def optimize_instructions(
             "Do not include any conversational filler. Just output the optimized instructions."
         )
 
-        user_prompt = f"Draft instructions:\n{request.instructions}\n\nPlease optimize these instructions."
+        user_prompt = (
+            f"Draft instructions:\n{request.instructions}\n\nPlease optimize these instructions."
+        )
 
         # Call LLM
         response = await llm.chat(
@@ -341,13 +331,9 @@ async def create_agent(
             .first()
         )
         if existing:
-            raise HTTPException(
-                status_code=400, detail="Agent with this name already exists"
-            )
+            raise HTTPException(status_code=400, detail="Agent with this name already exists")
 
-        _validate_knowledge_base_tools(
-            agent_data.knowledge_bases, agent_data.tool_categories
-        )
+        _validate_knowledge_base_tools(agent_data.knowledge_bases, agent_data.tool_categories)
 
         # Create agent
         agent = Agent(
@@ -389,11 +375,11 @@ async def create_agent(
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@router.get("", response_model=List[AgentListItem])
+@router.get("", response_model=list[AgentListItem])
 async def list_agents(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
-) -> List[AgentListItem]:
+) -> list[AgentListItem]:
     """List all agents for the current user."""
     try:
         agents = (
@@ -434,9 +420,7 @@ async def get_agent(
     """Get agent details."""
     try:
         agent = (
-            db.query(Agent)
-            .filter(Agent.id == agent_id, Agent.user_id == current_user.id)
-            .first()
+            db.query(Agent).filter(Agent.id == agent_id, Agent.user_id == current_user.id).first()
         )
 
         if not agent:
@@ -461,9 +445,7 @@ async def update_agent(
     """Update an existing agent."""
     try:
         agent = (
-            db.query(Agent)
-            .filter(Agent.id == agent_id, Agent.user_id == current_user.id)
-            .first()
+            db.query(Agent).filter(Agent.id == agent_id, Agent.user_id == current_user.id).first()
         )
 
         if not agent:
@@ -495,9 +477,7 @@ async def update_agent(
                 .first()
             )
             if existing:
-                raise HTTPException(
-                    status_code=400, detail="Agent with this name already exists"
-                )
+                raise HTTPException(status_code=400, detail="Agent with this name already exists")
             agent.name = agent_data.name  # type: ignore[assignment]
 
         if agent_data.description is not None:
@@ -554,13 +534,42 @@ async def delete_agent(
     """Delete an agent."""
     try:
         agent = (
-            db.query(Agent)
-            .filter(Agent.id == agent_id, Agent.user_id == current_user.id)
-            .first()
+            db.query(Agent).filter(Agent.id == agent_id, Agent.user_id == current_user.id).first()
         )
 
         if not agent:
             raise HTTPException(status_code=404, detail="Agent not found")
+
+        manager_reference = (
+            db.query(Workforce)
+            .filter(Workforce.manager_agent_id == agent.id)
+            .order_by(Workforce.id.asc())
+            .first()
+        )
+        if manager_reference:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "Cannot delete agent because it is used as the manager agent "
+                    f"by workforce '{manager_reference.name}'"
+                ),
+            )
+
+        worker_reference = (
+            db.query(Workforce)
+            .join(WorkforceAgent, WorkforceAgent.workforce_id == Workforce.id)
+            .filter(WorkforceAgent.agent_id == agent.id)
+            .order_by(Workforce.id.asc(), WorkforceAgent.id.asc())
+            .first()
+        )
+        if worker_reference:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "Cannot delete agent because it is used as a worker agent "
+                    f"by workforce '{worker_reference.name}'"
+                ),
+            )
 
         # Delete logo if exists
         if agent.logo_url:
@@ -589,9 +598,7 @@ async def publish_agent(
     """Publish an agent (make it publicly accessible)."""
     try:
         agent = (
-            db.query(Agent)
-            .filter(Agent.id == agent_id, Agent.user_id == current_user.id)
-            .first()
+            db.query(Agent).filter(Agent.id == agent_id, Agent.user_id == current_user.id).first()
         )
 
         if not agent:
@@ -630,9 +637,7 @@ async def unpublish_agent(
     """Unpublish an agent (revert to draft status)."""
     try:
         agent = (
-            db.query(Agent)
-            .filter(Agent.id == agent_id, Agent.user_id == current_user.id)
-            .first()
+            db.query(Agent).filter(Agent.id == agent_id, Agent.user_id == current_user.id).first()
         )
 
         if not agent:
@@ -672,9 +677,7 @@ async def upload_agent_logo(
     """Upload or update agent logo."""
     try:
         agent = (
-            db.query(Agent)
-            .filter(Agent.id == agent_id, Agent.user_id == current_user.id)
-            .first()
+            db.query(Agent).filter(Agent.id == agent_id, Agent.user_id == current_user.id).first()
         )
 
         if not agent:
@@ -709,20 +712,16 @@ async def upload_agent_logo(
 class AgentPreviewRequest(BaseModel):
     """Request model for agent preview."""
 
-    instructions: Optional[str] = Field(None, description="System instructions/prompt")
-    execution_mode: Optional[str] = Field(
+    instructions: str | None = Field(None, description="System instructions/prompt")
+    execution_mode: str | None = Field(
         "balanced", description="Execution mode: flash, balanced, think, or auto"
     )
-    models: Optional[dict] = Field(
+    models: dict | None = Field(
         None, description="Model config: {general, small_fast, visual, compact}"
     )
-    knowledge_bases: List[str] = Field(
-        default_factory=list, description="Knowledge base names"
-    )
-    skills: List[str] = Field(default_factory=list, description="Skill names")
-    tool_categories: List[str] = Field(
-        default_factory=list, description="Tool category names"
-    )
+    knowledge_bases: list[str] = Field(default_factory=list, description="Knowledge base names")
+    skills: list[str] = Field(default_factory=list, description="Skill names")
+    tool_categories: list[str] = Field(default_factory=list, description="Tool category names")
     message: str = Field(..., description="User message to preview")
 
 
@@ -756,9 +755,7 @@ async def preview_agent(
 
             if model_config.get("general"):
                 general_model = (
-                    db.query(DBModel)
-                    .filter(DBModel.id == model_config["general"])
-                    .first()
+                    db.query(DBModel).filter(DBModel.id == model_config["general"]).first()
                 )
                 if general_model:
                     default_llm = storage.get_llm_by_name_with_access(
@@ -766,9 +763,7 @@ async def preview_agent(
                     )
             if model_config.get("small_fast"):
                 fast_model = (
-                    db.query(DBModel)
-                    .filter(DBModel.id == model_config["small_fast"])
-                    .first()
+                    db.query(DBModel).filter(DBModel.id == model_config["small_fast"]).first()
                 )
                 if fast_model:
                     fast_llm = storage.get_llm_by_name_with_access(
@@ -776,9 +771,7 @@ async def preview_agent(
                     )
             if model_config.get("visual"):
                 visual_model = (
-                    db.query(DBModel)
-                    .filter(DBModel.id == model_config["visual"])
-                    .first()
+                    db.query(DBModel).filter(DBModel.id == model_config["visual"]).first()
                 )
                 if visual_model:
                     vision_llm = storage.get_llm_by_name_with_access(
@@ -786,9 +779,7 @@ async def preview_agent(
                     )
             if model_config.get("compact"):
                 compact_model = (
-                    db.query(DBModel)
-                    .filter(DBModel.id == model_config["compact"])
-                    .first()
+                    db.query(DBModel).filter(DBModel.id == model_config["compact"]).first()
                 )
                 if compact_model:
                     compact_llm = storage.get_llm_by_name_with_access(
@@ -796,9 +787,7 @@ async def preview_agent(
                     )
 
         if not default_llm:
-            raise HTTPException(
-                status_code=400, detail="General model is required for preview"
-            )
+            raise HTTPException(status_code=400, detail="General model is required for preview")
 
         # Create tool config with allowed collections, skills, and tools
         # WebToolConfig expects db and request, pass a minimal dict-like request object

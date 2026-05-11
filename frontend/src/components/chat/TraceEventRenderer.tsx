@@ -14,6 +14,7 @@ import {
   FileText,
   Check,
   Shield,
+  Users,
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { useApp } from '@/contexts/app-context-chat';
@@ -131,7 +132,14 @@ function useProcessedSteps(events: TraceEvent[]): ProcessedStep[] {
         return;
       }
 
+      const eventId = event.event_id || `event-${index}`;
       let stepId = event.step_id || (event.data?.step_id as string) || 'default';
+      if (event.event_type?.startsWith('workforce_delegation_')) {
+        stepId = String(
+          event.data?.worker_task_id ||
+          `workforce-${event.data?.workforce_run_id || 'run'}-${event.data?.worker_member_id || event.data?.agent_id || eventId}`
+        );
+      }
 
       if (event.event_type === 'react_task_start' || event.event_type === 'task_start_react') {
         currentReactStepId = stepId;
@@ -158,8 +166,6 @@ function useProcessedSteps(events: TraceEvent[]): ProcessedStep[] {
 
       const step = stepsMap.get(stepId)!;
       const timestamp = normalizeTimestampMs(event.timestamp);
-      const eventId = event.event_id || `event-${index}`;
-
       // Process different event types
       if (event.event_type === 'dag_step_start' || event.event_type === 'react_task_start') {
         step.stepName = (event.data?.step_name as string) || (event.event_type === 'react_task_start' ? t('traceEventRenderer.taskExecution') : '');
@@ -212,6 +218,71 @@ function useProcessedSteps(events: TraceEvent[]): ProcessedStep[] {
               reasoning: event.data?.response?.reasoning,
               tool_calls: event.data?.tools
             }
+          });
+        }
+      }
+
+      if (event.event_type === 'workforce_delegation_start') {
+        const workerName = String(
+          event.data?.worker_alias ||
+          event.data?.agent_name ||
+          event.data?.tool_name ||
+          t('traceEventRenderer.unknownWorker')
+        );
+        step.stepName = t('traceEventRenderer.workforceDelegation');
+        step.description = t('traceEventRenderer.delegateToWorker', { worker: workerName });
+        step.status = 'running';
+        step.actions.push({
+          id: eventId,
+          type: 'info',
+          title: t('traceEventRenderer.delegateToWorker', { worker: workerName }),
+          status: 'running',
+          timestamp,
+          data: {
+            tool: event.data?.tool_name,
+            output: event.data,
+          }
+        });
+      }
+
+      if (event.event_type === 'workforce_delegation_end') {
+        const output = event.data?.output || event.data?.response || '';
+        step.stepName = step.stepName || t('traceEventRenderer.workforceDelegation');
+        step.description = step.description || t('traceEventRenderer.workforceDelegation');
+        step.status = 'completed';
+        const action = step.actions.find(a => a.type === 'info' && a.status === 'running');
+        if (action) {
+          action.status = 'completed';
+          action.data.output = output || event.data;
+        } else {
+          step.actions.push({
+            id: eventId,
+            type: 'info',
+            title: t('traceEventRenderer.workerReturned'),
+            status: 'completed',
+            timestamp,
+            data: { output: output || event.data }
+          });
+        }
+      }
+
+      if (event.event_type === 'workforce_delegation_error') {
+        const errorMessage = event.data?.error || event.data?.message || t('traceEventRenderer.unknownError');
+        step.stepName = step.stepName || t('traceEventRenderer.workforceDelegation');
+        step.description = step.description || t('traceEventRenderer.workforceDelegation');
+        step.status = 'failed';
+        const action = step.actions.find(a => a.type === 'info' && a.status === 'running');
+        if (action) {
+          action.status = 'failed';
+          action.data.error = errorMessage;
+        } else {
+          step.actions.push({
+            id: eventId,
+            type: 'error',
+            title: t('traceEventRenderer.workerFailed'),
+            status: 'failed',
+            timestamp,
+            data: { error: errorMessage }
           });
         }
       }
@@ -772,7 +843,7 @@ function StepActionItem({ action, onViewDetail, onOpenTerminal, onFileClick, onA
             <span className="flex-shrink-0 flex items-center">
               {action.type === 'tool' && <Wrench className="w-3.5 h-3.5" />}
               {action.type === 'error' && <Info className="w-3.5 h-3.5 text-red-500" />}
-              {action.type === 'info' && <Info className="w-3.5 h-3.5" />}
+              {action.type === 'info' && <Users className="w-3.5 h-3.5" />}
             </span>
 
             <span className="font-medium break-words [overflow-wrap:anywhere]">{action.title}</span>
@@ -842,6 +913,13 @@ function StepActionItem({ action, onViewDetail, onOpenTerminal, onFileClick, onA
                   <div className="text-red-400 whitespace-pre-wrap">
                     {String(action.data.error)}
                   </div>
+                )}
+
+                {action.type === 'info' && (
+                  <>
+                    <ToolErrorDisplay action={action} t={t} />
+                    <ToolOutputDisplay action={action} isRunning={isRunning} t={t} onFileClick={onFileClick} onAgentClick={onAgentClick} />
+                  </>
                 )}
               </div>
             </ScrollArea>
