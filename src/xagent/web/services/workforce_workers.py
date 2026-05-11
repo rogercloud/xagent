@@ -16,10 +16,13 @@ from .workforce_snapshot import normalize_text
 _TEMPLATE_MANAGER = create_template_manager()
 
 _SAFE_TEMPLATE_ID_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_.-]*$")
+_MAX_TEMPLATE_ID_LENGTH = 200
 
 
 def _validate_template_id(template_id: str) -> None:
-    if not _SAFE_TEMPLATE_ID_RE.match(template_id):
+    if len(template_id) > _MAX_TEMPLATE_ID_LENGTH:
+        raise HTTPException(status_code=400, detail="template_id too long")
+    if not _SAFE_TEMPLATE_ID_RE.fullmatch(template_id):
         raise HTTPException(
             status_code=400, detail=f"Invalid template_id: {template_id}"
         )

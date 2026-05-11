@@ -212,3 +212,13 @@ def test_load_template_detail_rejects_path_traversal() -> None:
             if exc.status_code == 400:
                 raise AssertionError(f"Safe template_id {tid} was rejected with 400")
             # 404 is expected for non-existent template files
+
+
+def test_load_template_detail_rejects_overly_long_id() -> None:
+    long_id = "a" * 255
+    try:
+        load_template_detail(long_id)
+    except HTTPException as exc:
+        assert exc.status_code == 400
+    else:
+        raise AssertionError("Expected HTTPException for overly long template_id")
