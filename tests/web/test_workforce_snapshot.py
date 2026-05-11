@@ -3,6 +3,7 @@ import tempfile
 from fastapi import HTTPException
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session, sessionmaker
+
 from xagent.web.models.agent import Agent, AgentStatus
 from xagent.web.models.database import Base
 from xagent.web.models.user import User
@@ -51,7 +52,9 @@ def test_build_workforce_snapshot():
     db_session, db_path = _create_session()
     try:
         regular_user = _create_user(db_session, "snapshot-user")
-        manager = _create_agent(db_session, regular_user, "Manager", execution_mode="think")
+        manager = _create_agent(
+            db_session, regular_user, "Manager", execution_mode="think"
+        )
         worker = _create_agent(db_session, regular_user, "Research Agent")
 
         workforce = Workforce(

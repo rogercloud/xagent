@@ -4,6 +4,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 from sqlalchemy import or_
 from sqlalchemy.orm import Session
+
 from xagent.web.auth_dependencies import get_current_user
 from xagent.web.models.agent import Agent
 from xagent.web.models.database import get_db
@@ -145,7 +146,9 @@ def _serialize_worker(worker: WorkforceAgent) -> dict[str, Any]:
 
 
 def _serialize_workforce_detail(workforce: Workforce) -> dict[str, Any]:
-    workers = sorted(workforce.workers, key=lambda item: (item.sort_order or 0, item.id or 0))
+    workers = sorted(
+        workforce.workers, key=lambda item: (item.sort_order or 0, item.id or 0)
+    )
     return {
         "id": workforce.id,
         "name": workforce.name,
@@ -158,8 +161,12 @@ def _serialize_workforce_detail(workforce: Workforce) -> dict[str, Any]:
         "scope_type": workforce.scope_type,
         "scope_id": workforce.scope_id,
         "owner_user_id": workforce.owner_user_id,
-        "created_at": workforce.created_at.isoformat() if workforce.created_at else None,
-        "updated_at": workforce.updated_at.isoformat() if workforce.updated_at else None,
+        "created_at": workforce.created_at.isoformat()
+        if workforce.created_at
+        else None,
+        "updated_at": workforce.updated_at.isoformat()
+        if workforce.updated_at
+        else None,
     }
 
 
@@ -186,13 +193,19 @@ def _serialize_workforce_list_item(db: Session, workforce: Workforce) -> dict[st
                 "id": last_run.id,
                 "task_id": last_run.task_id,
                 "status": last_run.status,
-                "created_at": last_run.created_at.isoformat() if last_run.created_at else None,
+                "created_at": last_run.created_at.isoformat()
+                if last_run.created_at
+                else None,
             }
             if last_run
             else None
         ),
-        "created_at": workforce.created_at.isoformat() if workforce.created_at else None,
-        "updated_at": workforce.updated_at.isoformat() if workforce.updated_at else None,
+        "created_at": workforce.created_at.isoformat()
+        if workforce.created_at
+        else None,
+        "updated_at": workforce.updated_at.isoformat()
+        if workforce.updated_at
+        else None,
     }
 
 
@@ -214,7 +227,9 @@ def _check_duplicate_workforce_name(
         raise HTTPException(status_code=409, detail="Workforce name already exists")
 
 
-def _validate_worker_agent_ids(workers: list[WorkforceWorkerInput], manager_agent_id: int) -> None:
+def _validate_worker_agent_ids(
+    workers: list[WorkforceWorkerInput], manager_agent_id: int
+) -> None:
     seen_agent_ids: set[int] = set()
     for worker in workers:
         ensure_supported_source_type(worker.source_type)
@@ -222,9 +237,13 @@ def _validate_worker_agent_ids(workers: list[WorkforceWorkerInput], manager_agen
             if worker.agent_id is None:
                 raise HTTPException(status_code=400, detail="agent_id is required")
             if worker.agent_id == manager_agent_id:
-                raise HTTPException(status_code=400, detail="Manager agent cannot also be a worker")
+                raise HTTPException(
+                    status_code=400, detail="Manager agent cannot also be a worker"
+                )
             if worker.agent_id in seen_agent_ids:
-                raise HTTPException(status_code=409, detail="Duplicate worker agent in workforce")
+                raise HTTPException(
+                    status_code=409, detail="Duplicate worker agent in workforce"
+                )
             seen_agent_ids.add(worker.agent_id)
         elif worker.source_type == "template":
             if not worker.template_id:
@@ -234,12 +253,16 @@ def _validate_worker_agent_ids(workers: list[WorkforceWorkerInput], manager_agen
                 raise HTTPException(
                     status_code=400, detail="agent is required for source_type='new'"
                 )
-            new_agent_name = normalize_text(worker.agent.name, "agent.name", required=True)
+            new_agent_name = normalize_text(
+                worker.agent.name, "agent.name", required=True
+            )
             if new_agent_name is None:
                 raise HTTPException(status_code=400, detail="agent.name is required")
 
 
-def _ensure_can_activate(status: str, workforce: Workforce | None, workers: list[Any]) -> None:
+def _ensure_can_activate(
+    status: str, workforce: Workforce | None, workers: list[Any]
+) -> None:
     if status != "active":
         return
     enabled_count = 0
@@ -249,7 +272,8 @@ def _ensure_can_activate(status: str, workforce: Workforce | None, workers: list
         enabled_count = sum(1 for worker in workers if getattr(worker, "enabled", True))
     if enabled_count == 0:
         raise HTTPException(
-            status_code=400, detail="Active workforce requires at least one enabled worker"
+            status_code=400,
+            detail="Active workforce requires at least one enabled worker",
         )
 
 
@@ -290,18 +314,25 @@ async def list_workforces(
     query = db.query(Workforce)
     if search:
         query = query.filter(
-            or_(Workforce.name.ilike(f"%{search}%"), Workforce.description.ilike(f"%{search}%"))
+            or_(
+                Workforce.name.ilike(f"%{search}%"),
+                Workforce.description.ilike(f"%{search}%"),
+            )
         )
     if status:
         query = query.filter(Workforce.status == normalize_workforce_status(status))
 
     items = query.order_by(Workforce.updated_at.desc(), Workforce.id.desc()).all()
     if not user.is_admin:
-        items = [workforce for workforce in items if can_view_workforce(db, user, workforce)]
+        items = [
+            workforce for workforce in items if can_view_workforce(db, user, workforce)
+        ]
     total = len(items)
     paged_items = items[(page - 1) * size : (page - 1) * size + size]
     return {
-        "items": [_serialize_workforce_list_item(db, workforce) for workforce in paged_items],
+        "items": [
+            _serialize_workforce_list_item(db, workforce) for workforce in paged_items
+        ],
         "total": total,
         "page": page,
         "size": size,
@@ -336,8 +367,9 @@ async def create_workforce(
         user,
         db,
     )
+    manager_agent_id = cast(int, manager_agent.id)
     _check_duplicate_workforce_name(db, scope_type, scope_id, name)
-    _validate_worker_agent_ids(request.workers, manager_agent.id)
+    _validate_worker_agent_ids(request.workers, manager_agent_id)
     status = normalize_workforce_status(request.status)
     _ensure_can_activate(status, None, request.workers)
 
@@ -347,8 +379,10 @@ async def create_workforce(
         scope_id=scope_id,
         name=name,
         description=normalize_text(request.description, "description"),
-        manager_agent_id=manager_agent.id,
-        manager_instructions=normalize_text(request.manager_instructions, "manager_instructions"),
+        manager_agent_id=manager_agent_id,
+        manager_instructions=normalize_text(
+            request.manager_instructions, "manager_instructions"
+        ),
         status=status,
         canvas_layout=request.canvas_layout,
     )
@@ -395,6 +429,7 @@ async def update_workforce(
 ) -> dict[str, Any]:
     workforce = db.query(Workforce).filter(Workforce.id == workforce_id).first()
     workforce = ensure_workforce_access(db, user, workforce, action="edit")
+    workforce_row = cast(Any, workforce)
 
     if request.name is not None:
         name = normalize_text(request.name, "name", required=True)
@@ -408,30 +443,33 @@ async def update_workforce(
                 name,
                 cast(int, workforce.id),
             )
-            workforce.name = name
+            workforce_row.name = name
 
     if request.description is not None:
-        workforce.description = normalize_text(request.description, "description")
+        workforce_row.description = normalize_text(request.description, "description")
     if request.manager_instructions is not None:
-        workforce.manager_instructions = normalize_text(
+        workforce_row.manager_instructions = normalize_text(
             request.manager_instructions,
             "manager_instructions",
         )
     if request.canvas_layout is not None:
-        workforce.canvas_layout = request.canvas_layout
+        workforce_row.canvas_layout = request.canvas_layout
     if request.manager_agent_id is not None:
         manager_agent = ensure_agent_access(
             db.query(Agent).filter(Agent.id == request.manager_agent_id).first(),
             user,
             db,
         )
+        manager_agent_id = cast(int, manager_agent.id)
         if any(worker.agent_id == manager_agent.id for worker in workforce.workers):
-            raise HTTPException(status_code=400, detail="Manager agent cannot also be a worker")
-        workforce.manager_agent_id = manager_agent.id
+            raise HTTPException(
+                status_code=400, detail="Manager agent cannot also be a worker"
+            )
+        workforce_row.manager_agent_id = manager_agent_id
     if request.status is not None:
         status = normalize_workforce_status(request.status)
         _ensure_can_activate(status, workforce, [])
-        workforce.status = status
+        workforce_row.status = status
 
     db.commit()
     db.refresh(workforce)
@@ -446,7 +484,8 @@ async def archive_workforce(
 ) -> dict[str, Any]:
     workforce = db.query(Workforce).filter(Workforce.id == workforce_id).first()
     workforce = ensure_workforce_access(db, user, workforce, action="edit")
-    workforce.status = "archived"
+    workforce_row = cast(Any, workforce)
+    workforce_row.status = "archived"
     db.commit()
     return {"id": workforce.id, "status": workforce.status}
 
@@ -481,16 +520,19 @@ async def update_workforce_agent(
     workforce = ensure_workforce_access(db, user, workforce, action="edit")
     worker = (
         db.query(WorkforceAgent)
-        .filter(WorkforceAgent.id == member_id, WorkforceAgent.workforce_id == workforce.id)
+        .filter(
+            WorkforceAgent.id == member_id, WorkforceAgent.workforce_id == workforce.id
+        )
         .first()
     )
     if worker is None:
         raise HTTPException(status_code=404, detail="Workforce worker not found")
+    worker_row = cast(Any, worker)
 
     if request.alias is not None:
-        worker.alias = normalize_text(request.alias, "alias")
+        worker_row.alias = normalize_text(request.alias, "alias")
     if request.assignment_instructions is not None:
-        worker.assignment_instructions = (
+        worker_row.assignment_instructions = (
             normalize_text(
                 request.assignment_instructions,
                 "assignment_instructions",
@@ -499,11 +541,11 @@ async def update_workforce_agent(
             or ""
         )
     if request.enabled is not None:
-        worker.enabled = bool(request.enabled)
+        worker_row.enabled = bool(request.enabled)
     if request.sort_order is not None:
-        worker.sort_order = request.sort_order
+        worker_row.sort_order = request.sort_order
     if request.canvas_position is not None:
-        worker.canvas_position = request.canvas_position
+        worker_row.canvas_position = request.canvas_position
 
     _ensure_can_activate(cast(str, workforce.status), workforce, [])
     db.commit()
@@ -522,7 +564,9 @@ async def remove_workforce_agent(
     workforce = ensure_workforce_access(db, user, workforce, action="edit")
     worker = (
         db.query(WorkforceAgent)
-        .filter(WorkforceAgent.id == member_id, WorkforceAgent.workforce_id == workforce.id)
+        .filter(
+            WorkforceAgent.id == member_id, WorkforceAgent.workforce_id == workforce.id
+        )
         .first()
     )
     if worker is None:
@@ -561,7 +605,9 @@ async def create_workforce_run(
         description=message,
         status=TaskStatus.PENDING,
         agent_id=workforce.manager_agent_id,
-        agent_config=build_workforce_task_config(snapshot, selected_file_ids=request.files),
+        agent_config=build_workforce_task_config(
+            snapshot, selected_file_ids=request.files
+        ),
         execution_mode=request.execution_mode
         or workforce.manager_agent.execution_mode
         or "balanced",
@@ -578,11 +624,12 @@ async def create_workforce_run(
     )
     db.add(workforce_run)
     db.flush()
+    workforce_run_id = cast(int, workforce_run.id)
 
     task.agent_config = build_workforce_task_config(
         snapshot,
         selected_file_ids=request.files,
-        workforce_run_id=cast(int, workforce_run.id),
+        workforce_run_id=workforce_run_id,
     )
     get_workforce_policy().after_workforce_run_created(
         db,
@@ -625,7 +672,9 @@ async def propose_workforce_changes(
             status="message",
         )
     )
-    assistant_message, patch = await generate_builder_patch(db, user, workforce, user_message)
+    assistant_message, patch = await generate_builder_patch(
+        db, user, workforce, user_message
+    )
     assistant_row = WorkforceBuilderMessage(
         workforce_id=workforce.id,
         user_id=user.id,
@@ -641,7 +690,7 @@ async def propose_workforce_changes(
     return {
         "message_id": assistant_row.id,
         "assistant_message": assistant_row.content,
-        "proposed_patch": assistant_row.proposed_patch,
+        "proposed_patch": cast(dict[str, Any], assistant_row.proposed_patch),
         "requires_confirmation": True,
     }
 
@@ -668,9 +717,13 @@ async def apply_workforce_changes(
     if message.role != "assistant":
         raise HTTPException(status_code=400, detail="Builder message is not applicable")
     if message.status != "proposed" or not isinstance(message.proposed_patch, dict):
-        raise HTTPException(status_code=400, detail="Builder message has no pending patch")
+        raise HTTPException(
+            status_code=400, detail="Builder message has no pending patch"
+        )
     if request.proposed_patch != message.proposed_patch:
-        raise HTTPException(status_code=400, detail="Proposed patch does not match message")
+        raise HTTPException(
+            status_code=400, detail="Proposed patch does not match message"
+        )
 
     workforce = apply_builder_patch(db, user, workforce, request.proposed_patch)
     message.status = "applied"
@@ -693,7 +746,9 @@ async def get_workforce_canvas(
 ) -> dict[str, Any]:
     workforce = db.query(Workforce).filter(Workforce.id == workforce_id).first()
     workforce = ensure_workforce_access(db, user, workforce, action="view")
-    workers = sorted(workforce.workers, key=lambda item: (item.sort_order or 0, item.id or 0))
+    workers = sorted(
+        workforce.workers, key=lambda item: (item.sort_order or 0, item.id or 0)
+    )
 
     nodes = [
         {"id": "human", "type": "human", "label": "Human"},

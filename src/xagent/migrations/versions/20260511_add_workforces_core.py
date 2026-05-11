@@ -8,7 +8,6 @@ Create Date: 2026-05-11
 from collections.abc import Sequence
 
 import sqlalchemy as sa
-
 from alembic import op
 
 revision: str = "20260511_add_workforces_core"
@@ -40,18 +39,33 @@ def upgrade() -> None:
             sa.Column("manager_instructions", sa.Text(), nullable=True),
             sa.Column("status", sa.String(length=20), nullable=False),
             sa.Column("canvas_layout", sa.JSON(), nullable=True),
-            sa.Column("created_at", sa.DateTime(timezone=True), server_default=sa.func.now()),
-            sa.Column("updated_at", sa.DateTime(timezone=True), server_default=sa.func.now()),
-            sa.ForeignKeyConstraint(["manager_agent_id"], ["agents.id"], ondelete="RESTRICT"),
-            sa.ForeignKeyConstraint(["owner_user_id"], ["users.id"], ondelete="CASCADE"),
+            sa.Column(
+                "created_at", sa.DateTime(timezone=True), server_default=sa.func.now()
+            ),
+            sa.Column(
+                "updated_at", sa.DateTime(timezone=True), server_default=sa.func.now()
+            ),
+            sa.ForeignKeyConstraint(
+                ["manager_agent_id"], ["agents.id"], ondelete="RESTRICT"
+            ),
+            sa.ForeignKeyConstraint(
+                ["owner_user_id"], ["users.id"], ondelete="CASCADE"
+            ),
             sa.PrimaryKeyConstraint("id"),
-            sa.UniqueConstraint("scope_type", "scope_id", "name", name="uq_workforce_scope_name"),
+            sa.UniqueConstraint(
+                "scope_type", "scope_id", "name", name="uq_workforce_scope_name"
+            ),
         )
         op.create_index(op.f("ix_workforces_id"), "workforces", ["id"], unique=False)
         op.create_index(
-            op.f("ix_workforces_owner_user_id"), "workforces", ["owner_user_id"], unique=False
+            op.f("ix_workforces_owner_user_id"),
+            "workforces",
+            ["owner_user_id"],
+            unique=False,
         )
-        op.create_index(op.f("ix_workforces_scope_id"), "workforces", ["scope_id"], unique=False)
+        op.create_index(
+            op.f("ix_workforces_scope_id"), "workforces", ["scope_id"], unique=False
+        )
         op.create_index(
             op.f("ix_workforces_scope_type"), "workforces", ["scope_type"], unique=False
         )
@@ -61,7 +75,9 @@ def upgrade() -> None:
             ["manager_agent_id"],
             unique=False,
         )
-        op.create_index(op.f("ix_workforces_status"), "workforces", ["status"], unique=False)
+        op.create_index(
+            op.f("ix_workforces_status"), "workforces", ["status"], unique=False
+        )
 
     if not _table_exists(inspector, "workforce_agents"):
         op.create_table(
@@ -76,14 +92,22 @@ def upgrade() -> None:
             sa.Column("enabled", sa.Boolean(), nullable=False),
             sa.Column("sort_order", sa.Integer(), nullable=False),
             sa.Column("canvas_position", sa.JSON(), nullable=True),
-            sa.Column("created_at", sa.DateTime(timezone=True), server_default=sa.func.now()),
-            sa.Column("updated_at", sa.DateTime(timezone=True), server_default=sa.func.now()),
+            sa.Column(
+                "created_at", sa.DateTime(timezone=True), server_default=sa.func.now()
+            ),
+            sa.Column(
+                "updated_at", sa.DateTime(timezone=True), server_default=sa.func.now()
+            ),
             sa.ForeignKeyConstraint(["agent_id"], ["agents.id"], ondelete="RESTRICT"),
-            sa.ForeignKeyConstraint(["workforce_id"], ["workforces.id"], ondelete="CASCADE"),
+            sa.ForeignKeyConstraint(
+                ["workforce_id"], ["workforces.id"], ondelete="CASCADE"
+            ),
             sa.PrimaryKeyConstraint("id"),
             sa.UniqueConstraint("workforce_id", "agent_id", name="uq_workforce_agent"),
         )
-        op.create_index(op.f("ix_workforce_agents_id"), "workforce_agents", ["id"], unique=False)
+        op.create_index(
+            op.f("ix_workforce_agents_id"), "workforce_agents", ["id"], unique=False
+        )
         op.create_index(
             op.f("ix_workforce_agents_workforce_id"),
             "workforce_agents",
@@ -106,15 +130,21 @@ def upgrade() -> None:
             sa.Column("user_id", sa.Integer(), nullable=False),
             sa.Column("status", sa.String(length=20), nullable=False),
             sa.Column("snapshot", sa.JSON(), nullable=False),
-            sa.Column("created_at", sa.DateTime(timezone=True), server_default=sa.func.now()),
+            sa.Column(
+                "created_at", sa.DateTime(timezone=True), server_default=sa.func.now()
+            ),
             sa.Column("completed_at", sa.DateTime(timezone=True), nullable=True),
             sa.ForeignKeyConstraint(["task_id"], ["tasks.id"], ondelete="SET NULL"),
             sa.ForeignKeyConstraint(["user_id"], ["users.id"], ondelete="CASCADE"),
-            sa.ForeignKeyConstraint(["workforce_id"], ["workforces.id"], ondelete="CASCADE"),
+            sa.ForeignKeyConstraint(
+                ["workforce_id"], ["workforces.id"], ondelete="CASCADE"
+            ),
             sa.PrimaryKeyConstraint("id"),
             sa.UniqueConstraint("task_id"),
         )
-        op.create_index(op.f("ix_workforce_runs_id"), "workforce_runs", ["id"], unique=False)
+        op.create_index(
+            op.f("ix_workforce_runs_id"), "workforce_runs", ["id"], unique=False
+        )
         op.create_index(
             op.f("ix_workforce_runs_workforce_id"),
             "workforce_runs",
@@ -122,7 +152,10 @@ def upgrade() -> None:
             unique=False,
         )
         op.create_index(
-            op.f("ix_workforce_runs_user_id"), "workforce_runs", ["user_id"], unique=False
+            op.f("ix_workforce_runs_user_id"),
+            "workforce_runs",
+            ["user_id"],
+            unique=False,
         )
         op.create_index(
             op.f("ix_workforce_runs_status"), "workforce_runs", ["status"], unique=False
@@ -138,9 +171,13 @@ def upgrade() -> None:
             sa.Column("content", sa.Text(), nullable=False),
             sa.Column("proposed_patch", sa.JSON(), nullable=True),
             sa.Column("status", sa.String(length=20), nullable=False),
-            sa.Column("created_at", sa.DateTime(timezone=True), server_default=sa.func.now()),
+            sa.Column(
+                "created_at", sa.DateTime(timezone=True), server_default=sa.func.now()
+            ),
             sa.ForeignKeyConstraint(["user_id"], ["users.id"], ondelete="CASCADE"),
-            sa.ForeignKeyConstraint(["workforce_id"], ["workforces.id"], ondelete="CASCADE"),
+            sa.ForeignKeyConstraint(
+                ["workforce_id"], ["workforces.id"], ondelete="CASCADE"
+            ),
             sa.PrimaryKeyConstraint("id"),
         )
         op.create_index(
@@ -187,12 +224,16 @@ def downgrade() -> None:
     if _table_exists(inspector, "workforce_runs"):
         op.drop_index(op.f("ix_workforce_runs_status"), table_name="workforce_runs")
         op.drop_index(op.f("ix_workforce_runs_user_id"), table_name="workforce_runs")
-        op.drop_index(op.f("ix_workforce_runs_workforce_id"), table_name="workforce_runs")
+        op.drop_index(
+            op.f("ix_workforce_runs_workforce_id"), table_name="workforce_runs"
+        )
         op.drop_index(op.f("ix_workforce_runs_id"), table_name="workforce_runs")
         op.drop_table("workforce_runs")
 
     if _table_exists(inspector, "workforce_agents"):
-        op.drop_index(op.f("ix_workforce_agents_agent_id"), table_name="workforce_agents")
+        op.drop_index(
+            op.f("ix_workforce_agents_agent_id"), table_name="workforce_agents"
+        )
         op.drop_index(
             op.f("ix_workforce_agents_workforce_id"),
             table_name="workforce_agents",

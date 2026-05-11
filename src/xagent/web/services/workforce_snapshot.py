@@ -3,6 +3,7 @@ from typing import Any, cast
 
 from fastapi import HTTPException
 from sqlalchemy.orm import Session
+
 from xagent.web.models.agent import Agent
 from xagent.web.models.user import User
 
@@ -19,7 +20,9 @@ def normalize_workforce_status(status: str | None) -> str:
     return normalized
 
 
-def normalize_text(value: str | None, field_name: str, required: bool = False) -> str | None:
+def normalize_text(
+    value: str | None, field_name: str, required: bool = False
+) -> str | None:
     if value is None:
         if required:
             raise HTTPException(status_code=400, detail=f"{field_name} is required")
@@ -37,7 +40,9 @@ def slugify_name(value: str | None, fallback: str = "worker") -> str:
 
 
 def _sorted_workers(workforce: Workforce) -> list[WorkforceAgent]:
-    return sorted(workforce.workers, key=lambda item: (item.sort_order or 0, item.id or 0))
+    return sorted(
+        workforce.workers, key=lambda item: (item.sort_order or 0, item.id or 0)
+    )
 
 
 def validate_workforce_for_run(
@@ -65,9 +70,13 @@ def validate_workforce_for_run(
             required=True,
         )
         if instructions is None:
-            raise HTTPException(status_code=400, detail="assignment_instructions is required")
+            raise HTTPException(
+                status_code=400, detail="assignment_instructions is required"
+            )
         if int(worker.agent_id) == int(workforce.manager_agent_id):
-            raise HTTPException(status_code=400, detail="Manager agent cannot also be a worker")
+            raise HTTPException(
+                status_code=400, detail="Manager agent cannot also be a worker"
+            )
 
     return manager_agent, enabled_workers
 
@@ -96,11 +105,15 @@ def build_manager_system_prompt(snapshot: dict[str, Any]) -> str:
 
     manager_instructions = snapshot.get("manager", {}).get("workforce_instructions")
     if manager_instructions:
-        lines.extend(["", "Workforce-specific manager instructions:", manager_instructions])
+        lines.extend(
+            ["", "Workforce-specific manager instructions:", manager_instructions]
+        )
     return "\n".join(lines)
 
 
-def build_worker_system_prompt(workforce_name: str, assignment_instructions: str) -> str:
+def build_worker_system_prompt(
+    workforce_name: str, assignment_instructions: str
+) -> str:
     return "\n".join(
         [
             f'You are being called as part of Workforce "{workforce_name}".',
@@ -142,18 +155,24 @@ def build_agent_tool_overrides(
     return overrides
 
 
-def build_workforce_snapshot(db: Session, user: User, workforce: Workforce) -> dict[str, Any]:
+def build_workforce_snapshot(
+    db: Session, user: User, workforce: Workforce
+) -> dict[str, Any]:
     manager_agent, enabled_workers = validate_workforce_for_run(db, user, workforce)
     snapshot_workers: list[dict[str, Any]] = []
     for worker in enabled_workers:
-        alias = normalize_text(cast(str | None, worker.alias), "alias") or worker.agent.name
+        alias = (
+            normalize_text(cast(str | None, worker.alias), "alias") or worker.agent.name
+        )
         assignment_instructions = normalize_text(
             cast(str | None, worker.assignment_instructions),
             "assignment_instructions",
             required=True,
         )
         if assignment_instructions is None:
-            raise HTTPException(status_code=400, detail="assignment_instructions is required")
+            raise HTTPException(
+                status_code=400, detail="assignment_instructions is required"
+            )
 
         snapshot_workers.append(
             {

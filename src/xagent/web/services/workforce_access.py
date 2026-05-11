@@ -3,6 +3,7 @@ from typing import Any
 
 from fastapi import HTTPException
 from sqlalchemy.orm import Session
+
 from xagent.web.models.agent import Agent, AgentStatus
 from xagent.web.models.user import User
 
@@ -44,7 +45,9 @@ class WorkforcePolicy:
         del db, user, purpose
         return None
 
-    def before_workforce_run(self, db: Session, user: User, workforce: Workforce) -> None:
+    def before_workforce_run(
+        self, db: Session, user: User, workforce: Workforce
+    ) -> None:
         del db, user, workforce
 
     def after_workforce_run_created(

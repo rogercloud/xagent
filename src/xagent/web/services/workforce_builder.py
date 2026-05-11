@@ -6,6 +6,7 @@ from typing import Any, cast
 
 from fastapi import HTTPException
 from sqlalchemy.orm import Session
+
 from xagent.web.models.agent import Agent
 from xagent.web.models.user import User
 from xagent.web.services.llm_utils import UserAwareModelStorage
@@ -46,7 +47,9 @@ def serialize_builder_message(message: WorkforceBuilderMessage) -> dict[str, Any
     }
 
 
-def list_builder_messages(db: Session, workforce_id: int) -> list[WorkforceBuilderMessage]:
+def list_builder_messages(
+    db: Session, workforce_id: int
+) -> list[WorkforceBuilderMessage]:
     return (
         db.query(WorkforceBuilderMessage)
         .filter(WorkforceBuilderMessage.workforce_id == workforce_id)
@@ -56,7 +59,9 @@ def list_builder_messages(db: Session, workforce_id: int) -> list[WorkforceBuild
 
 
 def _serialize_workers_for_prompt(workforce: Workforce) -> list[dict[str, Any]]:
-    workers = sorted(workforce.workers, key=lambda item: (item.sort_order or 0, item.id or 0))
+    workers = sorted(
+        workforce.workers, key=lambda item: (item.sort_order or 0, item.id or 0)
+    )
     return [
         {
             "member_id": worker.id,
@@ -79,7 +84,9 @@ def _make_builder_context(workforce: Workforce) -> dict[str, Any]:
             "description": workforce.description,
             "status": workforce.status,
             "manager_agent_id": workforce.manager_agent_id,
-            "manager_agent_name": workforce.manager_agent.name if workforce.manager_agent else None,
+            "manager_agent_name": workforce.manager_agent.name
+            if workforce.manager_agent
+            else None,
             "manager_instructions": workforce.manager_instructions,
         },
         "workers": _serialize_workers_for_prompt(workforce),
@@ -87,7 +94,9 @@ def _make_builder_context(workforce: Workforce) -> dict[str, Any]:
 
 
 def _clean_patch(candidate: dict[str, Any]) -> dict[str, Any]:
-    summary = str(candidate.get("summary") or "").strip() or "Update workforce configuration."
+    summary = (
+        str(candidate.get("summary") or "").strip() or "Update workforce configuration."
+    )
     warnings = candidate.get("warnings")
     if not isinstance(warnings, list):
         warnings = []
@@ -170,12 +179,16 @@ def _fallback_patch_from_message(workforce: Workforce, message: str) -> dict[str
         operations.append(
             {
                 "op": "update_workforce",
-                "fields": {"manager_instructions": manager_instructions_match.group(2).strip()},
+                "fields": {
+                    "manager_instructions": manager_instructions_match.group(2).strip()
+                },
             }
         )
         summary_parts.append("Update manager instructions")
 
-    remove_match = re.search(r"\bremove\b\s+([a-zA-Z0-9 _-]+)", text, flags=re.IGNORECASE)
+    remove_match = re.search(
+        r"\bremove\b\s+([a-zA-Z0-9 _-]+)", text, flags=re.IGNORECASE
+    )
     if remove_match:
         raw_target = remove_match.group(1).strip().rstrip(".")
         matched_worker = _find_worker_by_name(workforce, raw_target)
@@ -212,7 +225,11 @@ def _fallback_patch_from_message(workforce: Workforce, message: str) -> dict[str
                 f'Update worker "{matched_worker.alias or matched_worker.agent.name}"'
             )
 
-    if "add" in lower and "worker" in lower and ("template" in lower or "based on" in lower):
+    if (
+        "add" in lower
+        and "worker" in lower
+        and ("template" in lower or "based on" in lower)
+    ):
         template = _find_template_candidate_for_message(text)
         instructions = _extract_assignment_instructions(text)
         if template is not None and instructions:
@@ -227,7 +244,11 @@ def _fallback_patch_from_message(workforce: Workforce, message: str) -> dict[str
             )
             summary_parts.append(f'Add worker from template "{template["name"]}"')
 
-    if "add" in lower and "worker" in lower and ("new agent" in lower or "create agent" in lower):
+    if (
+        "add" in lower
+        and "worker" in lower
+        and ("new agent" in lower or "create agent" in lower)
+    ):
         instructions = _extract_assignment_instructions(text)
         agent_name = _extract_new_agent_name(text)
         if agent_name and instructions:
@@ -303,16 +324,21 @@ def _find_worker_by_name(workforce: Workforce, raw_name: str) -> WorkforceAgent 
     return None
 
 
-def _find_agent_candidate_for_message(workforce: Workforce, message: str) -> Agent | None:
+def _find_agent_candidate_for_message(
+    workforce: Workforce, message: str
+) -> Agent | None:
     lower = message.lower()
     owner_id = workforce.owner_user_id
     db = workforce._sa_instance_state.session
     if db is None:
         return None
-    agents = db.query(Agent).filter(Agent.user_id == owner_id).order_by(Agent.id.asc()).all()
+    agents = (
+        db.query(Agent).filter(Agent.user_id == owner_id).order_by(Agent.id.asc()).all()
+    )
     existing_agent_ids = {worker.agent_id for worker in workforce.workers}
     manager_id = workforce.manager_agent_id
-    for agent in agents:
+    for raw_agent in agents:
+        agent = cast(Agent, raw_agent)
         if agent.id in existing_agent_ids or agent.id == manager_id:
             continue
         if agent.name.lower() in lower:
@@ -445,7 +471,9 @@ async def generate_builder_patch(
     if normalized_message is None:
         raise HTTPException(status_code=400, detail="message is required")
 
-    fallback_patch = _clean_patch(_fallback_patch_from_message(workforce, normalized_message))
+    fallback_patch = _clean_patch(
+        _fallback_patch_from_message(workforce, normalized_message)
+    )
     if _has_meaningful_operations(fallback_patch):
         return (
             f"I prepared {len(fallback_patch['operations'])} change(s) using rule-based parsing.",
@@ -467,7 +495,10 @@ async def generate_builder_patch(
     )
 
 
-def _apply_update_workforce(workforce: Workforce, operation: dict[str, Any], db: Session) -> None:
+def _apply_update_workforce(
+    workforce: Workforce, operation: dict[str, Any], db: Session
+) -> None:
+    workforce_row = cast(Any, workforce)
     fields = operation.get("fields")
     if not isinstance(fields, dict):
         return
@@ -485,17 +516,21 @@ def _apply_update_workforce(workforce: Workforce, operation: dict[str, Any], db:
                 .first()
             )
             if duplicate:
-                raise HTTPException(status_code=409, detail="Workforce name already exists")
-            workforce.name = name
+                raise HTTPException(
+                    status_code=409, detail="Workforce name already exists"
+                )
+            workforce_row.name = name
     if "description" in fields:
-        workforce.description = normalize_text(fields.get("description"), "description")
+        workforce_row.description = normalize_text(
+            fields.get("description"), "description"
+        )
     if "manager_instructions" in fields:
-        workforce.manager_instructions = normalize_text(
+        workforce_row.manager_instructions = normalize_text(
             fields.get("manager_instructions"),
             "manager_instructions",
         )
     if "status" in fields:
-        workforce.status = normalize_workforce_status(fields.get("status"))
+        workforce_row.status = normalize_workforce_status(fields.get("status"))
 
 
 def _apply_add_existing_worker(
@@ -506,15 +541,20 @@ def _apply_add_existing_worker(
 ) -> None:
     agent_id = operation.get("agent_id")
     if not isinstance(agent_id, int):
-        raise HTTPException(status_code=400, detail="agent_id is required for add_existing_worker")
+        raise HTTPException(
+            status_code=400, detail="agent_id is required for add_existing_worker"
+        )
 
     agent = ensure_agent_access(
         db.query(Agent).filter(Agent.id == agent_id).first(),
         user,
         db,
     )
-    if agent.id == workforce.manager_agent_id:
-        raise HTTPException(status_code=400, detail="Manager agent cannot also be a worker")
+    agent_id_value = cast(int, agent.id)
+    if agent_id_value == cast(int, workforce.manager_agent_id):
+        raise HTTPException(
+            status_code=400, detail="Manager agent cannot also be a worker"
+        )
     existing = (
         db.query(WorkforceAgent)
         .filter(
@@ -532,7 +572,9 @@ def _apply_add_existing_worker(
         required=True,
     )
     if assignment_instructions is None:
-        raise HTTPException(status_code=400, detail="assignment_instructions is required")
+        raise HTTPException(
+            status_code=400, detail="assignment_instructions is required"
+        )
 
     create_workforce_worker(
         db,
@@ -541,7 +583,7 @@ def _apply_add_existing_worker(
         source_type="existing",
         assignment_instructions=assignment_instructions,
         alias=operation.get("alias"),
-        agent_id=agent.id,
+        agent_id=agent_id_value,
         enabled=bool(operation.get("enabled", True)),
         sort_order=operation.get("sort_order")
         if isinstance(operation.get("sort_order"), int)
@@ -558,7 +600,8 @@ def _apply_add_worker_from_template(
     template_id = operation.get("template_id")
     if not isinstance(template_id, str) or not template_id.strip():
         raise HTTPException(
-            status_code=400, detail="template_id is required for add_worker_from_template"
+            status_code=400,
+            detail="template_id is required for add_worker_from_template",
         )
 
     assignment_instructions = normalize_text(
@@ -567,7 +610,9 @@ def _apply_add_worker_from_template(
         required=True,
     )
     if assignment_instructions is None:
-        raise HTTPException(status_code=400, detail="assignment_instructions is required")
+        raise HTTPException(
+            status_code=400, detail="assignment_instructions is required"
+        )
 
     create_workforce_worker(
         db,
@@ -592,7 +637,9 @@ def _apply_create_worker_agent(
 ) -> None:
     agent_payload = operation.get("agent")
     if not isinstance(agent_payload, dict):
-        raise HTTPException(status_code=400, detail="agent is required for create_worker_agent")
+        raise HTTPException(
+            status_code=400, detail="agent is required for create_worker_agent"
+        )
 
     assignment_instructions = normalize_text(
         operation.get("assignment_instructions"),
@@ -600,7 +647,9 @@ def _apply_create_worker_agent(
         required=True,
     )
     if assignment_instructions is None:
-        raise HTTPException(status_code=400, detail="assignment_instructions is required")
+        raise HTTPException(
+            status_code=400, detail="assignment_instructions is required"
+        )
 
     create_workforce_worker(
         db,
@@ -617,10 +666,14 @@ def _apply_create_worker_agent(
     )
 
 
-def _apply_update_worker(workforce: Workforce, operation: dict[str, Any], db: Session) -> None:
+def _apply_update_worker(
+    workforce: Workforce, operation: dict[str, Any], db: Session
+) -> None:
     member_id = operation.get("member_id")
     if not isinstance(member_id, int):
-        raise HTTPException(status_code=400, detail="member_id is required for update_worker")
+        raise HTTPException(
+            status_code=400, detail="member_id is required for update_worker"
+        )
     worker = (
         db.query(WorkforceAgent)
         .filter(
@@ -631,9 +684,10 @@ def _apply_update_worker(workforce: Workforce, operation: dict[str, Any], db: Se
     )
     if worker is None:
         raise HTTPException(status_code=404, detail="Workforce worker not found")
+    worker_row = cast(Any, worker)
 
     if "alias" in operation:
-        worker.alias = normalize_text(operation.get("alias"), "alias")
+        worker_row.alias = normalize_text(operation.get("alias"), "alias")
     if "assignment_instructions" in operation:
         assignment_instructions = normalize_text(
             operation.get("assignment_instructions"),
@@ -641,18 +695,24 @@ def _apply_update_worker(workforce: Workforce, operation: dict[str, Any], db: Se
             required=True,
         )
         if assignment_instructions is None:
-            raise HTTPException(status_code=400, detail="assignment_instructions is required")
-        worker.assignment_instructions = assignment_instructions
+            raise HTTPException(
+                status_code=400, detail="assignment_instructions is required"
+            )
+        worker_row.assignment_instructions = assignment_instructions
     if "enabled" in operation:
-        worker.enabled = bool(operation.get("enabled"))
+        worker_row.enabled = bool(operation.get("enabled"))
     if "sort_order" in operation and isinstance(operation.get("sort_order"), int):
-        worker.sort_order = int(operation["sort_order"])
+        worker_row.sort_order = int(operation["sort_order"])
 
 
-def _apply_remove_worker(workforce: Workforce, operation: dict[str, Any], db: Session) -> None:
+def _apply_remove_worker(
+    workforce: Workforce, operation: dict[str, Any], db: Session
+) -> None:
     member_id = operation.get("member_id")
     if not isinstance(member_id, int):
-        raise HTTPException(status_code=400, detail="member_id is required for remove_worker")
+        raise HTTPException(
+            status_code=400, detail="member_id is required for remove_worker"
+        )
     worker = (
         db.query(WorkforceAgent)
         .filter(
@@ -692,7 +752,9 @@ def apply_builder_patch(
         elif op_name == "remove_worker":
             _apply_remove_worker(workforce, operation, db)
         else:
-            raise HTTPException(status_code=400, detail=f"Unsupported builder operation: {op_name}")
+            raise HTTPException(
+                status_code=400, detail=f"Unsupported builder operation: {op_name}"
+            )
 
     db.flush()
     if workforce.status == "active":

@@ -3,6 +3,7 @@ from typing import Any, cast
 
 from fastapi import HTTPException
 from sqlalchemy.orm import Session
+
 from xagent.templates.utils import create_template_manager
 from xagent.web.models.agent import Agent, AgentStatus
 from xagent.web.models.user import User
@@ -46,7 +47,9 @@ def _resolve_unique_agent_name(db: Session, user: User, name: str) -> str:
         raise HTTPException(status_code=400, detail="name is required")
 
     existing = (
-        db.query(Agent).filter(Agent.user_id == user.id, Agent.name == normalized_name).first()
+        db.query(Agent)
+        .filter(Agent.user_id == user.id, Agent.name == normalized_name)
+        .first()
     )
     if existing is None:
         return normalized_name
@@ -57,7 +60,11 @@ def _resolve_unique_agent_name(db: Session, user: User, name: str) -> str:
         suffix_text = f" {suffix}"
         candidate_base = base_name[: max(1, 200 - len(suffix_text))].rstrip()
         candidate = f"{candidate_base}{suffix_text}"
-        conflict = db.query(Agent).filter(Agent.user_id == user.id, Agent.name == candidate).first()
+        conflict = (
+            db.query(Agent)
+            .filter(Agent.user_id == user.id, Agent.name == candidate)
+            .first()
+        )
         if conflict is None:
             return candidate
         suffix += 1
@@ -86,10 +93,14 @@ def create_agent_record(
         final_name = _resolve_unique_agent_name(db, user, normalized_name)
     else:
         existing = (
-            db.query(Agent).filter(Agent.user_id == user.id, Agent.name == normalized_name).first()
+            db.query(Agent)
+            .filter(Agent.user_id == user.id, Agent.name == normalized_name)
+            .first()
         )
         if existing:
-            raise HTTPException(status_code=409, detail="Agent with this name already exists")
+            raise HTTPException(
+                status_code=409, detail="Agent with this name already exists"
+            )
         final_name = normalized_name
 
     agent = Agent(
@@ -139,7 +150,9 @@ def list_template_summaries() -> list[dict[str, Any]]:
         enriched = _TEMPLATE_MANAGER._enrich_template(template)
         descriptions = enriched.get("descriptions") or {}
         if isinstance(descriptions, dict):
-            description = descriptions.get("en") or next(iter(descriptions.values()), None)
+            description = descriptions.get("en") or next(
+                iter(descriptions.values()), None
+            )
         else:
             description = descriptions
         results.append(
@@ -182,7 +195,11 @@ def next_worker_sort_order(db: Session, workforce_id: int) -> int:
         .order_by(WorkforceAgent.sort_order.desc(), WorkforceAgent.id.desc())
         .first()
     )
-    return int(max_sort_order[0]) + 1 if max_sort_order and max_sort_order[0] is not None else 1
+    return (
+        int(max_sort_order[0]) + 1
+        if max_sort_order and max_sort_order[0] is not None
+        else 1
+    )
 
 
 def create_workforce_worker(
@@ -208,7 +225,9 @@ def create_workforce_worker(
         required=True,
     )
     if normalized_assignment is None:
-        raise HTTPException(status_code=400, detail="assignment_instructions is required")
+        raise HTTPException(
+            status_code=400, detail="assignment_instructions is required"
+        )
 
     if source_type == "existing":
         if agent_id is None:
@@ -227,14 +246,18 @@ def create_workforce_worker(
             .first()
         )
         if existing:
-            raise HTTPException(status_code=409, detail="Agent already added to workforce")
+            raise HTTPException(
+                status_code=409, detail="Agent already added to workforce"
+            )
     elif source_type == "template":
         if not template_id:
             raise HTTPException(status_code=400, detail="template_id is required")
         agent = create_agent_from_template(db, user, template_id)
     else:
         if not isinstance(agent_payload, dict):
-            raise HTTPException(status_code=400, detail="agent is required for source_type='new'")
+            raise HTTPException(
+                status_code=400, detail="agent is required for source_type='new'"
+            )
         agent = create_agent_record(
             db,
             user,
@@ -253,7 +276,9 @@ def create_workforce_worker(
     agent_id_value = cast(int, agent.id)
     workforce_manager_id = cast(int, workforce.manager_agent_id)
     if agent_id_value == workforce_manager_id:
-        raise HTTPException(status_code=400, detail="Manager agent cannot also be a worker")
+        raise HTTPException(
+            status_code=400, detail="Manager agent cannot also be a worker"
+        )
 
     workforce_id = cast(int, workforce.id)
     worker = WorkforceAgent(

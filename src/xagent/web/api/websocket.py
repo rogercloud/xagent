@@ -446,7 +446,9 @@ def _infer_owner_from_relative_path(
     return None
 
 
-def _map_link_token_to_file_id(token: str, path_to_file_id: dict[str, str]) -> str | None:
+def _map_link_token_to_file_id(
+    token: str, path_to_file_id: dict[str, str]
+) -> str | None:
     raw = token.strip()
     if not raw:
         return None
@@ -481,7 +483,9 @@ def _map_link_token_to_file_id(token: str, path_to_file_id: dict[str, str]) -> s
     return None
 
 
-def _rewrite_file_links_to_file_id(output_text: Any, path_to_file_id: dict[str, str]) -> Any:
+def _rewrite_file_links_to_file_id(
+    output_text: Any, path_to_file_id: dict[str, str]
+) -> Any:
     if not isinstance(output_text, str) or not output_text:
         return output_text
 
@@ -603,14 +607,20 @@ def _normalize_file_outputs(
 
         resolved_path, relative_path = resolved_info
         normalized_relative_path = relative_path.lstrip("/")
-        expected_file_id = item_file_id or _build_output_file_id(normalized_relative_path)
+        expected_file_id = item_file_id or _build_output_file_id(
+            normalized_relative_path
+        )
 
         file_record = (
-            db.query(UploadedFile).filter(UploadedFile.storage_path == str(resolved_path)).first()
+            db.query(UploadedFile)
+            .filter(UploadedFile.storage_path == str(resolved_path))
+            .first()
         )
         if file_record is None and item_file_id:
             file_record = (
-                db.query(UploadedFile).filter(UploadedFile.file_id == item_file_id).first()
+                db.query(UploadedFile)
+                .filter(UploadedFile.file_id == item_file_id)
+                .first()
             )
 
         if file_record is None:
@@ -660,7 +670,8 @@ def _rewrite_links_in_payload(payload: Any, path_to_file_id: dict[str, str]) -> 
         return [_rewrite_links_in_payload(item, path_to_file_id) for item in payload]
     if isinstance(payload, dict):
         return {
-            key: _rewrite_links_in_payload(value, path_to_file_id) for key, value in payload.items()
+            key: _rewrite_links_in_payload(value, path_to_file_id)
+            for key, value in payload.items()
         }
     return payload
 
@@ -732,7 +743,9 @@ async def execute_task_background(
         # Get AI response
         chat_response = result.get("chat_response")
         if isinstance(chat_response, dict):
-            ai_response = chat_response.get("message") or result.get("output", "Task completed")
+            ai_response = chat_response.get("message") or result.get(
+                "output", "Task completed"
+            )
         else:
             ai_response = result.get("output", "Task completed")
 
@@ -852,7 +865,9 @@ async def execute_task_background(
                 "output": ai_response,
                 "file_outputs": normalized_outputs,
                 "success": result.get("success", False),
-                "chat_response": chat_response if isinstance(chat_response, dict) else None,
+                "chat_response": chat_response
+                if isinstance(chat_response, dict)
+                else None,
                 "timestamp": datetime.now(timezone.utc).timestamp(),
             },
             task_id,
@@ -961,7 +976,9 @@ async def execute_continuation_background(
                         task_updated.status = TaskStatus.FAILED
                     sync_workforce_run_status(db_new, task_updated, task_updated.status)
                     db_new.commit()
-                    logger.info(f"Updated task {task_id} status to {task_updated.status.value}")
+                    logger.info(
+                        f"Updated task {task_id} status to {task_updated.status.value}"
+                    )
                 else:
                     logger.info(f"Task {task_id} is paused, not updating status")
 
@@ -992,7 +1009,9 @@ async def execute_continuation_background(
                 "result": ai_response,
                 "output": ai_response,
                 "success": result.get("success", False),
-                "chat_response": chat_response if isinstance(chat_response, dict) else None,
+                "chat_response": chat_response
+                if isinstance(chat_response, dict)
+                else None,
                 "timestamp": datetime.now(timezone.utc).timestamp(),
             },
             task_id,
@@ -1000,7 +1019,9 @@ async def execute_continuation_background(
         logger.info(f"Background continuation for task {task_id} completed")
 
     except Exception as e:
-        logger.error(f"Background continuation for task {task_id} failed: {e}", exc_info=True)
+        logger.error(
+            f"Background continuation for task {task_id} failed: {e}", exc_info=True
+        )
         # Send error event
         try:
             await manager.broadcast_to_task(
@@ -1204,12 +1225,16 @@ class BackgroundTaskManager:
             if current_task is not None and old_task is current_task:
                 return
             if not old_task.done():
-                logger.info(f"Waiting for previous background task {task_id} to complete...")
+                logger.info(
+                    f"Waiting for previous background task {task_id} to complete..."
+                )
                 try:
                     await old_task
                     logger.info(f"Previous background task {task_id} completed")
                 except Exception as e:
-                    logger.warning(f"Previous background task {task_id} ended with error: {e}")
+                    logger.warning(
+                        f"Previous background task {task_id} ended with error: {e}"
+                    )
 
     def register_task(self, task_id: int, task: asyncio.Task) -> None:
         """Register new background task"""
@@ -1236,11 +1261,17 @@ class BackgroundTaskManager:
             except asyncio.CancelledError:
                 logger.info(f"Cancelled background task for task {task_id}")
             except asyncio.TimeoutError:
-                logger.info(f"Cancellation timeout for task {task_id}; continuing cleanup")
+                logger.info(
+                    f"Cancellation timeout for task {task_id}; continuing cleanup"
+                )
             except RuntimeError as e:
-                logger.warning(f"Background task {task_id} cancellation runtime warning: {e}")
+                logger.warning(
+                    f"Background task {task_id} cancellation runtime warning: {e}"
+                )
             except Exception as e:
-                logger.warning(f"Background task {task_id} raised during cancellation: {e}")
+                logger.warning(
+                    f"Background task {task_id} raised during cancellation: {e}"
+                )
 
         self.running_tasks.pop(task_id, None)
 
@@ -1267,7 +1298,9 @@ class SharedWebSocketTracer(TraceHandler):
             if not isinstance(value, str):
                 return value
             cleaned = value.replace("\x00", "").replace("\u0000", "")
-            cleaned = "".join(char for char in cleaned if ord(char) >= 32 or char in "\n\r\t")
+            cleaned = "".join(
+                char for char in cleaned if ord(char) >= 32 or char in "\n\r\t"
+            )
             return cleaned
 
         def serialize_value(value: Any) -> Any:
@@ -1334,7 +1367,10 @@ class SharedWebSocketTracer(TraceHandler):
 
         except (RuntimeError, ConnectionError) as e:
             error_msg = str(e)
-            if "close" in error_msg.lower() or "response already completed" in error_msg.lower():
+            if (
+                "close" in error_msg.lower()
+                or "response already completed" in error_msg.lower()
+            ):
                 self._closed = True
                 logger.debug(f"WebSocket connection closed: {e}")
             else:
@@ -1358,7 +1394,9 @@ async def redirect_legacy_preview(
 
     resolved_path, relative_path = resolved_info
     file_record = (
-        db.query(UploadedFile).filter(UploadedFile.storage_path == str(resolved_path)).first()
+        db.query(UploadedFile)
+        .filter(UploadedFile.storage_path == str(resolved_path))
+        .first()
     )
 
     if file_record is None:
@@ -1409,7 +1447,9 @@ class ConnectionManager:
             except ValueError:
                 pass
 
-    def move_connection(self, websocket: WebSocket, old_task_id: int, new_task_id: int) -> None:
+    def move_connection(
+        self, websocket: WebSocket, old_task_id: int, new_task_id: int
+    ) -> None:
         """Move a WebSocket connection from one task_id to another"""
         if old_task_id in self.active_connections:
             try:
@@ -1422,7 +1462,9 @@ class ConnectionManager:
         if new_task_id not in self.active_connections:
             self.active_connections[new_task_id] = []
         self.active_connections[new_task_id].append(websocket)
-        logger.info(f"Moved WebSocket connection from task {old_task_id} to {new_task_id}")
+        logger.info(
+            f"Moved WebSocket connection from task {old_task_id} to {new_task_id}"
+        )
 
     async def send_personal_message(self, message: dict, websocket: WebSocket) -> None:
         await websocket.send_text(json.dumps(message))
@@ -1438,7 +1480,9 @@ class ConnectionManager:
                     self.disconnect(connection, task_id)
                 except Exception as e:
                     # Other errors should not be silently handled, log and re-raise
-                    logger.error(f"Unexpected error broadcasting to task {task_id}: {e}")
+                    logger.error(
+                        f"Unexpected error broadcasting to task {task_id}: {e}"
+                    )
                     # Remove disconnected connection but preserve error propagation
                     self.disconnect(connection, task_id)
                     raise
@@ -1464,7 +1508,9 @@ async def handle_file_upload_for_task(
         logger.info(f"📁 Starting file upload for task {task_id}, files: {len(files)}")
 
         # Get agent
-        agent_service = await get_agent_manager().get_agent_for_task(task_id, db, user=user)
+        agent_service = await get_agent_manager().get_agent_for_task(
+            task_id, db, user=user
+        )
         logger.info(f"🤖 Got agent service for task {task_id}")
 
         for file_info in files:
@@ -1473,7 +1519,9 @@ async def handle_file_upload_for_task(
                 logger.warning(f"No file_id provided in file info: {file_info}")
                 continue
 
-            file_record = db.query(UploadedFile).filter(UploadedFile.file_id == file_id).first()
+            file_record = (
+                db.query(UploadedFile).filter(UploadedFile.file_id == file_id).first()
+            )
             if not file_record:
                 logger.warning(f"File record not found for file_id: {file_id}")
                 continue
@@ -1572,7 +1620,9 @@ async def get_authenticated_user(
         return None
 
 
-async def handle_chat_message(websocket: WebSocket, task_id: int, message_data: dict) -> None:
+async def handle_chat_message(
+    websocket: WebSocket, task_id: int, message_data: dict
+) -> None:
     """Handle chat message"""
     try:
         user_message = message_data.get("message", "")
@@ -1619,7 +1669,9 @@ async def handle_chat_message(websocket: WebSocket, task_id: int, message_data: 
                     task = db.query(Task).filter(Task.id == task_id).first()
                 else:
                     task = (
-                        db.query(Task).filter(Task.id == task_id, Task.user_id == user.id).first()
+                        db.query(Task)
+                        .filter(Task.id == task_id, Task.user_id == user.id)
+                        .first()
                     )
 
                 if not task:
@@ -1630,7 +1682,9 @@ async def handle_chat_message(websocket: WebSocket, task_id: int, message_data: 
                         logger.warning(
                             f"User {user.id} attempted to access task {task_id} belonging to user {existing_task.user_id}"
                         )
-                        raise ValueError(f"Access denied: Task {task_id} does not belong to you")
+                        raise ValueError(
+                            f"Access denied: Task {task_id} does not belong to you"
+                        )
                     else:
                         # Task doesn't exist (may have been deleted), create new task
                         # This is a fresh start, don't use continuation logic
@@ -1684,7 +1738,11 @@ async def handle_chat_message(websocket: WebSocket, task_id: int, message_data: 
                         if task.agent_id:
                             from ..models.agent import Agent
 
-                            agent = db.query(Agent).filter(Agent.id == task.agent_id).first()
+                            agent = (
+                                db.query(Agent)
+                                .filter(Agent.id == task.agent_id)
+                                .first()
+                            )
                             if agent:
                                 is_dag = agent.execution_mode == "think"
 
@@ -1732,7 +1790,9 @@ async def handle_chat_message(websocket: WebSocket, task_id: int, message_data: 
                 uploaded_files_context = ""
                 if files:
                     # Process file upload
-                    upload_result = await handle_file_upload_for_task(task_id, files, db, user)
+                    upload_result = await handle_file_upload_for_task(
+                        task_id, files, db, user
+                    )
                     uploaded_file_paths = upload_result.get("uploaded_files", [])
                     file_info_list = upload_result.get("file_info_list", [])
 
@@ -1748,14 +1808,21 @@ async def handle_chat_message(websocket: WebSocket, task_id: int, message_data: 
                         if task.agent_id:
                             from ..models.agent import Agent
 
-                            agent_record = db.query(Agent).filter(Agent.id == task.agent_id).first()
+                            agent_record = (
+                                db.query(Agent)
+                                .filter(Agent.id == task.agent_id)
+                                .first()
+                            )
                             if agent_record and agent_record.skills:
                                 if isinstance(agent_record.skills, list):
                                     is_agent_builder = any(
-                                        s == "agent-builder" for s in agent_record.skills
+                                        s == "agent-builder"
+                                        for s in agent_record.skills
                                     )
                                 elif isinstance(agent_record.skills, str):
-                                    is_agent_builder = "agent-builder" in agent_record.skills
+                                    is_agent_builder = (
+                                        "agent-builder" in agent_record.skills
+                                    )
 
                         uploaded_files_context = _build_uploaded_files_context(
                             file_info_list,
@@ -1784,7 +1851,9 @@ async def handle_chat_message(websocket: WebSocket, task_id: int, message_data: 
 
                         existing_prompt = context.get("system_prompt")
                         if existing_prompt:
-                            context["system_prompt"] = f"{existing_prompt}\n\n{file_prompt}"
+                            context["system_prompt"] = (
+                                f"{existing_prompt}\n\n{file_prompt}"
+                            )
                         else:
                             context["system_prompt"] = file_prompt
 
@@ -1838,7 +1907,9 @@ async def handle_chat_message(websocket: WebSocket, task_id: int, message_data: 
                     assert dag_pattern is not None  # for mypy type checking
 
                     # Immediately send trace_user_message to display user message on interface
-                    if hasattr(dag_pattern, "tracer") and hasattr(dag_pattern, "task_id"):
+                    if hasattr(dag_pattern, "tracer") and hasattr(
+                        dag_pattern, "task_id"
+                    ):
                         from ...core.agent.trace import trace_user_message
 
                         trace_data = {
@@ -1963,10 +2034,16 @@ async def handle_chat_message(websocket: WebSocket, task_id: int, message_data: 
                             before_message_id=int(persisted_user_message.id),
                         )
                         agent_service.set_conversation_history(conversation_history)
-                    recovery_state = await load_task_execution_recovery_state(db, task_id)
+                    recovery_state = await load_task_execution_recovery_state(
+                        db, task_id
+                    )
                     execution_context_messages = recovery_state.get("messages", [])
-                    agent_service.set_execution_context_messages(execution_context_messages)
-                    agent_service.set_recovered_skill_context(recovery_state.get("skill_context"))
+                    agent_service.set_execution_context_messages(
+                        execution_context_messages
+                    )
+                    agent_service.set_recovered_skill_context(
+                        recovery_state.get("skill_context")
+                    )
 
                     # IMPORTANT: Check if task was completed/failed BEFORE updating status
                     # This is needed to force fresh execution instead of continuation
@@ -1992,7 +2069,11 @@ async def handle_chat_message(websocket: WebSocket, task_id: int, message_data: 
                         if task.agent_id:
                             from ..models.agent import Agent
 
-                            agent = db.query(Agent).filter(Agent.id == task.agent_id).first()
+                            agent = (
+                                db.query(Agent)
+                                .filter(Agent.id == task.agent_id)
+                                .first()
+                            )
                             if agent:
                                 is_dag = agent.execution_mode == "think"
 
@@ -2037,7 +2118,10 @@ async def handle_chat_message(websocket: WebSocket, task_id: int, message_data: 
                     # Build context with vibe mode information if available
                     if hasattr(task, "execution_mode") and task.execution_mode:
                         context["execution_mode"] = task.execution_mode
-                    if hasattr(task, "process_description") and task.process_description:
+                    if (
+                        hasattr(task, "process_description")
+                        and task.process_description
+                    ):
                         context["process_description"] = task.process_description
                     if hasattr(task, "examples") and task.examples:
                         context["examples"] = task.examples
@@ -2115,7 +2199,9 @@ async def handle_chat_message(websocket: WebSocket, task_id: int, message_data: 
         raise
 
 
-async def handle_execute_task(websocket: WebSocket, task_id: int, message_data: dict) -> None:
+async def handle_execute_task(
+    websocket: WebSocket, task_id: int, message_data: dict
+) -> None:
     """Handle task execution request"""
     try:
         user = message_data.get("user")
@@ -2148,7 +2234,11 @@ async def handle_execute_task(websocket: WebSocket, task_id: int, message_data: 
             if user.is_admin:
                 task = db.query(Task).filter(Task.id == task_id).first()
             else:
-                task = db.query(Task).filter(Task.id == task_id, Task.user_id == user.id).first()
+                task = (
+                    db.query(Task)
+                    .filter(Task.id == task_id, Task.user_id == user.id)
+                    .first()
+                )
             if not task:
                 raise Exception(f"Task {task_id} not found or access denied")
 
@@ -2204,8 +2294,12 @@ async def handle_execute_task(websocket: WebSocket, task_id: int, message_data: 
                     make_agent_v2_outbound_handler(task_id)
                 )
             recovery_state = await load_task_execution_recovery_state(db, task_id)
-            agent_service.set_execution_context_messages(recovery_state.get("messages", []))
-            agent_service.set_recovered_skill_context(recovery_state.get("skill_context"))
+            agent_service.set_execution_context_messages(
+                recovery_state.get("messages", [])
+            )
+            agent_service.set_recovered_skill_context(
+                recovery_state.get("skill_context")
+            )
 
             # Set up user context
             with UserContext(user.id):
@@ -2314,7 +2408,9 @@ async def handle_execute_task(websocket: WebSocket, task_id: int, message_data: 
         raise
 
 
-async def send_historical_data_as_stream(websocket: WebSocket, task_id: int, user: User) -> None:
+async def send_historical_data_as_stream(
+    websocket: WebSocket, task_id: int, user: User
+) -> None:
     """Send historical data as stream messages - using unified trace event format"""
     try:
         # Load historical data directly from database
@@ -2654,15 +2750,21 @@ async def send_historical_data_as_stream(websocket: WebSocket, task_id: int, use
 
         except (ValueError, KeyError, TypeError) as e:
             # Data format error
-            logger.error(f"Data format error loading historical data for task {task_id}: {e}")
+            logger.error(
+                f"Data format error loading historical data for task {task_id}: {e}"
+            )
             raise
         except RuntimeError as e:
             # Runtime error
-            logger.error(f"Runtime error loading historical data for task {task_id}: {e}")
+            logger.error(
+                f"Runtime error loading historical data for task {task_id}: {e}"
+            )
             raise
         except Exception as e:
             # Other unknown errors, re-raise
-            logger.error(f"Unexpected error loading historical data for task {task_id}: {e}")
+            logger.error(
+                f"Unexpected error loading historical data for task {task_id}: {e}"
+            )
             raise
         finally:
             db.close()
@@ -2757,7 +2859,9 @@ async def websocket_chat_endpoint(
         raise
 
 
-async def handle_intervention(websocket: WebSocket, task_id: int, message_data: dict) -> None:
+async def handle_intervention(
+    websocket: WebSocket, task_id: int, message_data: dict
+) -> None:
     """Handle manual intervention"""
     try:
         intervention_data = {
@@ -2772,7 +2876,9 @@ async def handle_intervention(websocket: WebSocket, task_id: int, message_data: 
                 "type": "intervention_processed",
                 "message": f"Manual intervention processed: {intervention_data['action']}",
                 "intervention_id": intervention_data["step_id"],
-                "timestamp": datetime.now(timezone.utc).isoformat(),  # Send UTC timestamp directly
+                "timestamp": datetime.now(
+                    timezone.utc
+                ).isoformat(),  # Send UTC timestamp directly
             },
             task_id,
         )
@@ -2795,7 +2901,9 @@ async def handle_intervention(websocket: WebSocket, task_id: int, message_data: 
         raise
 
 
-async def handle_pause_task(websocket: WebSocket, task_id: int, message_data: dict) -> None:
+async def handle_pause_task(
+    websocket: WebSocket, task_id: int, message_data: dict
+) -> None:
     """Handle task pause request"""
     try:
         logger.info(f"🔘 handle_pause_task called for task {task_id}")
@@ -2816,7 +2924,9 @@ async def handle_pause_task(websocket: WebSocket, task_id: int, message_data: di
         from .chat import get_agent_manager
 
         logger.info(f"Getting agent service for task {task_id}")
-        agent_service = await get_agent_manager().get_agent_for_task(task_id, db, user=user)
+        agent_service = await get_agent_manager().get_agent_for_task(
+            task_id, db, user=user
+        )
         logger.info(f"Agent service obtained: {type(agent_service).__name__}")
 
         # Check if agent supports pause functionality
@@ -2856,7 +2966,9 @@ async def handle_pause_task(websocket: WebSocket, task_id: int, message_data: di
                     db_update.commit()
                     logger.info(f"Updated task {task_id} status to PAUSED in database")
                 else:
-                    logger.warning(f"Task {task_id} not found or access denied for user {user.id}")
+                    logger.warning(
+                        f"Task {task_id} not found or access denied for user {user.id}"
+                    )
             finally:
                 db_update.close()
 
@@ -2880,7 +2992,9 @@ async def handle_pause_task(websocket: WebSocket, task_id: int, message_data: di
                 },
                 websocket,
             )
-            logger.warning(f"Agent for task {task_id} does not support pause functionality")
+            logger.warning(
+                f"Agent for task {task_id} does not support pause functionality"
+            )
 
     except (ValueError, KeyError, TypeError) as e:
         # Data validation error
@@ -2900,7 +3014,9 @@ async def handle_pause_task(websocket: WebSocket, task_id: int, message_data: di
         raise
 
 
-async def handle_resume_task(websocket: WebSocket, task_id: int, message_data: dict) -> None:
+async def handle_resume_task(
+    websocket: WebSocket, task_id: int, message_data: dict
+) -> None:
     """Handle task resume request"""
     try:
         user = message_data.get("user")
@@ -2996,7 +3112,9 @@ async def handle_resume_task(websocket: WebSocket, task_id: int, message_data: d
                     db_update.commit()
                     logger.info(f"Updated task {task_id} status to RUNNING in database")
                 else:
-                    logger.warning(f"Task {task_id} not found or access denied for user {user.id}")
+                    logger.warning(
+                        f"Task {task_id} not found or access denied for user {user.id}"
+                    )
             finally:
                 db_update.close()
 
@@ -3020,7 +3138,9 @@ async def handle_resume_task(websocket: WebSocket, task_id: int, message_data: d
                 },
                 websocket,
             )
-            logger.warning(f"Agent for task {task_id} does not support resume functionality")
+            logger.warning(
+                f"Agent for task {task_id} does not support resume functionality"
+            )
 
     except (ValueError, KeyError, TypeError) as e:
         # Data validation error
@@ -3118,7 +3238,9 @@ async def handle_builder_chat(
 
     builder_tracer = create_ephemeral_tracer(
         task_id=builder_task_id,
-        websocket_handler=SharedWebSocketTracer(websocket, builder_task_id, is_preview=False),
+        websocket_handler=SharedWebSocketTracer(
+            websocket, builder_task_id, is_preview=False
+        ),
         user=user,
         is_preview=False,
     )
@@ -3233,14 +3355,18 @@ If the user wants to add skills, tool categories, or knowledge bases but you are
             )
 
         if not llm:
-            default_llm, fast_llm, vision_llm, compact_llm = resolver.get_configured_defaults(
-                user_id=user.id  # type: ignore[arg-type]
+            default_llm, fast_llm, vision_llm, compact_llm = (
+                resolver.get_configured_defaults(
+                    user_id=user.id  # type: ignore[arg-type]
+                )
             )
             llm = default_llm
 
         if not llm:
             await websocket.send_text(
-                json.dumps({"type": "error", "message": "No LLM configured for builder chat"})
+                json.dumps(
+                    {"type": "error", "message": "No LLM configured for builder chat"}
+                )
             )
             return
 
@@ -3333,7 +3459,9 @@ If the user wants to add skills, tool categories, or knowledge bases but you are
 
             # Save agent service to websocket state for reuse
             websocket.state.builder_agent_service = agent_service
-            logger.info(f"Created new builder chat agent service with task_id: {builder_task_id}")
+            logger.info(
+                f"Created new builder chat agent service with task_id: {builder_task_id}"
+            )
         else:
             agent_service = websocket.state.builder_agent_service
             # Update tracer to the new connection
@@ -3343,7 +3471,9 @@ If the user wants to add skills, tool categories, or knowledge bases but you are
                 websocket.state.builder_chat_history = []
             if not hasattr(websocket.state, "builder_memory"):
                 websocket.state.builder_memory = InMemoryMemoryStore()
-            if hasattr(agent_service, "agent") and hasattr(agent_service.agent, "patterns"):
+            if hasattr(agent_service, "agent") and hasattr(
+                agent_service.agent, "patterns"
+            ):
                 for pattern in agent_service.agent.patterns:
                     if hasattr(pattern, "tracer"):
                         pattern.tracer = builder_tracer
@@ -3362,7 +3492,9 @@ If the user wants to add skills, tool categories, or knowledge bases but you are
             if hasattr(websocket.state, "builder_chat_history") and hasattr(
                 agent_service, "set_conversation_history"
             ):
-                agent_service.set_conversation_history(websocket.state.builder_chat_history)
+                agent_service.set_conversation_history(
+                    websocket.state.builder_chat_history
+                )
 
             # Execute task with the agent
             with UserContext(int(user.id)):
@@ -3407,7 +3539,9 @@ If the user wants to add skills, tool categories, or knowledge bases but you are
                         )
                         output_content = f"```json\n{structured_content}\n```"
                     except Exception as e:
-                        logger.warning(f"Failed to serialize chat_response for history: {e}")
+                        logger.warning(
+                            f"Failed to serialize chat_response for history: {e}"
+                        )
 
                 if output_content:
                     websocket.state.builder_chat_history.append(
@@ -3423,7 +3557,9 @@ If the user wants to add skills, tool categories, or knowledge bases but you are
                     )
 
                 # Keep history size manageable (e.g. last 20 messages)
-                websocket.state.builder_chat_history = websocket.state.builder_chat_history[-20:]
+                websocket.state.builder_chat_history = (
+                    websocket.state.builder_chat_history[-20:]
+                )
 
             # Send task_completed event to match the preview flow behavior
             # which relies on Trace events but might need a final completion indicator
@@ -3432,7 +3568,9 @@ If the user wants to add skills, tool categories, or knowledge bases but you are
                 # so the frontend can receive the structured data instead of trying to parse markdown
                 task_completion_result = {"content": result.get("output", "")}
                 if result.get("chat_response"):
-                    task_completion_result["chat_response"] = result.get("chat_response")
+                    task_completion_result["chat_response"] = result.get(
+                        "chat_response"
+                    )
 
                 await websocket.send_text(
                     json.dumps(
@@ -3497,7 +3635,9 @@ async def websocket_build_preview_endpoint(
                     hasattr(websocket.state, "preview_agent_service")
                     and websocket.state.preview_agent_service
                 ):
-                    if hasattr(websocket.state.preview_agent_service, "pause_execution"):
+                    if hasattr(
+                        websocket.state.preview_agent_service, "pause_execution"
+                    ):
                         await websocket.state.preview_agent_service.pause_execution()
                         await websocket.send_text(
                             json.dumps(
@@ -3522,7 +3662,9 @@ async def websocket_build_preview_endpoint(
                     hasattr(websocket.state, "preview_agent_service")
                     and websocket.state.preview_agent_service
                 ):
-                    if hasattr(websocket.state.preview_agent_service, "resume_execution"):
+                    if hasattr(
+                        websocket.state.preview_agent_service, "resume_execution"
+                    ):
                         await websocket.state.preview_agent_service.resume_execution()
                         await websocket.send_text(
                             json.dumps(
@@ -3615,7 +3757,9 @@ async def handle_build_preview_execution(
 
     preview_tracer = create_ephemeral_tracer(
         task_id=preview_task_id,
-        websocket_handler=SharedWebSocketTracer(websocket, preview_task_id, is_preview=True),
+        websocket_handler=SharedWebSocketTracer(
+            websocket, preview_task_id, is_preview=True
+        ),
         user=user,
         is_preview=True,
     )
@@ -3636,7 +3780,9 @@ async def handle_build_preview_execution(
 
             if models_config.get("general"):
                 general_model = (
-                    db.query(DBModel).filter(DBModel.id == models_config["general"]).first()
+                    db.query(DBModel)
+                    .filter(DBModel.id == models_config["general"])
+                    .first()
                 )
                 if general_model:
                     default_llm = storage.get_llm_by_name_with_access(
@@ -3645,7 +3791,9 @@ async def handle_build_preview_execution(
 
             if models_config.get("small_fast"):
                 fast_model = (
-                    db.query(DBModel).filter(DBModel.id == models_config["small_fast"]).first()
+                    db.query(DBModel)
+                    .filter(DBModel.id == models_config["small_fast"])
+                    .first()
                 )
                 if fast_model:
                     fast_llm = storage.get_llm_by_name_with_access(
@@ -3654,7 +3802,9 @@ async def handle_build_preview_execution(
 
             if models_config.get("visual"):
                 visual_model = (
-                    db.query(DBModel).filter(DBModel.id == models_config["visual"]).first()
+                    db.query(DBModel)
+                    .filter(DBModel.id == models_config["visual"])
+                    .first()
                 )
                 if visual_model:
                     vision_llm = storage.get_llm_by_name_with_access(
@@ -3663,7 +3813,9 @@ async def handle_build_preview_execution(
 
             if models_config.get("compact"):
                 compact_model = (
-                    db.query(DBModel).filter(DBModel.id == models_config["compact"]).first()
+                    db.query(DBModel)
+                    .filter(DBModel.id == models_config["compact"])
+                    .first()
                 )
                 if compact_model:
                     compact_llm = storage.get_llm_by_name_with_access(
@@ -3695,7 +3847,9 @@ async def handle_build_preview_execution(
         if sandbox_manager:
             user_id = int(user.id)
             try:
-                sandbox = await sandbox_manager.get_or_create_sandbox("user", str(user_id))
+                sandbox = await sandbox_manager.get_or_create_sandbox(
+                    "user", str(user_id)
+                )
             except Exception as e:
                 logger.error(f"Failed to create sandbox for user {user_id}: {e}")
 
@@ -3706,7 +3860,9 @@ async def handle_build_preview_execution(
             # Get all tools and filter by category using metadata
             from ...core.tools.adapters.vibe.factory import ToolFactory
 
-            has_mcp = bool(tool_categories and any(tc.startswith("mcp:") for tc in tool_categories))
+            has_mcp = bool(
+                tool_categories and any(tc.startswith("mcp:") for tc in tool_categories)
+            )
             temp_config = WebToolConfig(
                 db=db,
                 request=MinimalRequest(int(user.id)),
@@ -3727,7 +3883,8 @@ async def handle_build_preview_execution(
 
                 # Check if we also need custom APIs
                 has_custom_api = bool(
-                    tool_categories and any(tc.startswith("mcp:") for tc in tool_categories)
+                    tool_categories
+                    and any(tc.startswith("mcp:") for tc in tool_categories)
                 )
                 if has_custom_api:
                     # Manually add custom APIs since temp_config might not load them properly
@@ -3752,13 +3909,17 @@ async def handle_build_preview_execution(
                             for tc in tool_categories:
                                 if tc.startswith("mcp:"):
                                     server_name = (
-                                        tc.split(":", 1)[1].replace(" ", "_").replace("-", "_")
+                                        tc.split(":", 1)[1]
+                                        .replace(" ", "_")
+                                        .replace("-", "_")
                                     )
                                     logger.info(
                                         f"Checking MCP tool: '{tool_name}' vs 'mcp_{server_name}_'"
                                     )
                                     # Use case-insensitive matching for MCP server prefix
-                                    if tool_name.lower().startswith(f"mcp_{server_name.lower()}_"):
+                                    if tool_name.lower().startswith(
+                                        f"mcp_{server_name.lower()}_"
+                                    ):
                                         allowed_tools.append(tool_name)
                                         break
                         elif category == "other":
@@ -3766,13 +3927,18 @@ async def handle_build_preview_execution(
                             for tc in tool_categories:
                                 if tc.startswith("mcp:"):
                                     server_name = (
-                                        tc.split(":", 1)[1].replace(" ", "_").replace("-", "_")
+                                        tc.split(":", 1)[1]
+                                        .replace(" ", "_")
+                                        .replace("-", "_")
                                     )
                                     logger.info(
                                         f"Checking Custom API tool: '{tool_name}' vs 'api_{server_name}_call'"
                                     )
                                     # Custom APIs are now prefixed with api_ and suffixed with _call
-                                    if tool_name.lower() == f"api_{server_name.lower()}_call":
+                                    if (
+                                        tool_name.lower()
+                                        == f"api_{server_name.lower()}_call"
+                                    ):
                                         allowed_tools.append(tool_name)
                                         break
 
@@ -3787,7 +3953,9 @@ async def handle_build_preview_execution(
             llm=default_llm,
             user_id=int(user.id),
             is_admin=bool(user.is_admin),
-            allowed_collections=knowledge_bases if knowledge_bases is not None else None,
+            allowed_collections=knowledge_bases
+            if knowledge_bases is not None
+            else None,
             allowed_skills=skills if skills is not None else None,
             allowed_tools=allowed_tools,
             task_id=preview_task_id,
@@ -3805,7 +3973,9 @@ async def handle_build_preview_execution(
             from ..models.agent import Agent as AgentModel
             from ..models.agent import AgentStatus
 
-            preview_agent = db.query(AgentModel).filter(AgentModel.id == preview_agent_id).first()
+            preview_agent = (
+                db.query(AgentModel).filter(AgentModel.id == preview_agent_id).first()
+            )
             if preview_agent and preview_agent.status == AgentStatus.PUBLISHED:
                 tool_config._excluded_agent_id = int(preview_agent.id)
                 logger.info(
@@ -3876,11 +4046,15 @@ async def handle_build_preview_execution(
                 for file_info in files_data:
                     file_id = file_info.get("file_id")
                     if not file_id:
-                        logger.warning(f"No file_id provided in preview file info: {file_info}")
+                        logger.warning(
+                            f"No file_id provided in preview file info: {file_info}"
+                        )
                         continue
 
                     file_record = (
-                        db.query(UploadedFile).filter(UploadedFile.file_id == file_id).first()
+                        db.query(UploadedFile)
+                        .filter(UploadedFile.file_id == file_id)
+                        .first()
                     )
                     if not file_record:
                         logger.warning(f"File record not found for file_id: {file_id}")
@@ -3932,7 +4106,9 @@ async def handle_build_preview_execution(
                         )
 
                     except Exception as e:
-                        logger.error(f"Error handling file {file_info.get('name')}: {e}")
+                        logger.error(
+                            f"Error handling file {file_info.get('name')}: {e}"
+                        )
                         continue
 
                 if file_info_list:
@@ -3947,11 +4123,15 @@ async def handle_build_preview_execution(
                         f"{file_summary}"
                     )
 
-                logger.info(f"🎉 File upload completed, uploaded {len(uploaded_files)} files")
+                logger.info(
+                    f"🎉 File upload completed, uploaded {len(uploaded_files)} files"
+                )
                 db.commit()
 
             except Exception as e:
-                logger.error(f"Error handling file upload for build preview: {e}", exc_info=True)
+                logger.error(
+                    f"Error handling file upload for build preview: {e}", exc_info=True
+                )
                 await websocket.send_text(
                     json.dumps(
                         {
@@ -3995,9 +4175,13 @@ async def handle_build_preview_execution(
             )
 
         # Append the new interaction to the history
-        websocket.state.preview_history.append({"role": "user", "content": user_message})
+        websocket.state.preview_history.append(
+            {"role": "user", "content": user_message}
+        )
         assistant_output = result.get("output", "")
-        websocket.state.preview_history.append({"role": "assistant", "content": assistant_output})
+        websocket.state.preview_history.append(
+            {"role": "assistant", "content": assistant_output}
+        )
 
         # Send preview completion event
         await websocket.send_text(

@@ -61,7 +61,9 @@ class CreateAgentToolResult(BaseModel):
 
     agent_id: int = Field(description="The ID of the created agent")
     agent_name: str = Field(description="The name of the created agent")
-    tool_name: str = Field(description="The tool name that can be used to call this agent")
+    tool_name: str = Field(
+        description="The tool name that can be used to call this agent"
+    )
     markdown_link: str = Field(
         description="Markdown link to the agent (e.g., '[Agent Name](agent://123)')"
     )
@@ -73,7 +75,9 @@ class UpdateAgentToolArgs(BaseModel):
     """Arguments for updating an existing agent."""
 
     agent_id: int = Field(description="ID of the agent to update")
-    name: str | None = Field(default=None, description="New name for the agent (optional)")
+    name: str | None = Field(
+        default=None, description="New name for the agent (optional)"
+    )
     description: str | None = Field(
         default=None,
         description="New description of when to use this agent (optional)",
@@ -114,7 +118,9 @@ class UpdateAgentToolResult(BaseModel):
 
     agent_id: int = Field(description="The ID of the updated agent")
     agent_name: str = Field(description="The name of the updated agent")
-    tool_name: str = Field(description="The tool name that can be used to call this agent")
+    tool_name: str = Field(
+        description="The tool name that can be used to call this agent"
+    )
     markdown_link: str = Field(
         description="Markdown link to the agent (e.g., '[Agent Name](agent://123)')"
     )
@@ -174,7 +180,9 @@ class AgentToolResult(BaseModel):
 
 
 class ListAvailableSkillsArgs(BaseModel):
-    query: str | None = Field(default=None, description="Optional search query to filter skills")
+    query: str | None = Field(
+        default=None, description="Optional search query to filter skills"
+    )
 
 
 class ListAvailableSkillsResult(BaseModel):
@@ -215,7 +223,9 @@ class ListAvailableSkillsTool(AbstractBaseTool):
     async def run_json_async(self, args: Mapping[str, Any]) -> Any:
         import os
 
-        skills_dir = os.path.join(os.path.dirname(__file__), "../../../../skills/builtin")
+        skills_dir = os.path.join(
+            os.path.dirname(__file__), "../../../../skills/builtin"
+        )
         available_skills = []
         if os.path.exists(skills_dir):
             for skill_dir in os.listdir(skills_dir):
@@ -324,7 +334,9 @@ class CreateAgentTool(AbstractBaseTool):
         # Get available skills (from builtin skills directory)
         import os
 
-        skills_dir = os.path.join(os.path.dirname(__file__), "../../../../skills/builtin")
+        skills_dir = os.path.join(
+            os.path.dirname(__file__), "../../../../skills/builtin"
+        )
         available_skills = []
         if os.path.exists(skills_dir):
             for skill_dir in os.listdir(skills_dir):
@@ -502,7 +514,9 @@ class CreateAgentTool(AbstractBaseTool):
                     models_config[default.config_type] = default.model_id
 
             missing_types = [
-                t for t in ["general", "small_fast", "visual", "compact"] if t not in models_config
+                t
+                for t in ["general", "small_fast", "visual", "compact"]
+                if t not in models_config
             ]
             if missing_types:
                 # Fill missing with visible users' shared defaults
@@ -519,7 +533,9 @@ class CreateAgentTool(AbstractBaseTool):
                 )
                 for admin_default in admin_defaults:
                     if admin_default.config_type not in models_config:
-                        models_config[admin_default.config_type] = admin_default.model_id
+                        models_config[admin_default.config_type] = (
+                            admin_default.model_id
+                        )
 
             execution_mode = args.get("execution_mode", "balanced")
             if execution_mode not in ["flash", "balanced", "think", "auto"]:
@@ -644,7 +660,9 @@ class UpdateAgentTool(AbstractBaseTool):
         # Get available skills (from builtin skills directory)
         import os
 
-        skills_dir = os.path.join(os.path.dirname(__file__), "../../../../skills/builtin")
+        skills_dir = os.path.join(
+            os.path.dirname(__file__), "../../../../skills/builtin"
+        )
         available_skills = []
         if os.path.exists(skills_dir):
             for skill_dir in os.listdir(skills_dir):
@@ -782,7 +800,9 @@ class UpdateAgentTool(AbstractBaseTool):
 
             # Update instructions if provided
             new_instructions = (
-                args.get("instructions", "").strip() if args.get("instructions") else None
+                args.get("instructions", "").strip()
+                if args.get("instructions")
+                else None
             )
             if new_instructions:
                 agent.instructions = new_instructions
@@ -1003,9 +1023,13 @@ class ListAgentsTool(AbstractBaseTool):
                 agent_infos.append(agent_info.model_dump())
 
             total_count = len(agent_infos)
-            filter_msg = f" (filtered by status: {status_filter})" if status_filter else ""
+            filter_msg = (
+                f" (filtered by status: {status_filter})" if status_filter else ""
+            )
 
-            logger.info(f"Listed {total_count} agents for user {self._user_id}{filter_msg}")
+            logger.info(
+                f"Listed {total_count} agents for user {self._user_id}{filter_msg}"
+            )
 
             return ListAgentsToolResult(
                 agents=agent_infos,
@@ -1085,7 +1109,10 @@ class AgentTool(AbstractBaseTool):
     @property
     def name(self) -> str:
         """Tool name."""
-        return self._tool_name or f"call_agent_{self._agent_name.lower().replace(' ', '_')}"
+        return (
+            self._tool_name
+            or f"call_agent_{self._agent_name.lower().replace(' ', '_')}"
+        )
 
     @property
     def description(self) -> str:
@@ -1238,7 +1265,9 @@ class AgentTool(AbstractBaseTool):
 
                 if agent.models.get("visual"):
                     visual_model = (
-                        self._db.query(DBModel).filter(DBModel.id == agent.models["visual"]).first()
+                        self._db.query(DBModel)
+                        .filter(DBModel.id == agent.models["visual"])
+                        .first()
                     )
                     if visual_model:
                         vision_llm = storage.get_llm_by_name_with_access(
@@ -1567,7 +1596,9 @@ async def create_agent_tools(config: "WebToolConfig") -> list[AbstractBaseTool]:
     delegate_agent_ids = config.get_delegate_agent_ids() if config else None
     if allowed_agent_ids is None and delegate_agent_ids:
         allowed_agent_ids = delegate_agent_ids
-    allow_cross_user_agent_ids = getattr(config, "get_allow_cross_user_agent_ids", lambda: False)()
+    allow_cross_user_agent_ids = getattr(
+        config, "get_allow_cross_user_agent_ids", lambda: False
+    )()
     if not config.get_enable_agent_tools() and not allowed_agent_ids:
         return []
 
@@ -1587,7 +1618,9 @@ async def create_agent_tools(config: "WebToolConfig") -> list[AbstractBaseTool]:
             excluded_agent_id=excluded_agent_id,
             include_draft=False,  # Only PUBLISHED agents
             allowed_agent_ids=allowed_agent_ids,
-            agent_tool_overrides=getattr(config, "get_agent_tool_overrides", lambda: {})(),
+            agent_tool_overrides=getattr(
+                config, "get_agent_tool_overrides", lambda: {}
+            )(),
             enable_global_agent_tools=config.get_enable_agent_tools(),
             allow_cross_user_agent_ids=allow_cross_user_agent_ids,
             parent_task_id=getattr(config, "get_parent_task_id", lambda: None)(),
@@ -1631,7 +1664,9 @@ async def create_create_agent_tool(config: "WebToolConfig") -> list[AbstractBase
             workspace_base_dir=None,
         )
 
-        logger.debug(f"Created CreateAgentTool and related list tools for user {user_id}")
+        logger.debug(
+            f"Created CreateAgentTool and related list tools for user {user_id}"
+        )
         return [tool, list_skills_tool, list_categories_tool]
     except Exception as e:
         logger.warning(f"Failed to create CreateAgentTool: {e}")

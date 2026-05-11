@@ -44,9 +44,13 @@ class AgentCreateRequest(BaseModel):
     models: dict | None = Field(
         None, description="Model config: {general, small_fast, visual, compact}"
     )
-    knowledge_bases: list[str] = Field(default_factory=list, description="Knowledge base names")
+    knowledge_bases: list[str] = Field(
+        default_factory=list, description="Knowledge base names"
+    )
     skills: list[str] = Field(default_factory=list, description="Skill names")
-    tool_categories: list[str] = Field(default_factory=list, description="Tool category names")
+    tool_categories: list[str] = Field(
+        default_factory=list, description="Tool category names"
+    )
     suggested_prompts: list[str] = Field(
         default_factory=list, description="Suggested prompt examples for users"
     )
@@ -162,7 +166,9 @@ def enhance_system_prompt_with_kb(
 # ===== Helper Functions =====
 
 
-def _validate_knowledge_base_tools(knowledge_bases: list[str], tool_categories: list[str]) -> None:
+def _validate_knowledge_base_tools(
+    knowledge_bases: list[str], tool_categories: list[str]
+) -> None:
     """Raise HTTPException if knowledge bases are selected without the knowledge tool category."""
     if knowledge_bases and KNOWLEDGE_TOOL_CATEGORY not in tool_categories:
         raise HTTPException(
@@ -282,7 +288,9 @@ async def optimize_instructions(
             llm = default_llm
 
         if not llm:
-            raise HTTPException(status_code=400, detail="No LLM available for optimization")
+            raise HTTPException(
+                status_code=400, detail="No LLM available for optimization"
+            )
 
         # Construct prompt
         system_prompt = (
@@ -292,9 +300,7 @@ async def optimize_instructions(
             "Do not include any conversational filler. Just output the optimized instructions."
         )
 
-        user_prompt = (
-            f"Draft instructions:\n{request.instructions}\n\nPlease optimize these instructions."
-        )
+        user_prompt = f"Draft instructions:\n{request.instructions}\n\nPlease optimize these instructions."
 
         # Call LLM
         response = await llm.chat(
@@ -331,9 +337,13 @@ async def create_agent(
             .first()
         )
         if existing:
-            raise HTTPException(status_code=400, detail="Agent with this name already exists")
+            raise HTTPException(
+                status_code=400, detail="Agent with this name already exists"
+            )
 
-        _validate_knowledge_base_tools(agent_data.knowledge_bases, agent_data.tool_categories)
+        _validate_knowledge_base_tools(
+            agent_data.knowledge_bases, agent_data.tool_categories
+        )
 
         # Create agent
         agent = Agent(
@@ -420,7 +430,9 @@ async def get_agent(
     """Get agent details."""
     try:
         agent = (
-            db.query(Agent).filter(Agent.id == agent_id, Agent.user_id == current_user.id).first()
+            db.query(Agent)
+            .filter(Agent.id == agent_id, Agent.user_id == current_user.id)
+            .first()
         )
 
         if not agent:
@@ -445,7 +457,9 @@ async def update_agent(
     """Update an existing agent."""
     try:
         agent = (
-            db.query(Agent).filter(Agent.id == agent_id, Agent.user_id == current_user.id).first()
+            db.query(Agent)
+            .filter(Agent.id == agent_id, Agent.user_id == current_user.id)
+            .first()
         )
 
         if not agent:
@@ -477,7 +491,9 @@ async def update_agent(
                 .first()
             )
             if existing:
-                raise HTTPException(status_code=400, detail="Agent with this name already exists")
+                raise HTTPException(
+                    status_code=400, detail="Agent with this name already exists"
+                )
             agent.name = agent_data.name  # type: ignore[assignment]
 
         if agent_data.description is not None:
@@ -534,7 +550,9 @@ async def delete_agent(
     """Delete an agent."""
     try:
         agent = (
-            db.query(Agent).filter(Agent.id == agent_id, Agent.user_id == current_user.id).first()
+            db.query(Agent)
+            .filter(Agent.id == agent_id, Agent.user_id == current_user.id)
+            .first()
         )
 
         if not agent:
@@ -598,7 +616,9 @@ async def publish_agent(
     """Publish an agent (make it publicly accessible)."""
     try:
         agent = (
-            db.query(Agent).filter(Agent.id == agent_id, Agent.user_id == current_user.id).first()
+            db.query(Agent)
+            .filter(Agent.id == agent_id, Agent.user_id == current_user.id)
+            .first()
         )
 
         if not agent:
@@ -637,7 +657,9 @@ async def unpublish_agent(
     """Unpublish an agent (revert to draft status)."""
     try:
         agent = (
-            db.query(Agent).filter(Agent.id == agent_id, Agent.user_id == current_user.id).first()
+            db.query(Agent)
+            .filter(Agent.id == agent_id, Agent.user_id == current_user.id)
+            .first()
         )
 
         if not agent:
@@ -677,7 +699,9 @@ async def upload_agent_logo(
     """Upload or update agent logo."""
     try:
         agent = (
-            db.query(Agent).filter(Agent.id == agent_id, Agent.user_id == current_user.id).first()
+            db.query(Agent)
+            .filter(Agent.id == agent_id, Agent.user_id == current_user.id)
+            .first()
         )
 
         if not agent:
@@ -719,9 +743,13 @@ class AgentPreviewRequest(BaseModel):
     models: dict | None = Field(
         None, description="Model config: {general, small_fast, visual, compact}"
     )
-    knowledge_bases: list[str] = Field(default_factory=list, description="Knowledge base names")
+    knowledge_bases: list[str] = Field(
+        default_factory=list, description="Knowledge base names"
+    )
     skills: list[str] = Field(default_factory=list, description="Skill names")
-    tool_categories: list[str] = Field(default_factory=list, description="Tool category names")
+    tool_categories: list[str] = Field(
+        default_factory=list, description="Tool category names"
+    )
     message: str = Field(..., description="User message to preview")
 
 
@@ -755,7 +783,9 @@ async def preview_agent(
 
             if model_config.get("general"):
                 general_model = (
-                    db.query(DBModel).filter(DBModel.id == model_config["general"]).first()
+                    db.query(DBModel)
+                    .filter(DBModel.id == model_config["general"])
+                    .first()
                 )
                 if general_model:
                     default_llm = storage.get_llm_by_name_with_access(
@@ -763,7 +793,9 @@ async def preview_agent(
                     )
             if model_config.get("small_fast"):
                 fast_model = (
-                    db.query(DBModel).filter(DBModel.id == model_config["small_fast"]).first()
+                    db.query(DBModel)
+                    .filter(DBModel.id == model_config["small_fast"])
+                    .first()
                 )
                 if fast_model:
                     fast_llm = storage.get_llm_by_name_with_access(
@@ -771,7 +803,9 @@ async def preview_agent(
                     )
             if model_config.get("visual"):
                 visual_model = (
-                    db.query(DBModel).filter(DBModel.id == model_config["visual"]).first()
+                    db.query(DBModel)
+                    .filter(DBModel.id == model_config["visual"])
+                    .first()
                 )
                 if visual_model:
                     vision_llm = storage.get_llm_by_name_with_access(
@@ -779,7 +813,9 @@ async def preview_agent(
                     )
             if model_config.get("compact"):
                 compact_model = (
-                    db.query(DBModel).filter(DBModel.id == model_config["compact"]).first()
+                    db.query(DBModel)
+                    .filter(DBModel.id == model_config["compact"])
+                    .first()
                 )
                 if compact_model:
                     compact_llm = storage.get_llm_by_name_with_access(
@@ -787,7 +823,9 @@ async def preview_agent(
                     )
 
         if not default_llm:
-            raise HTTPException(status_code=400, detail="General model is required for preview")
+            raise HTTPException(
+                status_code=400, detail="General model is required for preview"
+            )
 
         # Create tool config with allowed collections, skills, and tools
         # WebToolConfig expects db and request, pass a minimal dict-like request object

@@ -213,7 +213,9 @@ class ToolConfig(BaseToolConfig):
         tool_credentials = config_dict.get("tool_credentials", {})
         agent_tool_overrides = config_dict.get("agent_tool_overrides", {})
         enable_global_agent_tools = config_dict.get("enable_global_agent_tools", True)
-        allow_cross_user_agent_ids = config_dict.get("allow_cross_user_agent_ids", False)
+        allow_cross_user_agent_ids = config_dict.get(
+            "allow_cross_user_agent_ids", False
+        )
         parent_task_id = config_dict.get("parent_task_id")
         parent_tracer = config_dict.get("parent_tracer")
 
@@ -248,8 +250,12 @@ class ToolConfig(BaseToolConfig):
         self.image_models: dict[
             str, Any
         ] = {}  # Standalone usage typically doesn't have web context
-        self.asr_models: dict[str, Any] = {}  # Standalone usage typically doesn't have web context
-        self.tts_models: dict[str, Any] = {}  # Standalone usage typically doesn't have web context
+        self.asr_models: dict[
+            str, Any
+        ] = {}  # Standalone usage typically doesn't have web context
+        self.tts_models: dict[
+            str, Any
+        ] = {}  # Standalone usage typically doesn't have web context
         self.mcp_server_configs: list[dict[str, Any]] = mcp_server_configs
         self.file_tools_enabled: bool = bool(file_tools_enabled)
         self.basic_tools_enabled: bool = bool(basic_tools_enabled)

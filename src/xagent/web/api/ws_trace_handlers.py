@@ -18,7 +18,9 @@ from .websocket import create_stream_event, manager
 # Helper function to map new event types to old-style handling for compatibility
 def get_event_type_mapping(event: TraceEvent) -> str:
     """Map new trace event types to old-style string identifiers for compatibility."""
-    data_event_type = event.data.get("event_type") if isinstance(event.data, dict) else None
+    data_event_type = (
+        event.data.get("event_type") if isinstance(event.data, dict) else None
+    )
     if data_event_type in {
         "workforce_delegation_start",
         "workforce_delegation_end",
@@ -43,23 +45,47 @@ def get_event_type_mapping(event: TraceEvent) -> str:
         and category == TraceCategory.DAG_PLAN
     ):
         return "dag_plan_end"
-    elif scope == TraceScope.TASK and action == TraceAction.START and category == TraceCategory.DAG:
+    elif (
+        scope == TraceScope.TASK
+        and action == TraceAction.START
+        and category == TraceCategory.DAG
+    ):
         return "dag_execute_start"
     elif (
-        scope == TraceScope.TASK and action == TraceAction.UPDATE and category == TraceCategory.DAG
+        scope == TraceScope.TASK
+        and action == TraceAction.UPDATE
+        and category == TraceCategory.DAG
     ):
         return "dag_execution"
-    elif scope == TraceScope.TASK and action == TraceAction.END and category == TraceCategory.DAG:
+    elif (
+        scope == TraceScope.TASK
+        and action == TraceAction.END
+        and category == TraceCategory.DAG
+    ):
         return "dag_execute_end"
-    elif scope == TraceScope.STEP and action == TraceAction.START and category == TraceCategory.DAG:
+    elif (
+        scope == TraceScope.STEP
+        and action == TraceAction.START
+        and category == TraceCategory.DAG
+    ):
         return "dag_step_start"
-    elif scope == TraceScope.STEP and action == TraceAction.END and category == TraceCategory.DAG:
+    elif (
+        scope == TraceScope.STEP
+        and action == TraceAction.END
+        and category == TraceCategory.DAG
+    ):
         return "dag_step_end"
     elif (
-        scope == TraceScope.ACTION and action == TraceAction.START and category == TraceCategory.LLM
+        scope == TraceScope.ACTION
+        and action == TraceAction.START
+        and category == TraceCategory.LLM
     ):
         return "llm_call_start"
-    elif scope == TraceScope.ACTION and action == TraceAction.END and category == TraceCategory.LLM:
+    elif (
+        scope == TraceScope.ACTION
+        and action == TraceAction.END
+        and category == TraceCategory.LLM
+    ):
         return "llm_call_end"
     elif (
         scope == TraceScope.ACTION
@@ -74,7 +100,9 @@ def get_event_type_mapping(event: TraceEvent) -> str:
     ):
         return "tool_execution_start"
     elif (
-        scope == TraceScope.ACTION and action == TraceAction.END and category == TraceCategory.TOOL
+        scope == TraceScope.ACTION
+        and action == TraceAction.END
+        and category == TraceCategory.TOOL
     ):
         return "tool_execution_end"
     elif (
@@ -114,32 +142,54 @@ def get_event_type_mapping(event: TraceEvent) -> str:
         )
         return "user_message"
     elif (
-        scope == TraceScope.TASK and action == TraceAction.END and category == TraceCategory.MESSAGE
+        scope == TraceScope.TASK
+        and action == TraceAction.END
+        and category == TraceCategory.MESSAGE
     ):
         return "ai_message"
     elif (
-        scope == TraceScope.TASK and action == TraceAction.END and category == TraceCategory.GENERAL
+        scope == TraceScope.TASK
+        and action == TraceAction.END
+        and category == TraceCategory.GENERAL
     ):
         return "task_completion"
     # Skill selection events
     elif (
-        scope == TraceScope.TASK and action == TraceAction.START and category == TraceCategory.SKILL
+        scope == TraceScope.TASK
+        and action == TraceAction.START
+        and category == TraceCategory.SKILL
     ):
         return "skill_select_start"
-    elif scope == TraceScope.TASK and action == TraceAction.END and category == TraceCategory.SKILL:
+    elif (
+        scope == TraceScope.TASK
+        and action == TraceAction.END
+        and category == TraceCategory.SKILL
+    ):
         return "skill_select_end"
     # ReAct pattern events (for BUILD phase)
     elif (
-        scope == TraceScope.TASK and action == TraceAction.START and category == TraceCategory.REACT
+        scope == TraceScope.TASK
+        and action == TraceAction.START
+        and category == TraceCategory.REACT
     ):
         return "react_task_start"
-    elif scope == TraceScope.TASK and action == TraceAction.END and category == TraceCategory.REACT:
+    elif (
+        scope == TraceScope.TASK
+        and action == TraceAction.END
+        and category == TraceCategory.REACT
+    ):
         return "react_task_end"
     elif (
-        scope == TraceScope.STEP and action == TraceAction.START and category == TraceCategory.REACT
+        scope == TraceScope.STEP
+        and action == TraceAction.START
+        and category == TraceCategory.REACT
     ):
         return "react_step_start"
-    elif scope == TraceScope.STEP and action == TraceAction.END and category == TraceCategory.REACT:
+    elif (
+        scope == TraceScope.STEP
+        and action == TraceAction.END
+        and category == TraceCategory.REACT
+    ):
         return "react_step_end"
     elif (
         scope == TraceScope.ACTION
@@ -148,7 +198,9 @@ def get_event_type_mapping(event: TraceEvent) -> str:
     ):
         return "react_action_start"
     elif (
-        scope == TraceScope.ACTION and action == TraceAction.END and category == TraceCategory.REACT
+        scope == TraceScope.ACTION
+        and action == TraceAction.END
+        and category == TraceCategory.REACT
     ):
         return "react_action_end"
     else:
@@ -227,7 +279,9 @@ class WebSocketTraceHandler(TraceHandler):
                 )
 
         except Exception as e:
-            logger.warning(f"Failed to send trace event to WebSocket for task {self.task_id}: {e}")
+            logger.warning(
+                f"Failed to send trace event to WebSocket for task {self.task_id}: {e}"
+            )
 
     async def _load_task_description(self) -> None:
         """Load task description from database."""
@@ -238,7 +292,9 @@ class WebSocketTraceHandler(TraceHandler):
             # Run synchronous database operations in a thread pool to avoid blocking event loop
             await asyncio.to_thread(self._sync_load_task_description)
         except Exception as e:
-            logger.warning(f"Failed to load task description for task {self.task_id}: {e}")
+            logger.warning(
+                f"Failed to load task description for task {self.task_id}: {e}"
+            )
 
         self._task_description_loaded = True
 
@@ -255,7 +311,9 @@ class WebSocketTraceHandler(TraceHandler):
         try:
             task = db.query(Task).filter(Task.id == self.task_id).first()
             if task:
-                self._task_description = str(task.description) if task.description else None
+                self._task_description = (
+                    str(task.description) if task.description else None
+                )
                 logger.info(
                     f"Loaded task description for task {self.task_id}: {task.description[:50]}..."
                 )
@@ -277,7 +335,9 @@ class WebSocketTraceHandler(TraceHandler):
             return None
 
         # Create the base stream event
-        stream_event = create_stream_event(event_type_str, self.task_id, data, event.timestamp)
+        stream_event = create_stream_event(
+            event_type_str, self.task_id, data, event.timestamp
+        )
 
         # Add step_id if present (required for tool/LLM events)
         if event.step_id:
@@ -307,7 +367,9 @@ class WebSocketTraceHandler(TraceHandler):
             cleaned = value.replace("\x00", "")  # Remove NULL character
             cleaned = cleaned.replace("\u0000", "")  # Remove Unicode NULL
             # Remove other control characters that might cause issues
-            cleaned = "".join(char for char in cleaned if ord(char) >= 32 or char in "\n\r\t")
+            cleaned = "".join(
+                char for char in cleaned if ord(char) >= 32 or char in "\n\r\t"
+            )
             return cleaned
 
         def serialize_value(value: Any) -> Any:
@@ -345,7 +407,9 @@ class WebSocketTraceHandler(TraceHandler):
             return cleaned_data  # type: ignore[no-any-return]
         except (TypeError, ValueError) as e:
             # If still not serializable, return a safe fallback
-            logger.warning(f"Failed to serialize data for JSON: {e}, data type: {type(data)}")
+            logger.warning(
+                f"Failed to serialize data for JSON: {e}, data type: {type(data)}"
+            )
             return {
                 "_serialization_error": f"Failed to serialize {type(data).__name__}",
                 "_original_type": type(data).__name__,

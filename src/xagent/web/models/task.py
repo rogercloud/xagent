@@ -12,7 +12,7 @@ from sqlalchemy import (
     String,
     Text,
 )
-from sqlalchemy.orm import relationship
+from sqlalchemy.orm import Mapped, mapped_column, relationship
 from sqlalchemy.sql import func
 
 from .database import Base
@@ -111,7 +111,11 @@ class Task(Base):  # type: ignore
     agent_type = Column(
         String(20), default=AgentType.STANDARD.value, nullable=True
     )  # SQLite compatible
-    agent_config = Column(JSON, nullable=True)  # Agent-specific configuration
+    agent_config: Mapped[dict[str, Any] | None] = (
+        mapped_column(  # Agent-specific configuration
+            JSON, nullable=True
+        )
+    )
 
     # Execution mode configuration
     execution_mode = Column(

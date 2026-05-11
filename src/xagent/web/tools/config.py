@@ -23,7 +23,9 @@ from ..services.tool_credentials import (
 logger = logging.getLogger(__name__)
 
 
-async def refresh_oauth_token_if_needed(db: Any, oauth_account: Any, provider_name: str) -> bool:
+async def refresh_oauth_token_if_needed(
+    db: Any, oauth_account: Any, provider_name: str
+) -> bool:
     """Check if token is expired (or close to expiring) and refresh if needed."""
     if not oauth_account.expires_at:
         return True  # Assume valid if no expiration is set
@@ -40,7 +42,9 @@ async def refresh_oauth_token_if_needed(db: Any, oauth_account: Any, provider_na
         return True  # Token is still valid
 
     if not oauth_account.refresh_token:
-        logger.warning(f"Token expired for {provider_name} but no refresh_token available.")
+        logger.warning(
+            f"Token expired for {provider_name} but no refresh_token available."
+        )
         return False
 
     logger.info(f"Token expired for {provider_name}, attempting to refresh...")
@@ -49,7 +53,9 @@ async def refresh_oauth_token_if_needed(db: Any, oauth_account: Any, provider_na
         from ..models.oauth_provider import OAuthProvider
 
         provider_config = (
-            db.query(OAuthProvider).filter(OAuthProvider.provider_name == provider_name).first()
+            db.query(OAuthProvider)
+            .filter(OAuthProvider.provider_name == provider_name)
+            .first()
         )
         if not provider_config:
             logger.warning(f"Unknown provider for refresh: {provider_name}")
@@ -59,7 +65,9 @@ async def refresh_oauth_token_if_needed(db: Any, oauth_account: Any, provider_na
         client_secret = decrypt_value(provider_config.client_secret)
 
         if not client_id or not client_secret:
-            logger.warning(f"{provider_name} OAuth not configured (missing CLIENT_ID or SECRET).")
+            logger.warning(
+                f"{provider_name} OAuth not configured (missing CLIENT_ID or SECRET)."
+            )
             return False
 
         data = {
@@ -97,7 +105,9 @@ async def refresh_oauth_token_if_needed(db: Any, oauth_account: Any, provider_na
             logger.error(f"Failed to refresh {provider_name} token: {response.text}")
 
     except Exception as e:
-        logger.error(f"Exception refreshing token for {provider_name}: {e}", exc_info=True)
+        logger.error(
+            f"Exception refreshing token for {provider_name}: {e}", exc_info=True
+        )
 
     return False
 
@@ -136,7 +146,9 @@ class WebToolConfig(BaseToolConfig):
     ):
         self.db = db
         self.request = request
-        self._user_id = user_id if user_id is not None else self._get_user_id_from_request(request)
+        self._user_id = (
+            user_id if user_id is not None else self._get_user_id_from_request(request)
+        )
         self._is_admin_value = is_admin or self._get_is_admin_from_request(request)
         # Initialize workspace_config with base_dir and task_id if provided
         if workspace_config is None:
@@ -525,7 +537,9 @@ class WebToolConfig(BaseToolConfig):
                 .all()
             )
 
-            logger.info(f"Found {len(servers)} active MCP servers for user {self._user_id}")
+            logger.info(
+                f"Found {len(servers)} active MCP servers for user {self._user_id}"
+            )
 
             for server in servers:
                 # Build config dict from server model
@@ -546,7 +560,9 @@ class WebToolConfig(BaseToolConfig):
                     from ...web.models.user_oauth import UserOAuth
 
                     app_info = get_app_by_name(self.db, str(server.name))
-                    provider_name = app_info.get("provider") if app_info else server.name.lower()
+                    provider_name = (
+                        app_info.get("provider") if app_info else server.name.lower()
+                    )
 
                     # Some oauth records might be saved with the app_id as provider instead of the general provider_name
                     # For example, "google-drive" instead of "google"
@@ -601,14 +617,18 @@ class WebToolConfig(BaseToolConfig):
 
                         if is_valid and app_info:
                             app_id = app_info.get("id")
-                            logger.info(f"OAUTH CONFIG: Mapping '{app_id}' to executable proxy")
+                            logger.info(
+                                f"OAUTH CONFIG: Mapping '{app_id}' to executable proxy"
+                            )
 
                             launch_config = app_info.get("launch_config")
                             if launch_config:
                                 config["transport"] = "stdio"
                                 transport_config["transport"] = "stdio"
                                 transport_config["command"] = launch_config["command"]
-                                transport_config["args"] = launch_config.get("args", []).copy()
+                                transport_config["args"] = launch_config.get(
+                                    "args", []
+                                ).copy()
 
                                 env = {}
                                 for env_key, token_type in launch_config.get(
@@ -619,9 +639,13 @@ class WebToolConfig(BaseToolConfig):
 
                                 env.update(
                                     {
-                                        "HTTPS_PROXY": os.environ.get("HTTPS_PROXY", ""),
+                                        "HTTPS_PROXY": os.environ.get(
+                                            "HTTPS_PROXY", ""
+                                        ),
                                         "HTTP_PROXY": os.environ.get("HTTP_PROXY", ""),
-                                        "https_proxy": os.environ.get("https_proxy", ""),
+                                        "https_proxy": os.environ.get(
+                                            "https_proxy", ""
+                                        ),
                                         "http_proxy": os.environ.get("http_proxy", ""),
                                     }
                                 )
@@ -643,7 +667,9 @@ class WebToolConfig(BaseToolConfig):
                                 }
 
                     else:
-                        logger.info(f"OAUTH CONFIG: No valid token found for '{provider_name}'.")
+                        logger.info(
+                            f"OAUTH CONFIG: No valid token found for '{provider_name}'."
+                        )
 
                 if server.transport == "stdio":
                     if server.command:
@@ -678,9 +704,13 @@ class WebToolConfig(BaseToolConfig):
                     if server.docker_image:
                         transport_config["docker_image"] = server.docker_image
                     if server.docker_environment:
-                        transport_config["docker_environment"] = server.docker_environment
+                        transport_config["docker_environment"] = (
+                            server.docker_environment
+                        )
                     if server.docker_working_dir:
-                        transport_config["docker_working_dir"] = server.docker_working_dir
+                        transport_config["docker_working_dir"] = (
+                            server.docker_working_dir
+                        )
                     if server.volumes:
                         transport_config["volumes"] = server.volumes
                     if server.bind_ports:
@@ -697,7 +727,9 @@ class WebToolConfig(BaseToolConfig):
                 config["allow_users"] = [str(self._user_id)]  # Only allow current user
 
                 configs.append(config)
-                logger.debug(f"Loaded MCP server config: {server.name} ({server.transport})")
+                logger.debug(
+                    f"Loaded MCP server config: {server.name} ({server.transport})"
+                )
 
         except Exception as e:
             logger.warning(f"Failed to load MCP server configs: {e}", exc_info=True)
@@ -743,5 +775,7 @@ class WebToolConfig(BaseToolConfig):
             return custom_api_configs
 
         except Exception as e:
-            logger.error(f"Failed to get Custom API configs from database: {e}", exc_info=True)
+            logger.error(
+                f"Failed to get Custom API configs from database: {e}", exc_info=True
+            )
             return []
