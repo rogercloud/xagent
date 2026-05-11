@@ -562,6 +562,33 @@ class TestProtectionConstraints:
         assert update_response.status_code == 409
         assert "default" in update_response.json()["detail"].lower()
 
+    def test_unshared_default_model_sending_false_is_noop(
+        self, test_db, admin_headers, sample_model_data
+    ):
+        """share_with_users=false on an already-unshared default model is a no-op (200)."""
+        # Create model WITHOUT sharing
+        create_response = client.post(
+            "/api/models/", json=sample_model_data, headers=admin_headers
+        )
+        assert create_response.status_code == 200
+        model_id_str = create_response.json()["model_id"]
+        model_db_id = create_response.json()["id"]
+
+        # Set as own default
+        client.post(
+            "/api/models/user-default",
+            json={"model_id": model_db_id, "config_type": "general"},
+            headers=admin_headers,
+        )
+
+        # Sending share_with_users=False on an already-unshared model should be a no-op
+        update_response = client.put(
+            f"/api/models/{model_id_str}",
+            json={"share_with_users": False},
+            headers=admin_headers,
+        )
+        assert update_response.status_code == 200
+
     def test_owner_can_delete_when_no_default(
         self, test_db, admin_headers, sample_model_data
     ):

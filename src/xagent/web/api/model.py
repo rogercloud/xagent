@@ -1725,37 +1725,37 @@ async def update_model(
                 UserModel.user_id == user.id,
             ).update({"is_shared": True})
         else:
-            # Constraint 1: owner cannot un-share own default model
-            owner_defaults = (
-                db.query(UserDefaultModel)
-                .filter(
+            # `share_with_users=false` on an already-unshared model is a no-op
+            if is_shared:
+                # Constraint 1: owner cannot un-share own default model
+                owner_defaults = (
+                    db.query(UserDefaultModel)
+                    .filter(
+                        UserDefaultModel.model_id == db_model.id,
+                        UserDefaultModel.user_id == user.id,
+                    )
+                    .count()
+                )
+                if owner_defaults > 0:
+                    raise HTTPException(
+                        409,
+                        detail="Cannot un-share: you have this model as your default. Change default first.",
+                    )
+
+                # Disable sharing:
+                # 1. Update owner's record to shared=False
+                user_model.is_shared = False  # type: ignore[assignment]
+
+                # 2. Delete all non-owner UserModel records
+                db.query(UserModel).filter(
+                    UserModel.model_id == db_model.id, UserModel.is_owner.is_(False)
+                ).delete()
+
+                # 3. Clean up non-owner UserDefaultModel records
+                db.query(UserDefaultModel).filter(
                     UserDefaultModel.model_id == db_model.id,
-                    UserDefaultModel.user_id == user.id,
-                )
-                .count()
-            )
-            if owner_defaults > 0:
-                raise HTTPException(
-                    409,
-                    detail="Cannot un-share: you have this model as your default. Change default first.",
-                )
-
-            # Disable sharing:
-            # 1. Update owner's record to shared=False
-            db.query(UserModel).filter(
-                UserModel.model_id == db_model.id, UserModel.user_id == user.id
-            ).update({"is_shared": False})
-
-            # 2. Delete all non-owner UserModel records
-            db.query(UserModel).filter(
-                UserModel.model_id == db_model.id, UserModel.is_owner.is_(False)
-            ).delete()
-
-            # 3. Clean up non-owner UserDefaultModel records
-            db.query(UserDefaultModel).filter(
-                UserDefaultModel.model_id == db_model.id,
-                UserDefaultModel.user_id != user.id,
-            ).delete()
+                    UserDefaultModel.user_id != user.id,
+                ).delete()
 
     # Update model configuration in-place
     update_data = model_update.model_dump(exclude_unset=True)
