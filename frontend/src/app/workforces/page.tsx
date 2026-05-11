@@ -29,6 +29,7 @@ export default function WorkforcesPage() {
       setTotal(data.total)
     } catch (err) {
       setError(err instanceof Error ? err.message : "Failed to load workforces")
+      setItems([])
     } finally {
       setLoading(false)
     }

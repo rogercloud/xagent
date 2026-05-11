@@ -813,16 +813,28 @@ class AgentServiceManager:
                                 task_vision_llm,
                                 task_compact_llm,
                             ) = agent_config["llms"]
-                            # Agent Builder execution_mode overrides task pattern.
-                            agent_execution_mode = agent_config.get(
-                                "execution_mode", "balanced"
+                            # For workforce tasks, keep the task's own
+                            # execution_mode (validated at run creation).
+                            # For regular Agent Builder tasks, override with
+                            # the agent's current execution_mode.
+                            is_workforce = (
+                                isinstance(task.agent_config, dict)
+                                and "workforce_snapshot" in task.agent_config
                             )
-                            task_pattern = get_agent_pattern_for_execution_mode(
-                                agent_execution_mode
-                            )
-                            logger.info(
-                                f"Task {task_id} using Agent Builder execution mode: {agent.execution_mode} -> pattern={task_pattern}"
-                            )
+                            if not is_workforce:
+                                agent_execution_mode = agent_config.get(
+                                    "execution_mode", "balanced"
+                                )
+                                task_pattern = get_agent_pattern_for_execution_mode(
+                                    agent_execution_mode
+                                )
+                                logger.info(
+                                    f"Task {task_id} using Agent Builder execution mode: {agent.execution_mode} -> pattern={task_pattern}"
+                                )
+                            else:
+                                logger.info(
+                                    f"Workforce task {task_id} keeping task execution_mode: {task.execution_mode} -> pattern={task_pattern}"
+                                )
 
                     # If no models were resolved, use defaults
                     if not task_llm:

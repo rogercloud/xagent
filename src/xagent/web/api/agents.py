@@ -573,19 +573,19 @@ async def delete_agent(
                 ),
             )
 
-        worker_reference = (
+        workforce_reference = (
             db.query(Workforce)
             .join(WorkforceAgent, WorkforceAgent.workforce_id == Workforce.id)
             .filter(WorkforceAgent.agent_id == agent.id)
             .order_by(Workforce.id.asc(), WorkforceAgent.id.asc())
             .first()
         )
-        if worker_reference:
+        if workforce_reference:
             raise HTTPException(
                 status_code=409,
                 detail=(
                     "Cannot delete agent because it is used as a worker agent "
-                    f"by workforce '{worker_reference.name}'"
+                    f"by workforce '{workforce_reference.name}'"
                 ),
             )
 

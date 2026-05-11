@@ -30,17 +30,17 @@ function formatOperationTitle(op: string) {
 
 function operationSubtitle(operation: Record<string, unknown>) {
   if (operation.op === "add_existing_worker") {
-    return `agent_id=${String(operation.agent_id || "")}`
+    return `agent_id=${String(operation.agent_id ?? "")}`
   }
   if (operation.op === "add_worker_from_template") {
-    return `template_id=${String(operation.template_id || "")}`
+    return `template_id=${String(operation.template_id ?? "")}`
   }
   if (operation.op === "create_worker_agent") {
     const agent = operation.agent as Record<string, unknown> | undefined
-    return `agent=${String(agent?.name || "")}`
+    return `agent=${String(agent?.name ?? "")}`
   }
   if (operation.op === "update_worker" || operation.op === "remove_worker") {
-    return `member_id=${String(operation.member_id || "")}`
+    return `member_id=${String(operation.member_id ?? "")}`
   }
   return null
 }
