@@ -50,6 +50,8 @@ def _map_task_status(status: Any) -> str | None:
         return "pending"
     if status == TaskStatus.RUNNING:
         return "running"
+    if status == TaskStatus.PAUSED:
+        return "paused"
     if status == TaskStatus.COMPLETED:
         return "completed"
     if status == TaskStatus.FAILED:

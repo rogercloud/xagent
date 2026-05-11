@@ -22,12 +22,14 @@ from xagent.web.api.workforces import (
     get_workforce_canvas,
     list_workforces,
     propose_workforce_changes,
+    remove_workforce_agent,
     update_workforce,
     update_workforce_agent,
 )
 from xagent.web.models.agent import Agent, AgentStatus
 from xagent.web.models.database import Base
 from xagent.web.models.user import User
+from xagent.web.models.workforce import Workforce, WorkforceAgent
 
 
 def _create_session() -> tuple[Session, str]:
@@ -362,6 +364,61 @@ async def test_delete_agent_blocked_when_referenced_by_workforce() -> None:
             assert "worker agent" in exc.detail
         else:
             raise AssertionError("Expected worker delete to fail")
+    finally:
+        db_session.close()
+        try:
+            import os
+
+            os.remove(db_path)
+        except OSError:
+            pass
+
+
+@pytest.mark.asyncio
+async def test_delete_last_enabled_worker_from_active_workforce_fails() -> None:
+    db_session, db_path = _create_session()
+    try:
+        regular_user = _create_user(db_session, "delete-worker-user")
+        manager = _create_agent(db_session, regular_user, "Manager")
+        worker = _create_agent(db_session, regular_user, "Solo Worker")
+
+        workforce = Workforce(
+            scope_type="user",
+            scope_id=str(regular_user.id),
+            owner_user_id=regular_user.id,
+            name="Solo Workforce",
+            manager_agent_id=manager.id,
+            status="active",
+        )
+        db_session.add(workforce)
+        db_session.commit()
+        db_session.refresh(workforce)
+
+        worker_link = WorkforceAgent(
+            workforce_id=workforce.id,
+            agent_id=worker.id,
+            alias="Solo",
+            assignment_instructions="Do everything.",
+            enabled=True,
+        )
+        db_session.add(worker_link)
+        db_session.commit()
+        db_session.refresh(worker_link)
+
+        try:
+            await remove_workforce_agent(
+                workforce_id=workforce.id,
+                member_id=worker_link.id,
+                db=db_session,
+                user=regular_user,
+            )
+        except HTTPException as exc:
+            assert exc.status_code == 400
+            assert "enabled worker" in exc.detail.lower()
+            return
+        raise AssertionError(
+            "Expected HTTPException when deleting last enabled worker from active workforce"
+        )
     finally:
         db_session.close()
         try:

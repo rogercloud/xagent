@@ -574,6 +574,7 @@ async def remove_workforce_agent(
 
     db.delete(worker)
     db.flush()
+    db.expire(workforce, ["workers"])
     _ensure_can_activate(cast(str, workforce.status), workforce, [])
     db.commit()
     return {"status": "deleted"}

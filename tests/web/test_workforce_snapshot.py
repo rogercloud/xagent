@@ -6,8 +6,10 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from xagent.web.models.agent import Agent, AgentStatus
 from xagent.web.models.database import Base
+from xagent.web.models.task import TaskStatus
 from xagent.web.models.user import User
 from xagent.web.models.workforce import Workforce, WorkforceAgent
+from xagent.web.services.workforce_runtime import _map_task_status
 from xagent.web.services.workforce_snapshot import (
     build_agent_tool_overrides,
     build_workforce_snapshot,
@@ -153,3 +155,13 @@ def test_build_workforce_snapshot_requires_enabled_worker():
             os.remove(db_path)
         except OSError:
             pass
+
+
+def test_map_task_status_maps_paused() -> None:
+    assert _map_task_status(TaskStatus.PENDING) == "pending"
+    assert _map_task_status(TaskStatus.RUNNING) == "running"
+    assert _map_task_status(TaskStatus.PAUSED) == "paused"
+    assert _map_task_status(TaskStatus.COMPLETED) == "completed"
+    assert _map_task_status(TaskStatus.FAILED) == "failed"
+    assert _map_task_status(None) is None
+    assert _map_task_status("unknown") is None
