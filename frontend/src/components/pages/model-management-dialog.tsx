@@ -966,12 +966,17 @@ export function ModelManagementDialog({
                   <Label htmlFor="model_provider">{t('models.form.provider')}</Label>
                   <Select
                     value={formData.model_provider}
-                    onValueChange={(value) => setFormData({
-                      ...formData,
-                      model_provider: value,
-                      base_url: getDefaultBaseUrlForProvider(value, formData.category),
-                      abilities: getDefaultAbilitiesForProvider(formData.category, value),
-                    })}
+                    onValueChange={(value) => {
+                      resetConnectionState()
+                      setFormData(prev => ({
+                        ...prev,
+                        model_provider: value,
+                        model_name: "",
+                        base_url: getDefaultBaseUrlForProvider(value, prev.category),
+                        api_key: prev.model_provider === value ? prev.api_key : "",
+                        abilities: getDefaultAbilitiesForProvider(prev.category, value),
+                      }))
+                    }}
                     disabled={!!editingModel}
                     options={providers
                       .filter(p => p.category.includes(formData.category as any))
