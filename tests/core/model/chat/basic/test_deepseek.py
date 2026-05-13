@@ -2,11 +2,11 @@ from types import SimpleNamespace
 
 import pytest
 
-from xagent.core.model.chat.types import ChunkType
 from xagent.core.model.chat.basic.deepseek import (
     DEEPSEEK_DEFAULT_BASE_URL,
     DeepSeekLLM,
 )
+from xagent.core.model.chat.types import ChunkType
 
 
 class TestDeepSeekLLM:
@@ -62,6 +62,10 @@ class TestDeepSeekLLM:
 
     def test_supports_enable_thinking_param_is_false(self, llm):
         assert llm.supports_enable_thinking_param is False
+
+    def test_structured_output_capabilities(self, llm):
+        assert llm.supports_json_schema_response_format is False
+        assert llm.supports_json_object_response_format is True
 
     @pytest.mark.asyncio
     async def test_explicit_thinking_enabled_uses_deepseek_extra_body(
@@ -135,6 +139,33 @@ class TestDeepSeekLLM:
         assert call_kwargs["extra_body"]["thinking"] == {"type": "disabled"}
 
     @pytest.mark.asyncio
+    async def test_json_schema_response_format_uses_deepseek_json_object(
+        self, llm, mock_json_completion, mocker
+    ):
+        mock_client = mocker.AsyncMock()
+        mock_client.chat.completions.create.return_value = mock_json_completion
+        mocker.patch(
+            "xagent.core.model.chat.basic.openai.AsyncOpenAI",
+            return_value=mock_client,
+        )
+
+        await llm.chat(
+            [{"role": "user", "content": "Return JSON"}],
+            response_format={
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "action_decision",
+                    "strict": True,
+                    "schema": {"type": "object"},
+                },
+            },
+        )
+
+        call_kwargs = mock_client.chat.completions.create.call_args.kwargs
+        assert call_kwargs["response_format"] == {"type": "json_object"}
+        assert call_kwargs["extra_body"]["thinking"] == {"type": "disabled"}
+
+    @pytest.mark.asyncio
     async def test_output_config_disables_thinking_by_default(
         self, llm, mock_json_completion, mocker
     ):
@@ -156,6 +187,7 @@ class TestDeepSeekLLM:
         )
 
         call_kwargs = mock_client.chat.completions.create.call_args.kwargs
+        assert call_kwargs["response_format"] == {"type": "json_object"}
         assert call_kwargs["extra_body"]["thinking"] == {"type": "disabled"}
 
     @pytest.mark.asyncio
@@ -263,7 +295,9 @@ class TestDeepSeekLLM:
 
         assert result["type"] == "text"
         assert result["content"] == '{"status":"ok"}'
-        second_call_kwargs = mock_client.chat.completions.create.call_args_list[1].kwargs
+        second_call_kwargs = mock_client.chat.completions.create.call_args_list[
+            1
+        ].kwargs
         assert second_call_kwargs["extra_body"]["thinking"] == {"type": "disabled"}
         assert second_call_kwargs["reasoning_effort"] == "max"
         assert "reasoning_effort" not in second_call_kwargs["extra_body"]

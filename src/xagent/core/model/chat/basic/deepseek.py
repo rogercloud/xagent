@@ -35,7 +35,9 @@ def resolve_deepseek_api_key(api_key: Optional[str] = None) -> str:
     if resolved_api_key is None:
         openai_api_key = os.getenv("OPENAI_API_KEY")
         openai_api_key = (
-            openai_api_key.strip() if isinstance(openai_api_key, str) else openai_api_key
+            openai_api_key.strip()
+            if isinstance(openai_api_key, str)
+            else openai_api_key
         )
         if not is_placeholder_api_key(openai_api_key):
             resolved_api_key = openai_api_key
@@ -87,6 +89,16 @@ class DeepSeekLLM(OpenAILLM):
         """DeepSeek uses a `thinking` payload instead of `enable_thinking`."""
         return False
 
+    @property
+    def supports_json_schema_response_format(self) -> bool:
+        """DeepSeek supports JSON object mode, not OpenAI json_schema mode."""
+        return False
+
+    @property
+    def supports_json_object_response_format(self) -> bool:
+        """DeepSeek supports response_format={"type": "json_object"}."""
+        return True
+
     def _build_deepseek_extra_body(
         self,
         *,
@@ -133,6 +145,26 @@ class DeepSeekLLM(OpenAILLM):
 
         return extra_body, updated_kwargs
 
+    def _normalize_response_format(
+        self,
+        response_format: Optional[Dict[str, Any]],
+        output_config: Optional[Dict[str, Any]],
+    ) -> tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
+        if response_format and response_format.get("type") == "json_schema":
+            logger.warning(
+                "DeepSeek does not support json_schema response_format; using json_object instead."
+            )
+            return {"type": "json_object"}, output_config
+
+        format_config = (output_config or {}).get("format") or {}
+        if not response_format and format_config.get("type") == "json_schema":
+            logger.warning(
+                "DeepSeek does not support json_schema output_config; using json_object instead."
+            )
+            return {"type": "json_object"}, None
+
+        return response_format, output_config
+
     def _disable_thinking_extra_body(
         self, extra_body: Optional[Dict[str, Any]] = None
     ) -> Dict[str, Any]:
@@ -153,6 +185,10 @@ class DeepSeekLLM(OpenAILLM):
         output_config: Optional[Dict[str, Any]] = None,
         **kwargs: Any,
     ) -> Any:
+        response_format, output_config = self._normalize_response_format(
+            response_format=response_format,
+            output_config=output_config,
+        )
         extra_body, kwargs = self._prepare_deepseek_kwargs(
             tools=tools,
             response_format=response_format,
@@ -185,6 +221,10 @@ class DeepSeekLLM(OpenAILLM):
         output_config: Optional[Dict[str, Any]] = None,
         **kwargs: Any,
     ) -> AsyncIterator[StreamChunk]:
+        response_format, output_config = self._normalize_response_format(
+            response_format=response_format,
+            output_config=output_config,
+        )
         extra_body, kwargs = self._prepare_deepseek_kwargs(
             tools=tools,
             response_format=response_format,
