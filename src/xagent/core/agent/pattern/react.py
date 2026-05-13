@@ -1963,6 +1963,29 @@ Remember: Return ONLY ONE JSON object. No additional text, no multiple objects.
         if not value:
             return None
 
+        if len(value) == 1 and value[0] in ("tool_call", "final_answer"):
+            logger.info(f"First call: Recovered action type from JSON list: {value[0]}")
+            return {
+                "type": value[0],
+                "reasoning": "LLM returned only the ReAct action type",
+            }
+
+        if (
+            len(value) % 2 == 0
+            and all(isinstance(value[i], str) for i in range(0, len(value), 2))
+            and "type" in value
+        ):
+            recovered = {
+                value[i]: value[i + 1]
+                for i in range(0, len(value), 2)
+                if isinstance(value[i], str)
+            }
+            if isinstance(recovered.get("type"), str):
+                logger.info(
+                    "First call: Recovered action object from flat JSON key-value list"
+                )
+                return recovered
+
         if all(
             isinstance(item, list) and len(item) == 2 and isinstance(item[0], str)
             for item in value

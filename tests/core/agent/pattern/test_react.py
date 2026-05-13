@@ -472,21 +472,37 @@ async def test_react_raises_for_empty_action_array():
 
 
 @pytest.mark.asyncio
-async def test_react_raises_for_string_action_type_in_array():
-    """A first-phase JSON array with only text should not be accepted."""
+async def test_react_accepts_single_action_type_in_array():
+    """DeepSeek may return only the selected ReAct action type in an array."""
     llm = MockReActLLM(['["tool_call"]'])
     pattern = ReActPattern(llm, max_iterations=3)
 
-    with pytest.raises(PatternExecutionError, match="No ReAct action object found"):
-        await pattern._get_action_from_llm(
-            [{"role": "user", "content": "Create an FAQ agent"}]
-        )
+    action = await pattern._get_action_from_llm(
+        [{"role": "user", "content": "Create an FAQ agent"}]
+    )
+
+    assert action.type == "tool_call"
+    assert action.reasoning == "LLM returned only the ReAct action type"
 
 
 @pytest.mark.asyncio
 async def test_react_accepts_action_key_value_pair_list():
     """DeepSeek may return JSON as key-value pairs instead of an object."""
     llm = MockReActLLM(['[["type", "tool_call"], ["reasoning", "Need a tool"]]'])
+    pattern = ReActPattern(llm, max_iterations=3)
+
+    action = await pattern._get_action_from_llm(
+        [{"role": "user", "content": "Create an FAQ agent"}]
+    )
+
+    assert action.type == "tool_call"
+    assert action.reasoning == "Need a tool"
+
+
+@pytest.mark.asyncio
+async def test_react_accepts_flat_action_key_value_pair_list():
+    """DeepSeek may return a flat key-value list instead of an object."""
+    llm = MockReActLLM(['["type", "tool_call", "reasoning", "Need a tool"]'])
     pattern = ReActPattern(llm, max_iterations=3)
 
     action = await pattern._get_action_from_llm(
