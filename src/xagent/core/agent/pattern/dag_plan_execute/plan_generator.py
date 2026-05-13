@@ -1481,6 +1481,18 @@ When you return type="chat" (direct answer mode), you are providing a TEXT RESPO
                     # Providers such as DeepSeek only support JSON object mode;
                     # the prompt still carries the target schema/example.
                     llm_params["response_format"] = {"type": "json_object"}
+                    cleaned_messages = [
+                        *cleaned_messages,
+                        {
+                            "role": "user",
+                            "content": (
+                                "SYSTEM REMINDER: Return exactly one valid JSON object. "
+                                "Follow the requested schema/example from the prompt. "
+                                "Do not return an array, string, markdown, or schema "
+                                "description."
+                            ),
+                        },
+                    ]
             else:
                 # Fall back to simple JSON object mode
                 llm_params["response_format"] = {"type": "json_object"}

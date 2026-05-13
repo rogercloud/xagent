@@ -767,6 +767,18 @@ STORAGE THRESHOLD: Be extremely conservative. Default to should_store = false un
                     # Providers such as DeepSeek only support JSON object mode;
                     # the prompt still carries the target schema/example.
                     llm_params["response_format"] = {"type": "json_object"}
+                    cleaned_messages = [
+                        *cleaned_messages,
+                        {
+                            "role": "user",
+                            "content": (
+                                "SYSTEM REMINDER: Return exactly one valid JSON object. "
+                                "Follow the requested schema/example from the prompt. "
+                                "Do not return an array, string, markdown, or schema "
+                                "description."
+                            ),
+                        },
+                    ]
             else:
                 # Fallback to response_format
                 llm_params["response_format"] = kwargs.pop(

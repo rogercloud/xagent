@@ -514,13 +514,19 @@ async def test_react_accepts_nested_action_key_value_pair_list():
 @pytest.mark.asyncio
 async def test_react_raises_when_action_array_has_no_action_object_or_type():
     """A first-phase JSON array without a dict or action type should raise."""
-    llm = MockReActLLM(['["not an action"]'])
+    response = '["not an action"]'
+    llm = MockReActLLM([response])
     pattern = ReActPattern(llm, max_iterations=3)
 
-    with pytest.raises(PatternExecutionError, match="No ReAct action object found"):
+    with pytest.raises(
+        PatternExecutionError, match="No ReAct action object found"
+    ) as exc_info:
         await pattern._get_action_from_llm(
             [{"role": "user", "content": "Create an FAQ agent"}]
         )
+
+    assert exc_info.value.context["response_preview"] == response
+    assert exc_info.value.context["json_object_count"] == 1
 
 
 @pytest.mark.asyncio

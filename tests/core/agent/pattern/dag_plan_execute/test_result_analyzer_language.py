@@ -80,6 +80,7 @@ async def test_result_analyzer_keeps_output_config_for_schema_provider():
 
     assert llm.calls[0]["kwargs"]["output_config"] == output_config
     assert "response_format" not in llm.calls[0]["kwargs"]
+    assert "SYSTEM REMINDER" not in llm.calls[0]["messages"][-1]["content"]
 
 
 @pytest.mark.asyncio
@@ -94,6 +95,11 @@ async def test_result_analyzer_uses_json_object_without_schema_support():
 
     assert llm.calls[0]["kwargs"]["response_format"] == {"type": "json_object"}
     assert "output_config" not in llm.calls[0]["kwargs"]
+    assert (
+        "Return exactly one valid JSON object"
+        in llm.calls[0]["messages"][-1]["content"]
+    )
+    assert "requested schema/example" in llm.calls[0]["messages"][-1]["content"]
 
 
 @pytest.mark.asyncio
