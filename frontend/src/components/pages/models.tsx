@@ -98,7 +98,7 @@ const LOCAL_PROVIDER_CONFIGS: Record<string, Partial<ProviderConfig>> = {
     defaultBaseUrl: "https://api.openai.com/v1",
   },
   deepseek: {
-    icon: <Brain className="w-6 h-6" />,
+    icon: <img src="/deepseek.svg" alt="DeepSeek" className="w-6 h-6" />,
     category: ["llm"],
     defaultBaseUrl: "https://api.deepseek.com",
   },
