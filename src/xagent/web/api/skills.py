@@ -142,7 +142,7 @@ async def recall_skill(
     skill_manager = request.app.state.skill_manager
 
     # Get LLM from model_manager
-    from xagent.core.model.manager import (  # type: ignore[import-not-found]
+    from xagent.core.model.manager import (  # type: ignore[import-untyped]
         get_model_manager,
     )
 
