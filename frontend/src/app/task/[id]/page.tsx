@@ -21,13 +21,14 @@ import { FilePreviewActionButtons } from "@/components/file/file-preview-action-
 import { getTaskBackHref } from "./task-navigation";
 
 function TaskDetailContent() {
-  const { state, sendMessage, setTaskId, openFilePreview, closeFilePreview, requestStatus, dispatch, pauseTask, resumeTask } = useApp();
+  const { state, sendMessage, executeTask, setTaskId, openFilePreview, closeFilePreview, requestStatus, dispatch, pauseTask, resumeTask, isConnected } = useApp();
   const { t } = useI18n();
   const [files, setFiles] = useState<File[]>([]);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const params = useParams();
   const router = useRouter();
   const taskIdFromUrl = params.id;
+  const autoStartedWorkforceTasksRef = useRef<Set<number>>(new Set());
 
   // DAG preview toggle and layout
   const [dagPreviewOpen, setDagPreviewOpen] = useState(false);
@@ -87,6 +88,24 @@ function TaskDetailContent() {
       }
     }
   }, [taskIdFromUrl, setTaskId, state.taskId]);
+
+  useEffect(() => {
+    const task = state.currentTask;
+    if (!isConnected || !state.taskId || !task?.workforceId || !task.description) {
+      return;
+    }
+
+    if (task.status?.toLowerCase() !== "pending") {
+      return;
+    }
+
+    if (autoStartedWorkforceTasksRef.current.has(state.taskId)) {
+      return;
+    }
+
+    autoStartedWorkforceTasksRef.current.add(state.taskId);
+    executeTask(task.description);
+  }, [executeTask, isConnected, state.currentTask, state.taskId]);
 
   const scrollToBottom = () => {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
@@ -198,6 +217,23 @@ function TaskDetailContent() {
     merged.sort((a, b) => a.timestamp - b.timestamp);
     return merged;
   }, [state.messages]);
+
+  const timelineItems: CombinedItem[] = useMemo(() => {
+    if (combinedItems.length > 0 || !state.currentTask?.description) {
+      return combinedItems;
+    }
+
+    const createdAt = state.currentTask.createdAt
+      ? new Date(state.currentTask.createdAt).getTime()
+      : Date.now();
+
+    return [{
+      id: `task-${state.currentTask.id}-description`,
+      role: "user",
+      content: state.currentTask.description,
+      timestamp: Number.isNaN(createdAt) ? Date.now() : createdAt,
+    }];
+  }, [combinedItems, state.currentTask]);
 
   // DAG node and edge calculation
   const dagreGraph = new dagre.graphlib.Graph();
@@ -311,8 +347,8 @@ function TaskDetailContent() {
   }
 
   const hasFinalAssistantMessage =
-    combinedItems.length > 0 &&
-    combinedItems[combinedItems.length - 1].role === "assistant";
+    timelineItems.length > 0 &&
+    timelineItems[timelineItems.length - 1].role === "assistant";
 
   const isPlanning = dagNodes.length === 0 && state.dagExecution?.phase === "planning";
   const hasError = dagNodes.length === 0 && (state.dagExecution?.phase === "failed" || state.currentTask?.status === "failed");
@@ -348,7 +384,7 @@ function TaskDetailContent() {
         <div className="flex-1 overflow-y-auto">
           <main className={`container max-w-4xl mx-auto px-4 py-8 relative z-0 transition-all`}>
             <div className="space-y-6 pb-4">
-              {state.isHistoryLoading || combinedItems.length === 0 ? (
+              {state.isHistoryLoading && timelineItems.length === 0 ? (
                 <div className="flex flex-col items-center justify-center min-h-[60vh] py-16 text-center">
                   <div className="relative mb-6">
                     <div className="w-16 h-16 rounded-2xl bg-muted/30 flex items-center justify-center animate-pulse">
@@ -361,7 +397,7 @@ function TaskDetailContent() {
                 </div>
               ) : (
                 <>
-                  {combinedItems.map((item) => (
+                  {timelineItems.map((item) => (
                     <ChatMessage
                       key={item.id}
                       role={item.role}
