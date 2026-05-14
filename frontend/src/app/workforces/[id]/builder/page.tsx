@@ -102,32 +102,34 @@ export default function WorkforceBuilderPage() {
     }
   }
 
-  if (loading) return <div className="p-8 text-muted-foreground">Loading builder...</div>
-  if (error) return <div className="p-8 text-red-500">{error}</div>
-  if (!workforce) return <div className="p-8 text-muted-foreground">Workforce not found.</div>
+  if (loading) return <div className="h-full overflow-y-auto p-4 text-muted-foreground sm:p-8">Loading builder...</div>
+  if (error) return <div className="h-full overflow-y-auto p-4 text-red-500 sm:p-8">{error}</div>
+  if (!workforce) return <div className="h-full overflow-y-auto p-4 text-muted-foreground sm:p-8">Workforce not found.</div>
 
   return (
-    <div className="mx-auto grid w-full max-w-[1600px] gap-6 p-8 xl:grid-cols-[0.95fr_1.05fr_0.8fr]">
-      <div className="min-h-[640px]">
-        <WorkforceBuilderChat
-          messages={messages}
-          loading={loading}
-          submitting={submitting}
-          onSubmit={handleSubmit}
-        />
-      </div>
-      <div className="space-y-6">
-        <WorkforceSummary workforce={workforce} />
-        <ProposedPatchCard
-          patch={activeProposal?.proposed_patch ?? null}
-          messageId={activeProposal?.id ?? null}
-          status={activeProposal?.status ?? null}
-          applying={applying}
-          onApply={handleApply}
-        />
-      </div>
-      <div>
-        <WorkforceTestPanel workforceId={workforce.id} />
+    <div className="h-full overflow-y-auto">
+      <div className="mx-auto grid w-full max-w-[1600px] gap-6 p-4 sm:p-8 xl:grid-cols-[0.95fr_1.05fr_0.8fr]">
+        <div className="min-h-[640px]">
+          <WorkforceBuilderChat
+            messages={messages}
+            loading={loading}
+            submitting={submitting}
+            onSubmit={handleSubmit}
+          />
+        </div>
+        <div className="space-y-6">
+          <WorkforceSummary workforce={workforce} />
+          <ProposedPatchCard
+            patch={activeProposal?.proposed_patch ?? null}
+            messageId={activeProposal?.id ?? null}
+            status={activeProposal?.status ?? null}
+            applying={applying}
+            onApply={handleApply}
+          />
+        </div>
+        <div>
+          <WorkforceTestPanel workforceId={workforce.id} />
+        </div>
       </div>
     </div>
   )

@@ -40,7 +40,8 @@ export default function WorkforcesPage() {
   }, [load, page, search])
 
   return (
-    <div className="mx-auto flex w-full max-w-7xl flex-col gap-6 p-8">
+    <div className="h-full overflow-y-auto">
+      <div className="mx-auto flex w-full max-w-7xl flex-col gap-6 p-4 sm:p-8">
       <div className="flex flex-col gap-4 lg:flex-row lg:items-end lg:justify-between">
         <div>
           <div className="inline-flex items-center gap-2 rounded-full border px-3 py-1 text-xs uppercase tracking-[0.2em] text-muted-foreground">
@@ -185,6 +186,7 @@ export default function WorkforcesPage() {
           </>
         )
       ) : null}
+      </div>
     </div>
   )
 }

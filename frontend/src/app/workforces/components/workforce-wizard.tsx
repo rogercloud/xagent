@@ -98,11 +98,12 @@ export function WorkforceWizard() {
   }
 
   if (loadingAgents) {
-    return <div className="p-8 text-muted-foreground">Loading agents...</div>
+    return <div className="h-full overflow-y-auto p-4 text-muted-foreground sm:p-8">Loading agents...</div>
   }
 
   return (
-    <div className="mx-auto flex w-full max-w-6xl flex-col gap-6 p-8">
+    <div className="h-full overflow-y-auto">
+      <div className="mx-auto flex w-full max-w-6xl flex-col gap-6 p-4 sm:p-8">
       <div>
         <h1 className="text-3xl font-bold">Create Workforce</h1>
         <p className="mt-2 text-muted-foreground">
@@ -210,6 +211,7 @@ export function WorkforceWizard() {
             </Button>
           )}
         </div>
+      </div>
       </div>
     </div>
   )

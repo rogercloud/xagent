@@ -33,13 +33,15 @@ export default function WorkforceCanvasPage() {
     void load()
   }, [params.id])
 
-  if (loading) return <div className="p-8 text-muted-foreground">Loading canvas...</div>
-  if (error) return <div className="p-8 text-red-500">{error}</div>
-  if (!canvas) return <div className="p-8 text-muted-foreground">Canvas unavailable.</div>
+  if (loading) return <div className="h-full overflow-y-auto p-4 text-muted-foreground sm:p-8">Loading canvas...</div>
+  if (error) return <div className="h-full overflow-y-auto p-4 text-red-500 sm:p-8">{error}</div>
+  if (!canvas) return <div className="h-full overflow-y-auto p-4 text-muted-foreground sm:p-8">Canvas unavailable.</div>
 
   return (
-    <div className="mx-auto w-full max-w-7xl p-8">
-      <WorkforceCanvas canvas={canvas} />
+    <div className="h-full overflow-y-auto">
+      <div className="mx-auto w-full max-w-7xl p-4 sm:p-8">
+        <WorkforceCanvas canvas={canvas} />
+      </div>
     </div>
   )
 }

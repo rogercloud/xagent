@@ -215,12 +215,13 @@ export default function WorkforceDetailPage() {
     }
   }
 
-  if (loading) return <div className="p-8 text-muted-foreground">Loading workforce...</div>
-  if (error && !workforce) return <div className="p-8 text-red-500">{error}</div>
-  if (!workforce) return <div className="p-8 text-muted-foreground">Workforce not found.</div>
+  if (loading) return <div className="h-full overflow-y-auto p-4 text-muted-foreground sm:p-8">Loading workforce...</div>
+  if (error && !workforce) return <div className="h-full overflow-y-auto p-4 text-red-500 sm:p-8">{error}</div>
+  if (!workforce) return <div className="h-full overflow-y-auto p-4 text-muted-foreground sm:p-8">Workforce not found.</div>
 
   return (
-    <div className="mx-auto flex w-full max-w-7xl flex-col gap-6 p-8">
+    <div className="h-full overflow-y-auto">
+      <div className="mx-auto flex w-full max-w-7xl flex-col gap-6 p-4 sm:p-8">
       <div className="flex flex-wrap items-center justify-between gap-4">
         <div>
           <h1 className="text-3xl font-bold">{workforce.name}</h1>
@@ -445,6 +446,7 @@ export default function WorkforceDetailPage() {
           )}
         </CardContent>
       </Card>
+      </div>
     </div>
   )
 }
