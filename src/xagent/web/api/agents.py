@@ -4,6 +4,7 @@ import logging
 import os
 import uuid
 from datetime import datetime
+from typing import Any
 
 from fastapi import APIRouter, Body, Depends, HTTPException
 from pydantic import BaseModel, Field
@@ -257,6 +258,27 @@ def _agent_to_response(agent: Agent, db: Session) -> AgentResponse:
     )
 
 
+def _exclude_workforce_manager_agents(query: Any, db: Session) -> Any:
+    """Exclude agents that are internal managers for a Workforce."""
+    workforce_manager_ids = db.query(Workforce.manager_agent_id).filter(
+        Workforce.manager_agent_id.isnot(None)
+    )
+    return query.filter(~Agent.id.in_(workforce_manager_ids))
+
+
+def _is_workforce_manager_agent(db: Session, agent_id: int) -> bool:
+    """Return whether an agent is managed internally by a Workforce."""
+    return (
+        db.query(Workforce.id).filter(Workforce.manager_agent_id == agent_id).first()
+        is not None
+    )
+
+
+def _raise_if_workforce_manager_agent(db: Session, agent_id: int) -> None:
+    if _is_workforce_manager_agent(db, agent_id):
+        raise HTTPException(status_code=404, detail="Agent not found")
+
+
 # ===== Endpoints =====
 
 
@@ -393,8 +415,10 @@ async def list_agents(
     """List all agents for the current user."""
     try:
         agents = (
-            db.query(Agent)
-            .filter(Agent.user_id == current_user.id)
+            _exclude_workforce_manager_agents(
+                db.query(Agent).filter(Agent.user_id == current_user.id),
+                db,
+            )
             .order_by(Agent.created_at.desc())
             .all()
         )
@@ -437,6 +461,7 @@ async def get_agent(
 
         if not agent:
             raise HTTPException(status_code=404, detail="Agent not found")
+        _raise_if_workforce_manager_agent(db, int(agent.id))
 
         return _agent_to_response(agent, db)
 
@@ -464,6 +489,7 @@ async def update_agent(
 
         if not agent:
             raise HTTPException(status_code=404, detail="Agent not found")
+        _raise_if_workforce_manager_agent(db, int(agent.id))
 
         # Validate knowledge base + tool category consistency
         effective_kb = (
@@ -623,6 +649,7 @@ async def publish_agent(
 
         if not agent:
             raise HTTPException(status_code=404, detail="Agent not found")
+        _raise_if_workforce_manager_agent(db, int(agent.id))
 
         if agent.status == AgentStatus.PUBLISHED:
             return PublishResponse(
@@ -664,6 +691,7 @@ async def unpublish_agent(
 
         if not agent:
             raise HTTPException(status_code=404, detail="Agent not found")
+        _raise_if_workforce_manager_agent(db, int(agent.id))
 
         if agent.status != AgentStatus.PUBLISHED:
             return PublishResponse(
@@ -706,6 +734,7 @@ async def upload_agent_logo(
 
         if not agent:
             raise HTTPException(status_code=404, detail="Agent not found")
+        _raise_if_workforce_manager_agent(db, int(agent.id))
 
         # Delete old logo
         if agent.logo_url:

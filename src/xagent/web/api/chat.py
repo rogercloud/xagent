@@ -30,6 +30,7 @@ from ..models.database import get_db
 from ..models.model import Model as DBModel
 from ..models.task import AgentType, Task, TaskStatus
 from ..models.user import User
+from ..models.workforce import Workforce
 from ..schemas.chat import TaskCreateRequest, TaskCreateResponse
 from ..services.chat_history_service import (
     get_latest_waiting_question,
@@ -47,7 +48,10 @@ from ..services.task_lease_service import (
     run_task_lease_heartbeat,
     stop_task_lease_heartbeat,
 )
-from ..services.workforce_runtime import is_verified_workforce_task
+from ..services.workforce_runtime import (
+    is_verified_workforce_task,
+    sync_workforce_run_status,
+)
 from ..tools.config import WebToolConfig
 from ..tracing import create_task_tracer
 from ..user_isolated_memory import UserContext
@@ -57,6 +61,13 @@ logger = logging.getLogger(__name__)
 
 # Create router
 chat_router = APIRouter(prefix="/api/chat", tags=["chat"])
+
+
+def _is_workforce_manager_agent(db: Session, agent_id: int) -> bool:
+    return (
+        db.query(Workforce.id).filter(Workforce.manager_agent_id == agent_id).first()
+        is not None
+    )
 
 
 def create_default_llm() -> BaseLLM | None:
@@ -219,6 +230,7 @@ async def create_default_tools(
             "base_dir": str(get_uploads_dir() / f"user_{user.id}"),
             "task_id": task_id,
             "allowed_external_dirs": allowed_external_dirs,
+            "db_task_id": parent_task_id,
         },
         include_mcp_tools=bool(
             allowed_tools and any(t.startswith("mcp_") for t in allowed_tools)
@@ -1306,6 +1318,22 @@ class AgentServiceManager:
                     "status": "running_elsewhere",
                     "error": "Task is already running on another worker.",
                 }
+            try:
+                task_for_sync = (
+                    db_session.query(Task)
+                    .filter(Task.id == int(tracker_task_id))
+                    .first()
+                )
+                if task_for_sync is not None:
+                    sync_workforce_run_status(
+                        db_session, task_for_sync, TaskStatus.RUNNING
+                    )
+                    db_session.commit()
+            except Exception:
+                logger.debug(
+                    "Failed to sync workforce run status after lease acquisition",
+                    exc_info=True,
+                )
             lease_stop_event = asyncio.Event()
             lease_heartbeat_task = asyncio.create_task(
                 run_task_lease_heartbeat(lease, lease_stop_event)
@@ -1360,6 +1388,20 @@ class AgentServiceManager:
                     else:
                         final_status = TaskStatus.FAILED
                 release_task_lease(db_session, lease, status=final_status)
+                try:
+                    task_for_sync = (
+                        db_session.query(Task).filter(Task.id == lease.task_id).first()
+                    )
+                    if task_for_sync is not None:
+                        sync_workforce_run_status(
+                            db_session, task_for_sync, final_status
+                        )
+                        db_session.commit()
+                except Exception:
+                    logger.debug(
+                        "Failed to sync workforce run status after lease release",
+                        exc_info=True,
+                    )
             # Complete tracking if it was started
             if tracker:
                 try:
@@ -1872,6 +1914,12 @@ async def create_task(
     """Create new chat task"""
     try:
         from ..models.agent import Agent as AgentModel
+
+        if request.agent_id and _is_workforce_manager_agent(db, int(request.agent_id)):
+            raise HTTPException(
+                status_code=400,
+                detail="Workforce manager agents can only be run through Workforce",
+            )
 
         # Build task description with file information
         task_description = request.description or ""

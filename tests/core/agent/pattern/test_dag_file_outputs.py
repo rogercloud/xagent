@@ -106,6 +106,47 @@ class TestDAGFileOutputs:
         # Should be empty
         assert file_outputs == []
 
+    def test_extract_file_outputs_from_nested_step_history(self):
+        """Test that delegated tool file outputs are collected from step history."""
+        mock_llm = Mock(spec=OpenAILLM)
+        workspace = Mock()
+        workspace.get_output_files.return_value = []
+        dag_pattern = DAGPlanExecutePattern(llm=mock_llm, workspace=workspace)
+
+        file_outputs = dag_pattern._extract_file_outputs_from_history(
+            [
+                {
+                    "iteration": 1,
+                    "results": [
+                        {
+                            "step_id": "generate_file",
+                            "result": {
+                                "success": True,
+                                "result": {
+                                    "response": "created file",
+                                    "file_outputs": [
+                                        {
+                                            "file_id": "worker-file-id",
+                                            "filename": "worker.xlsx",
+                                            "file_path": "/tmp/worker.xlsx",
+                                        }
+                                    ],
+                                },
+                            },
+                        }
+                    ],
+                }
+            ]
+        )
+
+        assert file_outputs == [
+            {
+                "file_id": "worker-file-id",
+                "filename": "worker.xlsx",
+                "file_path": "/tmp/worker.xlsx",
+            }
+        ]
+
     @pytest.mark.usefixtures("mock_workspace_db")
     def test_extract_file_outputs_mixed_sources(self, tmp_path):
         """Test that workspace files take precedence over execution results."""

@@ -108,10 +108,18 @@ interface ProcessedStep {
 
 interface TraceEventRendererProps {
   events: TraceEvent[];
+  taskStatus?: string;
+}
+
+function getTraceData(event: TraceEvent): NonNullable<TraceEvent['data']> {
+  if (event.data && typeof event.data === 'object') {
+    return event.data;
+  }
+  return event as unknown as NonNullable<TraceEvent['data']>;
 }
 
 // Process trace events into steps
-function useProcessedSteps(events: TraceEvent[]): ProcessedStep[] {
+function useProcessedSteps(events: TraceEvent[], taskStatus?: string): ProcessedStep[] {
   const { t } = useI18n();
   return useMemo(() => {
     const stepsMap = new Map<string, ProcessedStep>();
@@ -132,12 +140,13 @@ function useProcessedSteps(events: TraceEvent[]): ProcessedStep[] {
         return;
       }
 
+      const eventData = getTraceData(event);
       const eventId = event.event_id || `event-${index}`;
-      let stepId = event.step_id || (event.data?.step_id as string) || 'default';
+      let stepId = event.step_id || (eventData.step_id as string) || 'default';
       if (event.event_type?.startsWith('workforce_delegation_')) {
         stepId = String(
-          event.data?.worker_task_id ||
-          `workforce-${event.data?.workforce_run_id || 'run'}-${event.data?.worker_member_id || event.data?.agent_id || eventId}`
+          eventData.worker_task_id ||
+          `workforce-${eventData.workforce_run_id || 'run'}-${eventData.worker_member_id || eventData.agent_id || eventId}`
         );
       }
 
@@ -168,11 +177,11 @@ function useProcessedSteps(events: TraceEvent[]): ProcessedStep[] {
       const timestamp = normalizeTimestampMs(event.timestamp);
       // Process different event types
       if (event.event_type === 'dag_step_start' || event.event_type === 'react_task_start') {
-        step.stepName = (event.data?.step_name as string) || (event.event_type === 'react_task_start' ? t('traceEventRenderer.taskExecution') : '');
-        step.description = (event.data?.description as string) || (event.data?.task as string) || '';
+        step.stepName = (eventData.step_name as string) || (event.event_type === 'react_task_start' ? t('traceEventRenderer.taskExecution') : '');
+        step.description = (eventData.description as string) || (eventData.task as string) || '';
         step.status = 'running';
 
-        const tools = event.data?.tool_names || event.data?.tools;
+        const tools = eventData.tool_names || eventData.tools;
         if (tools && Array.isArray(tools)) {
           step.tools = tools.map((toolItem: any) => {
             if (typeof toolItem === 'string') return { function: { name: toolItem } };
@@ -224,9 +233,9 @@ function useProcessedSteps(events: TraceEvent[]): ProcessedStep[] {
 
       if (event.event_type === 'workforce_delegation_start') {
         const workerName = String(
-          event.data?.worker_alias ||
-          event.data?.agent_name ||
-          event.data?.tool_name ||
+          eventData.worker_alias ||
+          eventData.agent_name ||
+          eventData.tool_name ||
           t('traceEventRenderer.unknownWorker')
         );
         step.stepName = t('traceEventRenderer.workforceDelegation');
@@ -239,21 +248,21 @@ function useProcessedSteps(events: TraceEvent[]): ProcessedStep[] {
           status: 'running',
           timestamp,
           data: {
-            tool: event.data?.tool_name,
-            output: event.data,
+            tool: eventData.tool_name,
+            output: eventData,
           }
         });
       }
 
       if (event.event_type === 'workforce_delegation_end') {
-        const output = event.data?.output || event.data?.response || '';
+        const output = eventData.output || eventData.response || '';
         step.stepName = step.stepName || t('traceEventRenderer.workforceDelegation');
         step.description = step.description || t('traceEventRenderer.workforceDelegation');
         step.status = 'completed';
         const action = step.actions.find(a => a.type === 'info' && a.status === 'running');
         if (action) {
           action.status = 'completed';
-          action.data.output = output || event.data;
+          action.data.output = output || eventData;
         } else {
           step.actions.push({
             id: eventId,
@@ -261,13 +270,13 @@ function useProcessedSteps(events: TraceEvent[]): ProcessedStep[] {
             title: t('traceEventRenderer.workerReturned'),
             status: 'completed',
             timestamp,
-            data: { output: output || event.data }
+            data: { output: output || eventData }
           });
         }
       }
 
       if (event.event_type === 'workforce_delegation_error') {
-        const errorMessage = event.data?.error || event.data?.message || t('traceEventRenderer.unknownError');
+        const errorMessage = eventData.error || eventData.message || t('traceEventRenderer.unknownError');
         step.stepName = step.stepName || t('traceEventRenderer.workforceDelegation');
         step.description = step.description || t('traceEventRenderer.workforceDelegation');
         step.status = 'failed';
@@ -429,8 +438,22 @@ function useProcessedSteps(events: TraceEvent[]): ProcessedStep[] {
       }
     });
 
+    if (taskStatus === 'completed' || taskStatus === 'failed') {
+      const terminalStatus = taskStatus === 'failed' ? 'failed' : 'completed';
+      stepsMap.forEach((step) => {
+        if (step.status === 'running' || step.status === 'pending') {
+          step.status = terminalStatus;
+        }
+        step.actions.forEach((action) => {
+          if (action.status === 'running') {
+            action.status = terminalStatus;
+          }
+        });
+      });
+    }
+
     return Array.from(stepsMap.values()).filter(step => step.stepName);
-  }, [events, t]);
+  }, [events, taskStatus, t]);
 }
 
 
@@ -1009,9 +1032,9 @@ function StepItem({ step, index, onOpenTerminal, onViewDetail, onFileClick, onAg
 }
 
 // Main TraceEventRenderer Component
-export function TraceEventRenderer({ events }: TraceEventRendererProps) {
+export function TraceEventRenderer({ events, taskStatus }: TraceEventRendererProps) {
   const { t } = useI18n();
-  const steps = useProcessedSteps(events);
+  const steps = useProcessedSteps(events, taskStatus);
   const router = useRouter();
 
   const { openFilePreview, dispatch } = useApp();

@@ -177,6 +177,10 @@ class AgentToolResult(BaseModel):
     """Result from agent tool execution."""
 
     response: str = Field(description="The agent's response")
+    file_outputs: list[dict[str, Any]] = Field(
+        default_factory=list,
+        description="Files created by the delegated agent, if any",
+    )
 
 
 class ListAvailableSkillsArgs(BaseModel):
@@ -1078,6 +1082,12 @@ class AgentTool(AbstractBaseTool):
         parent_tracer: Any | None = None,
         workforce_context: dict[str, Any] | None = None,
         agent_call_stack: list[int] | None = None,
+        user: Any | None = None,
+        is_admin: bool = False,
+        llm: Any | None = None,
+        vision_model: Any | None = None,
+        sandbox: Any | None = None,
+        allowed_external_dirs: list[str] | None = None,
     ):
         """
         Initialize an agent tool.
@@ -1103,6 +1113,12 @@ class AgentTool(AbstractBaseTool):
         self._parent_tracer = parent_tracer
         self._workforce_context = workforce_context or {}
         self._agent_call_stack = list(agent_call_stack or [])
+        self._user = user
+        self._is_admin = is_admin
+        self._llm = llm
+        self._vision_model = vision_model
+        self._sandbox = sandbox
+        self._allowed_external_dirs = allowed_external_dirs
         if workspace_base_dir is None:
             workspace_base_dir = str(get_uploads_dir())
         self._workspace_base_dir = workspace_base_dir
@@ -1144,6 +1160,7 @@ class AgentTool(AbstractBaseTool):
         execution_task_id: str | None = None,
         output: str | None = None,
         error: str | None = None,
+        file_outputs: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
         data: dict[str, Any] = {
             "event_type": f"workforce_delegation_{status}",
@@ -1159,6 +1176,8 @@ class AgentTool(AbstractBaseTool):
             data["output_length"] = len(output)
         if error is not None:
             data["error"] = error
+        if file_outputs:
+            data["file_outputs"] = file_outputs
         return data
 
     async def _trace_delegation(
@@ -1167,6 +1186,7 @@ class AgentTool(AbstractBaseTool):
         execution_task_id: str | None = None,
         output: str | None = None,
         error: str | None = None,
+        file_outputs: list[dict[str, Any]] | None = None,
     ) -> None:
         if (
             self._parent_tracer is None
@@ -1195,6 +1215,7 @@ class AgentTool(AbstractBaseTool):
                     execution_task_id=execution_task_id,
                     output=output,
                     error=error,
+                    file_outputs=file_outputs,
                 ),
             )
         except Exception:
@@ -1228,6 +1249,23 @@ class AgentTool(AbstractBaseTool):
             # Generate unique task ID for this execution
             execution_task_id = f"agent_{self._agent_id}_{uuid.uuid4().hex[:8]}"
             await self._trace_delegation("start", execution_task_id=execution_task_id)
+            child_tracer = self._parent_tracer
+            if child_tracer is None:
+                from .....core.tracing.factory import create_agent_tracer
+
+                child_tracer = create_agent_tracer(
+                    task_id=execution_task_id,
+                    user_id=self._user_id,
+                    trace_name=f"xagent-agent-tool-{execution_task_id}",
+                    session_id=execution_task_id,
+                    tags=["xagent", "agent-tool", "delegation"],
+                    metadata={
+                        "source": "agent_tool",
+                        "agent_id": self._agent_id,
+                        "agent_name": self._agent_name,
+                        "parent_task_id": self._parent_task_id,
+                    },
+                )
 
             # Resolve models
             from .....core.agent.service import AgentService
@@ -1301,6 +1339,7 @@ class AgentTool(AbstractBaseTool):
 
             agent_tool_categories = ensure_list(agent.tool_categories) or []
             next_agent_call_stack = [*self._agent_call_stack, self._agent_id]
+            db_task_id = self._parent_task_id
 
             allowed_tools = None
             if agent_tool_categories:
@@ -1354,19 +1393,29 @@ class AgentTool(AbstractBaseTool):
             tool_config = WebToolConfig(
                 db=self._db,
                 request=MinimalRequest(self._user_id),
+                user=self._user,
                 user_id=self._user_id,
+                is_admin=self._is_admin,
+                llm=self._llm,
+                vision_model=self._vision_model,
                 allowed_collections=agent.knowledge_bases
                 if agent.knowledge_bases is not None
                 else None,
                 allowed_skills=agent.skills if agent.skills is not None else None,
                 allowed_tools=allowed_tools,
                 task_id=execution_task_id,
-                workspace_base_dir=self._workspace_base_dir,
+                workspace_config={
+                    "base_dir": self._workspace_base_dir,
+                    "task_id": execution_task_id,
+                    "allowed_external_dirs": self._allowed_external_dirs,
+                    "db_task_id": db_task_id,
+                },
                 allowed_agent_ids=None,
                 enable_global_agent_tools="agent" in agent_tool_categories,
                 parent_task_id=self._parent_task_id,
-                parent_tracer=self._parent_tracer,
+                parent_tracer=child_tracer,
                 agent_call_stack=next_agent_call_stack,
+                sandbox=self._sandbox,
             )
 
             # Create agent service
@@ -1384,7 +1433,7 @@ class AgentTool(AbstractBaseTool):
                 enable_workspace=True,
                 workspace_base_dir=self._workspace_base_dir,
                 task_id=execution_task_id,
-                tracer=self._parent_tracer,
+                tracer=child_tracer,
             )
 
             # Build execution context
@@ -1397,6 +1446,64 @@ class AgentTool(AbstractBaseTool):
             if prompt_parts:
                 execution_context["system_prompt"] = "\n\n".join(prompt_parts)
 
+            if self._parent_task_id is not None:
+                try:
+                    from .....web.models.task import Task
+                    from .....web.models.uploaded_file import UploadedFile
+
+                    parent_task = (
+                        self._db.query(Task)
+                        .filter(
+                            Task.id == self._parent_task_id,
+                            Task.user_id == self._user_id,
+                        )
+                        .first()
+                    )
+                    raw_selected_file_ids = (
+                        parent_task.agent_config.get("selected_file_ids")
+                        if parent_task is not None
+                        and isinstance(parent_task.agent_config, dict)
+                        else None
+                    )
+                    selected_file_ids = (
+                        [
+                            str(file_id)
+                            for file_id in raw_selected_file_ids
+                            if isinstance(file_id, str) and file_id.strip()
+                        ]
+                        if isinstance(raw_selected_file_ids, list)
+                        else []
+                    )
+                    if selected_file_ids:
+                        uploaded_files = (
+                            self._db.query(UploadedFile)
+                            .filter(
+                                UploadedFile.file_id.in_(selected_file_ids),
+                                UploadedFile.user_id == self._user_id,
+                            )
+                            .all()
+                        )
+                        file_info = [
+                            {
+                                "file_id": str(file.file_id),
+                                "filename": str(file.filename),
+                                "storage_path": str(file.storage_path),
+                                "mime_type": file.mime_type,
+                                "file_size": int(file.file_size or 0),
+                            }
+                            for file in uploaded_files
+                        ]
+                        if file_info:
+                            execution_context["uploaded_files"] = [
+                                file["file_id"] for file in file_info
+                            ]
+                            execution_context["file_info"] = file_info
+                except Exception:
+                    logger.debug(
+                        "Failed to propagate parent task file context to agent tool",
+                        exc_info=True,
+                    )
+
             # Execute task
             with UserContext(self._user_id):
                 result = await agent_service.execute_task(
@@ -1406,13 +1513,22 @@ class AgentTool(AbstractBaseTool):
                 )
 
             output = result.get("output", "No response generated")
+            file_outputs = (
+                result.get("file_outputs", []) if isinstance(result, dict) else []
+            )
             logger.info(
                 f"Agent tool {self.name} executed successfully, output length: {len(output)}"
             )
             await self._trace_delegation(
-                "end", execution_task_id=execution_task_id, output=str(output)
+                "end",
+                execution_task_id=execution_task_id,
+                output=str(output),
+                file_outputs=file_outputs if isinstance(file_outputs, list) else [],
             )
-            return AgentToolResult(response=output).model_dump()
+            return AgentToolResult(
+                response=output,
+                file_outputs=file_outputs if isinstance(file_outputs, list) else [],
+            ).model_dump()
 
         except Exception as e:
             error_msg = f"Error executing agent {self._agent_id}: {str(e)}"
@@ -1454,6 +1570,12 @@ def get_published_agents_tools(
     parent_task_id: int | None = None,
     parent_tracer: Any | None = None,
     agent_call_stack: list[int] | None = None,
+    user: Any | None = None,
+    is_admin: bool = False,
+    llm: Any | None = None,
+    vision_model: Any | None = None,
+    sandbox: Any | None = None,
+    allowed_external_dirs: list[str] | None = None,
 ) -> list[AbstractBaseTool]:
     """
     Get tools for published (and optionally draft) agents.
@@ -1576,6 +1698,12 @@ def get_published_agents_tools(
                 parent_task_id=parent_task_id,
                 parent_tracer=parent_tracer,
                 agent_call_stack=agent_call_stack,
+                user=user,
+                is_admin=is_admin,
+                llm=llm,
+                vision_model=vision_model,
+                sandbox=sandbox,
+                allowed_external_dirs=allowed_external_dirs,
                 workforce_context={
                     key: override[key]
                     for key in (
@@ -1625,12 +1753,23 @@ async def create_agent_tools(config: "WebToolConfig") -> list[AbstractBaseTool]:
             return []
 
         excluded_agent_id = config.get_excluded_agent_id() if config else None
+        workspace_config = config.get_workspace_config() if config else None
+        workspace_base_dir = (
+            workspace_config.get("base_dir")
+            if isinstance(workspace_config, dict)
+            else None
+        )
+        allowed_external_dirs = (
+            workspace_config.get("allowed_external_dirs")
+            if isinstance(workspace_config, dict)
+            else None
+        )
 
         return get_published_agents_tools(
             db=db,
             user_id=user_id,
             task_id=config.get_task_id(),
-            workspace_base_dir=None,  # Will use get_uploads_dir() default
+            workspace_base_dir=workspace_base_dir,
             excluded_agent_id=excluded_agent_id,
             include_draft=False,  # Only PUBLISHED agents
             allowed_agent_ids=allowed_agent_ids,
@@ -1642,6 +1781,12 @@ async def create_agent_tools(config: "WebToolConfig") -> list[AbstractBaseTool]:
             parent_task_id=getattr(config, "get_parent_task_id", lambda: None)(),
             parent_tracer=getattr(config, "get_parent_tracer", lambda: None)(),
             agent_call_stack=getattr(config, "get_agent_call_stack", lambda: [])(),
+            user=getattr(config, "_user", None),
+            is_admin=bool(getattr(config, "is_admin", lambda: False)()),
+            llm=getattr(config, "get_llm", lambda: None)(),
+            vision_model=getattr(config, "_explicit_vision_model", None),
+            sandbox=getattr(config, "get_sandbox", lambda: None)(),
+            allowed_external_dirs=allowed_external_dirs,
         )
     except Exception as e:
         logger.warning(f"Failed to create agent tools: {e}")

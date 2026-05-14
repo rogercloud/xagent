@@ -106,6 +106,30 @@ export async function updateWorkforce(
   return response.json()
 }
 
+export async function publishWorkforce(
+  workforceId: number | string,
+): Promise<WorkforceDetail> {
+  const response = await apiRequest(`${getApiUrl()}/api/workforces/${workforceId}/publish`, {
+    method: "POST",
+  })
+  if (!response.ok) {
+    throw await parseApiError(response, "Failed to publish workforce")
+  }
+  return response.json()
+}
+
+export async function unpublishWorkforce(
+  workforceId: number | string,
+): Promise<WorkforceDetail> {
+  const response = await apiRequest(`${getApiUrl()}/api/workforces/${workforceId}/unpublish`, {
+    method: "POST",
+  })
+  if (!response.ok) {
+    throw await parseApiError(response, "Failed to unpublish workforce")
+  }
+  return response.json()
+}
+
 export async function addWorkforceAgent(
   workforceId: number | string,
   payload: WorkforceWorkerPayload,

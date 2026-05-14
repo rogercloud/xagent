@@ -315,7 +315,16 @@ async def test_agent_tool_emits_workforce_delegation_trace_events(monkeypatch) -
                 self.__class__.init_kwargs = kwargs
 
             async def execute_task(self, task, context=None, task_id=None):
-                return {"output": "worker output"}
+                return {
+                    "output": "worker output",
+                    "file_outputs": [
+                        {
+                            "file_id": "worker-file-id",
+                            "filename": "worker.xlsx",
+                            "file_path": "/tmp/worker.xlsx",
+                        }
+                    ],
+                }
 
         class FakeTracer:
             def __init__(self):
@@ -359,11 +368,19 @@ async def test_agent_tool_emits_workforce_delegation_trace_events(monkeypatch) -
         result = await tool.run_json_async({"task": "research"})
 
         assert result["response"] == "worker output"
+        assert result["file_outputs"] == [
+            {
+                "file_id": "worker-file-id",
+                "filename": "worker.xlsx",
+                "file_path": "/tmp/worker.xlsx",
+            }
+        ]
         assert FakeAgentService.init_kwargs["tracer"] is tracer
         nested_tool_config = FakeAgentService.init_kwargs["tool_config"]
         assert nested_tool_config.get_parent_tracer() is tracer
         assert nested_tool_config.get_parent_task_id() == 123
         assert nested_tool_config.get_agent_call_stack() == [agent.id]
+        assert nested_tool_config.get_workspace_config()["db_task_id"] == 123
         assert [event["data"]["event_type"] for event in tracer.events] == [
             "workforce_delegation_start",
             "workforce_delegation_end",
@@ -372,6 +389,13 @@ async def test_agent_tool_emits_workforce_delegation_trace_events(monkeypatch) -
         assert tracer.events[0]["data"]["workforce_run_id"] == 456
         assert tracer.events[0]["data"]["worker_alias"] == "Researcher"
         assert tracer.events[1]["data"]["output"] == "worker output"
+        assert tracer.events[1]["data"]["file_outputs"] == [
+            {
+                "file_id": "worker-file-id",
+                "filename": "worker.xlsx",
+                "file_path": "/tmp/worker.xlsx",
+            }
+        ]
     finally:
         db.close()
         _remove_db(db_path)

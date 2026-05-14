@@ -1378,6 +1378,7 @@ class DAGPlanExecutePattern(AgentPattern):
 
         # Add file outputs if available
         file_outputs = self._extract_file_outputs()
+        file_outputs.extend(self._extract_file_outputs_from_history(execution_history))
         if file_outputs:
             result["file_outputs"] = file_outputs
 
@@ -1441,6 +1442,60 @@ class DAGPlanExecutePattern(AgentPattern):
         logger.info(f"File outputs array: {file_outputs}")
         return file_outputs
 
+    def _extract_file_outputs_from_history(
+        self, execution_history: List[Dict[str, Any]]
+    ) -> List[Dict[str, str]]:
+        """Collect output files reported by delegated tools and completed steps."""
+        collected: List[Dict[str, str]] = []
+        seen: set[str] = set()
+
+        def add_file_output(file_info: Any) -> None:
+            if not isinstance(file_info, dict):
+                return
+            file_id = str(file_info.get("file_id") or "").strip()
+            filename = str(file_info.get("filename") or "").strip()
+            file_path = str(file_info.get("file_path") or "").strip()
+            relative_path = str(file_info.get("relative_path") or "").strip()
+            download_path = str(file_info.get("download_path") or "").strip()
+            key = file_id or file_path or relative_path or download_path
+            if not key or key in seen:
+                return
+            seen.add(key)
+
+            output: Dict[str, str] = {}
+            if file_id:
+                output["file_id"] = file_id
+            if filename:
+                output["filename"] = filename
+            if file_path:
+                output["file_path"] = file_path
+            if relative_path:
+                output["relative_path"] = relative_path
+            if download_path:
+                output["download_path"] = download_path
+            collected.append(output)
+
+        def collect_from_result(result: Any) -> None:
+            if not isinstance(result, dict):
+                return
+            file_outputs = result.get("file_outputs")
+            if isinstance(file_outputs, list):
+                for file_info in file_outputs:
+                    add_file_output(file_info)
+            nested_result = result.get("result")
+            if isinstance(nested_result, dict):
+                collect_from_result(nested_result)
+
+        for entry in execution_history:
+            collect_from_result(entry.get("result"))
+            results = entry.get("results")
+            if isinstance(results, list):
+                for step_result in results:
+                    if isinstance(step_result, dict):
+                        collect_from_result(step_result.get("result"))
+
+        return collected
+
     def _compile_continuation_result(
         self,
         additional_task: str,
@@ -1493,6 +1548,7 @@ class DAGPlanExecutePattern(AgentPattern):
 
         # Add file outputs if available
         file_outputs = self._extract_file_outputs()
+        file_outputs.extend(self._extract_file_outputs_from_history(execution_results))
         if file_outputs:
             result["file_outputs"] = file_outputs
 

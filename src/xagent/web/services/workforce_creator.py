@@ -57,12 +57,9 @@ def _clean_creation_plan(
         str(manager.get("description") or "").strip()
         or "Coordinates this Workforce and synthesizes worker outputs."
     )
-    manager_instructions = (
-        str(manager.get("instructions") or "").strip()
-        or (
-            "Understand the user's goal, delegate focused work to the available "
-            "workers, compare their outputs, and return one coherent final answer."
-        )
+    manager_instructions = str(manager.get("instructions") or "").strip() or (
+        "Understand the user's goal, delegate focused work to the available "
+        "workers, compare their outputs, and return one coherent final answer."
     )
 
     workers = candidate.get("workers")
@@ -119,7 +116,10 @@ def _fallback_creation_plan(prompt: str, agents: list[Agent]) -> dict[str, Any]:
     selected: list[Agent] = []
     for agent in agents:
         haystack = f"{agent.name} {agent.description or ''}".lower()
-        if any(token and token in haystack for token in re.findall(r"[a-z0-9]+", lower_prompt)):
+        if any(
+            token and token in haystack
+            for token in re.findall(r"[a-z0-9]+", lower_prompt)
+        ):
             selected.append(agent)
         if len(selected) >= 3:
             break

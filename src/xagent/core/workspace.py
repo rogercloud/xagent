@@ -51,8 +51,10 @@ class TaskWorkspace:
         id: str,
         base_dir: Optional[str] = None,
         allowed_external_dirs: Optional[List[str]] = None,
+        db_task_id: Optional[int] = None,
     ):
         self.id = id
+        self.db_task_id = db_task_id
         if base_dir is None:
             base_dir = str(get_uploads_dir())
         self.base_dir = (
@@ -131,7 +133,7 @@ class TaskWorkspace:
         from .storage.manager import create_db_session
 
         # Use provided session or create temporary one
-        if db_session:
+        if db_session is not None:
             db = db_session
             should_close = False
         else:
@@ -149,17 +151,19 @@ class TaskWorkspace:
             if existing:
                 return
 
-            # Extract task_id from workspace id (e.g., 'web_task_265' -> 265)
-            # Handle test environment workspaces (e.g., 'test_task')
-            try:
-                task_id = int(self.id.split("_")[-1])
-            except (ValueError, IndexError):
-                # Not a valid task ID, likely a test workspace
-                # Skip database registration in test environments
-                logger.debug(
-                    f"Skipping database registration for test workspace '{self.id}', file_id={file_id}"
-                )
-                return
+            task_id = self.db_task_id
+            if task_id is None:
+                # Extract task_id from workspace id (e.g., 'web_task_265' -> 265).
+                # AgentTool workspaces use non-DB ids such as 'agent_2_abcd1234',
+                # so callers should pass db_task_id explicitly for those.
+                try:
+                    task_id = int(self.id.split("_")[-1])
+                except (ValueError, IndexError):
+                    logger.debug(
+                        f"Skipping database registration for workspace '{self.id}' "
+                        f"without db_task_id, file_id={file_id}"
+                    )
+                    return
 
             # Get user_id from task
             task = db.query(Task).filter(Task.id == task_id).first()
@@ -208,7 +212,7 @@ class TaskWorkspace:
         try:
             from ..web.models.uploaded_file import UploadedFile
 
-            if db_session:
+            if db_session is not None:
                 db = db_session
                 should_close = False
             else:
@@ -873,6 +877,7 @@ def create_workspace(
     id: str,
     base_dir: Optional[str] = None,
     allowed_external_dirs: Optional[List[str]] = None,
+    db_task_id: Optional[int] = None,
 ) -> TaskWorkspace:
     """
     Create a new workspace for the given id.
@@ -887,7 +892,7 @@ def create_workspace(
     """
     if base_dir is None:
         base_dir = str(get_uploads_dir())
-    return TaskWorkspace(id, base_dir, allowed_external_dirs)
+    return TaskWorkspace(id, base_dir, allowed_external_dirs, db_task_id=db_task_id)
 
 
 def get_workspace_output_files(
@@ -925,6 +930,7 @@ class WorkspaceManager:
         base_dir: str,
         task_id: str,
         allowed_external_dirs: Optional[List[str]] = None,
+        db_task_id: Optional[int] = None,
     ) -> TaskWorkspace:
         """
         Get existing workspace or create new one.
@@ -940,8 +946,15 @@ class WorkspaceManager:
         cache_key = f"{base_dir}:{task_id}"
 
         if cache_key not in self._workspaces:
-            workspace = TaskWorkspace(task_id, base_dir, allowed_external_dirs)
+            workspace = TaskWorkspace(
+                task_id,
+                base_dir,
+                allowed_external_dirs,
+                db_task_id=db_task_id,
+            )
             self._workspaces[cache_key] = workspace
+        elif db_task_id is not None and self._workspaces[cache_key].db_task_id is None:
+            self._workspaces[cache_key].db_task_id = db_task_id
 
         return self._workspaces[cache_key]
 

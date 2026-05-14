@@ -341,7 +341,7 @@ export function ChatMessage({
     <div className="w-full space-y-2 animate-fade-in group">
       {shouldShowProcess && !isUser && (
         <div className={cn("pl-7")}>
-          <TraceEventRenderer events={traceEvents} />
+          <TraceEventRenderer events={traceEvents} taskStatus={taskStatus} />
         </div>
       )}
 

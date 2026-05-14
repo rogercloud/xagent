@@ -1,5 +1,6 @@
 import os
 import tempfile
+from asyncio import run
 from pathlib import Path
 from typing import Any, cast
 
@@ -9,13 +10,16 @@ from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
+from xagent.core.workspace import TaskWorkspace
 from xagent.web.api.auth import hash_password
-from xagent.web.api.files import file_router
+from xagent.web.api.files import download_file, file_router
 from xagent.web.auth_config import JWT_ALGORITHM, JWT_SECRET_KEY
 from xagent.web.models.database import Base, get_db
 from xagent.web.models.task import Task
 from xagent.web.models.uploaded_file import UploadedFile
 from xagent.web.models.user import User
+
+_ORIGINAL_CREATE_FILE_RECORD = TaskWorkspace._create_file_record
 
 
 @pytest.fixture(scope="function")
@@ -183,6 +187,89 @@ class TestAdminFileAccess:
 
         assert response.status_code == 200
         assert response.content == b"my content"
+
+    def test_registered_agent_workspace_file_download(self, test_db, temp_uploads_dir):
+        admin_user, regular_user, test_app, session = test_db
+        del admin_user
+        regular_user_id = int(cast(Any, regular_user.id))
+        task = Task(
+            id=85,
+            user_id=regular_user_id,
+            title="Agent Workspace File",
+            description="Agent workspace output file",
+        )
+        session.add(task)
+        session.commit()
+
+        workspace_output_dir = temp_uploads_dir / "agent_2_99ea8e11" / "output"
+        workspace_output_dir.mkdir(parents=True, exist_ok=True)
+        file_path = workspace_output_dir / "世界杯报告.txt"
+        file_path.write_text("agent output")
+
+        uploaded_file = UploadedFile(
+            user_id=regular_user_id,
+            task_id=int(cast(Any, task.id)),
+            filename=file_path.name,
+            storage_path=str(file_path),
+            mime_type="text/plain",
+            file_size=len("agent output"),
+        )
+        session.add(uploaded_file)
+        session.commit()
+        session.refresh(uploaded_file)
+
+        del test_app
+        response = run(
+            download_file(
+                str(uploaded_file.file_id),
+                user=regular_user,
+                db=session,
+            )
+        )
+
+        assert response.path == str(file_path)
+        assert response.filename == "世界杯报告.txt"
+        assert (
+            "filename*=utf-8''%E4%B8%96%E7%95%8C%E6%9D%AF%E6%8A%A5%E5%91%8A.txt"
+            in response.headers["content-disposition"]
+        )
+
+    def test_agent_workspace_registration_uses_db_task_id(
+        self, test_db, temp_uploads_dir, monkeypatch
+    ):
+        admin_user, regular_user, test_app, session = test_db
+        del admin_user, test_app
+        monkeypatch.setattr(
+            TaskWorkspace,
+            "_create_file_record",
+            _ORIGINAL_CREATE_FILE_RECORD,
+        )
+        regular_user_id = int(cast(Any, regular_user.id))
+        task = Task(
+            id=86,
+            user_id=regular_user_id,
+            title="Agent Workspace Registration",
+            description="worker output registration",
+        )
+        session.add(task)
+        session.commit()
+
+        workspace = TaskWorkspace(
+            "agent_2_99ea8e11",
+            str(temp_uploads_dir),
+            db_task_id=int(cast(Any, task.id)),
+        )
+        output_file = workspace.output_dir / "report.txt"
+        output_file.write_text("registered output")
+
+        file_id = workspace.register_file(str(output_file), db_session=session)
+
+        uploaded_file = (
+            session.query(UploadedFile).filter(UploadedFile.file_id == file_id).one()
+        )
+        assert uploaded_file.task_id == int(cast(Any, task.id))
+        assert uploaded_file.user_id == regular_user_id
+        assert uploaded_file.storage_path == str(output_file)
 
     def test_regular_user_access_other_user_file_denied(
         self, test_db, temp_uploads_dir

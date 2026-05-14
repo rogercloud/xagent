@@ -878,6 +878,8 @@ class PlanExecutor:
                 # Include success status
                 if "success" in result:
                     step_trace_data["success"] = result["success"]
+                if "file_outputs" in result:
+                    step_trace_data["file_outputs"] = result["file_outputs"]
 
             # Check for agent-specific trace data in the result (added by format_query_result tools)
             # This avoids circular dependencies by letting tools add data directly to results
@@ -892,6 +894,8 @@ class PlanExecutor:
                 and isinstance(result["result"], dict)
             ):
                 nested_result = result["result"]
+                if "file_outputs" in nested_result:
+                    step_trace_data["file_outputs"] = nested_result["file_outputs"]
                 if "agent_trace_data" in nested_result:
                     agent_trace_data = nested_result["agent_trace_data"]
                     if agent_trace_data:

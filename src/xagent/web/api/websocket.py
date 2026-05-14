@@ -1085,6 +1085,13 @@ async def execute_v2_resume_background(
         db_lease = next(db_gen)
         try:
             lease = acquire_task_lease(db_lease, task_id)
+            if lease is not None:
+                task_for_sync = db_lease.query(Task).filter(Task.id == task_id).first()
+                if task_for_sync is not None:
+                    sync_workforce_run_status(
+                        db_lease, task_for_sync, TaskStatus.RUNNING
+                    )
+                    db_lease.commit()
         finally:
             db_lease.close()
         if lease is None:
@@ -1151,6 +1158,8 @@ async def execute_v2_resume_background(
                         db_new, task_id, status=TaskStatus.FAILED
                     )
                     db_new.refresh(task_updated)
+                sync_workforce_run_status(db_new, task_updated, task_updated.status)
+                db_new.commit()
                 final_status = task_updated.status.value
             else:
                 final_status = task.status.value

@@ -6,10 +6,13 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from xagent.web.models.agent import Agent, AgentStatus
 from xagent.web.models.database import Base
-from xagent.web.models.task import TaskStatus
+from xagent.web.models.task import Task, TaskStatus
 from xagent.web.models.user import User
-from xagent.web.models.workforce import Workforce, WorkforceAgent
-from xagent.web.services.workforce_runtime import _map_task_status
+from xagent.web.models.workforce import Workforce, WorkforceAgent, WorkforceRun
+from xagent.web.services.workforce_runtime import (
+    _map_task_status,
+    sync_workforce_run_status,
+)
 from xagent.web.services.workforce_snapshot import (
     _build_worker_tool_name,
     build_agent_tool_overrides,
@@ -125,7 +128,7 @@ def test_build_workforce_snapshot_requires_enabled_worker():
             owner_user_id=regular_user.id,
             name="No Enabled Workers",
             manager_agent_id=manager.id,
-            status="draft",
+            status="active",
         )
         db_session.add(workforce)
         db_session.commit()
@@ -167,6 +170,64 @@ def test_map_task_status_maps_paused() -> None:
     assert _map_task_status(TaskStatus.FAILED) == "failed"
     assert _map_task_status(None) is None
     assert _map_task_status("unknown") is None
+
+
+def test_sync_workforce_run_status_tracks_task_lifecycle() -> None:
+    db_session, db_path = _create_session()
+    try:
+        regular_user = _create_user(db_session, "run-sync-user")
+        manager = _create_agent(db_session, regular_user, "Run Sync Manager")
+        workforce = Workforce(
+            scope_type="user",
+            scope_id=str(regular_user.id),
+            owner_user_id=regular_user.id,
+            name="Run Sync Workforce",
+            manager_agent_id=manager.id,
+            status="active",
+        )
+        db_session.add(workforce)
+        db_session.flush()
+        task = Task(
+            user_id=regular_user.id,
+            title="Run sync task",
+            description="Run sync task",
+            status=TaskStatus.PENDING,
+            agent_id=manager.id,
+            agent_config={},
+        )
+        db_session.add(task)
+        db_session.flush()
+        run = WorkforceRun(
+            workforce_id=workforce.id,
+            task_id=task.id,
+            user_id=regular_user.id,
+            status="pending",
+            snapshot={"version": 1},
+        )
+        db_session.add(run)
+        db_session.flush()
+        task.agent_config = {"workforce_run_id": run.id}
+        db_session.commit()
+
+        sync_workforce_run_status(db_session, task, TaskStatus.RUNNING)
+        db_session.commit()
+        db_session.refresh(run)
+        assert run.status == "running"
+        assert run.completed_at is None
+
+        sync_workforce_run_status(db_session, task, TaskStatus.COMPLETED)
+        db_session.commit()
+        db_session.refresh(run)
+        assert run.status == "completed"
+        assert run.completed_at is not None
+    finally:
+        db_session.close()
+        try:
+            import os
+
+            os.remove(db_path)
+        except OSError:
+            pass
 
 
 def test_build_worker_tool_name_truncates_long_alias() -> None:

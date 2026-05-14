@@ -29,6 +29,18 @@ const generateMessageId = (prefix: string) => {
   return `${prefix}-${++messageIdCounter}-${Date.now()}-${Math.random().toString(36).substr(2, 5)}`
 }
 
+const createNormalizedTraceEvent = (
+  message: WebSocketMessage,
+  eventType: string,
+  eventData: Record<string, unknown>,
+): TraceEvent => ({
+  event_id: message.event_id || String(eventData.event_id || generateMessageId(`trace-${eventType}`)),
+  event_type: eventType,
+  step_id: message.step_id || (typeof eventData.step_id === "string" ? eventData.step_id : undefined),
+  timestamp: message.timestamp,
+  data: eventData,
+})
+
 // Simple deduplication for all messages
 const recentMessages = new Set<string>()
 
@@ -2555,7 +2567,10 @@ export function AppProvider({ children, token }: { children: React.ReactNode; to
           // Default: add as trace event
           else {
             console.trace('Raw message:', JSON.stringify(message), 'Handler: handleMessage (unhandled event_type:', eventType, ')')
-            dispatch({ type: "ADD_TRACE_EVENT", payload: traceEventData })
+            dispatch({
+              type: "ADD_TRACE_EVENT",
+              payload: createNormalizedTraceEvent(message, eventType, eventData),
+            })
           }
         } else {
           console.trace('Raw message:', JSON.stringify(message), 'Handler: handleMessage (no event_type, direct trace event)')

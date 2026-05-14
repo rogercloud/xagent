@@ -15,7 +15,9 @@ import {
   addWorkforceAgent,
   getWorkforce,
   listAgentOptions,
+  publishWorkforce,
   removeWorkforceAgent,
+  unpublishWorkforce,
   updateWorkforce,
   updateWorkforceAgent,
 } from "@/lib/workforces-api"
@@ -217,6 +219,38 @@ export default function WorkforceDetailPage() {
     }
   }
 
+  const publishCurrentWorkforce = async () => {
+    if (!id) return
+    try {
+      setSaving(true)
+      setError(null)
+      const next = await publishWorkforce(id)
+      setWorkforce(next)
+      syncForm(next)
+      setMessage(t("workforces.messages.published"))
+    } catch (err) {
+      setError(err instanceof Error ? err.message : t("workforces.errors.publish"))
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  const unpublishCurrentWorkforce = async () => {
+    if (!id) return
+    try {
+      setSaving(true)
+      setError(null)
+      const next = await unpublishWorkforce(id)
+      setWorkforce(next)
+      syncForm(next)
+      setMessage(t("workforces.messages.unpublished"))
+    } catch (err) {
+      setError(err instanceof Error ? err.message : t("workforces.errors.unpublish"))
+    } finally {
+      setSaving(false)
+    }
+  }
+
   if (loading) return <div className="h-full overflow-y-auto p-4 text-muted-foreground sm:p-8">{t("workforces.loading.detail")}</div>
   if (error && !workforce) return <div className="h-full overflow-y-auto p-4 text-red-500 sm:p-8">{error}</div>
   if (!workforce) return <div className="h-full overflow-y-auto p-4 text-muted-foreground sm:p-8">{t("workforces.errors.notFound")}</div>
@@ -232,6 +266,20 @@ export default function WorkforceDetailPage() {
           </p>
         </div>
         <div className="flex flex-wrap gap-3">
+          {workforce.status === "draft" ? (
+            <Button onClick={() => void publishCurrentWorkforce()} disabled={saving}>
+              {saving ? t("workforces.loading.saving") : t("workforces.actions.publish")}
+            </Button>
+          ) : null}
+          {workforce.status === "active" ? (
+            <Button
+              variant="outline"
+              onClick={() => void unpublishCurrentWorkforce()}
+              disabled={saving}
+            >
+              {saving ? t("workforces.loading.saving") : t("workforces.actions.unpublish")}
+            </Button>
+          ) : null}
           <Link href={`/workforces/${workforce.id}/builder`}>
             <Button variant="outline">{t("workforces.actions.builder")}</Button>
           </Link>

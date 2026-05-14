@@ -3112,7 +3112,9 @@ Build when you need.`
       down: "Down",
       proposeChanges: "Propose Changes",
       applyChanges: "Apply Changes",
-      alreadyApplied: "Already Applied"
+      alreadyApplied: "Already Applied",
+      publish: "Publish",
+      unpublish: "Unpublish"
     },
     fields: {
       name: "Name",
@@ -3246,7 +3248,14 @@ Build when you need.`
       }
     },
     canvas: {
-      connections: "Connections"
+      backToDetails: "Back to details",
+      connections: "Connections",
+      noConnections: "No connections configured.",
+      nodeTypes: {
+        human: "Human",
+        manager: "Manager",
+        worker: "Worker"
+      }
     },
     loading: {
       list: "Loading workforces...",
@@ -3268,7 +3277,9 @@ Build when you need.`
       workerUpdated: "Worker updated",
       workerRemoved: "Worker removed",
       proposalCreated: "Builder proposal created",
-      changesApplied: "Workforce changes applied"
+      changesApplied: "Workforce changes applied",
+      published: "Workforce published",
+      unpublished: "Workforce unpublished"
     },
     errors: {
       loadList: "Failed to load workforces",
@@ -3285,7 +3296,9 @@ Build when you need.`
       canvasUnavailable: "Canvas unavailable.",
       loadBuilder: "Failed to load builder",
       proposeChanges: "Failed to propose changes",
-      applyChanges: "Failed to apply changes"
+      applyChanges: "Failed to apply changes",
+      publish: "Failed to publish workforce",
+      unpublish: "Failed to unpublish workforce"
     }
   },
   adminMcp: {

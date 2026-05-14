@@ -5,7 +5,8 @@ from fastapi import HTTPException
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session, sessionmaker
 
-from xagent.web.api.agents import delete_agent
+from xagent.web.api.agents import delete_agent, get_agent, list_agents
+from xagent.web.api.chat import create_task
 from xagent.web.api.workforces import (
     WorkforceBuilderApplyRequest,
     WorkforceBuilderProposeRequest,
@@ -25,7 +26,9 @@ from xagent.web.api.workforces import (
     get_workforce_canvas,
     list_workforces,
     propose_workforce_changes,
+    publish_workforce,
     remove_workforce_agent,
+    unpublish_workforce,
     update_workforce,
     update_workforce_agent,
 )
@@ -33,6 +36,7 @@ from xagent.web.models.agent import Agent, AgentStatus
 from xagent.web.models.database import Base
 from xagent.web.models.user import User
 from xagent.web.models.workforce import Workforce, WorkforceAgent
+from xagent.web.schemas.chat import TaskCreateRequest
 from xagent.web.services import workforce_builder as workforce_builder_service
 from xagent.web.services.workforce_access import WorkforcePolicy, set_workforce_policy
 
@@ -75,6 +79,210 @@ def _create_agent(
     db_session.commit()
     db_session.refresh(agent)
     return agent
+
+
+@pytest.mark.asyncio
+async def test_list_agents_hides_workforce_managers() -> None:
+    db_session, db_path = _create_session()
+    try:
+        regular_user = _create_user(db_session, "agent-list-user")
+        manager = _create_agent(db_session, regular_user, "Internal Manager")
+        worker = _create_agent(db_session, regular_user, "Worker Agent")
+        normal_agent = _create_agent(db_session, regular_user, "Regular Agent")
+
+        await create_workforce(
+            WorkforceCreateRequest(
+                name="Managed Workforce",
+                manager_agent_id=manager.id,
+                workers=[
+                    WorkforceWorkerInput(
+                        agent_id=worker.id,
+                        assignment_instructions="Handle assigned work.",
+                    )
+                ],
+            ),
+            db_session,
+            regular_user,
+        )
+
+        listed_agents = await list_agents(regular_user, db_session)
+        listed_agent_ids = {agent.id for agent in listed_agents}
+
+        assert manager.id not in listed_agent_ids
+        assert worker.id in listed_agent_ids
+        assert normal_agent.id in listed_agent_ids
+    finally:
+        db_session.close()
+        try:
+            import os
+
+            os.remove(db_path)
+        except OSError:
+            pass
+
+
+@pytest.mark.asyncio
+async def test_workforce_manager_is_hidden_from_direct_agent_access() -> None:
+    db_session, db_path = _create_session()
+    try:
+        regular_user = _create_user(db_session, "manager-hidden-user")
+        manager = _create_agent(db_session, regular_user, "Internal Manager")
+        worker = _create_agent(db_session, regular_user, "Worker Agent")
+
+        await create_workforce(
+            WorkforceCreateRequest(
+                name="Managed Workforce",
+                manager_agent_id=manager.id,
+                workers=[
+                    WorkforceWorkerInput(
+                        agent_id=worker.id,
+                        assignment_instructions="Handle assigned work.",
+                    )
+                ],
+            ),
+            db_session,
+            regular_user,
+        )
+
+        with pytest.raises(HTTPException) as detail_error:
+            await get_agent(manager.id, regular_user, db_session)
+        assert detail_error.value.status_code == 404
+
+        with pytest.raises(HTTPException) as task_error:
+            await create_task(
+                TaskCreateRequest(
+                    title="Run internal manager",
+                    description="Run the internal manager directly.",
+                    agent_id=manager.id,
+                ),
+                db_session,
+                regular_user,
+            )
+        assert task_error.value.status_code == 400
+        assert task_error.value.detail == (
+            "Workforce manager agents can only be run through Workforce"
+        )
+    finally:
+        db_session.close()
+        try:
+            import os
+
+            os.remove(db_path)
+        except OSError:
+            pass
+
+
+@pytest.mark.asyncio
+async def test_publish_and_unpublish_workforce() -> None:
+    db_session, db_path = _create_session()
+    try:
+        regular_user = _create_user(db_session, "publish-workforce-user")
+        manager = _create_agent(db_session, regular_user, "Manager")
+        worker = _create_agent(db_session, regular_user, "Worker")
+
+        created = await create_workforce(
+            WorkforceCreateRequest(
+                name="Publishable Workforce",
+                manager_agent_id=manager.id,
+                workers=[
+                    WorkforceWorkerInput(
+                        agent_id=worker.id,
+                        assignment_instructions="Handle assigned work.",
+                    )
+                ],
+            ),
+            db_session,
+            regular_user,
+        )
+        assert created["status"] == "draft"
+
+        published = await publish_workforce(created["id"], db_session, regular_user)
+        assert published["status"] == "active"
+
+        unpublished = await unpublish_workforce(created["id"], db_session, regular_user)
+        assert unpublished["status"] == "draft"
+    finally:
+        db_session.close()
+        try:
+            import os
+
+            os.remove(db_path)
+        except OSError:
+            pass
+
+
+@pytest.mark.asyncio
+async def test_publish_workforce_requires_enabled_worker() -> None:
+    db_session, db_path = _create_session()
+    try:
+        regular_user = _create_user(db_session, "publish-invalid-user")
+        manager = _create_agent(db_session, regular_user, "Manager")
+
+        created = await create_workforce(
+            WorkforceCreateRequest(
+                name="No Workers Workforce",
+                manager_agent_id=manager.id,
+            ),
+            db_session,
+            regular_user,
+        )
+
+        with pytest.raises(HTTPException) as error:
+            await publish_workforce(created["id"], db_session, regular_user)
+        assert error.value.status_code == 400
+        assert error.value.detail == (
+            "Active workforce requires at least one enabled worker"
+        )
+    finally:
+        db_session.close()
+        try:
+            import os
+
+            os.remove(db_path)
+        except OSError:
+            pass
+
+
+@pytest.mark.asyncio
+async def test_draft_workforce_cannot_run() -> None:
+    db_session, db_path = _create_session()
+    try:
+        regular_user = _create_user(db_session, "draft-run-user")
+        manager = _create_agent(db_session, regular_user, "Draft Run Manager")
+        worker = _create_agent(db_session, regular_user, "Draft Run Worker")
+
+        created = await create_workforce(
+            WorkforceCreateRequest(
+                name="Draft Run Workforce",
+                manager_agent_id=manager.id,
+                workers=[
+                    WorkforceWorkerInput(
+                        agent_id=worker.id,
+                        assignment_instructions="Handle draft run work.",
+                    )
+                ],
+            ),
+            db_session,
+            regular_user,
+        )
+
+        with pytest.raises(HTTPException) as run_error:
+            await create_workforce_run(
+                created["id"],
+                WorkforceRunRequest(message="Try to run a draft workforce"),
+                db_session,
+                regular_user,
+            )
+        assert run_error.value.status_code == 400
+        assert run_error.value.detail == "Workforce must be active to run"
+    finally:
+        db_session.close()
+        try:
+            import os
+
+            os.remove(db_path)
+        except OSError:
+            pass
 
 
 @pytest.mark.asyncio
@@ -279,6 +487,7 @@ async def test_workforce_rejects_draft_agent_on_update_add_and_run() -> None:
             WorkforceCreateRequest(
                 name="Lifecycle Workforce",
                 manager_agent_id=manager.id,
+                status="active",
                 workers=[
                     WorkforceWorkerInput(
                         agent_id=worker.id,
@@ -513,7 +722,17 @@ async def test_update_worker_and_canvas() -> None:
 
 
 @pytest.mark.asyncio
-async def test_builder_apply_and_run_workforce() -> None:
+async def test_builder_apply_and_run_workforce(monkeypatch) -> None:
+    async def no_llm_patch(db, user, workforce, message):
+        del db, user, workforce, message
+        return None
+
+    monkeypatch.setattr(
+        workforce_builder_service,
+        "_llm_generate_patch",
+        no_llm_patch,
+    )
+
     db_session, db_path = _create_session()
     try:
         regular_user = _create_user(db_session, "builder-user")
@@ -525,6 +744,7 @@ async def test_builder_apply_and_run_workforce() -> None:
             WorkforceCreateRequest(
                 name="Builder Workforce",
                 manager_agent_id=manager.id,
+                status="active",
                 workers=[
                     WorkforceWorkerInput(
                         agent_id=worker.id,
@@ -619,6 +839,7 @@ async def test_workforce_run_revalidates_policy_visible_agents() -> None:
             WorkforceCreateRequest(
                 name="Policy Workforce",
                 manager_agent_id=manager.id,
+                status="active",
                 workers=[
                     WorkforceWorkerInput(
                         agent_id=worker.id,
@@ -680,6 +901,7 @@ async def test_workforce_run_allows_policy_visible_agents() -> None:
             WorkforceCreateRequest(
                 name="Visible Policy Workforce",
                 manager_agent_id=manager.id,
+                status="active",
                 workers=[
                     WorkforceWorkerInput(
                         agent_id=worker.id,

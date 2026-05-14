@@ -148,6 +148,7 @@ class AgentService:
                 ws_config.get("base_dir", self.workspace_base_dir),
                 ws_config.get("task_id", self.id),
                 self.allowed_external_dirs,
+                db_task_id=ws_config.get("db_task_id"),
             )
         else:
             # Use provided workspace or create new one later in _setup_workspace()
@@ -429,6 +430,7 @@ class AgentService:
                         "output": normalized_output,
                         "success": result.get("success", False),
                         "chat_response": chat_response,
+                        "file_outputs": result.get("file_outputs", []),
                         "dag_status": execution_status,
                         "metadata": {
                             "agent_name": self.name,
@@ -448,6 +450,7 @@ class AgentService:
                     "output", result.get("error", "No output provided")
                 ),
                 "success": result.get("success", False),
+                "file_outputs": result.get("file_outputs", []),
                 "metadata": {
                     "agent_name": self.name,
                     "patterns_used": len(self.patterns),

@@ -3112,7 +3112,9 @@ Build when you need.`
       down: "下移",
       proposeChanges: "生成修改建议",
       applyChanges: "应用修改",
-      alreadyApplied: "已应用"
+      alreadyApplied: "已应用",
+      publish: "发布",
+      unpublish: "取消发布"
     },
     fields: {
       name: "名称",
@@ -3246,7 +3248,14 @@ Build when you need.`
       }
     },
     canvas: {
-      connections: "连接"
+      backToDetails: "返回详情",
+      connections: "连接",
+      noConnections: "暂未配置连接。",
+      nodeTypes: {
+        human: "Human",
+        manager: "Manager",
+        worker: "Worker"
+      }
     },
     loading: {
       list: "正在加载 Workforces...",
@@ -3268,7 +3277,9 @@ Build when you need.`
       workerUpdated: "Worker 已更新",
       workerRemoved: "Worker 已移除",
       proposalCreated: "Builder 修改建议已创建",
-      changesApplied: "Workforce 修改已应用"
+      changesApplied: "Workforce 修改已应用",
+      published: "Workforce 已发布",
+      unpublished: "Workforce 已取消发布"
     },
     errors: {
       loadList: "加载 Workforces 失败",
@@ -3285,7 +3296,9 @@ Build when you need.`
       canvasUnavailable: "画布不可用。",
       loadBuilder: "加载 builder 失败",
       proposeChanges: "生成修改建议失败",
-      applyChanges: "应用修改失败"
+      applyChanges: "应用修改失败",
+      publish: "发布 Workforce 失败",
+      unpublish: "取消发布 Workforce 失败"
     }
   },
   adminMcp: {

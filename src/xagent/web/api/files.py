@@ -4,6 +4,7 @@ import mimetypes
 from pathlib import Path
 from types import ModuleType
 from typing import Any, Dict, Optional, Tuple
+from urllib.parse import quote
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
@@ -115,6 +116,10 @@ def _guess_media_type(filename: str) -> str:
     return media_type or "application/octet-stream"
 
 
+def _content_disposition(disposition: str, filename: str) -> str:
+    return f"{disposition}; filename*=utf-8''{quote(filename)}"
+
+
 def _build_unique_file_path(path: Path) -> Path:
     if not path.exists():
         return path
@@ -141,10 +146,25 @@ def _ensure_under_uploads(path: Path, user_id: int) -> None:
         raise HTTPException(status_code=403, detail="Access denied") from exc
 
 
+def _ensure_under_uploads_root(path: Path) -> None:
+    resolved_path = path.resolve()
+    uploads_root = get_uploads_dir().resolve()
+    try:
+        resolved_path.relative_to(uploads_root)
+    except ValueError as exc:
+        raise HTTPException(status_code=403, detail="Access denied") from exc
+
+
 def _resolve_public_preview_target(
-    base_path: Path, relative_path: Optional[str], user_id: int
+    base_path: Path,
+    relative_path: Optional[str],
+    user_id: int,
+    require_user_root: bool = True,
 ) -> Path:
-    _ensure_under_uploads(base_path, user_id)
+    if require_user_root:
+        _ensure_under_uploads(base_path, user_id)
+    else:
+        _ensure_under_uploads_root(base_path)
     if not relative_path:
         return base_path
 
@@ -156,7 +176,10 @@ def _resolve_public_preview_target(
     except ValueError as exc:
         raise HTTPException(status_code=403, detail="Access denied") from exc
 
-    _ensure_under_uploads(candidate, user_id)
+    if require_user_root:
+        _ensure_under_uploads(candidate, user_id)
+    else:
+        _ensure_under_uploads_root(candidate)
     return candidate
 
 
@@ -736,7 +759,10 @@ async def download_file(
         file_name = full_path.name
         media_type = _guess_media_type(file_name)
 
-    _ensure_under_uploads(full_path, owner_user_id)
+    if file_record:
+        _ensure_under_uploads_root(full_path)
+    else:
+        _ensure_under_uploads(full_path, owner_user_id)
 
     if not full_path.exists():
         raise HTTPException(status_code=404, detail="File not found")
@@ -754,7 +780,10 @@ async def download_file(
         filename=file_name,
         media_type=media_type,
         headers={
-            "Content-Disposition": f'{content_disposition}; filename="{file_name}"'
+            "Content-Disposition": _content_disposition(
+                content_disposition,
+                file_name,
+            )
         },
     )
 
@@ -781,7 +810,10 @@ async def preview_file(
         file_name = full_path.name
         media_type = _guess_media_type(file_name)
 
-    _ensure_under_uploads(full_path, owner_user_id)
+    if file_record:
+        _ensure_under_uploads_root(full_path)
+    else:
+        _ensure_under_uploads(full_path, owner_user_id)
 
     if not full_path.exists():
         raise HTTPException(status_code=404, detail="File not found")
@@ -836,6 +868,7 @@ async def public_preview_file(
         base_path,
         relative_path,
         owner_user_id,
+        require_user_root=file_record is None,
     )
 
     if not target_path.exists() or not target_path.is_file():
@@ -900,7 +933,10 @@ async def delete_file(
             raise HTTPException(status_code=403, detail="Access denied")
         file_name = file_path.name
 
-    _ensure_under_uploads(file_path, owner_user_id)
+    if file_record:
+        _ensure_under_uploads_root(file_path)
+    else:
+        _ensure_under_uploads(file_path, owner_user_id)
 
     if file_path.exists() and file_path.is_file():
         file_path.unlink()

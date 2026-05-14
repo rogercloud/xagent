@@ -312,6 +312,30 @@ def _ensure_can_activate(
         )
 
 
+def _set_workforce_status(
+    db: Session,
+    user: User,
+    workforce_id: int,
+    status: str,
+) -> Workforce:
+    workforce = db.query(Workforce).filter(Workforce.id == workforce_id).first()
+    workforce = ensure_workforce_access(db, user, workforce, action="edit")
+    current_status = cast(str, workforce.status)
+    if current_status == "archived":
+        raise HTTPException(
+            status_code=409,
+            detail="Archived workforce cannot change publish state",
+        )
+
+    normalized_status = normalize_workforce_status(status)
+    _ensure_can_activate(normalized_status, workforce, [])
+    workforce_row = cast(Any, workforce)
+    workforce_row.status = normalized_status
+    db.commit()
+    db.refresh(workforce)
+    return workforce
+
+
 def _create_worker_row(
     db: Session,
     workforce: Workforce,
@@ -531,6 +555,26 @@ async def get_workforce(
 ) -> dict[str, Any]:
     workforce = db.query(Workforce).filter(Workforce.id == workforce_id).first()
     workforce = ensure_workforce_access(db, user, workforce, action="view")
+    return _serialize_workforce_detail(workforce)
+
+
+@router.post("/{workforce_id}/publish")
+async def publish_workforce(
+    workforce_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> dict[str, Any]:
+    workforce = _set_workforce_status(db, user, workforce_id, "active")
+    return _serialize_workforce_detail(workforce)
+
+
+@router.post("/{workforce_id}/unpublish")
+async def unpublish_workforce(
+    workforce_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> dict[str, Any]:
+    workforce = _set_workforce_status(db, user, workforce_id, "draft")
     return _serialize_workforce_detail(workforce)
 
 
