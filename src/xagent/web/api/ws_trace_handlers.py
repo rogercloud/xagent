@@ -322,7 +322,9 @@ class WebSocketTraceHandler(TraceHandler):
         finally:
             db.close()
 
-    def _convert_trace_event_to_stream_event(self, event: TraceEvent) -> dict[str, Any]:
+    def _convert_trace_event_to_stream_event(
+        self, event: TraceEvent
+    ) -> dict[str, Any] | None:
         """Convert trace event to unified stream format."""
         event_type_str = get_event_type_mapping(event)
         logger.debug(
