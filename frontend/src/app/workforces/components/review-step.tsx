@@ -6,7 +6,6 @@ import { Badge } from "@/components/ui/badge"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
 import type {
   WorkforceAgentOption,
-  WorkforceTemplateOption,
   WorkforceWorkerDraft,
 } from "@/types/workforce"
 
@@ -17,7 +16,6 @@ interface ReviewStepProps {
   managerInstructions: string
   workers: WorkforceWorkerDraft[]
   agents: WorkforceAgentOption[]
-  templates: WorkforceTemplateOption[]
 }
 
 export function ReviewStep({
@@ -27,7 +25,6 @@ export function ReviewStep({
   managerInstructions,
   workers,
   agents,
-  templates,
 }: ReviewStepProps) {
   const manager = agents.find((agent) => String(agent.id) === managerAgentId)
 
@@ -36,19 +33,12 @@ export function ReviewStep({
     warnings.push("Manager is not published yet.")
   }
   for (const worker of workers) {
-    if (worker.source_type === "existing") {
-      const agent = agents.find((item) => item.id === worker.agent_id)
-      if (agent && agent.status !== "published") {
-        warnings.push(`${worker.alias || agent.name} is not published yet.`)
-      }
+    const agent = agents.find((item) => item.id === worker.agent_id)
+    if (agent && agent.status !== "published") {
+      warnings.push(`${worker.alias || agent.name} is not published yet.`)
     }
     if (!worker.assignment_instructions.trim()) {
       warnings.push(`${worker.alias || "A worker"} is missing assignment instructions.`)
-    }
-    if (worker.source_type === "new" && worker.agent && !worker.agent.instructions.trim()) {
-      warnings.push(
-        `${worker.alias || worker.agent.name || "A new worker"} is missing agent instructions.`,
-      )
     }
   }
 
@@ -115,18 +105,8 @@ export function ReviewStep({
               </div>
             ) : (
               workers.map((worker, index) => {
-                const agent = worker.agent_id
-                  ? agents.find((item) => item.id === worker.agent_id)
-                  : null
-                const template = worker.template_id
-                  ? templates.find((item) => item.id === worker.template_id)
-                  : null
-                const title =
-                  worker.alias ||
-                  agent?.name ||
-                  template?.name ||
-                  worker.agent?.name ||
-                  `Worker ${index + 1}`
+                const agent = agents.find((item) => item.id === worker.agent_id)
+                const title = worker.alias || agent?.name || `Worker ${index + 1}`
 
                 return (
                   <div key={`${worker.source_type}-${index}`} className="rounded-lg border p-4">
@@ -136,21 +116,11 @@ export function ReviewStep({
                       {agent ? <Badge variant="secondary">{agent.status}</Badge> : null}
                     </div>
                     <div className="mt-1 text-sm text-muted-foreground">
-                      {worker.source_type === "existing"
-                        ? agent?.description || "Existing agent"
-                        : worker.source_type === "template"
-                          ? template?.description || "Template-based worker"
-                          : worker.agent?.description || "Brand new worker"}
+                      {agent?.description || "Published agent"}
                     </div>
                     <div className="mt-3 text-sm text-muted-foreground">
                       {worker.assignment_instructions}
                     </div>
-                    {worker.source_type === "new" && worker.agent ? (
-                      <div className="mt-3 rounded-lg bg-muted/30 p-3 text-sm text-muted-foreground">
-                        <div>Agent name: {worker.agent.name}</div>
-                        <div>Execution mode: {worker.agent.execution_mode}</div>
-                      </div>
-                    ) : null}
                   </div>
                 )
               })

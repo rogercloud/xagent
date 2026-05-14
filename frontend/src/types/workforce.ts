@@ -94,10 +94,8 @@ export interface WorkforceNewAgentDraft {
 }
 
 export interface WorkforceWorkerDraft {
-  source_type: "existing" | "template" | "new"
-  agent_id?: number
-  template_id?: string
-  agent?: WorkforceNewAgentDraft
+  source_type: "existing"
+  agent_id: number
   alias: string
   assignment_instructions: string
   enabled: boolean
@@ -111,15 +109,37 @@ export interface WorkforceCreatePayload {
   manager_instructions?: string
   status?: string
   workers?: Array<{
-    source_type: "existing" | "template" | "new"
-    agent_id?: number
-    template_id?: string
-    agent?: WorkforceNewAgentDraft
+    source_type: "existing"
+    agent_id: number
     alias?: string
     assignment_instructions: string
     enabled?: boolean
     sort_order?: number
   }>
+}
+
+export interface WorkforceUpdatePayload {
+  name?: string
+  description?: string
+  manager_agent_id?: number
+  manager_instructions?: string
+  status?: string
+}
+
+export interface WorkforceWorkerPayload {
+  source_type: "existing"
+  agent_id: number
+  alias?: string
+  assignment_instructions: string
+  enabled?: boolean
+  sort_order?: number
+}
+
+export interface WorkforceWorkerUpdatePayload {
+  alias?: string
+  assignment_instructions?: string
+  enabled?: boolean
+  sort_order?: number
 }
 
 export interface WorkforceRunResponse {

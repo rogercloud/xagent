@@ -14,6 +14,10 @@ import type {
   WorkforceDetail,
   WorkforceListResponse,
   WorkforceRunResponse,
+  WorkforceUpdatePayload,
+  WorkforceWorker,
+  WorkforceWorkerPayload,
+  WorkforceWorkerUpdatePayload,
   WorkforceTemplateOption,
 } from "@/types/workforce"
 
@@ -66,6 +70,76 @@ export async function createWorkforce(payload: WorkforceCreatePayload): Promise<
     throw await parseApiError(response, "Failed to create workforce")
   }
   return response.json()
+}
+
+export async function updateWorkforce(
+  workforceId: number | string,
+  payload: WorkforceUpdatePayload,
+): Promise<WorkforceDetail> {
+  const response = await apiRequest(`${getApiUrl()}/api/workforces/${workforceId}`, {
+    method: "PATCH",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(payload),
+  })
+  if (!response.ok) {
+    throw await parseApiError(response, "Failed to update workforce")
+  }
+  return response.json()
+}
+
+export async function addWorkforceAgent(
+  workforceId: number | string,
+  payload: WorkforceWorkerPayload,
+): Promise<WorkforceWorker> {
+  const response = await apiRequest(`${getApiUrl()}/api/workforces/${workforceId}/agents`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(payload),
+  })
+  if (!response.ok) {
+    throw await parseApiError(response, "Failed to add workforce worker")
+  }
+  return response.json()
+}
+
+export async function updateWorkforceAgent(
+  workforceId: number | string,
+  memberId: number | string,
+  payload: WorkforceWorkerUpdatePayload,
+): Promise<WorkforceWorker> {
+  const response = await apiRequest(
+    `${getApiUrl()}/api/workforces/${workforceId}/agents/${memberId}`,
+    {
+      method: "PATCH",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(payload),
+    },
+  )
+  if (!response.ok) {
+    throw await parseApiError(response, "Failed to update workforce worker")
+  }
+  return response.json()
+}
+
+export async function removeWorkforceAgent(
+  workforceId: number | string,
+  memberId: number | string,
+): Promise<void> {
+  const response = await apiRequest(
+    `${getApiUrl()}/api/workforces/${workforceId}/agents/${memberId}`,
+    {
+      method: "DELETE",
+    },
+  )
+  if (!response.ok) {
+    throw await parseApiError(response, "Failed to remove workforce worker")
+  }
 }
 
 export async function runWorkforce(

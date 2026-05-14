@@ -10,11 +10,9 @@ import { Textarea } from "@/components/ui/textarea"
 import {
   createWorkforce,
   listAgentOptions,
-  listWorkforceTemplates,
 } from "@/lib/workforces-api"
 import type {
   WorkforceAgentOption,
-  WorkforceTemplateOption,
   WorkforceWorkerDraft,
 } from "@/types/workforce"
 import { ManagerStep } from "./manager-step"
@@ -30,7 +28,6 @@ export function WorkforceWizard() {
   const [submitting, setSubmitting] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [agents, setAgents] = useState<WorkforceAgentOption[]>([])
-  const [templates, setTemplates] = useState<WorkforceTemplateOption[]>([])
 
   const [name, setName] = useState("")
   const [description, setDescription] = useState("")
@@ -43,12 +40,7 @@ export function WorkforceWizard() {
       workers.length > 0 &&
       workers.every((worker) => {
         if (!worker.assignment_instructions.trim()) return false
-        if (worker.source_type === "existing") return Boolean(worker.agent_id)
-        if (worker.source_type === "template") return Boolean(worker.template_id)
-        if (worker.source_type === "new") {
-          return Boolean(worker.agent?.name.trim() && worker.agent.instructions.trim())
-        }
-        return false
+        return Boolean(worker.agent_id)
       }),
     [workers],
   )
@@ -57,12 +49,8 @@ export function WorkforceWizard() {
     const loadAgents = async () => {
       try {
         setLoadingAgents(true)
-        const [agentData, templateData] = await Promise.all([
-          listAgentOptions(),
-          listWorkforceTemplates(),
-        ])
-        setAgents(agentData)
-        setTemplates(templateData)
+        const agentData = await listAgentOptions()
+        setAgents(agentData.filter((agent) => agent.status === "published"))
       } catch (err) {
         setError(err instanceof Error ? err.message : "Failed to load agents")
       } finally {
@@ -95,15 +83,6 @@ export function WorkforceWizard() {
         workers: workers.map((worker) => ({
           source_type: worker.source_type,
           agent_id: worker.agent_id,
-          template_id: worker.template_id,
-          agent: worker.agent
-            ? {
-                ...worker.agent,
-                name: worker.agent.name.trim(),
-                description: worker.agent.description.trim(),
-                instructions: worker.agent.instructions.trim(),
-              }
-            : undefined,
           alias: worker.alias.trim() || undefined,
           assignment_instructions: worker.assignment_instructions.trim(),
           enabled: worker.enabled,
@@ -191,7 +170,6 @@ export function WorkforceWizard() {
         <WorkersStep
           managerAgentId={managerAgentId}
           agents={agents}
-          templates={templates}
           workers={workers}
           onWorkersChange={setWorkers}
         />
@@ -205,7 +183,6 @@ export function WorkforceWizard() {
           managerInstructions={managerInstructions}
           workers={workers}
           agents={agents}
-          templates={templates}
         />
       ) : null}
 
