@@ -13,6 +13,7 @@ import type {
   WorkforceCreatePayload,
   WorkforceDetail,
   WorkforceListResponse,
+  WorkforcePromptCreatePayload,
   WorkforceRunResponse,
   WorkforceUpdatePayload,
   WorkforceWorker,
@@ -60,6 +61,22 @@ export async function getWorkforce(workforceId: number | string): Promise<Workfo
 
 export async function createWorkforce(payload: WorkforceCreatePayload): Promise<WorkforceDetail> {
   const response = await apiRequest(`${getApiUrl()}/api/workforces`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(payload),
+  })
+  if (!response.ok) {
+    throw await parseApiError(response, "Failed to create workforce")
+  }
+  return response.json()
+}
+
+export async function createWorkforceFromPrompt(
+  payload: WorkforcePromptCreatePayload,
+): Promise<WorkforceDetail> {
+  const response = await apiRequest(`${getApiUrl()}/api/workforces/from-prompt`, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",

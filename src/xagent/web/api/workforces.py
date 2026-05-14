@@ -6,7 +6,7 @@ from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
 from xagent.web.auth_dependencies import get_current_user
-from xagent.web.models.agent import Agent
+from xagent.web.models.agent import Agent, AgentStatus
 from xagent.web.models.database import get_db
 from xagent.web.models.task import Task, TaskStatus
 from xagent.web.models.user import User
@@ -31,6 +31,7 @@ from ..services.workforce_builder import (
     list_builder_messages,
     serialize_builder_message,
 )
+from ..services.workforce_creator import generate_workforce_creation_plan
 from ..services.workforce_snapshot import (
     build_workforce_snapshot,
     build_workforce_task_config,
@@ -38,6 +39,7 @@ from ..services.workforce_snapshot import (
     normalize_workforce_status,
 )
 from ..services.workforce_workers import (
+    create_agent_record,
     create_workforce_worker,
     ensure_supported_source_type,
     list_template_summaries,
@@ -79,6 +81,10 @@ class WorkforceCreateRequest(BaseModel):
     status: str | None = "draft"
     canvas_layout: dict[str, Any] | None = None
     workers: list[WorkforceWorkerInput] = Field(default_factory=list)
+
+
+class WorkforcePromptCreateRequest(BaseModel):
+    prompt: str = Field(..., min_length=1)
 
 
 class WorkforceUpdateRequest(BaseModel):
@@ -226,6 +232,47 @@ def _check_duplicate_workforce_name(
         query = query.filter(Workforce.id != exclude_workforce_id)
     if query.first():
         raise HTTPException(status_code=409, detail="Workforce name already exists")
+
+
+def _resolve_unique_workforce_name(
+    db: Session,
+    scope_type: str,
+    scope_id: str,
+    name: str,
+) -> str:
+    normalized_name = normalize_text(name, "name", required=True)
+    if normalized_name is None:
+        raise HTTPException(status_code=400, detail="name is required")
+    existing = (
+        db.query(Workforce)
+        .filter(
+            Workforce.scope_type == scope_type,
+            Workforce.scope_id == scope_id,
+            Workforce.name == normalized_name,
+        )
+        .first()
+    )
+    if existing is None:
+        return normalized_name
+
+    base_name = normalized_name
+    suffix = 2
+    while True:
+        suffix_text = f" {suffix}"
+        candidate_base = base_name[: max(1, 200 - len(suffix_text))].rstrip()
+        candidate = f"{candidate_base}{suffix_text}"
+        conflict = (
+            db.query(Workforce)
+            .filter(
+                Workforce.scope_type == scope_type,
+                Workforce.scope_id == scope_id,
+                Workforce.name == candidate,
+            )
+            .first()
+        )
+        if conflict is None:
+            return candidate
+        suffix += 1
 
 
 def _validate_worker_agent_ids(
@@ -380,6 +427,96 @@ async def create_workforce(
 
     for worker_input in request.workers:
         _create_worker_row(db, workforce, worker_input, user)
+
+    db.commit()
+    db.refresh(workforce)
+    return _serialize_workforce_detail(workforce)
+
+
+@router.post("/from-prompt")
+async def create_workforce_from_prompt(
+    request: WorkforcePromptCreateRequest,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> dict[str, Any]:
+    prompt = normalize_text(request.prompt, "prompt", required=True)
+    if prompt is None:
+        raise HTTPException(status_code=400, detail="prompt is required")
+
+    scope_type, scope_id = resolve_create_scope(db, user)
+    if not can_create_workforce(db, user, scope_type, scope_id):
+        raise HTTPException(status_code=403, detail="Access denied")
+
+    plan = await generate_workforce_creation_plan(db, user, prompt)
+    name = _resolve_unique_workforce_name(db, scope_type, scope_id, str(plan["name"]))
+    manager_plan = cast(dict[str, Any], plan["manager"])
+    manager_agent = create_agent_record(
+        db,
+        user,
+        name=str(manager_plan.get("name") or f"{name} Manager"),
+        description=manager_plan.get("description"),
+        instructions=manager_plan.get("instructions"),
+        execution_mode="think",
+        ensure_unique_name=True,
+        status=AgentStatus.PUBLISHED,
+    )
+
+    workforce = Workforce(
+        owner_user_id=user.id,
+        scope_type=scope_type,
+        scope_id=scope_id,
+        name=name,
+        description=normalize_text(plan.get("description"), "description"),
+        manager_agent_id=cast(int, manager_agent.id),
+        manager_instructions=normalize_text(
+            plan.get("manager_instructions"), "manager_instructions"
+        ),
+        status="draft",
+    )
+    db.add(workforce)
+    db.flush()
+
+    for index, worker in enumerate(
+        cast(list[dict[str, Any]], plan.get("workers") or [])
+    ):
+        _create_worker_row(
+            db,
+            workforce,
+            WorkforceWorkerInput(
+                source_type="existing",
+                agent_id=cast(int, worker["agent_id"]),
+                alias=cast(str | None, worker.get("alias")),
+                assignment_instructions=str(worker["assignment_instructions"]),
+                enabled=bool(worker.get("enabled", True)),
+                sort_order=index + 1,
+            ),
+            user,
+        )
+
+    db.add(
+        WorkforceBuilderMessage(
+            workforce_id=workforce.id,
+            user_id=user.id,
+            role="user",
+            content=prompt,
+            status="message",
+        )
+    )
+    warnings = cast(list[str], plan.get("warnings") or [])
+    assistant_content = "Created an initial Workforce draft from your prompt."
+    if warnings:
+        assistant_content = f"{assistant_content}\n\n" + "\n".join(
+            f"- {warning}" for warning in warnings
+        )
+    db.add(
+        WorkforceBuilderMessage(
+            workforce_id=workforce.id,
+            user_id=user.id,
+            role="assistant",
+            content=assistant_content,
+            status="message",
+        )
+    )
 
     db.commit()
     db.refresh(workforce)

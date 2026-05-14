@@ -3152,6 +3152,21 @@ Build when you need.`
       backToWorkforces: "返回 Workforces",
       title: "创建 Workforce",
       description: "先选择管理者，再添加 worker，最后在保存前检查编排配置。",
+      prompt: {
+        badge: "AI 创建",
+        title: "创建 Workforce",
+        description: "描述你想达成的目标。Builder 会创建 manager，在合适时从已发布 agents 中选择 workers，并打开一个可检查的草稿。",
+        cardTitle: "这个 Workforce 应该做什么？",
+        cardDescription: "生成的 manager 会专门用于这个 Workforce。Workers 只会从已有的已发布 agents 中选择。",
+        placeholder: "例如：创建一个用于每周竞品监控的 Workforce。它需要调研竞品动态，总结价格变化，并起草一份简洁的管理层简报。",
+        manualSetup: "手动设置",
+        generate: "生成 Workforce"
+      },
+      manual: {
+        title: "手动设置 Workforce",
+        description: "选择已有 manager，添加 workers，然后在保存前检查编排配置。",
+        backToPrompt: "返回 AI 创建"
+      },
       steps: {
         basics: "基础信息",
         workers: "Workers",

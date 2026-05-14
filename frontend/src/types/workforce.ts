@@ -118,6 +118,10 @@ export interface WorkforceCreatePayload {
   }>
 }
 
+export interface WorkforcePromptCreatePayload {
+  prompt: string
+}
+
 export interface WorkforceUpdatePayload {
   name?: string
   description?: string

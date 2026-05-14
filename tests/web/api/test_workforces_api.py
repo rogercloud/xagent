@@ -10,6 +10,7 @@ from xagent.web.api.workforces import (
     WorkforceBuilderApplyRequest,
     WorkforceBuilderProposeRequest,
     WorkforceCreateRequest,
+    WorkforcePromptCreateRequest,
     WorkforceRunRequest,
     WorkforceUpdateRequest,
     WorkforceWorkerInput,
@@ -17,8 +18,10 @@ from xagent.web.api.workforces import (
     add_workforce_agent,
     apply_workforce_changes,
     create_workforce,
+    create_workforce_from_prompt,
     create_workforce_run,
     get_workforce,
+    get_workforce_builder_messages,
     get_workforce_canvas,
     list_workforces,
     propose_workforce_changes,
@@ -72,6 +75,84 @@ def _create_agent(
     db_session.commit()
     db_session.refresh(agent)
     return agent
+
+
+@pytest.mark.asyncio
+async def test_create_workforce_from_prompt_creates_manager_and_selects_published_workers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db_session, db_path = _create_session()
+    try:
+        regular_user = _create_user(db_session, "prompt-create-user")
+        worker = _create_agent(db_session, regular_user, "Research Agent")
+        draft_worker = _create_agent(
+            db_session,
+            regular_user,
+            "Draft Research Agent",
+            status=AgentStatus.DRAFT,
+        )
+
+        async def fake_creation_plan(*args, **kwargs):
+            return {
+                "name": "Competitor Research Workforce",
+                "description": "Track competitor updates.",
+                "manager": {
+                    "name": "Competitor Research Manager",
+                    "description": "Coordinates competitor research.",
+                    "instructions": "Delegate research and synthesize a weekly brief.",
+                },
+                "manager_instructions": "Delegate research and synthesize a weekly brief.",
+                "workers": [
+                    {
+                        "agent_id": worker.id,
+                        "alias": "Researcher",
+                        "assignment_instructions": "Research competitor updates.",
+                        "enabled": True,
+                    }
+                ],
+                "warnings": [],
+            }
+
+        monkeypatch.setattr(
+            "xagent.web.api.workforces.generate_workforce_creation_plan",
+            fake_creation_plan,
+        )
+
+        created = await create_workforce_from_prompt(
+            WorkforcePromptCreateRequest(
+                prompt="Create a workforce for competitor research and weekly briefings."
+            ),
+            db_session,
+            regular_user,
+        )
+
+        assert created["name"]
+        assert created["status"] == "draft"
+        assert created["manager"]["id"] not in {worker.id, draft_worker.id}
+        manager = (
+            db_session.query(Agent).filter(Agent.id == created["manager"]["id"]).one()
+        )
+        assert manager.status == AgentStatus.PUBLISHED
+        assert manager.execution_mode == "think"
+        assert draft_worker.id not in {
+            item["agent"]["id"] for item in created["workers"]
+        }
+        assert all(
+            item["agent"]["status"] == "published" for item in created["workers"]
+        )
+
+        messages = await get_workforce_builder_messages(
+            created["id"], db_session, regular_user
+        )
+        assert [item["role"] for item in messages["items"]] == ["user", "assistant"]
+    finally:
+        db_session.close()
+        try:
+            import os
+
+            os.remove(db_path)
+        except OSError:
+            pass
 
 
 @pytest.mark.asyncio

@@ -27,7 +27,11 @@ const STEPS = [
   "workforces.create.steps.review",
 ] as const
 
-export function WorkforceWizard() {
+interface WorkforceWizardProps {
+  onPromptSetup?: () => void
+}
+
+export function WorkforceWizard({ onPromptSetup }: WorkforceWizardProps) {
   const router = useRouter()
   const { t } = useI18n()
   const [step, setStep] = useState(0)
@@ -120,14 +124,21 @@ export function WorkforceWizard() {
     <div className="h-full overflow-y-auto">
       <div className="mx-auto flex w-full max-w-6xl flex-col gap-6 p-4 sm:p-8">
       <div className="space-y-4">
-        <Button variant="ghost" className="w-fit gap-2 px-0" onClick={() => router.push("/workforces")}>
-          <ArrowLeft className="h-4 w-4" />
-          {t("workforces.create.backToWorkforces")}
-        </Button>
+        <div className="flex flex-wrap items-center gap-3">
+          <Button variant="ghost" className="w-fit gap-2 px-0" onClick={() => router.push("/workforces")}>
+            <ArrowLeft className="h-4 w-4" />
+            {t("workforces.create.backToWorkforces")}
+          </Button>
+          {onPromptSetup ? (
+            <Button variant="outline" onClick={onPromptSetup}>
+              {t("workforces.create.manual.backToPrompt")}
+            </Button>
+          ) : null}
+        </div>
         <div>
-          <h1 className="text-3xl font-bold">{t("workforces.create.title")}</h1>
+          <h1 className="text-3xl font-bold">{t("workforces.create.manual.title")}</h1>
           <p className="mt-2 text-muted-foreground">
-            {t("workforces.create.description")}
+            {t("workforces.create.manual.description")}
           </p>
         </div>
       </div>

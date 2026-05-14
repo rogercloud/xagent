@@ -3152,6 +3152,21 @@ Build when you need.`
       backToWorkforces: "Back to Workforces",
       title: "Create Workforce",
       description: "Start with a manager, add workers, then review the orchestration before saving.",
+      prompt: {
+        badge: "AI setup",
+        title: "Create Workforce",
+        description: "Describe the outcome you want. The builder will create a manager, select published workers when they fit, and open a reviewable draft.",
+        cardTitle: "What should this Workforce do?",
+        cardDescription: "The generated manager is created for this Workforce. Workers are selected only from existing published agents.",
+        placeholder: "Example: Build a Workforce for weekly competitor monitoring. It should research competitor updates, summarize pricing changes, and draft a concise leadership brief.",
+        manualSetup: "Manual setup",
+        generate: "Generate Workforce"
+      },
+      manual: {
+        title: "Manual Workforce Setup",
+        description: "Choose an existing manager, add workers, then review the orchestration before saving.",
+        backToPrompt: "Back to AI setup"
+      },
       steps: {
         basics: "Basics",
         workers: "Workers",

@@ -97,6 +97,7 @@ def create_agent_record(
     tool_categories: list[str] | None = None,
     suggested_prompts: list[str] | None = None,
     ensure_unique_name: bool = False,
+    status: AgentStatus = AgentStatus.DRAFT,
 ) -> Agent:
     normalized_name = normalize_text(name, "name", required=True)
     if normalized_name is None:
@@ -127,7 +128,7 @@ def create_agent_record(
         skills=normalize_string_list(skills),
         tool_categories=normalize_string_list(tool_categories),
         suggested_prompts=normalize_string_list(suggested_prompts),
-        status=AgentStatus.DRAFT,
+        status=status,
         widget_enabled=True,
         allowed_domains=[],
     )
