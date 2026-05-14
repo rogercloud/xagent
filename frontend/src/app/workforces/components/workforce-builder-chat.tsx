@@ -12,6 +12,7 @@ import {
 } from "@/components/ui/card"
 import { ScrollArea } from "@/components/ui/scroll-area"
 import { Textarea } from "@/components/ui/textarea"
+import { useI18n } from "@/contexts/i18n-context"
 import { cn, formatDate } from "@/lib/utils"
 import type { WorkforceBuilderMessage } from "@/types/workforce"
 
@@ -26,16 +27,13 @@ function roleIcon(role: string) {
   return role === "assistant" ? Bot : User
 }
 
-function roleLabel(role: string) {
-  return role === "assistant" ? "Builder" : "You"
-}
-
 export function WorkforceBuilderChat({
   messages,
   loading = false,
   submitting = false,
   onSubmit,
 }: WorkforceBuilderChatProps) {
+  const { t } = useI18n()
   const [message, setMessage] = useState("")
   const containerRef = useRef<HTMLDivElement | null>(null)
 
@@ -60,9 +58,9 @@ export function WorkforceBuilderChat({
   return (
     <Card className="h-full min-h-[640px]">
       <CardHeader>
-        <CardTitle>Builder Chat</CardTitle>
+        <CardTitle>{t("workforces.builder.chatTitle")}</CardTitle>
         <CardDescription>
-          Describe the workforce change you want. The builder will turn it into a reviewable patch.
+          {t("workforces.builder.chatDescription")}
         </CardDescription>
       </CardHeader>
       <CardContent className="flex h-full flex-col gap-4">
@@ -70,11 +68,10 @@ export function WorkforceBuilderChat({
           <ScrollArea className="h-[440px] rounded-lg border bg-muted/20">
             <div className="space-y-4 p-4">
               {loading ? (
-                <div className="text-sm text-muted-foreground">Loading builder history...</div>
+                <div className="text-sm text-muted-foreground">{t("workforces.loading.builderHistory")}</div>
               ) : messages.length === 0 ? (
                 <div className="rounded-lg border border-dashed bg-background p-4 text-sm text-muted-foreground">
-                  Start with something like: add worker Research Agent to handle competitor
-                  research.
+                  {t("workforces.builder.emptyPrompt")}
                 </div>
               ) : (
                 messages.map((item) => {
@@ -108,7 +105,7 @@ export function WorkforceBuilderChat({
                               : "text-muted-foreground",
                           )}
                         >
-                          <span className="font-medium">{roleLabel(item.role)}</span>
+                          <span className="font-medium">{item.role === "assistant" ? t("workforces.builder.roleBuilder") : t("workforces.builder.roleYou")}</span>
                           {item.created_at ? <span>{formatDate(item.created_at)}</span> : null}
                         </div>
                         <div className="whitespace-pre-wrap text-sm leading-6">{item.content}</div>
@@ -125,7 +122,7 @@ export function WorkforceBuilderChat({
               {submitting ? (
                 <div className="flex items-center gap-3 rounded-lg border bg-background px-4 py-3 text-sm text-muted-foreground">
                   <Loader2 className="size-4 animate-spin" />
-                  <span>Preparing a proposed patch...</span>
+                  <span>{t("workforces.builder.preparingPatch")}</span>
                 </div>
               ) : null}
             </div>
@@ -134,7 +131,7 @@ export function WorkforceBuilderChat({
 
         <div className="space-y-3">
           <Textarea
-            placeholder='Rename this workforce to "Launch Crew" and make Writer focus on launch email copy.'
+            placeholder={t("workforces.builder.messagePlaceholder")}
             value={message}
             onChange={(event) => setMessage(event.target.value)}
             rows={6}
@@ -146,9 +143,9 @@ export function WorkforceBuilderChat({
             }}
           />
           <div className="flex items-center justify-between gap-3">
-            <div className="text-xs text-muted-foreground">Press Ctrl/Cmd + Enter to send.</div>
+            <div className="text-xs text-muted-foreground">{t("workforces.builder.sendHint")}</div>
             <Button onClick={() => void handleSubmit()} disabled={!canSubmit}>
-              {submitting ? "Proposing..." : "Propose Changes"}
+              {submitting ? t("workforces.loading.proposing") : t("workforces.actions.proposeChanges")}
             </Button>
           </div>
         </div>

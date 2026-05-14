@@ -3,6 +3,7 @@
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
 import { Label } from "@/components/ui/label"
 import { Select } from "@/components/ui/select"
+import { useI18n } from "@/contexts/i18n-context"
 import type { WorkforceAgentOption } from "@/types/workforce"
 
 interface ManagerStepProps {
@@ -16,17 +17,19 @@ export function ManagerStep({
   onManagerAgentIdChange,
   agents,
 }: ManagerStepProps) {
+  const { t } = useI18n()
+
   return (
     <Card>
       <CardHeader>
-        <CardTitle>Manager</CardTitle>
+        <CardTitle>{t("workforces.fields.manager")}</CardTitle>
       </CardHeader>
       <CardContent className="space-y-3">
-        <Label>Select the manager agent</Label>
+        <Label>{t("workforces.create.manager.selectLabel")}</Label>
         <Select
           value={managerAgentId}
           onValueChange={onManagerAgentIdChange}
-          placeholder="Choose an agent"
+          placeholder={t("workforces.create.manager.placeholder")}
           options={agents.map((agent) => ({
             value: String(agent.id),
             label: agent.name,

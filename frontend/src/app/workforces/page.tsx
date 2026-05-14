@@ -6,10 +6,12 @@ import { ChevronLeft, ChevronRight, Layers, Play, Plus } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import { Card, CardContent } from "@/components/ui/card"
 import { SearchInput } from "@/components/ui/search-input"
+import { useI18n } from "@/contexts/i18n-context"
 import { listWorkforces } from "@/lib/workforces-api"
 import type { WorkforceListItem } from "@/types/workforce"
 
 export default function WorkforcesPage() {
+  const { locale, t } = useI18n()
   const [items, setItems] = useState<WorkforceListItem[]>([])
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
@@ -28,12 +30,12 @@ export default function WorkforcesPage() {
       setPages(data.pages)
       setTotal(data.total)
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed to load workforces")
+      setError(err instanceof Error ? err.message : t("workforces.errors.loadList"))
       setItems([])
     } finally {
       setLoading(false)
     }
-  }, [])
+  }, [t])
 
   useEffect(() => {
     void load(page, search)
@@ -46,17 +48,16 @@ export default function WorkforcesPage() {
         <div>
           <div className="inline-flex items-center gap-2 rounded-full border px-3 py-1 text-xs uppercase tracking-[0.2em] text-muted-foreground">
             <Layers className="h-3.5 w-3.5" />
-            Workforce
+            {t("workforces.list.badge")}
           </div>
-          <h1 className="mt-4 text-3xl font-bold">Workforces</h1>
+          <h1 className="mt-4 text-3xl font-bold">{t("workforces.list.title")}</h1>
           <p className="mt-2 max-w-2xl text-muted-foreground">
-            Create manager-led multi-agent work groups, keep worker roles explicit, and
-            run them from a single entry point.
+            {t("workforces.list.description")}
           </p>
         </div>
         <div className="flex flex-col gap-3 sm:flex-row sm:items-center">
           <SearchInput
-            placeholder="Search workforces..."
+            placeholder={t("workforces.list.searchPlaceholder")}
             value={search}
             onChange={(value) => {
               setSearch(value)
@@ -67,26 +68,25 @@ export default function WorkforcesPage() {
           <Link href="/workforces/new">
             <Button>
               <Plus className="mr-2 h-4 w-4" />
-              New Workforce
+              {t("workforces.actions.new")}
             </Button>
           </Link>
         </div>
       </div>
 
-      {loading ? <div className="p-8 text-muted-foreground">Loading workforces...</div> : null}
+      {loading ? <div className="p-8 text-muted-foreground">{t("workforces.loading.list")}</div> : null}
       {error ? <div className="p-8 text-red-500">{error}</div> : null}
 
       {!loading && !error ? (
         items.length === 0 ? (
           <Card className="border-dashed">
             <CardContent className="flex flex-col items-center gap-4 p-12 text-center">
-              <div className="text-lg font-medium">No workforces yet</div>
+              <div className="text-lg font-medium">{t("workforces.list.emptyTitle")}</div>
               <p className="max-w-xl text-sm text-muted-foreground">
-                Start with a manager agent, add a few workers, and return here to launch
-                coordinated runs.
+                {t("workforces.list.emptyDescription")}
               </p>
               <Link href="/workforces/new">
-                <Button>Create your first workforce</Button>
+                <Button>{t("workforces.list.createFirst")}</Button>
               </Link>
             </CardContent>
           </Card>
@@ -106,18 +106,21 @@ export default function WorkforcesPage() {
                             {item.name}
                           </Link>
                           <span className="rounded-full border px-2.5 py-1 text-xs capitalize text-muted-foreground">
-                            {item.status}
+                            {t(`workforces.status.${item.status}`)}
                           </span>
                         </div>
                         <p className="text-sm text-muted-foreground">
-                          {item.description || "No description"}
+                          {item.description || t("workforces.common.noDescription")}
                         </p>
                         <div className="flex flex-wrap gap-6 text-sm text-muted-foreground">
-                          <span>Manager: {item.manager.name}</span>
-                          <span>Workers: {item.worker_count}</span>
+                          <span>{t("workforces.list.manager", { name: item.manager.name })}</span>
+                          <span>{t("workforces.list.workers", { count: item.worker_count })}</span>
                           <span>
-                            Last update:{" "}
-                            {item.updated_at ? new Date(item.updated_at).toLocaleString() : "N/A"}
+                            {t("workforces.list.lastUpdate", {
+                              value: item.updated_at
+                                ? new Date(item.updated_at).toLocaleString(locale)
+                                : t("workforces.common.notAvailable"),
+                            })}
                           </span>
                         </div>
                       </div>
@@ -125,26 +128,35 @@ export default function WorkforcesPage() {
                         <Link href={`/workforces/${item.id}/run`}>
                           <Button className="w-full lg:w-auto">
                             <Play className="mr-2 h-4 w-4" />
-                            Run
+                            {t("workforces.actions.run")}
                           </Button>
                         </Link>
                         <div className="flex gap-3">
                           <Link href={`/workforces/${item.id}`}>
-                            <Button variant="outline">Details</Button>
+                            <Button variant="outline">{t("workforces.actions.details")}</Button>
                           </Link>
                           <Link href={`/workforces/${item.id}/builder`}>
-                            <Button variant="outline">Builder</Button>
+                            <Button variant="outline">{t("workforces.actions.builder")}</Button>
                           </Link>
                           <Link href={`/workforces/${item.id}/canvas`}>
-                            <Button variant="outline">Canvas</Button>
+                            <Button variant="outline">{t("workforces.actions.canvas")}</Button>
                           </Link>
                         </div>
                         {item.last_run ? (
                           <div className="text-xs text-muted-foreground">
-                            Last run #{item.last_run.id}{item.last_run.task_id != null ? ` · task #${item.last_run.task_id}` : ""} · {item.last_run.status}
+                            {item.last_run.task_id != null
+                              ? t("workforces.list.lastRunWithTask", {
+                                  runId: item.last_run.id,
+                                  taskId: item.last_run.task_id,
+                                  status: item.last_run.status,
+                                })
+                              : t("workforces.list.lastRun", {
+                                  runId: item.last_run.id,
+                                  status: item.last_run.status,
+                                })}
                           </div>
                         ) : (
-                          <div className="text-xs text-muted-foreground">No runs yet</div>
+                          <div className="text-xs text-muted-foreground">{t("workforces.list.noRuns")}</div>
                         )}
                       </div>
                     </div>
@@ -156,7 +168,11 @@ export default function WorkforcesPage() {
             {pages > 1 ? (
               <div className="flex items-center justify-between">
                 <div className="text-sm text-muted-foreground">
-                  Showing {(page - 1) * pageSize + 1}–{Math.min(page * pageSize, total)} of {total}
+                  {t("workforces.pagination.showing", {
+                    start: (page - 1) * pageSize + 1,
+                    end: Math.min(page * pageSize, total),
+                    total,
+                  })}
                 </div>
                 <div className="flex items-center gap-2">
                   <Button
@@ -166,10 +182,10 @@ export default function WorkforcesPage() {
                     disabled={page <= 1}
                   >
                     <ChevronLeft className="mr-1 h-4 w-4" />
-                    Prev
+                    {t("workforces.pagination.prev")}
                   </Button>
                   <span className="text-sm text-muted-foreground">
-                    Page {page} of {pages}
+                    {t("workforces.pagination.page", { page, pages })}
                   </span>
                   <Button
                     variant="outline"
@@ -177,7 +193,7 @@ export default function WorkforcesPage() {
                     onClick={() => setPage((current) => current + 1)}
                     disabled={page >= pages}
                   >
-                    Next
+                    {t("workforces.pagination.next")}
                     <ChevronRight className="ml-1 h-4 w-4" />
                   </Button>
                 </div>

@@ -2,11 +2,13 @@
 
 import { useEffect, useMemo, useState } from "react"
 import { useRouter } from "next/navigation"
+import { ArrowLeft } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import { Textarea } from "@/components/ui/textarea"
+import { useI18n } from "@/contexts/i18n-context"
 import {
   createWorkforce,
   listAgentOptions,
@@ -19,10 +21,15 @@ import { ManagerStep } from "./manager-step"
 import { ReviewStep } from "./review-step"
 import { WorkersStep } from "./workers-step"
 
-const STEPS = ["Basics", "Workers", "Review"] as const
+const STEPS = [
+  "workforces.create.steps.basics",
+  "workforces.create.steps.workers",
+  "workforces.create.steps.review",
+] as const
 
 export function WorkforceWizard() {
   const router = useRouter()
+  const { t } = useI18n()
   const [step, setStep] = useState(0)
   const [loadingAgents, setLoadingAgents] = useState(true)
   const [submitting, setSubmitting] = useState(false)
@@ -52,13 +59,13 @@ export function WorkforceWizard() {
         const agentData = await listAgentOptions()
         setAgents(agentData.filter((agent) => agent.status === "published"))
       } catch (err) {
-        setError(err instanceof Error ? err.message : "Failed to load agents")
+        setError(err instanceof Error ? err.message : t("workforces.errors.loadAgents"))
       } finally {
         setLoadingAgents(false)
       }
     }
     void loadAgents()
-  }, [])
+  }, [t])
 
   const canMoveForward = useMemo(() => {
     if (step === 0) {
@@ -91,34 +98,48 @@ export function WorkforceWizard() {
       })
       router.push(`/workforces/${workforce.id}/builder`)
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed to create workforce")
+      setError(err instanceof Error ? err.message : t("workforces.errors.create"))
     } finally {
       setSubmitting(false)
     }
   }
 
+  const handleBack = () => {
+    if (step === 0) {
+      router.push("/workforces")
+      return
+    }
+    setStep((current) => Math.max(0, current - 1))
+  }
+
   if (loadingAgents) {
-    return <div className="h-full overflow-y-auto p-4 text-muted-foreground sm:p-8">Loading agents...</div>
+    return <div className="h-full overflow-y-auto p-4 text-muted-foreground sm:p-8">{t("workforces.loading.agents")}</div>
   }
 
   return (
     <div className="h-full overflow-y-auto">
       <div className="mx-auto flex w-full max-w-6xl flex-col gap-6 p-4 sm:p-8">
-      <div>
-        <h1 className="text-3xl font-bold">Create Workforce</h1>
-        <p className="mt-2 text-muted-foreground">
-          Start with a manager, add workers, then review the orchestration before saving.
-        </p>
+      <div className="space-y-4">
+        <Button variant="ghost" className="w-fit gap-2 px-0" onClick={() => router.push("/workforces")}>
+          <ArrowLeft className="h-4 w-4" />
+          {t("workforces.create.backToWorkforces")}
+        </Button>
+        <div>
+          <h1 className="text-3xl font-bold">{t("workforces.create.title")}</h1>
+          <p className="mt-2 text-muted-foreground">
+            {t("workforces.create.description")}
+          </p>
+        </div>
       </div>
 
       <div className="grid gap-3 md:grid-cols-3">
-        {STEPS.map((label, index) => (
-          <Card key={label} className={index === step ? "border-primary" : undefined}>
+        {STEPS.map((labelKey, index) => (
+          <Card key={labelKey} className={index === step ? "border-primary" : undefined}>
             <CardContent className="flex items-center gap-3 p-4">
               <div className="flex h-8 w-8 items-center justify-center rounded-full border text-sm font-medium">
                 {index + 1}
               </div>
-              <div className="font-medium">{label}</div>
+              <div className="font-medium">{t(labelKey)}</div>
             </CardContent>
           </Card>
         ))}
@@ -128,32 +149,32 @@ export function WorkforceWizard() {
         <div className="grid gap-6 lg:grid-cols-[1.2fr_0.8fr]">
           <Card>
             <CardHeader>
-              <CardTitle>Basics</CardTitle>
+              <CardTitle>{t("workforces.create.steps.basics")}</CardTitle>
             </CardHeader>
             <CardContent className="space-y-4">
               <div className="space-y-2">
-                <Label>Name</Label>
+                <Label>{t("workforces.fields.name")}</Label>
                 <Input
                   value={name}
                   onChange={(event) => setName(event.target.value)}
-                  placeholder="Marketing Launch Workforce"
+                  placeholder={t("workforces.create.placeholders.name")}
                 />
               </div>
               <div className="space-y-2">
-                <Label>Description</Label>
+                <Label>{t("workforces.fields.description")}</Label>
                 <Textarea
                   value={description}
                   onChange={(event) => setDescription(event.target.value)}
-                  placeholder="Coordinate research, content, and launch tasks."
+                  placeholder={t("workforces.create.placeholders.description")}
                   rows={4}
                 />
               </div>
               <div className="space-y-2">
-                <Label>Manager Instructions</Label>
+                <Label>{t("workforces.fields.managerInstructions")}</Label>
                 <Textarea
                   value={managerInstructions}
                   onChange={(event) => setManagerInstructions(event.target.value)}
-                  placeholder="Coordinate workers, reconcile conflicting outputs, and return a single answer."
+                  placeholder={t("workforces.create.placeholders.managerInstructions")}
                   rows={5}
                 />
               </div>
@@ -192,22 +213,22 @@ export function WorkforceWizard() {
       <div className="flex items-center justify-between">
         <Button
           variant="outline"
-          onClick={() => setStep((current) => Math.max(0, current - 1))}
-          disabled={step === 0 || submitting}
+          onClick={handleBack}
+          disabled={submitting}
         >
-          Back
+          {step === 0 ? t("workforces.create.backToWorkforces") : t("common.back")}
         </Button>
         <div className="flex items-center gap-3">
           {step < STEPS.length - 1 ? (
             <Button onClick={() => setStep((current) => current + 1)} disabled={!canMoveForward}>
-              Next
+              {t("common.next")}
             </Button>
           ) : (
             <Button
               onClick={handleCreate}
               disabled={submitting || !canMoveForward || !workersAreValid}
             >
-              {submitting ? "Creating..." : "Create Workforce"}
+              {submitting ? t("workforces.loading.creating") : t("workforces.actions.create")}
             </Button>
           )}
         </div>

@@ -11,6 +11,7 @@ import {
   CardHeader,
   CardTitle,
 } from "@/components/ui/card"
+import { useI18n } from "@/contexts/i18n-context"
 import type { WorkforceBuilderPatch } from "@/types/workforce"
 
 interface ProposedPatchCardProps {
@@ -26,6 +27,12 @@ function formatOperationTitle(op: string) {
     .split("_")
     .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
     .join(" ")
+}
+
+function operationTitle(op: string, t: (key: string) => string) {
+  const key = `workforces.builder.operations.${op}`
+  const value = t(key)
+  return value === key ? formatOperationTitle(op) : value
 }
 
 function operationSubtitle(operation: Record<string, unknown>) {
@@ -52,6 +59,7 @@ export function ProposedPatchCard({
   applying = false,
   onApply,
 }: ProposedPatchCardProps) {
+  const { t } = useI18n()
   const alreadyApplied = status === "applied"
   const canApply = Boolean(
     patch && messageId && patch.operations.length > 0 && !applying && !alreadyApplied,
@@ -60,15 +68,15 @@ export function ProposedPatchCard({
   return (
     <Card>
       <CardHeader>
-        <CardTitle>Proposed Patch</CardTitle>
+        <CardTitle>{t("workforces.builder.patchTitle")}</CardTitle>
         <CardDescription>
-          Review the generated workforce changes before applying them.
+          {t("workforces.builder.patchDescription")}
         </CardDescription>
       </CardHeader>
       <CardContent className="space-y-4">
         {!patch ? (
           <div className="rounded-lg border border-dashed p-4 text-sm text-muted-foreground">
-            No proposal yet. Send a request in Builder Chat to generate a patch.
+            {t("workforces.builder.noProposal")}
           </div>
         ) : (
           <>
@@ -76,7 +84,7 @@ export function ProposedPatchCard({
               <div className="flex items-start gap-3">
                 <Sparkles className="mt-0.5 size-4 text-primary" />
                 <div>
-                  <div className="font-medium">Summary</div>
+                  <div className="font-medium">{t("workforces.builder.summary")}</div>
                   <p className="mt-1 text-sm text-muted-foreground">{patch.summary}</p>
                 </div>
               </div>
@@ -85,7 +93,7 @@ export function ProposedPatchCard({
             {patch.clarification ? (
               <Alert>
                 <AlertTriangle className="size-4" />
-                <AlertTitle>Clarification needed</AlertTitle>
+                <AlertTitle>{t("workforces.builder.clarificationNeeded")}</AlertTitle>
                 <AlertDescription>{patch.clarification}</AlertDescription>
               </Alert>
             ) : null}
@@ -93,7 +101,7 @@ export function ProposedPatchCard({
             {patch.warnings.length > 0 ? (
               <Alert className="border-amber-200 bg-amber-50 text-amber-900">
                 <AlertTriangle className="size-4" />
-                <AlertTitle>Warnings</AlertTitle>
+                <AlertTitle>{t("workforces.builder.warnings")}</AlertTitle>
                 <AlertDescription>
                   <div className="space-y-1">
                     {patch.warnings.map((warning, index) => (
@@ -105,26 +113,26 @@ export function ProposedPatchCard({
             ) : (
               <Alert>
                 <CheckCircle2 className="size-4 text-emerald-600" />
-                <AlertTitle>Ready to apply</AlertTitle>
-                <AlertDescription>No destructive warning was detected in this patch.</AlertDescription>
+                <AlertTitle>{t("workforces.builder.readyToApply")}</AlertTitle>
+                <AlertDescription>{t("workforces.builder.noDestructiveWarning")}</AlertDescription>
               </Alert>
             )}
 
             <div className="space-y-3">
               <div className="flex items-center justify-between gap-3">
-                <div className="font-medium">Operations</div>
-                <Badge variant="outline">{patch.operations.length} change(s)</Badge>
+                <div className="font-medium">{t("workforces.builder.operationsTitle")}</div>
+                <Badge variant="outline">{t("workforces.builder.changeCount", { count: patch.operations.length })}</Badge>
               </div>
               {patch.operations.length === 0 ? (
                 <div className="rounded-lg border border-dashed p-4 text-sm text-muted-foreground">
-                  This proposal does not contain any executable operation yet.
+                  {t("workforces.builder.noOperations")}
                 </div>
               ) : (
                 patch.operations.map((operation, index) => (
                   <div key={`${operation.op}-${index}`} className="rounded-lg border bg-background p-4">
                     <div className="mb-3 flex items-center justify-between gap-3">
                       <div>
-                        <div className="font-medium">{formatOperationTitle(operation.op)}</div>
+                        <div className="font-medium">{operationTitle(operation.op, t)}</div>
                         {operationSubtitle(operation) ? (
                           <div className="mt-1 text-xs text-muted-foreground">
                             {operationSubtitle(operation)}
@@ -153,12 +161,12 @@ export function ProposedPatchCard({
               {applying ? (
                 <>
                   <Loader2 className="size-4 animate-spin" />
-                  Applying Changes...
+                  {t("workforces.loading.applyingChanges")}
                 </>
               ) : alreadyApplied ? (
-                "Already Applied"
+                t("workforces.actions.alreadyApplied")
               ) : (
-                "Apply Changes"
+                t("workforces.actions.applyChanges")
               )}
             </Button>
           </>

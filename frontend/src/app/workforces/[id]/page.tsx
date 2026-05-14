@@ -10,6 +10,7 @@ import { Label } from "@/components/ui/label"
 import { Select } from "@/components/ui/select"
 import { Switch } from "@/components/ui/switch"
 import { Textarea } from "@/components/ui/textarea"
+import { useI18n } from "@/contexts/i18n-context"
 import {
   addWorkforceAgent,
   getWorkforce,
@@ -49,6 +50,7 @@ function buildWorkerEditState(workers: WorkforceWorker[]): Record<number, Worker
 }
 
 export default function WorkforceDetailPage() {
+  const { t } = useI18n()
   const params = useParams()
   const id = Array.isArray(params.id) ? params.id[0] : params.id
   const [workforce, setWorkforce] = useState<WorkforceDetail | null>(null)
@@ -93,11 +95,11 @@ export default function WorkforceDetailPage() {
       setAgents(agentData)
       syncForm(workforceData)
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed to load workforce")
+      setError(err instanceof Error ? err.message : t("workforces.errors.load"))
     } finally {
       setLoading(false)
     }
-  }, [id, syncForm])
+  }, [id, syncForm, t])
 
   useEffect(() => {
     void load()
@@ -136,9 +138,9 @@ export default function WorkforceDetailPage() {
       })
       setWorkforce(next)
       syncForm(next)
-      setMessage("Workforce updated")
+      setMessage(t("workforces.messages.updated"))
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed to update workforce")
+      setError(err instanceof Error ? err.message : t("workforces.errors.update"))
     } finally {
       setSaving(false)
     }
@@ -161,9 +163,9 @@ export default function WorkforceDetailPage() {
       setNewWorkerAlias("")
       setNewWorkerInstructions("")
       await load()
-      setMessage("Worker added")
+      setMessage(t("workforces.messages.workerAdded"))
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed to add worker")
+      setError(err instanceof Error ? err.message : t("workforces.errors.addWorker"))
     } finally {
       setSaving(false)
     }
@@ -192,9 +194,9 @@ export default function WorkforceDetailPage() {
             }
           : current,
       )
-      setMessage("Worker updated")
+      setMessage(t("workforces.messages.workerUpdated"))
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed to update worker")
+      setError(err instanceof Error ? err.message : t("workforces.errors.updateWorker"))
     } finally {
       setSaving(false)
     }
@@ -207,17 +209,17 @@ export default function WorkforceDetailPage() {
       setError(null)
       await removeWorkforceAgent(id, workerId)
       await load()
-      setMessage("Worker removed")
+      setMessage(t("workforces.messages.workerRemoved"))
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed to remove worker")
+      setError(err instanceof Error ? err.message : t("workforces.errors.removeWorker"))
     } finally {
       setSaving(false)
     }
   }
 
-  if (loading) return <div className="h-full overflow-y-auto p-4 text-muted-foreground sm:p-8">Loading workforce...</div>
+  if (loading) return <div className="h-full overflow-y-auto p-4 text-muted-foreground sm:p-8">{t("workforces.loading.detail")}</div>
   if (error && !workforce) return <div className="h-full overflow-y-auto p-4 text-red-500 sm:p-8">{error}</div>
-  if (!workforce) return <div className="h-full overflow-y-auto p-4 text-muted-foreground sm:p-8">Workforce not found.</div>
+  if (!workforce) return <div className="h-full overflow-y-auto p-4 text-muted-foreground sm:p-8">{t("workforces.errors.notFound")}</div>
 
   return (
     <div className="h-full overflow-y-auto">
@@ -226,18 +228,18 @@ export default function WorkforceDetailPage() {
         <div>
           <h1 className="text-3xl font-bold">{workforce.name}</h1>
           <p className="mt-2 text-muted-foreground">
-            Review and edit the current orchestration before running it.
+            {t("workforces.detail.description")}
           </p>
         </div>
         <div className="flex flex-wrap gap-3">
           <Link href={`/workforces/${workforce.id}/builder`}>
-            <Button variant="outline">Builder</Button>
+            <Button variant="outline">{t("workforces.actions.builder")}</Button>
           </Link>
           <Link href={`/workforces/${workforce.id}/canvas`}>
-            <Button variant="outline">Canvas</Button>
+            <Button variant="outline">{t("workforces.actions.canvas")}</Button>
           </Link>
           <Link href={`/workforces/${workforce.id}/run`}>
-            <Button>Run Workforce</Button>
+            <Button>{t("workforces.actions.runWorkforce")}</Button>
           </Link>
         </div>
       </div>
@@ -248,15 +250,15 @@ export default function WorkforceDetailPage() {
       <div className="grid gap-6 lg:grid-cols-[1fr_0.9fr]">
         <Card>
           <CardHeader>
-            <CardTitle>Edit Workforce</CardTitle>
+            <CardTitle>{t("workforces.detail.editTitle")}</CardTitle>
           </CardHeader>
           <CardContent className="space-y-4">
             <div className="space-y-2">
-              <Label>Name</Label>
+              <Label>{t("workforces.fields.name")}</Label>
               <Input value={name} onChange={(event) => setName(event.target.value)} />
             </div>
             <div className="space-y-2">
-              <Label>Description</Label>
+              <Label>{t("workforces.fields.description")}</Label>
               <Textarea
                 value={description}
                 onChange={(event) => setDescription(event.target.value)}
@@ -264,7 +266,7 @@ export default function WorkforceDetailPage() {
               />
             </div>
             <div className="space-y-2">
-              <Label>Manager</Label>
+              <Label>{t("workforces.fields.manager")}</Label>
               <Select
                 value={managerAgentId}
                 onValueChange={setManagerAgentId}
@@ -272,7 +274,7 @@ export default function WorkforceDetailPage() {
               />
             </div>
             <div className="space-y-2">
-              <Label>Manager Instructions</Label>
+              <Label>{t("workforces.fields.managerInstructions")}</Label>
               <Textarea
                 value={managerInstructions}
                 onChange={(event) => setManagerInstructions(event.target.value)}
@@ -283,7 +285,7 @@ export default function WorkforceDetailPage() {
               onClick={saveWorkforce}
               disabled={saving || !name.trim() || !managerAgentId}
             >
-              {saving ? "Saving..." : "Save Workforce"}
+              {saving ? t("workforces.loading.saving") : t("workforces.actions.saveWorkforce")}
             </Button>
           </CardContent>
         </Card>
@@ -293,29 +295,29 @@ export default function WorkforceDetailPage() {
 
       <Card>
         <CardHeader>
-          <CardTitle>Add Worker</CardTitle>
+          <CardTitle>{t("workforces.workers.addTitle")}</CardTitle>
         </CardHeader>
         <CardContent className="space-y-4">
           <div className="space-y-2">
-            <Label>Published Agent</Label>
+            <Label>{t("workforces.fields.publishedAgent")}</Label>
             <Select
               value={newWorkerAgentId}
               onValueChange={setNewWorkerAgentId}
-              placeholder="Choose a worker agent"
+              placeholder={t("workforces.workers.chooseAgent")}
               options={workerOptions}
             />
           </div>
           <div className="grid gap-4 md:grid-cols-2">
             <div className="space-y-2">
-              <Label>Alias</Label>
+              <Label>{t("workforces.fields.alias")}</Label>
               <Input
                 value={newWorkerAlias}
                 onChange={(event) => setNewWorkerAlias(event.target.value)}
-                placeholder="Optional display name"
+                placeholder={t("workforces.workers.aliasPlaceholder")}
               />
             </div>
             <div className="space-y-2">
-              <Label>Assignment Instructions</Label>
+              <Label>{t("workforces.fields.assignmentInstructions")}</Label>
               <Textarea
                 value={newWorkerInstructions}
                 onChange={(event) => setNewWorkerInstructions(event.target.value)}
@@ -327,19 +329,19 @@ export default function WorkforceDetailPage() {
             onClick={addWorker}
             disabled={saving || !newWorkerAgentId || !newWorkerInstructions.trim()}
           >
-            Add Worker
+            {t("workforces.actions.addWorker")}
           </Button>
         </CardContent>
       </Card>
 
       <Card>
         <CardHeader>
-          <CardTitle>Manage Workers</CardTitle>
+          <CardTitle>{t("workforces.workers.manageTitle")}</CardTitle>
         </CardHeader>
         <CardContent className="space-y-4">
           {workforce.workers.length === 0 ? (
             <div className="rounded-lg border border-dashed p-4 text-sm text-muted-foreground">
-              No workers configured.
+              {t("workforces.workers.noneConfigured")}
             </div>
           ) : (
             workforce.workers
@@ -355,13 +357,13 @@ export default function WorkforceDetailPage() {
                           {worker.alias || worker.agent.name}
                         </div>
                         <div className="text-sm text-muted-foreground">
-                          {worker.agent.name} · {worker.agent.status}
+                          {worker.agent.name} · {t(`workforces.status.${worker.agent.status}`)}
                         </div>
                       </div>
                       <div className="flex flex-wrap gap-2">
                         <Link href={`/build/${worker.agent.id}`} target="_blank">
                           <Button variant="outline" size="sm">
-                            Open Agent
+                            {t("workforces.actions.openAgent")}
                           </Button>
                         </Link>
                         <Button
@@ -370,13 +372,13 @@ export default function WorkforceDetailPage() {
                           onClick={() => void removeWorker(worker.id)}
                           disabled={saving}
                         >
-                          Remove
+                          {t("workforces.actions.remove")}
                         </Button>
                       </div>
                     </div>
                     <div className="mt-4 grid gap-4 md:grid-cols-[1fr_140px_140px]">
                       <div className="space-y-2">
-                        <Label>Alias</Label>
+                        <Label>{t("workforces.fields.alias")}</Label>
                         <Input
                           value={edit.alias}
                           onChange={(event) =>
@@ -388,7 +390,7 @@ export default function WorkforceDetailPage() {
                         />
                       </div>
                       <div className="space-y-2">
-                        <Label>Order</Label>
+                        <Label>{t("workforces.fields.order")}</Label>
                         <Input
                           type="number"
                           value={String(edit.sort_order)}
@@ -404,7 +406,7 @@ export default function WorkforceDetailPage() {
                         />
                       </div>
                       <div className="flex items-center justify-between rounded-lg border px-3 py-2">
-                        <div className="font-medium">Enabled</div>
+                        <div className="font-medium">{t("workforces.fields.enabled")}</div>
                         <Switch
                           checked={edit.enabled}
                           onCheckedChange={(checked) =>
@@ -417,7 +419,7 @@ export default function WorkforceDetailPage() {
                       </div>
                     </div>
                     <div className="mt-4 space-y-2">
-                      <Label>Assignment Instructions</Label>
+                      <Label>{t("workforces.fields.assignmentInstructions")}</Label>
                       <Textarea
                         value={edit.assignment_instructions}
                         onChange={(event) =>
@@ -438,7 +440,7 @@ export default function WorkforceDetailPage() {
                       onClick={() => void saveWorker(worker)}
                       disabled={saving || !edit.assignment_instructions.trim()}
                     >
-                      Save Worker
+                      {t("workforces.actions.saveWorker")}
                     </Button>
                   </div>
                 )

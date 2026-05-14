@@ -3,6 +3,7 @@
 import { useEffect, useMemo, useState } from "react"
 import { useParams } from "next/navigation"
 import { toast } from "sonner"
+import { useI18n } from "@/contexts/i18n-context"
 import {
   applyWorkforceChanges,
   getWorkforce,
@@ -32,6 +33,7 @@ function latestProposedAssistantMessage(
 }
 
 export default function WorkforceBuilderPage() {
+  const { t } = useI18n()
   const params = useParams()
   const id = Array.isArray(params.id) ? params.id[0] : params.id
   const [workforce, setWorkforce] = useState<WorkforceDetail | null>(null)
@@ -57,14 +59,14 @@ export default function WorkforceBuilderPage() {
         setWorkforce(workforceData)
         setMessages(historyData.items)
       } catch (err) {
-        setError(err instanceof Error ? err.message : "Failed to load builder")
+        setError(err instanceof Error ? err.message : t("workforces.errors.loadBuilder"))
       } finally {
         setLoading(false)
       }
     }
 
     void load()
-  }, [id])
+  }, [id, t])
 
   const handleSubmit = async (message: string) => {
     if (!id) return
@@ -73,9 +75,9 @@ export default function WorkforceBuilderPage() {
       const result = await proposeWorkforceChanges(id, { message })
       const history = await getWorkforceBuilderMessages(id)
       setMessages(history.items)
-      toast.success(result.assistant_message || "Builder proposal created")
+      toast.success(result.assistant_message || t("workforces.messages.proposalCreated"))
     } catch (err) {
-      const nextError = err instanceof Error ? err.message : "Failed to propose changes"
+      const nextError = err instanceof Error ? err.message : t("workforces.errors.proposeChanges")
       toast.error(nextError)
     } finally {
       setSubmitting(false)
@@ -93,18 +95,18 @@ export default function WorkforceBuilderPage() {
       setWorkforce(result.workforce)
       const history = await getWorkforceBuilderMessages(id)
       setMessages(history.items)
-      toast.success("Workforce changes applied")
+      toast.success(t("workforces.messages.changesApplied"))
     } catch (err) {
-      const nextError = err instanceof Error ? err.message : "Failed to apply changes"
+      const nextError = err instanceof Error ? err.message : t("workforces.errors.applyChanges")
       toast.error(nextError)
     } finally {
       setApplying(false)
     }
   }
 
-  if (loading) return <div className="h-full overflow-y-auto p-4 text-muted-foreground sm:p-8">Loading builder...</div>
+  if (loading) return <div className="h-full overflow-y-auto p-4 text-muted-foreground sm:p-8">{t("workforces.loading.builder")}</div>
   if (error) return <div className="h-full overflow-y-auto p-4 text-red-500 sm:p-8">{error}</div>
-  if (!workforce) return <div className="h-full overflow-y-auto p-4 text-muted-foreground sm:p-8">Workforce not found.</div>
+  if (!workforce) return <div className="h-full overflow-y-auto p-4 text-muted-foreground sm:p-8">{t("workforces.errors.notFound")}</div>
 
   return (
     <div className="h-full overflow-y-auto">

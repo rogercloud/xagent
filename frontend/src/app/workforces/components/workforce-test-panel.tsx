@@ -5,6 +5,7 @@ import { useRouter } from "next/navigation"
 import { Button } from "@/components/ui/button"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
 import { Textarea } from "@/components/ui/textarea"
+import { useI18n } from "@/contexts/i18n-context"
 import { runWorkforce } from "@/lib/workforces-api"
 
 interface WorkforceTestPanelProps {
@@ -12,6 +13,7 @@ interface WorkforceTestPanelProps {
 }
 
 export function WorkforceTestPanel({ workforceId }: WorkforceTestPanelProps) {
+  const { t } = useI18n()
   const router = useRouter()
   const [message, setMessage] = useState("")
   const [loading, setLoading] = useState(false)
@@ -25,7 +27,7 @@ export function WorkforceTestPanel({ workforceId }: WorkforceTestPanelProps) {
       const result = await runWorkforce(workforceId, message.trim())
       router.push(result.redirect_url)
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed to run workforce")
+      setError(err instanceof Error ? err.message : t("workforces.errors.run"))
     } finally {
       setLoading(false)
     }
@@ -34,18 +36,18 @@ export function WorkforceTestPanel({ workforceId }: WorkforceTestPanelProps) {
   return (
     <Card>
       <CardHeader>
-        <CardTitle>Test Workforce</CardTitle>
+        <CardTitle>{t("workforces.run.testTitle")}</CardTitle>
       </CardHeader>
       <CardContent className="space-y-4">
         <Textarea
-          placeholder="Describe the task you want the manager to coordinate."
+          placeholder={t("workforces.run.placeholder")}
           value={message}
           onChange={(event) => setMessage(event.target.value)}
           rows={8}
         />
         {error ? <div className="text-sm text-red-500">{error}</div> : null}
         <Button onClick={handleRun} disabled={loading || !message.trim()} className="w-full">
-          {loading ? "Starting..." : "Run Workforce"}
+          {loading ? t("workforces.loading.starting") : t("workforces.actions.runWorkforce")}
         </Button>
       </CardContent>
     </Card>

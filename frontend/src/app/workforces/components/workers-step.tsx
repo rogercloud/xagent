@@ -8,6 +8,7 @@ import { Label } from "@/components/ui/label"
 import { Select } from "@/components/ui/select"
 import { Switch } from "@/components/ui/switch"
 import { Textarea } from "@/components/ui/textarea"
+import { useI18n } from "@/contexts/i18n-context"
 import type { WorkforceAgentOption, WorkforceWorkerDraft } from "@/types/workforce"
 
 interface WorkersStepProps {
@@ -23,6 +24,7 @@ export function WorkersStep({
   workers,
   onWorkersChange,
 }: WorkersStepProps) {
+  const { t } = useI18n()
   const [draftAgentId, setDraftAgentId] = useState("")
   const [draftAlias, setDraftAlias] = useState("")
   const [draftInstructions, setDraftInstructions] = useState("")
@@ -91,15 +93,15 @@ export function WorkersStep({
     <div className="space-y-6">
       <Card>
         <CardHeader>
-          <CardTitle>Add Worker</CardTitle>
+          <CardTitle>{t("workforces.workers.addTitle")}</CardTitle>
         </CardHeader>
         <CardContent className="space-y-4">
           <div className="space-y-2">
-            <Label>Published Agent</Label>
+            <Label>{t("workforces.fields.publishedAgent")}</Label>
             <Select
               value={draftAgentId}
               onValueChange={setDraftAgentId}
-              placeholder="Choose a worker agent"
+              placeholder={t("workforces.workers.chooseAgent")}
               options={selectableAgents.map((agent) => ({
                 value: String(agent.id),
                 label: agent.name,
@@ -109,42 +111,42 @@ export function WorkersStep({
           </div>
           <div className="grid gap-4 md:grid-cols-2">
             <div className="space-y-2">
-              <Label>Alias</Label>
+              <Label>{t("workforces.fields.alias")}</Label>
               <Input
                 value={draftAlias}
                 onChange={(event) => setDraftAlias(event.target.value)}
-                placeholder="Optional display name"
+                placeholder={t("workforces.workers.aliasPlaceholder")}
               />
             </div>
             <div className="space-y-2">
-              <Label>Assignment Instructions</Label>
+              <Label>{t("workforces.fields.assignmentInstructions")}</Label>
               <Textarea
                 value={draftInstructions}
                 onChange={(event) => setDraftInstructions(event.target.value)}
-                placeholder="Describe what this worker handles inside the workforce."
+                placeholder={t("workforces.workers.instructionsPlaceholder")}
                 rows={3}
               />
             </div>
           </div>
           <Button onClick={addWorker} disabled={!canAdd}>
-            Add Worker
+            {t("workforces.actions.addWorker")}
           </Button>
         </CardContent>
       </Card>
 
       <Card>
         <CardHeader>
-          <CardTitle>Workers</CardTitle>
+          <CardTitle>{t("workforces.fields.workers")}</CardTitle>
         </CardHeader>
         <CardContent className="space-y-4">
           {workers.length === 0 ? (
             <div className="rounded-lg border border-dashed p-4 text-sm text-muted-foreground">
-              No workers selected yet.
+              {t("workforces.workers.noneSelected")}
             </div>
           ) : (
             workers.map((worker, index) => {
               const agent = agents.find((item) => item.id === worker.agent_id)
-              const title = worker.alias || agent?.name || `Worker ${index + 1}`
+              const title = worker.alias || agent?.name || t("workforces.workers.fallbackName", { index: index + 1 })
 
               return (
                 <div key={`${worker.agent_id}-${index}`} className="rounded-xl border p-4">
@@ -152,7 +154,7 @@ export function WorkersStep({
                     <div>
                       <div className="font-medium">{title}</div>
                       <div className="text-sm text-muted-foreground">
-                        {agent?.description || "Published agent worker"}
+                        {agent?.description || t("workforces.workers.defaultDescription")}
                       </div>
                     </div>
                     <div className="flex flex-wrap gap-2">
@@ -162,7 +164,7 @@ export function WorkersStep({
                         onClick={() => moveWorker(index, -1)}
                         disabled={index === 0}
                       >
-                        Up
+                        {t("workforces.actions.up")}
                       </Button>
                       <Button
                         variant="outline"
@@ -170,16 +172,16 @@ export function WorkersStep({
                         onClick={() => moveWorker(index, 1)}
                         disabled={index === workers.length - 1}
                       >
-                        Down
+                        {t("workforces.actions.down")}
                       </Button>
                       <Button variant="outline" size="sm" onClick={() => removeWorker(index)}>
-                        Remove
+                        {t("workforces.actions.remove")}
                       </Button>
                     </div>
                   </div>
                   <div className="mt-4 grid gap-4 md:grid-cols-2">
                     <div className="space-y-2">
-                      <Label>Alias</Label>
+                      <Label>{t("workforces.fields.alias")}</Label>
                       <Input
                         value={worker.alias}
                         onChange={(event) =>
@@ -189,9 +191,9 @@ export function WorkersStep({
                     </div>
                     <div className="flex items-center justify-between rounded-lg border px-3 py-2">
                       <div>
-                        <div className="font-medium">Enabled</div>
+                        <div className="font-medium">{t("workforces.fields.enabled")}</div>
                         <div className="text-sm text-muted-foreground">
-                          Disabled workers are kept in the Workforce but skipped at runtime.
+                          {t("workforces.workers.disabledHelp")}
                         </div>
                       </div>
                       <Switch
@@ -203,7 +205,7 @@ export function WorkersStep({
                     </div>
                   </div>
                   <div className="mt-4 space-y-2">
-                    <Label>Assignment Instructions</Label>
+                      <Label>{t("workforces.fields.assignmentInstructions")}</Label>
                     <Textarea
                       value={worker.assignment_instructions}
                       onChange={(event) =>

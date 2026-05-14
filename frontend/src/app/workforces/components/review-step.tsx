@@ -4,6 +4,7 @@ import Link from "next/link"
 import { AlertTriangle } from "lucide-react"
 import { Badge } from "@/components/ui/badge"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
+import { useI18n } from "@/contexts/i18n-context"
 import type {
   WorkforceAgentOption,
   WorkforceWorkerDraft,
@@ -26,33 +27,34 @@ export function ReviewStep({
   workers,
   agents,
 }: ReviewStepProps) {
+  const { t } = useI18n()
   const manager = agents.find((agent) => String(agent.id) === managerAgentId)
 
   const warnings: string[] = []
   if (manager && manager.status !== "published") {
-    warnings.push("Manager is not published yet.")
+    warnings.push(t("workforces.review.warnings.managerNotPublished"))
   }
   for (const worker of workers) {
     const agent = agents.find((item) => item.id === worker.agent_id)
     if (agent && agent.status !== "published") {
-      warnings.push(`${worker.alias || agent.name} is not published yet.`)
+      warnings.push(t("workforces.review.warnings.workerNotPublished", { name: worker.alias || agent.name }))
     }
     if (!worker.assignment_instructions.trim()) {
-      warnings.push(`${worker.alias || "A worker"} is missing assignment instructions.`)
+      warnings.push(t("workforces.review.warnings.missingInstructions", { name: worker.alias || t("workforces.workers.aWorker") }))
     }
   }
 
   return (
     <Card>
       <CardHeader>
-        <CardTitle>Review</CardTitle>
+        <CardTitle>{t("workforces.create.steps.review")}</CardTitle>
       </CardHeader>
       <CardContent className="space-y-6">
         {warnings.length > 0 ? (
           <div className="rounded-xl border border-amber-200 bg-amber-50 p-4 text-amber-900">
             <div className="flex items-center gap-2 font-medium">
               <AlertTriangle className="size-4" />
-              Potential Risks
+              {t("workforces.review.potentialRisks")}
             </div>
             <div className="mt-2 space-y-1 text-sm">
               {warnings.map((warning, index) => (
@@ -64,14 +66,14 @@ export function ReviewStep({
 
         <div className="grid gap-4 md:grid-cols-2">
           <div>
-            <div className="text-xs uppercase tracking-wide text-muted-foreground">Name</div>
-            <div className="mt-1 font-medium">{name || "Untitled Workforce"}</div>
+            <div className="text-xs uppercase tracking-wide text-muted-foreground">{t("workforces.fields.name")}</div>
+            <div className="mt-1 font-medium">{name || t("workforces.review.untitled")}</div>
           </div>
           <div>
-            <div className="text-xs uppercase tracking-wide text-muted-foreground">Manager</div>
+            <div className="text-xs uppercase tracking-wide text-muted-foreground">{t("workforces.fields.manager")}</div>
             <div className="mt-1 flex items-center gap-2 font-medium">
-              <span>{manager?.name || "Not selected"}</span>
-              {manager ? <Badge variant="outline">{manager.status}</Badge> : null}
+              <span>{manager?.name || t("workforces.common.notSelected")}</span>
+              {manager ? <Badge variant="outline">{t(`workforces.status.${manager.status}`)}</Badge> : null}
             </div>
             {manager ? (
               <Link
@@ -79,44 +81,44 @@ export function ReviewStep({
                 target="_blank"
                 className="mt-2 inline-block text-sm text-primary hover:underline"
               >
-                Open Agent Editor
+                {t("workforces.actions.openAgentEditor")}
               </Link>
             ) : null}
           </div>
         </div>
         <div>
-          <div className="text-xs uppercase tracking-wide text-muted-foreground">Description</div>
-          <div className="mt-1 text-sm text-muted-foreground">{description || "No description"}</div>
+          <div className="text-xs uppercase tracking-wide text-muted-foreground">{t("workforces.fields.description")}</div>
+          <div className="mt-1 text-sm text-muted-foreground">{description || t("workforces.common.noDescription")}</div>
         </div>
         <div>
           <div className="text-xs uppercase tracking-wide text-muted-foreground">
-            Manager Instructions
+            {t("workforces.fields.managerInstructions")}
           </div>
           <div className="mt-1 whitespace-pre-wrap text-sm text-muted-foreground">
-            {managerInstructions || "No manager instructions"}
+            {managerInstructions || t("workforces.review.noManagerInstructions")}
           </div>
         </div>
         <div>
-          <div className="text-xs uppercase tracking-wide text-muted-foreground">Workers</div>
+          <div className="text-xs uppercase tracking-wide text-muted-foreground">{t("workforces.fields.workers")}</div>
           <div className="mt-3 space-y-3">
             {workers.length === 0 ? (
               <div className="rounded-lg border border-dashed p-4 text-sm text-muted-foreground">
-                No workers configured.
+                {t("workforces.workers.noneConfigured")}
               </div>
             ) : (
               workers.map((worker, index) => {
                 const agent = agents.find((item) => item.id === worker.agent_id)
-                const title = worker.alias || agent?.name || `Worker ${index + 1}`
+                const title = worker.alias || agent?.name || t("workforces.workers.fallbackName", { index: index + 1 })
 
                 return (
                   <div key={`${worker.source_type}-${index}`} className="rounded-lg border p-4">
                     <div className="flex flex-wrap items-center gap-2">
                       <div className="font-medium">{title}</div>
-                      <Badge variant="outline">{worker.source_type}</Badge>
-                      {agent ? <Badge variant="secondary">{agent.status}</Badge> : null}
+                      <Badge variant="outline">{t(`workforces.sourceTypes.${worker.source_type}`)}</Badge>
+                      {agent ? <Badge variant="secondary">{t(`workforces.status.${agent.status}`)}</Badge> : null}
                     </div>
                     <div className="mt-1 text-sm text-muted-foreground">
-                      {agent?.description || "Published agent"}
+                      {agent?.description || t("workforces.workers.publishedAgent")}
                     </div>
                     <div className="mt-3 text-sm text-muted-foreground">
                       {worker.assignment_instructions}

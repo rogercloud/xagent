@@ -2,12 +2,14 @@
 
 import { useEffect, useState } from "react"
 import { useParams } from "next/navigation"
+import { useI18n } from "@/contexts/i18n-context"
 import { getWorkforce } from "@/lib/workforces-api"
 import type { WorkforceDetail } from "@/types/workforce"
 import { WorkforceSummary } from "../../components/workforce-summary"
 import { WorkforceTestPanel } from "../../components/workforce-test-panel"
 
 export default function WorkforceRunPage() {
+  const { t } = useI18n()
   const params = useParams()
   const [workforce, setWorkforce] = useState<WorkforceDetail | null>(null)
   const [loading, setLoading] = useState(true)
@@ -26,17 +28,17 @@ export default function WorkforceRunPage() {
         const data = await getWorkforce(id)
         setWorkforce(data)
       } catch (err) {
-        setError(err instanceof Error ? err.message : "Failed to load workforce")
+        setError(err instanceof Error ? err.message : t("workforces.errors.load"))
       } finally {
         setLoading(false)
       }
     }
     void load()
-  }, [params.id])
+  }, [params.id, t])
 
-  if (loading) return <div className="h-full overflow-y-auto p-4 text-muted-foreground sm:p-8">Loading run view...</div>
+  if (loading) return <div className="h-full overflow-y-auto p-4 text-muted-foreground sm:p-8">{t("workforces.loading.runView")}</div>
   if (error) return <div className="h-full overflow-y-auto p-4 text-red-500 sm:p-8">{error}</div>
-  if (!workforce) return <div className="h-full overflow-y-auto p-4 text-muted-foreground sm:p-8">Workforce not found.</div>
+  if (!workforce) return <div className="h-full overflow-y-auto p-4 text-muted-foreground sm:p-8">{t("workforces.errors.notFound")}</div>
 
   return (
     <div className="h-full overflow-y-auto">
