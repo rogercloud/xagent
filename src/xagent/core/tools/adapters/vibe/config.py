@@ -218,6 +218,7 @@ class ToolConfig(BaseToolConfig):
         )
         parent_task_id = config_dict.get("parent_task_id")
         parent_tracer = config_dict.get("parent_tracer")
+        agent_call_stack = config_dict.get("agent_call_stack")
 
         # Output limit configuration (uses environment variable as default)
         # Store custom values if provided, otherwise use None to fall back to base class defaults
@@ -288,6 +289,11 @@ class ToolConfig(BaseToolConfig):
             parent_task_id if isinstance(parent_task_id, int) else None
         )
         self.parent_tracer: Any | None = parent_tracer
+        self.agent_call_stack: list[int] = (
+            [int(agent_id) for agent_id in agent_call_stack]
+            if isinstance(agent_call_stack, list)
+            else []
+        )
 
     def get_workspace_config(self) -> dict[str, Any] | None:
         return self.workspace_config
@@ -372,6 +378,9 @@ class ToolConfig(BaseToolConfig):
 
     def get_parent_tracer(self) -> Any | None:
         return self.parent_tracer
+
+    def get_agent_call_stack(self) -> list[int]:
+        return self.agent_call_stack
 
     def get_sandbox(self) -> Any | None:
         return None  # Standalone config doesn't have sandbox

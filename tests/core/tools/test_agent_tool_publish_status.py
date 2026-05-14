@@ -227,6 +227,50 @@ async def test_create_agent_tools_treats_empty_delegate_allowlist_as_unrestricte
         _remove_db(db_path)
 
 
+def test_agent_call_stack_excludes_recursive_agent_tools() -> None:
+    db, db_path = _create_session()
+    try:
+        owner = User(username="stack-owner", password_hash="x", is_admin=False)
+        db.add(owner)
+        db.commit()
+        db.refresh(owner)
+
+        agent_a = Agent(
+            user_id=owner.id,
+            name="Agent A",
+            status=AgentStatus.PUBLISHED,
+        )
+        agent_b = Agent(
+            user_id=owner.id,
+            name="Agent B",
+            status=AgentStatus.PUBLISHED,
+        )
+        agent_c = Agent(
+            user_id=owner.id,
+            name="Agent C",
+            status=AgentStatus.PUBLISHED,
+        )
+        db.add_all([agent_a, agent_b, agent_c])
+        db.commit()
+        db.refresh(agent_a)
+        db.refresh(agent_b)
+        db.refresh(agent_c)
+
+        tools = get_published_agents_tools(
+            db=db,
+            user_id=owner.id,
+            agent_call_stack=[agent_a.id, agent_b.id],
+        )
+        tool_names = {tool.name for tool in tools}
+
+        assert "call_agent_agent_a" not in tool_names
+        assert "call_agent_agent_b" not in tool_names
+        assert "call_agent_agent_c" in tool_names
+    finally:
+        db.close()
+        _remove_db(db_path)
+
+
 @pytest.mark.asyncio
 async def test_agent_tool_emits_workforce_delegation_trace_events(monkeypatch) -> None:
     db, db_path = _create_session()
@@ -265,8 +309,10 @@ async def test_agent_tool_emits_workforce_delegation_trace_events(monkeypatch) -
                 return object()
 
         class FakeAgentService:
+            init_kwargs = None
+
             def __init__(self, *args, **kwargs):
-                pass
+                self.__class__.init_kwargs = kwargs
 
             async def execute_task(self, task, context=None, task_id=None):
                 return {"output": "worker output"}
@@ -313,6 +359,11 @@ async def test_agent_tool_emits_workforce_delegation_trace_events(monkeypatch) -
         result = await tool.run_json_async({"task": "research"})
 
         assert result["response"] == "worker output"
+        assert FakeAgentService.init_kwargs["tracer"] is tracer
+        nested_tool_config = FakeAgentService.init_kwargs["tool_config"]
+        assert nested_tool_config.get_parent_tracer() is tracer
+        assert nested_tool_config.get_parent_task_id() == 123
+        assert nested_tool_config.get_agent_call_stack() == [agent.id]
         assert [event["data"]["event_type"] for event in tracer.events] == [
             "workforce_delegation_start",
             "workforce_delegation_end",

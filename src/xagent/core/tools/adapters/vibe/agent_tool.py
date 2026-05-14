@@ -1077,6 +1077,7 @@ class AgentTool(AbstractBaseTool):
         parent_task_id: int | None = None,
         parent_tracer: Any | None = None,
         workforce_context: dict[str, Any] | None = None,
+        agent_call_stack: list[int] | None = None,
     ):
         """
         Initialize an agent tool.
@@ -1101,6 +1102,7 @@ class AgentTool(AbstractBaseTool):
         self._parent_task_id = parent_task_id
         self._parent_tracer = parent_tracer
         self._workforce_context = workforce_context or {}
+        self._agent_call_stack = list(agent_call_stack or [])
         if workspace_base_dir is None:
             workspace_base_dir = str(get_uploads_dir())
         self._workspace_base_dir = workspace_base_dir
@@ -1297,8 +1299,11 @@ class AgentTool(AbstractBaseTool):
                 def __init__(self, user_id: int):
                     self.user = type("obj", (), {"id": user_id})()
 
+            agent_tool_categories = ensure_list(agent.tool_categories) or []
+            next_agent_call_stack = [*self._agent_call_stack, self._agent_id]
+
             allowed_tools = None
-            if agent.tool_categories is not None:
+            if agent_tool_categories:
                 from .factory import ToolFactory
 
                 temp_config = WebToolConfig(
@@ -1357,8 +1362,11 @@ class AgentTool(AbstractBaseTool):
                 allowed_tools=allowed_tools,
                 task_id=execution_task_id,
                 workspace_base_dir=self._workspace_base_dir,
-                allowed_agent_ids=[],
-                enable_global_agent_tools=False,
+                allowed_agent_ids=None,
+                enable_global_agent_tools="agent" in agent_tool_categories,
+                parent_task_id=self._parent_task_id,
+                parent_tracer=self._parent_tracer,
+                agent_call_stack=next_agent_call_stack,
             )
 
             # Create agent service
@@ -1376,7 +1384,7 @@ class AgentTool(AbstractBaseTool):
                 enable_workspace=True,
                 workspace_base_dir=self._workspace_base_dir,
                 task_id=execution_task_id,
-                tracer=None,
+                tracer=self._parent_tracer,
             )
 
             # Build execution context
@@ -1445,6 +1453,7 @@ def get_published_agents_tools(
     allow_cross_user_agent_ids: bool = False,
     parent_task_id: int | None = None,
     parent_tracer: Any | None = None,
+    agent_call_stack: list[int] | None = None,
 ) -> list[AbstractBaseTool]:
     """
     Get tools for published (and optionally draft) agents.
@@ -1500,9 +1509,15 @@ def get_published_agents_tools(
                 Agent.user_id == user_id,
             )
 
-        # Exclude the specified agent (to prevent self-calls)
+        excluded_agent_ids = set(agent_call_stack or [])
+        if excluded_agent_id is not None:
+            excluded_agent_ids.add(excluded_agent_id)
+
+        # Exclude active call-chain agents to prevent recursive AgentTool loops.
         if excluded_agent_id is not None:
             query = query.filter(Agent.id != excluded_agent_id)
+        if excluded_agent_ids:
+            query = query.filter(Agent.id.notin_(excluded_agent_ids))
 
         agents = query.all()
 
@@ -1560,6 +1575,7 @@ def get_published_agents_tools(
                 extra_system_prompt=override.get("extra_system_prompt"),
                 parent_task_id=parent_task_id,
                 parent_tracer=parent_tracer,
+                agent_call_stack=agent_call_stack,
                 workforce_context={
                     key: override[key]
                     for key in (
@@ -1625,6 +1641,7 @@ async def create_agent_tools(config: "WebToolConfig") -> list[AbstractBaseTool]:
             allow_cross_user_agent_ids=allow_cross_user_agent_ids,
             parent_task_id=getattr(config, "get_parent_task_id", lambda: None)(),
             parent_tracer=getattr(config, "get_parent_tracer", lambda: None)(),
+            agent_call_stack=getattr(config, "get_agent_call_stack", lambda: [])(),
         )
     except Exception as e:
         logger.warning(f"Failed to create agent tools: {e}")

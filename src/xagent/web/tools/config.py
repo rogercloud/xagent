@@ -142,6 +142,7 @@ class WebToolConfig(BaseToolConfig):
         allow_cross_user_agent_ids: bool = False,
         parent_task_id: int | None = None,
         parent_tracer: Any | None = None,
+        agent_call_stack: list[int] | None = None,
         sandbox: Any | None = None,
     ):
         self.db = db
@@ -177,6 +178,7 @@ class WebToolConfig(BaseToolConfig):
         self._allow_cross_user_agent_ids = allow_cross_user_agent_ids
         self._parent_task_id = parent_task_id
         self._parent_tracer = parent_tracer
+        self._agent_call_stack = list(agent_call_stack or [])
         self._excluded_agent_id: int | None = None
 
         # Cache user object for hook queries.
@@ -375,6 +377,9 @@ class WebToolConfig(BaseToolConfig):
 
     def get_parent_tracer(self) -> Any | None:
         return self._parent_tracer
+
+    def get_agent_call_stack(self) -> list[int]:
+        return self._agent_call_stack
 
     def get_sandbox(self) -> Any | None:
         """Get sandbox instance. Returns None if not available."""
