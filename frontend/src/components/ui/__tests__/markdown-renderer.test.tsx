@@ -7,10 +7,17 @@ const apiRequestMock = vi.hoisted(() => vi.fn())
 
 vi.mock('@/lib/utils', () => ({
   getApiUrl: () => 'http://api.local',
+  cn: (...classes: Array<string | undefined | null | false>) =>
+    classes.filter(Boolean).join(' '),
 }))
 
 vi.mock('@/lib/api-wrapper', () => ({
   apiRequest: apiRequestMock,
+}))
+
+vi.mock('next/navigation', () => ({
+  useRouter: () => ({ push: vi.fn() }),
+  usePathname: () => '/build/new',
 }))
 
 import { MarkdownRenderer } from '../markdown-renderer'
@@ -108,5 +115,28 @@ describe('MarkdownRenderer', () => {
     })
 
     expect(apiRequestMock).not.toHaveBeenCalled()
+  })
+
+  it('renders agent links outside paragraph tags', async () => {
+    apiRequestMock.mockResolvedValue({
+      ok: true,
+      json: async () => ({
+        id: 1,
+        name: 'Research Agent',
+        description: 'Search and summarize results',
+        status: 'published',
+      }),
+    })
+
+    const { container } = render(
+      <MarkdownRenderer content={'Created [Research Agent](agent://1) for this task.'} />
+    )
+
+    await waitFor(() => {
+      expect(screen.getByText('Research Agent')).toBeInTheDocument()
+    })
+
+    expect(container.querySelector('p div')).toBeNull()
+    expect(container.querySelector('p p')).toBeNull()
   })
 })

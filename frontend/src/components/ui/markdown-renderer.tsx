@@ -161,6 +161,25 @@ function containsAgentCardElement(children: React.ReactNode): boolean {
   })
 }
 
+function nodeContainsAgentLink(node: any): boolean {
+  if (!node) {
+    return false
+  }
+
+  if (node.type === 'element' && node.tagName === 'a') {
+    const href = node.properties?.href
+    if (typeof href === 'string' && href.startsWith('agent:')) {
+      return true
+    }
+  }
+
+  if (!Array.isArray(node.children)) {
+    return false
+  }
+
+  return node.children.some(nodeContainsAgentLink)
+}
+
 
 const UUID_PATTERN =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
@@ -247,8 +266,8 @@ function MarkdownFileImage({
 export function MarkdownRenderer({ content, className = '', onFileClick, onAgentClick }: MarkdownRendererProps) {
   const components = React.useMemo<Components>(
     () => ({
-      p({ node: _node, children, ...props }) {
-        if (containsAgentCardElement(children)) {
+      p({ node, children, ...props }) {
+        if (nodeContainsAgentLink(node) || containsAgentCardElement(children)) {
           return (
             <div className="my-4" {...props}>
               {children}

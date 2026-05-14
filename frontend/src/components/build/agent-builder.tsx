@@ -380,6 +380,8 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
 
   // Setup WebSocket connection
   useEffect(() => {
+    let shouldReconnect = true
+
     const connectWebSocket = () => {
       if (!token) {
         console.log('⏳ Waiting for token to connect to WS...')
@@ -400,6 +402,10 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
         const ws = new WebSocket(wsUrl)
 
         ws.onopen = () => {
+          if (!shouldReconnect) {
+            ws.close()
+            return
+          }
           console.log('✅ Build preview WebSocket connected')
           setWsConnected(true)
           wsRef.current = ws
@@ -477,7 +483,9 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
         }
 
         ws.onerror = (error) => {
-          console.error('Build preview WebSocket error:', error)
+          if (shouldReconnect) {
+            console.warn('Build preview WebSocket error; waiting for close event to decide reconnect.', error)
+          }
           // Don't set connected false here, let onclose handle it
         }
 
@@ -487,6 +495,10 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
           wsRef.current = null
 
           // Don't reconnect if component unmounted or token changed (handled by cleanup)
+          if (!shouldReconnect) {
+            return
+          }
+
           // Retry logic
           if (reconnectAttemptsRef.current < maxReconnectAttempts) {
             reconnectAttemptsRef.current++
@@ -510,6 +522,7 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
     connectWebSocket()
 
     return () => {
+      shouldReconnect = false
       if (reconnectTimeoutRef.current) {
         clearTimeout(reconnectTimeoutRef.current)
       }
