@@ -30,6 +30,7 @@ from xagent.web.models.agent import Agent, AgentStatus
 from xagent.web.models.database import Base
 from xagent.web.models.user import User
 from xagent.web.models.workforce import Workforce, WorkforceAgent
+from xagent.web.services import workforce_builder as workforce_builder_service
 
 
 def _create_session() -> tuple[Session, str]:
@@ -500,6 +501,144 @@ async def test_builder_apply_and_run_workforce() -> None:
         )
         assert run_response["status"] == "pending"
         assert run_response["redirect_url"].startswith("/task/")
+    finally:
+        db_session.close()
+        try:
+            import os
+
+            os.remove(db_path)
+        except OSError:
+            pass
+
+
+@pytest.mark.asyncio
+async def test_builder_uses_llm_before_rule_based_fallback(monkeypatch) -> None:
+    db_session, db_path = _create_session()
+    try:
+        regular_user = _create_user(db_session, "llm-builder-user")
+        manager = _create_agent(db_session, regular_user, "LLM Manager")
+        worker = _create_agent(db_session, regular_user, "LLM Worker")
+
+        created = await create_workforce(
+            WorkforceCreateRequest(
+                name="Original Workforce",
+                manager_agent_id=manager.id,
+                workers=[
+                    WorkforceWorkerInput(
+                        agent_id=worker.id,
+                        assignment_instructions="Handle analysis.",
+                    )
+                ],
+            ),
+            db_session,
+            regular_user,
+        )
+
+        async def fake_llm_generate_patch(*args, **kwargs):
+            del args, kwargs
+            return {
+                "summary": "Rename from the LLM.",
+                "operations": [
+                    {
+                        "op": "update_workforce",
+                        "fields": {"name": "LLM Renamed Workforce"},
+                    }
+                ],
+                "warnings": [],
+            }
+
+        monkeypatch.setattr(
+            workforce_builder_service,
+            "_llm_generate_patch",
+            fake_llm_generate_patch,
+        )
+
+        propose = await propose_workforce_changes(
+            created["id"],
+            WorkforceBuilderProposeRequest(
+                message='Rename this workforce to "Rule Based Name".',
+            ),
+            db_session,
+            regular_user,
+        )
+
+        operation = propose["proposed_patch"]["operations"][0]
+        assert operation["fields"]["name"] == "LLM Renamed Workforce"
+        assert "using rule-based parsing" not in propose["assistant_message"]
+    finally:
+        db_session.close()
+        try:
+            import os
+
+            os.remove(db_path)
+        except OSError:
+            pass
+
+
+@pytest.mark.asyncio
+async def test_builder_filters_template_and_new_worker_operations(monkeypatch) -> None:
+    db_session, db_path = _create_session()
+    try:
+        regular_user = _create_user(db_session, "llm-builder-filter-user")
+        manager = _create_agent(db_session, regular_user, "Filter Manager")
+        worker = _create_agent(db_session, regular_user, "Filter Worker")
+
+        created = await create_workforce(
+            WorkforceCreateRequest(
+                name="Filter Workforce",
+                manager_agent_id=manager.id,
+                workers=[
+                    WorkforceWorkerInput(
+                        agent_id=worker.id,
+                        assignment_instructions="Handle analysis.",
+                    )
+                ],
+            ),
+            db_session,
+            regular_user,
+        )
+
+        async def fake_llm_generate_patch(*args, **kwargs):
+            del args, kwargs
+            return workforce_builder_service._clean_patch(
+                {
+                    "summary": "Unsupported worker creation.",
+                    "operations": [
+                        {
+                            "op": "add_worker_from_template",
+                            "template_id": "researcher-template",
+                            "assignment_instructions": "Research.",
+                        },
+                        {
+                            "op": "create_worker_agent",
+                            "agent": {"name": "Draft Worker"},
+                            "assignment_instructions": "Draft.",
+                        },
+                    ],
+                    "warnings": [],
+                    "clarification": "Choose an existing published agent.",
+                }
+            )
+
+        monkeypatch.setattr(
+            workforce_builder_service,
+            "_llm_generate_patch",
+            fake_llm_generate_patch,
+        )
+
+        propose = await propose_workforce_changes(
+            created["id"],
+            WorkforceBuilderProposeRequest(message="Add a brand new worker."),
+            db_session,
+            regular_user,
+        )
+
+        assert propose["proposed_patch"]["operations"] == []
+        assert (
+            propose["proposed_patch"]["clarification"]
+            == "Choose an existing published agent."
+        )
+        assert propose["assistant_message"] == "Choose an existing published agent."
     finally:
         db_session.close()
         try:

@@ -82,6 +82,14 @@ export function ProposedPatchCard({
               </div>
             </div>
 
+            {patch.clarification ? (
+              <Alert>
+                <AlertTriangle className="size-4" />
+                <AlertTitle>Clarification needed</AlertTitle>
+                <AlertDescription>{patch.clarification}</AlertDescription>
+              </Alert>
+            ) : null}
+
             {patch.warnings.length > 0 ? (
               <Alert className="border-amber-200 bg-amber-50 text-amber-900">
                 <AlertTriangle className="size-4" />

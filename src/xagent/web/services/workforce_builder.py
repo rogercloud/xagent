@@ -1,13 +1,12 @@
 import json
 import logging
-import os
 import re
 from typing import Any, cast
 
 from fastapi import HTTPException
 from sqlalchemy.orm import Session
 
-from xagent.web.models.agent import Agent
+from xagent.web.models.agent import Agent, AgentStatus
 from xagent.web.models.user import User
 from xagent.web.services.llm_utils import UserAwareModelStorage
 
@@ -17,15 +16,13 @@ from .workforce_snapshot import (
     normalize_text,
     normalize_workforce_status,
 )
-from .workforce_workers import create_workforce_worker, list_template_summaries
+from .workforce_workers import create_workforce_worker
 
 logger = logging.getLogger(__name__)
 
 SUPPORTED_BUILDER_OPS = {
     "update_workforce",
     "add_existing_worker",
-    "add_worker_from_template",
-    "create_worker_agent",
     "update_worker",
     "remove_worker",
 }
@@ -93,6 +90,32 @@ def _make_builder_context(workforce: Workforce) -> dict[str, Any]:
     }
 
 
+def _serialize_available_agents_for_prompt(
+    db: Session, user: User, workforce: Workforce
+) -> list[dict[str, Any]]:
+    existing_agent_ids = {worker.agent_id for worker in workforce.workers}
+    manager_id = workforce.manager_agent_id
+    query = db.query(Agent).filter(cast(Any, Agent.status) == AgentStatus.PUBLISHED)
+    if not user.is_admin:
+        query = query.filter(Agent.user_id == user.id)
+
+    agents = query.order_by(Agent.id.asc()).all()
+    results: list[dict[str, Any]] = []
+    for raw_agent in agents:
+        agent = cast(Agent, raw_agent)
+        if agent.id in existing_agent_ids or agent.id == manager_id:
+            continue
+        results.append(
+            {
+                "agent_id": agent.id,
+                "name": agent.name,
+                "description": agent.description,
+                "status": getattr(agent.status, "value", str(agent.status)),
+            }
+        )
+    return results
+
+
 def _clean_patch(candidate: dict[str, Any]) -> dict[str, Any]:
     summary = (
         str(candidate.get("summary") or "").strip() or "Update workforce configuration."
@@ -101,6 +124,7 @@ def _clean_patch(candidate: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(warnings, list):
         warnings = []
     clean_warnings = [str(item).strip() for item in warnings if str(item).strip()]
+    clarification = str(candidate.get("clarification") or "").strip() or None
 
     operations = candidate.get("operations")
     if not isinstance(operations, list):
@@ -119,6 +143,7 @@ def _clean_patch(candidate: dict[str, Any]) -> dict[str, Any]:
         "summary": summary,
         "operations": clean_operations,
         "warnings": clean_warnings,
+        "clarification": clarification,
     }
 
 
@@ -225,49 +250,6 @@ def _fallback_patch_from_message(workforce: Workforce, message: str) -> dict[str
                 f'Update worker "{matched_worker.alias or matched_worker.agent.name}"'
             )
 
-    if (
-        "add" in lower
-        and "worker" in lower
-        and ("template" in lower or "based on" in lower)
-    ):
-        template = _find_template_candidate_for_message(text)
-        instructions = _extract_assignment_instructions(text)
-        if template is not None and instructions:
-            alias = _extract_alias_after_add_worker(text)
-            operations.append(
-                {
-                    "op": "add_worker_from_template",
-                    "template_id": template["id"],
-                    "alias": alias or template["name"],
-                    "assignment_instructions": instructions,
-                }
-            )
-            summary_parts.append(f'Add worker from template "{template["name"]}"')
-
-    if (
-        "add" in lower
-        and "worker" in lower
-        and ("new agent" in lower or "create agent" in lower)
-    ):
-        instructions = _extract_assignment_instructions(text)
-        agent_name = _extract_new_agent_name(text)
-        if agent_name and instructions:
-            operations.append(
-                {
-                    "op": "create_worker_agent",
-                    "agent": {
-                        "name": agent_name,
-                        "description": f"{agent_name} created by Workforce Builder.",
-                        "instructions": instructions,
-                        "execution_mode": "balanced",
-                        "tool_categories": ["basic"],
-                    },
-                    "alias": agent_name,
-                    "assignment_instructions": instructions,
-                }
-            )
-            summary_parts.append(f'Create new worker agent "{agent_name}"')
-
     if "add" in lower and "worker" in lower:
         agent = _find_agent_candidate_for_message(workforce, text)
         instructions = _extract_assignment_instructions(text)
@@ -296,6 +278,7 @@ def _fallback_patch_from_message(workforce: Workforce, message: str) -> dict[str
         "summary": ". ".join(summary_parts) + ".",
         "operations": operations,
         "warnings": warnings,
+        "clarification": None,
     }
 
 
@@ -346,16 +329,6 @@ def _find_agent_candidate_for_message(
     return None
 
 
-def _find_template_candidate_for_message(message: str) -> dict[str, Any] | None:
-    lower = message.lower()
-    for template in list_template_summaries():
-        template_name = str(template.get("name") or "")
-        template_id = str(template.get("id") or "")
-        if template_name.lower() in lower or template_id.lower() in lower:
-            return template
-    return None
-
-
 def _extract_alias_after_add_worker(message: str) -> str | None:
     match = re.search(
         r"add\s+(?:a\s+)?worker\s+(?:named|called)\s+\"?([a-zA-Z0-9 _-]+)\"?",
@@ -365,21 +338,6 @@ def _extract_alias_after_add_worker(message: str) -> str | None:
     if match:
         alias = match.group(1).strip()
         return alias or None
-    return None
-
-
-def _extract_new_agent_name(message: str) -> str | None:
-    quoted = [str(item).strip() for item in re.findall(r'"([^"]+)"', message)]
-    if quoted:
-        return quoted[0] or None
-    match = re.search(
-        r"(?:new agent|create agent)\s+([a-zA-Z0-9 _-]+?)(?:\s+to\s+|\s+for\s+|$)",
-        message,
-        flags=re.IGNORECASE,
-    )
-    if match:
-        candidate = match.group(1).strip()
-        return candidate or None
     return None
 
 
@@ -427,14 +385,22 @@ async def _llm_generate_patch(
             "Do not modify underlying agent instructions, models, tools, skills, "
             "or knowledge bases. "
             "Supported operations are: update_workforce, add_existing_worker, "
-            "add_worker_from_template, create_worker_agent, update_worker, remove_worker. "
+            "update_worker, remove_worker. "
+            "Workers must be existing published agents from available_published_agents. "
+            "Do not create new agents or add workers from templates. "
             "For destructive operations like remove_worker, include a warning. "
-            "Return a JSON object with keys summary, operations, warnings. No markdown fences."
+            "If the user's intent is unclear, return no operations and include a "
+            "clarification question. "
+            "Return a JSON object with keys summary, operations, warnings, "
+            "clarification. No markdown fences."
         )
         user_prompt = json.dumps(
             {
                 "request": message,
                 "current_state": _make_builder_context(workforce),
+                "available_published_agents": _serialize_available_agents_for_prompt(
+                    db, user, workforce
+                ),
             },
             ensure_ascii=False,
         )
@@ -471,22 +437,30 @@ async def generate_builder_patch(
     if normalized_message is None:
         raise HTTPException(status_code=400, detail="message is required")
 
+    llm_patch = await _llm_generate_patch(db, user, workforce, normalized_message)
+    if llm_patch is not None:
+        if _has_meaningful_operations(llm_patch):
+            return (
+                f"I prepared {len(llm_patch['operations'])} change(s) for review.",
+                llm_patch,
+            )
+        clarification = llm_patch.get("clarification")
+        if clarification:
+            return (str(clarification), llm_patch)
+        return (
+            "I could not translate the request into an executable Workforce change. "
+            "Review the proposal details and refine the prompt if needed.",
+            llm_patch,
+        )
+
     fallback_patch = _clean_patch(
         _fallback_patch_from_message(workforce, normalized_message)
     )
     if _has_meaningful_operations(fallback_patch):
         return (
-            f"I prepared {len(fallback_patch['operations'])} change(s) using rule-based parsing.",
+            f"I prepared {len(fallback_patch['operations'])} change(s) using rule-based parsing because no LLM was available.",
             fallback_patch,
         )
-
-    if os.getenv("XAGENT_WORKFORCE_BUILDER_ENABLE_LLM") == "1":
-        llm_patch = await _llm_generate_patch(db, user, workforce, normalized_message)
-        if llm_patch is not None and _has_meaningful_operations(llm_patch):
-            return (
-                f"I prepared {len(llm_patch['operations'])} change(s) for review.",
-                llm_patch,
-            )
 
     return (
         "I could not confidently translate the request into a safe structured change. "
@@ -592,81 +566,6 @@ def _apply_add_existing_worker(
     )
 
 
-def _apply_add_worker_from_template(
-    workforce: Workforce,
-    operation: dict[str, Any],
-    db: Session,
-    user: User,
-) -> None:
-    template_id = operation.get("template_id")
-    if not isinstance(template_id, str) or not template_id.strip():
-        raise HTTPException(
-            status_code=400,
-            detail="template_id is required for add_worker_from_template",
-        )
-
-    assignment_instructions = normalize_text(
-        operation.get("assignment_instructions"),
-        "assignment_instructions",
-        required=True,
-    )
-    if assignment_instructions is None:
-        raise HTTPException(
-            status_code=400, detail="assignment_instructions is required"
-        )
-
-    create_workforce_worker(
-        db,
-        workforce,
-        user,
-        source_type="template",
-        assignment_instructions=assignment_instructions,
-        alias=operation.get("alias"),
-        template_id=template_id.strip(),
-        enabled=bool(operation.get("enabled", True)),
-        sort_order=operation.get("sort_order")
-        if isinstance(operation.get("sort_order"), int)
-        else None,
-    )
-
-
-def _apply_create_worker_agent(
-    workforce: Workforce,
-    operation: dict[str, Any],
-    db: Session,
-    user: User,
-) -> None:
-    agent_payload = operation.get("agent")
-    if not isinstance(agent_payload, dict):
-        raise HTTPException(
-            status_code=400, detail="agent is required for create_worker_agent"
-        )
-
-    assignment_instructions = normalize_text(
-        operation.get("assignment_instructions"),
-        "assignment_instructions",
-        required=True,
-    )
-    if assignment_instructions is None:
-        raise HTTPException(
-            status_code=400, detail="assignment_instructions is required"
-        )
-
-    create_workforce_worker(
-        db,
-        workforce,
-        user,
-        source_type="new",
-        assignment_instructions=assignment_instructions,
-        alias=operation.get("alias"),
-        agent_payload=agent_payload,
-        enabled=bool(operation.get("enabled", True)),
-        sort_order=operation.get("sort_order")
-        if isinstance(operation.get("sort_order"), int)
-        else None,
-    )
-
-
 def _apply_update_worker(
     workforce: Workforce, operation: dict[str, Any], db: Session
 ) -> None:
@@ -744,10 +643,6 @@ def apply_builder_patch(
             _apply_update_workforce(workforce, operation, db)
         elif op_name == "add_existing_worker":
             _apply_add_existing_worker(workforce, operation, db, user)
-        elif op_name == "add_worker_from_template":
-            _apply_add_worker_from_template(workforce, operation, db, user)
-        elif op_name == "create_worker_agent":
-            _apply_create_worker_agent(workforce, operation, db, user)
         elif op_name == "update_worker":
             _apply_update_worker(workforce, operation, db)
         elif op_name == "remove_worker":

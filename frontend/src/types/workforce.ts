@@ -138,6 +138,7 @@ export interface WorkforceBuilderPatch {
   summary: string
   operations: WorkforceBuilderOperation[]
   warnings: string[]
+  clarification?: string | null
 }
 
 export interface WorkforceBuilderMessage {
