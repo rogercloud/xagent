@@ -549,6 +549,7 @@ def _apply_add_existing_worker(
         db.query(Agent).filter(Agent.id == agent_id).first(),
         user,
         db,
+        require_published=True,
     )
     agent_id_value = cast(int, agent.id)
     if agent_id_value == cast(int, workforce.manager_agent_id):

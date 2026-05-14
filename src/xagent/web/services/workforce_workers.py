@@ -29,10 +29,10 @@ def _validate_template_id(template_id: str) -> None:
 
 
 def ensure_supported_source_type(source_type: str) -> None:
-    if source_type not in {"existing", "template", "new"}:
+    if source_type != "existing":
         raise HTTPException(
             status_code=400,
-            detail="source_type must be one of: existing, template, new",
+            detail="source_type must be existing; publish an agent before adding it to a workforce",
         )
 
 
@@ -250,6 +250,7 @@ def create_workforce_worker(
             db.query(Agent).filter(Agent.id == agent_id).first(),
             user,
             db,
+            require_published=True,
         )
         existing = (
             db.query(WorkforceAgent)

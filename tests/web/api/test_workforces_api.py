@@ -51,7 +51,11 @@ def _create_user(db_session: Session, username: str, is_admin: bool = False) -> 
 
 
 def _create_agent(
-    db_session: Session, user: User, name: str, execution_mode: str = "balanced"
+    db_session: Session,
+    user: User,
+    name: str,
+    execution_mode: str = "balanced",
+    status: AgentStatus = AgentStatus.PUBLISHED,
 ) -> Agent:
     agent = Agent(
         user_id=user.id,
@@ -60,12 +64,193 @@ def _create_agent(
         instructions=f"{name} instructions",
         execution_mode=execution_mode,
         models={"general": 1},
-        status=AgentStatus.PUBLISHED,
+        status=status,
     )
     db_session.add(agent)
     db_session.commit()
     db_session.refresh(agent)
     return agent
+
+
+@pytest.mark.asyncio
+async def test_create_workforce_requires_published_manager_and_workers() -> None:
+    db_session, db_path = _create_session()
+    try:
+        regular_user = _create_user(db_session, "published-required-user")
+        published_manager = _create_agent(db_session, regular_user, "Published Manager")
+        draft_manager = _create_agent(
+            db_session,
+            regular_user,
+            "Draft Manager",
+            status=AgentStatus.DRAFT,
+        )
+        draft_worker = _create_agent(
+            db_session,
+            regular_user,
+            "Draft Worker",
+            status=AgentStatus.DRAFT,
+        )
+
+        with pytest.raises(HTTPException) as manager_error:
+            await create_workforce(
+                WorkforceCreateRequest(
+                    name="Draft Manager Workforce",
+                    manager_agent_id=draft_manager.id,
+                    workers=[
+                        WorkforceWorkerInput(
+                            agent_id=draft_worker.id,
+                            assignment_instructions="Draft should not run.",
+                        )
+                    ],
+                ),
+                db_session,
+                regular_user,
+            )
+        assert manager_error.value.status_code == 400
+        assert manager_error.value.detail == "Workforce agents must be published"
+
+        with pytest.raises(HTTPException) as worker_error:
+            await create_workforce(
+                WorkforceCreateRequest(
+                    name="Draft Worker Workforce",
+                    manager_agent_id=published_manager.id,
+                    workers=[
+                        WorkforceWorkerInput(
+                            agent_id=draft_worker.id,
+                            assignment_instructions="Draft should not run.",
+                        )
+                    ],
+                ),
+                db_session,
+                regular_user,
+            )
+        assert worker_error.value.status_code == 400
+        assert worker_error.value.detail == "Workforce agents must be published"
+    finally:
+        db_session.close()
+        try:
+            import os
+
+            os.remove(db_path)
+        except OSError:
+            pass
+
+
+@pytest.mark.asyncio
+async def test_workforce_rejects_template_and_new_workers() -> None:
+    db_session, db_path = _create_session()
+    try:
+        regular_user = _create_user(db_session, "source-type-user")
+        manager = _create_agent(db_session, regular_user, "Source Type Manager")
+
+        for source_type in ("template", "new"):
+            with pytest.raises(HTTPException) as source_error:
+                await create_workforce(
+                    WorkforceCreateRequest(
+                        name=f"{source_type} Workforce",
+                        manager_agent_id=manager.id,
+                        workers=[
+                            WorkforceWorkerInput(
+                                source_type=source_type,
+                                template_id="researcher-template"
+                                if source_type == "template"
+                                else None,
+                                agent={"name": "New Worker"}
+                                if source_type == "new"
+                                else None,
+                                assignment_instructions="Do the work.",
+                            )
+                        ],
+                    ),
+                    db_session,
+                    regular_user,
+                )
+            assert source_error.value.status_code == 400
+            assert "source_type must be existing" in str(source_error.value.detail)
+    finally:
+        db_session.close()
+        try:
+            import os
+
+            os.remove(db_path)
+        except OSError:
+            pass
+
+
+@pytest.mark.asyncio
+async def test_workforce_rejects_draft_agent_on_update_add_and_run() -> None:
+    db_session, db_path = _create_session()
+    try:
+        regular_user = _create_user(db_session, "draft-lifecycle-user")
+        manager = _create_agent(db_session, regular_user, "Lifecycle Manager")
+        worker = _create_agent(db_session, regular_user, "Lifecycle Worker")
+        extra_worker = _create_agent(db_session, regular_user, "Lifecycle Extra")
+        draft_manager = _create_agent(
+            db_session,
+            regular_user,
+            "Lifecycle Draft Manager",
+            status=AgentStatus.DRAFT,
+        )
+
+        created = await create_workforce(
+            WorkforceCreateRequest(
+                name="Lifecycle Workforce",
+                manager_agent_id=manager.id,
+                workers=[
+                    WorkforceWorkerInput(
+                        agent_id=worker.id,
+                        assignment_instructions="Handle lifecycle work.",
+                    )
+                ],
+            ),
+            db_session,
+            regular_user,
+        )
+
+        with pytest.raises(HTTPException) as update_error:
+            await update_workforce(
+                created["id"],
+                WorkforceUpdateRequest(manager_agent_id=draft_manager.id),
+                db_session,
+                regular_user,
+            )
+        assert update_error.value.status_code == 400
+        assert update_error.value.detail == "Workforce agents must be published"
+
+        extra_worker.status = AgentStatus.DRAFT
+        db_session.commit()
+        with pytest.raises(HTTPException) as add_error:
+            await add_workforce_agent(
+                created["id"],
+                WorkforceWorkerInput(
+                    agent_id=extra_worker.id,
+                    assignment_instructions="Draft add should fail.",
+                ),
+                db_session,
+                regular_user,
+            )
+        assert add_error.value.status_code == 400
+        assert add_error.value.detail == "Workforce agents must be published"
+
+        worker.status = AgentStatus.DRAFT
+        db_session.commit()
+        with pytest.raises(HTTPException) as run_error:
+            await create_workforce_run(
+                created["id"],
+                WorkforceRunRequest(message="Run with stale draft worker"),
+                db_session,
+                regular_user,
+            )
+        assert run_error.value.status_code == 400
+        assert run_error.value.detail == "Workforce agents must be published"
+    finally:
+        db_session.close()
+        try:
+            import os
+
+            os.remove(db_path)
+        except OSError:
+            pass
 
 
 @pytest.mark.asyncio

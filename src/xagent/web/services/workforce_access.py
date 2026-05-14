@@ -151,13 +151,24 @@ def ensure_agent_access(
     user: User,
     db: Session,
     purpose: str = "workforce_select",
+    require_published: bool = False,
 ) -> Agent:
     if agent is None:
         raise HTTPException(status_code=404, detail="Agent not found")
     if user.is_admin or int(agent.user_id) == int(user.id):
+        if require_published and agent.status != AgentStatus.PUBLISHED:
+            raise HTTPException(
+                status_code=400,
+                detail="Workforce agents must be published",
+            )
         return agent
     visible_agent_ids = get_visible_agent_ids(db, user, purpose)
     if visible_agent_ids is not None and int(agent.id) in visible_agent_ids:
+        if require_published and agent.status != AgentStatus.PUBLISHED:
+            raise HTTPException(
+                status_code=400,
+                detail="Workforce agents must be published",
+            )
         return agent
     raise HTTPException(status_code=403, detail="Access denied to agent")
 
@@ -167,9 +178,13 @@ def ensure_workforce_agent_run_access(
     user: User,
     db: Session,
 ) -> Agent:
-    """Allow Workforce runs to reference published or policy-visible agents."""
+    """Allow Workforce runs to reference only published accessible agents."""
     if agent is None:
         raise HTTPException(status_code=404, detail="Agent not found")
+    if agent.status != AgentStatus.PUBLISHED:
+        raise HTTPException(
+            status_code=400, detail="Workforce agents must be published"
+        )
     if user.is_admin or int(agent.user_id) == int(user.id):
         return agent
     visible_agent_ids = get_visible_agent_ids(db, user, "workforce_run")

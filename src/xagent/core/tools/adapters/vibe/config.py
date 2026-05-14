@@ -95,7 +95,7 @@ class BaseToolConfig(ABC):
         """Whether to include published agents as tools."""
         pass
 
-    def get_delegate_agent_ids(self) -> Optional[List[int]]:
+    def get_delegate_agent_ids(self) -> list[int] | None:
         """Get explicitly selected delegable agent IDs. None means default behavior."""
         return None
 

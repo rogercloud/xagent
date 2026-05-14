@@ -246,19 +246,6 @@ def _validate_worker_agent_ids(
                     status_code=409, detail="Duplicate worker agent in workforce"
                 )
             seen_agent_ids.add(worker.agent_id)
-        elif worker.source_type == "template":
-            if not worker.template_id:
-                raise HTTPException(status_code=400, detail="template_id is required")
-        elif worker.source_type == "new":
-            if worker.agent is None:
-                raise HTTPException(
-                    status_code=400, detail="agent is required for source_type='new'"
-                )
-            new_agent_name = normalize_text(
-                worker.agent.name, "agent.name", required=True
-            )
-            if new_agent_name is None:
-                raise HTTPException(status_code=400, detail="agent.name is required")
 
 
 def _ensure_can_activate(
@@ -367,6 +354,7 @@ async def create_workforce(
         db.query(Agent).filter(Agent.id == request.manager_agent_id).first(),
         user,
         db,
+        require_published=True,
     )
     manager_agent_id = cast(int, manager_agent.id)
     _check_duplicate_workforce_name(db, scope_type, scope_id, name)
@@ -460,6 +448,7 @@ async def update_workforce(
             db.query(Agent).filter(Agent.id == request.manager_agent_id).first(),
             user,
             db,
+            require_published=True,
         )
         manager_agent_id = cast(int, manager_agent.id)
         if any(worker.agent_id == manager_agent.id for worker in workforce.workers):
