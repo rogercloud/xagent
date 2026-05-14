@@ -190,6 +190,4 @@ def ensure_workforce_agent_run_access(
     visible_agent_ids = get_visible_agent_ids(db, user, "workforce_run")
     if visible_agent_ids is not None and int(agent.id) in visible_agent_ids:
         return agent
-    if agent.status == AgentStatus.PUBLISHED:
-        return agent
     raise HTTPException(status_code=403, detail="Access denied to agent")

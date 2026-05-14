@@ -18,6 +18,7 @@ import type React from "react";
 import dagre from "dagre"
 import { CenterPanel } from "@/components/layout/center-panel"
 import { FilePreviewActionButtons } from "@/components/file/file-preview-action-buttons"
+import { getTaskBackHref } from "./task-navigation";
 
 function TaskDetailContent() {
   const { state, sendMessage, setTaskId, openFilePreview, closeFilePreview, requestStatus, dispatch, pauseTask, resumeTask } = useApp();
@@ -321,20 +322,15 @@ function TaskDetailContent() {
       ref={containerRef}
       className={`h-full bg-background relative transition-all flex ${anyPreviewOpen ? 'flex-row items-stretch' : 'flex-col'} overflow-hidden`}
     >
-      {/* Back Button - Only show if this task is from an agent */}
-      {state.currentTask?.agentId && (
+      {/* Back Button - Show for agent and workforce tasks */}
+      {(state.currentTask?.agentId || state.currentTask?.workforceId) && (
         <div className="absolute top-4 left-4 z-50">
           <Button
             variant="ghost"
             size="icon"
             className="rounded-full bg-background/50 hover:bg-background/80 backdrop-blur border shadow-sm"
             onClick={() => {
-              const agentId = state.currentTask?.agentId;
-              if (agentId) {
-                router.push(`/agent/${agentId}`);
-              } else {
-                router.push("/task");
-              }
+              router.push(getTaskBackHref(state.currentTask));
             }}
             title={t("common.back")}
           >

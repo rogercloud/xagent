@@ -254,6 +254,7 @@ interface Task {
   executionMode?: "flash" | "balanced" | "think"
   isDag?: boolean
   agentId?: number
+  workforceId?: number
 }
 
 interface StepExecution {
@@ -1004,6 +1005,7 @@ export function AppProvider({ children, token }: { children: React.ReactNode; to
                 executionMode: taskData.execution_mode,
                 isDag: taskData.is_dag,
                 agentId: taskData.agent_id,
+                workforceId: taskData.workforce_id,
               }
             })
 
@@ -3576,6 +3578,7 @@ export function AppProvider({ children, token }: { children: React.ReactNode; to
             executionMode: taskData.execution_mode,
             isDag: taskData.is_dag,
             agentId: taskData.agent_id,
+            workforceId: taskData.workforce_id,
           }
           dispatch({ type: "SET_CURRENT_TASK", payload: newTask })
           dispatch({ type: "TRIGGER_TASK_UPDATE" })

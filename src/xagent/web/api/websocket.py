@@ -81,6 +81,14 @@ def _resolve_task_llm_ids(
     )
 
 
+def _extract_task_workforce_id(task: Any) -> int | None:
+    agent_config = getattr(task, "agent_config", None)
+    if not isinstance(agent_config, dict):
+        return None
+    workforce_id = agent_config.get("workforce_id")
+    return workforce_id if isinstance(workforce_id, int) else None
+
+
 def normalize_filename(filename: str) -> str:
     """
     Normalize filename by removing special characters and spaces.
@@ -843,6 +851,7 @@ async def execute_task_background(
                         "description": task.description,
                         "status": final_task_status,
                         "execution_mode": task.execution_mode,
+                        "workforce_id": _extract_task_workforce_id(task),
                     },
                     task.updated_at if task.updated_at else None,
                 ),
@@ -1159,6 +1168,7 @@ async def execute_v2_resume_background(
                         "description": task.description,
                         "status": final_status,
                         "execution_mode": task.execution_mode,
+                        "workforce_id": _extract_task_workforce_id(task),
                     },
                 ),
                 task_id,
@@ -1771,6 +1781,7 @@ async def handle_chat_message(
                                 "compact_model_name": task.compact_model_name,
                                 "execution_mode": task.execution_mode,
                                 "agent_id": task.agent_id,
+                                "workforce_id": _extract_task_workforce_id(task),
                                 "is_dag": is_dag,
                                 "created_at": safe_timestamp_to_unix(task.created_at)
                                 if task.created_at
@@ -1968,6 +1979,7 @@ async def handle_chat_message(
                                 "visual_model_name": task.visual_model_name,
                                 "compact_model_name": task.compact_model_name,
                                 "execution_mode": task.execution_mode,
+                                "workforce_id": _extract_task_workforce_id(task),
                                 "created_at": safe_timestamp_to_unix(task.created_at)
                                 if task.created_at
                                 else None,
@@ -2102,6 +2114,7 @@ async def handle_chat_message(
                                 "compact_model_name": task.compact_model_name,
                                 "execution_mode": task.execution_mode,
                                 "agent_id": task.agent_id,
+                                "workforce_id": _extract_task_workforce_id(task),
                                 "is_dag": is_dag,
                                 "created_at": safe_timestamp_to_unix(task.created_at)
                                 if task.created_at
@@ -2267,6 +2280,7 @@ async def handle_execute_task(
                     "visual_model_name": task.visual_model_name,
                     "compact_model_name": task.compact_model_name,
                     "execution_mode": task.execution_mode,
+                    "workforce_id": _extract_task_workforce_id(task),
                     "created_at": safe_timestamp_to_unix(task.created_at)
                     if task.created_at
                     else None,
@@ -2483,6 +2497,7 @@ async def send_historical_data_as_stream(
                     "compact_model_name": task.compact_model_name,
                     "execution_mode": task.execution_mode,
                     "agent_id": task.agent_id,
+                    "workforce_id": _extract_task_workforce_id(task),
                     "is_dag": is_dag,
                     "waiting_question": waiting_question,
                     "waiting_interactions": waiting_interactions,

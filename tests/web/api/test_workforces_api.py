@@ -31,6 +31,7 @@ from xagent.web.models.database import Base
 from xagent.web.models.user import User
 from xagent.web.models.workforce import Workforce, WorkforceAgent
 from xagent.web.services import workforce_builder as workforce_builder_service
+from xagent.web.services.workforce_access import WorkforcePolicy, set_workforce_policy
 
 
 def _create_session() -> tuple[Session, str]:
@@ -502,6 +503,123 @@ async def test_builder_apply_and_run_workforce() -> None:
         assert run_response["status"] == "pending"
         assert run_response["redirect_url"].startswith("/task/")
     finally:
+        db_session.close()
+        try:
+            import os
+
+            os.remove(db_path)
+        except OSError:
+            pass
+
+
+@pytest.mark.asyncio
+async def test_workforce_run_revalidates_policy_visible_agents() -> None:
+    class RunOnlyPolicy(WorkforcePolicy):
+        def can_view_workforce(self, db, user, workforce):
+            del db, user, workforce
+            return True
+
+        def can_run_workforce(self, db, user, workforce):
+            del db, user, workforce
+            return True
+
+        def get_visible_agent_ids(self, db, user, purpose):
+            del db, user, purpose
+            return set()
+
+    db_session, db_path = _create_session()
+    try:
+        owner = _create_user(db_session, "policy-owner")
+        runner = _create_user(db_session, "policy-runner")
+        manager = _create_agent(db_session, owner, "Policy Manager")
+        worker = _create_agent(db_session, owner, "Policy Worker")
+
+        created = await create_workforce(
+            WorkforceCreateRequest(
+                name="Policy Workforce",
+                manager_agent_id=manager.id,
+                workers=[
+                    WorkforceWorkerInput(
+                        agent_id=worker.id,
+                        assignment_instructions="Handle policy work.",
+                    )
+                ],
+            ),
+            db_session,
+            owner,
+        )
+
+        set_workforce_policy(RunOnlyPolicy())
+        with pytest.raises(HTTPException) as run_error:
+            await create_workforce_run(
+                created["id"],
+                WorkforceRunRequest(message="Run with no visible agents"),
+                db_session,
+                runner,
+            )
+        assert run_error.value.status_code == 403
+        assert run_error.value.detail == "Access denied to agent"
+    finally:
+        set_workforce_policy(WorkforcePolicy())
+        db_session.close()
+        try:
+            import os
+
+            os.remove(db_path)
+        except OSError:
+            pass
+
+
+@pytest.mark.asyncio
+async def test_workforce_run_allows_policy_visible_agents() -> None:
+    class VisibleRunPolicy(WorkforcePolicy):
+        def __init__(self, visible_ids):
+            self.visible_ids = visible_ids
+
+        def can_view_workforce(self, db, user, workforce):
+            del db, user, workforce
+            return True
+
+        def can_run_workforce(self, db, user, workforce):
+            del db, user, workforce
+            return True
+
+        def get_visible_agent_ids(self, db, user, purpose):
+            del db, user, purpose
+            return self.visible_ids
+
+    db_session, db_path = _create_session()
+    try:
+        owner = _create_user(db_session, "visible-policy-owner")
+        runner = _create_user(db_session, "visible-policy-runner")
+        manager = _create_agent(db_session, owner, "Visible Policy Manager")
+        worker = _create_agent(db_session, owner, "Visible Policy Worker")
+
+        created = await create_workforce(
+            WorkforceCreateRequest(
+                name="Visible Policy Workforce",
+                manager_agent_id=manager.id,
+                workers=[
+                    WorkforceWorkerInput(
+                        agent_id=worker.id,
+                        assignment_instructions="Handle visible policy work.",
+                    )
+                ],
+            ),
+            db_session,
+            owner,
+        )
+
+        set_workforce_policy(VisibleRunPolicy({manager.id, worker.id}))
+        response = await create_workforce_run(
+            created["id"],
+            WorkforceRunRequest(message="Run with visible agents"),
+            db_session,
+            runner,
+        )
+        assert response["status"] == "pending"
+    finally:
+        set_workforce_policy(WorkforcePolicy())
         db_session.close()
         try:
             import os

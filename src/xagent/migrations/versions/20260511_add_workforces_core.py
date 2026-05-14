@@ -1,7 +1,7 @@
 """add workforce core tables
 
 Revision ID: 20260511_add_workforces_core
-Revises: b2c517a02b3b
+Revises: 7f4d2c9a1b58
 Create Date: 2026-05-11
 """
 
@@ -11,7 +11,7 @@ import sqlalchemy as sa
 from alembic import op
 
 revision: str = "20260511_add_workforces_core"
-down_revision: str | None = "b2c517a02b3b"
+down_revision: str | None = "7f4d2c9a1b58"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 
