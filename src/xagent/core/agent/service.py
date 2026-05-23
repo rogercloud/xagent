@@ -619,7 +619,75 @@ class AgentService:
             else tuple(str(name) for name in allowed_tools)
         )
 
-        return (override_items, allowed_items)
+        get_allowed_agent_ids = getattr(self.tool_config, "get_allowed_agent_ids", None)
+        allowed_agent_ids = (
+            get_allowed_agent_ids() if callable(get_allowed_agent_ids) else None
+        )
+        allowed_agent_items = (
+            None
+            if allowed_agent_ids is None
+            else tuple(str(agent_id) for agent_id in allowed_agent_ids)
+        )
+
+        get_agent_tool_overrides = getattr(
+            self.tool_config, "get_agent_tool_overrides", None
+        )
+        agent_tool_overrides = (
+            get_agent_tool_overrides() if callable(get_agent_tool_overrides) else {}
+        )
+        if isinstance(agent_tool_overrides, dict):
+            agent_override_items = tuple(
+                sorted(
+                    (
+                        str(agent_id),
+                        tuple(
+                            sorted(
+                                (str(key), repr(value))
+                                for key, value in override.items()
+                            )
+                        )
+                        if isinstance(override, dict)
+                        else repr(override),
+                    )
+                    for agent_id, override in agent_tool_overrides.items()
+                )
+            )
+        else:
+            agent_override_items = ()
+
+        get_enable_global_agent_tools = getattr(
+            self.tool_config, "get_enable_global_agent_tools", None
+        )
+        enable_global_agent_tools = (
+            get_enable_global_agent_tools()
+            if callable(get_enable_global_agent_tools)
+            else True
+        )
+
+        get_allow_cross_user_agent_ids = getattr(
+            self.tool_config, "get_allow_cross_user_agent_ids", None
+        )
+        allow_cross_user_agent_ids = (
+            get_allow_cross_user_agent_ids()
+            if callable(get_allow_cross_user_agent_ids)
+            else False
+        )
+
+        get_agent_call_stack = getattr(self.tool_config, "get_agent_call_stack", None)
+        agent_call_stack = (
+            get_agent_call_stack() if callable(get_agent_call_stack) else []
+        )
+        agent_call_stack_items = tuple(str(agent_id) for agent_id in agent_call_stack)
+
+        return (
+            override_items,
+            allowed_items,
+            allowed_agent_items,
+            agent_override_items,
+            bool(enable_global_agent_tools),
+            bool(allow_cross_user_agent_ids),
+            agent_call_stack_items,
+        )
 
     def _execution_type(self) -> str:
         if self.pattern == "dag_plan_execute":

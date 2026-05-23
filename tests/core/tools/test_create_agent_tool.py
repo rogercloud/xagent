@@ -112,6 +112,117 @@ class TestCreateAgentTool:
                 pass
 
     @pytest.mark.asyncio
+    async def test_agent_tool_applies_workforce_runtime_overrides(self) -> None:
+        db, db_path = _create_session()
+        try:
+            user = User(username="testuser11", password_hash="x", is_admin=False)
+            db.add(user)
+            db.commit()
+            db.refresh(user)
+
+            model = Model(
+                model_id="test-model-id",
+                category="llm",
+                model_provider="openai",
+                model_name="gpt-4",
+                api_key="test-api-key",
+                base_url="https://api.openai.com/v1",
+                temperature=0.7,
+                abilities=["chat"],
+            )
+            db.add(model)
+            db.commit()
+            db.refresh(model)
+
+            agent = Agent(
+                user_id=user.id,
+                name="Worker Agent",
+                description="Nested workforce worker",
+                instructions="Base worker instructions.",
+                status=AgentStatus.PUBLISHED,
+                models={"general": model.id},
+            )
+            db.add(agent)
+            db.commit()
+            db.refresh(agent)
+
+            parent_handler = Mock()
+            parent_tracer = Mock()
+            parent_tracer.handlers = [parent_handler]
+
+            tool = AgentTool(
+                agent_id=agent.id,
+                agent_name=agent.name,
+                agent_description=agent.description or "",
+                db=db,
+                user_id=user.id,
+                task_id="tool-session",
+                tool_name="call_workforce_worker_7_writer",
+                tool_description="Write the final report.",
+                extra_system_prompt="Workforce assignment: write only.",
+                parent_task_id="parent-task-2",
+                parent_tracer=parent_tracer,
+                agent_call_stack=[99],
+                allowed_agent_ids=[],
+                enable_global_agent_tools=False,
+                runtime_metadata={"workforce_id": 123, "worker_alias": "Writer"},
+            )
+
+            with (
+                patch(
+                    "xagent.web.services.llm_utils.UserAwareModelStorage"
+                ) as mock_storage_class,
+                patch(
+                    "xagent.core.agent.service.AgentService"
+                ) as mock_agent_service_class,
+                patch("xagent.core.memory.in_memory.InMemoryMemoryStore"),
+            ):
+                mock_storage = Mock()
+                mock_llm = Mock()
+                mock_storage.get_llm_by_name_with_access.return_value = mock_llm
+                mock_storage_class.return_value = mock_storage
+
+                mock_agent_service = mock_agent_service_class.return_value
+                mock_agent_service.execute_task = AsyncMock(
+                    return_value={
+                        "output": "worker response",
+                        "file_outputs": [{"filename": "report.txt"}],
+                    }
+                )
+
+                result = await tool.run_json_async({"task": "draft report"})
+
+            assert tool.name == "call_workforce_worker_7_writer"
+            assert tool.description == "Write the final report."
+            assert result["response"] == "worker response"
+            assert result["file_outputs"] == [{"filename": "report.txt"}]
+
+            tool_config = mock_agent_service_class.call_args.kwargs["tool_config"]
+            assert tool_config.get_allowed_agent_ids() == []
+            assert tool_config.get_enable_global_agent_tools() is False
+            assert tool_config.get_parent_task_id() == "parent-task-2"
+            assert tool_config.get_parent_tracer() is parent_tracer
+            assert tool_config.get_agent_call_stack() == [99, agent.id]
+
+            tracer = mock_agent_service_class.call_args.kwargs["tracer"]
+            assert parent_handler in tracer.handlers
+
+            execute_context = mock_agent_service.execute_task.call_args.kwargs[
+                "context"
+            ]
+            assert execute_context["system_prompt"] == (
+                "Base worker instructions.\n\nWorkforce assignment: write only."
+            )
+        finally:
+            db.close()
+            try:
+                import os
+
+                os.remove(db_path)
+            except OSError:
+                pass
+
+    @pytest.mark.asyncio
     async def test_create_agent_with_tool_filters(self) -> None:
         """Test agent creation with tool categories and skills filters."""
         db, db_path = _create_session()
