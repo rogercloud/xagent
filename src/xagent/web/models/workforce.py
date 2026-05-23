@@ -52,7 +52,11 @@ class Workforce(Base):  # type: ignore[no-any-unimported]
         back_populates="workforce",
         cascade="all, delete-orphan",
     )
-    runs = relationship("WorkforceRun", back_populates="workforce")
+    runs = relationship(
+        "WorkforceRun",
+        back_populates="workforce",
+        cascade="all, delete-orphan",
+    )
     builder_messages = relationship(
         "WorkforceBuilderMessage",
         back_populates="workforce",

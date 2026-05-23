@@ -6,7 +6,7 @@ from sqlalchemy import create_engine, inspect
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import StaticPool
 
-from xagent.web.models import Agent, Base, User, Workforce
+from xagent.web.models import Agent, Base, User, Workforce, WorkforceRun
 from xagent.web.models.agent import AgentStatus
 from xagent.web.services.workforce_access import ensure_workforce_access
 from xagent.web.services.workforce_snapshot import (
@@ -105,6 +105,30 @@ def test_workforce_models_are_registered(db_session: Session) -> None:
     assert "workforce_agents" in tables
     assert "workforce_runs" in tables
     assert "workforce_builder_messages" in tables
+
+
+def test_deleting_workforce_deletes_runs_with_orm_cascade(
+    db_session: Session,
+) -> None:
+    user = _create_user(db_session, "owner")
+    manager = _create_agent(db_session, user, "Manager")
+    workforce = _create_workforce(db_session, user, manager)
+    run = WorkforceRun(
+        workforce_id=workforce.id,
+        user_id=user.id,
+        status="pending",
+        snapshot={"version": 1},
+    )
+    db_session.add(run)
+    db_session.commit()
+
+    workforce_id = int(workforce.id)
+    run_id = int(run.id)
+    db_session.delete(workforce)
+    db_session.commit()
+
+    assert db_session.get(Workforce, workforce_id) is None
+    assert db_session.get(WorkforceRun, run_id) is None
 
 
 def test_build_workforce_snapshot_for_active_workforce(db_session: Session) -> None:
