@@ -50,6 +50,18 @@ def _drop_index_if_exists(index_name: str, table_name: str) -> None:
         op.drop_index(op.f(index_name), table_name=table_name)
 
 
+def _foreign_key_if_table_exists(
+    table_name: str,
+    columns: list[str],
+    referent: list[str],
+    *,
+    ondelete: str,
+) -> list[sa.ForeignKeyConstraint]:
+    if not _table_exists(table_name):
+        return []
+    return [sa.ForeignKeyConstraint(columns, referent, ondelete=ondelete)]
+
+
 def upgrade() -> None:
     if not _table_exists("workforces"):
         op.create_table(
@@ -76,11 +88,17 @@ def upgrade() -> None:
                 server_default=sa.func.now(),
                 nullable=True,
             ),
-            sa.ForeignKeyConstraint(
-                ["manager_agent_id"], ["agents.id"], ondelete="RESTRICT"
+            *_foreign_key_if_table_exists(
+                "agents",
+                ["manager_agent_id"],
+                ["agents.id"],
+                ondelete="RESTRICT",
             ),
-            sa.ForeignKeyConstraint(
-                ["owner_user_id"], ["users.id"], ondelete="CASCADE"
+            *_foreign_key_if_table_exists(
+                "users",
+                ["owner_user_id"],
+                ["users.id"],
+                ondelete="CASCADE",
             ),
             sa.PrimaryKeyConstraint("id"),
             sa.UniqueConstraint(
@@ -124,9 +142,17 @@ def upgrade() -> None:
                 server_default=sa.func.now(),
                 nullable=True,
             ),
-            sa.ForeignKeyConstraint(["agent_id"], ["agents.id"], ondelete="RESTRICT"),
-            sa.ForeignKeyConstraint(
-                ["workforce_id"], ["workforces.id"], ondelete="CASCADE"
+            *_foreign_key_if_table_exists(
+                "agents",
+                ["agent_id"],
+                ["agents.id"],
+                ondelete="RESTRICT",
+            ),
+            *_foreign_key_if_table_exists(
+                "workforces",
+                ["workforce_id"],
+                ["workforces.id"],
+                ondelete="CASCADE",
             ),
             sa.PrimaryKeyConstraint("id"),
             sa.UniqueConstraint("workforce_id", "agent_id", name="uq_workforce_agent"),
@@ -156,10 +182,23 @@ def upgrade() -> None:
                 nullable=True,
             ),
             sa.Column("completed_at", sa.DateTime(timezone=True), nullable=True),
-            sa.ForeignKeyConstraint(["task_id"], ["tasks.id"], ondelete="SET NULL"),
-            sa.ForeignKeyConstraint(["user_id"], ["users.id"], ondelete="CASCADE"),
-            sa.ForeignKeyConstraint(
-                ["workforce_id"], ["workforces.id"], ondelete="CASCADE"
+            *_foreign_key_if_table_exists(
+                "tasks",
+                ["task_id"],
+                ["tasks.id"],
+                ondelete="SET NULL",
+            ),
+            *_foreign_key_if_table_exists(
+                "users",
+                ["user_id"],
+                ["users.id"],
+                ondelete="CASCADE",
+            ),
+            *_foreign_key_if_table_exists(
+                "workforces",
+                ["workforce_id"],
+                ["workforces.id"],
+                ondelete="CASCADE",
             ),
             sa.PrimaryKeyConstraint("id"),
             sa.UniqueConstraint("task_id"),
@@ -188,9 +227,17 @@ def upgrade() -> None:
                 server_default=sa.func.now(),
                 nullable=True,
             ),
-            sa.ForeignKeyConstraint(["user_id"], ["users.id"], ondelete="CASCADE"),
-            sa.ForeignKeyConstraint(
-                ["workforce_id"], ["workforces.id"], ondelete="CASCADE"
+            *_foreign_key_if_table_exists(
+                "users",
+                ["user_id"],
+                ["users.id"],
+                ondelete="CASCADE",
+            ),
+            *_foreign_key_if_table_exists(
+                "workforces",
+                ["workforce_id"],
+                ["workforces.id"],
+                ondelete="CASCADE",
             ),
             sa.PrimaryKeyConstraint("id"),
         )
