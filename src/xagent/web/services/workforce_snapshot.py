@@ -59,7 +59,7 @@ def build_worker_tool_name(worker_id: int, alias: str) -> str:
         return raw
 
     worker_id_str = str(worker_id)
-    hash_suffix = "_" + hashlib.md5(slug.encode()).hexdigest()[:6]
+    hash_suffix = "_" + hashlib.sha256(slug.encode()).hexdigest()[:6]
     available = (
         _MAX_TOOL_NAME_LENGTH
         - len(_TOOL_NAME_PREFIX)

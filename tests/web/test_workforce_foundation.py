@@ -1,3 +1,5 @@
+import hashlib
+
 import pytest
 from fastapi import HTTPException
 from sqlalchemy import create_engine, inspect
@@ -282,6 +284,11 @@ def test_workforce_status_and_tool_name_normalization() -> None:
     assert normalize_workforce_run_status(" Completed ") == "completed"
     assert len(tool_name) <= 64
     assert tool_name.startswith("call_workforce_worker_99_")
+    assert tool_name.endswith(
+        hashlib.sha256(
+            "this_worker_alias_is_long_enough_to_require_stable_truncation".encode()
+        ).hexdigest()[:6]
+    )
 
     with pytest.raises(HTTPException) as status_error:
         normalize_workforce_status("unknown")
