@@ -673,6 +673,13 @@ class AgentService:
             else False
         )
 
+        get_parent_task_id = getattr(self.tool_config, "get_parent_task_id", None)
+        parent_task_id = get_parent_task_id() if callable(get_parent_task_id) else None
+
+        get_parent_tracer = getattr(self.tool_config, "get_parent_tracer", None)
+        parent_tracer = get_parent_tracer() if callable(get_parent_tracer) else None
+        parent_tracer_identity = None if parent_tracer is None else id(parent_tracer)
+
         get_agent_call_stack = getattr(self.tool_config, "get_agent_call_stack", None)
         agent_call_stack = (
             get_agent_call_stack() if callable(get_agent_call_stack) else []
@@ -686,6 +693,8 @@ class AgentService:
             agent_override_items,
             bool(enable_global_agent_tools),
             bool(allow_cross_user_agent_ids),
+            None if parent_task_id is None else str(parent_task_id),
+            parent_tracer_identity,
             agent_call_stack_items,
         )
 

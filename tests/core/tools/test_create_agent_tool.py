@@ -147,8 +147,25 @@ class TestCreateAgentTool:
             db.refresh(agent)
 
             parent_handler = Mock()
-            parent_tracer = Mock()
-            parent_tracer.handlers = [parent_handler]
+
+            class ParentTracer:
+                def __init__(self) -> None:
+                    self.handlers = [parent_handler]
+                    self.events = []
+
+                async def trace_event(
+                    self, event_type, task_id=None, step_id=None, data=None
+                ):
+                    self.events.append(
+                        {
+                            "event_type": event_type.value,
+                            "task_id": task_id,
+                            "step_id": step_id,
+                            "data": data or {},
+                        }
+                    )
+
+            parent_tracer = ParentTracer()
 
             tool = AgentTool(
                 agent_id=agent.id,
@@ -196,6 +213,20 @@ class TestCreateAgentTool:
             assert tool.description == "Write the final report."
             assert result["response"] == "worker response"
             assert result["file_outputs"] == [{"filename": "report.txt"}]
+            assert [event["data"]["event_type"] for event in parent_tracer.events] == [
+                "workforce_delegation_start",
+                "workforce_delegation_end",
+            ]
+            assert parent_tracer.events[0]["task_id"] == "parent-task-2"
+            assert parent_tracer.events[0]["data"]["workforce_id"] == 123
+            assert parent_tracer.events[0]["data"]["worker_alias"] == "Writer"
+            assert parent_tracer.events[1]["data"]["output"] == "worker response"
+            assert parent_tracer.events[1]["data"]["output_length"] == len(
+                "worker response"
+            )
+            assert parent_tracer.events[1]["data"]["file_outputs"] == [
+                {"filename": "report.txt"}
+            ]
 
             tool_config = mock_agent_service_class.call_args.kwargs["tool_config"]
             assert tool_config.get_allowed_agent_ids() == []

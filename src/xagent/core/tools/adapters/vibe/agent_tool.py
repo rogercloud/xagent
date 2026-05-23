@@ -1283,6 +1283,85 @@ class AgentTool(AbstractBaseTool):
         """Sync execution not supported."""
         raise NotImplementedError("AgentTool only supports async execution.")
 
+    def _build_delegation_trace_data(
+        self,
+        status: str,
+        execution_task_id: Optional[str] = None,
+        output: Optional[str] = None,
+        error: Optional[str] = None,
+        file_outputs: Optional[list[dict[str, Any]]] = None,
+    ) -> dict[str, Any]:
+        data: dict[str, Any] = {
+            "event_type": f"workforce_delegation_{status}",
+            "agent_id": self._agent_id,
+            "agent_name": self._agent_name,
+            "tool_name": self.name,
+        }
+        data.update(self._runtime_metadata)
+        if execution_task_id:
+            data["worker_task_id"] = execution_task_id
+        if output is not None:
+            data["output"] = output[:2000]
+            data["output_length"] = len(output)
+        if error is not None:
+            data["error"] = error
+        if file_outputs:
+            data["file_outputs"] = file_outputs
+        return data
+
+    async def _trace_delegation(
+        self,
+        status: str,
+        execution_task_id: Optional[str] = None,
+        output: Optional[str] = None,
+        error: Optional[str] = None,
+        file_outputs: Optional[list[dict[str, Any]]] = None,
+    ) -> None:
+        if (
+            self._parent_tracer is None
+            or self._parent_task_id is None
+            or not self._runtime_metadata
+        ):
+            return
+
+        trace_event = getattr(self._parent_tracer, "trace_event", None)
+        if not callable(trace_event):
+            return
+
+        try:
+            import inspect
+
+            from .....core.agent.trace import (
+                TraceAction,
+                TraceCategory,
+                TraceEventType,
+                TraceScope,
+            )
+
+            action = {
+                "start": TraceAction.START,
+                "end": TraceAction.END,
+                "error": TraceAction.ERROR,
+            }.get(status)
+            if action is None:
+                return
+
+            result = trace_event(
+                TraceEventType(TraceScope.TASK, action, TraceCategory.GENERAL),
+                task_id=str(self._parent_task_id),
+                data=self._build_delegation_trace_data(
+                    status=status,
+                    execution_task_id=execution_task_id,
+                    output=output,
+                    error=error,
+                    file_outputs=file_outputs,
+                ),
+            )
+            if inspect.isawaitable(result):
+                await result
+        except Exception:
+            logger.debug("Failed to emit workforce delegation trace", exc_info=True)
+
     async def run_json_async(self, args: Mapping[str, Any]) -> Any:
         """Execute the agent with the given task."""
         import uuid
@@ -1291,6 +1370,7 @@ class AgentTool(AbstractBaseTool):
         from .....web.tools.config import WebToolConfig
         from .....web.user_isolated_memory import UserContext
 
+        execution_task_id: Optional[str] = None
         try:
             # Load agent from database - support both PUBLISHED and DRAFT
             agent = (
@@ -1303,12 +1383,13 @@ class AgentTool(AbstractBaseTool):
             )
 
             if not agent:
-                return AgentToolResult(
-                    response=f"Error: Agent {self._agent_id} not found"
-                ).model_dump(exclude_none=True)
+                error_msg = f"Error: Agent {self._agent_id} not found"
+                await self._trace_delegation("error", error=error_msg)
+                return AgentToolResult(response=error_msg).model_dump(exclude_none=True)
 
             # Generate unique task ID for this execution
             execution_task_id = f"agent_{self._agent_id}_{uuid.uuid4().hex[:8]}"
+            await self._trace_delegation("start", execution_task_id=execution_task_id)
 
             # Resolve models
             from .....core.agent.service import AgentService
@@ -1369,9 +1450,11 @@ class AgentTool(AbstractBaseTool):
                         )
 
             if not default_llm:
-                return AgentToolResult(
-                    response=f"Error: No valid model configured for agent {agent.name}"
-                ).model_dump(exclude_none=True)
+                error_msg = f"Error: No valid model configured for agent {agent.name}"
+                await self._trace_delegation(
+                    "error", execution_task_id=execution_task_id, error=error_msg
+                )
+                return AgentToolResult(response=error_msg).model_dump(exclude_none=True)
 
             # Create tool config with allowed collections, skills, and tools
             class MinimalRequest:
@@ -1523,6 +1606,12 @@ class AgentTool(AbstractBaseTool):
             logger.info(
                 f"Agent tool {self.name} executed successfully, output length: {len(output)}"
             )
+            await self._trace_delegation(
+                "end",
+                execution_task_id=execution_task_id,
+                output=str(output),
+                file_outputs=file_outputs if isinstance(file_outputs, list) else None,
+            )
             return AgentToolResult(
                 response=output,
                 file_outputs=file_outputs if isinstance(file_outputs, list) else None,
@@ -1531,6 +1620,9 @@ class AgentTool(AbstractBaseTool):
         except Exception as e:
             error_msg = f"Error executing agent {self._agent_id}: {str(e)}"
             logger.error(error_msg, exc_info=True)
+            await self._trace_delegation(
+                "error", execution_task_id=execution_task_id, error=error_msg
+            )
             return AgentToolResult(response=error_msg).model_dump(exclude_none=True)
 
 

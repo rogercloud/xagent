@@ -204,6 +204,55 @@ def test_allowed_agent_ids_include_only_selected_published_user_agents() -> None
             pass
 
 
+def test_allowed_agent_ids_can_cross_users_only_when_enabled() -> None:
+    db, db_path = _create_session()
+    try:
+        owner = User(username="owner_cross", password_hash="x", is_admin=False)
+        runner = User(username="runner_cross", password_hash="x", is_admin=False)
+        db.add_all([owner, runner])
+        db.commit()
+        db.refresh(owner)
+        db.refresh(runner)
+
+        published_agent = Agent(
+            user_id=owner.id,
+            name="Shared Workforce Worker",
+            status=AgentStatus.PUBLISHED,
+        )
+        db.add(published_agent)
+        db.commit()
+        db.refresh(published_agent)
+
+        blocked_tools = get_published_agents_tools(
+            db=db,
+            user_id=runner.id,
+            allowed_agent_ids=[published_agent.id],
+            enable_global_agent_tools=False,
+        )
+        assert "call_agent_shared_workforce_worker" not in {
+            tool.name for tool in blocked_tools
+        }
+
+        allowed_tools = get_published_agents_tools(
+            db=db,
+            user_id=runner.id,
+            allowed_agent_ids=[published_agent.id],
+            enable_global_agent_tools=False,
+            allow_cross_user_agent_ids=True,
+        )
+        assert "call_agent_shared_workforce_worker" in {
+            tool.name for tool in allowed_tools
+        }
+    finally:
+        db.close()
+        try:
+            import os
+
+            os.remove(db_path)
+        except OSError:
+            pass
+
+
 def test_global_agent_tools_can_be_disabled_without_allowed_workers() -> None:
     db, db_path = _create_session()
     try:
