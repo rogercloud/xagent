@@ -7,7 +7,7 @@ from xagent.web.models.agent import Agent
 from xagent.web.models.user import User
 
 from ..models.workforce import Workforce, WorkforceAgent
-from .workforce_access import ensure_agent_access
+from .workforce_access import ensure_agent_access, ensure_workforce_access
 from .workforce_snapshot import normalize_text
 
 
@@ -46,6 +46,7 @@ def create_workforce_worker(
     sort_order: int | None = None,
     canvas_position: dict[str, Any] | None = None,
 ) -> WorkforceAgent:
+    workforce = ensure_workforce_access(db, user, workforce, action="edit")
     ensure_supported_source_type(source_type)
 
     normalized_assignment = normalize_text(

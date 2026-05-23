@@ -6,7 +6,7 @@ from sqlalchemy import create_engine, inspect
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import StaticPool
 
-from xagent.web.models import Agent, Base, User, Workforce, WorkforceRun
+from xagent.web.models import Agent, Base, User, Workforce, WorkforceAgent, WorkforceRun
 from xagent.web.models.agent import AgentStatus
 from xagent.web.services.workforce_access import ensure_workforce_access
 from xagent.web.services.workforce_snapshot import (
@@ -244,6 +244,30 @@ def test_create_workforce_worker_requires_published_existing_agent(
         )
     assert unpublished.value.status_code == 400
     assert unpublished.value.detail == "Workforce agents must be published"
+
+
+def test_create_workforce_worker_requires_workforce_edit_access(
+    db_session: Session,
+) -> None:
+    owner = _create_user(db_session, "owner")
+    other = _create_user(db_session, "other")
+    manager = _create_agent(db_session, owner, "Manager")
+    other_agent = _create_agent(db_session, other, "Other Worker")
+    workforce = _create_workforce(db_session, owner, manager)
+
+    with pytest.raises(HTTPException) as denied:
+        create_workforce_worker(
+            db_session,
+            workforce,
+            other,
+            source_type="existing",
+            agent_id=other_agent.id,
+            assignment_instructions="Collect evidence.",
+        )
+
+    assert denied.value.status_code == 403
+    assert denied.value.detail == "Access denied"
+    assert db_session.query(WorkforceAgent).count() == 0
 
 
 def test_create_workforce_worker_rejects_duplicate_worker(
