@@ -180,7 +180,7 @@ class TestCreateAgentTool:
                 parent_task_id="parent-task-2",
                 parent_tracer=parent_tracer,
                 agent_call_stack=[99],
-                allowed_agent_ids=[],
+                delegation_allowed_agent_ids=[],
                 enable_global_agent_tools=False,
                 runtime_metadata={"workforce_id": 123, "worker_alias": "Writer"},
             )

@@ -5,6 +5,7 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import Session, sessionmaker
 
 from xagent.core.tools.adapters.vibe.agent_tool import (
+    AgentTool,
     create_create_agent_tool,
     create_list_agents_tool,
     create_update_agent_tool,
@@ -243,6 +244,203 @@ def test_allowed_agent_ids_can_cross_users_only_when_enabled() -> None:
         assert "call_agent_shared_workforce_worker" in {
             tool.name for tool in allowed_tools
         }
+    finally:
+        db.close()
+        try:
+            import os
+
+            os.remove(db_path)
+        except OSError:
+            pass
+
+
+@pytest.mark.asyncio
+async def test_agent_tool_execution_enforces_owner_visibility() -> None:
+    db, db_path = _create_session()
+    try:
+        owner = User(username="exec_owner", password_hash="x", is_admin=False)
+        runner = User(username="exec_runner", password_hash="x", is_admin=False)
+        db.add_all([owner, runner])
+        db.commit()
+        db.refresh(owner)
+        db.refresh(runner)
+
+        published_agent = Agent(
+            user_id=owner.id,
+            name="Private Worker",
+            status=AgentStatus.PUBLISHED,
+        )
+        db.add(published_agent)
+        db.commit()
+        db.refresh(published_agent)
+
+        tool = AgentTool(
+            agent_id=published_agent.id,
+            agent_name=published_agent.name,
+            agent_description="Private worker",
+            db=db,
+            user_id=runner.id,
+        )
+
+        result = await tool.run_json_async({"task": "run private worker"})
+
+        assert result["response"] == f"Error: Agent {published_agent.id} not found"
+    finally:
+        db.close()
+        try:
+            import os
+
+            os.remove(db_path)
+        except OSError:
+            pass
+
+
+@pytest.mark.asyncio
+async def test_agent_tool_execution_enforces_target_allowed_agent_ids() -> None:
+    db, db_path = _create_session()
+    try:
+        owner = User(username="allow_owner", password_hash="x", is_admin=False)
+        db.add(owner)
+        db.commit()
+        db.refresh(owner)
+
+        allowed_agent = Agent(
+            user_id=owner.id,
+            name="Allowed Worker",
+            status=AgentStatus.PUBLISHED,
+        )
+        blocked_agent = Agent(
+            user_id=owner.id,
+            name="Blocked Worker",
+            status=AgentStatus.PUBLISHED,
+        )
+        db.add_all([allowed_agent, blocked_agent])
+        db.commit()
+        db.refresh(allowed_agent)
+        db.refresh(blocked_agent)
+
+        tool = AgentTool(
+            agent_id=blocked_agent.id,
+            agent_name=blocked_agent.name,
+            agent_description="Blocked worker",
+            db=db,
+            user_id=owner.id,
+            target_allowed_agent_ids=[allowed_agent.id],
+        )
+
+        result = await tool.run_json_async({"task": "run blocked worker"})
+
+        assert result["response"] == f"Error: Agent {blocked_agent.id} not found"
+    finally:
+        db.close()
+        try:
+            import os
+
+            os.remove(db_path)
+        except OSError:
+            pass
+
+
+@pytest.mark.asyncio
+async def test_agent_tool_execution_allows_cross_user_only_with_target_allowlist() -> (
+    None
+):
+    db, db_path = _create_session()
+    try:
+        owner = User(username="cross_owner", password_hash="x", is_admin=False)
+        runner = User(username="cross_runner", password_hash="x", is_admin=False)
+        db.add_all([owner, runner])
+        db.commit()
+        db.refresh(owner)
+        db.refresh(runner)
+
+        published_agent = Agent(
+            user_id=owner.id,
+            name="Cross User Worker",
+            status=AgentStatus.PUBLISHED,
+        )
+        db.add(published_agent)
+        db.commit()
+        db.refresh(published_agent)
+
+        blocked_tool = AgentTool(
+            agent_id=published_agent.id,
+            agent_name=published_agent.name,
+            agent_description="Cross user worker",
+            db=db,
+            user_id=runner.id,
+            target_allowed_agent_ids=[published_agent.id],
+        )
+        blocked_result = await blocked_tool.run_json_async(
+            {"task": "run cross user worker"}
+        )
+        assert (
+            blocked_result["response"] == f"Error: Agent {published_agent.id} not found"
+        )
+
+        allowed_tool = AgentTool(
+            agent_id=published_agent.id,
+            agent_name=published_agent.name,
+            agent_description="Cross user worker",
+            db=db,
+            user_id=runner.id,
+            target_allowed_agent_ids=[published_agent.id],
+            target_allow_cross_user_agent_ids=True,
+        )
+        allowed_result = await allowed_tool.run_json_async(
+            {"task": "run cross user worker"}
+        )
+        assert allowed_result["response"] == (
+            f"Error: No valid model configured for agent {published_agent.name}"
+        )
+    finally:
+        db.close()
+        try:
+            import os
+
+            os.remove(db_path)
+        except OSError:
+            pass
+
+
+@pytest.mark.asyncio
+async def test_delegation_allowed_agent_ids_do_not_block_current_worker_execution() -> (
+    None
+):
+    db, db_path = _create_session()
+    try:
+        owner = User(username="nested_owner", password_hash="x", is_admin=False)
+        db.add(owner)
+        db.commit()
+        db.refresh(owner)
+
+        worker = Agent(
+            user_id=owner.id,
+            name="Nested Restricted Worker",
+            status=AgentStatus.PUBLISHED,
+        )
+        db.add(worker)
+        db.commit()
+        db.refresh(worker)
+
+        tools = get_published_agents_tools(
+            db=db,
+            user_id=owner.id,
+            allowed_agent_ids=[worker.id],
+            enable_global_agent_tools=False,
+            agent_tool_overrides={
+                worker.id: {
+                    "allowed_agent_ids": [],
+                    "enable_global_agent_tools": False,
+                }
+            },
+        )
+
+        assert len(tools) == 1
+        result = await tools[0].run_json_async({"task": "run nested restricted worker"})
+        assert result["response"] == (
+            f"Error: No valid model configured for agent {worker.name}"
+        )
     finally:
         db.close()
         try:

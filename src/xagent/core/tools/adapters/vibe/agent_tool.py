@@ -49,6 +49,28 @@ def _normalize_agent_ids(agent_ids: Any) -> Optional[list[int]]:
     return normalized
 
 
+def _apply_agent_visibility_filters(
+    query: Any,
+    agent_model: Any,
+    *,
+    user_id: int,
+    allowed_agent_ids: Optional[list[int]],
+    allow_cross_user_agent_ids: bool,
+) -> Any | None:
+    normalized_allowed_agent_ids = _normalize_agent_ids(allowed_agent_ids)
+    if normalized_allowed_agent_ids is not None:
+        if not normalized_allowed_agent_ids:
+            return None
+        query = query.filter(agent_model.id.in_(normalized_allowed_agent_ids))
+
+    # Cross-user execution is only valid for explicit allowlists. Global
+    # discovery and direct execution remain owner-scoped.
+    if not allow_cross_user_agent_ids or normalized_allowed_agent_ids is None:
+        query = query.filter(agent_model.user_id == user_id)
+
+    return query
+
+
 def _normalize_agent_tool_overrides(
     overrides: Optional[Mapping[Any, Any]],
 ) -> dict[int, dict[str, Any]]:
@@ -1198,10 +1220,12 @@ class AgentTool(AbstractBaseTool):
         parent_task_id: Optional[str] = None,
         parent_tracer: Optional[Any] = None,
         agent_call_stack: Optional[list[int]] = None,
-        allowed_agent_ids: Optional[list[int]] = None,
+        delegation_allowed_agent_ids: Optional[list[int]] = None,
         agent_tool_overrides: Optional[Mapping[Any, Any]] = None,
         enable_global_agent_tools: bool = True,
-        allow_cross_user_agent_ids: bool = False,
+        delegation_allow_cross_user_agent_ids: bool = False,
+        target_allowed_agent_ids: Optional[list[int]] = None,
+        target_allow_cross_user_agent_ids: bool = False,
         runtime_metadata: Optional[dict[str, Any]] = None,
     ):
         """
@@ -1221,10 +1245,12 @@ class AgentTool(AbstractBaseTool):
             parent_task_id: Parent task ID for delegation metadata
             parent_tracer: Parent tracer whose handlers should receive child traces
             agent_call_stack: Active delegation stack for recursion prevention
-            allowed_agent_ids: Agent IDs this delegated agent may call
+            delegation_allowed_agent_ids: Agent IDs exposed to this delegated agent for nested agent calls
             agent_tool_overrides: Nested delegated agent tool overrides
             enable_global_agent_tools: Whether this delegated agent sees global agent tools
-            allow_cross_user_agent_ids: Whether explicit nested agent IDs may cross users
+            delegation_allow_cross_user_agent_ids: Whether explicit nested agent IDs may cross users
+            target_allowed_agent_ids: Agent IDs this tool may execute as its target
+            target_allow_cross_user_agent_ids: Whether this tool may execute explicit cross-user target IDs
             runtime_metadata: Extra delegation metadata for tracing
         """
         self._agent_id = agent_id
@@ -1238,12 +1264,20 @@ class AgentTool(AbstractBaseTool):
         self._task_id = task_id or f"agent_tool_{agent_id}"
         self._parent_task_id = parent_task_id or task_id
         self._parent_tracer = parent_tracer
-        self._allowed_agent_ids = _normalize_agent_ids(allowed_agent_ids)
+        self._delegation_allowed_agent_ids = _normalize_agent_ids(
+            delegation_allowed_agent_ids
+        )
         self._agent_tool_overrides = _normalize_agent_tool_overrides(
             agent_tool_overrides
         )
         self._enable_global_agent_tools = bool(enable_global_agent_tools)
-        self._allow_cross_user_agent_ids = bool(allow_cross_user_agent_ids)
+        self._delegation_allow_cross_user_agent_ids = bool(
+            delegation_allow_cross_user_agent_ids
+        )
+        self._target_allowed_agent_ids = _normalize_agent_ids(target_allowed_agent_ids)
+        self._target_allow_cross_user_agent_ids = bool(
+            target_allow_cross_user_agent_ids
+        )
         self._runtime_metadata = dict(runtime_metadata or {})
         self._agent_call_stack = _normalize_agent_ids(agent_call_stack) or []
         if agent_id not in self._agent_call_stack:
@@ -1373,14 +1407,18 @@ class AgentTool(AbstractBaseTool):
         execution_task_id: Optional[str] = None
         try:
             # Load agent from database - support both PUBLISHED and DRAFT
-            agent = (
-                self._db.query(Agent)
-                .filter(
-                    Agent.id == self._agent_id,
-                    Agent.status.in_(["published", "draft"]),  # type: ignore[attr-defined]
-                )
-                .first()
+            agent = self._db.query(Agent).filter(
+                Agent.id == self._agent_id,
+                Agent.status.in_(["published", "draft"]),  # type: ignore[attr-defined]
             )
+            agent = _apply_agent_visibility_filters(
+                agent,
+                Agent,
+                user_id=self._user_id,
+                allowed_agent_ids=self._target_allowed_agent_ids,
+                allow_cross_user_agent_ids=self._target_allow_cross_user_agent_ids,
+            )
+            agent = agent.first() if agent is not None else None
 
             if not agent:
                 error_msg = f"Error: Agent {self._agent_id} not found"
@@ -1471,10 +1509,10 @@ class AgentTool(AbstractBaseTool):
                     user_id=self._user_id,
                     include_mcp_tools=True,
                     browser_tools_enabled=True,
-                    allowed_agent_ids=self._allowed_agent_ids,
+                    allowed_agent_ids=self._delegation_allowed_agent_ids,
                     agent_tool_overrides=self._agent_tool_overrides,
                     enable_global_agent_tools=self._enable_global_agent_tools,
-                    allow_cross_user_agent_ids=self._allow_cross_user_agent_ids,
+                    allow_cross_user_agent_ids=self._delegation_allow_cross_user_agent_ids,
                     parent_task_id=self._parent_task_id,
                     parent_tracer=self._parent_tracer,
                     agent_call_stack=self._agent_call_stack,
@@ -1526,10 +1564,10 @@ class AgentTool(AbstractBaseTool):
                 else None,
                 allowed_skills=agent.skills if agent.skills is not None else None,
                 allowed_tools=allowed_tools,
-                allowed_agent_ids=self._allowed_agent_ids,
+                allowed_agent_ids=self._delegation_allowed_agent_ids,
                 agent_tool_overrides=self._agent_tool_overrides,
                 enable_global_agent_tools=self._enable_global_agent_tools,
-                allow_cross_user_agent_ids=self._allow_cross_user_agent_ids,
+                allow_cross_user_agent_ids=self._delegation_allow_cross_user_agent_ids,
                 parent_task_id=self._parent_task_id,
                 parent_tracer=self._parent_tracer,
                 agent_call_stack=self._agent_call_stack,
@@ -1688,7 +1726,7 @@ def get_published_agents_tools(
 
     tools: list[AbstractBaseTool] = []
     normalized_overrides = _normalize_agent_tool_overrides(agent_tool_overrides)
-    normalized_allowed_agent_ids = _normalize_agent_ids(allowed_agent_ids)
+    normalized_injected_agent_ids = _normalize_agent_ids(allowed_agent_ids)
     normalized_call_stack = _normalize_agent_ids(agent_call_stack) or []
     excluded_agent_ids = set(normalized_call_stack)
 
@@ -1699,30 +1737,35 @@ def get_published_agents_tools(
             pass
 
     if (
-        normalized_allowed_agent_ids is None
+        normalized_injected_agent_ids is None
         and not enable_global_agent_tools
         and normalized_overrides
     ):
-        normalized_allowed_agent_ids = list(normalized_overrides.keys())
+        normalized_injected_agent_ids = list(normalized_overrides.keys())
 
-    if normalized_allowed_agent_ids is not None:
-        normalized_allowed_agent_ids = [
+    if normalized_injected_agent_ids is not None:
+        normalized_injected_agent_ids = [
             agent_id
-            for agent_id in normalized_allowed_agent_ids
+            for agent_id in normalized_injected_agent_ids
             if agent_id not in excluded_agent_ids
         ]
 
     try:
-        if normalized_allowed_agent_ids is not None:
-            if not normalized_allowed_agent_ids:
+        if normalized_injected_agent_ids is not None:
+            if not normalized_injected_agent_ids:
                 return []
-            filters = [
-                Agent.id.in_(normalized_allowed_agent_ids),
+            query = db.query(Agent).filter(
                 Agent.status.in_(["published"]),  # type: ignore[attr-defined]
-            ]
-            if not allow_cross_user_agent_ids:
-                filters.append(Agent.user_id == user_id)
-            query = db.query(Agent).filter(*filters)
+            )
+            query = _apply_agent_visibility_filters(
+                query,
+                Agent,
+                user_id=user_id,
+                allowed_agent_ids=normalized_injected_agent_ids,
+                allow_cross_user_agent_ids=allow_cross_user_agent_ids,
+            )
+            if query is None:
+                return []
         elif not enable_global_agent_tools:
             return []
         elif include_draft:
@@ -1769,7 +1812,7 @@ def get_published_agents_tools(
                 if draft_agent.id not in existing_ids:
                     agents.append(draft_agent)
 
-        if normalized_allowed_agent_ids is not None:
+        if normalized_injected_agent_ids is not None:
             agent_types = "selected PUBLISHED"
         else:
             agent_types = "PUBLISHED and DRAFT" if include_draft else "PUBLISHED"
@@ -1797,18 +1840,18 @@ def get_published_agents_tools(
                 override, "description", "tool_description"
             )
             extra_system_prompt = _string_override(override, "extra_system_prompt")
-            nested_allowed_agent_ids = (
+            delegation_allowed_agent_ids = (
                 _normalize_agent_ids(override.get("allowed_agent_ids"))
                 if "allowed_agent_ids" in override
                 else None
             )
-            nested_agent_tool_overrides = _normalize_agent_tool_overrides(
+            delegation_agent_tool_overrides = _normalize_agent_tool_overrides(
                 override.get("agent_tool_overrides")
             )
-            nested_enable_global_agent_tools = _truthy_bool(
+            delegation_enable_global_agent_tools = _truthy_bool(
                 override.get("enable_global_agent_tools"), True
             )
-            nested_allow_cross_user_agent_ids = _truthy_bool(
+            delegation_allow_cross_user_agent_ids = _truthy_bool(
                 override.get("allow_cross_user_agent_ids"), False
             )
             runtime_metadata = {
@@ -1837,10 +1880,12 @@ def get_published_agents_tools(
                 parent_task_id=parent_task_id,
                 parent_tracer=parent_tracer,
                 agent_call_stack=normalized_call_stack,
-                allowed_agent_ids=nested_allowed_agent_ids,
-                agent_tool_overrides=nested_agent_tool_overrides,
-                enable_global_agent_tools=nested_enable_global_agent_tools,
-                allow_cross_user_agent_ids=nested_allow_cross_user_agent_ids,
+                delegation_allowed_agent_ids=delegation_allowed_agent_ids,
+                agent_tool_overrides=delegation_agent_tool_overrides,
+                enable_global_agent_tools=delegation_enable_global_agent_tools,
+                delegation_allow_cross_user_agent_ids=delegation_allow_cross_user_agent_ids,
+                target_allowed_agent_ids=normalized_injected_agent_ids,
+                target_allow_cross_user_agent_ids=allow_cross_user_agent_ids,
                 runtime_metadata=runtime_metadata,
             )
             tools.append(tool)
