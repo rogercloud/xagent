@@ -1269,7 +1269,7 @@ class AgentTool(AbstractBaseTool):
             tool_description: Optional delegated tool description override
             extra_system_prompt: Optional system prompt appended during execution
             parent_task_id: Parent task ID for delegation metadata
-            parent_tracer: Parent tracer whose handlers should receive child traces
+            parent_tracer: Parent tracer that receives delegation summary events
             agent_call_stack: Active delegation stack for recursion prevention
             delegation_allowed_agent_ids: Agent IDs exposed to this delegated agent for nested agent calls
             agent_tool_overrides: Nested delegated agent tool overrides
@@ -1418,6 +1418,32 @@ class AgentTool(AbstractBaseTool):
                 await result
         except Exception:
             logger.debug("Failed to emit workforce delegation trace", exc_info=True)
+
+    def _create_child_execution_tracer(
+        self,
+        *,
+        execution_task_id: str,
+        agent_name: str,
+    ) -> Any:
+        """Create a child-owned tracer for delegated agent internals."""
+        metadata = {
+            "source": "xagent-agent-tool",
+            "task_id": execution_task_id,
+            "parent_task_id": self._parent_task_id or self._task_id,
+            "agent_id": self._agent_id,
+            "agent_name": agent_name,
+            "agent_call_stack": self._agent_call_stack,
+        }
+        metadata.update(self._runtime_metadata)
+
+        return create_agent_tracer(
+            task_id=execution_task_id,
+            user_id=self._user_id,
+            trace_name=f"xagent-agent-tool-{self._agent_id}",
+            session_id=str(self._parent_task_id or self._task_id),
+            tags=["xagent", "agent-tool", "nested-agent"],
+            metadata=metadata,
+        )
 
     def _resolve_delegated_output_path(self, workspace: Any, raw_path: str) -> Path:
         raw = raw_path.strip()
@@ -1722,32 +1748,9 @@ class AgentTool(AbstractBaseTool):
                 },
             )
 
-            parent_handlers = []
-            if self._parent_tracer is not None:
-                parent_handlers = [
-                    handler
-                    for handler in getattr(self._parent_tracer, "handlers", [])
-                    if handler.__class__.__name__ != "LangfuseTraceHandler"
-                ]
-
-            metadata = {
-                "source": "xagent-agent-tool",
-                "task_id": execution_task_id,
-                "parent_task_id": self._parent_task_id or self._task_id,
-                "agent_id": self._agent_id,
-                "agent_name": agent.name,
-                "agent_call_stack": self._agent_call_stack,
-            }
-            metadata.update(self._runtime_metadata)
-
-            tracer = create_agent_tracer(
-                handlers=parent_handlers,
-                task_id=execution_task_id,
-                user_id=self._user_id,
-                trace_name=f"xagent-agent-tool-{self._agent_id}",
-                session_id=str(self._parent_task_id or self._task_id),
-                tags=["xagent", "agent-tool", "nested-agent"],
-                metadata=metadata,
+            tracer = self._create_child_execution_tracer(
+                execution_task_id=execution_task_id,
+                agent_name=str(agent.name),
             )
 
             # Create agent service
@@ -1862,7 +1865,7 @@ def get_published_agents_tools(
         enable_global_agent_tools: Whether to include globally visible published agents
         allow_cross_user_agent_ids: Whether explicit allowed IDs may cross users
         parent_task_id: Parent task ID for delegation metadata
-        parent_tracer: Parent tracer for child trace propagation
+        parent_tracer: Parent tracer for delegation summary events
         agent_call_stack: Active delegation stack for recursion prevention
 
     Returns:

@@ -254,7 +254,8 @@ class TestCreateAgentTool:
             assert tool_config.get_agent_call_stack() == [99, agent.id]
 
             tracer = mock_agent_service_class.call_args.kwargs["tracer"]
-            assert parent_handler in tracer.handlers
+            assert tracer is not parent_tracer
+            assert parent_handler not in tracer.handlers
 
             execute_context = mock_agent_service.execute_task.call_args.kwargs[
                 "context"
