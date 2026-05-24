@@ -1316,10 +1316,7 @@ class AgentTool(AbstractBaseTool):
     @property
     def name(self) -> str:
         """Tool name."""
-        return (
-            self._tool_name
-            or f"call_agent_{self._agent_name.lower().replace(' ', '_')}"
-        )
+        return self._tool_name or gen_agent_tool_name(self._agent_name)
 
     @property
     def description(self) -> str:
@@ -1545,8 +1542,6 @@ class AgentTool(AbstractBaseTool):
 
     async def run_json_async(self, args: Mapping[str, Any]) -> Any:
         """Execute the agent with the given task."""
-        import uuid
-
         from .....web.models.agent import Agent
         from .....web.tools.config import WebToolConfig
         from .....web.user_isolated_memory import UserContext
@@ -1573,7 +1568,7 @@ class AgentTool(AbstractBaseTool):
                 return AgentToolResult(response=error_msg).model_dump(exclude_none=True)
 
             # Generate unique task ID for this execution
-            execution_task_id = f"agent_{self._agent_id}_{uuid.uuid4().hex[:8]}"
+            execution_task_id = f"agent_{self._agent_id}_{uuid4().hex[:8]}"
             await self._trace_delegation("start", execution_task_id=execution_task_id)
 
             # Resolve models
@@ -1710,7 +1705,7 @@ class AgentTool(AbstractBaseTool):
                 allowed_collections=agent.knowledge_bases
                 if agent.knowledge_bases is not None
                 else None,
-                allowed_skills=agent.skills if agent.skills is not None else None,
+                allowed_skills=agent.skills,
                 allowed_tools=allowed_tools,
                 allowed_agent_ids=self._delegation_allowed_agent_ids,
                 agent_tool_overrides=self._agent_tool_overrides,
