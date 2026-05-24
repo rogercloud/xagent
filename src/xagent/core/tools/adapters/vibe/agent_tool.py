@@ -1795,6 +1795,7 @@ class AgentTool(AbstractBaseTool):
             file_outputs = self._parent_owned_file_outputs(
                 result.get("file_outputs"), agent_service.workspace
             )
+            file_outputs = file_outputs if isinstance(file_outputs, list) else None
             logger.info(
                 f"Agent tool {self.name} executed successfully, output length: {len(output)}"
             )
@@ -1802,11 +1803,11 @@ class AgentTool(AbstractBaseTool):
                 "end",
                 execution_task_id=execution_task_id,
                 output=str(output),
-                file_outputs=file_outputs if isinstance(file_outputs, list) else None,
+                file_outputs=file_outputs,
             )
             return AgentToolResult(
                 response=output,
-                file_outputs=file_outputs if isinstance(file_outputs, list) else None,
+                file_outputs=file_outputs,
             ).model_dump(exclude_none=True)
 
         except Exception as e:
@@ -1935,9 +1936,9 @@ def get_published_agents_tools(
                 Agent.user_id == user_id,
             )
 
-        # Exclude the specified agent (to prevent self-calls)
-        for agent_id in excluded_agent_ids:
-            query = query.filter(Agent.id != agent_id)
+        # Exclude the active delegation stack to prevent recursive self-calls.
+        if excluded_agent_ids:
+            query = query.filter(Agent.id.notin_(sorted(excluded_agent_ids)))
 
         agents = query.all()
 

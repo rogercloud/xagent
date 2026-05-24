@@ -590,6 +590,10 @@ class AgentService:
         if not self.tool_config:
             return ()
 
+        def _get_conf(attr: str, default: Any = None) -> Any:
+            getter = getattr(self.tool_config, attr, None)
+            return getter() if callable(getter) else default
+
         refresh_overrides = getattr(
             self.tool_config, "refresh_user_tool_overrides", None
         )
@@ -597,8 +601,7 @@ class AgentService:
             # Re-read the hook-backed policy before comparing signatures.
             refresh_overrides()
 
-        get_overrides = getattr(self.tool_config, "get_user_tool_overrides", None)
-        overrides: Any = get_overrides() if callable(get_overrides) else {}
+        overrides: Any = _get_conf("get_user_tool_overrides", {})
         if isinstance(overrides, dict):
             override_items = tuple(
                 sorted(
@@ -612,30 +615,21 @@ class AgentService:
         else:
             override_items = ()
 
-        get_allowed_tools = getattr(self.tool_config, "get_allowed_tools", None)
-        allowed_tools = get_allowed_tools() if callable(get_allowed_tools) else None
+        allowed_tools = _get_conf("get_allowed_tools")
         allowed_items = (
             None
             if allowed_tools is None
             else tuple(str(name) for name in allowed_tools)
         )
 
-        get_allowed_agent_ids = getattr(self.tool_config, "get_allowed_agent_ids", None)
-        allowed_agent_ids = (
-            get_allowed_agent_ids() if callable(get_allowed_agent_ids) else None
-        )
+        allowed_agent_ids = _get_conf("get_allowed_agent_ids")
         allowed_agent_items = (
             None
             if allowed_agent_ids is None
             else tuple(str(agent_id) for agent_id in allowed_agent_ids)
         )
 
-        get_agent_tool_overrides = getattr(
-            self.tool_config, "get_agent_tool_overrides", None
-        )
-        agent_tool_overrides = (
-            get_agent_tool_overrides() if callable(get_agent_tool_overrides) else {}
-        )
+        agent_tool_overrides = _get_conf("get_agent_tool_overrides", {})
         if isinstance(agent_tool_overrides, dict):
             agent_override_items = tuple(
                 sorted(
@@ -656,35 +650,13 @@ class AgentService:
         else:
             agent_override_items = ()
 
-        get_enable_global_agent_tools = getattr(
-            self.tool_config, "get_enable_global_agent_tools", None
-        )
-        enable_global_agent_tools = (
-            get_enable_global_agent_tools()
-            if callable(get_enable_global_agent_tools)
-            else True
-        )
-
-        get_allow_cross_user_agent_ids = getattr(
-            self.tool_config, "get_allow_cross_user_agent_ids", None
-        )
-        allow_cross_user_agent_ids = (
-            get_allow_cross_user_agent_ids()
-            if callable(get_allow_cross_user_agent_ids)
-            else False
-        )
-
-        get_parent_task_id = getattr(self.tool_config, "get_parent_task_id", None)
-        parent_task_id = get_parent_task_id() if callable(get_parent_task_id) else None
-
-        get_parent_tracer = getattr(self.tool_config, "get_parent_tracer", None)
-        parent_tracer = get_parent_tracer() if callable(get_parent_tracer) else None
+        enable_global_agent_tools = _get_conf("get_enable_global_agent_tools", True)
+        allow_cross_user_agent_ids = _get_conf("get_allow_cross_user_agent_ids", False)
+        parent_task_id = _get_conf("get_parent_task_id")
+        parent_tracer = _get_conf("get_parent_tracer")
         parent_tracer_identity = None if parent_tracer is None else id(parent_tracer)
 
-        get_agent_call_stack = getattr(self.tool_config, "get_agent_call_stack", None)
-        agent_call_stack = (
-            get_agent_call_stack() if callable(get_agent_call_stack) else []
-        )
+        agent_call_stack = _get_conf("get_agent_call_stack", [])
         agent_call_stack_items = tuple(str(agent_id) for agent_id in agent_call_stack)
 
         return (
