@@ -24,6 +24,38 @@ logger = logging.getLogger(__name__)
 MAX_AGENT_NAME_LENGTH = 200
 
 
+class _DelegatedAgentDatabaseTraceHandler:
+    """Persist child-agent traces without broadcasting them to the parent UI."""
+
+    def __init__(
+        self,
+        *,
+        task_id: int,
+        build_id: str,
+        metadata: Mapping[str, Any],
+    ) -> None:
+        from .....web.api.trace_handlers import DatabaseTraceHandler
+
+        self.task_id = task_id
+        self.build_id = build_id
+        self.metadata = dict(metadata)
+        self._handler = DatabaseTraceHandler(task_id, build_id=build_id)
+
+    async def handle_event(self, event: Any) -> None:
+        original_data = event.data
+        base_data = original_data if isinstance(original_data, dict) else {}
+        event.data = {**base_data, **self.metadata}
+        try:
+            await self._handler.handle_event(event)
+        finally:
+            event.data = original_data
+
+    async def load_latest_checkpoint(
+        self, execution_id: str
+    ) -> Optional[dict[str, Any]]:
+        return await self._handler.load_latest_checkpoint(execution_id)
+
+
 def _normalize_agent_ids(agent_ids: Any) -> Optional[list[int]]:
     if agent_ids is None:
         return None
@@ -1350,6 +1382,7 @@ class AgentTool(AbstractBaseTool):
     ) -> dict[str, Any]:
         data: dict[str, Any] = {
             "event_type": f"workforce_delegation_{status}",
+            "status": status,
             "agent_id": self._agent_id,
             "agent_name": self._agent_name,
             "tool_name": self.name,
@@ -1395,16 +1428,15 @@ class AgentTool(AbstractBaseTool):
                 TraceScope,
             )
 
-            action = {
-                "start": TraceAction.START,
-                "end": TraceAction.END,
-                "error": TraceAction.ERROR,
-            }.get(status)
-            if action is None:
+            if status not in {"start", "end", "error"}:
                 return
 
             result = trace_event(
-                TraceEventType(TraceScope.TASK, action, TraceCategory.GENERAL),
+                TraceEventType(
+                    TraceScope.TASK,
+                    TraceAction.UPDATE,
+                    TraceCategory.GENERAL,
+                ),
                 task_id=str(self._parent_task_id),
                 data=self._build_delegation_trace_data(
                     status=status,
@@ -1424,19 +1456,32 @@ class AgentTool(AbstractBaseTool):
         *,
         execution_task_id: str,
         agent_name: str,
+        parent_db_task_id: Optional[int],
     ) -> Any:
         """Create a child-owned tracer for delegated agent internals."""
         metadata = {
-            "source": "xagent-agent-tool",
+            "source": "xagent-agent-tool-child",
             "task_id": execution_task_id,
+            "worker_task_id": execution_task_id,
             "parent_task_id": self._parent_task_id or self._task_id,
+            "parent_db_task_id": parent_db_task_id,
             "agent_id": self._agent_id,
             "agent_name": agent_name,
             "agent_call_stack": self._agent_call_stack,
         }
         metadata.update(self._runtime_metadata)
+        handlers: list[Any] = []
+        if parent_db_task_id is not None:
+            handlers.append(
+                _DelegatedAgentDatabaseTraceHandler(
+                    task_id=parent_db_task_id,
+                    build_id=execution_task_id,
+                    metadata=metadata,
+                )
+            )
 
         return create_agent_tracer(
+            handlers=handlers,
             task_id=execution_task_id,
             user_id=self._user_id,
             trace_name=f"xagent-agent-tool-{self._agent_id}",
@@ -1751,6 +1796,7 @@ class AgentTool(AbstractBaseTool):
             tracer = self._create_child_execution_tracer(
                 execution_task_id=execution_task_id,
                 agent_name=str(agent.name),
+                parent_db_task_id=parent_db_task_id,
             )
 
             # Create agent service

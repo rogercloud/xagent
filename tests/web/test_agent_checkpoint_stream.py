@@ -168,26 +168,36 @@ def test_persist_agent_outbound_event_uses_payload_ids(monkeypatch) -> None:
         db.close()
 
 
-def test_database_trace_handler_dedupes_user_message_turn_id() -> None:
+def _create_trace_handler_test_task(
+    username: str,
+    *,
+    title: str = "Chat task",
+    description: str = "Task chat",
+):
     engine = create_engine("sqlite:///:memory:")
     SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
     Base.metadata.create_all(bind=engine)
     db = SessionLocal()
-    try:
-        user = User(username="tester", password_hash="hashed_password", is_admin=False)
-        db.add(user)
-        db.commit()
-        db.refresh(user)
-        task = Task(
-            user_id=int(user.id),
-            title="Chat task",
-            description="Task chat",
-            status=TaskStatus.PENDING,
-        )
-        db.add(task)
-        db.commit()
-        db.refresh(task)
 
+    user = User(username=username, password_hash="hashed_password", is_admin=False)
+    db.add(user)
+    db.commit()
+    db.refresh(user)
+    task = Task(
+        user_id=int(user.id),
+        title=title,
+        description=description,
+        status=TaskStatus.PENDING,
+    )
+    db.add(task)
+    db.commit()
+    db.refresh(task)
+    return SessionLocal, db, task
+
+
+def test_database_trace_handler_dedupes_user_message_turn_id() -> None:
+    _, db, task = _create_trace_handler_test_task("tester")
+    try:
         handler = DatabaseTraceHandler(int(task.id))
         event_type = TraceEventType(
             TraceScope.TASK,
@@ -221,6 +231,149 @@ def test_database_trace_handler_dedupes_user_message_turn_id() -> None:
             .all()
         )
         assert [row.data["turn_id"] for row in rows] == ["turn-1", "turn-2"]
+    finally:
+        db.close()
+
+
+def test_database_trace_handler_dedupes_user_message_turn_id_per_build() -> None:
+    _, db, task = _create_trace_handler_test_task("build-tester")
+    try:
+        event_type = TraceEventType(
+            TraceScope.TASK,
+            TraceAction.START,
+            TraceCategory.MESSAGE,
+        )
+        parent_handler = DatabaseTraceHandler(int(task.id))
+        worker_handler = DatabaseTraceHandler(
+            int(task.id),
+            build_id="agent_123_abcd1234",
+        )
+
+        parent_handler._save_trace_event(
+            db,
+            TraceEvent(
+                event_type,
+                task_id=str(task.id),
+                data={"message": "Repeat", "turn_id": "turn-1"},
+            ),
+        )
+        worker_handler._save_trace_event(
+            db,
+            TraceEvent(
+                event_type,
+                task_id="agent_123_abcd1234",
+                data={"message": "Repeat", "turn_id": "turn-1"},
+            ),
+        )
+        worker_handler._save_trace_event(
+            db,
+            TraceEvent(
+                event_type,
+                task_id="agent_123_abcd1234",
+                data={"message": "Repeat", "turn_id": "turn-1"},
+            ),
+        )
+
+        rows = (
+            db.query(DatabaseTraceEvent)
+            .filter_by(task_id=int(task.id), event_type="user_message")
+            .order_by(DatabaseTraceEvent.id)
+            .all()
+        )
+        assert [(row.build_id, row.data["turn_id"]) for row in rows] == [
+            (None, "turn-1"),
+            ("agent_123_abcd1234", "turn-1"),
+        ]
+    finally:
+        db.close()
+
+
+def test_database_trace_handler_build_checkpoint_does_not_update_task_pointer() -> None:
+    _, db, task = _create_trace_handler_test_task(
+        "checkpoint-user",
+        title="Checkpoint task",
+        description="Task with worker checkpoint",
+    )
+    try:
+        handler = DatabaseTraceHandler(
+            int(task.id),
+            build_id="agent_123_abcd1234",
+        )
+        event = TraceEvent(
+            CHECKPOINT_EVENT_TYPE,
+            task_id="agent_123_abcd1234",
+            data={
+                "checkpoint_type": CHECKPOINT_TYPE,
+                "execution_id": "agent_123_abcd1234",
+                "snapshot": {"label": "worker_checkpoint"},
+            },
+        )
+
+        handler._save_trace_event(db, event)
+        db.refresh(task)
+
+        row = db.query(DatabaseTraceEvent).filter_by(task_id=int(task.id)).one()
+        assert row.build_id == "agent_123_abcd1234"
+        assert task.last_checkpoint_event_id is None
+    finally:
+        db.close()
+
+
+def test_database_trace_handler_load_latest_checkpoint_is_build_scoped(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    SessionLocal, db, task = _create_trace_handler_test_task(
+        "load-user",
+        title="Checkpoint task",
+        description="Task with scoped checkpoints",
+    )
+
+    def get_test_db() -> Iterator[Session]:
+        session = SessionLocal()
+        try:
+            yield session
+        finally:
+            session.close()
+
+    monkeypatch.setattr("xagent.web.api.trace_handlers.get_db", get_test_db)
+
+    try:
+        parent_handler = DatabaseTraceHandler(int(task.id))
+        worker_handler = DatabaseTraceHandler(
+            int(task.id),
+            build_id="agent_123_abcd1234",
+        )
+        parent_handler._save_trace_event(
+            db,
+            TraceEvent(
+                CHECKPOINT_EVENT_TYPE,
+                task_id=str(task.id),
+                data={
+                    "checkpoint_type": CHECKPOINT_TYPE,
+                    "execution_id": "shared-execution",
+                    "snapshot": {"label": "parent_checkpoint"},
+                },
+            ),
+        )
+        worker_handler._save_trace_event(
+            db,
+            TraceEvent(
+                CHECKPOINT_EVENT_TYPE,
+                task_id="agent_123_abcd1234",
+                data={
+                    "checkpoint_type": CHECKPOINT_TYPE,
+                    "execution_id": "shared-execution",
+                    "snapshot": {"label": "worker_checkpoint"},
+                },
+            ),
+        )
+
+        assert parent_handler._sync_load_latest_checkpoint("shared-execution") == {
+            "label": "parent_checkpoint"
+        }
+        assert worker_handler._sync_load_latest_checkpoint("shared-execution") == {
+            "label": "worker_checkpoint"
+        }
     finally:
         db.close()
 

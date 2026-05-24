@@ -237,9 +237,15 @@ class TestCreateAgentTool:
                 "workforce_delegation_start",
                 "workforce_delegation_end",
             ]
+            assert [event["event_type"] for event in parent_tracer.events] == [
+                "task_update_general",
+                "task_update_general",
+            ]
             assert parent_tracer.events[0]["task_id"] == "parent-task-2"
+            assert parent_tracer.events[0]["data"]["status"] == "start"
             assert parent_tracer.events[0]["data"]["workforce_id"] == 123
             assert parent_tracer.events[0]["data"]["worker_alias"] == "Writer"
+            assert parent_tracer.events[1]["data"]["status"] == "end"
             assert parent_tracer.events[1]["data"]["output"] == "worker response"
             assert parent_tracer.events[1]["data"]["output_length"] == len(
                 "worker response"
@@ -410,6 +416,22 @@ class TestCreateAgentTool:
                 tool_config = mock_agent_service_class.call_args.kwargs["tool_config"]
                 assert tool_config.get_workspace_config()["db_task_id"] == 77
                 assert parent_tracer.events[-1]["data"]["file_outputs"] == file_outputs
+
+                tracer = mock_agent_service_class.call_args.kwargs["tracer"]
+                execution_task_id = mock_agent_service_class.call_args.kwargs["task_id"]
+                db_handlers = [
+                    handler
+                    for handler in tracer.handlers
+                    if handler.__class__.__name__
+                    == "_DelegatedAgentDatabaseTraceHandler"
+                ]
+                assert len(db_handlers) == 1
+                assert db_handlers[0].task_id == 77
+                assert db_handlers[0].build_id == execution_task_id
+                assert db_handlers[0].metadata["worker_task_id"] == execution_task_id
+                assert db_handlers[0].metadata["parent_task_id"] == "77"
+                assert db_handlers[0].metadata["parent_db_task_id"] == 77
+                assert db_handlers[0].metadata["agent_id"] == agent.id
         finally:
             db.close()
             try:
