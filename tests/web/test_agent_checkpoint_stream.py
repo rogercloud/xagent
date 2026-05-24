@@ -449,6 +449,77 @@ def test_historical_replay_duplicate_turn_helper_allows_distinct_turns() -> None
 
 
 @pytest.mark.asyncio
+async def test_historical_replay_skips_audit_only_trace_events(monkeypatch) -> None:
+    SessionLocal, db, task = _create_trace_handler_test_task("audit-history")
+    try:
+        task_id = int(task.id)
+        user_id = int(task.user_id)
+        base_time = datetime(2026, 5, 22, tzinfo=timezone.utc)
+        db.add_all(
+            [
+                DatabaseTraceEvent(
+                    task_id=task_id,
+                    event_id="audit-workforce",
+                    event_type="task_update_general",
+                    timestamp=base_time + timedelta(seconds=1),
+                    data={
+                        "__audit_only__": True,
+                        "event_type": "workforce_delegation_start",
+                        "worker_task_id": "agent_123_abcd1234",
+                    },
+                ),
+                DatabaseTraceEvent(
+                    task_id=task_id,
+                    event_id="visible-tool",
+                    event_type="tool_execution_start",
+                    timestamp=base_time + timedelta(seconds=2),
+                    data={"tool_name": "call_agent_worker"},
+                ),
+            ]
+        )
+        db.commit()
+    finally:
+        db.close()
+
+    def get_test_db() -> Iterator[Session]:
+        session = SessionLocal()
+        try:
+            yield session
+        finally:
+            session.close()
+
+    sent_events: list[dict] = []
+
+    async def send_personal_message(event: dict, websocket: object) -> None:
+        sent_events.append(event)
+
+    monkeypatch.setattr("xagent.web.models.database.get_db", get_test_db)
+    monkeypatch.setattr("xagent.web.api.websocket.cache_get", lambda *args: None)
+    monkeypatch.setattr(
+        "xagent.web.api.websocket.cache_set", lambda *args, **kwargs: None
+    )
+    monkeypatch.setattr(
+        "xagent.web.api.websocket.manager.send_personal_message",
+        send_personal_message,
+    )
+
+    await send_historical_data_as_stream(
+        websocket=object(),
+        task_id=task_id,
+        user=SimpleNamespace(id=user_id, is_admin=False),
+    )
+
+    trace_event_ids = [
+        event.get("event_id")
+        for event in sent_events
+        if event.get("type") == "trace_event"
+    ]
+
+    assert "audit-workforce" not in trace_event_ids
+    assert "visible-tool" in trace_event_ids
+
+
+@pytest.mark.asyncio
 async def test_historical_replay_uses_turn_id_before_legacy_content_dedupe(
     monkeypatch,
 ) -> None:

@@ -1381,6 +1381,7 @@ class AgentTool(AbstractBaseTool):
         file_outputs: Optional[list[dict[str, Any]]] = None,
     ) -> dict[str, Any]:
         data: dict[str, Any] = {
+            "__audit_only__": True,
             "event_type": f"workforce_delegation_{status}",
             "status": status,
             "agent_id": self._agent_id,

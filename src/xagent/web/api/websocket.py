@@ -540,6 +540,11 @@ def _is_agent_checkpoint_data(data: Any) -> bool:
     )
 
 
+def _is_audit_only_trace_data(data: Any) -> bool:
+    """Return True for trace payloads that should stay server-side."""
+    return isinstance(data, dict) and data.get("__audit_only__") is True
+
+
 def convert_to_local_time(utc_dt: Any) -> datetime:
     """Convert UTC datetime to local time for consistent display."""
     if utc_dt.tzinfo is None:
@@ -3064,6 +3069,11 @@ async def send_historical_data_as_stream(
                 normalized_event_data = trace_event.data
                 if isinstance(trace_event.data, dict):
                     normalized_event_data = dict(trace_event.data)
+                    if _is_audit_only_trace_data(normalized_event_data):
+                        normalized_trace_data_by_event_id[str(trace_event.event_id)] = (
+                            normalized_event_data
+                        )
+                        continue
                     normalized_outputs, path_to_file_id = _normalize_file_outputs(
                         db,
                         task_id=task_id,
@@ -3108,6 +3118,8 @@ async def send_historical_data_as_stream(
                 normalized_event_data = normalized_trace_data_by_event_id.get(
                     str(trace_event.event_id), trace_event.data
                 )
+                if _is_audit_only_trace_data(normalized_event_data):
+                    continue
                 if _is_duplicate_user_message_turn(
                     str(trace_event.event_type),
                     normalized_event_data,
