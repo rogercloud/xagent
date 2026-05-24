@@ -105,6 +105,7 @@ class AgentService:
                 ws_config.get("base_dir", self.workspace_base_dir),
                 ws_config.get("task_id", self.id),
                 self.allowed_external_dirs,
+                db_task_id=ws_config.get("db_task_id"),
             )
         elif self.enable_workspace:
             self._setup_workspace()

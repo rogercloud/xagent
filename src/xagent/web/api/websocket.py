@@ -849,6 +849,39 @@ def _normalize_file_outputs(
     path_to_file_id: Dict[str, str] = {}
     changed = False
 
+    def add_normalized_output(
+        file_record: UploadedFile,
+        fallback_filename: str,
+        raw_paths: list[str],
+    ) -> None:
+        final_file_id = str(file_record.file_id)
+        final_filename = fallback_filename or str(file_record.filename)
+
+        normalized_outputs.append(
+            build_file_ref(
+                file_id=final_file_id,
+                filename=final_filename,
+                mime_type=getattr(file_record, "mime_type", None),
+                size=getattr(file_record, "file_size", None),
+            )
+        )
+
+        for raw_path in raw_paths:
+            stripped = raw_path.strip()
+            if stripped:
+                path_to_file_id[stripped] = final_file_id
+                path_to_file_id[stripped.lstrip("/")] = final_file_id
+
+        storage_path = getattr(file_record, "storage_path", None)
+        if storage_path:
+            path_to_file_id[str(storage_path)] = final_file_id
+
+        workspace_relative_path = getattr(file_record, "workspace_relative_path", None)
+        if isinstance(workspace_relative_path, str) and workspace_relative_path.strip():
+            _add_file_link_aliases(
+                path_to_file_id, workspace_relative_path, final_file_id
+            )
+
     for item in file_outputs:
         item_file_id = ""
         item_filename = ""
@@ -909,6 +942,32 @@ def _normalize_file_outputs(
 
         resolved_path, relative_path = resolved_info
         normalized_relative_path = relative_path.lstrip("/")
+        file_record = (
+            db.query(UploadedFile)
+            .filter(UploadedFile.storage_path == str(resolved_path))
+            .first()
+        )
+        if file_record is not None and not _uploaded_file_record_in_task_scope(
+            file_record, task_id, task_user_id
+        ):
+            logger.warning(
+                "Skipping file output record outside task/user scope: %s",
+                getattr(file_record, "file_id", str(resolved_path)),
+            )
+            continue
+
+        if file_record is not None and not _output_path_in_current_task_scope(
+            normalized_relative_path, task_id, task_user_id
+        ):
+            if getattr(file_record, "workspace_category", None) != "output":
+                logger.warning(
+                    "Skipping registered file output outside output category: %s",
+                    getattr(file_record, "file_id", str(resolved_path)),
+                )
+                continue
+            add_normalized_output(file_record, item_filename, raw_paths)
+            continue
+
         if not _output_path_in_current_task_scope(
             normalized_relative_path, task_id, task_user_id
         ):
@@ -927,20 +986,6 @@ def _normalize_file_outputs(
         expected_file_id = item_file_id or _build_output_file_id(
             workspace_relative_path
         )
-
-        file_record = (
-            db.query(UploadedFile)
-            .filter(UploadedFile.storage_path == str(resolved_path))
-            .first()
-        )
-        if file_record is not None and not _uploaded_file_record_in_task_scope(
-            file_record, task_id, task_user_id
-        ):
-            logger.warning(
-                "Skipping file output record outside task/user scope: %s",
-                getattr(file_record, "file_id", str(resolved_path)),
-            )
-            continue
 
         if file_record is None and item_file_id:
             file_record = (
@@ -1002,29 +1047,15 @@ def _normalize_file_outputs(
                 db.rollback()
                 raise
 
-        final_file_id = str(file_record.file_id)
-        final_filename = item_filename or str(file_record.filename)
-
         if item_file_id:
-            path_to_file_id[item_file_id] = final_file_id
-
-        normalized_outputs.append(
-            build_file_ref(
-                file_id=final_file_id,
-                filename=final_filename,
-                mime_type=getattr(file_record, "mime_type", None),
-                size=getattr(file_record, "file_size", None),
-            )
+            path_to_file_id[item_file_id] = str(file_record.file_id)
+        add_normalized_output(file_record, item_filename, raw_paths)
+        _add_file_link_aliases(
+            path_to_file_id, normalized_relative_path, str(file_record.file_id)
         )
 
-        for raw_path in raw_paths:
-            stripped = raw_path.strip()
-            if stripped:
-                path_to_file_id[stripped] = final_file_id
-                path_to_file_id[stripped.lstrip("/")] = final_file_id
-        _add_file_link_aliases(path_to_file_id, normalized_relative_path, final_file_id)
-
         if workspace_relative_path != normalized_relative_path:
+            final_file_id = str(file_record.file_id)
             path_to_file_id[workspace_relative_path] = final_file_id
             path_to_file_id[f"/{workspace_relative_path}"] = final_file_id
             path_to_file_id[f"preview/{workspace_relative_path}"] = final_file_id

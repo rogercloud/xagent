@@ -3,6 +3,7 @@ Agent Tool - Convert published agents into callable tools
 """
 
 import logging
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Mapping, Optional, Type
 from uuid import uuid4
 
@@ -47,6 +48,31 @@ def _normalize_agent_ids(agent_ids: Any) -> Optional[list[int]]:
         normalized.append(agent_id)
         seen.add(agent_id)
     return normalized
+
+
+def _coerce_db_task_id(task_id: Any) -> Optional[int]:
+    if task_id is None:
+        return None
+
+    if isinstance(task_id, bool):
+        return None
+
+    if isinstance(task_id, int):
+        return task_id
+
+    if not isinstance(task_id, str):
+        return None
+
+    normalized = task_id.strip()
+    if normalized.isdecimal():
+        return int(normalized)
+
+    for prefix in ("web_task_", "task_"):
+        if normalized.startswith(prefix):
+            task_id_value = normalized.removeprefix(prefix)
+            return int(task_id_value) if task_id_value.isdecimal() else None
+
+    return None
 
 
 def _apply_agent_visibility_filters(
@@ -1396,6 +1422,127 @@ class AgentTool(AbstractBaseTool):
         except Exception:
             logger.debug("Failed to emit workforce delegation trace", exc_info=True)
 
+    def _resolve_delegated_output_path(self, workspace: Any, raw_path: str) -> Path:
+        raw = raw_path.strip()
+        path = Path(raw)
+        if path.is_absolute():
+            return Path(workspace.resolve_path(raw))
+
+        first_part = Path(raw).parts[0] if Path(raw).parts else ""
+        default_dir = (
+            "workspace" if first_part in {"input", "output", "temp"} else "output"
+        )
+        return Path(workspace.resolve_path(raw, default_dir=default_dir))
+
+    def _parent_owned_file_outputs(
+        self, file_outputs: Any, workspace: Any
+    ) -> Optional[list[dict[str, Any]]]:
+        if not isinstance(file_outputs, list):
+            return None
+
+        parent_db_task_id = _coerce_db_task_id(self._parent_task_id)
+        if parent_db_task_id is None:
+            if self._runtime_metadata:
+                logger.warning(
+                    "Skipping delegated file outputs without a parent DB task id: %s",
+                    self._parent_task_id,
+                )
+                return []
+            return file_outputs
+
+        from .....core.file_ref import build_file_ref
+        from .....web.models.uploaded_file import UploadedFile
+
+        normalized_outputs: list[dict[str, Any]] = []
+
+        for item in file_outputs:
+            item_file_id = ""
+            item_filename = ""
+            raw_paths: list[str] = []
+
+            if isinstance(item, str):
+                raw_paths = [item]
+            elif isinstance(item, dict):
+                if isinstance(item.get("file_id"), str):
+                    item_file_id = str(item["file_id"]).strip()
+                if isinstance(item.get("filename"), str):
+                    item_filename = str(item["filename"]).strip()
+                for key in ("file_path", "download_path", "relative_path", "path"):
+                    value = item.get(key)
+                    if isinstance(value, str) and value.strip():
+                        raw_paths.append(value)
+            else:
+                continue
+
+            file_record = None
+            if item_file_id:
+                file_record = (
+                    self._db.query(UploadedFile)
+                    .filter(
+                        UploadedFile.file_id == item_file_id,
+                        UploadedFile.user_id == self._user_id,
+                        UploadedFile.task_id == parent_db_task_id,
+                    )
+                    .first()
+                )
+
+            if file_record is None and workspace is not None:
+                for raw_path in raw_paths:
+                    try:
+                        resolved_path = self._resolve_delegated_output_path(
+                            workspace, raw_path
+                        )
+                    except (FileNotFoundError, ValueError):
+                        logger.debug(
+                            "Failed to resolve delegated file output: %s",
+                            raw_path,
+                            exc_info=True,
+                        )
+                        continue
+
+                    if not resolved_path.exists() or not resolved_path.is_file():
+                        continue
+
+                    try:
+                        registered_file_id = workspace.register_file(
+                            str(resolved_path),
+                            db_session=self._db,
+                        )
+                    except (FileNotFoundError, ValueError):
+                        logger.debug(
+                            "Failed to register delegated file output: %s",
+                            raw_path,
+                            exc_info=True,
+                        )
+                        continue
+
+                    file_record = (
+                        self._db.query(UploadedFile)
+                        .filter(
+                            UploadedFile.file_id == registered_file_id,
+                            UploadedFile.user_id == self._user_id,
+                            UploadedFile.task_id == parent_db_task_id,
+                        )
+                        .first()
+                    )
+                    if file_record is not None:
+                        break
+
+            if file_record is None:
+                logger.warning("Skipping unregistered delegated file output: %s", item)
+                continue
+
+            normalized_outputs.append(
+                build_file_ref(
+                    file_id=str(file_record.file_id),
+                    filename=item_filename or str(file_record.filename),
+                    mime_type=getattr(file_record, "mime_type", None),
+                    size=getattr(file_record, "file_size", None),
+                )
+            )
+
+        return normalized_outputs
+
     async def run_json_async(self, args: Mapping[str, Any]) -> Any:
         """Execute the agent with the given task."""
         import uuid
@@ -1555,6 +1702,7 @@ class AgentTool(AbstractBaseTool):
                                         allowed_tools.append(tool_name)
                                         break
 
+            parent_db_task_id = _coerce_db_task_id(self._parent_task_id)
             tool_config = WebToolConfig(
                 db=self._db,
                 request=MinimalRequest(self._user_id),
@@ -1572,7 +1720,11 @@ class AgentTool(AbstractBaseTool):
                 parent_tracer=self._parent_tracer,
                 agent_call_stack=self._agent_call_stack,
                 task_id=execution_task_id,
-                workspace_base_dir=self._workspace_base_dir,
+                workspace_config={
+                    "base_dir": self._workspace_base_dir,
+                    "task_id": execution_task_id,
+                    "db_task_id": parent_db_task_id,
+                },
             )
 
             parent_handlers = []
@@ -1640,7 +1792,9 @@ class AgentTool(AbstractBaseTool):
                 )
 
             output = result.get("output", "No response generated")
-            file_outputs = result.get("file_outputs")
+            file_outputs = self._parent_owned_file_outputs(
+                result.get("file_outputs"), agent_service.workspace
+            )
             logger.info(
                 f"Agent tool {self.name} executed successfully, output length: {len(output)}"
             )
