@@ -1,15 +1,23 @@
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
 
 from sqlalchemy.orm import Session
 
-from xagent.web.models.task import TaskStatus
+from xagent.web.models.task import Task, TaskStatus
 
 from ..models.workforce import WorkforceRun
+from .task_lease_service import (
+    TaskLease,
+    release_current_runner_task_lease,
+    release_task_lease,
+)
 from .workforce_snapshot import build_agent_tool_overrides
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -180,3 +188,69 @@ def sync_workforce_run_status(
         changed = True
 
     return changed
+
+
+def _sync_workforce_run_status_for_task_id(
+    db: Session,
+    task_id: int,
+    status: TaskStatus,
+) -> bool:
+    task = db.query(Task).filter(Task.id == int(task_id)).first()
+    if task is None:
+        return False
+    changed = sync_workforce_run_status(db, task, status)
+    if changed:
+        db.commit()
+    return changed
+
+
+def release_task_lease_with_workforce_sync(
+    db: Session,
+    lease: TaskLease | None,
+    *,
+    status: TaskStatus,
+) -> bool:
+    released = release_task_lease(db, lease, status=status)
+    if not released or lease is None:
+        return released
+    try:
+        _sync_workforce_run_status_for_task_id(db, lease.task_id, status)
+    except Exception:
+        try:
+            db.rollback()
+        except Exception:
+            pass
+        logger.warning(
+            "Failed to sync workforce run status after task lease release",
+            exc_info=True,
+        )
+    return released
+
+
+def release_current_runner_task_lease_with_workforce_sync(
+    db: Session,
+    task_id: int,
+    *,
+    status: TaskStatus,
+    runner_id: str | None = None,
+) -> bool:
+    released = release_current_runner_task_lease(
+        db,
+        task_id,
+        status=status,
+        runner_id=runner_id,
+    )
+    if not released:
+        return released
+    try:
+        _sync_workforce_run_status_for_task_id(db, task_id, status)
+    except Exception:
+        try:
+            db.rollback()
+        except Exception:
+            pass
+        logger.warning(
+            "Failed to sync workforce run status after current runner lease release",
+            exc_info=True,
+        )
+    return released

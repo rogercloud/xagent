@@ -16,10 +16,13 @@ from xagent.web.models.chat_message import TaskChatMessage
 from xagent.web.models.task import TaskStatus
 from xagent.web.models.uploaded_file import UploadedFile
 from xagent.web.services import task_orchestrator as task_orchestrator_module
+from xagent.web.services.task_lease_service import acquire_task_lease
 from xagent.web.services.workforce_access import WorkforcePolicy, set_workforce_policy
 from xagent.web.services.workforce_runs import create_workforce_run
 from xagent.web.services.workforce_runtime import (
     _map_task_status,
+    release_current_runner_task_lease_with_workforce_sync,
+    release_task_lease_with_workforce_sync,
     resolve_workforce_task_runtime,
     sync_workforce_run_status,
 )
@@ -313,6 +316,102 @@ def test_sync_workforce_run_status_tracks_task_lifecycle(db_session: Session) ->
     db_session.refresh(run)
     assert run.status == "completed"
     assert run.completed_at is not None
+
+
+def test_release_task_lease_with_workforce_sync_marks_run_failed(
+    db_session: Session,
+) -> None:
+    user = _create_user(db_session, "owner")
+    manager = _create_agent(db_session, user, "Manager")
+    workforce = _create_workforce(db_session, user, manager)
+    task = Task(
+        user_id=user.id,
+        title="Workforce task",
+        description="Run workforce",
+        status=TaskStatus.PENDING,
+        agent_id=manager.id,
+        execution_mode="balanced",
+        agent_config={},
+    )
+    db_session.add(task)
+    db_session.flush()
+    run = WorkforceRun(
+        workforce_id=workforce.id,
+        task_id=task.id,
+        user_id=user.id,
+        status="running",
+        snapshot={"version": 1},
+    )
+    db_session.add(run)
+    db_session.flush()
+    task.agent_config = {"workforce_run_id": run.id}
+    db_session.commit()
+
+    lease = acquire_task_lease(db_session, int(task.id))
+    assert lease is not None
+
+    assert (
+        release_task_lease_with_workforce_sync(
+            db_session,
+            lease,
+            status=TaskStatus.FAILED,
+        )
+        is True
+    )
+    db_session.refresh(task)
+    db_session.refresh(run)
+
+    assert task.status == TaskStatus.FAILED
+    assert run.status == "failed"
+    assert run.completed_at is not None
+
+
+def test_release_current_runner_task_lease_with_workforce_sync_pauses_run(
+    db_session: Session,
+) -> None:
+    user = _create_user(db_session, "owner")
+    manager = _create_agent(db_session, user, "Manager")
+    workforce = _create_workforce(db_session, user, manager)
+    task = Task(
+        user_id=user.id,
+        title="Workforce task",
+        description="Run workforce",
+        status=TaskStatus.PENDING,
+        agent_id=manager.id,
+        execution_mode="balanced",
+        agent_config={},
+    )
+    db_session.add(task)
+    db_session.flush()
+    run = WorkforceRun(
+        workforce_id=workforce.id,
+        task_id=task.id,
+        user_id=user.id,
+        status="running",
+        snapshot={"version": 1},
+    )
+    db_session.add(run)
+    db_session.flush()
+    task.agent_config = {"workforce_run_id": run.id}
+    db_session.commit()
+
+    lease = acquire_task_lease(db_session, int(task.id))
+    assert lease is not None
+
+    assert (
+        release_current_runner_task_lease_with_workforce_sync(
+            db_session,
+            int(task.id),
+            status=TaskStatus.WAITING_FOR_USER,
+        )
+        is True
+    )
+    db_session.refresh(task)
+    db_session.refresh(run)
+
+    assert task.status == TaskStatus.WAITING_FOR_USER
+    assert run.status == "paused"
+    assert run.completed_at is None
 
 
 @pytest.mark.asyncio

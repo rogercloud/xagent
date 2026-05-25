@@ -58,9 +58,9 @@ from .hot_path_cache import invalidate_task_cache
 from .task_lease_service import (
     acquire_task_lease,
     get_runner_id,
-    release_current_runner_task_lease,
     run_task_lease_heartbeat,
 )
+from .workforce_runtime import release_current_runner_task_lease_with_workforce_sync
 
 logger = logging.getLogger(__name__)
 
@@ -635,7 +635,7 @@ async def _schedule_bg(
                     except Exception:
                         pass
                 try:
-                    release_current_runner_task_lease(
+                    release_current_runner_task_lease_with_workforce_sync(
                         bg_db, task_id, status=final_status
                     )
                 except Exception as e:

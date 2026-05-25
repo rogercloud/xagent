@@ -53,13 +53,13 @@ from ..services.task_execution_context_service import (
 from ..services.task_lease_service import (
     acquire_task_lease,
     mark_task_paused_if_stale,
-    release_task_lease,
     run_task_lease_heartbeat,
     stop_task_lease_heartbeat,
 )
 from ..services.trace_message_storage import decode_trace_events_data
 from ..services.workforce_runtime import (
     WorkforceTaskRuntime,
+    release_task_lease_with_workforce_sync,
     resolve_workforce_task_runtime,
     sync_workforce_run_status,
 )
@@ -1595,20 +1595,9 @@ class AgentServiceManager:
                         final_status = TaskStatus.COMPLETED
                     else:
                         final_status = TaskStatus.FAILED
-                release_task_lease(db_session, lease, status=final_status)
-                try:
-                    task_for_sync = (
-                        db_session.query(Task).filter(Task.id == lease.task_id).first()
-                    )
-                    if task_for_sync is not None and sync_workforce_run_status(
-                        db_session, task_for_sync, final_status
-                    ):
-                        db_session.commit()
-                except Exception:
-                    logger.debug(
-                        "Failed to sync workforce run status after lease release",
-                        exc_info=True,
-                    )
+                release_task_lease_with_workforce_sync(
+                    db_session, lease, status=final_status
+                )
             # Complete tracking if it was started
             if tracker:
                 try:

@@ -163,7 +163,9 @@ async def test_execute_task_background_reuses_task_id_for_terminal_tasks(
     def fake_get_db():
         yield db_session
 
-    def fake_release_current_runner_task_lease(db, task_id, *, status):
+    def fake_release_current_runner_task_lease_with_workforce_sync(
+        db, task_id, *, status
+    ):
         return True
 
     monkeypatch.setattr(
@@ -174,8 +176,8 @@ async def test_execute_task_background_reuses_task_id_for_terminal_tasks(
     monkeypatch.setattr(websocket_api, "manager", BroadcastManager())
     monkeypatch.setattr(
         websocket_api,
-        "release_current_runner_task_lease",
-        fake_release_current_runner_task_lease,
+        "release_current_runner_task_lease_with_workforce_sync",
+        fake_release_current_runner_task_lease_with_workforce_sync,
     )
     monkeypatch.setattr(database_models, "get_db", fake_get_db)
     monkeypatch.setattr(

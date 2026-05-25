@@ -55,13 +55,15 @@ from ..services.managed_file_ref import (
 from ..services.task_lease_service import (
     acquire_task_lease,
     mark_task_paused_if_stale,
-    release_current_runner_task_lease,
-    release_task_lease,
     run_task_lease_heartbeat,
     stop_task_lease_heartbeat,
 )
 from ..services.uploaded_file_store import UploadedFileStore
-from ..services.workforce_runtime import sync_workforce_run_status
+from ..services.workforce_runtime import (
+    release_current_runner_task_lease_with_workforce_sync,
+    release_task_lease_with_workforce_sync,
+    sync_workforce_run_status,
+)
 from ..tools.config import WebToolConfig
 from ..tracing import create_ephemeral_tracer
 from ..user_isolated_memory import UserContext
@@ -1468,27 +1470,17 @@ async def execute_resume_background(
             task_updated = db_new.query(Task).filter(Task.id == task_id).first()
             if task_updated:
                 if status == "waiting_for_user":
-                    lease_released = release_current_runner_task_lease(
-                        db_new, task_id, status=TaskStatus.WAITING_FOR_USER
-                    )
-                    db_new.refresh(task_updated)
+                    final_task_status = TaskStatus.WAITING_FOR_USER
                 elif status == "interrupted":
-                    lease_released = release_current_runner_task_lease(
-                        db_new, task_id, status=TaskStatus.PAUSED
-                    )
-                    db_new.refresh(task_updated)
+                    final_task_status = TaskStatus.PAUSED
                 elif success:
-                    lease_released = release_current_runner_task_lease(
-                        db_new, task_id, status=TaskStatus.COMPLETED
-                    )
-                    db_new.refresh(task_updated)
+                    final_task_status = TaskStatus.COMPLETED
                 else:
-                    lease_released = release_current_runner_task_lease(
-                        db_new, task_id, status=TaskStatus.FAILED
-                    )
-                    db_new.refresh(task_updated)
-                sync_workforce_run_status(db_new, task_updated, task_updated.status)
-                db_new.commit()
+                    final_task_status = TaskStatus.FAILED
+                lease_released = release_current_runner_task_lease_with_workforce_sync(
+                    db_new, task_id, status=final_task_status
+                )
+                db_new.refresh(task_updated)
                 final_status = task_updated.status.value
             else:
                 final_status = task.status.value
@@ -1550,7 +1542,9 @@ async def execute_resume_background(
             db_gen = get_db()
             db_cleanup = next(db_gen)
             try:
-                release_task_lease(db_cleanup, lease, status=TaskStatus.FAILED)
+                release_task_lease_with_workforce_sync(
+                    db_cleanup, lease, status=TaskStatus.FAILED
+                )
             finally:
                 db_cleanup.close()
         _clear_task_pause_accepted(task_id)
@@ -2908,16 +2902,14 @@ async def handle_execute_task(
 
                 # Update task status
                 if result.get("success", False):
-                    release_current_runner_task_lease(
+                    release_current_runner_task_lease_with_workforce_sync(
                         db, task_id, status=TaskStatus.COMPLETED
                     )
                 else:
-                    release_current_runner_task_lease(
+                    release_current_runner_task_lease_with_workforce_sync(
                         db, task_id, status=TaskStatus.FAILED
                     )
                 db.refresh(task)
-                if sync_workforce_run_status(db, task, task.status):
-                    db.commit()
 
                 # Send task completion event (don't duplicate result as trace system already sent)
 
