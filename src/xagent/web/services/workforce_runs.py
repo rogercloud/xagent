@@ -14,6 +14,7 @@ from xagent.web.models.uploaded_file import UploadedFile
 from xagent.web.models.user import User
 from xagent.web.models.workforce import Workforce, WorkforceRun
 
+from .task_orchestrator import TaskTurnOrchestrator, TaskTurnPayload, TurnKind
 from .workforce_access import ensure_workforce_access, get_workforce_policy
 from .workforce_runtime import sync_workforce_run_status
 from .workforce_snapshot import (
@@ -21,7 +22,6 @@ from .workforce_snapshot import (
     build_workforce_task_config,
     normalize_text,
 )
-from .task_orchestrator import TaskTurnOrchestrator, TaskTurnPayload, TurnKind
 
 
 @dataclass(frozen=True)

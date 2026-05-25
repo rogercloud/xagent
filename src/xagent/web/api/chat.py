@@ -60,7 +60,6 @@ from ..services.task_lease_service import (
 from ..services.trace_message_storage import decode_trace_events_data
 from ..services.workforce_runtime import (
     WorkforceTaskRuntime,
-    is_workforce_task,
     resolve_workforce_task_runtime,
     sync_workforce_run_status,
 )
@@ -252,6 +251,16 @@ def _build_workforce_system_prompt(
     if base_system_prompt:
         prompts.append(base_system_prompt)
     return "\n\n".join(prompts) if prompts else None
+
+
+def _int_id_or_none(value: Any) -> Optional[int]:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str) and value.isdigit():
+        return int(value)
+    return None
 
 
 async def create_default_tools(
@@ -751,12 +760,16 @@ class AgentServiceManager:
 
         agent_config = None
         has_agent_builder_config = False
-        if task.agent_id:
-            agent = (
-                db.query(Agent)
-                .filter(Agent.id == task.agent_id, Agent.user_id == task.user_id)
-                .first()
-            )
+        workforce_runtime = resolve_workforce_task_runtime(db, task)
+        task_agent_id = _int_id_or_none(getattr(task, "agent_id", None))
+        if task_agent_id is not None:
+            agent_query = db.query(Agent).filter(Agent.id == task_agent_id)
+            if not (
+                workforce_runtime is not None
+                and workforce_runtime.manager_agent_id == task_agent_id
+            ):
+                agent_query = agent_query.filter(Agent.user_id == task.user_id)
+            agent = agent_query.first()
             if agent:
                 logger.info(
                     "Task %s using Agent Builder config: %s", task_id, agent.name
@@ -777,7 +790,7 @@ class AgentServiceManager:
                     task_vision_llm,
                     task_compact_llm,
                 ) = self._merge_agent_builder_llms(baseline_llms, agent_config["llms"])
-                if is_workforce_task(task):
+                if workforce_runtime is not None:
                     logger.info(
                         "Workforce task %s keeping task execution mode: %s -> pattern=%s",
                         task_id,
@@ -840,12 +853,13 @@ class AgentServiceManager:
     ) -> tuple[list[Any], Any]:
         """Build the tool set configured for a web task."""
         excluded_agent_id = None
-        if task.agent_id:
+        task_agent_id = _int_id_or_none(getattr(task, "agent_id", None))
+        if task_agent_id is not None:
             from ..models.agent import AgentStatus
 
             current_agent = (
                 db.query(Agent)
-                .filter(Agent.id == task.agent_id, Agent.user_id == task.user_id)
+                .filter(Agent.id == task_agent_id, Agent.user_id == task.user_id)
                 .first()
             )
             if current_agent and current_agent.status == AgentStatus.PUBLISHED:
@@ -1122,14 +1136,17 @@ class AgentServiceManager:
 
                 # Check if task has an associated published agent that should be excluded from agent tools
                 excluded_agent_id = None
-                if task and task.agent_id:
+                task_agent_id = (
+                    _int_id_or_none(getattr(task, "agent_id", None)) if task else None
+                )
+                if task is not None and task_agent_id is not None:
                     # Get the current agent to check if it's published
                     from ..models.agent import AgentStatus
 
                     current_agent = (
                         db.query(Agent)
                         .filter(
-                            Agent.id == task.agent_id, Agent.user_id == task.user_id
+                            Agent.id == task_agent_id, Agent.user_id == task.user_id
                         )
                         .first()
                     )
@@ -1178,9 +1195,9 @@ class AgentServiceManager:
                                 f"falling back to local execution: {e}"
                             )
 
-                    # Filter tools by tool category using tool metadata
-                    # Note: Tool names are stable, defined in code, no database storage needed
-                    allowed_tools: Optional[List[str]] = None
+                # Filter tools by tool category using tool metadata
+                # Note: Tool names are stable, defined in code, no database storage needed
+                allowed_tools: Optional[List[str]] = None
                 if agent_config and "tool_categories" in agent_config:
                     tool_categories = agent_config["tool_categories"]
 
@@ -1344,7 +1361,7 @@ class AgentServiceManager:
                         ]
                     # Agent Builder agents serve end users, so v2 task memory is
                     # disabled until the product exposes an explicit opt-in.
-                    agent_builder_memory_enabled = not bool(task and task.agent_id)
+                    agent_builder_memory_enabled = task_agent_id is None
 
                     # Build allowed external directories for the task owner's uploads.
                     allowed_external_dirs = _build_allowed_external_dirs(
@@ -1788,7 +1805,9 @@ class AgentServiceManager:
                             ]
                         # Agent Builder agents serve end users, so v2 task memory is
                         # disabled until the product exposes an explicit opt-in.
-                        agent_builder_memory_enabled = not bool(task and task.agent_id)
+                        agent_builder_memory_enabled = (
+                            _int_id_or_none(getattr(task, "agent_id", None)) is None
+                        )
                         self._agents[task_id] = AgentService(
                             name=f"reconstructed_agent_task_{task_id}",
                             id=f"web_task_{task_id}",  # Use task ID only for workspace

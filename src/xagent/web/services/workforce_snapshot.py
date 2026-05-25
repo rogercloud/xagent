@@ -90,7 +90,9 @@ def validate_workforce_for_run(
     if workforce.status != "active":
         raise HTTPException(status_code=400, detail="Workforce must be active to run")
 
-    manager_agent = ensure_workforce_agent_run_access(workforce.manager_agent, user, db)
+    manager_agent = ensure_workforce_agent_run_access(
+        workforce.manager_agent, user, db, workforce
+    )
     workers = _sorted_workers(workforce)
     enabled_workers = [worker for worker in workers if worker.enabled]
     if not enabled_workers:
@@ -99,7 +101,7 @@ def validate_workforce_for_run(
         )
 
     for worker in enabled_workers:
-        ensure_workforce_agent_run_access(worker.agent, user, db)
+        ensure_workforce_agent_run_access(worker.agent, user, db, workforce)
         instructions = normalize_text(
             cast(str | None, worker.assignment_instructions),
             "assignment_instructions",

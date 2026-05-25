@@ -1,5 +1,6 @@
 import asyncio
 from typing import Any
+from unittest.mock import MagicMock, patch
 
 import pytest
 from fastapi import HTTPException
@@ -8,7 +9,7 @@ from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import StaticPool
 
 from xagent.core.tools.adapters.vibe.factory import ToolFactory
-from xagent.web.api.chat import create_default_tools
+from xagent.web.api.chat import AgentServiceManager, create_default_tools
 from xagent.web.models import Agent, Base, Task, User, Workforce, WorkforceRun
 from xagent.web.models.agent import AgentStatus
 from xagent.web.models.chat_message import TaskChatMessage
@@ -16,12 +17,12 @@ from xagent.web.models.task import TaskStatus
 from xagent.web.models.uploaded_file import UploadedFile
 from xagent.web.services import task_orchestrator as task_orchestrator_module
 from xagent.web.services.workforce_access import WorkforcePolicy, set_workforce_policy
+from xagent.web.services.workforce_runs import create_workforce_run
 from xagent.web.services.workforce_runtime import (
     _map_task_status,
     resolve_workforce_task_runtime,
     sync_workforce_run_status,
 )
-from xagent.web.services.workforce_runs import create_workforce_run
 from xagent.web.services.workforce_workers import create_workforce_worker
 
 
@@ -354,9 +355,8 @@ async def test_create_workforce_run_revalidates_policy_visible_agents(
 
 
 @pytest.mark.asyncio
-async def test_create_workforce_run_allows_policy_visible_agents(
+async def test_create_workforce_run_rejects_policy_visible_agents_outside_run_scope(
     db_session: Session,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     class VisibleRunPolicy(WorkforcePolicy):
         def __init__(self, visible_ids: set[int]):
@@ -374,7 +374,6 @@ async def test_create_workforce_run_allows_policy_visible_agents(
             del db, user, purpose
             return self.visible_ids
 
-    _patch_schedule_bg(monkeypatch)
     owner = _create_user(db_session, "owner")
     runner = _create_user(db_session, "runner")
     manager = _create_agent(db_session, owner, "Manager")
@@ -385,17 +384,86 @@ async def test_create_workforce_run_allows_policy_visible_agents(
 
     set_workforce_policy(VisibleRunPolicy({manager.id, worker_agent.id}))
 
+    with pytest.raises(HTTPException) as run_error:
+        await create_workforce_run(
+            db_session,
+            runner,
+            workforce,
+            message="Run with visible agents outside run scope",
+        )
+
+    assert run_error.value.status_code == 403
+    assert run_error.value.detail == "Access denied to agent"
+
+
+@pytest.mark.asyncio
+async def test_verified_workforce_run_scope_loads_manager_config(
+    db_session: Session,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class TeamScopePolicy(WorkforcePolicy):
+        def can_run_workforce(
+            self, db: Session, user: User, workforce: Workforce
+        ) -> bool:
+            del db, user, workforce
+            return True
+
+        def is_agent_in_workforce_run_scope(
+            self,
+            db: Session,
+            user: User,
+            workforce: Workforce,
+            agent: Agent,
+        ) -> bool:
+            del db, user, workforce, agent
+            return True
+
+    _patch_schedule_bg(monkeypatch)
+    owner = _create_user(db_session, "owner")
+    runner = _create_user(db_session, "runner")
+    manager = _create_agent(
+        db_session,
+        owner,
+        "Manager",
+        execution_mode="think",
+    )
+    manager.instructions = "Use the workforce manager instructions."
+    manager.tool_categories = ["browser"]
+    manager.knowledge_bases = ["kb-1"]
+    manager.skills = ["skill-1"]
+    manager.models = {}
+    worker_agent = _create_agent(db_session, owner, "Analyst")
+    workforce = _create_workforce(db_session, owner, manager)
+    _add_worker(db_session, owner, workforce, worker_agent)
+    db_session.commit()
+
+    set_workforce_policy(TeamScopePolicy())
+
     result = await create_workforce_run(
         db_session,
         runner,
         workforce,
-        message="Run with visible agents",
+        message="Run with team scope",
+        execution_mode="balanced",
     )
     await result.background_task
+    db_session.refresh(result.task)
 
-    assert result.task.user_id == runner.id
-    assert result.task.agent_id == manager.id
-    assert result.workforce_run.status == "running"
+    default_llm = MagicMock()
+    default_llm.model_name = "default-model"
+    with patch("xagent.web.api.chat.create_default_llm", return_value=default_llm):
+        runtime_config = AgentServiceManager()._resolve_task_runtime_config(
+            task_id=int(result.task.id),
+            task=result.task,
+            db=db_session,
+            user=runner,
+        )
+
+    assert runtime_config["agent_config"]["instructions"] == manager.instructions
+    assert runtime_config["agent_config"]["tool_categories"] == ["browser"]
+    assert runtime_config["agent_config"]["knowledge_bases"] == ["kb-1"]
+    assert runtime_config["agent_config"]["skills"] == ["skill-1"]
+    assert runtime_config["task_pattern"] == "react"
 
 
 @pytest.mark.asyncio
