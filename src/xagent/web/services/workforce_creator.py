@@ -19,6 +19,7 @@ from .workforce_access import (
     list_accessible_published_agents,
     resolve_create_scope,
 )
+from .workforce_names import resolve_unique_agent_name, resolve_unique_workforce_name
 from .workforce_snapshot import normalize_text
 from .workforce_workers import create_workforce_worker
 
@@ -233,71 +234,6 @@ async def generate_workforce_creation_plan(
         return _fallback_creation_plan(normalized_prompt, agents)
 
 
-def _resolve_unique_workforce_name(
-    db: Session,
-    scope_type: str,
-    scope_id: str,
-    name: str,
-) -> str:
-    normalized_name = normalize_text(name, "name", required=True)
-    existing = (
-        db.query(Workforce)
-        .filter(
-            Workforce.scope_type == scope_type,
-            Workforce.scope_id == scope_id,
-            Workforce.name == normalized_name,
-        )
-        .first()
-    )
-    if existing is None:
-        return normalized_name
-
-    base_name = normalized_name
-    suffix = 2
-    while True:
-        suffix_text = f" {suffix}"
-        candidate_base = base_name[: max(1, 200 - len(suffix_text))].rstrip()
-        candidate = f"{candidate_base}{suffix_text}"
-        conflict = (
-            db.query(Workforce)
-            .filter(
-                Workforce.scope_type == scope_type,
-                Workforce.scope_id == scope_id,
-                Workforce.name == candidate,
-            )
-            .first()
-        )
-        if conflict is None:
-            return candidate
-        suffix += 1
-
-
-def _resolve_unique_agent_name(db: Session, user: User, name: str) -> str:
-    normalized_name = normalize_text(name, "name", required=True)
-    existing = (
-        db.query(Agent)
-        .filter(Agent.user_id == int(user.id), Agent.name == normalized_name)
-        .first()
-    )
-    if existing is None:
-        return normalized_name
-
-    base_name = normalized_name
-    suffix = 2
-    while True:
-        suffix_text = f" {suffix}"
-        candidate_base = base_name[: max(1, 200 - len(suffix_text))].rstrip()
-        candidate = f"{candidate_base}{suffix_text}"
-        conflict = (
-            db.query(Agent)
-            .filter(Agent.user_id == int(user.id), Agent.name == candidate)
-            .first()
-        )
-        if conflict is None:
-            return candidate
-        suffix += 1
-
-
 def _create_manager_agent_from_plan(
     db: Session,
     user: User,
@@ -306,10 +242,10 @@ def _create_manager_agent_from_plan(
 ) -> Agent:
     return AgentStore(db).add_agent(
         user_id=int(user.id),
-        name=_resolve_unique_agent_name(
+        name=resolve_unique_agent_name(
             db,
-            user,
-            str(manager_plan.get("name") or f"{name} Manager"),
+            user_id=int(user.id),
+            name=str(manager_plan.get("name") or f"{name} Manager"),
         ),
         description=normalize_text(
             cast(str | None, manager_plan.get("description")),
@@ -355,11 +291,11 @@ async def create_workforce_from_prompt(
     owner_user_id = int(user.id)
     try:
         plan = await generate_workforce_creation_plan(db, user, normalized_prompt)
-        name = _resolve_unique_workforce_name(
+        name = resolve_unique_workforce_name(
             db,
-            scope_type,
-            scope_id,
-            str(plan["name"]),
+            scope_type=scope_type,
+            scope_id=scope_id,
+            name=str(plan["name"]),
         )
         manager_plan = cast(dict[str, Any], plan["manager"])
         manager_agent = _create_manager_agent_from_plan(db, user, name, manager_plan)

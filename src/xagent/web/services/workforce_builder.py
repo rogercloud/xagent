@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from typing import Any, cast
 
 from fastapi import HTTPException
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, selectinload
 
 from xagent.web.models.agent import Agent, AgentStatus
 from xagent.web.models.user import User
@@ -17,6 +17,7 @@ from .workforce_access import (
     ensure_workforce_access,
     list_accessible_published_agents,
 )
+from .workforce_names import workforce_name_exists
 from .workforce_snapshot import normalize_text
 from .workforce_workers import create_workforce_worker
 
@@ -72,6 +73,34 @@ def list_builder_messages(
         .order_by(WorkforceBuilderMessage.id.asc())
         .all()
     )
+
+
+def _load_builder_workforce(db: Session, workforce: Workforce) -> Workforce:
+    if workforce.id is None:
+        return workforce
+    loaded = (
+        db.query(Workforce)
+        .options(
+            selectinload(Workforce.manager_agent),
+            selectinload(Workforce.workers).selectinload(WorkforceAgent.agent),
+        )
+        .filter(Workforce.id == workforce.id)
+        .first()
+    )
+    if loaded is None:
+        raise HTTPException(status_code=404, detail="Workforce not found")
+    return loaded
+
+
+def _ensure_builder_workforce_access(
+    db: Session,
+    user: User,
+    workforce: Workforce,
+    *,
+    action: str,
+) -> Workforce:
+    workforce = ensure_workforce_access(db, user, workforce, action=action)
+    return _load_builder_workforce(db, workforce)
 
 
 def _serialize_workers_for_prompt(workforce: Workforce) -> list[dict[str, Any]]:
@@ -281,15 +310,16 @@ def _fallback_patch_from_message(
         )
         summary_parts.append(f'Rename workforce to "{workforce_name_target}"')
 
-    if (
-        ("description" in lower or "desc" in lower)
-        and workforce_name_target
-        and len(quoted_texts) >= 2
-    ):
+    description_match = re.search(
+        r"(?:description|desc)\s*(?:to|as|=)?\s*\"([^\"]+)\"",
+        text,
+        flags=re.IGNORECASE,
+    )
+    if description_match:
         operations.append(
             {
                 "op": "update_workforce",
-                "fields": {"description": quoted_texts[1].strip()},
+                "fields": {"description": description_match.group(1).strip()},
             }
         )
         summary_parts.append("Update workforce description")
@@ -460,7 +490,7 @@ async def generate_builder_patch(
     workforce: Workforce,
     message: str,
 ) -> tuple[str, dict[str, Any]]:
-    workforce = ensure_workforce_access(db, user, workforce, action="edit")
+    workforce = _ensure_builder_workforce_access(db, user, workforce, action="edit")
     normalized_message = normalize_text(message, "message", required=True)
 
     llm_patch = await _llm_generate_patch(db, user, workforce, normalized_message)
@@ -515,17 +545,13 @@ def _apply_update_workforce(
         )
     if "name" in fields:
         name = normalize_text(cast(str | None, fields.get("name")), "name", True)
-        duplicate = (
-            db.query(Workforce)
-            .filter(
-                Workforce.id != workforce.id,
-                Workforce.scope_type == workforce.scope_type,
-                Workforce.scope_id == workforce.scope_id,
-                Workforce.name == name,
-            )
-            .first()
-        )
-        if duplicate:
+        if workforce_name_exists(
+            db,
+            scope_type=str(workforce.scope_type),
+            scope_id=str(workforce.scope_id),
+            name=name,
+            exclude_workforce_id=int(workforce.id),
+        ):
             raise HTTPException(status_code=409, detail="Workforce name already exists")
         workforce_row.name = name
     if "description" in fields:
@@ -757,6 +783,13 @@ async def propose_workforce_builder_changes(
     workforce = ensure_workforce_access(db, user, workforce, action="edit")
     user_message_text = normalize_text(message, "message", required=True)
 
+    assistant_message_text, patch = await generate_builder_patch(
+        db,
+        user,
+        workforce,
+        user_message_text,
+    )
+
     try:
         user_message = WorkforceBuilderMessage(
             workforce_id=int(workforce.id),
@@ -766,12 +799,6 @@ async def propose_workforce_builder_changes(
             status="message",
         )
         db.add(user_message)
-        assistant_message_text, patch = await generate_builder_patch(
-            db,
-            user,
-            workforce,
-            user_message_text,
-        )
         assistant_message = WorkforceBuilderMessage(
             workforce_id=int(workforce.id),
             user_id=int(user.id),

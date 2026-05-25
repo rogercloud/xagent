@@ -3,7 +3,7 @@ from typing import Any
 
 import pytest
 from fastapi import HTTPException
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, inspect
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import StaticPool
 
@@ -263,10 +263,10 @@ async def test_create_workforce_from_prompt_creates_draft_and_builder_messages(
     async def fake_plan(db: Session, user: User, prompt: str) -> dict[str, Any]:
         del db, user
         return {
-            "name": "Launch Workforce",
+            "name": "launch workforce",
             "description": prompt,
             "manager": {
-                "name": "Launch Manager",
+                "name": "launch manager",
                 "description": "Coordinates launch work.",
                 "instructions": "Delegate and summarize.",
             },
@@ -296,9 +296,9 @@ async def test_create_workforce_from_prompt_creates_draft_and_builder_messages(
 
     workforce = result.workforce
     assert workforce.id != existing_workforce.id
-    assert workforce.name == "Launch Workforce 2"
+    assert workforce.name == "launch workforce 2"
     assert workforce.status == "draft"
-    assert workforce.manager_agent.name == "Launch Manager 2"
+    assert workforce.manager_agent.name == "launch manager 2"
     assert workforce.manager_agent.status == AgentStatus.PUBLISHED
     assert workforce.manager_agent.published_at is not None
     assert workforce.manager_agent.execution_mode == "think"
@@ -433,6 +433,63 @@ async def test_generate_builder_patch_uses_llm_and_filters_available_agents(
     }
 
 
+def test_load_builder_workforce_preloads_prompt_relationships(
+    db_session: Session,
+) -> None:
+    owner = _create_user(db_session, "owner")
+    manager = _create_agent(db_session, owner, "Manager")
+    analyst = _create_agent(db_session, owner, "Analyst")
+    editor = _create_agent(db_session, owner, "Editor")
+    workforce = _create_workforce(db_session, owner, manager)
+    _add_worker(db_session, owner, workforce, analyst)
+    _add_worker(db_session, owner, workforce, editor, alias="Editor")
+    workforce_id = int(workforce.id)
+    db_session.commit()
+    db_session.expire_all()
+
+    unloaded_workforce = db_session.get(Workforce, workforce_id)
+    assert unloaded_workforce is not None
+
+    loaded = builder_module._load_builder_workforce(db_session, unloaded_workforce)
+
+    assert "manager_agent" not in inspect(loaded).unloaded
+    assert "workers" not in inspect(loaded).unloaded
+    assert {worker.agent.name for worker in loaded.workers} == {"Analyst", "Editor"}
+    assert all("agent" not in inspect(worker).unloaded for worker in loaded.workers)
+
+
+@pytest.mark.asyncio
+async def test_builder_fallback_can_update_description_without_rename(
+    db_session: Session,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    owner = _create_user(db_session, "owner")
+    manager = _create_agent(db_session, owner, "Manager")
+    worker_agent = _create_agent(db_session, owner, "Analyst")
+    workforce = _create_workforce(db_session, owner, manager)
+    _add_worker(db_session, owner, workforce, worker_agent)
+    monkeypatch.setattr(
+        builder_module,
+        "UserAwareModelStorage",
+        lambda db: _FakeModelStorage(db, None),
+    )
+
+    assistant_text, patch = await generate_builder_patch(
+        db_session,
+        owner,
+        workforce,
+        'Set description to "Focus on launch planning"',
+    )
+
+    assert "rule-based parsing" in assistant_text
+    assert patch["operations"] == [
+        {
+            "op": "update_workforce",
+            "fields": {"description": "Focus on launch planning"},
+        }
+    ]
+
+
 @pytest.mark.asyncio
 async def test_builder_fallback_can_add_policy_visible_agent(
     db_session: Session,
@@ -517,6 +574,9 @@ async def test_propose_builder_changes_persists_user_and_assistant_messages(
         message: str,
     ) -> tuple[str, dict[str, Any]]:
         del db, user, target_workforce
+        assert not db_session.new
+        assert not db_session.dirty
+        assert not db_session.deleted
         return (
             f"Prepared patch for {message}",
             {
@@ -674,6 +734,44 @@ def test_apply_builder_patch_rejects_workforce_status_update(
     assert invalid.value.status_code == 400
     assert invalid.value.detail == "Unsupported workforce update fields: status"
     assert db_session.get(Workforce, workforce.id).status == "draft"
+
+
+def test_apply_builder_patch_rejects_case_insensitive_workforce_name_duplicate(
+    db_session: Session,
+) -> None:
+    owner = _create_user(db_session, "owner")
+    manager = _create_agent(db_session, owner, "Manager")
+    first_workforce = _create_workforce(
+        db_session,
+        owner,
+        manager,
+        name="Launch Workforce",
+    )
+    second_workforce = _create_workforce(
+        db_session,
+        owner,
+        manager,
+        name="Research Team",
+    )
+    patch = {
+        "summary": "Rename workforce.",
+        "operations": [
+            {
+                "op": "update_workforce",
+                "fields": {"name": "launch workforce"},
+            }
+        ],
+        "warnings": [],
+        "clarification": None,
+    }
+
+    with pytest.raises(HTTPException) as conflict:
+        builder_module.apply_builder_patch(db_session, owner, second_workforce, patch)
+
+    assert first_workforce.name == "Launch Workforce"
+    assert second_workforce.name == "Research Team"
+    assert conflict.value.status_code == 409
+    assert conflict.value.detail == "Workforce name already exists"
 
 
 def test_admin_can_apply_active_workforce_metadata_patch_without_run_scope(
