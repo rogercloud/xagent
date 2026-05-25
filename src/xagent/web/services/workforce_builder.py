@@ -7,7 +7,7 @@ from typing import Any, cast
 from fastapi import HTTPException
 from sqlalchemy.orm import Session
 
-from xagent.web.models.agent import Agent
+from xagent.web.models.agent import Agent, AgentStatus
 from xagent.web.models.user import User
 from xagent.web.services.llm_utils import UserAwareModelStorage
 
@@ -17,11 +17,7 @@ from .workforce_access import (
     ensure_workforce_access,
     list_accessible_published_agents,
 )
-from .workforce_snapshot import (
-    build_workforce_snapshot,
-    normalize_text,
-    normalize_workforce_status,
-)
+from .workforce_snapshot import normalize_text, normalize_workforce_status
 from .workforce_workers import create_workforce_worker
 
 logger = logging.getLogger(__name__)
@@ -171,6 +167,21 @@ def _clean_patch(candidate: dict[str, Any]) -> dict[str, Any]:
         "warnings": clean_warnings,
         "clarification": clarification,
     }
+
+
+def _normalize_optional_bool(
+    operation: dict[str, Any],
+    field_name: str,
+) -> bool | None:
+    if field_name not in operation:
+        return None
+    value = operation.get(field_name)
+    if not isinstance(value, bool):
+        raise HTTPException(
+            status_code=400,
+            detail=f"{field_name} must be a boolean",
+        )
+    return value
 
 
 def _has_meaningful_operations(patch: dict[str, Any]) -> bool:
@@ -563,6 +574,7 @@ def _apply_add_existing_worker(
         "assignment_instructions",
         required=True,
     )
+    enabled = _normalize_optional_bool(operation, "enabled")
     create_workforce_worker(
         db,
         workforce,
@@ -571,7 +583,7 @@ def _apply_add_existing_worker(
         assignment_instructions=assignment_instructions,
         alias=cast(str | None, operation.get("alias")),
         agent_id=agent_id_value,
-        enabled=bool(operation.get("enabled", True)),
+        enabled=True if enabled is None else enabled,
         sort_order=operation.get("sort_order")
         if isinstance(operation.get("sort_order"), int)
         else None,
@@ -601,19 +613,27 @@ def _apply_update_worker(
         raise HTTPException(status_code=404, detail="Workforce worker not found")
     worker_row = cast(Any, worker)
 
+    alias = None
     if "alias" in operation:
-        worker_row.alias = normalize_text(
+        alias = normalize_text(
             cast(str | None, operation.get("alias")),
             "alias",
         )
+    assignment_instructions = None
     if "assignment_instructions" in operation:
-        worker_row.assignment_instructions = normalize_text(
+        assignment_instructions = normalize_text(
             cast(str | None, operation.get("assignment_instructions")),
             "assignment_instructions",
             required=True,
         )
-    if "enabled" in operation:
-        worker_row.enabled = bool(operation.get("enabled"))
+    enabled = _normalize_optional_bool(operation, "enabled")
+
+    if "alias" in operation:
+        worker_row.alias = alias
+    if "assignment_instructions" in operation:
+        worker_row.assignment_instructions = assignment_instructions
+    if enabled is not None:
+        worker_row.enabled = enabled
     if "sort_order" in operation and isinstance(operation.get("sort_order"), int):
         worker_row.sort_order = int(operation["sort_order"])
 
@@ -643,6 +663,52 @@ def _apply_remove_worker(
     db.flush()
 
 
+def _ensure_published_agent(agent: Agent | None) -> Agent:
+    if agent is None:
+        raise HTTPException(status_code=404, detail="Agent not found")
+    if agent.status != AgentStatus.PUBLISHED:
+        raise HTTPException(
+            status_code=400,
+            detail="Workforce agents must be published",
+        )
+    return agent
+
+
+def _validate_active_workforce_configuration(
+    db: Session,
+    workforce: Workforce,
+) -> None:
+    if workforce.status != "active":
+        return
+
+    _ensure_published_agent(db.get(Agent, int(workforce.manager_agent_id)))
+    workers = (
+        db.query(WorkforceAgent)
+        .filter(WorkforceAgent.workforce_id == workforce.id)
+        .order_by(WorkforceAgent.sort_order.asc(), WorkforceAgent.id.asc())
+        .all()
+    )
+    enabled_workers = [worker for worker in workers if worker.enabled]
+    if not enabled_workers:
+        raise HTTPException(
+            status_code=400,
+            detail="Workforce requires at least one enabled worker",
+        )
+
+    for worker in enabled_workers:
+        _ensure_published_agent(worker.agent)
+        normalize_text(
+            cast(str | None, worker.assignment_instructions),
+            "assignment_instructions",
+            required=True,
+        )
+        if int(worker.agent_id) == int(workforce.manager_agent_id):
+            raise HTTPException(
+                status_code=400,
+                detail="Manager agent cannot also be a worker",
+            )
+
+
 def apply_builder_patch(
     db: Session,
     user: User,
@@ -670,8 +736,7 @@ def apply_builder_patch(
             )
 
     db.flush()
-    if workforce.status == "active":
-        build_workforce_snapshot(db, user, workforce)
+    _validate_active_workforce_configuration(db, workforce)
     return workforce
 
 

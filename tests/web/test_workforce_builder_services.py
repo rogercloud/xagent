@@ -543,7 +543,50 @@ def test_apply_builder_changes_validates_patch_and_updates_message(
     assert result.message.proposed_patch == patch
 
 
-def test_apply_builder_patch_revalidates_active_workforce_run_scope(
+def test_admin_can_apply_active_workforce_metadata_patch_without_run_scope(
+    db_session: Session,
+) -> None:
+    owner = _create_user(db_session, "owner")
+    admin = _create_user(db_session, "admin", is_admin=True)
+    manager = _create_agent(db_session, owner, "Manager")
+    worker_agent = _create_agent(db_session, owner, "Analyst")
+    workforce = _create_workforce(db_session, owner, manager, status="active")
+    _add_worker(db_session, owner, workforce, worker_agent)
+    patch = {
+        "summary": "Rename workforce.",
+        "operations": [
+            {
+                "op": "update_workforce",
+                "fields": {"name": "Admin Renamed Workforce"},
+            }
+        ],
+        "warnings": [],
+        "clarification": None,
+    }
+    message = WorkforceBuilderMessage(
+        workforce_id=int(workforce.id),
+        user_id=int(admin.id),
+        role="assistant",
+        content="Prepared patch.",
+        proposed_patch=patch,
+        status="proposed",
+    )
+    db_session.add(message)
+    db_session.commit()
+
+    result = apply_workforce_builder_changes(
+        db_session,
+        admin,
+        workforce,
+        message_id=int(message.id),
+        proposed_patch=patch,
+    )
+
+    assert result.workforce.name == "Admin Renamed Workforce"
+    assert result.message.status == "applied"
+
+
+def test_apply_builder_patch_revalidates_active_workforce_configuration(
     db_session: Session,
 ) -> None:
     owner = _create_user(db_session, "owner")
@@ -586,6 +629,106 @@ def test_apply_builder_patch_revalidates_active_workforce_run_scope(
     assert invalid.value.status_code == 400
     assert invalid.value.detail == "Workforce requires at least one enabled worker"
     assert db_session.get(WorkforceAgent, worker.id).enabled is True
+
+
+def test_apply_builder_patch_rejects_non_boolean_worker_enabled(
+    db_session: Session,
+) -> None:
+    owner = _create_user(db_session, "owner")
+    manager = _create_agent(db_session, owner, "Manager")
+    worker_agent = _create_agent(db_session, owner, "Analyst")
+    workforce = _create_workforce(db_session, owner, manager)
+    worker = _add_worker(db_session, owner, workforce, worker_agent)
+    patch = {
+        "summary": "Disable worker.",
+        "operations": [
+            {
+                "op": "update_worker",
+                "member_id": int(worker.id),
+                "enabled": "false",
+            }
+        ],
+        "warnings": [],
+        "clarification": None,
+    }
+    message = WorkforceBuilderMessage(
+        workforce_id=int(workforce.id),
+        user_id=int(owner.id),
+        role="assistant",
+        content="Prepared patch.",
+        proposed_patch=patch,
+        status="proposed",
+    )
+    db_session.add(message)
+    db_session.commit()
+
+    with pytest.raises(HTTPException) as invalid:
+        apply_workforce_builder_changes(
+            db_session,
+            owner,
+            workforce,
+            message_id=int(message.id),
+            proposed_patch=patch,
+        )
+
+    assert invalid.value.status_code == 400
+    assert invalid.value.detail == "enabled must be a boolean"
+    assert db_session.get(WorkforceAgent, worker.id).enabled is True
+
+
+def test_apply_builder_patch_rejects_non_boolean_added_worker_enabled(
+    db_session: Session,
+) -> None:
+    owner = _create_user(db_session, "owner")
+    manager = _create_agent(db_session, owner, "Manager")
+    worker_agent = _create_agent(db_session, owner, "Analyst")
+    editor_agent = _create_agent(db_session, owner, "Editor")
+    workforce = _create_workforce(db_session, owner, manager)
+    _add_worker(db_session, owner, workforce, worker_agent)
+    patch = {
+        "summary": "Add editor.",
+        "operations": [
+            {
+                "op": "add_existing_worker",
+                "agent_id": int(editor_agent.id),
+                "assignment_instructions": "Edit the final brief.",
+                "enabled": "false",
+            }
+        ],
+        "warnings": [],
+        "clarification": None,
+    }
+    message = WorkforceBuilderMessage(
+        workforce_id=int(workforce.id),
+        user_id=int(owner.id),
+        role="assistant",
+        content="Prepared patch.",
+        proposed_patch=patch,
+        status="proposed",
+    )
+    db_session.add(message)
+    db_session.commit()
+
+    with pytest.raises(HTTPException) as invalid:
+        apply_workforce_builder_changes(
+            db_session,
+            owner,
+            workforce,
+            message_id=int(message.id),
+            proposed_patch=patch,
+        )
+
+    assert invalid.value.status_code == 400
+    assert invalid.value.detail == "enabled must be a boolean"
+    assert (
+        db_session.query(WorkforceAgent)
+        .filter(
+            WorkforceAgent.workforce_id == workforce.id,
+            WorkforceAgent.agent_id == editor_agent.id,
+        )
+        .first()
+        is None
+    )
 
 
 @pytest.mark.asyncio
