@@ -763,13 +763,13 @@ class AgentServiceManager:
         workforce_runtime = resolve_workforce_task_runtime(db, task)
         task_agent_id = _int_id_or_none(getattr(task, "agent_id", None))
         if task_agent_id is not None:
-            agent_query = db.query(Agent).filter(Agent.id == task_agent_id)
+            agent_filters = [Agent.id == task_agent_id]
             if not (
                 workforce_runtime is not None
                 and workforce_runtime.manager_agent_id == task_agent_id
             ):
-                agent_query = agent_query.filter(Agent.user_id == task.user_id)
-            agent = agent_query.first()
+                agent_filters.append(Agent.user_id == task.user_id)
+            agent = db.query(Agent).filter(*agent_filters).first()
             if agent:
                 logger.info(
                     "Task %s using Agent Builder config: %s", task_id, agent.name
