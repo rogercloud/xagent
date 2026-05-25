@@ -415,6 +415,7 @@ def finish_turn(bg_db: Any, task_id: int) -> None:
       - other statuses (PAUSED / WAITING_FOR_USER): leave alone
     """
     from ..models.chat_message import TaskChatMessage
+    from .workforce_runtime import sync_workforce_run_status
 
     bg_db.expire_all()
 
@@ -438,6 +439,7 @@ def finish_turn(bg_db: Any, task_id: int) -> None:
         if latest_assistant is not None:
             fresh.output = latest_assistant.content
             fresh.error_message = None
+            sync_workforce_run_status(bg_db, fresh, TaskStatus.COMPLETED)
             bg_db.commit()
             invalidate_task_cache(task_id)
             logger.info(
@@ -450,6 +452,9 @@ def finish_turn(bg_db: Any, task_id: int) -> None:
                 "finish_turn: task %s completed but no assistant message found",
                 task_id,
             )
+            if sync_workforce_run_status(bg_db, fresh, TaskStatus.COMPLETED):
+                bg_db.commit()
+                invalidate_task_cache(task_id)
         return
 
     if status == TaskStatus.FAILED:
@@ -464,7 +469,8 @@ def finish_turn(bg_db: Any, task_id: int) -> None:
             # see a contradiction (status=failed + output populated).
             fresh.output = None
             changed = True
-        if changed:
+        run_changed = sync_workforce_run_status(bg_db, fresh, TaskStatus.FAILED)
+        if changed or run_changed:
             bg_db.commit()
             invalidate_task_cache(task_id)
             logger.info(
@@ -502,6 +508,7 @@ def finish_turn(bg_db: Any, task_id: int) -> None:
         fresh.status = TaskStatus.FAILED
         fresh.error_message = "Task execution failed without status update; see /steps."
         fresh.output = None  # latest-turn snapshot invariant
+        sync_workforce_run_status(bg_db, fresh, TaskStatus.FAILED)
         bg_db.commit()
         invalidate_task_cache(task_id)
         logger.warning(

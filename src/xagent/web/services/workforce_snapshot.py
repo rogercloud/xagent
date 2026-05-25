@@ -12,7 +12,7 @@ from ..models.workforce import Workforce, WorkforceAgent
 from .workforce_access import ensure_workforce_access, ensure_workforce_agent_run_access
 
 WORKFORCE_STATUSES = {"draft", "active", "archived"}
-RUN_STATUSES = {"pending", "running", "completed", "failed", "cancelled"}
+RUN_STATUSES = {"pending", "running", "paused", "completed", "failed", "cancelled"}
 
 
 def normalize_workforce_status(status: str | None) -> str:
@@ -250,3 +250,19 @@ def build_workforce_snapshot(
     }
     snapshot["manager"]["runtime_prompt"] = build_manager_system_prompt(snapshot)
     return snapshot
+
+
+def build_workforce_task_config(
+    snapshot: dict[str, Any],
+    selected_file_ids: list[str] | None = None,
+    workforce_run_id: int | None = None,
+) -> dict[str, Any]:
+    config: dict[str, Any] = {
+        "workforce_id": snapshot["workforce"]["id"],
+        "workforce_snapshot": snapshot,
+    }
+    if workforce_run_id is not None:
+        config["workforce_run_id"] = workforce_run_id
+    if selected_file_ids:
+        config["selected_file_ids"] = selected_file_ids
+    return config
