@@ -1,6 +1,6 @@
 import hashlib
 import re
-from typing import Any, cast
+from typing import Any, Literal, cast, overload
 
 from fastapi import HTTPException
 from sqlalchemy.orm import Session
@@ -27,6 +27,18 @@ def normalize_workforce_run_status(status: str | None) -> str:
     if normalized not in RUN_STATUSES:
         raise HTTPException(status_code=400, detail="Invalid workforce run status")
     return normalized
+
+
+@overload
+def normalize_text(
+    value: str | None, field_name: str, required: Literal[True]
+) -> str: ...
+
+
+@overload
+def normalize_text(
+    value: str | None, field_name: str, required: Literal[False] = False
+) -> str | None: ...
 
 
 def normalize_text(

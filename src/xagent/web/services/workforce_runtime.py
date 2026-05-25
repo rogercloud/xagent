@@ -98,12 +98,13 @@ def resolve_workforce_task_runtime(
     if not allowed_agent_ids:
         return None
 
+    allowed_agent_id_set = set(allowed_agent_ids)
     overrides = {
         agent_id: override
         for agent_id, override in build_agent_tool_overrides(
             snapshot, workforce_run_id=workforce_run_id
         ).items()
-        if agent_id in set(allowed_agent_ids)
+        if agent_id in allowed_agent_id_set
     }
     worker_tool_names = {
         str(override["tool_name"])

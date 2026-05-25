@@ -101,8 +101,6 @@ async def create_workforce_run(
     policy.before_workforce_run(db, user, workforce)
 
     normalized_message = normalize_text(message, "message", required=True)
-    if normalized_message is None:
-        raise HTTPException(status_code=400, detail="message is required")
 
     selected_files = _normalize_selected_file_ids(selected_file_ids)
     snapshot = build_workforce_snapshot(db, user, workforce)
