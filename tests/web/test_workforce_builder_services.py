@@ -18,6 +18,11 @@ from xagent.web.models import (
 from xagent.web.models.agent import AgentStatus
 from xagent.web.services import workforce_builder as builder_module
 from xagent.web.services import workforce_creator as creator_module
+from xagent.web.services.agent_store import AgentStore
+from xagent.web.services.hot_path_cache import (
+    InMemoryTTLCache,
+    set_cache_backend_for_testing,
+)
 from xagent.web.services.workforce_access import WorkforcePolicy, set_workforce_policy
 from xagent.web.services.workforce_builder import (
     apply_workforce_builder_changes,
@@ -305,6 +310,65 @@ async def test_create_workforce_from_prompt_creates_draft_and_builder_messages(
 
 
 @pytest.mark.asyncio
+async def test_create_workforce_from_prompt_invalidates_agent_list_cache(
+    db_session: Session,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    set_cache_backend_for_testing(InMemoryTTLCache())
+    try:
+        owner = _create_user(db_session, "owner")
+        worker_agent = _create_agent(db_session, owner, "Analyst")
+        db_session.commit()
+        store = AgentStore(db_session)
+        cached_agent_names = {
+            item["name"] for item in store.list_agent_items(int(owner.id))
+        }
+        assert cached_agent_names == {"Analyst"}
+
+        async def fake_plan(db: Session, user: User, prompt: str) -> dict[str, Any]:
+            del db, user, prompt
+            return {
+                "name": "Launch Workforce",
+                "description": "Plan a product launch",
+                "manager": {
+                    "name": "Launch Manager",
+                    "description": "Coordinates launch work.",
+                    "instructions": "Delegate and summarize.",
+                },
+                "manager_instructions": "Delegate and summarize.",
+                "workers": [
+                    {
+                        "agent_id": int(worker_agent.id),
+                        "alias": "Analyst",
+                        "assignment_instructions": "Collect launch research.",
+                        "enabled": True,
+                    }
+                ],
+                "warnings": [],
+            }
+
+        monkeypatch.setattr(
+            creator_module,
+            "generate_workforce_creation_plan",
+            fake_plan,
+        )
+
+        result = await create_workforce_from_prompt(
+            db_session,
+            owner,
+            prompt="Plan a product launch",
+        )
+
+        refreshed_agent_names = {
+            item["name"] for item in store.list_agent_items(int(owner.id))
+        }
+        assert result.workforce.manager_agent.name == "Launch Manager"
+        assert refreshed_agent_names == {"Analyst", "Launch Manager"}
+    finally:
+        set_cache_backend_for_testing(None)
+
+
+@pytest.mark.asyncio
 async def test_generate_builder_patch_uses_llm_and_filters_available_agents(
     db_session: Session,
     monkeypatch: pytest.MonkeyPatch,
@@ -477,7 +541,7 @@ async def test_propose_builder_changes_persists_user_and_assistant_messages(
         message="rename it",
     )
 
-    messages = list_builder_messages(db_session, int(workforce.id))
+    messages = list_builder_messages(db_session, owner, workforce)
     assert [message.role for message in messages] == ["user", "assistant"]
     assert result.user_message.id == messages[0].id
     assert result.assistant_message.status == "proposed"
@@ -487,6 +551,31 @@ async def test_propose_builder_changes_persists_user_and_assistant_messages(
         serialize_builder_message(result.assistant_message)["proposed_patch"]["summary"]
         == "Rename workforce."
     )
+
+
+def test_list_builder_messages_requires_workforce_view_access(
+    db_session: Session,
+) -> None:
+    owner = _create_user(db_session, "owner")
+    other = _create_user(db_session, "other")
+    manager = _create_agent(db_session, owner, "Manager")
+    workforce = _create_workforce(db_session, owner, manager)
+    message = WorkforceBuilderMessage(
+        workforce_id=int(workforce.id),
+        user_id=int(owner.id),
+        role="assistant",
+        content="Prepared patch.",
+        status="message",
+    )
+    db_session.add(message)
+    db_session.commit()
+
+    assert list_builder_messages(db_session, owner, workforce) == [message]
+    with pytest.raises(HTTPException) as denied:
+        list_builder_messages(db_session, other, workforce)
+
+    assert denied.value.status_code == 403
+    assert denied.value.detail == "Access denied"
 
 
 def test_apply_builder_changes_validates_patch_and_updates_message(
@@ -541,6 +630,50 @@ def test_apply_builder_changes_validates_patch_and_updates_message(
     assert result.workforce.name == "Launch Workforce"
     assert result.message.status == "applied"
     assert result.message.proposed_patch == patch
+
+
+def test_apply_builder_patch_rejects_workforce_status_update(
+    db_session: Session,
+) -> None:
+    owner = _create_user(db_session, "owner")
+    manager = _create_agent(db_session, owner, "Manager")
+    worker_agent = _create_agent(db_session, owner, "Analyst")
+    workforce = _create_workforce(db_session, owner, manager, status="draft")
+    _add_worker(db_session, owner, workforce, worker_agent)
+    patch = {
+        "summary": "Publish workforce.",
+        "operations": [
+            {
+                "op": "update_workforce",
+                "fields": {"status": "active"},
+            }
+        ],
+        "warnings": [],
+        "clarification": None,
+    }
+    message = WorkforceBuilderMessage(
+        workforce_id=int(workforce.id),
+        user_id=int(owner.id),
+        role="assistant",
+        content="Prepared patch.",
+        proposed_patch=patch,
+        status="proposed",
+    )
+    db_session.add(message)
+    db_session.commit()
+
+    with pytest.raises(HTTPException) as invalid:
+        apply_workforce_builder_changes(
+            db_session,
+            owner,
+            workforce,
+            message_id=int(message.id),
+            proposed_patch=patch,
+        )
+
+    assert invalid.value.status_code == 400
+    assert invalid.value.detail == "Unsupported workforce update fields: status"
+    assert db_session.get(Workforce, workforce.id).status == "draft"
 
 
 def test_admin_can_apply_active_workforce_metadata_patch_without_run_scope(

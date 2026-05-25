@@ -17,7 +17,7 @@ from .workforce_access import (
     ensure_workforce_access,
     list_accessible_published_agents,
 )
-from .workforce_snapshot import normalize_text, normalize_workforce_status
+from .workforce_snapshot import normalize_text
 from .workforce_workers import create_workforce_worker
 
 logger = logging.getLogger(__name__)
@@ -62,11 +62,13 @@ def serialize_builder_message(message: WorkforceBuilderMessage) -> dict[str, Any
 
 def list_builder_messages(
     db: Session,
-    workforce_id: int,
+    user: User,
+    workforce: Workforce,
 ) -> list[WorkforceBuilderMessage]:
+    workforce = ensure_workforce_access(db, user, workforce, action="view")
     return (
         db.query(WorkforceBuilderMessage)
-        .filter(WorkforceBuilderMessage.workforce_id == workforce_id)
+        .filter(WorkforceBuilderMessage.workforce_id == workforce.id)
         .order_by(WorkforceBuilderMessage.id.asc())
         .all()
     )
@@ -502,6 +504,15 @@ def _apply_update_workforce(
     fields = operation.get("fields")
     if not isinstance(fields, dict):
         return
+    unsupported_fields = set(fields) - {"name", "description", "manager_instructions"}
+    if unsupported_fields:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Unsupported workforce update fields: "
+                + ", ".join(sorted(unsupported_fields))
+            ),
+        )
     if "name" in fields:
         name = normalize_text(cast(str | None, fields.get("name")), "name", True)
         duplicate = (
@@ -526,10 +537,6 @@ def _apply_update_workforce(
         workforce_row.manager_instructions = normalize_text(
             cast(str | None, fields.get("manager_instructions")),
             "manager_instructions",
-        )
-    if "status" in fields:
-        workforce_row.status = normalize_workforce_status(
-            cast(str | None, fields.get("status"))
         )
 
 

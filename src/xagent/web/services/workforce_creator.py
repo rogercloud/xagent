@@ -2,7 +2,6 @@ import json
 import logging
 import re
 from dataclasses import dataclass
-from datetime import datetime, timezone
 from typing import Any, cast
 
 from fastapi import HTTPException
@@ -13,6 +12,8 @@ from xagent.web.models.user import User
 from xagent.web.services.llm_utils import UserAwareModelStorage
 
 from ..models.workforce import Workforce, WorkforceBuilderMessage
+from .agent_store import AgentStore
+from .hot_path_cache import invalidate_agent_cache
 from .workforce_access import (
     can_create_workforce,
     list_accessible_published_agents,
@@ -303,7 +304,7 @@ def _create_manager_agent_from_plan(
     name: str,
     manager_plan: dict[str, Any],
 ) -> Agent:
-    agent = Agent(
+    return AgentStore(db).add_agent(
         user_id=int(user.id),
         name=_resolve_unique_agent_name(
             db,
@@ -325,13 +326,19 @@ def _create_manager_agent_from_plan(
         tool_categories=[],
         suggested_prompts=[],
         status=AgentStatus.PUBLISHED,
-        published_at=datetime.now(timezone.utc),
         widget_enabled=True,
         allowed_domains=[],
     )
-    db.add(agent)
-    db.flush()
-    return agent
+
+
+def invalidate_workforce_creation_cache(
+    *,
+    owner_user_id: int,
+    manager_agent_id: int,
+    workforce_id: int,
+) -> None:
+    del workforce_id
+    invalidate_agent_cache(owner_user_id, manager_agent_id)
 
 
 async def create_workforce_from_prompt(
@@ -345,6 +352,7 @@ async def create_workforce_from_prompt(
     if not can_create_workforce(db, user, scope_type, scope_id):
         raise HTTPException(status_code=403, detail="Access denied")
 
+    owner_user_id = int(user.id)
     try:
         plan = await generate_workforce_creation_plan(db, user, normalized_prompt)
         name = _resolve_unique_workforce_name(
@@ -412,11 +420,18 @@ async def create_workforce_from_prompt(
             status="message",
         )
         db.add(assistant_message)
+        manager_agent_id = int(manager_agent.id)
+        workforce_id = int(workforce.id)
         db.commit()
     except Exception:
         db.rollback()
         raise
-
+    else:
+        invalidate_workforce_creation_cache(
+            owner_user_id=owner_user_id,
+            manager_agent_id=manager_agent_id,
+            workforce_id=workforce_id,
+        )
     db.refresh(workforce)
     db.refresh(user_message)
     db.refresh(assistant_message)
