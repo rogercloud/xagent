@@ -41,6 +41,7 @@ from .api.v1 import v1_router
 from .api.v1.errors import V1ApiError, v1_api_error_handler
 from .api.websocket import ws_router
 from .api.widget import widget_router
+from .api.workforces import router as workforces_router
 from .dynamic_memory_store import get_memory_store
 from .logging_config import setup_logging
 from .models.database import init_db
@@ -453,6 +454,7 @@ app.include_router(skills_router)
 app.include_router(system_router)
 app.include_router(templates_router)
 app.include_router(agents_router)
+app.include_router(workforces_router)
 app.include_router(channel_router, prefix="/api/channels", tags=["Channels"])
 app.include_router(widget_router)
 # Public SDK surface, mounted under /v1. Auth via xag_* API key,

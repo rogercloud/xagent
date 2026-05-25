@@ -1,0 +1,775 @@
+from typing import Any, cast
+
+from fastapi import APIRouter, Depends, HTTPException
+from pydantic import BaseModel, Field
+from sqlalchemy import or_
+from sqlalchemy.orm import Session, selectinload
+
+from ..auth_dependencies import get_current_user
+from ..models.agent import Agent
+from ..models.database import get_db
+from ..models.user import User
+from ..models.workforce import (
+    Workforce,
+    WorkforceAgent,
+    WorkforceRun,
+)
+from ..services.workforce_access import (
+    can_create_workforce,
+    can_view_workforce,
+    ensure_agent_access,
+    ensure_workforce_access,
+    resolve_create_scope,
+)
+from ..services.workforce_builder import (
+    apply_workforce_builder_changes,
+    list_builder_messages,
+    propose_workforce_builder_changes,
+    serialize_builder_message,
+)
+from ..services.workforce_creator import create_workforce_from_prompt
+from ..services.workforce_names import workforce_name_exists
+from ..services.workforce_runs import create_workforce_run as start_workforce_run
+from ..services.workforce_snapshot import (
+    normalize_text,
+    normalize_workforce_status,
+    validate_workforce_for_run,
+)
+from ..services.workforce_workers import create_workforce_worker
+
+router = APIRouter(prefix="/api/workforces", tags=["workforces"])
+
+
+class WorkforceWorkerInput(BaseModel):
+    source_type: str = Field(default="existing")
+    agent_id: int | None = None
+    alias: str | None = Field(None, max_length=200)
+    assignment_instructions: str = Field(..., min_length=1)
+    enabled: bool = True
+    sort_order: int | None = None
+    canvas_position: dict[str, Any] | None = None
+
+
+class WorkforceCreateRequest(BaseModel):
+    name: str = Field(..., min_length=1, max_length=200)
+    description: str | None = None
+    manager_agent_id: int
+    manager_instructions: str | None = None
+    canvas_layout: dict[str, Any] | None = None
+    workers: list[WorkforceWorkerInput] = Field(default_factory=list)
+
+
+class WorkforcePromptCreateRequest(BaseModel):
+    prompt: str = Field(..., min_length=1)
+
+
+class WorkforceUpdateRequest(BaseModel):
+    name: str | None = Field(None, min_length=1, max_length=200)
+    description: str | None = None
+    manager_agent_id: int | None = None
+    manager_instructions: str | None = None
+    canvas_layout: dict[str, Any] | None = None
+
+
+class WorkforceWorkerUpdateRequest(BaseModel):
+    alias: str | None = Field(None, max_length=200)
+    assignment_instructions: str | None = Field(None, min_length=1)
+    enabled: bool | None = None
+    sort_order: int | None = None
+    canvas_position: dict[str, Any] | None = None
+
+
+class WorkforceRunRequest(BaseModel):
+    message: str = Field(..., min_length=1)
+    files: list[str] = Field(default_factory=list)
+    execution_mode: str | None = None
+
+
+class WorkforceBuilderProposeRequest(BaseModel):
+    message: str = Field(..., min_length=1)
+
+
+class WorkforceBuilderApplyRequest(BaseModel):
+    message_id: int
+    proposed_patch: dict[str, Any]
+
+
+def _field_supplied(model: BaseModel, field_name: str) -> bool:
+    return field_name in model.model_fields_set
+
+
+def _load_workforce(db: Session, workforce_id: int) -> Workforce | None:
+    return (
+        db.query(Workforce)
+        .options(
+            selectinload(Workforce.manager_agent),
+            selectinload(Workforce.workers).selectinload(WorkforceAgent.agent),
+        )
+        .filter(Workforce.id == workforce_id)
+        .first()
+    )
+
+
+def _reload_workforce(db: Session, workforce: Workforce) -> Workforce:
+    workforce_id = int(workforce.id)
+    loaded = _load_workforce(db, workforce_id)
+    if loaded is None:
+        raise HTTPException(status_code=404, detail="Workforce not found")
+    return loaded
+
+
+def _agent_status_value(agent: Agent) -> str:
+    value = getattr(agent.status, "value", None)
+    if isinstance(value, str):
+        return value
+    return str(agent.status or "")
+
+
+def _serialize_datetime(value: Any) -> str | None:
+    return value.isoformat() if value else None
+
+
+def _serialize_agent(agent: Agent) -> dict[str, Any]:
+    return {
+        "id": agent.id,
+        "name": agent.name,
+        "description": agent.description,
+        "logo_url": agent.logo_url,
+        "status": _agent_status_value(agent),
+    }
+
+
+def _sorted_workers(workforce: Workforce) -> list[WorkforceAgent]:
+    return sorted(
+        workforce.workers,
+        key=lambda item: (item.sort_order or 0, item.id or 0),
+    )
+
+
+def _serialize_worker(worker: WorkforceAgent) -> dict[str, Any]:
+    return {
+        "id": worker.id,
+        "agent": _serialize_agent(worker.agent),
+        "alias": worker.alias,
+        "assignment_instructions": worker.assignment_instructions,
+        "source_type": worker.source_type,
+        "template_id": worker.template_id,
+        "enabled": worker.enabled,
+        "sort_order": worker.sort_order,
+        "canvas_position": worker.canvas_position,
+        "created_at": _serialize_datetime(worker.created_at),
+        "updated_at": _serialize_datetime(worker.updated_at),
+    }
+
+
+def _serialize_workforce_detail(workforce: Workforce) -> dict[str, Any]:
+    return {
+        "id": workforce.id,
+        "name": workforce.name,
+        "description": workforce.description,
+        "status": workforce.status,
+        "manager": _serialize_agent(workforce.manager_agent),
+        "manager_instructions": workforce.manager_instructions,
+        "workers": [_serialize_worker(worker) for worker in _sorted_workers(workforce)],
+        "canvas_layout": workforce.canvas_layout,
+        "scope_type": workforce.scope_type,
+        "scope_id": workforce.scope_id,
+        "owner_user_id": workforce.owner_user_id,
+        "created_at": _serialize_datetime(workforce.created_at),
+        "updated_at": _serialize_datetime(workforce.updated_at),
+    }
+
+
+def _serialize_workforce_list_item(db: Session, workforce: Workforce) -> dict[str, Any]:
+    last_run = (
+        db.query(WorkforceRun)
+        .filter(WorkforceRun.workforce_id == workforce.id)
+        .order_by(WorkforceRun.created_at.desc(), WorkforceRun.id.desc())
+        .first()
+    )
+    return {
+        "id": workforce.id,
+        "name": workforce.name,
+        "description": workforce.description,
+        "status": workforce.status,
+        "manager": {
+            "id": workforce.manager_agent.id,
+            "name": workforce.manager_agent.name,
+            "logo_url": workforce.manager_agent.logo_url,
+        },
+        "worker_count": len(workforce.workers),
+        "last_run": (
+            {
+                "id": last_run.id,
+                "task_id": last_run.task_id,
+                "status": last_run.status,
+                "created_at": _serialize_datetime(last_run.created_at),
+            }
+            if last_run
+            else None
+        ),
+        "created_at": _serialize_datetime(workforce.created_at),
+        "updated_at": _serialize_datetime(workforce.updated_at),
+    }
+
+
+def _ensure_unique_workforce_name(
+    db: Session,
+    workforce: Workforce | None,
+    *,
+    scope_type: str,
+    scope_id: str,
+    name: str,
+) -> str:
+    normalized_name = normalize_text(name, "name", required=True)
+    if workforce_name_exists(
+        db,
+        scope_type=scope_type,
+        scope_id=scope_id,
+        name=normalized_name,
+        exclude_workforce_id=int(workforce.id) if workforce is not None else None,
+    ):
+        raise HTTPException(status_code=409, detail="Workforce name already exists")
+    return normalized_name
+
+
+def _ensure_publish_state_mutable(workforce: Workforce) -> None:
+    if workforce.status == "archived":
+        raise HTTPException(
+            status_code=409,
+            detail="Archived workforce cannot change publish state",
+        )
+
+
+def _validate_if_active(db: Session, user: User, workforce: Workforce) -> None:
+    if workforce.status != "active":
+        return
+    db.flush()
+    db.expire(workforce, ["manager_agent", "workers"])
+    validate_workforce_for_run(db, user, workforce)
+
+
+def _load_worker(db: Session, workforce: Workforce, member_id: int) -> WorkforceAgent:
+    worker = (
+        db.query(WorkforceAgent)
+        .options(selectinload(WorkforceAgent.agent))
+        .filter(
+            WorkforceAgent.id == member_id,
+            WorkforceAgent.workforce_id == workforce.id,
+        )
+        .first()
+    )
+    if worker is None:
+        raise HTTPException(status_code=404, detail="Workforce worker not found")
+    return worker
+
+
+@router.get("")
+async def list_workforces(
+    search: str = "",
+    page: int = 1,
+    size: int = 20,
+    status: str | None = None,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> dict[str, Any]:
+    if page < 1 or size < 1 or size > 100:
+        raise HTTPException(status_code=400, detail="Invalid pagination parameters")
+
+    query = db.query(Workforce).options(
+        selectinload(Workforce.manager_agent),
+        selectinload(Workforce.workers).selectinload(WorkforceAgent.agent),
+    )
+    normalized_search = search.strip()
+    if normalized_search:
+        query = query.filter(
+            or_(
+                Workforce.name.ilike(f"%{normalized_search}%"),
+                Workforce.description.ilike(f"%{normalized_search}%"),
+            )
+        )
+    if status:
+        query = query.filter(Workforce.status == normalize_workforce_status(status))
+
+    workforces = query.order_by(Workforce.updated_at.desc(), Workforce.id.desc()).all()
+    visible_workforces = [
+        workforce for workforce in workforces if can_view_workforce(db, user, workforce)
+    ]
+    total = len(visible_workforces)
+    offset = (page - 1) * size
+    paged_workforces = visible_workforces[offset : offset + size]
+    return {
+        "items": [
+            _serialize_workforce_list_item(db, workforce)
+            for workforce in paged_workforces
+        ],
+        "total": total,
+        "page": page,
+        "size": size,
+        "pages": (total + size - 1) // size,
+    }
+
+
+@router.post("")
+async def create_workforce(
+    request: WorkforceCreateRequest,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> dict[str, Any]:
+    scope_type, scope_id = resolve_create_scope(db, user)
+    if not can_create_workforce(db, user, scope_type, scope_id):
+        raise HTTPException(status_code=403, detail="Access denied")
+
+    name = _ensure_unique_workforce_name(
+        db,
+        None,
+        scope_type=scope_type,
+        scope_id=scope_id,
+        name=request.name,
+    )
+    manager_agent = ensure_agent_access(
+        db.query(Agent).filter(Agent.id == request.manager_agent_id).first(),
+        user,
+        db,
+        require_published=True,
+    )
+
+    try:
+        workforce = Workforce(
+            owner_user_id=int(user.id),
+            scope_type=scope_type,
+            scope_id=scope_id,
+            name=name,
+            description=normalize_text(request.description, "description"),
+            manager_agent_id=int(manager_agent.id),
+            manager_instructions=normalize_text(
+                request.manager_instructions,
+                "manager_instructions",
+            ),
+            status="draft",
+            canvas_layout=request.canvas_layout,
+        )
+        db.add(workforce)
+        db.flush()
+
+        for worker_input in request.workers:
+            create_workforce_worker(
+                db,
+                workforce,
+                user,
+                source_type=worker_input.source_type,
+                assignment_instructions=worker_input.assignment_instructions,
+                alias=worker_input.alias,
+                agent_id=worker_input.agent_id,
+                enabled=worker_input.enabled,
+                sort_order=worker_input.sort_order,
+                canvas_position=worker_input.canvas_position,
+            )
+
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+
+    return _serialize_workforce_detail(_reload_workforce(db, workforce))
+
+
+@router.post("/from-prompt")
+async def create_workforce_from_prompt_endpoint(
+    request: WorkforcePromptCreateRequest,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> dict[str, Any]:
+    result = await create_workforce_from_prompt(db, user, prompt=request.prompt)
+    workforce = _reload_workforce(db, result.workforce)
+    return {
+        "workforce": _serialize_workforce_detail(workforce),
+        "plan": result.plan,
+        "messages": [serialize_builder_message(message) for message in result.messages],
+    }
+
+
+@router.get("/{workforce_id}")
+async def get_workforce(
+    workforce_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> dict[str, Any]:
+    workforce = ensure_workforce_access(
+        db,
+        user,
+        _load_workforce(db, workforce_id),
+        action="view",
+    )
+    return _serialize_workforce_detail(workforce)
+
+
+@router.patch("/{workforce_id}")
+async def update_workforce(
+    workforce_id: int,
+    request: WorkforceUpdateRequest,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> dict[str, Any]:
+    workforce = ensure_workforce_access(
+        db,
+        user,
+        _load_workforce(db, workforce_id),
+        action="edit",
+    )
+    workforce_row = cast(Any, workforce)
+
+    if _field_supplied(request, "name"):
+        workforce_row.name = _ensure_unique_workforce_name(
+            db,
+            workforce,
+            scope_type=str(workforce.scope_type),
+            scope_id=str(workforce.scope_id),
+            name=cast(str, request.name),
+        )
+    if _field_supplied(request, "description"):
+        workforce_row.description = normalize_text(request.description, "description")
+    if _field_supplied(request, "manager_instructions"):
+        workforce_row.manager_instructions = normalize_text(
+            request.manager_instructions,
+            "manager_instructions",
+        )
+    if _field_supplied(request, "canvas_layout"):
+        workforce_row.canvas_layout = request.canvas_layout
+    if _field_supplied(request, "manager_agent_id"):
+        if request.manager_agent_id is None:
+            raise HTTPException(status_code=400, detail="manager_agent_id is required")
+        manager_agent = ensure_agent_access(
+            db.query(Agent).filter(Agent.id == request.manager_agent_id).first(),
+            user,
+            db,
+            require_published=True,
+        )
+        if any(
+            int(worker.agent_id) == int(manager_agent.id)
+            for worker in workforce.workers
+        ):
+            raise HTTPException(
+                status_code=400,
+                detail="Manager agent cannot also be a worker",
+            )
+        workforce_row.manager_agent_id = int(manager_agent.id)
+
+    try:
+        _validate_if_active(db, user, workforce)
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+
+    return _serialize_workforce_detail(_reload_workforce(db, workforce))
+
+
+@router.delete("/{workforce_id}")
+async def archive_workforce(
+    workforce_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> dict[str, Any]:
+    workforce = ensure_workforce_access(
+        db,
+        user,
+        _load_workforce(db, workforce_id),
+        action="edit",
+    )
+    cast(Any, workforce).status = "archived"
+    db.commit()
+    return {"id": workforce.id, "status": workforce.status}
+
+
+@router.post("/{workforce_id}/publish")
+async def publish_workforce(
+    workforce_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> dict[str, Any]:
+    workforce = ensure_workforce_access(
+        db,
+        user,
+        _load_workforce(db, workforce_id),
+        action="edit",
+    )
+    _ensure_publish_state_mutable(workforce)
+    cast(Any, workforce).status = "active"
+
+    try:
+        _validate_if_active(db, user, workforce)
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+
+    return _serialize_workforce_detail(_reload_workforce(db, workforce))
+
+
+@router.post("/{workforce_id}/unpublish")
+async def unpublish_workforce(
+    workforce_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> dict[str, Any]:
+    workforce = ensure_workforce_access(
+        db,
+        user,
+        _load_workforce(db, workforce_id),
+        action="edit",
+    )
+    _ensure_publish_state_mutable(workforce)
+    cast(Any, workforce).status = "draft"
+    db.commit()
+    return _serialize_workforce_detail(_reload_workforce(db, workforce))
+
+
+@router.post("/{workforce_id}/agents")
+async def add_workforce_agent(
+    workforce_id: int,
+    request: WorkforceWorkerInput,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> dict[str, Any]:
+    workforce = ensure_workforce_access(
+        db,
+        user,
+        _load_workforce(db, workforce_id),
+        action="edit",
+    )
+    try:
+        worker = create_workforce_worker(
+            db,
+            workforce,
+            user,
+            source_type=request.source_type,
+            assignment_instructions=request.assignment_instructions,
+            alias=request.alias,
+            agent_id=request.agent_id,
+            enabled=request.enabled,
+            sort_order=request.sort_order,
+            canvas_position=request.canvas_position,
+        )
+        _validate_if_active(db, user, workforce)
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+
+    db.refresh(worker)
+    return _serialize_worker(worker)
+
+
+@router.patch("/{workforce_id}/agents/{member_id}")
+async def update_workforce_agent(
+    workforce_id: int,
+    member_id: int,
+    request: WorkforceWorkerUpdateRequest,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> dict[str, Any]:
+    workforce = ensure_workforce_access(
+        db,
+        user,
+        _load_workforce(db, workforce_id),
+        action="edit",
+    )
+    worker = _load_worker(db, workforce, member_id)
+    worker_row = cast(Any, worker)
+
+    if _field_supplied(request, "alias"):
+        worker_row.alias = normalize_text(request.alias, "alias")
+    if _field_supplied(request, "assignment_instructions"):
+        worker_row.assignment_instructions = normalize_text(
+            request.assignment_instructions,
+            "assignment_instructions",
+            required=True,
+        )
+    if _field_supplied(request, "enabled"):
+        if request.enabled is None:
+            raise HTTPException(status_code=400, detail="enabled is required")
+        worker_row.enabled = bool(request.enabled)
+    if _field_supplied(request, "sort_order"):
+        worker_row.sort_order = request.sort_order
+    if _field_supplied(request, "canvas_position"):
+        worker_row.canvas_position = request.canvas_position
+
+    try:
+        _validate_if_active(db, user, workforce)
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+
+    db.refresh(worker)
+    return _serialize_worker(worker)
+
+
+@router.delete("/{workforce_id}/agents/{member_id}")
+async def remove_workforce_agent(
+    workforce_id: int,
+    member_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> dict[str, str]:
+    workforce = ensure_workforce_access(
+        db,
+        user,
+        _load_workforce(db, workforce_id),
+        action="edit",
+    )
+    worker = _load_worker(db, workforce, member_id)
+
+    try:
+        db.delete(worker)
+        db.flush()
+        db.expire(workforce, ["workers"])
+        _validate_if_active(db, user, workforce)
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+
+    return {"status": "deleted"}
+
+
+@router.post("/{workforce_id}/runs")
+async def create_workforce_run(
+    workforce_id: int,
+    request: WorkforceRunRequest,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> dict[str, Any]:
+    result = await start_workforce_run(
+        db,
+        user,
+        _load_workforce(db, workforce_id),
+        message=request.message,
+        selected_file_ids=request.files,
+        execution_mode=request.execution_mode,
+    )
+    return {
+        "workforce_run_id": result.workforce_run.id,
+        "task_id": result.task.id,
+        "status": result.workforce_run.status,
+        "redirect_url": f"/task/{result.task.id}",
+    }
+
+
+@router.get("/{workforce_id}/builder/messages")
+async def get_workforce_builder_messages(
+    workforce_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> dict[str, Any]:
+    workforce = ensure_workforce_access(
+        db,
+        user,
+        _load_workforce(db, workforce_id),
+        action="view",
+    )
+    messages = list_builder_messages(db, user, workforce)
+    return {"items": [serialize_builder_message(message) for message in messages]}
+
+
+@router.post("/{workforce_id}/builder/propose")
+async def propose_workforce_changes(
+    workforce_id: int,
+    request: WorkforceBuilderProposeRequest,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> dict[str, Any]:
+    result = await propose_workforce_builder_changes(
+        db,
+        user,
+        ensure_workforce_access(
+            db,
+            user,
+            _load_workforce(db, workforce_id),
+            action="edit",
+        ),
+        message=request.message,
+    )
+    return {
+        "user_message": serialize_builder_message(result.user_message),
+        "assistant_message": serialize_builder_message(result.assistant_message),
+        "proposed_patch": result.proposed_patch,
+        "requires_confirmation": result.requires_confirmation,
+    }
+
+
+@router.post("/{workforce_id}/builder/apply")
+async def apply_workforce_changes(
+    workforce_id: int,
+    request: WorkforceBuilderApplyRequest,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> dict[str, Any]:
+    result = apply_workforce_builder_changes(
+        db,
+        user,
+        ensure_workforce_access(
+            db,
+            user,
+            _load_workforce(db, workforce_id),
+            action="edit",
+        ),
+        message_id=request.message_id,
+        proposed_patch=request.proposed_patch,
+    )
+    workforce = _reload_workforce(db, result.workforce)
+    return {
+        "status": "applied",
+        "message": serialize_builder_message(result.message),
+        "workforce": _serialize_workforce_detail(workforce),
+    }
+
+
+@router.get("/{workforce_id}/canvas")
+async def get_workforce_canvas(
+    workforce_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> dict[str, Any]:
+    workforce = ensure_workforce_access(
+        db,
+        user,
+        _load_workforce(db, workforce_id),
+        action="view",
+    )
+    manager_node_id = f"manager-{workforce.manager_agent.id}"
+    nodes: list[dict[str, Any]] = [
+        {"id": "human", "type": "human", "label": "Human"},
+        {
+            "id": manager_node_id,
+            "type": "manager",
+            "agent_id": workforce.manager_agent.id,
+            "label": workforce.manager_agent.name,
+        },
+    ]
+    edges: list[dict[str, Any]] = [
+        {"id": "human-manager", "source": "human", "target": manager_node_id}
+    ]
+
+    for worker in _sorted_workers(workforce):
+        worker_node_id = f"worker-{worker.id}"
+        nodes.append(
+            {
+                "id": worker_node_id,
+                "type": "worker",
+                "agent_id": worker.agent_id,
+                "label": worker.alias or worker.agent.name,
+                "position": worker.canvas_position,
+                "enabled": worker.enabled,
+            }
+        )
+        edges.append(
+            {
+                "id": f"manager-worker-{worker.id}",
+                "source": manager_node_id,
+                "target": worker_node_id,
+            }
+        )
+
+    return {"nodes": nodes, "edges": edges, "layout": workforce.canvas_layout or {}}

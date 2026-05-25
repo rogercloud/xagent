@@ -1,0 +1,367 @@
+from types import SimpleNamespace
+from typing import Any
+
+import pytest
+
+from xagent.web.api import workforces as workforces_api
+from xagent.web.models.agent import Agent, AgentStatus
+from xagent.web.models.user import User
+from xagent.web.models.workforce import WorkforceBuilderMessage
+
+from .conftest import (
+    _admin_headers,
+    _direct_db_session,
+    _register_second_user,
+    client,
+)
+
+
+@pytest.fixture(autouse=True)
+def _db(_test_db: None) -> None:
+    pass
+
+
+def _user_id(username: str = "admin") -> int:
+    db = _direct_db_session()
+    try:
+        user = db.query(User).filter(User.username == username).first()
+        assert user is not None
+        return int(user.id)
+    finally:
+        db.close()
+
+
+def _create_published_agent(user_id: int, name: str) -> int:
+    db = _direct_db_session()
+    try:
+        agent = Agent(
+            user_id=user_id,
+            name=name,
+            description=f"{name} description",
+            instructions=f"{name} instructions",
+            execution_mode="balanced",
+            status=AgentStatus.PUBLISHED,
+        )
+        db.add(agent)
+        db.commit()
+        db.refresh(agent)
+        return int(agent.id)
+    finally:
+        db.close()
+
+
+def _create_workforce(
+    headers: dict[str, str],
+    *,
+    name: str = "Support Workforce",
+    worker_count: int = 1,
+    canvas_layout: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    owner_id = _user_id()
+    manager_agent_id = _create_published_agent(owner_id, f"{name} Manager")
+    workers = []
+    for index in range(worker_count):
+        workers.append(
+            {
+                "source_type": "existing",
+                "agent_id": _create_published_agent(
+                    owner_id, f"{name} Worker {index + 1}"
+                ),
+                "alias": f"worker-{index + 1}",
+                "assignment_instructions": f"Handle area {index + 1}",
+                "enabled": True,
+                "sort_order": index + 1,
+                "canvas_position": {"x": 100 + index, "y": 200 + index},
+            }
+        )
+
+    response = client.post(
+        "/api/workforces",
+        headers=headers,
+        json={
+            "name": name,
+            "description": "Coordinates support work",
+            "manager_agent_id": manager_agent_id,
+            "manager_instructions": "Delegate and synthesize.",
+            "canvas_layout": canvas_layout,
+            "workers": workers,
+        },
+    )
+    assert response.status_code == 200, response.text
+    return response.json()
+
+
+def test_workforce_endpoints_require_authentication() -> None:
+    response = client.get("/api/workforces")
+    assert response.status_code == 403
+
+
+def test_create_list_get_and_cross_user_access_control() -> None:
+    headers = _admin_headers()
+    workforce = _create_workforce(headers)
+
+    assert workforce["status"] == "draft"
+    assert workforce["manager"]["name"] == "Support Workforce Manager"
+    assert workforce["workers"][0]["agent"]["name"] == "Support Workforce Worker 1"
+
+    list_response = client.get("/api/workforces", headers=headers)
+    assert list_response.status_code == 200
+    list_payload = list_response.json()
+    assert list_payload["total"] == 1
+    assert list_payload["items"][0]["id"] == workforce["id"]
+
+    detail_response = client.get(f"/api/workforces/{workforce['id']}", headers=headers)
+    assert detail_response.status_code == 200
+    assert detail_response.json()["id"] == workforce["id"]
+
+    other_headers = _register_second_user()
+    denied_response = client.get(
+        f"/api/workforces/{workforce['id']}", headers=other_headers
+    )
+    assert denied_response.status_code == 403
+
+
+def test_publish_unpublish_and_active_validation() -> None:
+    headers = _admin_headers()
+    empty_workforce = _create_workforce(headers, name="Empty Workforce", worker_count=0)
+
+    invalid_publish = client.post(
+        f"/api/workforces/{empty_workforce['id']}/publish",
+        headers=headers,
+    )
+    assert invalid_publish.status_code == 400
+    assert "at least one enabled worker" in invalid_publish.json()["detail"]
+
+    workforce = _create_workforce(headers, name="Runnable Workforce")
+    publish_response = client.post(
+        f"/api/workforces/{workforce['id']}/publish",
+        headers=headers,
+    )
+    assert publish_response.status_code == 200
+    assert publish_response.json()["status"] == "active"
+
+    unpublish_response = client.post(
+        f"/api/workforces/{workforce['id']}/unpublish",
+        headers=headers,
+    )
+    assert unpublish_response.status_code == 200
+    assert unpublish_response.json()["status"] == "draft"
+
+
+def test_worker_add_update_remove_and_active_rollback() -> None:
+    headers = _admin_headers()
+    workforce = _create_workforce(headers, name="Worker Edit Workforce")
+    owner_id = _user_id()
+
+    add_response = client.post(
+        f"/api/workforces/{workforce['id']}/agents",
+        headers=headers,
+        json={
+            "source_type": "existing",
+            "agent_id": _create_published_agent(owner_id, "Additional Worker"),
+            "alias": "extra",
+            "assignment_instructions": "Handle overflow work",
+            "enabled": True,
+            "sort_order": 2,
+        },
+    )
+    assert add_response.status_code == 200, add_response.text
+    added_worker_id = add_response.json()["id"]
+
+    update_response = client.patch(
+        f"/api/workforces/{workforce['id']}/agents/{added_worker_id}",
+        headers=headers,
+        json={
+            "alias": "overflow",
+            "assignment_instructions": "Handle escalations",
+            "canvas_position": {"x": 9, "y": 10},
+        },
+    )
+    assert update_response.status_code == 200
+    updated_worker = update_response.json()
+    assert updated_worker["alias"] == "overflow"
+    assert updated_worker["canvas_position"] == {"x": 9, "y": 10}
+
+    delete_response = client.delete(
+        f"/api/workforces/{workforce['id']}/agents/{added_worker_id}",
+        headers=headers,
+    )
+    assert delete_response.status_code == 200
+    assert delete_response.json() == {"status": "deleted"}
+
+    publish_response = client.post(
+        f"/api/workforces/{workforce['id']}/publish",
+        headers=headers,
+    )
+    assert publish_response.status_code == 200
+    only_worker_id = publish_response.json()["workers"][0]["id"]
+
+    invalid_disable = client.patch(
+        f"/api/workforces/{workforce['id']}/agents/{only_worker_id}",
+        headers=headers,
+        json={"enabled": False},
+    )
+    assert invalid_disable.status_code == 400
+
+    detail_response = client.get(f"/api/workforces/{workforce['id']}", headers=headers)
+    assert detail_response.status_code == 200
+    assert detail_response.json()["workers"][0]["enabled"] is True
+
+
+def test_builder_propose_apply_requires_stored_patch_match() -> None:
+    headers = _admin_headers()
+    workforce = _create_workforce(headers, name="Builder Workforce")
+
+    propose_response = client.post(
+        f"/api/workforces/{workforce['id']}/builder/propose",
+        headers=headers,
+        json={"message": 'rename "Renamed Workforce"'},
+    )
+    assert propose_response.status_code == 200, propose_response.text
+    assert propose_response.json()["assistant_message"]["status"] == "proposed"
+
+    patch = {
+        "summary": "Rename Workforce.",
+        "operations": [
+            {
+                "op": "update_workforce",
+                "fields": {"name": "Renamed Workforce"},
+            }
+        ],
+        "warnings": [],
+        "clarification": None,
+    }
+    owner_id = _user_id()
+    db = _direct_db_session()
+    try:
+        message = WorkforceBuilderMessage(
+            workforce_id=workforce["id"],
+            user_id=owner_id,
+            role="assistant",
+            content="I prepared 1 change for review.",
+            proposed_patch=patch,
+            status="proposed",
+        )
+        db.add(message)
+        db.commit()
+        db.refresh(message)
+        message_id = int(message.id)
+    finally:
+        db.close()
+
+    tampered_patch = {**patch, "summary": "tampered"}
+    bad_apply = client.post(
+        f"/api/workforces/{workforce['id']}/builder/apply",
+        headers=headers,
+        json={"message_id": message_id, "proposed_patch": tampered_patch},
+    )
+    assert bad_apply.status_code == 400
+    assert "does not match" in bad_apply.json()["detail"]
+
+    apply_response = client.post(
+        f"/api/workforces/{workforce['id']}/builder/apply",
+        headers=headers,
+        json={"message_id": message_id, "proposed_patch": patch},
+    )
+    assert apply_response.status_code == 200, apply_response.text
+    assert apply_response.json()["workforce"]["name"] == "Renamed Workforce"
+
+    messages_response = client.get(
+        f"/api/workforces/{workforce['id']}/builder/messages",
+        headers=headers,
+    )
+    assert messages_response.status_code == 200
+    message_roles = [item["role"] for item in messages_response.json()["items"]]
+    assert message_roles.count("user") == 1
+    assert message_roles.count("assistant") == 2
+
+
+def test_from_prompt_creates_draft_workforce() -> None:
+    headers = _admin_headers()
+    _create_published_agent(_user_id(), "Research Worker")
+
+    response = client.post(
+        "/api/workforces/from-prompt",
+        headers=headers,
+        json={"prompt": "Create a research workforce for product analysis"},
+    )
+    assert response.status_code == 200, response.text
+    payload = response.json()
+    assert payload["workforce"]["status"] == "draft"
+    assert payload["workforce"]["manager"]["status"] == "published"
+    assert len(payload["messages"]) == 2
+    assert payload["plan"]["workers"]
+
+
+def test_run_endpoint_delegates_to_run_service(monkeypatch: pytest.MonkeyPatch) -> None:
+    headers = _admin_headers()
+    workforce = _create_workforce(headers, name="Run Workforce")
+    captured: dict[str, Any] = {}
+
+    async def fake_start_workforce_run(
+        db: Any,
+        user: User,
+        workforce_arg: Any,
+        *,
+        message: str,
+        selected_file_ids: list[str] | None = None,
+        execution_mode: str | None = None,
+    ) -> Any:
+        captured.update(
+            {
+                "user_id": int(user.id),
+                "workforce_id": int(workforce_arg.id),
+                "message": message,
+                "selected_file_ids": selected_file_ids,
+                "execution_mode": execution_mode,
+            }
+        )
+        return SimpleNamespace(
+            workforce_run=SimpleNamespace(id=99, status="pending"),
+            task=SimpleNamespace(id=123),
+        )
+
+    monkeypatch.setattr(
+        workforces_api,
+        "start_workforce_run",
+        fake_start_workforce_run,
+    )
+
+    response = client.post(
+        f"/api/workforces/{workforce['id']}/runs",
+        headers=headers,
+        json={"message": "go", "files": ["file-1"], "execution_mode": "think"},
+    )
+    assert response.status_code == 200, response.text
+    assert response.json() == {
+        "workforce_run_id": 99,
+        "task_id": 123,
+        "status": "pending",
+        "redirect_url": "/task/123",
+    }
+    assert captured == {
+        "user_id": _user_id(),
+        "workforce_id": workforce["id"],
+        "message": "go",
+        "selected_file_ids": ["file-1"],
+        "execution_mode": "think",
+    }
+
+
+def test_canvas_read_returns_nodes_edges_and_layout() -> None:
+    headers = _admin_headers()
+    workforce = _create_workforce(
+        headers,
+        name="Canvas Workforce",
+        canvas_layout={"zoom": 0.8},
+    )
+
+    response = client.get(f"/api/workforces/{workforce['id']}/canvas", headers=headers)
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["layout"] == {"zoom": 0.8}
+    assert [node["type"] for node in payload["nodes"]] == ["human", "manager", "worker"]
+    assert [edge["source"] for edge in payload["edges"]] == [
+        "human",
+        f"manager-{workforce['manager']['id']}",
+    ]
