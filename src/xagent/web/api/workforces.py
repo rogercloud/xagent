@@ -382,11 +382,7 @@ async def create_workforce_from_prompt_endpoint(
 ) -> dict[str, Any]:
     result = await create_workforce_from_prompt(db, user, prompt=request.prompt)
     workforce = _reload_workforce(db, result.workforce)
-    return {
-        "workforce": _serialize_workforce_detail(workforce),
-        "plan": result.plan,
-        "messages": [serialize_builder_message(message) for message in result.messages],
-    }
+    return _serialize_workforce_detail(workforce)
 
 
 @router.get("/{workforce_id}")
@@ -691,9 +687,12 @@ async def propose_workforce_changes(
         ),
         message=request.message,
     )
+    assistant_message = serialize_builder_message(result.assistant_message)
     return {
+        "message_id": result.assistant_message.id,
         "user_message": serialize_builder_message(result.user_message),
-        "assistant_message": serialize_builder_message(result.assistant_message),
+        "assistant_message": result.assistant_message.content,
+        "message": assistant_message,
         "proposed_patch": result.proposed_patch,
         "requires_confirmation": result.requires_confirmation,
     }
@@ -721,6 +720,7 @@ async def apply_workforce_changes(
     workforce = _reload_workforce(db, result.workforce)
     return {
         "status": "applied",
+        "message_id": result.message.id,
         "message": serialize_builder_message(result.message),
         "workforce": _serialize_workforce_detail(workforce),
     }

@@ -218,7 +218,14 @@ def test_builder_propose_apply_requires_stored_patch_match() -> None:
         json={"message": 'rename "Renamed Workforce"'},
     )
     assert propose_response.status_code == 200, propose_response.text
-    assert propose_response.json()["assistant_message"]["status"] == "proposed"
+    propose_payload = propose_response.json()
+    assert isinstance(propose_payload["assistant_message"], str)
+    assert propose_payload["message_id"] == propose_payload["message"]["id"]
+    assert propose_payload["message"]["status"] == "proposed"
+    assert (
+        propose_payload["message"]["proposed_patch"]
+        == propose_payload["proposed_patch"]
+    )
 
     patch = {
         "summary": "Rename Workforce.",
@@ -264,7 +271,10 @@ def test_builder_propose_apply_requires_stored_patch_match() -> None:
         json={"message_id": message_id, "proposed_patch": patch},
     )
     assert apply_response.status_code == 200, apply_response.text
-    assert apply_response.json()["workforce"]["name"] == "Renamed Workforce"
+    apply_payload = apply_response.json()
+    assert apply_payload["message_id"] == message_id
+    assert apply_payload["message"]["status"] == "applied"
+    assert apply_payload["workforce"]["name"] == "Renamed Workforce"
 
     messages_response = client.get(
         f"/api/workforces/{workforce['id']}/builder/messages",
@@ -287,10 +297,16 @@ def test_from_prompt_creates_draft_workforce() -> None:
     )
     assert response.status_code == 200, response.text
     payload = response.json()
-    assert payload["workforce"]["status"] == "draft"
-    assert payload["workforce"]["manager"]["status"] == "published"
-    assert len(payload["messages"]) == 2
-    assert payload["plan"]["workers"]
+    assert payload["id"]
+    assert payload["status"] == "draft"
+    assert payload["manager"]["status"] == "published"
+
+    messages_response = client.get(
+        f"/api/workforces/{payload['id']}/builder/messages",
+        headers=headers,
+    )
+    assert messages_response.status_code == 200
+    assert len(messages_response.json()["items"]) == 2
 
 
 def test_run_endpoint_delegates_to_run_service(monkeypatch: pytest.MonkeyPatch) -> None:
