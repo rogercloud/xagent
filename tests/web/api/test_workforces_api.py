@@ -182,6 +182,22 @@ def test_worker_add_update_remove_and_active_rollback() -> None:
     assert updated_worker["alias"] == "overflow"
     assert updated_worker["canvas_position"] == {"x": 9, "y": 10}
 
+    invalid_sort_order = client.patch(
+        f"/api/workforces/{workforce['id']}/agents/{added_worker_id}",
+        headers=headers,
+        json={"sort_order": None},
+    )
+    assert invalid_sort_order.status_code == 400
+
+    detail_response = client.get(f"/api/workforces/{workforce['id']}", headers=headers)
+    assert detail_response.status_code == 200
+    added_worker = next(
+        worker
+        for worker in detail_response.json()["workers"]
+        if worker["id"] == added_worker_id
+    )
+    assert added_worker["sort_order"] == 2
+
     delete_response = client.delete(
         f"/api/workforces/{workforce['id']}/agents/{added_worker_id}",
         headers=headers,

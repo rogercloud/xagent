@@ -587,6 +587,8 @@ async def update_workforce_agent(
             raise HTTPException(status_code=400, detail="enabled is required")
         worker_row.enabled = bool(request.enabled)
     if _field_supplied(request, "sort_order"):
+        if request.sort_order is None:
+            raise HTTPException(status_code=400, detail="sort_order is required")
         worker_row.sort_order = request.sort_order
     if _field_supplied(request, "canvas_position"):
         worker_row.canvas_position = request.canvas_position
