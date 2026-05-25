@@ -201,6 +201,49 @@ async def test_create_workforce_run_creates_task_run_and_starts_turn(
     )
 
 
+@pytest.mark.asyncio
+async def test_create_workforce_run_marks_task_failed_when_turn_start_fails_after_claim(
+    db_session: Session,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def fail_schedule_bg(**kwargs: Any) -> asyncio.Task[None]:
+        del kwargs
+        raise RuntimeError("schedule failed")
+
+    monkeypatch.setattr(task_orchestrator_module, "_schedule_bg", fail_schedule_bg)
+
+    user = _create_user(db_session, "owner")
+    manager = _create_agent(db_session, user, "Manager")
+    worker_agent = _create_agent(db_session, user, "Analyst")
+    workforce = _create_workforce(db_session, user, manager)
+    _add_worker(db_session, user, workforce, worker_agent)
+    db_session.commit()
+
+    with pytest.raises(RuntimeError, match="schedule failed"):
+        await create_workforce_run(
+            db_session,
+            user,
+            workforce,
+            message="Coordinate a launch brief",
+        )
+
+    task = db_session.query(Task).filter(Task.agent_id == manager.id).one()
+    workforce_run = db_session.query(WorkforceRun).one()
+
+    assert task.status == TaskStatus.FAILED
+    assert task.error_message == "Workforce run failed to start"
+    assert task.output is None
+    assert workforce_run.task_id == task.id
+    assert workforce_run.status == "failed"
+    assert workforce_run.completed_at is not None
+    assert (
+        db_session.query(TaskChatMessage)
+        .filter(TaskChatMessage.task_id == task.id, TaskChatMessage.role == "user")
+        .count()
+        == 1
+    )
+
+
 def test_resolve_workforce_task_runtime_requires_verified_run(
     db_session: Session,
 ) -> None:

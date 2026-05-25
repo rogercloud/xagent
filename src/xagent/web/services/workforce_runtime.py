@@ -190,6 +190,29 @@ def sync_workforce_run_status(
     return changed
 
 
+def mark_workforce_task_status(
+    db: Session,
+    task: Task,
+    status: TaskStatus,
+    *,
+    error_message: str | None = None,
+    clear_output: bool = False,
+) -> bool:
+    """Update the task lifecycle source of truth and project it to WorkforceRun."""
+    changed = False
+    if task.status != status:
+        task.status = status
+        changed = True
+    if error_message is not None and task.error_message != error_message:
+        setattr(task, "error_message", error_message)
+        changed = True
+    if clear_output and task.output is not None:
+        setattr(task, "output", None)
+        changed = True
+
+    return sync_workforce_run_status(db, task, status) or changed
+
+
 def _sync_workforce_run_status_for_task_id(
     db: Session,
     task_id: int,

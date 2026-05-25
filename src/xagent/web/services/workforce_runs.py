@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
-from datetime import datetime, timezone
 from typing import Any, cast
 
 from fastapi import HTTPException
@@ -16,7 +15,7 @@ from xagent.web.models.workforce import Workforce, WorkforceRun
 
 from .task_orchestrator import TaskTurnOrchestrator, TaskTurnPayload, TurnKind
 from .workforce_access import ensure_workforce_access, get_workforce_policy
-from .workforce_runtime import sync_workforce_run_status
+from .workforce_runtime import mark_workforce_task_status, sync_workforce_run_status
 from .workforce_snapshot import (
     build_workforce_snapshot,
     build_workforce_task_config,
@@ -158,6 +157,7 @@ async def create_workforce_run(
 
     db.refresh(task)
     db.refresh(workforce_run)
+    task_id = int(task.id)
 
     try:
         background_task = await TaskTurnOrchestrator.begin_turn(
@@ -170,10 +170,15 @@ async def create_workforce_run(
         )
     except Exception:
         db.rollback()
-        fresh_run = db.get(WorkforceRun, int(workforce_run.id))
-        if fresh_run is not None:
-            setattr(fresh_run, "status", "failed")
-            setattr(fresh_run, "completed_at", datetime.now(timezone.utc))
+        fresh_task = db.get(Task, task_id)
+        if fresh_task is not None:
+            mark_workforce_task_status(
+                db,
+                fresh_task,
+                TaskStatus.FAILED,
+                error_message="Workforce run failed to start",
+                clear_output=True,
+            )
             db.commit()
         raise
 
