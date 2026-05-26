@@ -14,6 +14,13 @@ import { useApp } from "@/contexts/app-context-chat"
 import { useRouter, useSearchParams } from "next/navigation"
 import { apiRequest } from "@/lib/api-wrapper"
 import { getApiUrl } from "@/lib/utils"
+import {
+  canDeleteAgent,
+  canEditAgent,
+  canPublishAgent,
+  canRunAgent,
+  getAgentChatHref,
+} from "@/lib/agent-ui-access"
 import { ConfirmDialog } from "@/components/ui/confirm-dialog"
 import { toast } from "sonner"
 import { getBrandingFromEnv } from "@/lib/branding"
@@ -54,10 +61,6 @@ const isTaskCreateResponse = (value: unknown): value is TaskCreateResponse => {
   const candidate = value as Record<string, unknown>
   return typeof candidate.task_id === "number"
 }
-
-const canEditAgent = (agent: Agent) => agent.readonly !== true && agent.can_edit !== false
-const canPublishAgent = (agent: Agent) => canEditAgent(agent) && agent.can_publish !== false
-const canDeleteAgent = (agent: Agent) => canEditAgent(agent) && agent.can_delete !== false
 
 export default function BuildsPage() {
   const { t } = useI18n()
@@ -456,47 +459,55 @@ export default function BuildsPage() {
                           {t('builds.card.updatedAt')}: {formatDate(agent.updated_at || agent.created_at)}
                         </div>
                       </div>
-                      {canEditAgent(agent) && (
+                      {(canRunAgent(agent) || canEditAgent(agent)) && (
                         <div className="flex gap-2" onClick={(e) => e.stopPropagation()}>
-                        {agent.status === 'published' ? (
-                          <>
-                            <Button
-                              variant="default"
-                              className="flex-1 bg-blue-600 hover:bg-blue-700 text-white"
-                              onClick={() => router.push(`/agent/${agent.id}`)}
-                            >
-                              <MessageSquare className="mr-1.5 h-4 w-4" />
-                              {t('builds.list.actions.chat')}
-                            </Button>
-                            <Button
-                              variant="outline"
-                              size="icon"
-                              onClick={() => {
-                                setDeployAgent(agent);
-                              }}
-                              title="Deploy"
-                            >
-                              <Rocket className="h-4 w-4" />
-                            </Button>
-                            <Button
-                              variant="outline"
-                              className="px-4"
-                              onClick={() => router.push(`/build/${agent.id}`)}
-                            >
-                              <Edit className="mr-1.5 h-4 w-4" />
-                              {t('builds.list.actions.edit')}
-                            </Button>
-                          </>
-                        ) : (
-                          <Button
-                            variant="outline"
-                            className="flex-1 w-full"
-                            onClick={() => router.push(`/build/${agent.id}`)}
-                          >
-                            <Edit className="mr-1.5 h-4 w-4" />
-                            {t('builds.list.actions.edit')}
-                          </Button>
-                        )}
+                          {agent.status === 'published' ? (
+                            <>
+                              {canRunAgent(agent) && (
+                                <Button
+                                  variant="default"
+                                  className="flex-1 bg-blue-600 hover:bg-blue-700 text-white"
+                                  onClick={() => router.push(getAgentChatHref(agent))}
+                                >
+                                  <MessageSquare className="mr-1.5 h-4 w-4" />
+                                  {t('builds.list.actions.chat')}
+                                </Button>
+                              )}
+                              {canEditAgent(agent) && (
+                                <>
+                                  <Button
+                                    variant="outline"
+                                    size="icon"
+                                    onClick={() => {
+                                      setDeployAgent(agent);
+                                    }}
+                                    title="Deploy"
+                                  >
+                                    <Rocket className="h-4 w-4" />
+                                  </Button>
+                                  <Button
+                                    variant="outline"
+                                    className="px-4"
+                                    onClick={() => router.push(`/build/${agent.id}`)}
+                                  >
+                                    <Edit className="mr-1.5 h-4 w-4" />
+                                    {t('builds.list.actions.edit')}
+                                  </Button>
+                                </>
+                              )}
+                            </>
+                          ) : (
+                            canEditAgent(agent) && (
+                              <Button
+                                variant="outline"
+                                className="flex-1 w-full"
+                                onClick={() => router.push(`/build/${agent.id}`)}
+                              >
+                                <Edit className="mr-1.5 h-4 w-4" />
+                                {t('builds.list.actions.edit')}
+                              </Button>
+                            )
+                          )}
                         </div>
                       )}
                     </div>

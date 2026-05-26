@@ -1,4 +1,4 @@
-import { useState, useRef, useEffect } from "react";
+import React, { useState, useRef, useEffect } from "react";
 import { createFileChipHTML } from "./FileChip";
 import { useRouter } from "next/navigation";
 import { Paperclip, X, File as FileIcon, Sparkles, Pause, Play, Loader2, ArrowUp, Globe } from "lucide-react";
@@ -511,7 +511,8 @@ export function ChatInput({
 
     if (!canSubmit() || isSubmittingRef.current) return;
 
-    if (!agentConfig.model) {
+    const hasSelectedAgent = selectedAgents.length > 0;
+    if (!hasSelectedAgent && !agentConfig.model) {
       setShowNoModelAlert(true);
       return;
     }

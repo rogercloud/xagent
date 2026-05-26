@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useEffect, useMemo } from "react";
+import { useState, useEffect, useMemo, useRef } from "react";
 import { Bot, Presentation, Search, Smartphone, Wand2 } from "lucide-react";
 import { useI18n } from "@/contexts/i18n-context";
 import { useApp } from "@/contexts/app-context-chat";
@@ -9,6 +9,7 @@ import { FilePreviewDialog } from "@/components/file/file-preview-dialog";
 import { getBrandingFromEnv } from "@/lib/branding";
 import { apiRequest } from "@/lib/api-wrapper";
 import { getApiUrl } from "@/lib/utils";
+import { findRunnableAgentById } from "@/lib/agent-ui-access";
 import { useSearchParams } from "next/navigation";
 
 function TaskHomePageContent() {
@@ -17,6 +18,8 @@ function TaskHomePageContent() {
   const searchParams = useSearchParams();
   const starter = searchParams.get("starter");
   const promptFromQuery = searchParams.get("prompt");
+  const agentFromQuery = searchParams.get("agent");
+  const appliedAgentFromQueryRef = useRef<string | null>(null);
 
   const [files, setFiles] = useState<File[]>([]);
   const [agents, setAgents] = useState<AgentCard[]>([]);
@@ -56,6 +59,20 @@ function TaskHomePageContent() {
     };
     fetchAgents();
   }, []);
+
+  useEffect(() => {
+    if (!agentFromQuery || appliedAgentFromQueryRef.current === agentFromQuery || agents.length === 0) {
+      return;
+    }
+
+    const selectedAgent = findRunnableAgentById(agents, agentFromQuery);
+    if (!selectedAgent) {
+      return;
+    }
+
+    setSelectedAgents([selectedAgent]);
+    appliedAgentFromQueryRef.current = agentFromQuery;
+  }, [agentFromQuery, agents]);
 
   useEffect(() => {
     let cancelled = false;
