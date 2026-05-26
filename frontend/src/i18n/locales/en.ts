@@ -3039,7 +3039,8 @@ Build when you need.`
       warnings: {
         managerNotPublished: "Manager is not published yet.",
         workerNotPublished: "{name} is not published yet.",
-        missingInstructions: "{name} is missing assignment instructions."
+        missingInstructions: "{name} is missing assignment instructions.",
+        managerCannotBeWorker: "{name} is already a worker. Choose a different manager or remove that worker."
       }
     },
     summary: {

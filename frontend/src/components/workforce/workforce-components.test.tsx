@@ -319,4 +319,56 @@ describe("workforce frontend core components", () => {
     expect(JSON.stringify(createWorkforceMock.mock.calls[0][0])).not.toContain("status")
     expect(onCreated).toHaveBeenCalledWith(workforceDetail)
   })
+
+  it("blocks submit when a changed manager is already configured as a worker", async () => {
+    listAgentOptionsMock.mockResolvedValueOnce([
+      {
+        id: 7,
+        name: "Manager Agent",
+        description: null,
+        logo_url: null,
+        status: "published",
+      },
+      {
+        id: 8,
+        name: "Research Agent",
+        description: "Research",
+        logo_url: null,
+        status: "published",
+      },
+    ])
+
+    render(<WorkforceWizard onCreated={vi.fn()} />)
+
+    await screen.findByText("workforces.create.manual.title")
+
+    fireEvent.change(screen.getByPlaceholderText("workforces.create.placeholders.name"), {
+      target: { value: "Launch Workforce" },
+    })
+    fireEvent.change(screen.getByLabelText("workforces.create.manager.placeholder"), {
+      target: { value: "7" },
+    })
+    fireEvent.click(screen.getByText("common.next"))
+
+    fireEvent.change(screen.getByLabelText("workforces.workers.chooseAgent"), {
+      target: { value: "8" },
+    })
+    fireEvent.change(screen.getByPlaceholderText("workforces.workers.instructionsPlaceholder"), {
+      target: { value: "Research competitors" },
+    })
+    fireEvent.click(screen.getByText("workforces.actions.addWorker"))
+
+    fireEvent.click(screen.getByText("common.back"))
+    fireEvent.change(screen.getByLabelText("workforces.create.manager.placeholder"), {
+      target: { value: "8" },
+    })
+
+    expect(
+      screen.getByText("workforces.review.warnings.managerCannotBeWorker"),
+    ).toBeInTheDocument()
+
+    fireEvent.click(screen.getByText("common.next"))
+    expect(screen.getByText("common.next")).toBeDisabled()
+    expect(createWorkforceMock).not.toHaveBeenCalled()
+  })
 })

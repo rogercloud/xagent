@@ -51,14 +51,32 @@ export function WorkforceWizard({
   const [managerInstructions, setManagerInstructions] = useState("")
   const [workers, setWorkers] = useState<WorkforceWorkerDraft[]>([])
 
+  const managerWorkerConflict = useMemo(() => {
+    if (!managerAgentId) return null
+    const managerId = Number(managerAgentId)
+    return workers.find((worker) => worker.agent_id === managerId) ?? null
+  }, [managerAgentId, workers])
+
+  const managerWorkerConflictMessage = useMemo(() => {
+    if (!managerWorkerConflict) return null
+    const agent = agents.find((item) => item.id === managerWorkerConflict.agent_id)
+    return t("workforces.review.warnings.managerCannotBeWorker", {
+      name:
+        managerWorkerConflict.alias
+        || agent?.name
+        || t("workforces.workers.aWorker"),
+    })
+  }, [agents, managerWorkerConflict, t])
+
   const workersAreValid = useMemo(
     () =>
       workers.length > 0
+      && !managerWorkerConflict
       && workers.every((worker) => {
         if (!worker.assignment_instructions.trim()) return false
         return Boolean(worker.agent_id)
       }),
-    [workers],
+    [managerWorkerConflict, workers],
   )
 
   useEffect(() => {
@@ -87,6 +105,7 @@ export function WorkforceWizard({
   }, [step, name, managerAgentId, workersAreValid])
 
   const handleCreate = async () => {
+    if (!name.trim() || !managerAgentId || !workersAreValid) return
     setSubmitting(true)
     setError(null)
     try {
@@ -228,6 +247,12 @@ export function WorkforceWizard({
             workers={workers}
             agents={agents}
           />
+        ) : null}
+
+        {managerWorkerConflictMessage ? (
+          <div className="rounded-lg border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-900">
+            {managerWorkerConflictMessage}
+          </div>
         ) : null}
 
         {error ? <div className="text-sm text-red-500">{error}</div> : null}

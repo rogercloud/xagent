@@ -3039,7 +3039,8 @@ Build when you need.`
       warnings: {
         managerNotPublished: "Manager 还没有发布。",
         workerNotPublished: "{name} 还没有发布。",
-        missingInstructions: "{name} 缺少任务指令。"
+        missingInstructions: "{name} 缺少任务指令。",
+        managerCannotBeWorker: "{name} 已经是 worker。请选择其他 manager，或移除这个 worker。"
       }
     },
     summary: {
