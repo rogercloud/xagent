@@ -2,7 +2,7 @@ from typing import Any, cast
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
-from sqlalchemy import or_
+from sqlalchemy import func, or_
 from sqlalchemy.orm import Session, selectinload
 
 from ..auth_dependencies import get_current_user
@@ -16,9 +16,9 @@ from ..models.workforce import (
 )
 from ..services.workforce_access import (
     can_create_workforce,
-    can_view_workforce,
     ensure_agent_access,
     ensure_workforce_access,
+    filter_visible_workforces,
     resolve_create_scope,
 )
 from ..services.workforce_builder import (
@@ -180,13 +180,10 @@ def _serialize_workforce_detail(workforce: Workforce) -> dict[str, Any]:
     }
 
 
-def _serialize_workforce_list_item(db: Session, workforce: Workforce) -> dict[str, Any]:
-    last_run = (
-        db.query(WorkforceRun)
-        .filter(WorkforceRun.workforce_id == workforce.id)
-        .order_by(WorkforceRun.created_at.desc(), WorkforceRun.id.desc())
-        .first()
-    )
+def _serialize_workforce_list_item(
+    workforce: Workforce,
+    last_run: WorkforceRun | None,
+) -> dict[str, Any]:
     return {
         "id": workforce.id,
         "name": workforce.name,
@@ -211,6 +208,35 @@ def _serialize_workforce_list_item(db: Session, workforce: Workforce) -> dict[st
         "created_at": _serialize_datetime(workforce.created_at),
         "updated_at": _serialize_datetime(workforce.updated_at),
     }
+
+
+def _load_latest_runs_by_workforce(
+    db: Session,
+    workforce_ids: list[int],
+) -> dict[int, WorkforceRun]:
+    if not workforce_ids:
+        return {}
+
+    ranked_runs = (
+        db.query(
+            WorkforceRun.id.label("id"),
+            func.row_number()
+            .over(
+                partition_by=WorkforceRun.workforce_id,
+                order_by=(WorkforceRun.created_at.desc(), WorkforceRun.id.desc()),
+            )
+            .label("rank"),
+        )
+        .filter(WorkforceRun.workforce_id.in_(workforce_ids))
+        .subquery()
+    )
+    latest_runs = (
+        db.query(WorkforceRun)
+        .join(ranked_runs, WorkforceRun.id == ranked_runs.c.id)
+        .filter(ranked_runs.c.rank == 1)
+        .all()
+    )
+    return {int(run.workforce_id): run for run in latest_runs}
 
 
 def _ensure_unique_workforce_name(
@@ -276,10 +302,7 @@ async def list_workforces(
     if page < 1 or size < 1 or size > 100:
         raise HTTPException(status_code=400, detail="Invalid pagination parameters")
 
-    query = db.query(Workforce).options(
-        selectinload(Workforce.manager_agent),
-        selectinload(Workforce.workers).selectinload(WorkforceAgent.agent),
-    )
+    query = db.query(Workforce)
     normalized_search = search.strip()
     if normalized_search:
         query = query.filter(
@@ -290,17 +313,30 @@ async def list_workforces(
         )
     if status:
         query = query.filter(Workforce.status == normalize_workforce_status(status))
+    query = filter_visible_workforces(db, user, query)
 
-    workforces = query.order_by(Workforce.updated_at.desc(), Workforce.id.desc()).all()
-    visible_workforces = [
-        workforce for workforce in workforces if can_view_workforce(db, user, workforce)
-    ]
-    total = len(visible_workforces)
+    total = query.count()
     offset = (page - 1) * size
-    paged_workforces = visible_workforces[offset : offset + size]
+    paged_workforces = (
+        query.options(
+            selectinload(Workforce.manager_agent),
+            selectinload(Workforce.workers).selectinload(WorkforceAgent.agent),
+        )
+        .order_by(Workforce.updated_at.desc(), Workforce.id.desc())
+        .offset(offset)
+        .limit(size)
+        .all()
+    )
+    latest_runs = _load_latest_runs_by_workforce(
+        db,
+        [int(workforce.id) for workforce in paged_workforces],
+    )
     return {
         "items": [
-            _serialize_workforce_list_item(db, workforce)
+            _serialize_workforce_list_item(
+                workforce,
+                latest_runs.get(int(workforce.id)),
+            )
             for workforce in paged_workforces
         ],
         "total": total,

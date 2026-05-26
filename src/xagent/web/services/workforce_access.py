@@ -3,7 +3,7 @@ from typing import Any, cast
 
 from fastapi import HTTPException
 from sqlalchemy import or_
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Query, Session
 
 from xagent.web.models.agent import Agent, AgentStatus
 from xagent.web.models.user import User
@@ -29,6 +29,17 @@ class WorkforcePolicy:
     def can_view_workforce(self, db: Session, user: User, workforce: Workforce) -> bool:
         del db
         return bool(user.is_admin or int(workforce.owner_user_id) == int(user.id))
+
+    def filter_visible_workforces(
+        self,
+        db: Session,
+        user: User,
+        query: Query[Workforce],
+    ) -> Query[Workforce]:
+        del db
+        if user.is_admin:
+            return query
+        return query.filter(Workforce.owner_user_id == int(user.id))
 
     def can_run_workforce(self, db: Session, user: User, workforce: Workforce) -> bool:
         return self.can_view_workforce(db, user, workforce)
@@ -128,6 +139,14 @@ def can_view_workforce(db: Session, user: User, workforce: Workforce) -> bool:
     return get_workforce_policy().can_view_workforce(db, user, workforce)
 
 
+def filter_visible_workforces(
+    db: Session,
+    user: User,
+    query: Query[Workforce],
+) -> Query[Workforce]:
+    return get_workforce_policy().filter_visible_workforces(db, user, query)
+
+
 def can_run_workforce(db: Session, user: User, workforce: Workforce) -> bool:
     return get_workforce_policy().can_run_workforce(db, user, workforce)
 
@@ -157,6 +176,11 @@ def ensure_workforce_access(
 
     if not allowed:
         raise HTTPException(status_code=403, detail="Access denied")
+    if action == "edit" and workforce.status == "archived":
+        raise HTTPException(
+            status_code=409,
+            detail="Archived workforce cannot be edited",
+        )
     return workforce
 
 

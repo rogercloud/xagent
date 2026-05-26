@@ -1,12 +1,15 @@
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from typing import Any
 
 import pytest
+from sqlalchemy import event
 
 from xagent.web.api import workforces as workforces_api
 from xagent.web.models.agent import Agent, AgentStatus
+from xagent.web.models.database import get_engine
 from xagent.web.models.user import User
-from xagent.web.models.workforce import WorkforceBuilderMessage
+from xagent.web.models.workforce import WorkforceBuilderMessage, WorkforceRun
 
 from .conftest import (
     _admin_headers,
@@ -56,8 +59,9 @@ def _create_workforce(
     name: str = "Support Workforce",
     worker_count: int = 1,
     canvas_layout: dict[str, Any] | None = None,
+    username: str = "admin",
 ) -> dict[str, Any]:
-    owner_id = _user_id()
+    owner_id = _user_id(username)
     manager_agent_id = _create_published_agent(owner_id, f"{name} Manager")
     workers = []
     for index in range(worker_count):
@@ -91,6 +95,31 @@ def _create_workforce(
     return response.json()
 
 
+def _create_workforce_run(
+    *,
+    workforce_id: int,
+    user_id: int,
+    status: str,
+    created_at: datetime,
+) -> int:
+    db = _direct_db_session()
+    try:
+        run = WorkforceRun(
+            workforce_id=workforce_id,
+            task_id=None,
+            user_id=user_id,
+            status=status,
+            snapshot={"workforce": {"id": workforce_id}},
+            created_at=created_at,
+        )
+        db.add(run)
+        db.commit()
+        db.refresh(run)
+        return int(run.id)
+    finally:
+        db.close()
+
+
 def test_workforce_endpoints_require_authentication() -> None:
     response = client.get("/api/workforces")
     assert response.status_code == 403
@@ -119,6 +148,76 @@ def test_create_list_get_and_cross_user_access_control() -> None:
         f"/api/workforces/{workforce['id']}", headers=other_headers
     )
     assert denied_response.status_code == 403
+
+    other_workforce = _create_workforce(
+        other_headers,
+        name="Other User Workforce",
+        username="bob",
+    )
+    other_list_response = client.get("/api/workforces", headers=other_headers)
+    assert other_list_response.status_code == 200
+    other_list_payload = other_list_response.json()
+    assert other_list_payload["total"] == 1
+    assert other_list_payload["items"][0]["id"] == other_workforce["id"]
+
+
+def test_list_workforces_paginates_visible_query_and_bulk_loads_last_runs() -> None:
+    headers = _admin_headers()
+    owner_id = _user_id()
+    workforces = [
+        _create_workforce(headers, name=f"Paged Workforce {index}")
+        for index in range(3)
+    ]
+    now = datetime.now(timezone.utc)
+    expected_latest_status: dict[int, str] = {}
+    for index, workforce in enumerate(workforces):
+        workforce_id = int(workforce["id"])
+        _create_workforce_run(
+            workforce_id=workforce_id,
+            user_id=owner_id,
+            status="failed",
+            created_at=now + timedelta(minutes=index),
+        )
+        expected_latest_status[workforce_id] = "completed"
+        _create_workforce_run(
+            workforce_id=workforce_id,
+            user_id=owner_id,
+            status="completed",
+            created_at=now + timedelta(minutes=10 + index),
+        )
+
+    workforce_run_selects: list[str] = []
+
+    def track_workforce_run_queries(
+        conn: Any,
+        cursor: Any,
+        statement: str,
+        parameters: Any,
+        context: Any,
+        executemany: bool,
+    ) -> None:
+        del conn, cursor, parameters, context, executemany
+        if "from workforce_runs" in statement.lower():
+            workforce_run_selects.append(statement)
+
+    event.listen(get_engine(), "before_cursor_execute", track_workforce_run_queries)
+    try:
+        response = client.get(
+            "/api/workforces",
+            headers=headers,
+            params={"page": 1, "size": 2},
+        )
+    finally:
+        event.remove(get_engine(), "before_cursor_execute", track_workforce_run_queries)
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["total"] == 3
+    assert payload["pages"] == 2
+    assert len(payload["items"]) == 2
+    assert len(workforce_run_selects) == 1
+    for item in payload["items"]:
+        assert item["last_run"]["status"] == expected_latest_status[item["id"]]
 
 
 def test_publish_unpublish_and_active_validation() -> None:
@@ -222,6 +321,85 @@ def test_worker_add_update_remove_and_active_rollback() -> None:
     detail_response = client.get(f"/api/workforces/{workforce['id']}", headers=headers)
     assert detail_response.status_code == 200
     assert detail_response.json()["workers"][0]["enabled"] is True
+
+
+def test_archived_workforce_rejects_all_edit_boundaries() -> None:
+    headers = _admin_headers()
+    workforce = _create_workforce(headers, name="Archived Workforce")
+    owner_id = _user_id()
+    worker_id = workforce["workers"][0]["id"]
+
+    archive_response = client.delete(
+        f"/api/workforces/{workforce['id']}",
+        headers=headers,
+    )
+    assert archive_response.status_code == 200
+
+    patch_response = client.patch(
+        f"/api/workforces/{workforce['id']}",
+        headers=headers,
+        json={"description": "updated"},
+    )
+    assert patch_response.status_code == 409
+
+    add_response = client.post(
+        f"/api/workforces/{workforce['id']}/agents",
+        headers=headers,
+        json={
+            "source_type": "existing",
+            "agent_id": _create_published_agent(owner_id, "Archived Late Worker"),
+            "assignment_instructions": "Should not be added",
+        },
+    )
+    assert add_response.status_code == 409
+
+    update_worker_response = client.patch(
+        f"/api/workforces/{workforce['id']}/agents/{worker_id}",
+        headers=headers,
+        json={"alias": "blocked"},
+    )
+    assert update_worker_response.status_code == 409
+
+    remove_worker_response = client.delete(
+        f"/api/workforces/{workforce['id']}/agents/{worker_id}",
+        headers=headers,
+    )
+    assert remove_worker_response.status_code == 409
+
+    db = _direct_db_session()
+    try:
+        message = WorkforceBuilderMessage(
+            workforce_id=workforce["id"],
+            user_id=owner_id,
+            role="assistant",
+            content="Prepared patch.",
+            proposed_patch={
+                "summary": "Rename archived workforce.",
+                "operations": [
+                    {
+                        "op": "update_workforce",
+                        "fields": {"name": "Renamed Archived Workforce"},
+                    }
+                ],
+                "warnings": [],
+                "clarification": None,
+            },
+            status="proposed",
+        )
+        db.add(message)
+        db.commit()
+        db.refresh(message)
+        message_id = int(message.id)
+        proposed_patch = message.proposed_patch
+    finally:
+        db.close()
+
+    apply_response = client.post(
+        f"/api/workforces/{workforce['id']}/builder/apply",
+        headers=headers,
+        json={"message_id": message_id, "proposed_patch": proposed_patch},
+    )
+    assert apply_response.status_code == 409
 
 
 def test_builder_propose_apply_requires_stored_patch_match() -> None:
