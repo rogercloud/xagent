@@ -196,6 +196,56 @@ def test_agent_options_use_workforce_policy_and_only_published_agents() -> None:
     assert options_by_id[shared_published_id]["can_edit"] is False
 
 
+def test_workforce_detail_marks_policy_visible_agents_readonly() -> None:
+    _admin_headers()
+    bob_headers = _register_second_user()
+    admin_id = _user_id("admin")
+
+    shared_manager_id = _create_agent(
+        admin_id,
+        "Shared Manager",
+        AgentStatus.PUBLISHED,
+    )
+    shared_worker_id = _create_agent(
+        admin_id,
+        "Shared Worker",
+        AgentStatus.PUBLISHED,
+    )
+    set_workforce_policy(_VisibleAgentPolicy({shared_manager_id, shared_worker_id}))
+
+    response = client.post(
+        "/api/workforces",
+        headers=bob_headers,
+        json={
+            "name": "Shared Agent Workforce",
+            "manager_agent_id": shared_manager_id,
+            "workers": [
+                {
+                    "source_type": "existing",
+                    "agent_id": shared_worker_id,
+                    "assignment_instructions": "Handle shared work",
+                },
+            ],
+        },
+    )
+    assert response.status_code == 200, response.text
+    workforce = response.json()
+
+    detail_response = client.get(
+        f"/api/workforces/{workforce['id']}",
+        headers=bob_headers,
+    )
+    assert detail_response.status_code == 200, detail_response.text
+    detail = detail_response.json()
+
+    assert detail["manager"]["access"] == "policy"
+    assert detail["manager"]["readonly"] is True
+    assert detail["manager"]["can_edit"] is False
+    assert detail["workers"][0]["agent"]["access"] == "policy"
+    assert detail["workers"][0]["agent"]["readonly"] is True
+    assert detail["workers"][0]["agent"]["can_edit"] is False
+
+
 def test_create_list_get_and_cross_user_access_control() -> None:
     headers = _admin_headers()
     workforce = _create_workforce(headers)

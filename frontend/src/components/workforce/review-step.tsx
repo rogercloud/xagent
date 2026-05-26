@@ -6,6 +6,7 @@ import { AlertTriangle } from "lucide-react"
 import { Badge } from "@/components/ui/badge"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
 import { useI18n } from "@/contexts/i18n-context"
+import { canEditAgent } from "@/lib/agent-ui-access"
 import type {
   WorkforceAgentOption,
   WorkforceWorkerDraft,
@@ -93,8 +94,11 @@ export function ReviewStep({
               {manager ? (
                 <Badge variant="outline">{t(`workforces.status.${manager.status}`)}</Badge>
               ) : null}
+              {manager && !canEditAgent(manager) ? (
+                <Badge variant="secondary">{t("workforces.actions.readOnly")}</Badge>
+              ) : null}
             </div>
-            {manager ? (
+            {manager && canEditAgent(manager) ? (
               <Link
                 href={getAgentHref(manager.id)}
                 target="_blank"
@@ -146,6 +150,9 @@ export function ReviewStep({
                       </Badge>
                       {agent ? (
                         <Badge variant="secondary">{t(`workforces.status.${agent.status}`)}</Badge>
+                      ) : null}
+                      {agent && !canEditAgent(agent) ? (
+                        <Badge variant="secondary">{t("workforces.actions.readOnly")}</Badge>
                       ) : null}
                     </div>
                     <div className="mt-1 text-sm text-muted-foreground">

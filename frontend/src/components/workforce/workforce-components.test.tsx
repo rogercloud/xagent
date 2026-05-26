@@ -101,8 +101,10 @@ vi.mock("next/link", () => ({
 
 import {
   ProposedPatchCard,
+  ReviewStep,
   WorkforceBuilderChat,
   WorkforcePromptCreator,
+  WorkforceSummary,
   WorkforceTestPanel,
   WorkforceWizard,
 } from "."
@@ -238,6 +240,92 @@ describe("workforce frontend core components", () => {
       })
     })
     expect(onRunCreated).toHaveBeenCalledWith(runResult)
+  })
+
+  it("does not link readonly workforce agents to the editor", () => {
+    render(
+      <ReviewStep
+        name="Launch Workforce"
+        description=""
+        managerAgentId="7"
+        managerInstructions=""
+        agents={[
+          {
+            id: 7,
+            name: "Shared Manager",
+            description: null,
+            logo_url: null,
+            status: "published",
+            readonly: true,
+            can_edit: false,
+          },
+          {
+            id: 8,
+            name: "Owned Worker",
+            description: null,
+            logo_url: null,
+            status: "published",
+            readonly: false,
+            can_edit: true,
+          },
+        ]}
+        workers={[
+          {
+            source_type: "existing",
+            agent_id: 8,
+            alias: "",
+            assignment_instructions: "Research competitors",
+            enabled: true,
+            sort_order: 1,
+          },
+        ]}
+      />,
+    )
+
+    expect(screen.queryByText("workforces.actions.openAgentEditor")).not.toBeInTheDocument()
+    expect(screen.getAllByText("workforces.actions.readOnly")).toHaveLength(1)
+  })
+
+  it("hides summary editor links for readonly workforce agents", () => {
+    render(
+      <WorkforceSummary
+        workforce={{
+          ...workforceDetail,
+          manager: {
+            ...workforceDetail.manager,
+            readonly: true,
+            can_edit: false,
+          },
+          workers: [
+            {
+              id: 1,
+              agent: {
+                id: 8,
+                name: "Shared Worker",
+                description: null,
+                logo_url: null,
+                status: "published",
+                readonly: true,
+                can_edit: false,
+              },
+              alias: null,
+              assignment_instructions: "Research competitors",
+              source_type: "existing",
+              template_id: null,
+              enabled: true,
+              sort_order: 1,
+              canvas_position: null,
+              created_at: null,
+              updated_at: null,
+            },
+          ],
+        }}
+      />,
+    )
+
+    expect(screen.queryByText("workforces.actions.openAgentEditor")).not.toBeInTheDocument()
+    expect(screen.queryByText("workforces.actions.editAgent")).not.toBeInTheDocument()
+    expect(screen.getAllByText("workforces.actions.readOnly")).toHaveLength(2)
   })
 
   it("filters manager and worker choices to published agents and creates PR5 payloads", async () => {

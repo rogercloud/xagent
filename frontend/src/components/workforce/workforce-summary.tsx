@@ -5,6 +5,7 @@ import Link from "next/link"
 import { Badge } from "@/components/ui/badge"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
 import { useI18n } from "@/contexts/i18n-context"
+import { canEditAgent } from "@/lib/agent-ui-access"
 import type { WorkforceDetail } from "@/types/workforce"
 import { WorkforceStatusBadge } from "./workforce-status-badge"
 
@@ -34,17 +35,24 @@ export function WorkforceSummary({
             <div className="text-xs uppercase tracking-wide text-muted-foreground">
               {t("workforces.fields.manager")}
             </div>
-            <div className="mt-1 font-medium">{workforce.manager.name}</div>
+            <div className="mt-1 flex flex-wrap items-center gap-2 font-medium">
+              <span>{workforce.manager.name}</span>
+              {!canEditAgent(workforce.manager) ? (
+                <Badge variant="secondary">{t("workforces.actions.readOnly")}</Badge>
+              ) : null}
+            </div>
             <div className="text-sm text-muted-foreground">
               {workforce.manager.description || t("workforces.common.noDescription")}
             </div>
-            <Link
-              href={getAgentHref(workforce.manager.id)}
-              target="_blank"
-              className="mt-2 inline-block text-sm text-primary hover:underline"
-            >
-              {t("workforces.actions.openAgentEditor")}
-            </Link>
+            {canEditAgent(workforce.manager) ? (
+              <Link
+                href={getAgentHref(workforce.manager.id)}
+                target="_blank"
+                className="mt-2 inline-block text-sm text-primary hover:underline"
+              >
+                {t("workforces.actions.openAgentEditor")}
+              </Link>
+            ) : null}
           </div>
           <div>
             <div className="text-xs uppercase tracking-wide text-muted-foreground">
@@ -112,13 +120,18 @@ export function WorkforceSummary({
                         {worker.template_id ? (
                           <Badge variant="outline">{worker.template_id}</Badge>
                         ) : null}
-                        <Link
-                          href={getAgentHref(worker.agent.id)}
-                          target="_blank"
-                          className="text-sm text-primary hover:underline"
-                        >
-                          {t("workforces.actions.editAgent")}
-                        </Link>
+                        {!canEditAgent(worker.agent) ? (
+                          <Badge variant="secondary">{t("workforces.actions.readOnly")}</Badge>
+                        ) : null}
+                        {canEditAgent(worker.agent) ? (
+                          <Link
+                            href={getAgentHref(worker.agent.id)}
+                            target="_blank"
+                            className="text-sm text-primary hover:underline"
+                          >
+                            {t("workforces.actions.editAgent")}
+                          </Link>
+                        ) : null}
                       </div>
                     </div>
                     <Badge variant={worker.enabled ? "default" : "secondary"}>
