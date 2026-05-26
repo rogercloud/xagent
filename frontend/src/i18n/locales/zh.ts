@@ -2903,6 +2903,235 @@ Build when you need.`
       copied: "已复制到剪贴板"
     }
   },
+  workforces: {
+    common: {
+      noDescription: "暂无描述",
+      notAvailable: "不可用",
+      notSelected: "未选择"
+    },
+    status: {
+      draft: "草稿",
+      active: "启用",
+      archived: "已归档",
+      published: "已发布",
+      enabled: "已启用",
+      disabled: "已禁用"
+    },
+    sourceTypes: {
+      existing: "已有 Agent"
+    },
+    actions: {
+      new: "新建 Workforce",
+      create: "创建 Workforce",
+      run: "运行",
+      runWorkforce: "运行 Workforce",
+      details: "详情",
+      builder: "Builder",
+      canvas: "画布",
+      saveWorkforce: "保存 Workforce",
+      addWorker: "添加 Worker",
+      openAgent: "打开 Agent",
+      openAgentEditor: "打开 Agent 编辑器",
+      editAgent: "编辑 Agent",
+      remove: "移除",
+      saveWorker: "保存 Worker",
+      up: "上移",
+      down: "下移",
+      proposeChanges: "生成修改建议",
+      applyChanges: "应用修改",
+      alreadyApplied: "已应用",
+      readOnly: "只读",
+      publish: "发布",
+      unpublish: "取消发布",
+      archive: "归档"
+    },
+    fields: {
+      name: "名称",
+      description: "描述",
+      manager: "Manager",
+      managerInstructions: "Manager 指令",
+      workers: "Workers",
+      publishedAgent: "已发布 Agent",
+      alias: "别名",
+      assignmentInstructions: "任务指令",
+      enabled: "启用",
+      order: "顺序",
+      updated: "更新时间"
+    },
+    list: {
+      badge: "Workforce",
+      title: "Workforces",
+      description: "创建由 manager 统筹的多 Agent 工作组，明确 worker 职责，并从统一入口运行。",
+      searchPlaceholder: "搜索 Workforces...",
+      emptyTitle: "还没有 Workforce",
+      emptyDescription: "先选择 manager agent，再添加几个 worker，之后可以回到这里发起协同运行。",
+      createFirst: "创建第一个 Workforce",
+      manager: "Manager: {name}",
+      workers: "Workers: {count}",
+      lastUpdate: "最后更新: {value}",
+      lastRun: "最近运行 #{runId} - {status}",
+      lastRunWithTask: "最近运行 #{runId} - 任务 #{taskId} - {status}",
+      noRuns: "还没有运行记录"
+    },
+    pagination: {
+      showing: "显示第 {start}-{end} 条，共 {total} 条",
+      prev: "上一页",
+      page: "第 {page} 页，共 {pages} 页",
+      next: "下一页"
+    },
+    create: {
+      backToWorkforces: "返回 Workforces",
+      title: "创建 Workforce",
+      description: "先选择管理者，再添加 worker，最后在保存前检查编排配置。",
+      prompt: {
+        badge: "AI 创建",
+        title: "创建 Workforce",
+        description: "描述你想达成的目标。Builder 会创建 manager，在合适时从已发布 agents 中选择 workers，并打开一个可检查的草稿。",
+        cardTitle: "这个 Workforce 应该做什么？",
+        cardDescription: "生成的 manager 会专门用于这个 Workforce。Workers 只会从已有的已发布 agents 中选择。",
+        placeholder: "例如：创建一个用于每周竞品监控的 Workforce。它需要调研竞品动态，总结价格变化，并起草一份简洁的管理层简报。",
+        manualSetup: "手动设置",
+        generate: "生成 Workforce"
+      },
+      manual: {
+        title: "手动设置 Workforce",
+        description: "选择已有 manager，添加 workers，然后在保存前检查编排配置。",
+        backToPrompt: "返回 AI 创建"
+      },
+      steps: {
+        basics: "基础信息",
+        workers: "Workers",
+        review: "检查"
+      },
+      placeholders: {
+        name: "营销发布 Workforce",
+        description: "协调调研、内容和发布任务。",
+        managerInstructions: "协调 workers，处理冲突结果，并返回统一答案。"
+      },
+      manager: {
+        selectLabel: "选择 manager agent",
+        placeholder: "选择 agent"
+      }
+    },
+    detail: {
+      description: "运行前检查并编辑当前编排。",
+      editTitle: "编辑 Workforce"
+    },
+    workers: {
+      addTitle: "添加 Worker",
+      manageTitle: "管理 Workers",
+      chooseAgent: "选择 worker agent",
+      aliasPlaceholder: "可选显示名称",
+      instructionsPlaceholder: "描述这个 worker 在 workforce 中负责什么。",
+      noneSelected: "还没有选择 worker。",
+      noneConfigured: "还没有配置 worker。",
+      noneYet: "还没有 worker。",
+      fallbackName: "Worker {index}",
+      aWorker: "某个 worker",
+      defaultDescription: "已发布的 agent worker",
+      publishedAgent: "已发布 agent",
+      disabledHelp: "禁用的 worker 会保留在 Workforce 中，但运行时会跳过。"
+    },
+    review: {
+      potentialRisks: "潜在风险",
+      untitled: "未命名 Workforce",
+      noManagerInstructions: "没有 manager 指令",
+      warnings: {
+        managerNotPublished: "Manager 还没有发布。",
+        workerNotPublished: "{name} 还没有发布。",
+        missingInstructions: "{name} 缺少任务指令。"
+      }
+    },
+    summary: {
+      enabledCount: "{count} 个已启用"
+    },
+    run: {
+      testTitle: "测试 Workforce",
+      placeholder: "描述你希望 manager 协调完成的任务。"
+    },
+    builder: {
+      chatTitle: "Builder 对话",
+      chatDescription: "描述你想要的 workforce 修改，builder 会生成可检查的 patch。",
+      emptyPrompt: "可以这样开始：添加 Research Agent worker 来负责竞品调研。",
+      roleBuilder: "Builder",
+      roleYou: "你",
+      preparingPatch: "正在准备修改建议...",
+      messagePlaceholder: "把这个 workforce 改名为 \"Launch Crew\"，并让 Writer 专注发布邮件文案。",
+      sendHint: "按 Ctrl/Cmd + Enter 发送。",
+      patchTitle: "修改建议",
+      patchDescription: "应用前先检查生成的 workforce 修改。",
+      noProposal: "还没有建议。在 Builder 对话中发送请求来生成 patch。",
+      summary: "摘要",
+      clarificationNeeded: "需要澄清",
+      warnings: "警告",
+      readyToApply: "可以应用",
+      noDestructiveWarning: "这个 patch 没有检测到破坏性操作警告。",
+      operationsTitle: "操作",
+      changeCount: "{count} 项修改",
+      noOperations: "这个建议还没有包含可执行操作。",
+      operations: {
+        update_workforce: "更新 Workforce",
+        add_existing_worker: "添加已有 Worker",
+        update_worker: "更新 Worker",
+        remove_worker: "移除 Worker"
+      }
+    },
+    canvas: {
+      backToDetails: "返回详情",
+      connections: "连接",
+      noConnections: "暂未配置连接。",
+      nodeTypes: {
+        human: "Human",
+        manager: "Manager",
+        worker: "Worker"
+      }
+    },
+    loading: {
+      list: "正在加载 Workforces...",
+      agents: "正在加载 agents...",
+      creating: "正在创建...",
+      detail: "正在加载 Workforce...",
+      saving: "正在保存...",
+      starting: "正在启动...",
+      builderHistory: "正在加载 builder 历史...",
+      proposing: "正在生成建议...",
+      applyingChanges: "正在应用修改...",
+      runView: "正在加载运行页面...",
+      canvas: "正在加载画布...",
+      builder: "正在加载 builder..."
+    },
+    messages: {
+      updated: "Workforce 已更新",
+      workerAdded: "Worker 已添加",
+      workerUpdated: "Worker 已更新",
+      workerRemoved: "Worker 已移除",
+      proposalCreated: "Builder 修改建议已创建",
+      changesApplied: "Workforce 修改已应用",
+      published: "Workforce 已发布",
+      unpublished: "Workforce 已取消发布",
+      archived: "Workforce 已归档"
+    },
+    errors: {
+      loadList: "加载 Workforces 失败",
+      loadAgents: "加载 agents 失败",
+      create: "创建 Workforce 失败",
+      load: "加载 Workforce 失败",
+      update: "更新 Workforce 失败",
+      addWorker: "添加 worker 失败",
+      updateWorker: "更新 worker 失败",
+      removeWorker: "移除 worker 失败",
+      run: "运行 Workforce 失败",
+      notFound: "没有找到 Workforce。",
+      loadCanvas: "加载 Workforce 画布失败",
+      canvasUnavailable: "画布不可用。",
+      loadBuilder: "加载 builder 失败",
+      proposeChanges: "生成修改建议失败",
+      applyChanges: "应用修改失败",
+      publish: "发布 Workforce 失败",
+      unpublish: "取消发布 Workforce 失败",
+      archive: "归档 Workforce 失败"
+    }
+  },
   adminMcp: {
     pageTitle: "公共 MCP 配置",
     pageDescription: "管理 OAuth 供应商和依赖它们的公共 MCP 应用。",

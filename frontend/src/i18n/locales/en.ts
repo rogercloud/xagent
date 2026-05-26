@@ -2903,6 +2903,235 @@ Build when you need.`
       copied: "Copied to clipboard"
     }
   },
+  workforces: {
+    common: {
+      noDescription: "No description",
+      notAvailable: "N/A",
+      notSelected: "Not selected"
+    },
+    status: {
+      draft: "Draft",
+      active: "Active",
+      archived: "Archived",
+      published: "Published",
+      enabled: "Enabled",
+      disabled: "Disabled"
+    },
+    sourceTypes: {
+      existing: "Existing Agent"
+    },
+    actions: {
+      new: "New Workforce",
+      create: "Create Workforce",
+      run: "Run",
+      runWorkforce: "Run Workforce",
+      details: "Details",
+      builder: "Builder",
+      canvas: "Canvas",
+      saveWorkforce: "Save Workforce",
+      addWorker: "Add Worker",
+      openAgent: "Open Agent",
+      openAgentEditor: "Open Agent Editor",
+      editAgent: "Edit Agent",
+      remove: "Remove",
+      saveWorker: "Save Worker",
+      up: "Move up",
+      down: "Move down",
+      proposeChanges: "Propose Changes",
+      applyChanges: "Apply Changes",
+      alreadyApplied: "Already Applied",
+      readOnly: "Read only",
+      publish: "Publish",
+      unpublish: "Unpublish",
+      archive: "Archive"
+    },
+    fields: {
+      name: "Name",
+      description: "Description",
+      manager: "Manager",
+      managerInstructions: "Manager Instructions",
+      workers: "Workers",
+      publishedAgent: "Published Agent",
+      alias: "Alias",
+      assignmentInstructions: "Assignment Instructions",
+      enabled: "Enabled",
+      order: "Order",
+      updated: "Updated"
+    },
+    list: {
+      badge: "Workforce",
+      title: "Workforces",
+      description: "Create manager-led multi-agent work groups, keep worker roles explicit, and run them from a single entry point.",
+      searchPlaceholder: "Search workforces...",
+      emptyTitle: "No workforces yet",
+      emptyDescription: "Start with a manager agent, add a few workers, and return here to launch coordinated runs.",
+      createFirst: "Create your first workforce",
+      manager: "Manager: {name}",
+      workers: "Workers: {count}",
+      lastUpdate: "Last update: {value}",
+      lastRun: "Last run #{runId} - {status}",
+      lastRunWithTask: "Last run #{runId} - task #{taskId} - {status}",
+      noRuns: "No runs yet"
+    },
+    pagination: {
+      showing: "Showing {start}-{end} of {total}",
+      prev: "Prev",
+      page: "Page {page} of {pages}",
+      next: "Next"
+    },
+    create: {
+      backToWorkforces: "Back to Workforces",
+      title: "Create Workforce",
+      description: "Start with a manager, add workers, then review the orchestration before saving.",
+      prompt: {
+        badge: "AI setup",
+        title: "Create Workforce",
+        description: "Describe the outcome you want. The builder will create a manager, select published workers when they fit, and open a reviewable draft.",
+        cardTitle: "What should this Workforce do?",
+        cardDescription: "The generated manager is created for this Workforce. Workers are selected only from existing published agents.",
+        placeholder: "Example: Build a Workforce for weekly competitor monitoring. It should research competitor updates, summarize pricing changes, and draft a concise leadership brief.",
+        manualSetup: "Manual setup",
+        generate: "Generate Workforce"
+      },
+      manual: {
+        title: "Manual Workforce Setup",
+        description: "Choose an existing manager, add workers, then review the orchestration before saving.",
+        backToPrompt: "Back to AI setup"
+      },
+      steps: {
+        basics: "Basics",
+        workers: "Workers",
+        review: "Review"
+      },
+      placeholders: {
+        name: "Marketing Launch Workforce",
+        description: "Coordinate research, content, and launch tasks.",
+        managerInstructions: "Coordinate workers, reconcile conflicting outputs, and return a single answer."
+      },
+      manager: {
+        selectLabel: "Select the manager agent",
+        placeholder: "Choose an agent"
+      }
+    },
+    detail: {
+      description: "Review and edit the current orchestration before running it.",
+      editTitle: "Edit Workforce"
+    },
+    workers: {
+      addTitle: "Add Worker",
+      manageTitle: "Manage Workers",
+      chooseAgent: "Choose a worker agent",
+      aliasPlaceholder: "Optional display name",
+      instructionsPlaceholder: "Describe what this worker handles inside the workforce.",
+      noneSelected: "No workers selected yet.",
+      noneConfigured: "No workers configured.",
+      noneYet: "No workers yet.",
+      fallbackName: "Worker {index}",
+      aWorker: "A worker",
+      defaultDescription: "Published agent worker",
+      publishedAgent: "Published agent",
+      disabledHelp: "Disabled workers are kept in the Workforce but skipped at runtime."
+    },
+    review: {
+      potentialRisks: "Potential Risks",
+      untitled: "Untitled Workforce",
+      noManagerInstructions: "No manager instructions",
+      warnings: {
+        managerNotPublished: "Manager is not published yet.",
+        workerNotPublished: "{name} is not published yet.",
+        missingInstructions: "{name} is missing assignment instructions."
+      }
+    },
+    summary: {
+      enabledCount: "{count} enabled"
+    },
+    run: {
+      testTitle: "Test Workforce",
+      placeholder: "Describe the task you want the manager to coordinate."
+    },
+    builder: {
+      chatTitle: "Builder Chat",
+      chatDescription: "Describe the workforce change you want. The builder will turn it into a reviewable patch.",
+      emptyPrompt: "Start with something like: add worker Research Agent to handle competitor research.",
+      roleBuilder: "Builder",
+      roleYou: "You",
+      preparingPatch: "Preparing a proposed patch...",
+      messagePlaceholder: "Rename this workforce to \"Launch Crew\" and make Writer focus on launch email copy.",
+      sendHint: "Press Ctrl/Cmd + Enter to send.",
+      patchTitle: "Proposed Patch",
+      patchDescription: "Review the generated workforce changes before applying them.",
+      noProposal: "No proposal yet. Send a request in Builder Chat to generate a patch.",
+      summary: "Summary",
+      clarificationNeeded: "Clarification needed",
+      warnings: "Warnings",
+      readyToApply: "Ready to apply",
+      noDestructiveWarning: "No destructive warning was detected in this patch.",
+      operationsTitle: "Operations",
+      changeCount: "{count} change(s)",
+      noOperations: "This proposal does not contain any executable operation yet.",
+      operations: {
+        update_workforce: "Update Workforce",
+        add_existing_worker: "Add Existing Worker",
+        update_worker: "Update Worker",
+        remove_worker: "Remove Worker"
+      }
+    },
+    canvas: {
+      backToDetails: "Back to details",
+      connections: "Connections",
+      noConnections: "No connections configured.",
+      nodeTypes: {
+        human: "Human",
+        manager: "Manager",
+        worker: "Worker"
+      }
+    },
+    loading: {
+      list: "Loading workforces...",
+      agents: "Loading agents...",
+      creating: "Creating...",
+      detail: "Loading workforce...",
+      saving: "Saving...",
+      starting: "Starting...",
+      builderHistory: "Loading builder history...",
+      proposing: "Proposing...",
+      applyingChanges: "Applying Changes...",
+      runView: "Loading run view...",
+      canvas: "Loading canvas...",
+      builder: "Loading builder..."
+    },
+    messages: {
+      updated: "Workforce updated",
+      workerAdded: "Worker added",
+      workerUpdated: "Worker updated",
+      workerRemoved: "Worker removed",
+      proposalCreated: "Builder proposal created",
+      changesApplied: "Workforce changes applied",
+      published: "Workforce published",
+      unpublished: "Workforce unpublished",
+      archived: "Workforce archived"
+    },
+    errors: {
+      loadList: "Failed to load workforces",
+      loadAgents: "Failed to load agents",
+      create: "Failed to create workforce",
+      load: "Failed to load workforce",
+      update: "Failed to update workforce",
+      addWorker: "Failed to add worker",
+      updateWorker: "Failed to update worker",
+      removeWorker: "Failed to remove worker",
+      run: "Failed to run workforce",
+      notFound: "Workforce not found.",
+      loadCanvas: "Failed to load workforce canvas",
+      canvasUnavailable: "Canvas unavailable.",
+      loadBuilder: "Failed to load builder",
+      proposeChanges: "Failed to propose changes",
+      applyChanges: "Failed to apply changes",
+      publish: "Failed to publish workforce",
+      unpublish: "Failed to unpublish workforce",
+      archive: "Failed to archive workforce"
+    }
+  },
   adminMcp: {
     pageTitle: "Public MCP Configuration",
     pageDescription: "Manage OAuth providers and the public MCP apps that depend on them.",
