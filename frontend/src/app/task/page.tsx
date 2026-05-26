@@ -61,8 +61,13 @@ function TaskHomePageContent() {
     let cancelled = false;
 
     const fetchSelectedAgentConfig = async () => {
-      const selectedAgentId = Number(selectedAgents[0]?.id);
+      const selectedAgent = selectedAgents[0];
+      const selectedAgentId = Number(selectedAgent?.id);
       if (Number.isNaN(selectedAgentId)) {
+        setSelectedAgentConfig(undefined);
+        return;
+      }
+      if (selectedAgent?.readonly === true || selectedAgent?.can_edit === false) {
         setSelectedAgentConfig(undefined);
         return;
       }

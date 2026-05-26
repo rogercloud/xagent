@@ -12,9 +12,14 @@ from fastapi.testclient import TestClient
 
 from xagent.core.model.chat.basic.base import BaseLLM
 from xagent.web.api.auth import auth_router
-from xagent.web.api.chat import AgentServiceManager, chat_router
+from xagent.web.api.chat import (
+    AgentServiceManager,
+    _load_agent_for_task_runtime,
+    chat_router,
+)
 from xagent.web.api.model import model_router
 from xagent.web.models.database import Base, get_db, get_engine
+from xagent.web.services.workforce_access import WorkforcePolicy, set_workforce_policy
 
 
 def override_get_db():
@@ -69,6 +74,13 @@ def test_db():
         shutil.rmtree(temp_dir)
     except OSError:
         pass
+
+
+@pytest.fixture(autouse=True)
+def reset_workforce_policy():
+    set_workforce_policy(WorkforcePolicy())
+    yield
+    set_workforce_policy(WorkforcePolicy())
 
 
 @pytest.fixture(scope="function")
@@ -177,7 +189,15 @@ def test_runtime_config_preserves_task_llm_when_agent_model_is_unavailable():
         user_id=71,
     )
     user = MagicMock(id=71)
-    agent = MagicMock(id=9, name="Published Agent", execution_mode="balanced")
+    from xagent.web.models.agent import AgentStatus
+
+    agent = MagicMock(
+        id=9,
+        user_id=71,
+        name="Published Agent",
+        execution_mode="balanced",
+        status=AgentStatus.PUBLISHED,
+    )
     db = MagicMock()
     db.query.return_value.filter.return_value.first.return_value = agent
 
@@ -242,8 +262,14 @@ def test_runtime_config_uses_accessible_agent_model_over_task_baseline():
     )
     user = MagicMock(id=71)
     db = MagicMock()
+    from xagent.web.models.agent import AgentStatus
+
     db.query.return_value.filter.return_value.first.return_value = MagicMock(
-        id=9, name="Published Agent", execution_mode="balanced"
+        id=9,
+        user_id=71,
+        name="Published Agent",
+        execution_mode="balanced",
+        status=AgentStatus.PUBLISHED,
     )
 
     fake_agent_builder_config = {
@@ -722,6 +748,72 @@ def test_task_create_rejects_agent_id_from_another_user(
 
         assert resp.status_code == 404
         assert resp.json()["detail"] == "Agent not found or access denied"
+    finally:
+        db.close()
+
+
+def test_task_create_allows_policy_visible_published_agent(
+    test_db, user1_headers, user2_headers
+):
+    from xagent.web.models.agent import Agent, AgentStatus
+    from xagent.web.models.database import get_db
+    from xagent.web.models.task import Task
+    from xagent.web.models.user import User
+
+    class VisibleAgentPolicy(WorkforcePolicy):
+        def __init__(self, visible_agent_ids: set[int]) -> None:
+            self.visible_agent_ids = visible_agent_ids
+
+        def get_visible_agent_ids(self, db, user, purpose: str) -> set[int] | None:
+            del db, user
+            return self.visible_agent_ids if purpose == "agent_list" else None
+
+    db = next(get_db())
+    try:
+        user2 = db.query(User).filter(User.username == "user2").first()
+        assert user2 is not None
+
+        shared_agent = Agent(
+            user_id=user2.id,
+            name="user2-shared-agent",
+            description="shared",
+            instructions="Use shared instructions.",
+            execution_mode="think",
+            status=AgentStatus.PUBLISHED,
+        )
+        db.add(shared_agent)
+        db.commit()
+        db.refresh(shared_agent)
+
+        set_workforce_policy(VisibleAgentPolicy({int(shared_agent.id)}))
+
+        resp = client.post(
+            "/api/chat/task/create",
+            json={
+                "title": "shared-agent-task",
+                "description": "desc",
+                "agent_id": shared_agent.id,
+            },
+            headers=user1_headers,
+        )
+
+        assert resp.status_code == 200, resp.text
+        task = db.query(Task).filter(Task.id == resp.json()["task_id"]).one()
+        assert int(task.agent_id) == int(shared_agent.id)
+        assert _load_agent_for_task_runtime(db, task) == shared_agent
+
+        from xagent.web.services.task_setup_snapshot import (
+            load_task_setup_snapshot_sync,
+        )
+
+        snapshot = load_task_setup_snapshot_sync(
+            int(task.id),
+            user_id=int(task.user_id),
+        )
+        assert snapshot is not None
+        assert snapshot.agent is not None
+        assert snapshot.agent.id == int(shared_agent.id)
+        assert snapshot.excluded_agent_id == int(shared_agent.id)
     finally:
         db.close()
 

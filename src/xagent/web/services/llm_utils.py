@@ -1008,6 +1008,43 @@ class RuntimeConfig:
     workforce: Any = None
 
 
+def _load_agent_for_task_runtime(
+    session: Session,
+    task_row: Any,
+    workforce: Any,
+) -> Any | None:
+    from ..models.agent import Agent, AgentStatus
+    from ..models.user import User
+    from .agent_access import list_accessible_published_agents
+
+    task_agent_id = getattr(task_row, "agent_id", None)
+    if task_agent_id is None:
+        return None
+
+    agent = session.query(Agent).filter(Agent.id == task_agent_id).first()
+    if agent is None:
+        return None
+    if int(agent.user_id) == int(task_row.user_id):
+        return agent
+    if workforce is not None and workforce.manager_agent_id == task_agent_id:
+        return agent
+    if getattr(agent.status, "value", agent.status) != AgentStatus.PUBLISHED.value:
+        return None
+
+    user = session.query(User).filter(User.id == task_row.user_id).first()
+    if user is None:
+        return None
+    visible_agent_ids = {
+        int(item.id)
+        for item in list_accessible_published_agents(
+            session,
+            user,
+            purpose="agent_list",
+        )
+    }
+    return agent if int(agent.id) in visible_agent_ids else None
+
+
 def resolve_task_runtime_config_core(
     task_row: Any,
     session: Session,
@@ -1038,7 +1075,7 @@ def resolve_task_runtime_config_core(
         get_agent_pattern_for_execution_mode,
         get_default_task_execution_mode,
     )
-    from ..models.agent import Agent, AgentStatus
+    from ..models.agent import AgentStatus
 
     task_execution_mode = getattr(task_row, "execution_mode", None)
     if not task_execution_mode:
@@ -1080,26 +1117,16 @@ def resolve_task_runtime_config_core(
     agent_fields: Optional[AgentRuntimeFields] = None
 
     # Workforce runtime resolution -- pure query against the same
-    # session, no side effect. workforce mode changes two things in
-    # the resolution below: (1) the Agent ownership filter (manager
-    # agent is legitimately cross-user), and (2) the execution_mode
-    # override (workforce task keeps its own mode, doesn't inherit
-    # from agent_config).
+    # session, no side effect. Workforce and policy-visible agent modes
+    # change two things below: (1) the Agent access check can allow a
+    # cross-user manager/shared agent, and (2) workforce tasks keep their
+    # own execution_mode instead of inheriting from agent_config.
     from .workforce_runtime import resolve_workforce_task_runtime
 
     workforce = resolve_workforce_task_runtime(session, task_row)
 
     if task_row.agent_id is not None:
-        agent_filters = [Agent.id == task_row.agent_id]
-        if not (
-            workforce is not None and workforce.manager_agent_id == task_row.agent_id
-        ):
-            # Defense in depth: workforce manager is cross-user by
-            # design, but ANY other case must keep the user_id filter
-            # so a misconfigured workforce_run_id can't be used as a
-            # cross-tenant agent read primitive.
-            agent_filters.append(Agent.user_id == task_row.user_id)
-        agent_row = session.query(Agent).filter(*agent_filters).first()
+        agent_row = _load_agent_for_task_runtime(session, task_row, workforce)
         if agent_row is not None:
             agent_config = load_agent_builder_config(
                 agent_row, session, int(task_row.user_id)

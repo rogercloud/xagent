@@ -26,13 +26,14 @@ from ...core.model.chat.basic.zhipu import ZhipuLLM
 from ...core.model.providers import is_placeholder_api_key
 from ..auth_dependencies import get_current_user
 from ..dynamic_memory_store import get_memory_store
-from ..models.agent import Agent
+from ..models.agent import Agent, AgentStatus
 from ..models.chat_message import TaskChatMessage
 from ..models.database import get_db
 from ..models.model import Model as DBModel
 from ..models.task import AgentType, Task, TaskStatus, TraceEvent
 from ..models.user import User
 from ..schemas.chat import TaskCreateRequest, TaskCreateResponse
+from ..services.agent_access import list_accessible_published_agents
 from ..services.chat_history_service import (
     get_latest_waiting_question,
     load_task_transcript,
@@ -93,6 +94,69 @@ def _build_task_agent_config(
     if selected_file_ids:
         task_agent_config["selected_file_ids"] = selected_file_ids
     return task_agent_config or None
+
+
+def _is_published_agent(agent: Agent) -> bool:
+    return getattr(agent.status, "value", agent.status) == AgentStatus.PUBLISHED.value
+
+
+def _load_agent_for_task_create(
+    db: Session,
+    user: User,
+    agent_id: int,
+) -> Agent | None:
+    agent = db.query(Agent).filter(Agent.id == agent_id).first()
+    if agent is None:
+        return None
+    if int(agent.user_id) == int(user.id):
+        return agent
+    if not _is_published_agent(agent):
+        return None
+    visible_agent_ids = {
+        int(item.id)
+        for item in list_accessible_published_agents(
+            db,
+            user,
+            purpose="agent_list",
+        )
+    }
+    return agent if int(agent.id) in visible_agent_ids else None
+
+
+def _load_agent_for_task_runtime(
+    db: Session,
+    task: Task,
+    workforce_runtime: WorkforceTaskRuntime | None = None,
+) -> Agent | None:
+    task_agent_id = _int_id_or_none(getattr(task, "agent_id", None))
+    if task_agent_id is None:
+        return None
+
+    agent = db.query(Agent).filter(Agent.id == task_agent_id).first()
+    if agent is None:
+        return None
+    if int(agent.user_id) == int(task.user_id):
+        return agent
+    if (
+        workforce_runtime is not None
+        and workforce_runtime.manager_agent_id == task_agent_id
+    ):
+        return agent
+    if not _is_published_agent(agent):
+        return None
+
+    user = db.query(User).filter(User.id == task.user_id).first()
+    if user is None:
+        return None
+    visible_agent_ids = {
+        int(item.id)
+        for item in list_accessible_published_agents(
+            db,
+            user,
+            purpose="agent_list",
+        )
+    }
+    return agent if int(agent.id) in visible_agent_ids else None
 
 
 def _get_task_activity_ids(db: Session, task_id: int) -> tuple[int, int]:
@@ -866,26 +930,17 @@ class AgentServiceManager:
         parent_tracer: Optional[Any] = None,
     ) -> tuple[list[Any], Any]:
         """Build the tool set configured for a web task."""
+        workforce_runtime = resolve_workforce_task_runtime(db, task)
         excluded_agent_id = None
-        task_agent_id = _int_id_or_none(getattr(task, "agent_id", None))
-        if task_agent_id is not None:
-            from ..models.agent import AgentStatus
-
-            current_agent = (
-                db.query(Agent)
-                .filter(Agent.id == task_agent_id, Agent.user_id == task.user_id)
-                .first()
+        current_agent = _load_agent_for_task_runtime(db, task, workforce_runtime)
+        if current_agent and _is_published_agent(current_agent):
+            excluded_agent_id = int(current_agent.id)
+            logger.info(
+                f"Task {task_id} is associated with published agent "
+                f"{current_agent.id} ({current_agent.name}), will exclude from "
+                "agent tools"
             )
-            if current_agent and current_agent.status == AgentStatus.PUBLISHED:
-                excluded_agent_id = int(current_agent.id)
-                logger.info(
-                    f"Task {task_id} is associated with published agent "
-                    f"{current_agent.id} ({current_agent.name}), will exclude from "
-                    "agent tools"
-                )
         elif agent_config and agent_config.get("preview_agent_id"):
-            from ..models.agent import AgentStatus
-
             current_agent = (
                 db.query(Agent)
                 .filter(
@@ -1273,9 +1328,6 @@ class AgentServiceManager:
                             f"Preview task {task_id} is for published agent {current_agent.id} ({current_agent.name}), will exclude from agent tools"
                         )
 
-                workforce_runtime = (
-                    resolve_workforce_task_runtime(db, task) if task else None
-                )
                 workspace_owner_id = (
                     int(task.user_id)
                     if task and task.user_id is not None
@@ -2116,10 +2168,10 @@ async def create_task(
 
         selected_agent: Optional[Agent] = None
         if request.agent_id:
-            selected_agent = (
-                db.query(Agent)
-                .filter(Agent.id == request.agent_id, Agent.user_id == user.id)
-                .first()
+            selected_agent = _load_agent_for_task_create(
+                db,
+                user,
+                int(request.agent_id),
             )
             if not selected_agent:
                 raise HTTPException(

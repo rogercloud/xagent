@@ -12,7 +12,6 @@ from ..models.agent import Agent, AgentStatus
 from ..models.user import User
 from .workforce_access import get_visible_agent_ids
 
-
 AgentAccessLevel = Literal["owner", "policy"]
 
 
