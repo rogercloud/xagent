@@ -1328,6 +1328,9 @@ class AgentServiceManager:
                             f"Preview task {task_id} is for published agent {current_agent.id} ({current_agent.name}), will exclude from agent tools"
                         )
 
+                workforce_runtime = (
+                    resolve_workforce_task_runtime(db, task) if task else None
+                )
                 workspace_owner_id = (
                     int(task.user_id)
                     if task and task.user_id is not None
