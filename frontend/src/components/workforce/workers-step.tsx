@@ -30,15 +30,14 @@ export function WorkersStep({
   const [draftAlias, setDraftAlias] = useState("")
   const [draftInstructions, setDraftInstructions] = useState("")
 
-  const selectableAgents = useMemo(
-    () =>
-      agents.filter(
-        (agent) =>
-          String(agent.id) !== managerAgentId
-          && !workers.some((worker) => worker.agent_id === agent.id),
-      ),
-    [agents, managerAgentId, workers],
-  )
+  const selectableAgents = useMemo(() => {
+    const workerAgentIds = new Set(workers.map((worker) => worker.agent_id))
+    return agents.filter(
+      (agent) =>
+        String(agent.id) !== managerAgentId
+        && !workerAgentIds.has(agent.id),
+    )
+  }, [agents, managerAgentId, workers])
 
   const addWorker = () => {
     if (!draftAgentId || !draftInstructions.trim()) return

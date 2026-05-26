@@ -12,7 +12,10 @@ interface WorkforceCanvasProps {
 
 export function WorkforceCanvas({ canvas }: WorkforceCanvasProps) {
   const { t } = useI18n()
-  const nodesById = new Map(canvas.nodes.map((node) => [node.id, node]))
+  const nodesById = React.useMemo(
+    () => new Map(canvas.nodes.map((node) => [node.id, node])),
+    [canvas.nodes],
+  )
 
   const nodeTypeLabel = (node: WorkforceCanvasNode) => {
     const key = `workforces.canvas.nodeTypes.${node.type}`

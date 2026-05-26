@@ -59,7 +59,7 @@ export function WorkforceSummary({
             <div className="text-xs uppercase tracking-wide text-muted-foreground">
               {t("workforces.fields.updated")}
             </div>
-            <div className="mt-1 font-medium">
+            <div className="mt-1 font-medium" suppressHydrationWarning>
               {workforce.updated_at
                 ? new Date(workforce.updated_at).toLocaleString(locale)
                 : t("workforces.common.notAvailable")}
