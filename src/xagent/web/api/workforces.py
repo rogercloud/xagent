@@ -14,6 +14,11 @@ from ..models.workforce import (
     WorkforceAgent,
     WorkforceRun,
 )
+from ..services.agent_access import (
+    AccessibleAgent,
+    accessible_agent_permissions,
+    list_accessible_published_agent_items,
+)
 from ..services.workforce_access import (
     can_create_workforce,
     ensure_agent_access,
@@ -137,6 +142,14 @@ def _serialize_agent(agent: Agent) -> dict[str, Any]:
         "logo_url": agent.logo_url,
         "status": _agent_status_value(agent),
     }
+
+
+def _serialize_accessible_agent_option(
+    accessible_agent: AccessibleAgent,
+) -> dict[str, Any]:
+    item = _serialize_agent(accessible_agent.agent)
+    item.update(accessible_agent_permissions(accessible_agent))
+    return item
 
 
 def _sorted_workers(workforce: Workforce) -> list[WorkforceAgent]:
@@ -419,6 +432,21 @@ async def create_workforce_from_prompt_endpoint(
     result = await create_workforce_from_prompt(db, user, prompt=request.prompt)
     workforce = _reload_workforce(db, result.workforce)
     return _serialize_workforce_detail(workforce)
+
+
+@router.get("/agent-options")
+async def list_workforce_agent_options(
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> list[dict[str, Any]]:
+    return [
+        _serialize_accessible_agent_option(agent)
+        for agent in list_accessible_published_agent_items(
+            db,
+            user,
+            purpose="workforce_select",
+        )
+    ]
 
 
 @router.get("/{workforce_id}")

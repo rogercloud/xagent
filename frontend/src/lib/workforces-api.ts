@@ -287,7 +287,7 @@ export async function getWorkforceCanvas(
 }
 
 export async function listAgentOptions(): Promise<WorkforceAgentOption[]> {
-  const response = await apiRequest(`${getApiUrl()}/api/agents`)
+  const response = await apiRequest(`${getApiUrl()}/api/workforces/agent-options`)
   if (!response.ok) {
     throw await parseApiError(response, "Failed to load agents")
   }

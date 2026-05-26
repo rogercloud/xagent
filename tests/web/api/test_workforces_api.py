@@ -10,6 +10,7 @@ from xagent.web.models.agent import Agent, AgentStatus
 from xagent.web.models.database import get_engine
 from xagent.web.models.user import User
 from xagent.web.models.workforce import WorkforceBuilderMessage, WorkforceRun
+from xagent.web.services.workforce_access import WorkforcePolicy, set_workforce_policy
 
 from .conftest import (
     _admin_headers,
@@ -24,6 +25,13 @@ def _db(_test_db: None) -> None:
     pass
 
 
+@pytest.fixture(autouse=True)
+def _reset_workforce_policy() -> None:
+    set_workforce_policy(WorkforcePolicy())
+    yield
+    set_workforce_policy(WorkforcePolicy())
+
+
 def _user_id(username: str = "admin") -> int:
     db = _direct_db_session()
     try:
@@ -34,7 +42,7 @@ def _user_id(username: str = "admin") -> int:
         db.close()
 
 
-def _create_published_agent(user_id: int, name: str) -> int:
+def _create_agent(user_id: int, name: str, status: AgentStatus) -> int:
     db = _direct_db_session()
     try:
         agent = Agent(
@@ -43,7 +51,7 @@ def _create_published_agent(user_id: int, name: str) -> int:
             description=f"{name} description",
             instructions=f"{name} instructions",
             execution_mode="balanced",
-            status=AgentStatus.PUBLISHED,
+            status=status,
         )
         db.add(agent)
         db.commit()
@@ -51,6 +59,10 @@ def _create_published_agent(user_id: int, name: str) -> int:
         return int(agent.id)
     finally:
         db.close()
+
+
+def _create_published_agent(user_id: int, name: str) -> int:
+    return _create_agent(user_id, name, AgentStatus.PUBLISHED)
 
 
 def _create_workforce(
@@ -120,9 +132,68 @@ def _create_workforce_run(
         db.close()
 
 
+class _VisibleAgentPolicy(WorkforcePolicy):
+    def __init__(self, visible_agent_ids: set[int]) -> None:
+        self.visible_agent_ids = visible_agent_ids
+
+    def get_visible_agent_ids(
+        self,
+        db: Any,
+        user: User,
+        purpose: str,
+    ) -> set[int]:
+        del db, user
+        assert purpose == "workforce_select"
+        return self.visible_agent_ids
+
+
 def test_workforce_endpoints_require_authentication() -> None:
     response = client.get("/api/workforces")
     assert response.status_code == 403
+
+
+def test_agent_options_use_workforce_policy_and_only_published_agents() -> None:
+    _admin_headers()
+    bob_headers = _register_second_user()
+    admin_id = _user_id("admin")
+    bob_id = _user_id("bob")
+
+    bob_published_id = _create_agent(
+        bob_id,
+        "Bob Published Worker",
+        AgentStatus.PUBLISHED,
+    )
+    bob_draft_id = _create_agent(
+        bob_id,
+        "Bob Draft Worker",
+        AgentStatus.DRAFT,
+    )
+    shared_published_id = _create_agent(
+        admin_id,
+        "Shared Published Worker",
+        AgentStatus.PUBLISHED,
+    )
+    shared_draft_id = _create_agent(
+        admin_id,
+        "Shared Draft Worker",
+        AgentStatus.DRAFT,
+    )
+    set_workforce_policy(_VisibleAgentPolicy({shared_published_id, shared_draft_id}))
+
+    response = client.get("/api/workforces/agent-options", headers=bob_headers)
+    assert response.status_code == 200, response.text
+    options_by_id = {item["id"]: item for item in response.json()}
+
+    assert bob_published_id in options_by_id
+    assert shared_published_id in options_by_id
+    assert bob_draft_id not in options_by_id
+    assert shared_draft_id not in options_by_id
+
+    assert options_by_id[bob_published_id]["access"] == "owner"
+    assert options_by_id[bob_published_id]["readonly"] is False
+    assert options_by_id[shared_published_id]["access"] == "policy"
+    assert options_by_id[shared_published_id]["readonly"] is True
+    assert options_by_id[shared_published_id]["can_edit"] is False
 
 
 def test_create_list_get_and_cross_user_access_control() -> None:

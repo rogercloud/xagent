@@ -55,6 +55,10 @@ const isTaskCreateResponse = (value: unknown): value is TaskCreateResponse => {
   return typeof candidate.task_id === "number"
 }
 
+const canEditAgent = (agent: Agent) => agent.readonly !== true && agent.can_edit !== false
+const canPublishAgent = (agent: Agent) => canEditAgent(agent) && agent.can_publish !== false
+const canDeleteAgent = (agent: Agent) => canEditAgent(agent) && agent.can_delete !== false
+
 export default function BuildsPage() {
   const { t } = useI18n()
   const { dispatch, setTaskId, setPendingMessage } = useApp()
@@ -355,8 +359,12 @@ export default function BuildsPage() {
                 {filteredAgents.map((agent) => (
                   <div
                     key={agent.id}
-                    className="group relative flex flex-col justify-between space-y-4 rounded-xl border bg-card p-6 shadow-sm transition-all hover:shadow-md hover:border-primary/50 cursor-pointer"
-                    onClick={() => router.push(`/build/${agent.id}`)}
+                    className={`group relative flex flex-col justify-between space-y-4 rounded-xl border bg-card p-6 shadow-sm transition-all ${canEditAgent(agent) ? "cursor-pointer hover:shadow-md hover:border-primary/50" : "cursor-default"}`}
+                    onClick={() => {
+                      if (canEditAgent(agent)) {
+                        router.push(`/build/${agent.id}`)
+                      }
+                    }}
                   >
                     <div className="flex-1">
                       <div className="space-y-4">
@@ -382,46 +390,54 @@ export default function BuildsPage() {
                             </div>
                           </div>
                         </div>
-                        <div className="absolute right-4 top-1" onClick={(e) => e.stopPropagation()}>
-                          <Popover>
-                            <PopoverTrigger asChild>
-                              <Button variant="ghost" size="icon" className="h-8 w-8 text-muted-foreground hover:text-foreground">
-                                <MoreVertical className="h-4 w-4" />
-                              </Button>
-                            </PopoverTrigger>
-                            <PopoverContent align="end" className="w-32 p-1" onClick={(e) => e.stopPropagation()}>
-                              <div className="flex flex-col">
-                                <Button
-                                  variant="ghost"
-                                  className="justify-start px-2 py-1.5 h-auto font-normal text-sm"
-                                  onClick={(e) => {
-                                    e.stopPropagation()
-                                    if (agent.status === 'published') {
-                                      handleUnpublish(agent.id)
-                                    } else {
-                                      handlePublish(agent.id)
-                                    }
-                                  }}
-                                >
-                                  <Globe className="mr-2 h-4 w-4" />
-                                  {agent.status === 'published' ? t('builds.list.actions.unpublish') : t('builds.list.actions.publish')}
+                        {(canPublishAgent(agent) || canDeleteAgent(agent)) && (
+                          <div className="absolute right-4 top-1" onClick={(e) => e.stopPropagation()}>
+                            <Popover>
+                              <PopoverTrigger asChild>
+                                <Button variant="ghost" size="icon" className="h-8 w-8 text-muted-foreground hover:text-foreground">
+                                  <MoreVertical className="h-4 w-4" />
                                 </Button>
-                                <div className="h-px bg-border my-1 mx-1" />
-                                <Button
-                                  variant="ghost"
-                                  className="justify-start px-2 py-1.5 h-auto font-normal text-sm text-destructive hover:text-destructive hover:bg-destructive/10"
-                                  onClick={(e) => {
-                                    e.stopPropagation()
-                                    handleDelete(agent.id)
-                                  }}
-                                >
-                                  <Trash2 className="mr-2 h-4 w-4" />
-                                  {t('builds.list.actions.delete')}
-                                </Button>
-                              </div>
-                            </PopoverContent>
-                          </Popover>
-                        </div>
+                              </PopoverTrigger>
+                              <PopoverContent align="end" className="w-32 p-1" onClick={(e) => e.stopPropagation()}>
+                                <div className="flex flex-col">
+                                  {canPublishAgent(agent) && (
+                                    <Button
+                                      variant="ghost"
+                                      className="justify-start px-2 py-1.5 h-auto font-normal text-sm"
+                                      onClick={(e) => {
+                                        e.stopPropagation()
+                                        if (agent.status === 'published') {
+                                          handleUnpublish(agent.id)
+                                        } else {
+                                          handlePublish(agent.id)
+                                        }
+                                      }}
+                                    >
+                                      <Globe className="mr-2 h-4 w-4" />
+                                      {agent.status === 'published' ? t('builds.list.actions.unpublish') : t('builds.list.actions.publish')}
+                                    </Button>
+                                  )}
+                                  {canPublishAgent(agent) && canDeleteAgent(agent) && (
+                                    <div className="h-px bg-border my-1 mx-1" />
+                                  )}
+                                  {canDeleteAgent(agent) && (
+                                    <Button
+                                      variant="ghost"
+                                      className="justify-start px-2 py-1.5 h-auto font-normal text-sm text-destructive hover:text-destructive hover:bg-destructive/10"
+                                      onClick={(e) => {
+                                        e.stopPropagation()
+                                        handleDelete(agent.id)
+                                      }}
+                                    >
+                                      <Trash2 className="mr-2 h-4 w-4" />
+                                      {t('builds.list.actions.delete')}
+                                    </Button>
+                                  )}
+                                </div>
+                              </PopoverContent>
+                            </Popover>
+                          </div>
+                        )}
 
                         <p className="text-sm text-muted-foreground line-clamp-2 mt-4">
                           {agent.description || t('builds.card.noDescription')}
@@ -440,7 +456,8 @@ export default function BuildsPage() {
                           {t('builds.card.updatedAt')}: {formatDate(agent.updated_at || agent.created_at)}
                         </div>
                       </div>
-                      <div className="flex gap-2" onClick={(e) => e.stopPropagation()}>
+                      {canEditAgent(agent) && (
+                        <div className="flex gap-2" onClick={(e) => e.stopPropagation()}>
                         {agent.status === 'published' ? (
                           <>
                             <Button
@@ -480,7 +497,8 @@ export default function BuildsPage() {
                             {t('builds.list.actions.edit')}
                           </Button>
                         )}
-                      </div>
+                        </div>
+                      )}
                     </div>
                   </div>
                 ))}

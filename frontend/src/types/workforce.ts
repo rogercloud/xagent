@@ -78,6 +78,11 @@ export interface WorkforceAgentOption {
   description: string | null
   logo_url: string | null
   status: string
+  access?: string
+  readonly?: boolean
+  can_edit?: boolean
+  can_publish?: boolean
+  can_delete?: boolean
 }
 
 export interface WorkforceWorkerDraft {

@@ -12,10 +12,10 @@ from xagent.web.models.user import User
 from xagent.web.services.llm_utils import UserAwareModelStorage
 
 from ..models.workforce import Workforce, WorkforceAgent, WorkforceBuilderMessage
+from .agent_access import list_accessible_published_agents
 from .workforce_access import (
     ensure_agent_access,
     ensure_workforce_access,
-    list_accessible_published_agents,
 )
 from .workforce_names import workforce_name_exists
 from .workforce_snapshot import normalize_text

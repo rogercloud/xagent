@@ -13,6 +13,7 @@ vi.mock("@/lib/utils", () => ({
 import {
   archiveWorkforce,
   createWorkforce,
+  listAgentOptions,
   listWorkforces,
   proposeWorkforceChanges,
   runWorkforce,
@@ -83,6 +84,16 @@ describe("workforces-api", () => {
       ],
     })
     expect(JSON.parse(String(options.body))).not.toHaveProperty("status")
+  })
+
+  it("loads workforce-selectable agents from the workforce options endpoint", async () => {
+    apiRequestMock.mockResolvedValueOnce(jsonResponse([]))
+
+    await expect(listAgentOptions()).resolves.toEqual([])
+
+    expect(apiRequestMock).toHaveBeenCalledWith(
+      "http://api.local/api/workforces/agent-options",
+    )
   })
 
   it("runs a workforce with the run payload shape", async () => {

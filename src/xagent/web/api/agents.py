@@ -4,7 +4,7 @@ import logging
 import os
 import uuid
 from datetime import datetime, timezone
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Body, Depends, HTTPException
 from pydantic import BaseModel, Field
@@ -27,6 +27,11 @@ from ..schemas.agent_api_key import (
     APIKeyGenerateResponse,
     APIKeyMetadataResponse,
     APIKeyRevokeResponse,
+)
+from ..services.agent_access import (
+    AccessibleAgent,
+    accessible_agent_permissions,
+    list_accessible_agents,
 )
 from ..services.agent_store import AgentStore
 from ..services.llm_utils import UserAwareModelStorage
@@ -124,6 +129,11 @@ class AgentListItem(BaseModel):
     updated_at: str
     widget_enabled: bool
     allowed_domains: List[str]
+    access: str = "owner"
+    readonly: bool = False
+    can_edit: bool = True
+    can_publish: bool = True
+    can_delete: bool = True
 
 
 class PublishResponse(BaseModel):
@@ -212,6 +222,15 @@ async def _validate_knowledge_bases_exist(
                 + ", ".join(missing)
             ),
         )
+
+
+def _serialize_agent_list_item(
+    store: AgentStore,
+    accessible_agent: AccessibleAgent,
+) -> dict[str, Any]:
+    item = store.agent_to_list_item_dict(accessible_agent.agent)
+    item.update(accessible_agent_permissions(accessible_agent))
+    return item
 
 
 def _save_logo(base64_data: Optional[str], agent_id: int) -> Optional[str]:
@@ -445,9 +464,17 @@ async def list_agents(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> List[AgentListItem]:
-    """List all agents for the current user."""
+    """List agents visible to the current user."""
     try:
-        items = AgentStore(db).list_agent_items(int(current_user.id))
+        store = AgentStore(db)
+        items = [
+            _serialize_agent_list_item(store, item)
+            for item in list_accessible_agents(
+                db,
+                current_user,
+                purpose="agent_list",
+            )
+        ]
         return [AgentListItem.model_validate(item) for item in items]
 
     except Exception as e:
