@@ -58,6 +58,7 @@ const en = {
     deploy: "Deploy",
     agentDev: "Agent Development",
     task: "Task",
+    workforces: "Workforces",
     history: "All Tasks",
     search: "Search Tasks",
     templates: "Templates",
@@ -2851,7 +2852,12 @@ Build when you need.`
     queryPrefix: "Query:",
     pathPrefix: "Path:",
     bashPrefix: "Bash:",
-    searchPrefix: "Search:"
+    searchPrefix: "Search:",
+    workforceDelegation: "Workforce Delegation",
+    delegateToWorker: "Delegate to {worker}",
+    workerReturned: "Worker returned result",
+    workerFailed: "Worker failed",
+    unknownWorker: "Unknown Worker"
   },
   deploy_agent: {
     title: "Deploy Agent",

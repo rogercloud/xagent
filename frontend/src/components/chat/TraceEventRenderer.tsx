@@ -141,6 +141,40 @@ interface TraceEventRendererProps {
   events: TraceEvent[];
 }
 
+function getTraceData(event: TraceEvent): NonNullable<TraceEvent['data']> {
+  if (event.data && typeof event.data === 'object') {
+    return event.data;
+  }
+  return event as unknown as NonNullable<TraceEvent['data']>;
+}
+
+const getWaitingQuestionFromEvents = (events: TraceEvent[]): string | null => {
+  for (let i = events.length - 1; i >= 0; i--) {
+    const event = events[i];
+    if (event.event_type === 'agent_message') {
+      const expectsResponse = event.data?.expect_response === true || event.data?.message_type === 'question';
+      if (!expectsResponse) {
+        continue;
+      }
+      const message = event.data?.message || event.data?.content;
+      if (typeof message === 'string' && message.trim()) {
+        return message;
+      }
+    }
+    if (event.event_type === 'react_task_end') {
+      const result = event.data?.result as any;
+      if (
+        result?.status === 'waiting_for_user' &&
+        typeof result.message === 'string' &&
+        result.message.trim()
+      ) {
+        return result.message;
+      }
+    }
+  }
+  return null;
+};
+
 const isAgentProgressEvent = (event: TraceEvent): boolean => (
   event.event_type === 'agent_progress' ||
   (
@@ -182,8 +216,15 @@ function useProcessedSteps(events: TraceEvent[]): ProcessedStep[] {
         return;
       }
 
-      let stepId = event.step_id || (event.data?.step_id as string) || 'default';
+      const eventData = getTraceData(event);
+      let stepId = event.step_id || (eventData.step_id as string) || 'default';
       const isProgressMessage = isAgentProgressEvent(event);
+      if (event.event_type?.startsWith('workforce_delegation_')) {
+        stepId = String(
+          eventData.worker_task_id ||
+          `workforce-${eventData.workforce_run_id || 'run'}-${eventData.worker_member_id || eventData.agent_id || event.event_id || index}`
+        );
+      }
 
       if (event.event_type === 'react_task_start' || event.event_type === 'task_start_react') {
         currentReactStepId = stepId;
@@ -217,11 +258,11 @@ function useProcessedSteps(events: TraceEvent[]): ProcessedStep[] {
 
       // Process different event types
       if (event.event_type === 'dag_step_start' || event.event_type === 'react_task_start') {
-        step.stepName = (event.data?.step_name as string) || (event.event_type === 'react_task_start' ? t('traceEventRenderer.taskExecution') : '');
-        step.description = (event.data?.description as string) || (event.data?.task as string) || '';
+        step.stepName = (eventData.step_name as string) || (event.event_type === 'react_task_start' ? t('traceEventRenderer.taskExecution') : '');
+        step.description = (eventData.description as string) || (eventData.task as string) || '';
         step.status = 'running';
 
-        const tools = event.data?.tool_names || event.data?.tools;
+        const tools = eventData.tool_names || eventData.tools;
         if (tools && Array.isArray(tools)) {
           step.tools = tools.map((toolItem: any) => {
             if (typeof toolItem === 'string') return { function: { name: toolItem } };
@@ -235,26 +276,26 @@ function useProcessedSteps(events: TraceEvent[]): ProcessedStep[] {
         step.actions.push({
           id: eventId,
           type: 'llm',
-          title: t('traceEventRenderer.callLLM', { model: event.data?.model_name || t('traceEventRenderer.unknownModel') }),
+          title: t('traceEventRenderer.callLLM', { model: eventData.model_name || t('traceEventRenderer.unknownModel') }),
           status: 'running',
           timestamp,
-          data: { model: event.data?.model_name }
+          data: { model: eventData.model_name }
         });
       }
 
       if (event.event_type === 'llm_call_end' || event.event_type === 'llm_call_result') {
-        if (event.data?.response?.reasoning) {
-          step.reasoning = event.data.response.reasoning;
+        if (eventData.response?.reasoning) {
+          step.reasoning = eventData.response.reasoning;
         }
-        if (event.data?.tools) {
-          step.tools = event.data.tools;
+        if (eventData.tools) {
+          step.tools = eventData.tools;
         }
 
         const action = findLastRunningAction(step, 'llm');
         if (action) {
           action.status = 'completed';
-          action.data.reasoning = event.data?.response?.reasoning;
-          action.data.tool_calls = event.data?.tools;
+          action.data.reasoning = eventData.response?.reasoning;
+          action.data.tool_calls = eventData.tools;
         } else {
           // Fallback if no start event found
           step.actions.push({
@@ -264,8 +305,8 @@ function useProcessedSteps(events: TraceEvent[]): ProcessedStep[] {
             status: 'completed',
             timestamp,
             data: {
-              reasoning: event.data?.response?.reasoning,
-              tool_calls: event.data?.tools
+              reasoning: eventData.response?.reasoning,
+              tool_calls: eventData.tools
             }
           });
         }
@@ -290,6 +331,74 @@ function useProcessedSteps(events: TraceEvent[]): ProcessedStep[] {
               output: message.trim(),
               inline: true,
             }
+          });
+        }
+      }
+
+      if (event.event_type === 'workforce_delegation_start') {
+        const workerName = String(
+          eventData.worker_alias ||
+          eventData.agent_name ||
+          eventData.tool_name ||
+          t('traceEventRenderer.unknownWorker')
+        );
+        step.stepName = t('traceEventRenderer.workforceDelegation');
+        step.description = t('traceEventRenderer.delegateToWorker', { worker: workerName });
+        step.status = 'running';
+        step.actions.push({
+          id: eventId,
+          type: 'info',
+          title: t('traceEventRenderer.delegateToWorker', { worker: workerName }),
+          status: 'running',
+          timestamp,
+          data: {
+            tool: eventData.tool_name,
+            output: eventData,
+          }
+        });
+      }
+
+      if (event.event_type === 'workforce_delegation_end') {
+        const output = eventData.output || eventData.response || '';
+        step.stepName = step.stepName || t('traceEventRenderer.workforceDelegation');
+        step.description = step.description || t('traceEventRenderer.workforceDelegation');
+        step.status = 'completed';
+        const action = step.actions.find((item) => item.type === 'info' && item.status === 'running');
+        if (action) {
+          action.status = 'completed';
+          action.data.output = output || eventData;
+        } else {
+          step.actions.push({
+            id: eventId,
+            type: 'info',
+            title: t('traceEventRenderer.workerReturned'),
+            status: 'completed',
+            timestamp,
+            data: { output: output || eventData }
+          });
+        }
+      }
+
+      if (event.event_type === 'workforce_delegation_error') {
+        const errorMessage = eventData.error || eventData.message || t('traceEventRenderer.unknownError');
+        step.stepName = step.stepName || t('traceEventRenderer.workforceDelegation');
+        step.description = step.description || t('traceEventRenderer.workforceDelegation');
+        step.status = 'failed';
+        const action = step.actions.find((item) => item.type === 'info' && item.status === 'running');
+        if (action) {
+          action.type = 'error';
+          action.title = t('traceEventRenderer.workerFailed');
+          action.status = 'failed';
+          action.data.output = undefined;
+          action.data.error = errorMessage;
+        } else {
+          step.actions.push({
+            id: eventId,
+            type: 'error',
+            title: t('traceEventRenderer.workerFailed'),
+            status: 'failed',
+            timestamp,
+            data: { error: errorMessage }
           });
         }
       }

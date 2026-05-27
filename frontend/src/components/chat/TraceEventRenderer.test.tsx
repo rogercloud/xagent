@@ -13,6 +13,7 @@ vi.mock("@/contexts/i18n-context", () => ({
   useI18n: () => ({
     t: (key: string, vars?: Record<string, string | number>) => {
       if (vars?.tool) return `${key}:${vars.tool}`
+      if (vars?.worker) return `${key}:${vars.worker}`
       return key
     },
   }),
@@ -487,5 +488,83 @@ describe("TraceEventRenderer", () => {
     expect(toggle).toHaveAttribute("aria-expanded", "true")
     expect(screen.getByText("traceEventRenderer.hideProcess")).toBeInTheDocument()
     expect(screen.getByText(/traceEventRenderer.executeTool:web_search/)).toBeInTheDocument()
+  })
+
+  it("renders workforce delegation trace events as a dedicated step", () => {
+    render(
+      <TraceEventRenderer
+        events={[
+          {
+            event_id: "delegation-start",
+            event_type: "workforce_delegation_start",
+            timestamp: Date.now(),
+            data: {
+              workforce_run_id: 5,
+              worker_member_id: 7,
+              worker_task_id: 99,
+              worker_alias: "Researcher",
+              tool_name: "research_worker",
+            },
+          },
+          {
+            event_id: "delegation-end",
+            event_type: "workforce_delegation_end",
+            timestamp: Date.now(),
+            data: {
+              worker_task_id: 99,
+              output: "Research complete",
+            },
+          },
+        ]}
+      />,
+    )
+
+    const toggle = screen.getByRole("button", {
+      name: /traceEventRenderer.delegateToWorker:Researcher/,
+    })
+
+    expect(toggle).toHaveAttribute("aria-expanded", "false")
+    fireEvent.click(toggle)
+    expect(toggle).toHaveAttribute("aria-expanded", "true")
+    expect(screen.getByText(/Research complete/)).toBeInTheDocument()
+  })
+
+  it("renders workforce delegation failures as errors", () => {
+    render(
+      <TraceEventRenderer
+        events={[
+          {
+            event_id: "delegation-start",
+            event_type: "workforce_delegation_start",
+            timestamp: Date.now(),
+            data: {
+              worker_task_id: 99,
+              worker_alias: "Researcher",
+            },
+          },
+          {
+            event_id: "delegation-error",
+            event_type: "workforce_delegation_error",
+            timestamp: Date.now(),
+            data: {
+              worker_task_id: 99,
+              error: "Worker timed out",
+            },
+          },
+        ]}
+      />,
+    )
+
+    const stepToggle = screen.getByRole("button", {
+      name: /traceEventRenderer.delegateToWorker:Researcher/,
+    })
+    fireEvent.click(stepToggle)
+
+    const errorToggle = screen.getByRole("button", {
+      name: /traceEventRenderer.workerFailed/,
+    })
+    fireEvent.click(errorToggle)
+
+    expect(screen.getByText("Worker timed out")).toBeInTheDocument()
   })
 })
