@@ -9,6 +9,7 @@ import { SearchInput } from "@/components/ui/search-input"
 import { useI18n } from "@/contexts/i18n-context"
 import { listWorkforces } from "@/lib/workforces-api"
 import type { WorkforceListItem } from "@/types/workforce"
+import { getRunDisabledReason } from "./workforce-ui-state"
 
 export default function WorkforcesPage() {
   const { locale, t } = useI18n()
@@ -93,76 +94,91 @@ export default function WorkforcesPage() {
         ) : (
           <>
             <div className="grid gap-4">
-              {items.map((item) => (
-                <Card key={item.id} className="overflow-hidden">
-                  <CardContent className="p-0">
-                    <div className="grid gap-6 p-6 lg:grid-cols-[1.4fr_0.6fr] lg:items-center">
-                      <div className="space-y-4">
-                        <div className="flex flex-wrap items-center gap-3">
-                          <Link
-                            href={`/workforces/${item.id}`}
-                            className="text-xl font-semibold hover:underline"
-                          >
-                            {item.name}
-                          </Link>
-                          <span className="rounded-full border px-2.5 py-1 text-xs capitalize text-muted-foreground">
-                            {t(`workforces.status.${item.status}`)}
-                          </span>
-                        </div>
-                        <p className="text-sm text-muted-foreground">
-                          {item.description || t("workforces.common.noDescription")}
-                        </p>
-                        <div className="flex flex-wrap gap-6 text-sm text-muted-foreground">
-                          <span>{t("workforces.list.manager", { name: item.manager.name })}</span>
-                          <span>{t("workforces.list.workers", { count: item.worker_count })}</span>
-                          <span>
-                            {t("workforces.list.lastUpdate", {
-                              value: item.updated_at
-                                ? new Date(item.updated_at).toLocaleString(locale)
-                                : t("workforces.common.notAvailable"),
-                            })}
-                          </span>
-                        </div>
-                      </div>
-                      <div className="flex flex-col gap-3 lg:items-end">
-                        <Link href={`/workforces/${item.id}/run`}>
-                          <Button className="w-full lg:w-auto">
-                            <Play className="mr-2 h-4 w-4" />
-                            {t("workforces.actions.run")}
-                          </Button>
-                        </Link>
-                        <div className="flex gap-3">
-                          <Link href={`/workforces/${item.id}`}>
-                            <Button variant="outline">{t("workforces.actions.details")}</Button>
-                          </Link>
-                          <Link href={`/workforces/${item.id}/builder`}>
-                            <Button variant="outline">{t("workforces.actions.builder")}</Button>
-                          </Link>
-                          <Link href={`/workforces/${item.id}/canvas`}>
-                            <Button variant="outline">{t("workforces.actions.canvas")}</Button>
-                          </Link>
-                        </div>
-                        {item.last_run ? (
-                          <div className="text-xs text-muted-foreground">
-                            {item.last_run.task_id != null
-                              ? t("workforces.list.lastRunWithTask", {
-                                  runId: item.last_run.id,
-                                  taskId: item.last_run.task_id,
-                                  status: item.last_run.status,
-                                })
-                              : t("workforces.list.lastRun", {
-                                  runId: item.last_run.id,
-                                  status: item.last_run.status,
-                                })}
+              {items.map((item) => {
+                const runDisabledReason = getRunDisabledReason(item.status, t)
+                return (
+                  <Card key={item.id} className="overflow-hidden">
+                    <CardContent className="p-0">
+                      <div className="grid gap-6 p-6 lg:grid-cols-[1.4fr_0.6fr] lg:items-center">
+                        <div className="space-y-4">
+                          <div className="flex flex-wrap items-center gap-3">
+                            <Link
+                              href={`/workforces/${item.id}`}
+                              className="text-xl font-semibold hover:underline"
+                            >
+                              {item.name}
+                            </Link>
+                            <span className="rounded-full border px-2.5 py-1 text-xs capitalize text-muted-foreground">
+                              {t(`workforces.status.${item.status}`)}
+                            </span>
                           </div>
-                        ) : (
-                          <div className="text-xs text-muted-foreground">{t("workforces.list.noRuns")}</div>
-                        )}
+                          <p className="text-sm text-muted-foreground">
+                            {item.description || t("workforces.common.noDescription")}
+                          </p>
+                          <div className="flex flex-wrap gap-6 text-sm text-muted-foreground">
+                            <span>{t("workforces.list.manager", { name: item.manager.name })}</span>
+                            <span>{t("workforces.list.workers", { count: item.worker_count })}</span>
+                            <span>
+                              {t("workforces.list.lastUpdate", {
+                                value: item.updated_at
+                                  ? new Date(item.updated_at).toLocaleString(locale)
+                                  : t("workforces.common.notAvailable"),
+                              })}
+                            </span>
+                          </div>
+                        </div>
+                        <div className="flex flex-col gap-3 lg:items-end">
+                          <div className="flex w-full flex-col gap-1 lg:w-auto lg:items-end">
+                            {runDisabledReason ? (
+                              <Button className="w-full lg:w-auto" disabled>
+                                <Play className="mr-2 h-4 w-4" />
+                                {t("workforces.actions.run")}
+                              </Button>
+                            ) : (
+                              <Link href={`/workforces/${item.id}/run`}>
+                                <Button className="w-full lg:w-auto">
+                                  <Play className="mr-2 h-4 w-4" />
+                                  {t("workforces.actions.run")}
+                                </Button>
+                              </Link>
+                            )}
+                            {runDisabledReason ? (
+                              <div className="text-xs text-muted-foreground">{runDisabledReason}</div>
+                            ) : null}
+                          </div>
+                          <div className="flex gap-3">
+                            <Link href={`/workforces/${item.id}`}>
+                              <Button variant="outline">{t("workforces.actions.details")}</Button>
+                            </Link>
+                            <Link href={`/workforces/${item.id}/builder`}>
+                              <Button variant="outline">{t("workforces.actions.builder")}</Button>
+                            </Link>
+                            <Link href={`/workforces/${item.id}/canvas`}>
+                              <Button variant="outline">{t("workforces.actions.canvas")}</Button>
+                            </Link>
+                          </div>
+                          {item.last_run ? (
+                            <div className="text-xs text-muted-foreground">
+                              {item.last_run.task_id != null
+                                ? t("workforces.list.lastRunWithTask", {
+                                    runId: item.last_run.id,
+                                    taskId: item.last_run.task_id,
+                                    status: item.last_run.status,
+                                  })
+                                : t("workforces.list.lastRun", {
+                                    runId: item.last_run.id,
+                                    status: item.last_run.status,
+                                  })}
+                            </div>
+                          ) : (
+                            <div className="text-xs text-muted-foreground">{t("workforces.list.noRuns")}</div>
+                          )}
+                        </div>
                       </div>
-                    </div>
-                  </CardContent>
-                </Card>
-              ))}
+                    </CardContent>
+                  </Card>
+                )
+              })}
             </div>
 
             {pages > 1 ? (

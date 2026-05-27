@@ -6,6 +6,7 @@ import { useI18n } from "@/contexts/i18n-context"
 import { getWorkforce } from "@/lib/workforces-api"
 import type { WorkforceDetail, WorkforceRunResponse } from "@/types/workforce"
 import { WorkforceSummary, WorkforceTestPanel } from "@/components/workforce"
+import { getRunDisabledReason } from "../../workforce-ui-state"
 
 export default function WorkforceRunPage() {
   const { t } = useI18n()
@@ -40,6 +41,8 @@ export default function WorkforceRunPage() {
   if (error) return <div className="h-full overflow-y-auto p-4 text-red-500 sm:p-8">{error}</div>
   if (!workforce) return <div className="h-full overflow-y-auto p-4 text-muted-foreground sm:p-8">{t("workforces.errors.notFound")}</div>
 
+  const runDisabledReason = getRunDisabledReason(workforce.status, t)
+
   const handleRunCreated = (result: WorkforceRunResponse) => {
     router.push(result.redirect_url || `/task/${result.task_id}`)
   }
@@ -50,7 +53,8 @@ export default function WorkforceRunPage() {
         <WorkforceSummary workforce={workforce} />
         <WorkforceTestPanel
           workforceId={workforce.id}
-          disabled={workforce.status !== "active"}
+          disabled={Boolean(runDisabledReason)}
+          disabledReason={runDisabledReason || undefined}
           onRunCreated={handleRunCreated}
         />
       </div>

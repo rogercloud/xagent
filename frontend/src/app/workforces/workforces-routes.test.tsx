@@ -4,8 +4,19 @@ import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/re
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 
 const getWorkforceMock = vi.hoisted(() => vi.fn())
+const getWorkforceBuilderMessagesMock = vi.hoisted(() => vi.fn())
+const listAgentOptionsMock = vi.hoisted(() => vi.fn())
 const listWorkforcesMock = vi.hoisted(() => vi.fn())
+const proposeWorkforceChangesMock = vi.hoisted(() => vi.fn())
+const applyWorkforceChangesMock = vi.hoisted(() => vi.fn())
 const runWorkforceMock = vi.hoisted(() => vi.fn())
+const addWorkforceAgentMock = vi.hoisted(() => vi.fn())
+const archiveWorkforceMock = vi.hoisted(() => vi.fn())
+const publishWorkforceMock = vi.hoisted(() => vi.fn())
+const removeWorkforceAgentMock = vi.hoisted(() => vi.fn())
+const unpublishWorkforceMock = vi.hoisted(() => vi.fn())
+const updateWorkforceMock = vi.hoisted(() => vi.fn())
+const updateWorkforceAgentMock = vi.hoisted(() => vi.fn())
 const routerPushMock = vi.hoisted(() => vi.fn())
 const paramsMock = vi.hoisted(() => ({ id: "42" as string | string[] | undefined }))
 const translateMock = vi.hoisted(
@@ -44,12 +55,82 @@ vi.mock("@/contexts/i18n-context", () => ({
 }))
 
 vi.mock("@/lib/workforces-api", () => ({
+  addWorkforceAgent: addWorkforceAgentMock,
+  applyWorkforceChanges: applyWorkforceChangesMock,
+  archiveWorkforce: archiveWorkforceMock,
   getWorkforce: getWorkforceMock,
+  getWorkforceBuilderMessages: getWorkforceBuilderMessagesMock,
+  listAgentOptions: listAgentOptionsMock,
   listWorkforces: listWorkforcesMock,
+  publishWorkforce: publishWorkforceMock,
+  proposeWorkforceChanges: proposeWorkforceChangesMock,
+  removeWorkforceAgent: removeWorkforceAgentMock,
   runWorkforce: runWorkforceMock,
+  unpublishWorkforce: unpublishWorkforceMock,
+  updateWorkforce: updateWorkforceMock,
+  updateWorkforceAgent: updateWorkforceAgentMock,
+}))
+
+vi.mock("sonner", () => ({
+  toast: {
+    error: vi.fn(),
+    success: vi.fn(),
+  },
+}))
+
+vi.mock("@/components/ui/select", () => ({
+  Select: ({
+    value,
+    onValueChange,
+    options,
+    placeholder,
+    disabled,
+  }: {
+    value?: string
+    onValueChange: (value: string) => void
+    options?: Array<{ value: string; label: string }>
+    placeholder?: string
+    disabled?: boolean
+  }) => (
+    <select
+      aria-label={placeholder}
+      value={value || ""}
+      disabled={disabled}
+      onChange={(event) => onValueChange(event.target.value)}
+    >
+      <option value="">{placeholder}</option>
+      {(options || []).map((option) => (
+        <option key={option.value} value={option.value}>
+          {option.label}
+        </option>
+      ))}
+    </select>
+  ),
+}))
+
+vi.mock("@/components/ui/switch", () => ({
+  Switch: ({
+    checked,
+    disabled,
+    onCheckedChange,
+  }: {
+    checked?: boolean
+    disabled?: boolean
+    onCheckedChange?: (checked: boolean) => void
+  }) => (
+    <input
+      aria-label="switch"
+      type="checkbox"
+      checked={Boolean(checked)}
+      disabled={disabled}
+      onChange={(event) => onCheckedChange?.(event.target.checked)}
+    />
+  ),
 }))
 
 import WorkforcesPage from "./page"
+import WorkforceBuilderPage from "./[id]/builder/page"
+import WorkforceDetailPage from "./[id]/page"
 import WorkforceRunPage from "./[id]/run/page"
 import { getNavigationGroupsForUser } from "@/components/layout/sidebar"
 import type { WorkforceDetail, WorkforceListResponse } from "@/types/workforce"
@@ -108,8 +189,19 @@ const listResponse: WorkforceListResponse = {
 describe("workforce route entry points", () => {
   beforeEach(() => {
     getWorkforceMock.mockReset()
+    getWorkforceBuilderMessagesMock.mockReset()
+    listAgentOptionsMock.mockReset()
     listWorkforcesMock.mockReset()
+    proposeWorkforceChangesMock.mockReset()
+    applyWorkforceChangesMock.mockReset()
     runWorkforceMock.mockReset()
+    addWorkforceAgentMock.mockReset()
+    archiveWorkforceMock.mockReset()
+    publishWorkforceMock.mockReset()
+    removeWorkforceAgentMock.mockReset()
+    unpublishWorkforceMock.mockReset()
+    updateWorkforceMock.mockReset()
+    updateWorkforceAgentMock.mockReset()
     routerPushMock.mockReset()
     paramsMock.id = "42"
   })
@@ -159,6 +251,28 @@ describe("workforce route entry points", () => {
     )
   })
 
+  it("keeps list run actions disabled for non-active workforces", async () => {
+    listWorkforcesMock.mockResolvedValueOnce({
+      ...listResponse,
+      items: [
+        {
+          ...listResponse.items[0],
+          id: 43,
+          name: "Draft Workforce",
+          status: "draft",
+          last_run: null,
+        },
+      ],
+    })
+
+    render(<WorkforcesPage />)
+
+    expect(await screen.findByText("Draft Workforce")).toBeInTheDocument()
+    expect(screen.getByText("workforces.run.inactiveDisabled")).toBeInTheDocument()
+    expect(screen.queryByRole("link", { name: /workforces.actions.run/ })).not.toBeInTheDocument()
+    expect(screen.getByRole("button", { name: /workforces.actions.run/ })).toBeDisabled()
+  })
+
   it("runs a workforce and redirects to the created task", async () => {
     getWorkforceMock.mockResolvedValueOnce(workforceDetail)
     runWorkforceMock.mockResolvedValueOnce({
@@ -183,5 +297,71 @@ describe("workforce route entry points", () => {
       })
     })
     expect(routerPushMock).toHaveBeenCalledWith("/task/99")
+  })
+
+  it("shows a run disabled reason for non-active workforces", async () => {
+    getWorkforceMock.mockResolvedValueOnce({
+      ...workforceDetail,
+      status: "draft",
+    })
+
+    render(<WorkforceRunPage />)
+
+    expect(await screen.findByText("Launch Workforce")).toBeInTheDocument()
+    expect(screen.getByText("workforces.run.inactiveDisabled")).toBeInTheDocument()
+    expect(screen.getByPlaceholderText("workforces.run.placeholder")).toBeDisabled()
+    expect(screen.getByText("workforces.actions.runWorkforce")).toBeDisabled()
+    fireEvent.click(screen.getByText("workforces.actions.runWorkforce"))
+    expect(runWorkforceMock).not.toHaveBeenCalled()
+  })
+
+  it("keeps the detail run action disabled for non-active workforces", async () => {
+    getWorkforceMock.mockResolvedValueOnce({
+      ...workforceDetail,
+      status: "draft",
+    })
+    listAgentOptionsMock.mockResolvedValueOnce([])
+
+    render(<WorkforceDetailPage />)
+
+    expect(await screen.findByRole("heading", { name: "Launch Workforce" })).toBeInTheDocument()
+    expect(screen.getByText("workforces.run.inactiveDisabled")).toBeInTheDocument()
+    expect(screen.queryByRole("link", { name: /workforces.actions.runWorkforce/ })).not.toBeInTheDocument()
+    expect(screen.getByRole("button", { name: /workforces.actions.runWorkforce/ })).toBeDisabled()
+  })
+
+  it("keeps builder propose and apply controls read-only for archived workforces", async () => {
+    getWorkforceMock.mockResolvedValueOnce({
+      ...workforceDetail,
+      status: "archived",
+    })
+    getWorkforceBuilderMessagesMock.mockResolvedValueOnce({
+      items: [
+        {
+          id: 12,
+          role: "assistant",
+          content: "Prepared a patch.",
+          status: "proposed",
+          proposed_patch: {
+            summary: "Rename",
+            operations: [{ op: "update_workforce", fields: { name: "Renamed" } }],
+            warnings: [],
+          },
+          created_at: null,
+        },
+      ],
+    })
+
+    render(<WorkforceBuilderPage />)
+
+    expect(await screen.findByText("Launch Workforce")).toBeInTheDocument()
+    expect(screen.getByText("workforces.builder.archivedReadOnly")).toBeInTheDocument()
+    expect(screen.getByPlaceholderText("workforces.builder.messagePlaceholder")).toBeDisabled()
+
+    const readOnlyButtons = screen.getAllByText("workforces.actions.readOnly")
+    expect(readOnlyButtons).toHaveLength(2)
+    readOnlyButtons.forEach((button) => expect(button).toBeDisabled())
+    expect(proposeWorkforceChangesMock).not.toHaveBeenCalled()
+    expect(applyWorkforceChangesMock).not.toHaveBeenCalled()
   })
 })

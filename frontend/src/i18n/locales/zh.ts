@@ -3056,11 +3056,14 @@ Build when you need.`
     },
     run: {
       testTitle: "测试 Workforce",
-      placeholder: "描述你希望 manager 协调完成的任务。"
+      placeholder: "描述你希望 manager 协调完成的任务。",
+      inactiveDisabled: "请先发布这个 Workforce 再运行。",
+      archivedDisabled: "已归档的 Workforce 不能运行。"
     },
     builder: {
       chatTitle: "Builder 对话",
       chatDescription: "描述你想要的 workforce 修改，builder 会生成可检查的 patch。",
+      archivedReadOnly: "已归档的 Workforce 是只读的，不能生成或应用 Builder 修改。",
       emptyPrompt: "可以这样开始：添加 Research Agent worker 来负责竞品调研。",
       roleBuilder: "Builder",
       roleYou: "你",

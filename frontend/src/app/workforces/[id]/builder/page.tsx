@@ -22,6 +22,7 @@ import {
   WorkforceSummary,
   WorkforceTestPanel,
 } from "@/components/workforce"
+import { getBuilderReadOnlyReason, getRunDisabledReason } from "../../workforce-ui-state"
 
 function latestProposedAssistantMessage(
   messages: WorkforceBuilderMessage[],
@@ -116,6 +117,9 @@ export default function WorkforceBuilderPage() {
   if (error) return <div className="h-full overflow-y-auto p-4 text-red-500 sm:p-8">{error}</div>
   if (!workforce) return <div className="h-full overflow-y-auto p-4 text-muted-foreground sm:p-8">{t("workforces.errors.notFound")}</div>
 
+  const builderReadOnlyReason = getBuilderReadOnlyReason(workforce.status, t)
+  const runDisabledReason = getRunDisabledReason(workforce.status, t)
+
   return (
     <div className="h-full overflow-y-auto">
       <div className="mx-auto grid w-full max-w-[1600px] gap-6 p-4 sm:p-8 xl:grid-cols-[0.95fr_1.05fr_0.8fr]">
@@ -124,6 +128,8 @@ export default function WorkforceBuilderPage() {
             messages={messages}
             loading={loading}
             submitting={submitting}
+            readOnly={Boolean(builderReadOnlyReason)}
+            readOnlyReason={builderReadOnlyReason || undefined}
             onSubmit={handleSubmit}
           />
         </div>
@@ -134,13 +140,15 @@ export default function WorkforceBuilderPage() {
             messageId={activeProposal?.id ?? null}
             status={activeProposal?.status ?? null}
             applying={applying}
+            readOnly={Boolean(builderReadOnlyReason)}
             onApply={handleApply}
           />
         </div>
         <div>
           <WorkforceTestPanel
             workforceId={workforce.id}
-            disabled={workforce.status !== "active"}
+            disabled={Boolean(runDisabledReason)}
+            disabledReason={runDisabledReason || undefined}
             onRunCreated={handleRunCreated}
           />
         </div>

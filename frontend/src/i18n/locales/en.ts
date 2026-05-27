@@ -3056,11 +3056,14 @@ Build when you need.`
     },
     run: {
       testTitle: "Test Workforce",
-      placeholder: "Describe the task you want the manager to coordinate."
+      placeholder: "Describe the task you want the manager to coordinate.",
+      inactiveDisabled: "Publish this workforce before running it.",
+      archivedDisabled: "Archived workforces cannot run."
     },
     builder: {
       chatTitle: "Builder Chat",
       chatDescription: "Describe the workforce change you want. The builder will turn it into a reviewable patch.",
+      archivedReadOnly: "Archived workforces are read-only. Builder changes cannot be proposed or applied.",
       emptyPrompt: "Start with something like: add worker Research Agent to handle competitor research.",
       roleBuilder: "Builder",
       roleYou: "You",

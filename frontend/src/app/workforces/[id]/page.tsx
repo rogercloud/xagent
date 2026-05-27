@@ -29,6 +29,7 @@ import type {
 } from "@/types/workforce"
 import { WorkforceSummary } from "@/components/workforce"
 import { canEditAgent } from "@/lib/agent-ui-access"
+import { getRunDisabledReason } from "../workforce-ui-state"
 
 interface WorkerEditState {
   alias: string
@@ -275,6 +276,8 @@ export default function WorkforceDetailPage() {
   if (error && !workforce) return <div className="h-full overflow-y-auto p-4 text-red-500 sm:p-8">{error}</div>
   if (!workforce) return <div className="h-full overflow-y-auto p-4 text-muted-foreground sm:p-8">{t("workforces.errors.notFound")}</div>
 
+  const runDisabledReason = getRunDisabledReason(workforce.status, t)
+
   return (
     <div className="h-full overflow-y-auto">
       <div className="mx-auto flex w-full max-w-7xl flex-col gap-6 p-4 sm:p-8">
@@ -306,9 +309,18 @@ export default function WorkforceDetailPage() {
           <Link href={`/workforces/${workforce.id}/canvas`}>
             <Button variant="outline">{t("workforces.actions.canvas")}</Button>
           </Link>
-          <Link href={`/workforces/${workforce.id}/run`}>
-            <Button>{t("workforces.actions.runWorkforce")}</Button>
-          </Link>
+          <div className="flex flex-col gap-1">
+            {runDisabledReason ? (
+              <Button disabled>{t("workforces.actions.runWorkforce")}</Button>
+            ) : (
+              <Link href={`/workforces/${workforce.id}/run`}>
+                <Button>{t("workforces.actions.runWorkforce")}</Button>
+              </Link>
+            )}
+            {runDisabledReason ? (
+              <span className="max-w-48 text-xs text-muted-foreground">{runDisabledReason}</span>
+            ) : null}
+          </div>
           {!isArchived ? (
             <Button
               variant="outline"
