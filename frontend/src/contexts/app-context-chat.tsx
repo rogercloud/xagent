@@ -12,7 +12,7 @@ import { ClarificationForm } from "@/components/chat/clarification-form"
 
 interface WebSocketMessage {
   type: string
-  data: unknown
+  data?: unknown
   timestamp: string
   task_id?: number
   step_id?: string
@@ -40,6 +40,7 @@ import { apiRequest, getApiErrorMessage, getUploadErrorMessage, isJsonRecord, pa
 import { useI18n } from "@/contexts/i18n-context"
 import { normalizeTimestampMs } from "@/lib/time-utils"
 import { unwrapFinalAnswerContent } from "@/lib/final-answer"
+import { normalizeTaskCompletedMessage } from "@/lib/task-completion"
 import {
   getFinalAnswerStreamActionPayload,
   getFinalAnswerStreamMessageId,
@@ -387,8 +388,39 @@ const normalizeStepStatus = (status: unknown): StepExecution["status"] => {
     : "pending"
 }
 
+const normalizeTaskStatus = (status: unknown): Task["status"] | null => {
+  return status === "pending" ||
+    status === "running" ||
+    status === "completed" ||
+    status === "failed" ||
+    status === "paused" ||
+    status === "waiting_for_user"
+    ? status
+    : null
+}
+
 const getString = (value: unknown, fallback = ""): string => typeof value === "string" ? value : fallback
 const getStringArray = (value: unknown): string[] => Array.isArray(value) ? value.map(item => String(item)) : []
+
+const getWebSocketErrorMessage = (message: WebSocketMessage): string => {
+  const root = message as unknown as Record<string, unknown>
+  const data = isJsonRecord(message.data) ? message.data : null
+  return getString(data?.message) || getString(data?.error) || getString(root.message) || getString(root.error) || "Unknown error"
+}
+
+const getWebSocketTaskStatus = (message: WebSocketMessage): Task["status"] | null => {
+  const root = message as unknown as Record<string, unknown>
+  const data = isJsonRecord(message.data) ? message.data : null
+  const rootTask = isJsonRecord(root.task) ? root.task : null
+  const dataTask = isJsonRecord(data?.task) ? data.task : null
+  return normalizeTaskStatus(dataTask?.status) || normalizeTaskStatus(rootTask?.status) || normalizeTaskStatus(data?.status) || normalizeTaskStatus(root.status)
+}
+
+const shouldStopProcessingForTaskStatus = (status: Task["status"] | null): boolean =>
+  status === "completed" ||
+  status === "failed" ||
+  status === "paused" ||
+  status === "waiting_for_user"
 
 const stepsFromPlanData = (planData: unknown, existingSteps: StepExecution[]): StepExecution[] | null => {
   const planRecord = planData && typeof planData === "object" ? planData as Record<string, unknown> : null
@@ -3614,10 +3646,10 @@ export function AppProvider({ children, token }: { children: React.ReactNode; to
         break
 
       case "task_completed":
-        const taskData = message.data as { success?: boolean; result?: string | Record<string, unknown>; file_outputs?: string[] }
+        const taskData = normalizeTaskCompletedMessage(message)
         dispatch({
           type: "UPDATE_TASK_STATUS",
-          payload: { status: taskData.success ? "completed" : "failed" }
+          payload: { status: taskData.status }
         })
         dispatch({ type: "TRIGGER_TASK_UPDATE" })
         dispatch({ type: "SET_PROCESSING", payload: false })  // Stop processing on task completion
@@ -3626,13 +3658,13 @@ export function AppProvider({ children, token }: { children: React.ReactNode; to
         if (state.dagExecution) {
           const updatedDAGExecution = {
             ...state.dagExecution,
-            phase: (taskData.success ? "completed" : "failed") as "completed" | "failed",
+            phase: taskData.status,
             updated_at: new Date().toISOString()
           }
           dispatch({ type: "SET_DAG_EXECUTION", payload: updatedDAGExecution })
         } else {
           const dagExecution: DAGExecution = {
-            phase: (taskData.success ? "completed" : "failed") as "completed" | "failed",
+            phase: taskData.status,
             current_plan: {},
             created_at: new Date().toISOString(),
             updated_at: new Date().toISOString()
@@ -3646,14 +3678,14 @@ export function AppProvider({ children, token }: { children: React.ReactNode; to
         }
 
         // Handle file outputs
-        if (taskData.file_outputs && taskData.file_outputs.length > 0) {
-          const fileCount = taskData.file_outputs.length
+        if (taskData.fileOutputs.length > 0) {
+          const fileCount = taskData.fileOutputs.length
           const fileContent = (
             <>
               <FileText className="h-4 w-4 inline mr-2 text-green-500" />
               {t('agent.logs.event.messages.fileOutputsGenerated', { count: fileCount })}:
               <div className="mt-2 space-y-1">
-                {taskData.file_outputs.map((file: string | any, index: number) => {
+                {taskData.fileOutputs.map((file: string | any, index: number) => {
                   let fileName, filePath
                   if (typeof file === 'object' && file !== null) {
                     fileName = file.filename || 'unknown'
@@ -3669,7 +3701,7 @@ export function AppProvider({ children, token }: { children: React.ReactNode; to
                       <button
                         onClick={() => {
                           // Dispatch custom event to open file preview with all files
-                          const allFiles = normalizeGeneratedPreviewFiles(taskData.file_outputs)
+                          const allFiles = normalizeGeneratedPreviewFiles(taskData.fileOutputs)
 
                           if (!filePath) {
                             return
@@ -3710,7 +3742,7 @@ export function AppProvider({ children, token }: { children: React.ReactNode; to
             })
           }
 
-          dispatchAutoOpenPreview(taskData.file_outputs, dispatch)
+          dispatchAutoOpenPreview(taskData.fileOutputs, dispatch)
         }
 
         dispatch({ type: "SET_PROCESSING", payload: false })
@@ -3787,6 +3819,7 @@ export function AppProvider({ children, token }: { children: React.ReactNode; to
       case "task_paused":
         console.trace('Original message:', JSON.stringify(message), 'Handler: handleMessage (task_paused)')
         dispatch({ type: "UPDATE_TASK_STATUS", payload: { status: "paused" } })
+        dispatch({ type: "SET_PROCESSING", payload: false })
         break
 
       case "task_waiting_for_user":
@@ -3802,6 +3835,7 @@ export function AppProvider({ children, token }: { children: React.ReactNode; to
             waitingInteractions: interactions.length > 0 ? interactions : undefined,
           }
         })
+        dispatch({ type: "SET_PROCESSING", payload: false })
         if (
           waitingMessage &&
           waitingMessage !== "Task waiting for user response" &&
@@ -3830,10 +3864,18 @@ export function AppProvider({ children, token }: { children: React.ReactNode; to
 
       case "agent_error":
         console.trace('Original message:', JSON.stringify(message), 'Handler: handleMessage (agent_error)')
-        const errorData = message.data as { message?: string }
+        const agentErrorMessage = getWebSocketErrorMessage(message)
+        const agentErrorTaskStatus = getWebSocketTaskStatus(message)
 
-        // Update DAG execution status to failed
-        if (state.dagExecution) {
+        if (agentErrorTaskStatus) {
+          dispatch({
+            type: "UPDATE_TASK_STATUS",
+            payload: { status: agentErrorTaskStatus },
+          })
+          dispatch({ type: "TRIGGER_TASK_UPDATE" })
+        }
+
+        if (agentErrorTaskStatus === "failed" && state.dagExecution) {
           const updatedDAGExecution = {
             ...state.dagExecution,
             phase: "failed" as const,
@@ -3842,17 +3884,48 @@ export function AppProvider({ children, token }: { children: React.ReactNode; to
           dispatch({ type: "SET_DAG_EXECUTION", payload: updatedDAGExecution })
         }
 
-        dispatch({ type: "SET_PROCESSING", payload: false })
+        if (shouldStopProcessingForTaskStatus(agentErrorTaskStatus)) {
+          dispatch({ type: "SET_PROCESSING", payload: false })
+        }
+
         dispatch({
           type: "ADD_MESSAGE",
           payload: {
             id: generateMessageId("msg"),
             role: "assistant",
-            content: `${t('agent.logs.event.messages.errorPrefix')} ${errorData.message || t('common.errors.unknownError')}`,
+            content: `${t('agent.logs.event.messages.errorPrefix')} ${agentErrorMessage || t('common.errors.unknownError')}`,
             timestamp: message.timestamp,
             status: "failed",
           },
         })
+        break
+
+      case "error":
+      case "task_error":
+        console.trace('Original message:', JSON.stringify(message), 'Handler: handleMessage (error)')
+        const websocketErrorMessage = getWebSocketErrorMessage(message)
+        const websocketTaskStatus = getWebSocketTaskStatus(message)
+
+        if (websocketTaskStatus) {
+          dispatch({ type: "UPDATE_TASK_STATUS", payload: { status: websocketTaskStatus } })
+          dispatch({ type: "TRIGGER_TASK_UPDATE" })
+        }
+        if (shouldStopProcessingForTaskStatus(websocketTaskStatus)) {
+          dispatch({ type: "SET_PROCESSING", payload: false })
+        }
+
+        if (!isDuplicateMessage(websocketErrorMessage, "agent-error")) {
+          dispatch({
+            type: "ADD_MESSAGE",
+            payload: {
+              id: generateMessageId("msg-error"),
+              role: "assistant",
+              content: `${t('agent.logs.event.messages.errorPrefix')} ${websocketErrorMessage}`,
+              timestamp: message.timestamp,
+              status: "failed",
+            },
+          })
+        }
         break
 
       case "message_received":

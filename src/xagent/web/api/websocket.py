@@ -34,7 +34,7 @@ from ...core.agent.checkpoint import CHECKPOINT_EVENT_TYPE
 from ...core.agent.trace import TraceEvent, TraceHandler, trace_user_message
 from ...core.file_ref import FILE_REF_MODEL_INSTRUCTIONS, build_file_ref
 from ..auth_dependencies import get_user_from_websocket_token
-from ..models.database import get_db
+from ..models.database import get_db, get_session_local
 from ..models.task import Task, TaskStatus
 from ..models.uploaded_file import UploadedFile
 from ..models.user import User
@@ -62,6 +62,7 @@ from ..services.task_lease_service import (
 )
 from ..services.uploaded_file_store import UploadedFileStore
 from ..services.workforce_runtime import (
+    mark_workforce_task_status,
     release_current_runner_task_lease_with_workforce_sync,
     release_task_lease_with_workforce_sync,
     sync_workforce_run_status,
@@ -97,6 +98,79 @@ def _task_status_uses_live_control(
     if pause_accepted:
         return False
     return status in {TaskStatus.WAITING_FOR_USER, TaskStatus.RUNNING}
+
+
+def _task_status_payload(db: Session, task_id: int) -> dict[str, Any] | None:
+    task = db.query(Task).filter(Task.id == task_id).first()
+    if task is None:
+        return None
+    return {
+        "id": task_id,
+        "status": task.status.value,
+    }
+
+
+def _task_error_payload(
+    db: Session,
+    task_id: int,
+    message: str,
+    *,
+    event_type: str = "error",
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "type": event_type,
+        "message": message,
+    }
+    task_payload = _task_status_payload(db, task_id)
+    if task_payload is not None:
+        payload["task"] = task_payload
+    return payload
+
+
+def _terminal_task_error_payload(
+    task_id: int,
+    message: str,
+    *,
+    event_type: str = "agent_error",
+) -> dict[str, Any]:
+    SessionLocal = get_session_local()
+    db = SessionLocal()
+    try:
+        released = release_current_runner_task_lease_with_workforce_sync(
+            db, task_id, status=TaskStatus.FAILED
+        )
+        task = db.query(Task).filter(Task.id == task_id).first()
+        if task is not None:
+            if not released:
+                setattr(task, "runner_id", None)
+                setattr(task, "lease_expires_at", None)
+                setattr(task, "last_heartbeat_at", datetime.now(timezone.utc))
+            mark_workforce_task_status(
+                db,
+                task,
+                TaskStatus.FAILED,
+                error_message=message,
+            )
+            db.commit()
+        return _task_error_payload(
+            db,
+            task_id,
+            message,
+            event_type=event_type,
+        )
+    except Exception:
+        db.rollback()
+        logger.warning("Failed to persist terminal task error", exc_info=True)
+        return {
+            "type": event_type,
+            "message": message,
+            "task": {
+                "id": task_id,
+                "status": TaskStatus.FAILED.value,
+            },
+        }
+    finally:
+        db.close()
 
 
 def _resolve_task_llm_ids(
@@ -1523,11 +1597,16 @@ async def execute_task_background(
         logger.error(f"Background task {task_id} execution failed: {e}", exc_info=True)
         # Send error event
         try:
+            message = str(e)
             await manager.broadcast_to_task(
                 {
-                    "type": "task_error",
+                    **_terminal_task_error_payload(
+                        task_id,
+                        message,
+                        event_type="task_error",
+                    ),
                     "task_id": task_id,
-                    "error": str(e),
+                    "error": message,
                     "timestamp": datetime.now(timezone.utc).timestamp(),
                 },
                 task_id,
@@ -2245,6 +2324,7 @@ async def handle_chat_message(
         context = message_data.get("context", {})
         files = message_data.get("files", [])
         user = message_data.get("user")
+        authorized_task_id: int | None = None
 
         # Race-condition fallback: when the message arrives without `files`
         # in its payload, the frontend may still have uploaded files via the
@@ -2427,6 +2507,8 @@ async def handle_chat_message(
                         )
                         await manager.broadcast_to_task(task_event, task_id)
                         logger.info(f"task_info event sent for task {task_id}")
+
+                authorized_task_id = int(task.id)
 
                 if not files and task.status == TaskStatus.PENDING:
                     files = _selected_file_refs_from_task(task, db)
@@ -2739,10 +2821,14 @@ async def handle_chat_message(
                         }:
                             await manager.broadcast_to_task(
                                 {
-                                    "type": "agent_error",
-                                    "message": (
-                                        "Task pause is still being applied; "
-                                        "please retry shortly."
+                                    **_task_error_payload(
+                                        db,
+                                        task_id,
+                                        (
+                                            "Task pause is still being applied; "
+                                            "please retry shortly."
+                                        ),
+                                        event_type="agent_error",
                                     ),
                                     "timestamp": datetime.now(timezone.utc).timestamp(),
                                 },
@@ -2885,8 +2971,12 @@ async def handle_chat_message(
                         )
                         await manager.broadcast_to_task(
                             {
-                                "type": "agent_error",
-                                "message": ("Internal dispatch error; please retry."),
+                                **_task_error_payload(
+                                    db,
+                                    task_id,
+                                    "Internal dispatch error; please retry.",
+                                    event_type="agent_error",
+                                ),
                                 "timestamp": datetime.now(timezone.utc).timestamp(),
                             },
                             task_id,
@@ -2917,11 +3007,15 @@ async def handle_chat_message(
                         )
                         await manager.broadcast_to_task(
                             {
-                                "type": "agent_error",
-                                "message": (
-                                    "Task is currently busy; please wait for "
-                                    "the previous turn to finish before sending "
-                                    "another message."
+                                **_task_error_payload(
+                                    db,
+                                    task_id,
+                                    (
+                                        "Task is currently busy; please wait for "
+                                        "the previous turn to finish before sending "
+                                        "another message."
+                                    ),
+                                    event_type="agent_error",
                                 ),
                                 "timestamp": datetime.now(timezone.utc).timestamp(),
                             },
@@ -2933,26 +3027,48 @@ async def handle_chat_message(
 
         except (ValueError, KeyError, TypeError) as e:
             # Data validation and format error
+            message = f"Data validation error: {str(e)}"
             logger.error(f"Data validation error in agent execution: {e}")
-            await manager.broadcast_to_task(
-                {
-                    "type": "agent_error",
-                    "message": f"Data validation error: {str(e)}",
-                    "timestamp": datetime.now(timezone.utc).timestamp(),
-                },
-                task_id,
-            )
+            timestamp = datetime.now(timezone.utc).timestamp()
+            if authorized_task_id is not None:
+                await manager.broadcast_to_task(
+                    {
+                        **_terminal_task_error_payload(authorized_task_id, message),
+                        "timestamp": timestamp,
+                    },
+                    authorized_task_id,
+                )
+            else:
+                await manager.send_personal_message(
+                    {
+                        "type": "error",
+                        "message": message,
+                        "timestamp": timestamp,
+                    },
+                    websocket,
+                )
         except RuntimeError as e:
             # Runtime error
+            message = f"Runtime error: {str(e)}"
             logger.error(f"Runtime error in agent execution: {e}")
-            await manager.broadcast_to_task(
-                {
-                    "type": "agent_error",
-                    "message": f"Runtime error: {str(e)}",
-                    "timestamp": datetime.now(timezone.utc).timestamp(),
-                },
-                task_id,
-            )
+            timestamp = datetime.now(timezone.utc).timestamp()
+            if authorized_task_id is not None:
+                await manager.broadcast_to_task(
+                    {
+                        **_terminal_task_error_payload(authorized_task_id, message),
+                        "timestamp": timestamp,
+                    },
+                    authorized_task_id,
+                )
+            else:
+                await manager.send_personal_message(
+                    {
+                        "type": "error",
+                        "message": message,
+                        "timestamp": timestamp,
+                    },
+                    websocket,
+                )
         except Exception as e:
             # Other unknown errors, re-raise
             logger.error(f"Unexpected error in agent execution: {e}")
@@ -2980,6 +3096,7 @@ async def handle_execute_task(
     """Handle task execution request"""
     try:
         user = message_data.get("user")
+        authorized_task_id: int | None = None
         if not user:
             raise ValueError("User authentication required for task execution")
 
@@ -3016,6 +3133,7 @@ async def handle_execute_task(
                 )
             if not task:
                 raise Exception(f"Task {task_id} not found or access denied")
+            authorized_task_id = int(task.id)
 
             (
                 model_id,
@@ -3153,26 +3271,48 @@ async def handle_execute_task(
 
     except (ValueError, KeyError, TypeError) as e:
         # Data validation and format error
+        message = f"Data validation error: {str(e)}"
         logger.error(f"Data validation error in task execution: {e}")
-        await manager.broadcast_to_task(
-            {
-                "type": "agent_error",
-                "message": f"Data validation error: {str(e)}",
-                "timestamp": datetime.now(timezone.utc).isoformat(),
-            },
-            task_id,
-        )
+        timestamp = datetime.now(timezone.utc).isoformat()
+        if authorized_task_id is not None:
+            await manager.broadcast_to_task(
+                {
+                    **_terminal_task_error_payload(authorized_task_id, message),
+                    "timestamp": timestamp,
+                },
+                authorized_task_id,
+            )
+        else:
+            await manager.send_personal_message(
+                {
+                    "type": "error",
+                    "message": message,
+                    "timestamp": timestamp,
+                },
+                websocket,
+            )
     except RuntimeError as e:
         # Runtime error
+        message = f"Runtime error: {str(e)}"
         logger.error(f"Runtime error in task execution: {e}")
-        await manager.broadcast_to_task(
-            {
-                "type": "agent_error",
-                "message": f"Runtime error: {str(e)}",
-                "timestamp": datetime.now(timezone.utc).isoformat(),
-            },
-            task_id,
-        )
+        timestamp = datetime.now(timezone.utc).isoformat()
+        if authorized_task_id is not None:
+            await manager.broadcast_to_task(
+                {
+                    **_terminal_task_error_payload(authorized_task_id, message),
+                    "timestamp": timestamp,
+                },
+                authorized_task_id,
+            )
+        else:
+            await manager.send_personal_message(
+                {
+                    "type": "error",
+                    "message": message,
+                    "timestamp": timestamp,
+                },
+                websocket,
+            )
     except Exception as e:
         # Other unknown errors, re-raise
         logger.error(f"Unexpected error in task execution: {e}")
@@ -3842,10 +3982,11 @@ async def handle_pause_task(
             pause_result = await agent_service.pause_execution()
             if pause_result is False:
                 await manager.send_personal_message(
-                    {
-                        "type": "error",
-                        "message": "No live execution found to pause",
-                    },
+                    _task_error_payload(
+                        db,
+                        task_id,
+                        "No live execution found to pause",
+                    ),
                     websocket,
                 )
                 logger.warning(f"No live execution found to pause for task {task_id}")
@@ -3867,10 +4008,11 @@ async def handle_pause_task(
         else:
             # If pause not supported, send error message
             await manager.send_personal_message(
-                {
-                    "type": "error",
-                    "message": "Current agent does not support pause functionality",
-                },
+                _task_error_payload(
+                    db,
+                    task_id,
+                    "Current agent does not support pause functionality",
+                ),
                 websocket,
             )
             logger.warning(

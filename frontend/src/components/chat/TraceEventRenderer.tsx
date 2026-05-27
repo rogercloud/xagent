@@ -23,6 +23,10 @@ import { MarkdownRenderer } from "@/components/ui/markdown-renderer";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { normalizeTimestampMs } from '@/lib/time-utils';
 import { InlineFilePreview } from '@/components/file/inline-file-preview';
+import {
+  isStoppedTraceProcessStatus,
+  resolveTraceProcessStatus,
+} from '@/lib/trace-process-status';
 
 // Types
 interface ToolArgs {
@@ -128,7 +132,7 @@ interface ProcessedStep {
   stepId: string;
   stepName: string;
   description: string;
-  status: 'pending' | 'running' | 'completed' | 'failed';
+  status: 'pending' | 'running' | 'completed' | 'failed' | 'paused' | 'waiting_for_user';
   tools: Array<{ function: { name: string } }>;
   reasoning?: string;
   code: string;
@@ -139,6 +143,7 @@ interface ProcessedStep {
 
 interface TraceEventRendererProps {
   events: TraceEvent[];
+  taskStatus?: string;
 }
 
 function getTraceData(event: TraceEvent): NonNullable<TraceEvent['data']> {
@@ -185,7 +190,7 @@ const isAgentProgressEvent = (event: TraceEvent): boolean => (
 );
 
 // Process trace events into steps
-function useProcessedSteps(events: TraceEvent[]): ProcessedStep[] {
+function useProcessedSteps(events: TraceEvent[], taskStatus?: string): ProcessedStep[] {
   const { t } = useI18n();
   return useMemo(() => {
     const stepsMap = new Map<string, ProcessedStep>();
@@ -598,8 +603,42 @@ function useProcessedSteps(events: TraceEvent[]): ProcessedStep[] {
       }
     });
 
-    return Array.from(stepsMap.values()).filter(step => step.stepName);
-  }, [events, t]);
+    const steps = Array.from(stepsMap.values()).filter(step => step.stepName);
+
+    if (isStoppedTraceProcessStatus(taskStatus)) {
+      steps.forEach((step) => {
+        const runningActions = step.actions.filter(action => action.status === 'running');
+        if (taskStatus === 'failed' && (step.status !== 'completed' || runningActions.length > 0)) {
+          step.status = 'failed';
+          runningActions.forEach((action) => {
+            action.status = 'failed';
+            action.data.error = action.data.error || t('traceEventRenderer.unknownError');
+          });
+          return;
+        }
+
+        if (taskStatus === 'completed' && step.status !== 'failed') {
+          step.status = 'completed';
+          runningActions.forEach((action) => {
+            action.status = 'completed';
+          });
+          return;
+        }
+
+        if (
+          (taskStatus === 'paused' || taskStatus === 'waiting_for_user') &&
+          (step.status === 'pending' || step.status === 'running')
+        ) {
+          step.status = taskStatus;
+          runningActions.forEach((action) => {
+            action.status = 'completed';
+          });
+        }
+      });
+    }
+
+    return steps;
+  }, [events, taskStatus, t]);
 }
 
 
@@ -1159,6 +1198,7 @@ function StepItem({ step, index, onOpenTerminal, onViewDetail, onFileClick, onAg
   const { t } = useI18n();
   const isCompleted = step.status === 'completed';
   const isFailed = step.status === 'failed';
+  const isPaused = step.status === 'paused' || step.status === 'waiting_for_user';
   const [isExpanded, setIsExpanded] = useState(() => !isCompleted);
   const wasCompletedRef = useRef(isCompleted);
   const rawTitle = step.description || step.stepName;
@@ -1196,6 +1236,8 @@ function StepItem({ step, index, onOpenTerminal, onViewDetail, onFileClick, onAg
           <CheckCircle2 className="w-5 h-5 text-green-500 mt-0.5" />
         ) : isFailed ? (
           <Info className="w-5 h-5 text-red-500 mt-0.5" />
+        ) : isPaused ? (
+          <Info className="w-5 h-5 text-yellow-500 mt-0.5" />
         ) : (
           <Loader2 className="w-5 h-5 text-primary animate-spin mt-0.5" />
         )}
@@ -1245,9 +1287,13 @@ function StepItem({ step, index, onOpenTerminal, onViewDetail, onFileClick, onAg
 }
 
 // Main TraceEventRenderer Component
-export function TraceEventRenderer({ events }: TraceEventRendererProps) {
+export function TraceEventRenderer({ events, taskStatus }: TraceEventRendererProps) {
   const { t } = useI18n();
-  const steps = useProcessedSteps(events);
+  const processStatus = resolveTraceProcessStatus({
+    taskStatus,
+    traceEvents: events,
+  });
+  const steps = useProcessedSteps(events, processStatus);
   const router = useRouter();
 
   const { openFilePreview, dispatch } = useApp();

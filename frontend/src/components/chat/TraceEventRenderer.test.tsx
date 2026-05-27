@@ -1,7 +1,7 @@
 /// <reference types="@testing-library/jest-dom/vitest" />
 import React from "react"
 import { cleanup, fireEvent, render, screen } from "@testing-library/react"
-import { afterEach, describe, expect, it, vi } from "vitest"
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 
 const apiRequestMock = vi.hoisted(() => vi.fn())
 
@@ -59,6 +59,10 @@ vi.mock("@/components/file/pptx-preview-renderer", () => ({
 import { TraceEventRenderer } from "./TraceEventRenderer"
 
 describe("TraceEventRenderer", () => {
+  beforeEach(() => {
+    window.scrollTo = vi.fn()
+  })
+
   afterEach(() => {
     cleanup()
     apiRequestMock.mockReset()
@@ -488,6 +492,75 @@ describe("TraceEventRenderer", () => {
     expect(toggle).toHaveAttribute("aria-expanded", "true")
     expect(screen.getByText("traceEventRenderer.hideProcess")).toBeInTheDocument()
     expect(screen.getByText(/traceEventRenderer.executeTool:web_search/)).toBeInTheDocument()
+  })
+
+  it("stops running process spinners when the parent task has failed", () => {
+    const { container } = render(
+      <TraceEventRenderer
+        taskStatus="failed"
+        events={[
+          {
+            event_id: "start",
+            event_type: "react_task_start",
+            step_id: "step-1",
+            timestamp: 1000,
+            data: {},
+          },
+          {
+            event_id: "llm-start",
+            event_type: "llm_call_start",
+            step_id: "step-1",
+            timestamp: 2000,
+            data: { model_name: "gpt-test" },
+          },
+          {
+            event_id: "llm-failed",
+            event_type: "llm_call_failed",
+            step_id: "step-1",
+            timestamp: 3000,
+            data: { error: "OpenAI bad request" },
+          },
+        ]}
+      />,
+    )
+
+    expect(container.querySelector(".animate-spin")).toBeNull()
+  })
+
+  it("infers a failed process from terminal trace errors when task status is unavailable", () => {
+    const { container } = render(
+      <TraceEventRenderer
+        events={[
+          {
+            event_id: "start",
+            event_type: "react_task_start",
+            step_id: "step-1",
+            timestamp: 1000,
+            data: {},
+          },
+          {
+            event_id: "llm-start",
+            event_type: "llm_call_start",
+            step_id: "step-1",
+            timestamp: 2000,
+            data: { model_name: "gpt-test" },
+          },
+          {
+            event_id: "trace-error",
+            event_type: "trace_error",
+            step_id: "step-1",
+            timestamp: 3000,
+            data: {
+              error_type: "agent_error",
+              status: "failed",
+              error_message: "All patterns failed",
+            },
+          },
+        ]}
+      />,
+    )
+
+    expect(container.querySelector(".animate-spin")).toBeNull()
   })
 
   it("renders workforce delegation trace events as a dedicated step", () => {
