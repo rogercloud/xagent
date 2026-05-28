@@ -345,6 +345,7 @@ def _build_tool_selection_spec_for_task(
         workforce_extra_names=(
             workforce_runtime.worker_tool_names if workforce_runtime else None
         ),
+        extras_only_when_unconfigured=workforce_runtime is not None,
     )
     if spec.is_all():
         logger.info(
