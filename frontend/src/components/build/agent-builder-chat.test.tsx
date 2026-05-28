@@ -327,4 +327,38 @@ describe("AgentBuilderChat", () => {
       )
     })
   })
+
+  it("handles null task completion results without crashing", async () => {
+    render(
+      <AgentBuilderChat
+        agentConfig={agentConfig}
+        onUpdateConfig={vi.fn()}
+      />
+    )
+
+    fireEvent.click(screen.getByText("send-chat-input"))
+
+    expect(MockWebSocket.instances).toHaveLength(1)
+    const ws = MockWebSocket.instances[0]
+    ws.open()
+
+    await waitFor(() => {
+      expect(ws.sentMessages).toHaveLength(1)
+    })
+
+    ws.onmessage?.({
+      data: JSON.stringify({
+        type: "task_completed",
+        success: true,
+        status: "completed",
+        result: null,
+      }),
+    })
+
+    await waitFor(() => {
+      const messages = screen.getAllByTestId("chat-message")
+      const latestMessage = messages[messages.length - 1]
+      expect(latestMessage).toHaveAttribute("data-process-status", "completed")
+    })
+  })
 })

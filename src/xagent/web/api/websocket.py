@@ -142,9 +142,10 @@ def _terminal_task_error_payload(
         task = db.query(Task).filter(Task.id == task_id).first()
         if task is not None:
             if not released:
-                setattr(task, "runner_id", None)
-                setattr(task, "lease_expires_at", None)
-                setattr(task, "last_heartbeat_at", datetime.now(timezone.utc))
+                orm_task = cast(Any, task)
+                orm_task.runner_id = None
+                orm_task.lease_expires_at = None
+                orm_task.last_heartbeat_at = datetime.now(timezone.utc)
             mark_workforce_task_status(
                 db,
                 task,

@@ -330,6 +330,47 @@ describe("workforce route entry points", () => {
     expect(screen.getByRole("button", { name: /workforces.actions.runWorkforce/ })).toBeDisabled()
   })
 
+  it("allows clearing and replacing worker sort order before saving", async () => {
+    const worker = {
+      id: 100,
+      agent: {
+        id: 8,
+        name: "Worker Agent",
+        description: null,
+        logo_url: null,
+        status: "published",
+      },
+      alias: "Researcher",
+      assignment_instructions: "Research launch tasks",
+      source_type: "existing" as const,
+      template_id: null,
+      enabled: true,
+      sort_order: 3,
+      canvas_position: null,
+      created_at: null,
+      updated_at: null,
+    }
+    getWorkforceMock.mockResolvedValueOnce({ ...workforceDetail, workers: [worker] })
+    listAgentOptionsMock.mockResolvedValueOnce([])
+    updateWorkforceAgentMock.mockResolvedValueOnce({ ...worker, sort_order: 12 })
+
+    render(<WorkforceDetailPage />)
+
+    const sortInput = (await screen.findByDisplayValue("3")) as HTMLInputElement
+    fireEvent.change(sortInput, { target: { value: "" } })
+    expect(sortInput.value).toBe("")
+    fireEvent.change(sortInput, { target: { value: "12" } })
+    fireEvent.click(screen.getByText("workforces.actions.saveWorker"))
+
+    await waitFor(() => {
+      expect(updateWorkforceAgentMock).toHaveBeenCalledWith(
+        "42",
+        100,
+        expect.objectContaining({ sort_order: 12 }),
+      )
+    })
+  })
+
   it("keeps builder propose and apply controls read-only for archived workforces", async () => {
     getWorkforceMock.mockResolvedValueOnce({
       ...workforceDetail,

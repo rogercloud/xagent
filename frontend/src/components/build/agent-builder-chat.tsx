@@ -401,7 +401,7 @@ export function AgentBuilderChat({ agentConfig, onUpdateConfig, availableOptions
               // The backend no longer sends config_updates in task_completed.
               // We handle it in tool_execution_end.
 
-              let finalContent = typeof taskCompletion.result === 'object' ? (taskCompletion.result as any).content : taskCompletion.result;
+              let finalContent = taskCompletion.result && typeof taskCompletion.result === 'object' ? (taskCompletion.result as any).content : taskCompletion.result;
               finalContent = finalContent || currentReply;
 
               let cleanReply = typeof finalContent === 'string' ? finalContent.replace(/```json[\s\S]*?(```|$)/gi, "").trim() : "";

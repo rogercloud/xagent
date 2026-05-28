@@ -35,7 +35,7 @@ interface WorkerEditState {
   alias: string
   assignment_instructions: string
   enabled: boolean
-  sort_order: number
+  sort_order: string
 }
 
 function workerEditState(worker: WorkforceWorker): WorkerEditState {
@@ -43,7 +43,7 @@ function workerEditState(worker: WorkforceWorker): WorkerEditState {
     alias: worker.alias || "",
     assignment_instructions: worker.assignment_instructions,
     enabled: worker.enabled,
-    sort_order: worker.sort_order ?? 1,
+    sort_order: String(worker.sort_order ?? 1),
   }
 }
 
@@ -52,6 +52,14 @@ function buildWorkerEditState(workers: WorkforceWorker[]): Record<number, Worker
     accumulator[worker.id] = workerEditState(worker)
     return accumulator
   }, {})
+}
+
+function normalizeWorkerSortOrder(value: string, fallback: number | null | undefined): number {
+  const parsed = Number(value)
+  if (Number.isFinite(parsed) && parsed > 0) {
+    return parsed
+  }
+  return fallback ?? 1
 }
 
 export default function WorkforceDetailPage() {
@@ -188,7 +196,7 @@ export default function WorkforceDetailPage() {
         alias: edit.alias.trim() || null,
         assignment_instructions: edit.assignment_instructions.trim(),
         enabled: edit.enabled,
-        sort_order: edit.sort_order,
+        sort_order: normalizeWorkerSortOrder(edit.sort_order, worker.sort_order),
       })
       setWorkforce((current) =>
         current
@@ -495,13 +503,13 @@ export default function WorkforceDetailPage() {
                         <Label>{t("workforces.fields.order")}</Label>
                         <Input
                           type="number"
-                          value={String(edit.sort_order)}
+                          value={edit.sort_order}
                           onChange={(event) =>
                             setWorkerEdits((current) => ({
                               ...current,
                               [worker.id]: {
                                 ...edit,
-                                sort_order: Number(event.target.value) || worker.sort_order || 1,
+                                sort_order: event.target.value,
                               },
                             }))
                           }

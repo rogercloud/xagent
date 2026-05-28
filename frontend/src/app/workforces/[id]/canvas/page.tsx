@@ -13,6 +13,7 @@ import { WorkforceCanvas } from "@/components/workforce"
 export default function WorkforceCanvasPage() {
   const { t } = useI18n()
   const params = useParams()
+  const id = Array.isArray(params.id) ? params.id[0] : params.id
   const [canvas, setCanvas] = useState<WorkforceCanvasResponse | null>(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
@@ -22,7 +23,6 @@ export default function WorkforceCanvasPage() {
       try {
         setLoading(true)
         setError(null)
-        const id = Array.isArray(params.id) ? params.id[0] : params.id
         if (!id) {
           setCanvas(null)
           return
@@ -36,9 +36,8 @@ export default function WorkforceCanvasPage() {
       }
     }
     void load()
-  }, [params.id, t])
+  }, [id, t])
 
-  const id = Array.isArray(params.id) ? params.id[0] : params.id
   const backHref = id ? `/workforces/${id}` : "/workforces"
 
   if (loading) return <div className="h-full overflow-y-auto p-4 text-muted-foreground sm:p-8">{t("workforces.loading.canvas")}</div>
