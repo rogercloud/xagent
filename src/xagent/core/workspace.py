@@ -137,6 +137,14 @@ class TaskWorkspace:
 
         # Check if file already exists in database
         resolved_db_session = db_session or self.db_session
+        cached_file_id = self._recently_registered_files.get(str(resolved_path))
+        if cached_file_id:
+            self._sync_existing_file_record(
+                cached_file_id, resolved_path, resolved_db_session
+            )
+            self._remember_file_registration(cached_file_id, resolved_path)
+            return cached_file_id
+
         existing_file_id = self._get_file_id_from_db(resolved_path, resolved_db_session)
         if existing_file_id:
             self._sync_existing_file_record(

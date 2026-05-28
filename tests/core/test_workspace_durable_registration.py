@@ -269,6 +269,68 @@ def test_agent_workspace_register_file_avoids_parent_output_name_collision(
         engine.dispose()
 
 
+def test_agent_workspace_register_file_is_idempotent_after_canonicalization(
+    monkeypatch, tmp_path, mock_workspace_db
+):
+    del mock_workspace_db
+    object_root = tmp_path / "objects"
+    monkeypatch.setenv("XAGENT_FILE_STORAGE_URI", object_root.as_uri())
+    get_file_storage.cache_clear()
+
+    engine = create_engine(
+        "sqlite:///:memory:", connect_args={"check_same_thread": False}
+    )
+    SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+    Base.metadata.create_all(bind=engine)
+    db = SessionLocal()
+    try:
+        user = User(username="delegated-idempotent-user", password_hash="hash")
+        db.add(user)
+        db.flush()
+        task = Task(id=321, user_id=user.id, title="Parent task")
+        db.add(task)
+        db.commit()
+
+        workspace = TaskWorkspace(
+            id="agent_2_abcd1234",
+            base_dir=str(tmp_path / "workspaces"),
+            db_task_id=321,
+        )
+        output_path = workspace.output_dir / "report.txt"
+        output_path.write_text("first delegated output", encoding="utf-8")
+
+        file_id = workspace.register_file(str(output_path), db_session=db)
+        db.commit()
+
+        output_path.write_text("updated delegated output", encoding="utf-8")
+        second_file_id = workspace.register_file(str(output_path), db_session=db)
+        db.commit()
+
+        assert second_file_id == file_id
+        records = db.query(UploadedFile).all()
+        assert len(records) == 1
+        record = records[0]
+        canonical_path = (
+            tmp_path
+            / "workspaces"
+            / f"user_{user.id}"
+            / "web_task_321"
+            / "output"
+            / "report.txt"
+        )
+        assert record.storage_path == str(canonical_path)
+        assert record.workspace_relative_path == "output/report.txt"
+        assert record.file_size == len("updated delegated output")
+        assert canonical_path.read_text(encoding="utf-8") == "updated delegated output"
+
+        object_files = [path for path in object_root.rglob("*") if path.is_file()]
+        assert len(object_files) == 1
+        assert object_files[0].read_text(encoding="utf-8") == "updated delegated output"
+    finally:
+        db.close()
+        engine.dispose()
+
+
 def test_tool_factory_workspace_preserves_db_task_id(tmp_path):
     workspace = ToolFactory._create_workspace(
         {
