@@ -18,6 +18,7 @@ from .....web.services.model_service import (
 from ....tracing import create_agent_tracer
 from ....utils.type_check import ensure_list
 from ...core.document_search import find_missing_knowledge_bases
+from .agent_tool_names import gen_agent_tool_name
 from .base import AbstractBaseTool, ToolCategory, ToolVisibility
 
 logger = logging.getLogger(__name__)
@@ -750,7 +751,7 @@ class CreateAgentTool(AbstractBaseTool):
             )
 
             # Generate the tool name and markdown link
-            tool_name = gen_agent_tool_name(agent_name)
+            tool_name = gen_agent_tool_name(agent.id)
             markdown_link = f"[{agent_name}](agent://{agent.id})"
 
             rename_note = ""
@@ -945,7 +946,7 @@ class UpdateAgentTool(AbstractBaseTool):
                 return UpdateAgentToolResult(
                     agent_id=agent_id,
                     agent_name=agent.name,
-                    tool_name=gen_agent_tool_name(agent.name),
+                    tool_name=gen_agent_tool_name(agent.id),
                     markdown_link=f"[{agent.name}](agent://{agent.id})",
                     status="error",
                     message=(
@@ -1045,7 +1046,7 @@ class UpdateAgentTool(AbstractBaseTool):
                 return UpdateAgentToolResult(
                     agent_id=agent_id,
                     agent_name=agent.name,
-                    tool_name=gen_agent_tool_name(agent.name),
+                    tool_name=gen_agent_tool_name(agent.id),
                     markdown_link=f"[{agent.name}](agent://{agent.id})",
                     status="success",
                     message=f"ℹ️ No updates were made to agent '{agent.name}' (ID: {agent_id}). "
@@ -1062,7 +1063,7 @@ class UpdateAgentTool(AbstractBaseTool):
 
             # Generate the tool name and markdown link
             agent_name = str(agent.name)
-            tool_name = gen_agent_tool_name(agent_name)
+            tool_name = gen_agent_tool_name(agent.id)
             markdown_link = f"[{agent_name}](agent://{agent.id})"
 
             logger.info(
@@ -1217,7 +1218,7 @@ class ListAgentsTool(AbstractBaseTool):
             # Build agent info list
             agent_infos = []
             for agent in agents:
-                tool_name = gen_agent_tool_name(agent.name)
+                tool_name = gen_agent_tool_name(agent.id)
                 markdown_link = f"[{agent.name}](agent://{agent.id})"
 
                 agent_info = AgentInfo(
@@ -1309,7 +1310,8 @@ class AgentTool(AbstractBaseTool):
             user_id: User ID for model access
             task_id: Task ID for workspace isolation
             workspace_base_dir: Base directory for workspace files
-            tool_name: Optional delegated tool name override
+            tool_name: Deprecated delegated tool name override. Agent tools always
+                expose the canonical agent_<id> name.
             tool_description: Optional delegated tool description override
             extra_system_prompt: Optional system prompt appended during execution
             parent_task_id: Parent task ID for delegation metadata
@@ -1360,7 +1362,7 @@ class AgentTool(AbstractBaseTool):
     @property
     def name(self) -> str:
         """Tool name."""
-        return self._tool_name or gen_agent_tool_name(self._agent_name)
+        return gen_agent_tool_name(self._agent_id)
 
     @property
     def description(self) -> str:
@@ -1829,22 +1831,6 @@ class AgentTool(AbstractBaseTool):
                 "error", execution_task_id=execution_task_id, error=error_msg
             )
             return AgentToolResult(response=error_msg).model_dump(exclude_none=True)
-
-
-def gen_agent_tool_name(agent_name: str) -> str:
-    """
-    Generate the tool name for a published agent.
-
-    This is a centralized function to ensure consistent naming across the codebase.
-    Tool name format: call_agent_{agent_name_lower_with_underscores}
-
-    Args:
-        agent_name: The name of the agent
-
-    Returns:
-        The tool name that will be used for this agent
-    """
-    return f"call_agent_{agent_name.lower().replace(' ', '_')}"
 
 
 def get_published_agents_tools(

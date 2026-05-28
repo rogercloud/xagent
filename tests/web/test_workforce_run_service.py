@@ -631,7 +631,7 @@ async def test_create_default_tools_forwards_workforce_delegation_config(
     )
 
     user = _create_user(db_session, "owner")
-    overrides = {42: {"tool_name": "call_workforce_worker_1_research"}}
+    overrides = {42: {"tool_name": "agent_42"}}
 
     await create_default_tools(
         db_session,

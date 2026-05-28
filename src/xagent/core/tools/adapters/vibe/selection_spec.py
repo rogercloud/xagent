@@ -472,6 +472,8 @@ class _SpecByCategories(ToolSelectionSpec):
         return True
 
     def includes_published_agent(self) -> bool:
+        if self.name_extras:
+            return True
         if "agent" not in self.categories:
             return False
         if self.published_agent_ids is not None and len(self.published_agent_ids) == 0:

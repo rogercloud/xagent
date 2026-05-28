@@ -926,6 +926,7 @@ def test_from_raw_workforce_extras_carried_in_by_categories():
     )
     assert isinstance(spec, _SpecByCategories)
     assert spec.name_extras == frozenset({"worker_tool_a", "worker_tool_b"})
+    assert spec.includes_published_agent() is True
 
 
 # ----- P2 fix: includes_custom_api with category restriction -------------

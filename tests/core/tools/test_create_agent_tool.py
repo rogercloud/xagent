@@ -126,7 +126,7 @@ class TestCreateAgentTool:
                 assert result["status"] == "success"
                 assert result["agent_name"] == "test_agent"
                 assert result["agent_id"] > 0
-                assert result["tool_name"] == "call_agent_test_agent"
+                assert result["tool_name"] == f"agent_{result['agent_id']}"
                 assert "test_agent" in result["markdown_link"]
                 assert "agent://" in result["markdown_link"]
                 mock_invalidate_agent_cache.assert_called_once_with(
@@ -250,7 +250,7 @@ class TestCreateAgentTool:
 
                 result = await tool.run_json_async({"task": "draft report"})
 
-            assert tool.name == "call_workforce_worker_7_writer"
+            assert tool.name == f"agent_{agent.id}"
             assert tool.description == "Write the final report."
             assert result["response"] == "worker response"
             assert result["file_outputs"] == []
@@ -1445,19 +1445,19 @@ class TestAgentToolNameGeneration:
     """Test suite for agent tool name generation."""
 
     def test_gen_agent_tool_name_simple(self) -> None:
-        """Test tool name generation with simple name."""
-        result = gen_agent_tool_name("TestAgent")
-        assert result == "call_agent_testagent"  # No spaces, just lowercased
+        """Test tool name generation with an agent ID."""
+        result = gen_agent_tool_name(42)
+        assert result == "agent_42"
 
-    def test_gen_agent_tool_name_with_spaces(self) -> None:
-        """Test tool name generation with spaces."""
-        result = gen_agent_tool_name("Research Assistant")
-        assert result == "call_agent_research_assistant"
+    def test_gen_agent_tool_name_with_string_id(self) -> None:
+        """Test tool name generation with a string agent ID."""
+        result = gen_agent_tool_name("42")
+        assert result == "agent_42"
 
-    def test_gen_agent_tool_name_with_special_chars(self) -> None:
-        """Test tool name generation with special characters."""
-        result = gen_agent_tool_name("AI-Research-Agent_2024")
-        assert result == "call_agent_ai-research-agent_2024"
+    def test_gen_agent_tool_name_rejects_names(self) -> None:
+        """Test tool name generation rejects display names."""
+        with pytest.raises(ValueError):
+            gen_agent_tool_name("Research Assistant")
 
 
 class TestDraftAgentsInTools:
@@ -1490,8 +1490,8 @@ class TestDraftAgentsInTools:
             )
             tool_names = {tool.name for tool in tools}
 
-            assert "call_agent_published_agent" in tool_names
-            assert "call_agent_draft_agent" not in tool_names
+            assert f"agent_{published_agent.id}" in tool_names
+            assert f"agent_{draft_agent.id}" not in tool_names
 
         finally:
             db.close()
@@ -1529,8 +1529,8 @@ class TestDraftAgentsInTools:
             )
             tool_names = {tool.name for tool in tools}
 
-            assert "call_agent_published_agent" in tool_names
-            assert "call_agent_draft_agent" in tool_names
+            assert f"agent_{published_agent.id}" in tool_names
+            assert f"agent_{draft_agent.id}" in tool_names
 
         finally:
             db.close()
@@ -1567,7 +1567,7 @@ class TestDraftAgentsInTools:
             )
             tool_names = {tool.name for tool in tools_for_user2}
 
-            assert "call_agent_user1_draft" not in tool_names
+            assert f"agent_{draft_agent.id}" not in tool_names
 
         finally:
             db.close()
@@ -1632,7 +1632,7 @@ class TestCreateAndCallAgent:
                 )
                 tool_names = {tool.name for tool in tools}
 
-                assert "call_agent_simple_calculator" in tool_names
+                assert f"agent_{agent_id}" in tool_names
 
                 # Step 3: Verify agent can be loaded
                 agent = db.query(Agent).filter(Agent.id == agent_id).first()
