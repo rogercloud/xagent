@@ -2058,7 +2058,7 @@ if TYPE_CHECKING:
     from xagent.web.tools.config import WebToolConfig
 
 
-@register_tool(categories={"agent"})
+@register_tool(categories={"agent"}, selection_gate="published_agent")
 async def create_agent_tools(config: "WebToolConfig") -> list[AbstractBaseTool]:
     """Create tools from published agents.
 

@@ -188,6 +188,40 @@ async def test_registry_skips_creator_when_categories_disjoint(isolated_registry
     assert len(tools) == 1
 
 
+async def test_registry_runs_published_agent_creator_for_workforce_extras(
+    isolated_registry,
+):
+    """Workforce injects specific worker agent tools by name, without
+    selecting the whole ``agent`` category. The registry must still dispatch
+    only the published-agent creator so the final name filter can keep the
+    injected worker tool.
+    """
+    basic = AsyncMock(return_value=[_mock_tool("calc", "basic")])
+    basic.__name__ = "basic_creator"
+    published_agents = AsyncMock(return_value=[_mock_tool("agent_42", "agent")])
+    published_agents.__name__ = "create_agent_tools"
+    agent_management = AsyncMock(return_value=[_mock_tool("create_agent", "agent")])
+    agent_management.__name__ = "create_create_agent_tool"
+    isolated_registry.register(basic, categories={"basic"})
+    isolated_registry.register(
+        published_agents,
+        categories={"agent"},
+        selection_gate="published_agent",
+    )
+    isolated_registry.register(agent_management, categories={"agent"})
+
+    spec = ToolSelectionSpec.from_raw(
+        tool_categories=["basic"],
+        workforce_extra_names={"agent_42"},
+    )
+    tools = await isolated_registry.create_registered_tools(_FakeConfig(spec))
+
+    assert basic.await_count == 1
+    assert published_agents.await_count == 1
+    assert agent_management.await_count == 0
+    assert [tool.name for tool in tools] == ["calc", "agent_42"]
+
+
 async def test_registry_always_runs_creator_without_declared_categories(
     isolated_registry,
 ):
@@ -1010,6 +1044,26 @@ def test_compute_allowed_names_by_categories_filters_correctly():
         ]
     )
     assert result == frozenset({"calc", "injected_worker_tool"})
+
+
+def test_compute_allowed_names_workforce_extra_does_not_admit_agent_category():
+    """Injected workforce worker names must not broaden the user's category
+    selection to every agent-category tool.
+    """
+    spec = ToolSelectionSpec.from_raw(
+        tool_categories=["basic"],
+        workforce_extra_names={"agent_42"},
+    )
+    result = spec.compute_allowed_names(
+        [
+            _mock_tool("calc", "basic"),
+            _mock_tool("agent_42", "agent"),
+            _mock_tool("agent_99", "agent"),
+        ]
+    )
+
+    assert spec.categories == frozenset({"basic"})
+    assert result == frozenset({"calc", "agent_42"})
 
 
 # ----- Factory L252 dispatch through spec.compute_allowed_names ---------
