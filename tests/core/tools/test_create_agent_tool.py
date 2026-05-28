@@ -1,6 +1,7 @@
 """Tests for CreateAgentTool - dynamically creating agents during task execution."""
 
 import tempfile
+from pathlib import Path
 from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
@@ -430,9 +431,17 @@ class TestCreateAgentTool:
                     .filter(UploadedFile.file_id == file_outputs[0]["file_id"])
                     .one()
                 )
+                canonical_path = (
+                    Path(workspace_root)
+                    / f"user_{user.id}"
+                    / "web_task_77"
+                    / "output"
+                    / "report.txt"
+                )
                 assert file_record.user_id == user.id
                 assert file_record.task_id == 77
-                assert file_record.storage_path == str(output_path)
+                assert file_record.storage_path == str(canonical_path)
+                assert canonical_path.read_text(encoding="utf-8") == "worker report"
                 assert file_record.workspace_relative_path == "output/report.txt"
                 assert file_record.workspace_category == "output"
 
@@ -535,7 +544,16 @@ class TestCreateAgentTool:
                     .filter(UploadedFile.file_id == "worker-owned-output")
                     .one()
                 )
+                canonical_path = (
+                    Path(workspace_root)
+                    / f"user_{user.id}"
+                    / "web_task_77"
+                    / "output"
+                    / "report.txt"
+                )
                 assert file_record.task_id == 77
+                assert file_record.storage_path == str(canonical_path)
+                assert canonical_path.read_text(encoding="utf-8") == "worker report"
                 assert file_record.workspace_relative_path == "output/report.txt"
                 assert file_record.workspace_category == "output"
         finally:
