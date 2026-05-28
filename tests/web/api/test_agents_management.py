@@ -8,6 +8,7 @@ from xagent.web.models.agent import Agent, AgentStatus
 from xagent.web.models.agent_api_key import AgentApiKey
 from xagent.web.models.task import Task, TaskStatus
 from xagent.web.models.user import User
+from xagent.web.models.workforce import Workforce
 from xagent.web.services.workforce_access import WorkforcePolicy, set_workforce_policy
 
 from .conftest import (
@@ -139,6 +140,48 @@ def test_list_agents_includes_owned_agents_and_policy_visible_agents() -> None:
     assert items_by_id[shared_draft_id]["access"] == "policy"
     assert items_by_id[shared_draft_id]["status"] == "draft"
     assert items_by_id[shared_draft_id]["readonly"] is True
+
+
+def test_list_agents_hides_workforce_manager_agents() -> None:
+    headers = _admin_headers()
+    owner_id = _user_id("admin")
+    manager_id = _create_agent_row(
+        user_id=owner_id,
+        name="Generated Manager",
+        status=AgentStatus.PUBLISHED,
+    )
+    worker_id = _create_agent_row(
+        user_id=owner_id,
+        name="Reusable Worker",
+        status=AgentStatus.PUBLISHED,
+    )
+
+    db = _direct_db_session()
+    try:
+        workforce = Workforce(
+            owner_user_id=owner_id,
+            scope_type="user",
+            scope_id=str(owner_id),
+            name="Generated Workforce",
+            manager_agent_id=manager_id,
+            status="draft",
+        )
+        db.add(workforce)
+        db.commit()
+    finally:
+        db.close()
+
+    response = client.get("/api/agents", headers=headers)
+    assert response.status_code == 200, response.text
+    agent_ids = {item["id"] for item in response.json()}
+    assert manager_id not in agent_ids
+    assert worker_id in agent_ids
+
+    options_response = client.get("/api/workforces/agent-options", headers=headers)
+    assert options_response.status_code == 200, options_response.text
+    option_ids = {item["id"] for item in options_response.json()}
+    assert manager_id not in option_ids
+    assert worker_id in option_ids
 
 
 class TestDeleteAgent:
