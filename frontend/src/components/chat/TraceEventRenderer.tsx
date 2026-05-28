@@ -550,7 +550,8 @@ function useProcessedSteps(events: TraceEvent[], taskStatus?: string): Processed
       }
 
       if (['dag_step_failed', 'tool_execution_failed', 'llm_call_failed', 'react_task_failed', 'agent_error', 'trace_error'].includes(event.event_type as string)) {
-        const isTerminalFailure = ['dag_step_failed', 'react_task_failed', 'agent_error'].includes(event.event_type as string);
+        const isTerminalFailure =
+          ['dag_step_failed', 'react_task_failed', 'agent_error', 'trace_error'].includes(event.event_type as string);
         if (isTerminalFailure) {
           step.status = 'failed';
         } else if (step.status === 'pending') {
@@ -561,7 +562,8 @@ function useProcessedSteps(events: TraceEvent[], taskStatus?: string): Processed
         const errorData = event.data || {};
         let errorMessage =
           errorData.error ||
-          errorData.message;
+          errorData.message ||
+          errorData.error_message;
 
         if (!errorMessage && errorData.result) {
           errorMessage = (errorData.result as any).error || (errorData.result as any).message;

@@ -354,7 +354,7 @@ export function ChatMessage({
     for (let i = traceEvents.length - 1; i >= 0; i--) {
       const event = traceEvents[i];
       if (['trace_error', 'task_failed', 'react_task_failed', 'dag_step_failed', 'agent_error'].includes(event.event_type || '')) {
-        errorMessage = (event.data?.error as string) || (event.data?.message as string) || "";
+        errorMessage = (event.data?.error as string) || (event.data?.message as string) || (event.data?.error_message as string) || "";
         if (errorMessage) break;
       }
     }

@@ -1,3 +1,5 @@
+import { normalizeTaskStatus } from "./task-status"
+
 export type TaskTerminalStatus = "completed" | "failed"
 
 type TaskCompletedRecord = {
@@ -30,9 +32,8 @@ const asRecord = (value: unknown): TaskCompletedRecord | null => {
   return value && typeof value === "object" ? (value as TaskCompletedRecord) : null
 }
 
-const normalizeStatus = (value: unknown): TaskTerminalStatus | null => {
-  if (typeof value !== "string") return null
-  const normalized = value.toLowerCase()
+const normalizeTerminalStatus = (value: unknown): TaskTerminalStatus | null => {
+  const normalized = normalizeTaskStatus(value)
   if (normalized === "completed") return "completed"
   if (normalized === "failed") return "failed"
   return null
@@ -43,8 +44,8 @@ export const normalizeTaskCompletedMessage = (
 ): NormalizedTaskCompletion => {
   const root = asRecord(message) || {}
   const payload = asRecord(root.data) || root
-  const taskStatus = normalizeStatus(payload.task?.status)
-  const payloadStatus = normalizeStatus(payload.status)
+  const taskStatus = normalizeTerminalStatus(payload.task?.status)
+  const payloadStatus = normalizeTerminalStatus(payload.status)
   const explicitStatus = taskStatus || payloadStatus
   const success =
     explicitStatus

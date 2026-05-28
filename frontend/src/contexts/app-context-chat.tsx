@@ -41,6 +41,7 @@ import { useI18n } from "@/contexts/i18n-context"
 import { normalizeTimestampMs } from "@/lib/time-utils"
 import { unwrapFinalAnswerContent } from "@/lib/final-answer"
 import { normalizeTaskCompletedMessage } from "@/lib/task-completion"
+import { isStoppedTaskStatus, normalizeTaskStatus, type TaskStatus } from "@/lib/task-status"
 import {
   getFinalAnswerStreamActionPayload,
   getFinalAnswerStreamMessageId,
@@ -335,7 +336,7 @@ interface Message {
 interface Task {
   id: string
   title: string
-  status: "pending" | "running" | "completed" | "failed" | "paused" | "waiting_for_user"
+  status: TaskStatus
   description: string
   createdAt: string | number
   updatedAt: string | number
@@ -388,17 +389,6 @@ const normalizeStepStatus = (status: unknown): StepExecution["status"] => {
     : "pending"
 }
 
-const normalizeTaskStatus = (status: unknown): Task["status"] | null => {
-  return status === "pending" ||
-    status === "running" ||
-    status === "completed" ||
-    status === "failed" ||
-    status === "paused" ||
-    status === "waiting_for_user"
-    ? status
-    : null
-}
-
 const getString = (value: unknown, fallback = ""): string => typeof value === "string" ? value : fallback
 const getStringArray = (value: unknown): string[] => Array.isArray(value) ? value.map(item => String(item)) : []
 
@@ -413,14 +403,11 @@ const getWebSocketTaskStatus = (message: WebSocketMessage): Task["status"] | nul
   const data = isJsonRecord(message.data) ? message.data : null
   const rootTask = isJsonRecord(root.task) ? root.task : null
   const dataTask = isJsonRecord(data?.task) ? data.task : null
-  return normalizeTaskStatus(dataTask?.status) || normalizeTaskStatus(rootTask?.status) || normalizeTaskStatus(data?.status) || normalizeTaskStatus(root.status)
+  return normalizeTaskStatus(dataTask?.status) || normalizeTaskStatus(rootTask?.status) || normalizeTaskStatus(data?.status) || normalizeTaskStatus(root.status) || null
 }
 
-const shouldStopProcessingForTaskStatus = (status: Task["status"] | null): boolean =>
-  status === "completed" ||
-  status === "failed" ||
-  status === "paused" ||
-  status === "waiting_for_user"
+const shouldStopProcessingForTaskStatus = (status: unknown): boolean =>
+  isStoppedTaskStatus(status)
 
 const stepsFromPlanData = (planData: unknown, existingSteps: StepExecution[]): StepExecution[] | null => {
   const planRecord = planData && typeof planData === "object" ? planData as Record<string, unknown> : null
@@ -591,7 +578,7 @@ function appReducer(state: AppState, action: AppAction): AppState {
       return { ...state, isHistoryLoading: action.payload }
 
     case "SYNC_PROCESSING_STATUS":
-      if (state.currentTask?.status === 'completed' || state.currentTask?.status === 'failed') {
+      if (shouldStopProcessingForTaskStatus(state.currentTask?.status)) {
         return { ...state, isProcessing: false }
       }
       return state
@@ -711,25 +698,50 @@ function appReducer(state: AppState, action: AppAction): AppState {
       return { ...state, messages: updatedMessages }
     }
 
-    case "SET_CURRENT_TASK":
+    case "SET_CURRENT_TASK": {
+      const incomingTask = action.payload
+        ? {
+          ...action.payload,
+          status:
+            normalizeTaskStatus(action.payload.status) ||
+            (state.currentTask?.id === action.payload.id
+              ? state.currentTask.status
+              : "pending"),
+        }
+        : null
+
+      const currentTask = (state.currentTask && incomingTask && state.currentTask.id === incomingTask.id)
+        ? { ...state.currentTask, ...incomingTask, agentName: incomingTask.agentName || state.currentTask.agentName, agentLogoUrl: incomingTask.agentLogoUrl || state.currentTask.agentLogoUrl }
+        : incomingTask
+
       return {
         ...state,
-        currentTask: (state.currentTask && action.payload && state.currentTask.id === action.payload.id)
-          ? { ...state.currentTask, ...action.payload, agentName: action.payload.agentName || state.currentTask.agentName, agentLogoUrl: action.payload.agentLogoUrl || state.currentTask.agentLogoUrl }
-          : action.payload
+        currentTask,
+        isProcessing: currentTask && shouldStopProcessingForTaskStatus(currentTask.status)
+          ? false
+          : state.isProcessing,
       }
+    }
 
-    case "UPDATE_TASK_STATUS":
+    case "UPDATE_TASK_STATUS": {
       if (!state.currentTask) {
         return state
       }
 
-      const isWaitingForUser = action.payload.status === "waiting_for_user"
+      const nextStatus = normalizeTaskStatus(action.payload.status)
+      if (!nextStatus) {
+        return state
+      }
+
+      const isWaitingForUser = nextStatus === "waiting_for_user"
       return {
         ...state,
+        isProcessing: shouldStopProcessingForTaskStatus(nextStatus)
+          ? false
+          : state.isProcessing,
         currentTask: {
           ...state.currentTask,
-          status: action.payload.status,
+          status: nextStatus,
           updatedAt: new Date().toISOString(),
           waitingQuestion: isWaitingForUser
             ? action.payload.waitingQuestion ?? state.currentTask.waitingQuestion
@@ -739,6 +751,7 @@ function appReducer(state: AppState, action: AppAction): AppState {
             : undefined,
         },
       }
+    }
 
     case "SET_DAG_EXECUTION":
       return { ...state, dagExecution: action.payload }
@@ -1293,6 +1306,7 @@ export function AppProvider({ children, token }: { children: React.ReactNode; to
           // Handle structured trace events
           if (eventType === "task_info") {
             const taskData = eventData
+            const taskStatus = normalizeTaskStatus(taskData.status) || "pending"
             console.log('📥 Received task_info event:', {
               taskData,
               status: taskData.status,
@@ -1300,13 +1314,13 @@ export function AppProvider({ children, token }: { children: React.ReactNode; to
             })
 
             // Store pending task for auto-execution
-            if (taskData.status === 'pending' && taskData.description) {
+            if (taskStatus === 'pending' && taskData.description) {
               pendingTaskToExecute = { description: taskData.description }
               console.log('💾 Stored pending task for auto-execution:', taskData.description)
             }
 
             // Check if status changed and trigger update if so
-            if (currentState.currentTask?.id === taskData.id.toString() && currentState.currentTask?.status !== taskData.status) {
+            if (currentState.currentTask?.id === taskData.id.toString() && currentState.currentTask?.status !== taskStatus) {
               dispatch({ type: "TRIGGER_TASK_UPDATE" })
             }
 
@@ -1316,7 +1330,7 @@ export function AppProvider({ children, token }: { children: React.ReactNode; to
                 id: taskData.id.toString(),
                 title: taskData.title,
                 description: taskData.description,
-                status: taskData.status,
+                status: taskStatus,
                 createdAt: taskData.created_at,
                 updatedAt: taskData.updated_at,
                 modelId: taskData.model_id,
@@ -4112,7 +4126,7 @@ export function AppProvider({ children, token }: { children: React.ReactNode; to
           const newTask: Task = {
             id: newTaskId.toString(),
             title: taskData.title,
-            status: taskData.status,
+            status: normalizeTaskStatus(taskData.status) || "pending",
             description: taskData.description || message,
             createdAt: taskData.created_at,
             updatedAt: taskData.updated_at,

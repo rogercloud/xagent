@@ -563,6 +563,42 @@ describe("TraceEventRenderer", () => {
     expect(container.querySelector(".animate-spin")).toBeNull()
   })
 
+  it("stops spinning when a step-local trace error has no explicit status", () => {
+    const { container } = render(
+      <TraceEventRenderer
+        events={[
+          {
+            event_id: "start",
+            event_type: "react_task_start",
+            step_id: "react-step",
+            timestamp: 1000,
+            data: {},
+          },
+          {
+            event_id: "llm-start",
+            event_type: "llm_call_start",
+            step_id: "react-step",
+            timestamp: 2000,
+            data: { model_name: "gpt-test" },
+          },
+          {
+            event_id: "trace-error",
+            event_type: "trace_error",
+            step_id: "react-step",
+            timestamp: 3000,
+            data: {
+              error_type: "agent_pattern_error",
+              error_message: "OpenAI bad request",
+            },
+          },
+        ]}
+      />,
+    )
+
+    expect(container.querySelector(".animate-spin")).toBeNull()
+    expect(container).toHaveTextContent("OpenAI bad request")
+  })
+
   it("renders workforce delegation trace events as a dedicated step", () => {
     render(
       <TraceEventRenderer

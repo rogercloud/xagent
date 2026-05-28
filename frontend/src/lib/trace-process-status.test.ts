@@ -36,6 +36,30 @@ describe("trace process status", () => {
     ).toBe("failed")
   })
 
+  it("infers a failed process from step-local trace errors without a status field", () => {
+    expect(
+      resolveTraceProcessStatus({
+        traceEvents: [
+          {
+            event_type: "react_task_start",
+            data: {},
+          },
+          {
+            event_type: "llm_call_start",
+            data: {},
+          },
+          {
+            event_type: "trace_error",
+            data: {
+              error_type: "agent_pattern_error",
+              error_message: "OpenAI bad request",
+            },
+          },
+        ],
+      })
+    ).toBe("failed")
+  })
+
   it("prefers explicit process status over trace inference", () => {
     expect(
       resolveTraceProcessStatus({

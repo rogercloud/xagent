@@ -42,6 +42,18 @@ describe("task-completion", () => {
     expect(payload.task?.id).toBe(3)
   })
 
+  it("accepts enum-style uppercase terminal statuses", () => {
+    const payload = normalizeTaskCompletedMessage({
+      type: "task_completed",
+      task: {
+        status: "FAILED",
+      },
+    })
+
+    expect(payload.status).toBe("failed")
+    expect(payload.success).toBe(false)
+  })
+
   it("falls back to task status when success is omitted", () => {
     const payload = normalizeTaskCompletedMessage({
       type: "task_completed",

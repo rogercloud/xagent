@@ -1,31 +1,15 @@
-export type TraceProcessStatus =
-  | "pending"
-  | "running"
-  | "completed"
-  | "failed"
-  | "paused"
-  | "waiting_for_user"
+import {
+  isStoppedTaskStatus,
+  normalizeTaskStatus,
+  type TaskStatus,
+} from "./task-status"
+
+export type TraceProcessStatus = TaskStatus
 
 type TraceProcessEvent = {
   event_type?: string
   data?: unknown
 }
-
-const TRACE_PROCESS_STATUSES = new Set<TraceProcessStatus>([
-  "pending",
-  "running",
-  "completed",
-  "failed",
-  "paused",
-  "waiting_for_user",
-])
-
-const STOPPED_TRACE_PROCESS_STATUSES = new Set<TraceProcessStatus>([
-  "completed",
-  "failed",
-  "paused",
-  "waiting_for_user",
-])
 
 const TERMINAL_FAILURE_EVENTS = new Set([
   "agent_error",
@@ -37,20 +21,28 @@ const TERMINAL_FAILURE_EVENTS = new Set([
 const asRecord = (value: unknown): Record<string, unknown> | null =>
   value && typeof value === "object" ? (value as Record<string, unknown>) : null
 
-export const normalizeTraceProcessStatus = (
-  status: unknown
-): TraceProcessStatus | undefined => {
-  if (typeof status !== "string") return undefined
-  const normalized = status.trim().toLowerCase()
-  return TRACE_PROCESS_STATUSES.has(normalized as TraceProcessStatus)
-    ? (normalized as TraceProcessStatus)
-    : undefined
+const isFailureTraceError = (eventData: Record<string, unknown> | null): boolean => {
+  if (!eventData) return true
+
+  const eventStatus = normalizeTraceProcessStatus(eventData.status)
+  if (eventStatus === "failed") return true
+
+  const errorType = typeof eventData.error_type === "string" ? eventData.error_type : ""
+  if (errorType.endsWith("_error")) return true
+
+  return (
+    typeof eventData.error === "string" ||
+    typeof eventData.message === "string" ||
+    typeof eventData.error_message === "string"
+  )
 }
 
-export const isStoppedTraceProcessStatus = (status: unknown): boolean => {
-  const normalized = normalizeTraceProcessStatus(status)
-  return normalized ? STOPPED_TRACE_PROCESS_STATUSES.has(normalized) : false
-}
+export const normalizeTraceProcessStatus = (
+  status: unknown
+): TraceProcessStatus | undefined => normalizeTaskStatus(status)
+
+export const isStoppedTraceProcessStatus = (status: unknown): boolean =>
+  isStoppedTaskStatus(status)
 
 export const getTraceProcessStatusFromEvents = (
   events?: TraceProcessEvent[]
@@ -64,15 +56,11 @@ export const getTraceProcessStatusFromEvents = (
 
     if (eventData) {
       const eventStatus = normalizeTraceProcessStatus(eventData.status)
-      if (eventStatus && STOPPED_TRACE_PROCESS_STATUSES.has(eventStatus)) {
+      if (eventStatus && isStoppedTraceProcessStatus(eventStatus)) {
         return eventStatus
       }
 
-      if (
-        eventType === "trace_error" &&
-        (eventData.error_type === "agent_error" ||
-          eventData.status === "failed")
-      ) {
+      if (eventType === "trace_error" && isFailureTraceError(eventData)) {
         return "failed"
       }
     }

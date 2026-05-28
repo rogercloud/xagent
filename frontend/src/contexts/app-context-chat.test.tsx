@@ -212,6 +212,47 @@ describe("AppProvider websocket message routing", () => {
     })
   })
 
+  it("normalizes uppercase task info status before syncing processing state", async () => {
+    render(
+      <AppProvider token="token">
+        <SeedRunningTask />
+        <StateProbe />
+      </AppProvider>
+    )
+
+    const onMessage = webSocketOptions.current?.onMessage
+    expect(onMessage).toBeDefined()
+
+    await waitFor(() => {
+      expect(screen.getByTestId("task-status").textContent).toBe("running")
+      expect(screen.getByTestId("processing").textContent).toBe("true")
+    })
+
+    act(() => {
+      onMessage?.({
+        type: "trace_event",
+        timestamp: "2026-05-27T05:00:02Z",
+        data: {
+          event_id: "task-info-1",
+          event_type: "task_info",
+          data: {
+            id: 1,
+            title: "Test task",
+            description: "Test task",
+            status: "FAILED",
+            created_at: "2026-05-27T05:00:00Z",
+            updated_at: "2026-05-27T05:00:02Z",
+          },
+        },
+      })
+    })
+
+    await waitFor(() => {
+      expect(screen.getByTestId("task-status").textContent).toBe("failed")
+      expect(screen.getByTestId("processing").textContent).toBe("false")
+    })
+  })
+
   it("shows websocket error payloads and syncs task status when provided", async () => {
     render(
       <AppProvider token="token">
