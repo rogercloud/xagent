@@ -186,11 +186,16 @@ export default function WorkforceDetailPage() {
       description: agent.description || undefined,
     }))
 
+  const beginMutation = () => {
+    setSaving(true)
+    setError(null)
+    setMessage(null)
+  }
+
   const saveWorkforce = async () => {
     if (!id || !name.trim() || !managerAgentId) return
     try {
-      setSaving(true)
-      setError(null)
+      beginMutation()
       const next = await updateWorkforce(id, {
         name: name.trim(),
         description: description.trim() || null,
@@ -210,8 +215,7 @@ export default function WorkforceDetailPage() {
   const addWorker = async () => {
     if (!id || !newWorkerAgentId || !newWorkerInstructions.trim()) return
     try {
-      setSaving(true)
-      setError(null)
+      beginMutation()
       await addWorkforceAgent(id, {
         source_type: "existing",
         agent_id: Number(newWorkerAgentId),
@@ -234,11 +238,10 @@ export default function WorkforceDetailPage() {
 
   const saveWorker = async (worker: WorkforceWorker) => {
     if (!id) return
-    const edit = workerEdits[worker.id]
-    if (!edit || !edit.assignment_instructions.trim()) return
+    const edit = workerEdits[worker.id] ?? workerEditState(worker)
+    if (!edit.assignment_instructions.trim()) return
     try {
-      setSaving(true)
-      setError(null)
+      beginMutation()
       const updated = await updateWorkforceAgent(id, worker.id, {
         alias: edit.alias.trim() || null,
         assignment_instructions: edit.assignment_instructions.trim(),
@@ -266,8 +269,7 @@ export default function WorkforceDetailPage() {
   const removeWorker = async (workerId: number) => {
     if (!id) return
     try {
-      setSaving(true)
-      setError(null)
+      beginMutation()
       await removeWorkforceAgent(id, workerId)
       await load({ silent: true })
       setMessage(t("workforces.messages.workerRemoved"))
@@ -281,8 +283,7 @@ export default function WorkforceDetailPage() {
   const publishCurrentWorkforce = async () => {
     if (!id) return
     try {
-      setSaving(true)
-      setError(null)
+      beginMutation()
       const next = await publishWorkforce(id)
       setWorkforce(next)
       syncForm(next)
@@ -297,8 +298,7 @@ export default function WorkforceDetailPage() {
   const unpublishCurrentWorkforce = async () => {
     if (!id) return
     try {
-      setSaving(true)
-      setError(null)
+      beginMutation()
       const next = await unpublishWorkforce(id)
       setWorkforce(next)
       syncForm(next)
@@ -313,8 +313,7 @@ export default function WorkforceDetailPage() {
   const archiveCurrentWorkforce = async () => {
     if (!id) return
     try {
-      setSaving(true)
-      setError(null)
+      beginMutation()
       await archiveWorkforce(id)
       const next = await getWorkforce(id)
       setWorkforce(next)
