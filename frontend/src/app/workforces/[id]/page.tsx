@@ -38,6 +38,10 @@ interface WorkerEditState {
   sort_order: string
 }
 
+interface LoadOptions {
+  silent?: boolean
+}
+
 function workerEditState(worker: WorkforceWorker): WorkerEditState {
   return {
     alias: worker.alias || "",
@@ -55,8 +59,9 @@ function buildWorkerEditState(workers: WorkforceWorker[]): Record<number, Worker
 }
 
 function normalizeWorkerSortOrder(value: string, fallback: number | null | undefined): number {
-  const parsed = Number(value)
-  if (Number.isFinite(parsed) && parsed > 0) {
+  const normalized = value.trim()
+  const parsed = /^\d+$/.test(normalized) ? Number.parseInt(normalized, 10) : NaN
+  if (Number.isInteger(parsed) && parsed > 0) {
     return parsed
   }
   return fallback ?? 1
@@ -96,10 +101,13 @@ export default function WorkforceDetailPage() {
     setWorkerEdits(buildWorkerEditState(nextWorkforce.workers))
   }, [])
 
-  const load = useCallback(async () => {
+  const load = useCallback(async (options: LoadOptions = {}) => {
     if (!id) return
+    const { silent = false } = options
     try {
-      setLoading(true)
+      if (!silent) {
+        setLoading(true)
+      }
       setError(null)
       const [workforceData, agentData] = await Promise.all([
         getWorkforce(id),
@@ -111,7 +119,9 @@ export default function WorkforceDetailPage() {
     } catch (err) {
       setError(err instanceof Error ? err.message : t("workforces.errors.load"))
     } finally {
-      setLoading(false)
+      if (!silent) {
+        setLoading(false)
+      }
     }
   }, [id, syncForm, t])
 
@@ -192,7 +202,7 @@ export default function WorkforceDetailPage() {
       setNewWorkerAgentId("")
       setNewWorkerAlias("")
       setNewWorkerInstructions("")
-      await load()
+      await load({ silent: true })
       setMessage(t("workforces.messages.workerAdded"))
     } catch (err) {
       setError(err instanceof Error ? err.message : t("workforces.errors.addWorker"))
@@ -238,7 +248,7 @@ export default function WorkforceDetailPage() {
       setSaving(true)
       setError(null)
       await removeWorkforceAgent(id, workerId)
-      await load()
+      await load({ silent: true })
       setMessage(t("workforces.messages.workerRemoved"))
     } catch (err) {
       setError(err instanceof Error ? err.message : t("workforces.errors.removeWorker"))
@@ -519,6 +529,8 @@ export default function WorkforceDetailPage() {
                         <Label>{t("workforces.fields.order")}</Label>
                         <Input
                           type="number"
+                          min={1}
+                          step={1}
                           value={edit.sort_order}
                           onChange={(event) =>
                             setWorkerEdits((current) => ({

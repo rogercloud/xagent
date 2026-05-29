@@ -118,7 +118,7 @@ export default function WorkforcesPage() {
                           <div className="flex flex-wrap gap-6 text-sm text-muted-foreground">
                             <span>{t("workforces.list.manager", { name: item.manager.name })}</span>
                             <span>{t("workforces.list.workers", { count: item.worker_count })}</span>
-                            <span>
+                            <span suppressHydrationWarning>
                               {t("workforces.list.lastUpdate", {
                                 value: item.updated_at
                                   ? new Date(item.updated_at).toLocaleString(locale)

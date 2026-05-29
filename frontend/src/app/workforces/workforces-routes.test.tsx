@@ -392,6 +392,106 @@ describe("workforce route entry points", () => {
     })
   })
 
+  it("keeps worker sort order integer-only when saving", async () => {
+    const worker = {
+      id: 100,
+      agent: {
+        id: 8,
+        name: "Worker Agent",
+        description: null,
+        logo_url: null,
+        status: "published",
+      },
+      alias: "Researcher",
+      assignment_instructions: "Research launch tasks",
+      source_type: "existing" as const,
+      template_id: null,
+      enabled: true,
+      sort_order: 3,
+      canvas_position: null,
+      created_at: null,
+      updated_at: null,
+    }
+    getWorkforceMock.mockResolvedValueOnce({ ...workforceDetail, workers: [worker] })
+    listAgentOptionsMock.mockResolvedValueOnce([])
+    updateWorkforceAgentMock.mockResolvedValueOnce(worker)
+
+    render(<WorkforceDetailPage />)
+
+    const sortInput = (await screen.findByDisplayValue("3")) as HTMLInputElement
+    fireEvent.change(sortInput, { target: { value: "1.5" } })
+    fireEvent.click(screen.getByText("workforces.actions.saveWorker"))
+
+    await waitFor(() => {
+      expect(updateWorkforceAgentMock).toHaveBeenCalledWith(
+        "42",
+        100,
+        expect.objectContaining({ sort_order: 3 }),
+      )
+    })
+  })
+
+  it("keeps the detail page visible while refreshing after adding a worker", async () => {
+    const agentOptions = [
+      {
+        id: 8,
+        name: "Worker Agent",
+        description: null,
+        logo_url: null,
+        status: "published",
+      },
+    ]
+    let resolveReload: (value: WorkforceDetail) => void
+    const reload = new Promise<WorkforceDetail>((resolve) => {
+      resolveReload = resolve
+    })
+    getWorkforceMock
+      .mockResolvedValueOnce(workforceDetail)
+      .mockReturnValueOnce(reload)
+    listAgentOptionsMock
+      .mockResolvedValueOnce(agentOptions)
+      .mockResolvedValueOnce(agentOptions)
+    addWorkforceAgentMock.mockResolvedValueOnce({ id: 101 })
+
+    const { container } = render(<WorkforceDetailPage />)
+
+    expect(await screen.findByRole("heading", { name: "Launch Workforce" })).toBeInTheDocument()
+    fireEvent.change(screen.getByLabelText("workforces.workers.chooseAgent"), {
+      target: { value: "8" },
+    })
+    const textareas = container.querySelectorAll("textarea")
+    fireEvent.change(textareas[textareas.length - 1], {
+      target: { value: "Research launch tasks" },
+    })
+    fireEvent.click(screen.getByText("workforces.actions.addWorker"))
+
+    await waitFor(() => {
+      expect(addWorkforceAgentMock).toHaveBeenCalled()
+    })
+    expect(screen.queryByText("workforces.loading.detail")).not.toBeInTheDocument()
+    expect(screen.getByRole("heading", { name: "Launch Workforce" })).toBeInTheDocument()
+
+    resolveReload!({
+      ...workforceDetail,
+      workers: [
+        {
+          id: 100,
+          agent: agentOptions[0],
+          alias: null,
+          assignment_instructions: "Research launch tasks",
+          source_type: "existing",
+          template_id: null,
+          enabled: true,
+          sort_order: 1,
+          canvas_position: null,
+          created_at: null,
+          updated_at: null,
+        },
+      ],
+    })
+    await screen.findByText("workforces.messages.workerAdded")
+  })
+
   it("keeps builder propose and apply controls read-only for archived workforces", async () => {
     getWorkforceMock.mockResolvedValueOnce({
       ...workforceDetail,
