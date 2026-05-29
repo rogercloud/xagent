@@ -302,6 +302,44 @@ def test_update_workforce_keeps_existing_generated_manager_but_rejects_switching
     assert switch_to_generated_response.status_code == 404
 
 
+def test_workforce_detail_marks_generated_manager_readonly() -> None:
+    headers = _admin_headers()
+    owner_id = _user_id("admin")
+    generated_manager_id = _create_agent(
+        owner_id,
+        "Generated Manager",
+        AgentStatus.PUBLISHED,
+        AgentOrigin.WORKFORCE_GENERATED_MANAGER.value,
+    )
+
+    db = _direct_db_session()
+    try:
+        workforce = Workforce(
+            owner_user_id=owner_id,
+            scope_type="user",
+            scope_id=str(owner_id),
+            name="Generated Manager Workforce",
+            manager_agent_id=generated_manager_id,
+            status="draft",
+        )
+        db.add(workforce)
+        db.commit()
+        db.refresh(workforce)
+        workforce_id = int(workforce.id)
+    finally:
+        db.close()
+
+    response = client.get(f"/api/workforces/{workforce_id}", headers=headers)
+    assert response.status_code == 200, response.text
+    manager = response.json()["manager"]
+    assert manager["id"] == generated_manager_id
+    assert manager["access"] == "owner"
+    assert manager["readonly"] is True
+    assert manager["can_edit"] is False
+    assert manager["can_publish"] is False
+    assert manager["can_delete"] is False
+
+
 def test_workforce_detail_marks_policy_visible_agents_readonly() -> None:
     _admin_headers()
     bob_headers = _register_second_user()
