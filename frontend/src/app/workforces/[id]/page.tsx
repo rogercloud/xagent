@@ -42,6 +42,10 @@ interface LoadOptions {
   silent?: boolean
 }
 
+interface SyncFormOptions {
+  preserveEditableState?: boolean
+}
+
 function workerEditState(worker: WorkforceWorker): WorkerEditState {
   return {
     alias: worker.alias || "",
@@ -93,12 +97,29 @@ export default function WorkforceDetailPage() {
   )
   const isArchived = workforce?.status === "archived"
 
-  const syncForm = useCallback((nextWorkforce: WorkforceDetail) => {
-    setName(nextWorkforce.name)
-    setDescription(nextWorkforce.description || "")
-    setManagerAgentId(String(nextWorkforce.manager.id))
-    setManagerInstructions(nextWorkforce.manager_instructions || "")
-    setWorkerEdits(buildWorkerEditState(nextWorkforce.workers))
+  const syncForm = useCallback((
+    nextWorkforce: WorkforceDetail,
+    options: SyncFormOptions = {},
+  ) => {
+    if (!options.preserveEditableState) {
+      setName(nextWorkforce.name)
+      setDescription(nextWorkforce.description || "")
+      setManagerAgentId(String(nextWorkforce.manager.id))
+      setManagerInstructions(nextWorkforce.manager_instructions || "")
+      setWorkerEdits(buildWorkerEditState(nextWorkforce.workers))
+      return
+    }
+
+    const serverWorkerEdits = buildWorkerEditState(nextWorkforce.workers)
+    setWorkerEdits((current) =>
+      nextWorkforce.workers.reduce<Record<number, WorkerEditState>>(
+        (accumulator, worker) => {
+          accumulator[worker.id] = current[worker.id] ?? serverWorkerEdits[worker.id]
+          return accumulator
+        },
+        {},
+      ),
+    )
   }, [])
 
   const load = useCallback(async (options: LoadOptions = {}) => {
@@ -115,7 +136,7 @@ export default function WorkforceDetailPage() {
       ])
       setWorkforce(workforceData)
       setAgents(agentData)
-      syncForm(workforceData)
+      syncForm(workforceData, { preserveEditableState: silent })
     } catch (err) {
       setError(err instanceof Error ? err.message : t("workforces.errors.load"))
     } finally {

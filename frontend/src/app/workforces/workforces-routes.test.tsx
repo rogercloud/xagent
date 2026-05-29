@@ -456,6 +456,9 @@ describe("workforce route entry points", () => {
     const { container } = render(<WorkforceDetailPage />)
 
     expect(await screen.findByRole("heading", { name: "Launch Workforce" })).toBeInTheDocument()
+    fireEvent.change(screen.getByDisplayValue("Launch Workforce"), {
+      target: { value: "Unsaved Workforce Name" },
+    })
     fireEvent.change(screen.getByLabelText("workforces.workers.chooseAgent"), {
       target: { value: "8" },
     })
@@ -490,6 +493,7 @@ describe("workforce route entry points", () => {
       ],
     })
     await screen.findByText("workforces.messages.workerAdded")
+    expect(screen.getByDisplayValue("Unsaved Workforce Name")).toBeInTheDocument()
   })
 
   it("keeps builder propose and apply controls read-only for archived workforces", async () => {
