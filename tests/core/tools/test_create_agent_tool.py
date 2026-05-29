@@ -20,7 +20,7 @@ from xagent.core.tools.adapters.vibe.agent_tool import (
 )
 from xagent.core.tracing.langfuse.handler import LangfuseTraceHandler
 from xagent.core.workspace import TaskWorkspace
-from xagent.web.models.agent import Agent, AgentStatus
+from xagent.web.models.agent import Agent, AgentOrigin, AgentStatus
 from xagent.web.models.database import Base
 from xagent.web.models.model import Model
 from xagent.web.models.task import Task
@@ -144,6 +144,57 @@ class TestCreateAgentTool:
                 assert agent.status == AgentStatus.DRAFT
                 assert agent.instructions == "You are a test agent for unit testing."
 
+        finally:
+            db.close()
+            try:
+                import os
+
+                os.remove(db_path)
+            except OSError:
+                pass
+
+    @pytest.mark.asyncio
+    async def test_agent_tool_rejects_generated_workforce_manager(self) -> None:
+        db, db_path = _create_session()
+        try:
+            user = User(
+                username="testuser_generated_manager_run",
+                password_hash="x",
+                is_admin=False,
+            )
+            db.add(user)
+            db.commit()
+            db.refresh(user)
+
+            generated_manager = Agent(
+                user_id=user.id,
+                name="Generated Manager",
+                description="Private workforce manager",
+                instructions="Coordinate the workforce.",
+                status=AgentStatus.PUBLISHED,
+                origin=AgentOrigin.WORKFORCE_GENERATED_MANAGER.value,
+            )
+            db.add(generated_manager)
+            db.commit()
+            db.refresh(generated_manager)
+
+            tool = AgentTool(
+                agent_id=generated_manager.id,
+                agent_name=generated_manager.name,
+                agent_description=generated_manager.description or "",
+                db=db,
+                user_id=user.id,
+            )
+
+            with patch(
+                "xagent.core.agent.service.AgentService"
+            ) as mock_agent_service_class:
+                result = await tool.run_json_async({"task": "run private manager"})
+
+            assert (
+                result["response"] == f"Error: Agent {generated_manager.id} not found"
+            )
+            mock_agent_service_class.assert_not_called()
         finally:
             db.close()
             try:
@@ -1089,6 +1140,106 @@ class TestUpdateAgentTool:
                 pass
 
     @pytest.mark.asyncio
+    async def test_update_agent_rejects_generated_workforce_manager(self) -> None:
+        db, db_path = _create_session()
+        try:
+            user = User(
+                username="testuser_update_generated_manager",
+                password_hash="x",
+                is_admin=False,
+            )
+            db.add(user)
+            db.commit()
+            db.refresh(user)
+
+            generated_manager = Agent(
+                user_id=user.id,
+                name="Generated Manager",
+                description="Private manager",
+                instructions="Coordinate the workforce.",
+                status=AgentStatus.PUBLISHED,
+                origin=AgentOrigin.WORKFORCE_GENERATED_MANAGER.value,
+            )
+            db.add(generated_manager)
+            db.commit()
+            db.refresh(generated_manager)
+
+            tool = UpdateAgentTool(db=db, user_id=user.id)
+
+            result = await tool.run_json_async(
+                {
+                    "agent_id": generated_manager.id,
+                    "name": "renamed_manager",
+                }
+            )
+
+            assert result["status"] == "error"
+            assert "not found" in result["message"].lower()
+            db.refresh(generated_manager)
+            assert generated_manager.name == "Generated Manager"
+
+        finally:
+            db.close()
+            try:
+                import os
+
+                os.remove(db_path)
+            except OSError:
+                pass
+
+    @pytest.mark.asyncio
+    async def test_update_agent_name_conflict_ignores_generated_workforce_manager(
+        self,
+    ) -> None:
+        db, db_path = _create_session()
+        try:
+            user = User(
+                username="testuser_update_generated_manager_name",
+                password_hash="x",
+                is_admin=False,
+            )
+            db.add(user)
+            db.commit()
+            db.refresh(user)
+
+            visible_agent = Agent(
+                user_id=user.id,
+                name="Visible Agent",
+                status=AgentStatus.DRAFT,
+            )
+            generated_manager = Agent(
+                user_id=user.id,
+                name="Hidden Manager Name",
+                status=AgentStatus.PUBLISHED,
+                origin=AgentOrigin.WORKFORCE_GENERATED_MANAGER.value,
+            )
+            db.add_all([visible_agent, generated_manager])
+            db.commit()
+            db.refresh(visible_agent)
+
+            tool = UpdateAgentTool(db=db, user_id=user.id)
+
+            result = await tool.run_json_async(
+                {
+                    "agent_id": visible_agent.id,
+                    "name": "Hidden Manager Name",
+                }
+            )
+
+            assert result["status"] == "success"
+            db.refresh(visible_agent)
+            assert visible_agent.name == "Hidden Manager Name"
+
+        finally:
+            db.close()
+            try:
+                import os
+
+                os.remove(db_path)
+            except OSError:
+                pass
+
+    @pytest.mark.asyncio
     async def test_update_agent_rejects_missing_knowledge_base(self) -> None:
         """Test that update_agent rejects knowledge bases that do not exist."""
         db, db_path = _create_session()
@@ -1347,6 +1498,53 @@ class TestListAgentsTool:
                 pass
 
     @pytest.mark.asyncio
+    async def test_list_agents_hides_generated_workforce_managers(self) -> None:
+        db, db_path = _create_session()
+        try:
+            user = User(
+                username="testuser_list_generated_manager",
+                password_hash="x",
+                is_admin=False,
+            )
+            db.add(user)
+            db.commit()
+            db.refresh(user)
+
+            regular_agent = Agent(
+                user_id=user.id,
+                name="reusable_agent",
+                description="User reusable agent",
+                status=AgentStatus.PUBLISHED,
+            )
+            generated_manager = Agent(
+                user_id=user.id,
+                name="generated_manager",
+                description="Private workforce manager",
+                status=AgentStatus.PUBLISHED,
+                origin=AgentOrigin.WORKFORCE_GENERATED_MANAGER.value,
+            )
+            db.add_all([regular_agent, generated_manager])
+            db.commit()
+
+            tool = ListAgentsTool(db=db, user_id=user.id)
+
+            result = await tool.run_json_async({})
+
+            assert result["status"] == "success"
+            assert result["total_count"] == 1
+            agent_names = {agent["name"] for agent in result["agents"]}
+            assert agent_names == {"reusable_agent"}
+
+        finally:
+            db.close()
+            try:
+                import os
+
+                os.remove(db_path)
+            except OSError:
+                pass
+
+    @pytest.mark.asyncio
     async def test_list_agents_with_status_filter(self) -> None:
         """Test listing agents with status filter."""
         db, db_path = _create_session()
@@ -1550,6 +1748,56 @@ class TestDraftAgentsInTools:
             assert f"agent_{published_agent.id}" in tool_names
             assert f"agent_{draft_agent.id}" in tool_names
 
+        finally:
+            db.close()
+            try:
+                import os
+
+                os.remove(db_path)
+            except OSError:
+                pass
+
+    def test_generated_workforce_managers_are_hidden_from_agent_tools(self) -> None:
+        db, db_path = _create_session()
+        try:
+            user = User(
+                username="testuser_generated_manager_tools",
+                password_hash="x",
+                is_admin=False,
+            )
+            db.add(user)
+            db.commit()
+            db.refresh(user)
+
+            reusable_agent = Agent(
+                user_id=user.id,
+                name="Reusable Agent",
+                status=AgentStatus.PUBLISHED,
+            )
+            generated_manager = Agent(
+                user_id=user.id,
+                name="Generated Manager",
+                status=AgentStatus.PUBLISHED,
+                origin=AgentOrigin.WORKFORCE_GENERATED_MANAGER.value,
+            )
+            db.add_all([reusable_agent, generated_manager])
+            db.commit()
+            db.refresh(reusable_agent)
+            db.refresh(generated_manager)
+
+            tools = get_published_agents_tools(db=db, user_id=user.id)
+            tool_names = {tool.name for tool in tools}
+
+            assert f"agent_{reusable_agent.id}" in tool_names
+            assert f"agent_{generated_manager.id}" not in tool_names
+
+            explicitly_allowed_tools = get_published_agents_tools(
+                db=db,
+                user_id=user.id,
+                allowed_agent_ids=[generated_manager.id],
+            )
+
+            assert explicitly_allowed_tools == []
         finally:
             db.close()
             try:

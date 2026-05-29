@@ -119,13 +119,29 @@ export default function WorkforceDetailPage() {
     void load()
   }, [load])
 
-  const managerOptions = publishedAgents
-    .filter((agent) => !workforce?.workers.some((worker) => worker.agent.id === agent.id))
-    .map((agent) => ({
-      value: String(agent.id),
-      label: agent.name,
-      description: agent.description || undefined,
-    }))
+  const managerOptions = useMemo(() => {
+    const options = publishedAgents
+      .filter((agent) => !workforce?.workers.some((worker) => worker.agent.id === agent.id))
+      .map((agent) => ({
+        value: String(agent.id),
+        label: agent.name,
+        description: agent.description || undefined,
+      }))
+
+    const currentManager = workforce?.manager
+    if (
+      currentManager?.status === "published" &&
+      !options.some((option) => option.value === String(currentManager.id))
+    ) {
+      options.unshift({
+        value: String(currentManager.id),
+        label: currentManager.name,
+        description: currentManager.description || undefined,
+      })
+    }
+
+    return options
+  }, [publishedAgents, workforce])
 
   const workerOptions = publishedAgents
     .filter(

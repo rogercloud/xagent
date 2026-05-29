@@ -6,7 +6,7 @@ import pytest
 from sqlalchemy import event
 
 from xagent.web.api import workforces as workforces_api
-from xagent.web.models.agent import Agent, AgentStatus
+from xagent.web.models.agent import Agent, AgentOrigin, AgentStatus
 from xagent.web.models.database import get_engine
 from xagent.web.models.user import User
 from xagent.web.models.workforce import WorkforceBuilderMessage, WorkforceRun
@@ -42,7 +42,12 @@ def _user_id(username: str = "admin") -> int:
         db.close()
 
 
-def _create_agent(user_id: int, name: str, status: AgentStatus) -> int:
+def _create_agent(
+    user_id: int,
+    name: str,
+    status: AgentStatus,
+    origin: str = AgentOrigin.USER.value,
+) -> int:
     db = _direct_db_session()
     try:
         agent = Agent(
@@ -51,6 +56,7 @@ def _create_agent(user_id: int, name: str, status: AgentStatus) -> int:
             description=f"{name} description",
             instructions=f"{name} instructions",
             execution_mode="balanced",
+            origin=origin,
             status=status,
         )
         db.add(agent)
@@ -194,6 +200,42 @@ def test_agent_options_use_workforce_policy_and_only_published_agents() -> None:
     assert options_by_id[shared_published_id]["access"] == "policy"
     assert options_by_id[shared_published_id]["readonly"] is True
     assert options_by_id[shared_published_id]["can_edit"] is False
+
+
+def test_generated_workforce_manager_agents_are_private_to_their_workforce() -> None:
+    headers = _admin_headers()
+    owner_id = _user_id("admin")
+    reusable_manager_id = _create_agent(
+        owner_id,
+        "Reusable Manager",
+        AgentStatus.PUBLISHED,
+    )
+    generated_manager_id = _create_agent(
+        owner_id,
+        "Generated Manager",
+        AgentStatus.PUBLISHED,
+        AgentOrigin.WORKFORCE_GENERATED_MANAGER.value,
+    )
+
+    reusable_response = client.post(
+        "/api/workforces",
+        headers=headers,
+        json={
+            "name": "Reusable Manager Workforce",
+            "manager_agent_id": reusable_manager_id,
+        },
+    )
+    assert reusable_response.status_code == 200, reusable_response.text
+
+    generated_response = client.post(
+        "/api/workforces",
+        headers=headers,
+        json={
+            "name": "Generated Manager Workforce",
+            "manager_agent_id": generated_manager_id,
+        },
+    )
+    assert generated_response.status_code == 404
 
 
 def test_workforce_detail_marks_policy_visible_agents_readonly() -> None:

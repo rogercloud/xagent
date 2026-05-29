@@ -127,6 +127,24 @@ def _apply_agent_visibility_filters(
     if not allow_cross_user_agent_ids or normalized_allowed_agent_ids is None:
         query = query.filter(agent_model.user_id == user_id)
 
+    query = _exclude_private_workforce_manager_agents(query, agent_model)
+
+    return query
+
+
+def _exclude_private_workforce_manager_agents(query: Any, agent_model: Any) -> Any:
+    from .....web.models.agent import AgentOrigin
+
+    return query.filter(
+        agent_model.origin != AgentOrigin.WORKFORCE_GENERATED_MANAGER.value
+    )
+
+
+def _apply_owned_agent_tool_filters(
+    query: Any, agent_model: Any, *, user_id: int
+) -> Any:
+    query = query.filter(agent_model.user_id == user_id)
+    query = _exclude_private_workforce_manager_agents(query, agent_model)
     return query
 
 
@@ -926,11 +944,13 @@ class UpdateAgentTool(AbstractBaseTool):
                 ).model_dump()
 
             # Find the agent
-            agent = (
-                self._db.query(Agent)
-                .filter(Agent.id == agent_id, Agent.user_id == self._user_id)
-                .first()
+            query = self._db.query(Agent).filter(Agent.id == agent_id)
+            query = _apply_owned_agent_tool_filters(
+                query,
+                Agent,
+                user_id=self._user_id,
             )
+            agent = query.first()
 
             if not agent:
                 return UpdateAgentToolResult(
@@ -963,15 +983,14 @@ class UpdateAgentTool(AbstractBaseTool):
             new_name = args.get("name", "").strip() if args.get("name") else None
             if new_name:
                 # Check for duplicate name (exclude current agent)
-                existing = (
-                    self._db.query(Agent)
-                    .filter(
-                        Agent.user_id == self._user_id,
+                existing = _apply_owned_agent_tool_filters(
+                    self._db.query(Agent).filter(
                         Agent.name == new_name,
                         Agent.id != agent_id,
-                    )
-                    .first()
-                )
+                    ),
+                    Agent,
+                    user_id=self._user_id,
+                ).first()
                 if existing:
                     return UpdateAgentToolResult(
                         agent_id=0,
@@ -1206,7 +1225,11 @@ class ListAgentsTool(AbstractBaseTool):
                 ).model_dump()
 
             # Build query
-            query = self._db.query(Agent).filter(Agent.user_id == self._user_id)
+            query = _apply_owned_agent_tool_filters(
+                self._db.query(Agent),
+                Agent,
+                user_id=self._user_id,
+            )
 
             # Apply status filter if provided
             if status_filter:
@@ -1924,15 +1947,15 @@ def get_published_agents_tools(
         elif include_draft:
             # Include both PUBLISHED and DRAFT agents
             query = db.query(Agent).filter(
-                Agent.user_id == user_id,
                 Agent.status.in_(["published", "draft"]),  # type: ignore[attr-defined]
             )
+            query = _apply_owned_agent_tool_filters(query, Agent, user_id=user_id)
         else:
             # Only PUBLISHED agents
             query = db.query(Agent).filter(
                 Agent.status == "published",
-                Agent.user_id == user_id,
             )
+            query = _apply_owned_agent_tool_filters(query, Agent, user_id=user_id)
 
         # Exclude the active delegation stack to prevent recursive self-calls.
         if excluded_agent_ids:
@@ -1950,15 +1973,14 @@ def get_published_agents_tools(
                 for agent_id in (normalized_draft_agent_ids or [])
                 if agent_id not in excluded_agent_ids
             ]
-            draft_agents = (
-                db.query(Agent)
-                .filter(
+            draft_agents = _apply_owned_agent_tool_filters(
+                db.query(Agent).filter(
                     Agent.id.in_(normalized_draft_agent_ids),
-                    Agent.user_id == user_id,
                     Agent.status == "draft",
-                )
-                .all()
-            )
+                ),
+                Agent,
+                user_id=user_id,
+            ).all()
             # Merge without duplicates
             existing_ids = {agent.id for agent in agents}
             for draft_agent in draft_agents:

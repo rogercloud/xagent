@@ -330,6 +330,27 @@ describe("workforce route entry points", () => {
     expect(screen.getByRole("button", { name: /workforces.actions.runWorkforce/ })).toBeDisabled()
   })
 
+  it("keeps the current manager visible when it is hidden from agent options", async () => {
+    getWorkforceMock.mockResolvedValueOnce(workforceDetail)
+    listAgentOptionsMock.mockResolvedValueOnce([
+      {
+        id: 8,
+        name: "Worker Agent",
+        description: null,
+        logo_url: null,
+        status: "published",
+      },
+    ])
+
+    render(<WorkforceDetailPage />)
+
+    expect(await screen.findByRole("heading", { name: "Launch Workforce" })).toBeInTheDocument()
+    expect(screen.getByRole("option", { name: "Manager Agent" })).toHaveAttribute(
+      "value",
+      "7",
+    )
+  })
+
   it("allows clearing and replacing worker sort order before saving", async () => {
     const worker = {
       id: 100,
