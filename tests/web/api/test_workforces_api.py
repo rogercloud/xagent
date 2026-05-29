@@ -9,7 +9,7 @@ from xagent.web.api import workforces as workforces_api
 from xagent.web.models.agent import Agent, AgentOrigin, AgentStatus
 from xagent.web.models.database import get_engine
 from xagent.web.models.user import User
-from xagent.web.models.workforce import WorkforceBuilderMessage, WorkforceRun
+from xagent.web.models.workforce import Workforce, WorkforceBuilderMessage, WorkforceRun
 from xagent.web.services.workforce_access import WorkforcePolicy, set_workforce_policy
 
 from .conftest import (
@@ -236,6 +236,70 @@ def test_generated_workforce_manager_agents_are_private_to_their_workforce() -> 
         },
     )
     assert generated_response.status_code == 404
+
+
+def test_update_workforce_keeps_existing_generated_manager_but_rejects_switching_to_one() -> (
+    None
+):
+    headers = _admin_headers()
+    owner_id = _user_id("admin")
+    generated_manager_id = _create_agent(
+        owner_id,
+        "Generated Manager",
+        AgentStatus.PUBLISHED,
+        AgentOrigin.WORKFORCE_GENERATED_MANAGER.value,
+    )
+    reusable_manager_id = _create_agent(
+        owner_id,
+        "Reusable Manager",
+        AgentStatus.PUBLISHED,
+    )
+
+    db = _direct_db_session()
+    try:
+        workforce = Workforce(
+            owner_user_id=owner_id,
+            scope_type="user",
+            scope_id=str(owner_id),
+            name="Generated Manager Workforce",
+            manager_agent_id=generated_manager_id,
+            status="draft",
+        )
+        db.add(workforce)
+        db.commit()
+        db.refresh(workforce)
+        workforce_id = int(workforce.id)
+    finally:
+        db.close()
+
+    keep_response = client.patch(
+        f"/api/workforces/{workforce_id}",
+        headers=headers,
+        json={
+            "name": "Renamed Generated Manager Workforce",
+            "manager_agent_id": generated_manager_id,
+        },
+    )
+    assert keep_response.status_code == 200, keep_response.text
+    assert keep_response.json()["name"] == "Renamed Generated Manager Workforce"
+    assert keep_response.json()["manager"]["id"] == generated_manager_id
+
+    switch_to_reusable_response = client.patch(
+        f"/api/workforces/{workforce_id}",
+        headers=headers,
+        json={"manager_agent_id": reusable_manager_id},
+    )
+    assert switch_to_reusable_response.status_code == 200, (
+        switch_to_reusable_response.text
+    )
+    assert switch_to_reusable_response.json()["manager"]["id"] == reusable_manager_id
+
+    switch_to_generated_response = client.patch(
+        f"/api/workforces/{workforce_id}",
+        headers=headers,
+        json={"manager_agent_id": generated_manager_id},
+    )
+    assert switch_to_generated_response.status_code == 404
 
 
 def test_workforce_detail_marks_policy_visible_agents_readonly() -> None:

@@ -519,21 +519,22 @@ async def update_workforce(
     if _field_supplied(request, "manager_agent_id"):
         if request.manager_agent_id is None:
             raise HTTPException(status_code=400, detail="manager_agent_id is required")
-        manager_agent = ensure_agent_access(
-            db.query(Agent).filter(Agent.id == request.manager_agent_id).first(),
-            user,
-            db,
-            require_published=True,
-        )
-        if any(
-            int(worker.agent_id) == int(manager_agent.id)
-            for worker in workforce.workers
-        ):
-            raise HTTPException(
-                status_code=400,
-                detail="Manager agent cannot also be a worker",
+        if int(request.manager_agent_id) != int(workforce.manager_agent_id):
+            manager_agent = ensure_agent_access(
+                db.query(Agent).filter(Agent.id == request.manager_agent_id).first(),
+                user,
+                db,
+                require_published=True,
             )
-        workforce_row.manager_agent_id = int(manager_agent.id)
+            if any(
+                int(worker.agent_id) == int(manager_agent.id)
+                for worker in workforce.workers
+            ):
+                raise HTTPException(
+                    status_code=400,
+                    detail="Manager agent cannot also be a worker",
+                )
+            workforce_row.manager_agent_id = int(manager_agent.id)
 
     try:
         _validate_if_active(db, user, workforce)
