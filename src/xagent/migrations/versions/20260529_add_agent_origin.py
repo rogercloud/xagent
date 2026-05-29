@@ -1,7 +1,7 @@
 """add agent origin
 
 Revision ID: 20260529_add_agent_origin
-Revises: 20260526_seed_builtin_microsoft_graph_mcp_apps
+Revises: 20260528_add_kb_ingest_targets
 Create Date: 2026-05-29 00:00:00.000000
 
 """
@@ -13,7 +13,7 @@ from alembic import op
 from sqlalchemy import inspect
 
 revision: str = "20260529_add_agent_origin"
-down_revision: Union[str, None] = "20260526_seed_builtin_microsoft_graph_mcp_apps"
+down_revision: Union[str, None] = "20260528_add_kb_ingest_targets"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 
