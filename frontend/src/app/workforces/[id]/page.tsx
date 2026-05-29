@@ -258,6 +258,10 @@ export default function WorkforceDetailPage() {
             }
           : current,
       )
+      setWorkerEdits((current) => ({
+        ...current,
+        [updated.id]: workerEditState(updated),
+      }))
       setMessage(t("workforces.messages.workerUpdated"))
     } catch (err) {
       setError(err instanceof Error ? err.message : t("workforces.errors.updateWorker"))
