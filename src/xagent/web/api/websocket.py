@@ -70,6 +70,7 @@ from ..services.workforce_runtime import (
 from ..tracing import create_ephemeral_tracer
 from ..user_isolated_memory import UserContext
 from ..utils.db_timezone import safe_timestamp_to_unix
+from .public_trace_events import is_audit_only_trace_data, normalize_public_trace_event
 
 logger = logging.getLogger(__name__)
 
@@ -661,7 +662,7 @@ def _is_agent_checkpoint_data(data: Any) -> bool:
 
 def _is_audit_only_trace_data(data: Any) -> bool:
     """Return True for trace payloads that should stay server-side."""
-    return isinstance(data, dict) and data.get("__audit_only__") is True
+    return is_audit_only_trace_data(data)
 
 
 def convert_to_local_time(utc_dt: Any) -> datetime:
@@ -1949,9 +1950,17 @@ class SharedWebSocketTracer(TraceHandler):
         try:
             from .ws_trace_handlers import get_event_type_mapping
 
+            if _is_audit_only_trace_data(event.data):
+                return
+
             # Convert trace event to stream format
             event_type_str = get_event_type_mapping(event)
             serialized_data = self._serialize_data(event.data)
+            if _is_agent_checkpoint_data(serialized_data):
+                return
+            event_type_str, serialized_data = normalize_public_trace_event(
+                event_type_str, serialized_data
+            )
 
             stream_event = create_stream_event(
                 event_type_str,
@@ -3553,15 +3562,19 @@ async def send_historical_data_as_stream(
                         normalized_event_data,
                         historical_path_to_file_id,
                     )
+                public_event_type, public_event_data = normalize_public_trace_event(
+                    str(trace_event.event_type),
+                    normalized_event_data,
+                )
                 historical_events.append(
                     {
                         "type": "trace_event",
                         "data": {
                             "event_id": trace_event.event_id,
-                            "event_type": trace_event.event_type,
+                            "event_type": public_event_type,
                             "step_id": trace_event.step_id,
                             "parent_event_id": trace_event.parent_event_id,
-                            "data": normalized_event_data,
+                            "data": public_event_data,
                         },
                         "timestamp": safe_timestamp_to_unix(trace_event.timestamp)
                         if trace_event.timestamp

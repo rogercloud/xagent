@@ -315,11 +315,11 @@ class TestCreateAgentTool:
                 "task_update_general",
             ]
             assert parent_tracer.events[0]["task_id"] == "parent-task-2"
-            assert parent_tracer.events[0]["data"]["__audit_only__"] is True
+            assert "__audit_only__" not in parent_tracer.events[0]["data"]
             assert parent_tracer.events[0]["data"]["status"] == "start"
             assert parent_tracer.events[0]["data"]["workforce_id"] == 123
             assert parent_tracer.events[0]["data"]["worker_alias"] == "Writer"
-            assert parent_tracer.events[1]["data"]["__audit_only__"] is True
+            assert "__audit_only__" not in parent_tracer.events[1]["data"]
             assert parent_tracer.events[1]["data"]["status"] == "end"
             assert parent_tracer.events[1]["data"]["output"] == "worker response"
             assert parent_tracer.events[1]["data"]["output_length"] == len(
