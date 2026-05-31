@@ -20,6 +20,13 @@ class KBHandleProvider:
             "KBHandleProvider"
         )
 
+    def reset_for_tests(self) -> None:
+        """Clear provider-owned caches for test reset.
+
+        The current provider is stateless, but the hook keeps the coordinator
+        reset path ready for backend handle caches.
+        """
+
 
 @dataclass(frozen=True)
 class LanceDBCollectionHandle:

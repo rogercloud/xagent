@@ -14,6 +14,7 @@ from .models import (
     KBStorageBackend,
     KBUserScope,
 )
+from .storage_shim import KBStorageShimCompatibilityFacade
 
 __all__ = [
     "KBAccessMode",
@@ -22,6 +23,7 @@ __all__ = [
     "KBContextRequest",
     "KBHandleProvider",
     "KBCoordinator",
+    "KBStorageShimCompatibilityFacade",
     "KBStorageBackend",
     "KBUserScope",
     "LanceDBCollectionHandle",
