@@ -31,9 +31,9 @@ class KBCoordinator:
 
     def __init__(
         self,
-        storage_factory: Optional[StorageFactory] = None,
-        handle_provider: Optional[KBHandleProvider] = None,
-        storage_shim: Optional[KBStorageShimCompatibilityFacade] = None,
+        storage_factory: StorageFactory | None = None,
+        handle_provider: KBHandleProvider | None = None,
+        storage_shim: KBStorageShimCompatibilityFacade | None = None,
     ) -> None:
         self._storage_factory = storage_factory or StorageFactory.get_factory()
         self._handle_provider = handle_provider or KBHandleProvider()

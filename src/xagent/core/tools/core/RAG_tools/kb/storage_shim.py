@@ -25,13 +25,11 @@ class KBStorageShimCompatibilityFacade:
     """
 
     def __init__(self, storage_factory: StorageFactory | None = None) -> None:
-        self._storage_factory = storage_factory or self._get_default_storage_factory()
+        if storage_factory is None:
+            from ..storage.factory import StorageFactory
 
-    @staticmethod
-    def _get_default_storage_factory() -> StorageFactory:
-        from ..storage.factory import StorageFactory
-
-        return StorageFactory.get_factory()
+            storage_factory = StorageFactory.get_factory()
+        self._storage_factory = storage_factory
 
     def get_kb_write_coordinator(self) -> KBWriteCoordinator:
         """Return the legacy write coordinator singleton."""
