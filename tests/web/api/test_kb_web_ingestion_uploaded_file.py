@@ -942,6 +942,113 @@ class TestIngestWebHandleWebFile:
         assert response.status_code == 500
         assert not expected_persistent.exists()
 
+    def test_ingest_web_zero_success_failure_compensates_new_uploaded_file(
+        self, web_test_env, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Zero-success web ingest failure should remove the staged upload row and artifacts."""
+        app, headers, user, TestingSessionLocal = web_test_env
+        client = TestClient(app)
+        monkeypatch.setenv("XAGENT_FILE_STORAGE_URI", (tmp_path / "objects").as_uri())
+        monkeypatch.setenv(
+            "XAGENT_FILE_MATERIALIZE_DIR", str(tmp_path / "materialized")
+        )
+        get_file_storage.cache_clear()
+
+        uploads_root = tmp_path / "uploads"
+        monkeypatch.setenv("XAGENT_UPLOADS_DIR", str(uploads_root))
+        url = "https://example.com/page"
+        collection = "c1"
+        title = "Failed page"
+        url_hash = hashlib.sha256(f"{collection}:{url}".encode()).hexdigest()[:16]
+        filename = f"{url_hash}_{_normalize_web_title_for_filename(title)}.md"
+        expected_persistent = uploads_root / f"user_{user.id}" / collection / filename
+        captured: dict[str, str] = {}
+
+        def patched_get_upload_path(
+            filename_arg: str,
+            *,
+            user_id: int,
+            collection: str,
+            collection_is_sanitized: bool,
+        ) -> Path:
+            assert collection_is_sanitized is True
+            return uploads_root / f"user_{user_id}" / collection / filename_arg
+
+        async def stub_run_web_ingestion(
+            *,
+            collection: str,
+            crawl_config,
+            ingestion_config,
+            user_id: int,
+            is_admin: bool,
+            file_handler,
+        ):
+            temp_md = tmp_path / "temp.md"
+            temp_md.write_text("# Title\n\nBody", encoding="utf-8")
+            file_info = file_handler(temp_md, title, collection, url)
+            captured["file_id"] = str(file_info["file_id"])
+
+            from xagent.core.tools.core.RAG_tools.core.schemas import WebIngestionResult
+            from xagent.web.services.managed_file_ref import build_upload_storage_key
+
+            captured["storage_key"] = build_upload_storage_key(
+                user.id,
+                captured["file_id"],
+                filename,
+            )
+            assert expected_persistent.exists()
+            assert get_file_storage().exists(captured["storage_key"])
+
+            return WebIngestionResult(
+                status="error",
+                collection=collection,
+                total_urls_found=1,
+                pages_crawled=1,
+                pages_failed=1,
+                documents_created=0,
+                chunks_created=0,
+                embeddings_created=0,
+                crawled_urls=[url],
+                failed_urls={url: "embedding failed"},
+                message="failed",
+                warnings=[],
+                elapsed_time_ms=1,
+            )
+
+        with (
+            patch(
+                "xagent.web.api.kb.get_upload_path", side_effect=patched_get_upload_path
+            ),
+            patch(
+                "xagent.web.api.kb.get_session_local", return_value=TestingSessionLocal
+            ),
+            patch(
+                "xagent.web.api.kb.run_web_ingestion",
+                side_effect=stub_run_web_ingestion,
+            ),
+        ):
+            response = client.post(
+                "/api/kb/ingest-web",
+                data={"collection": collection, "start_url": "https://example.com"},
+                headers=headers,
+            )
+
+        assert response.status_code == 500
+        assert captured["file_id"]
+        assert not expected_persistent.exists()
+        assert not get_file_storage().exists(captured["storage_key"])
+
+        session = TestingSessionLocal()
+        try:
+            assert (
+                session.query(UploadedFile)
+                .filter(UploadedFile.file_id == captured["file_id"])
+                .first()
+                is None
+            )
+        finally:
+            session.close()
+
 
 class TestWebFileRefreshHelpers:
     """Test helper functions for stale content refresh."""

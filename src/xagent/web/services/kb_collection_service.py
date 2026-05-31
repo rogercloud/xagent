@@ -6,7 +6,7 @@ import logging
 import os
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional, Set
+from typing import TYPE_CHECKING, Optional, Set
 
 from filelock import Timeout
 from sqlalchemy import or_
@@ -19,7 +19,16 @@ from ..models.uploaded_file import UploadedFile
 from .kb_file_service import delete_uploaded_file_if_orphaned
 from .uploaded_file_store import UploadedFileStore
 
+if TYPE_CHECKING:
+    from ...core.tools.core.RAG_tools.kb import KBFileCompatibilityFacade
+
 logger = logging.getLogger(__name__)
+
+
+def _get_file_compatibility_facade() -> "KBFileCompatibilityFacade":
+    from ...core.tools.core.RAG_tools.kb import get_kb_coordinator
+
+    return get_kb_coordinator().file_compatibility
 
 
 @dataclass(frozen=True)
@@ -67,7 +76,7 @@ def _path_belongs_to_collection_dir(
     return file_path == collection_dir or collection_dir in file_path.parents
 
 
-def list_collection_uploaded_file_owner_ids(
+def _list_collection_uploaded_file_owner_ids_impl(
     db: Session,
     *,
     collection_name: str,
@@ -116,7 +125,7 @@ def list_collection_uploaded_file_owner_ids(
     return owner_ids
 
 
-def delete_collection_physical_dir(
+def _delete_collection_physical_dir_impl(
     *,
     user_id: int,
     collection_name: str,
@@ -180,7 +189,7 @@ def delete_collection_physical_dir(
         )
 
 
-def delete_collection_uploaded_files(
+def _delete_collection_uploaded_files_impl(
     db: Session,
     *,
     user_id: int,
@@ -226,7 +235,7 @@ def delete_collection_uploaded_files(
     return deleted_uploaded_files
 
 
-def rename_collection_storage(
+def _rename_collection_storage_impl(
     db: Session,
     *,
     user_id: int,
@@ -395,3 +404,63 @@ def rename_collection_storage(
             old_collection_dir=old_collection_dir,
             new_collection_dir=new_collection_dir,
         )
+
+
+def list_collection_uploaded_file_owner_ids(
+    db: Session,
+    *,
+    collection_name: str,
+) -> Set[int]:
+    """List UploadedFile owners with files under a collection directory."""
+    return _get_file_compatibility_facade().list_collection_uploaded_file_owner_ids(
+        db,
+        collection_name=collection_name,
+    )
+
+
+def delete_collection_physical_dir(
+    *,
+    user_id: int,
+    collection_name: str,
+) -> CollectionPhysicalDeleteResult:
+    """Move a collection directory to trash if it exists."""
+    return _get_file_compatibility_facade().delete_collection_physical_dir(
+        user_id=user_id,
+        collection_name=collection_name,
+    )
+
+
+def delete_collection_uploaded_files(
+    db: Session,
+    *,
+    user_id: int,
+    collection_file_ids: Set[str],
+    remaining_file_ids: Set[str],
+    collection_dir: Optional[Path],
+) -> int:
+    """Delete orphan UploadedFile rows for a collection, with legacy path fallback."""
+    return _get_file_compatibility_facade().delete_collection_uploaded_files(
+        db,
+        user_id=user_id,
+        collection_file_ids=collection_file_ids,
+        remaining_file_ids=remaining_file_ids,
+        collection_dir=collection_dir,
+    )
+
+
+def rename_collection_storage(
+    db: Session,
+    *,
+    user_id: int,
+    old_collection_name: str,
+    new_collection_name: str,
+    collection_file_ids: Set[str],
+) -> CollectionPhysicalRenameResult:
+    """Rename collection directory and update UploadedFile storage paths."""
+    return _get_file_compatibility_facade().rename_collection_storage(
+        db,
+        user_id=user_id,
+        old_collection_name=old_collection_name,
+        new_collection_name=new_collection_name,
+        collection_file_ids=collection_file_ids,
+    )

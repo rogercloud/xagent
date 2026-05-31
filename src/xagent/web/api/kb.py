@@ -133,6 +133,12 @@ from ..services.kb_file_service import (
     build_uploaded_filename_map as _build_uploaded_filename_map,
 )
 from ..services.kb_file_service import (
+    capture_uploaded_file_refresh_snapshot as _capture_uploaded_file_refresh_snapshot,
+)
+from ..services.kb_file_service import (
+    compensate_new_uploaded_file as _compensate_new_uploaded_file,
+)
+from ..services.kb_file_service import (
     delete_uploaded_file_if_orphaned as _delete_uploaded_file_if_orphaned,
 )
 from ..services.kb_file_service import (
@@ -143,6 +149,9 @@ from ..services.kb_file_service import (
 )
 from ..services.kb_file_service import (
     resolve_document_filename as _resolve_document_filename,
+)
+from ..services.kb_file_service import (
+    restore_uploaded_file_refresh_snapshot as _restore_uploaded_file_refresh_snapshot,
 )
 from ..services.kb_file_service import (
     upsert_uploaded_file_record as _upsert_uploaded_file_record,
@@ -1101,6 +1110,11 @@ def _refresh_existing_file_if_changed(
     # Mark succeeded - now atomically replace the file
     backup_path = _build_ingest_backup_path(existing_path)
     shutil.copy2(existing_path, backup_path)
+    refresh_snapshot = _capture_uploaded_file_refresh_snapshot(
+        existing_record,
+        backup_path=backup_path,
+        reindex_marker_applied=True,
+    )
     try:
         _atomic_replace_file(temp_file_path, existing_path)
         file_record = _upsert_uploaded_file_record(
@@ -1111,12 +1125,16 @@ def _refresh_existing_file_if_changed(
             mime_type="text/markdown",
             file_size=existing_path.stat().st_size,
         )
-    except Exception:
-        _restore_ingest_file_backup(
-            file_path=existing_path,
-            backup_path=backup_path,
-            had_existing_file=True,
+    except Exception as exc:
+        restore_result = _restore_uploaded_file_refresh_snapshot(
+            db_session,
+            refresh_snapshot,
         )
+        if restore_result.side_effects_may_remain:
+            raise RollbackFailureError(
+                "Failed to fully restore refreshed web file "
+                f"for {url}: {'; '.join(restore_result.errors) or exc}"
+            ) from exc
         raise
     finally:
         if backup_path.exists():
@@ -3044,6 +3062,7 @@ async def ingest_web(
         # Note: For large-scale web ingestion (>10000 pages), consider using
         # a bounded-size dict (e.g., with maxitems) to control memory usage.
         _processed_urls: Dict[str, str] = {}
+        _new_web_file_ids: set[str] = set()
 
         # Define file handler for persistent storage and UploadedFile record creation
         def _handle_web_file(
@@ -3197,6 +3216,7 @@ async def ingest_web(
                     )
 
                     _processed_urls[url_hash] = str(file_record.file_id)
+                    _new_web_file_ids.add(str(file_record.file_id))
                     return FileHandlerResult(
                         file_path=str(persistent_file),
                         file_id=str(file_record.file_id),
@@ -3254,11 +3274,41 @@ async def ingest_web(
             result = result.model_copy(update={"message": web_updated_message})
 
         if result.status == "error":
-            if not collection_existed_before:
-                await _cleanup_failed_new_collection_metadata(
-                    collection_name=safe_collection,
-                    user=_user,
+            cleanup_incomplete = False
+            cleanup_errors: list[str] = []
+            if result.documents_created == 0:
+                for file_id in sorted(_new_web_file_ids):
+                    cleanup_result = _compensate_new_uploaded_file(
+                        db,
+                        file_id=file_id,
+                        user_id=int(_user.id),
+                    )
+                    if cleanup_result.side_effects_may_remain:
+                        cleanup_incomplete = True
+                        cleanup_errors.extend(cleanup_result.errors)
+                        db.rollback()
+                        continue
+                    db.commit()
+
+            if cleanup_incomplete:
+                cleanup_message = "Web ingest rollback incomplete: " + "; ".join(
+                    cleanup_errors or ["side effects may remain"]
                 )
+                result = result.model_copy(
+                    update={"warnings": [*result.warnings, cleanup_message]}
+                )
+            if not collection_existed_before:
+                if cleanup_incomplete:
+                    logger.warning(
+                        "Skipping failed web-ingest collection metadata cleanup for %s "
+                        "because file rollback is incomplete",
+                        safe_collection,
+                    )
+                else:
+                    await _cleanup_failed_new_collection_metadata(
+                        collection_name=safe_collection,
+                        user=_user,
+                    )
             return JSONResponse(status_code=500, content=result.model_dump())
         if result.status == "partial":
             logger.warning(
