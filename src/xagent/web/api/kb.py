@@ -1200,6 +1200,36 @@ def _recreate_missing_existing_file(
     )
 
 
+def _compensate_new_web_ingest_files(
+    db: Session,
+    *,
+    file_ids: set[str],
+    user_id: int,
+) -> tuple[bool, list[str]]:
+    cleanup_incomplete = False
+    cleanup_errors: list[str] = []
+    for file_id in sorted(file_ids):
+        cleanup_result = _compensate_new_uploaded_file(
+            db,
+            file_id=file_id,
+            user_id=user_id,
+        )
+        if cleanup_result.side_effects_may_remain:
+            cleanup_incomplete = True
+            cleanup_errors.extend(cleanup_result.errors)
+            db.rollback()
+            continue
+        try:
+            db.commit()
+        except Exception as commit_exc:  # noqa: BLE001
+            cleanup_incomplete = True
+            cleanup_errors.append(
+                f"Database commit failed for file {file_id}: {commit_exc}"
+            )
+            db.rollback()
+    return cleanup_incomplete, cleanup_errors
+
+
 class _WebFileLock:
     """Per-key in-process lock for web ingestion file operations."""
 
@@ -3277,18 +3307,11 @@ async def ingest_web(
             cleanup_incomplete = False
             cleanup_errors: list[str] = []
             if result.documents_created == 0:
-                for file_id in sorted(_new_web_file_ids):
-                    cleanup_result = _compensate_new_uploaded_file(
-                        db,
-                        file_id=file_id,
-                        user_id=int(_user.id),
-                    )
-                    if cleanup_result.side_effects_may_remain:
-                        cleanup_incomplete = True
-                        cleanup_errors.extend(cleanup_result.errors)
-                        db.rollback()
-                        continue
-                    db.commit()
+                cleanup_incomplete, cleanup_errors = _compensate_new_web_ingest_files(
+                    db,
+                    file_ids=_new_web_file_ids,
+                    user_id=int(_user.id),
+                )
 
             if cleanup_incomplete:
                 cleanup_message = "Web ingest rollback incomplete: " + "; ".join(
