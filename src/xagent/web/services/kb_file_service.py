@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import os
+import shutil
 import time
 from collections import OrderedDict
 from dataclasses import dataclass
@@ -468,26 +469,57 @@ def _restore_uploaded_file_refresh_snapshot_impl(
 ) -> FileCompensationResult:
     """Restore UploadedFile row, local file, durable bytes, and cache state."""
     effects: list[str] = []
+    errors: list[str] = []
+
+    if snapshot.backup_path is not None:
+        try:
+            if snapshot.had_local_file:
+                snapshot.previous_path.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(snapshot.backup_path, snapshot.previous_path)
+                effects.append("local_file_restored")
+            else:
+                snapshot.previous_path.unlink(missing_ok=True)
+                effects.append("local_file_removed")
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "Failed to restore local UploadedFile backup for file_id=%s: %s",
+                snapshot.file_id,
+                exc,
+            )
+            errors.append(str(exc))
+
+    try:
+        db.rollback()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "Failed to roll back database session before UploadedFile refresh restore "
+            "for file_id=%s: %s",
+            snapshot.file_id,
+            exc,
+        )
+        errors.append(str(exc))
+        return FileCompensationResult(
+            status="incomplete",
+            side_effects_may_remain=True,
+            errors=tuple(errors),
+            effects=tuple(effects),
+        )
+
     try:
         query = db.query(UploadedFile).filter(UploadedFile.file_id == snapshot.file_id)
         if snapshot.user_id is not None:
             query = query.filter(UploadedFile.user_id == snapshot.user_id)
         file_record = query.first()
         if file_record is None:
-            return _compensation_incomplete(
+            errors.append(
                 f"UploadedFile missing during refresh restore: {snapshot.file_id}"
             )
-
-        if snapshot.backup_path is not None:
-            if snapshot.had_local_file:
-                snapshot.previous_path.parent.mkdir(parents=True, exist_ok=True)
-                import shutil
-
-                shutil.copy2(snapshot.backup_path, snapshot.previous_path)
-                effects.append("local_file_restored")
-            else:
-                snapshot.previous_path.unlink(missing_ok=True)
-                effects.append("local_file_removed")
+            return FileCompensationResult(
+                status="incomplete",
+                side_effects_may_remain=True,
+                errors=tuple(errors),
+                effects=tuple(effects),
+            )
 
         for field_name, value in snapshot.row_fields.items():
             setattr(file_record, field_name, value)
@@ -514,10 +546,23 @@ def _restore_uploaded_file_refresh_snapshot_impl(
             snapshot.file_id,
             exc,
         )
-        return _compensation_incomplete(exc, effects=tuple(effects))
+        errors.append(str(exc))
+        return FileCompensationResult(
+            status="incomplete",
+            side_effects_may_remain=True,
+            errors=tuple(errors),
+            effects=tuple(effects),
+        )
 
     if snapshot.reindex_marker_applied:
         effects.append("reindex_marker_was_applied")
+    if errors:
+        return FileCompensationResult(
+            status="incomplete",
+            side_effects_may_remain=True,
+            errors=tuple(errors),
+            effects=tuple(effects),
+        )
     return _compensation_complete(*effects)
 
 

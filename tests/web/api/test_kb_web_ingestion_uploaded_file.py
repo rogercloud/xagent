@@ -28,6 +28,7 @@ import pytest
 from fastapi import FastAPI, HTTPException, UploadFile
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 
 from xagent.core.file_storage.factory import get_file_storage
@@ -495,6 +496,74 @@ class TestWebIngestionUploadedFilePersistence:
 
         assert atomic_replace.called
         assert existing_path.read_text(encoding="utf-8") == "old content"
+
+    def test_refresh_existing_file_rolls_back_failed_upsert_before_restore(
+        self,
+        db_session: Session,
+        test_user: User,
+        mock_user: MagicMock,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setenv("XAGENT_FILE_STORAGE_URI", (tmp_path / "objects").as_uri())
+        monkeypatch.setenv(
+            "XAGENT_FILE_MATERIALIZE_DIR", str(tmp_path / "materialized")
+        )
+        get_file_storage.cache_clear()
+
+        temp_dir = tmp_path / "ingest"
+        temp_dir.mkdir()
+        existing_path = temp_dir / "existing.md"
+        existing_path.write_text("old content", encoding="utf-8")
+        temp_file_path = temp_dir / "incoming.md"
+        temp_file_path.write_text("new content", encoding="utf-8")
+
+        existing_record = _upsert_uploaded_file_record(
+            db_session,
+            user_id=int(mock_user.id),
+            filename="existing.md",
+            storage_path=existing_path,
+            mime_type="text/markdown",
+            file_size=existing_path.stat().st_size,
+        )
+        file_id = str(existing_record.file_id)
+
+        def failing_upsert(db: Session, *_args, **_kwargs):
+            db.add(
+                User(
+                    username=str(test_user.username),
+                    password_hash="duplicate",
+                    is_admin=False,
+                )
+            )
+            db.commit()
+
+        with patch(
+            "xagent.web.api.kb._mark_uploaded_file_for_reindex", return_value=True
+        ):
+            with patch(
+                "xagent.web.api.kb._upsert_uploaded_file_record",
+                side_effect=failing_upsert,
+            ):
+                with pytest.raises(IntegrityError):
+                    _refresh_existing_file_if_changed(
+                        existing_record=existing_record,
+                        temp_file_path=temp_file_path,
+                        db_session=db_session,
+                        user_id=int(mock_user.id),
+                        url="https://example.com/page",
+                        filename="existing.md",
+                        url_hash="hash",
+                        processed_urls={},
+                        context="cross-session",
+                    )
+
+        assert existing_path.read_text(encoding="utf-8") == "old content"
+        restored_record = (
+            db_session.query(UploadedFile).filter(UploadedFile.file_id == file_id).one()
+        )
+        assert restored_record.filename == "existing.md"
+        assert list(temp_dir.glob("existing.md.rollback-*")) == []
 
     def test_refresh_existing_file_restores_missing_local_from_durable_before_compare(
         self,

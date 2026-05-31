@@ -1110,6 +1110,7 @@ def _refresh_existing_file_if_changed(
     # Mark succeeded - now atomically replace the file
     backup_path = _build_ingest_backup_path(existing_path)
     shutil.copy2(existing_path, backup_path)
+    remove_backup = True
     refresh_snapshot = _capture_uploaded_file_refresh_snapshot(
         existing_record,
         backup_path=backup_path,
@@ -1126,18 +1127,29 @@ def _refresh_existing_file_if_changed(
             file_size=existing_path.stat().st_size,
         )
     except Exception as exc:
+        try:
+            db_session.rollback()
+        except Exception as rollback_exc:  # noqa: BLE001
+            logger.warning(
+                "Failed to roll back database session before restoring refreshed "
+                "web file for url=%s, file_id=%s: %s",
+                url,
+                existing_record.file_id,
+                rollback_exc,
+            )
         restore_result = _restore_uploaded_file_refresh_snapshot(
             db_session,
             refresh_snapshot,
         )
         if restore_result.side_effects_may_remain:
+            remove_backup = False
             raise RollbackFailureError(
                 "Failed to fully restore refreshed web file "
                 f"for {url}: {'; '.join(restore_result.errors) or exc}"
             ) from exc
         raise
     finally:
-        if backup_path.exists():
+        if remove_backup and backup_path.exists():
             backup_path.unlink()
     processed_urls[url_hash] = str(file_record.file_id)
 

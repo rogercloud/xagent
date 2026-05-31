@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 from sqlalchemy import create_engine
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import sessionmaker
 
 from xagent.core.file_storage import get_file_storage
@@ -148,3 +149,74 @@ def test_restore_uploaded_file_refresh_snapshot_restores_row_local_and_durable(
     assert file_record.filename == "page.md"
     with get_file_storage().open_read(storage_key) as handle:
         assert handle.read() == b"old content"
+
+
+def test_restore_uploaded_file_refresh_snapshot_rolls_back_failed_session(
+    compensation_env,
+) -> None:
+    db, uploads_dir = compensation_env
+    file_path = uploads_dir / "user_1" / "kb" / "page.md"
+    file_path.parent.mkdir(parents=True)
+    file_path.write_text("old content", encoding="utf-8")
+    file_record = upsert_uploaded_file_record(
+        db,
+        user_id=1,
+        filename="page.md",
+        storage_path=file_path,
+        mime_type="text/markdown",
+        file_size=file_path.stat().st_size,
+    )
+
+    backup_path = uploads_dir / "page.md.backup"
+    backup_path.write_text("old content", encoding="utf-8")
+    snapshot = capture_uploaded_file_refresh_snapshot(
+        file_record,
+        backup_path=backup_path,
+    )
+
+    file_path.write_text("new content", encoding="utf-8")
+    file_record.filename = "renamed.md"
+    db.flush()
+    db.add(User(username="user_1", password_hash="dupe", is_admin=False))
+    with pytest.raises(IntegrityError):
+        db.commit()
+
+    result = restore_uploaded_file_refresh_snapshot(db, snapshot)
+    db.commit()
+
+    assert result.complete
+    assert file_path.read_text(encoding="utf-8") == "old content"
+    restored_record = (
+        db.query(UploadedFile).filter(UploadedFile.file_id == file_record.file_id).one()
+    )
+    assert restored_record.filename == "page.md"
+
+
+def test_restore_uploaded_file_refresh_snapshot_restores_local_before_db_query(
+    tmp_path: Path,
+) -> None:
+    file_path = tmp_path / "page.md"
+    file_path.write_text("new content", encoding="utf-8")
+    backup_path = tmp_path / "page.md.backup"
+    backup_path.write_text("old content", encoding="utf-8")
+    snapshot = kb_file_service.UploadedFileRefreshSnapshot(
+        file_id="file-1",
+        user_id=1,
+        row_fields={},
+        previous_path=file_path,
+        backup_path=backup_path,
+        had_local_file=True,
+    )
+
+    class BrokenSession:
+        def rollback(self) -> None:
+            pass
+
+        def query(self, *_args):
+            raise RuntimeError("database unavailable")
+
+    result = restore_uploaded_file_refresh_snapshot(BrokenSession(), snapshot)  # type: ignore[arg-type]
+
+    assert result.side_effects_may_remain
+    assert "local_file_restored" in result.effects
+    assert file_path.read_text(encoding="utf-8") == "old content"
