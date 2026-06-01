@@ -2,13 +2,12 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterator
+from contextlib import contextmanager
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
-
-from .models import KBAccessMode, KBContextRequest
 
 if TYPE_CHECKING:
     from ..core.schemas import ParsedElementDisplay
-    from ..storage.contracts import VectorIndexStore
     from .coordinator import KBCoordinator
     from .storage_shim import KBStorageShimCompatibilityFacade
 
@@ -16,9 +15,9 @@ if TYPE_CHECKING:
 class KBParseDisplayCompatibilityFacade:
     """Compatibility boundary for legacy parse display helpers.
 
-    Parse display helpers are synchronous read-only APIs. The facade resolves
-    coordinator-owned context and storage access while preserving the legacy
-    helper names, signatures, tuple shapes, and conversion behavior.
+    Parse display helpers are synchronous read-only APIs. The facade binds
+    coordinator-owned storage access while preserving the legacy helper names,
+    signatures, tuple shapes, and conversion behavior.
     """
 
     def __init__(
@@ -36,31 +35,17 @@ class KBParseDisplayCompatibilityFacade:
             return self._coordinator.storage_shim
         return None
 
-    def _resolve_vector_store(
-        self,
-        collection: str,
-        user_id: Optional[int],
-        is_admin: bool,
-    ) -> VectorIndexStore:
-        if self._coordinator is not None:
-            context = self._coordinator.get_context_sync(
-                KBContextRequest(
-                    collection=collection,
-                    user_id=user_id,
-                    is_admin=is_admin,
-                    access_mode=KBAccessMode.READ,
-                    hide_missing=True,
-                )
-            )
-            return context.vector_index_store
-
+    @contextmanager
+    def _storage_context(self) -> Iterator[None]:
         storage_shim = self._active_storage_shim()
-        if storage_shim is not None:
-            return storage_shim.get_vector_index_store()
+        if storage_shim is None:
+            yield
+            return
 
-        from ..storage.factory import get_vector_index_store
+        from ..storage.factory import bind_storage_shim_for_current_context
 
-        return get_vector_index_store()
+        with bind_storage_shim_for_current_context(storage_shim):
+            yield
 
     def reconstruct_parse_result_from_db(
         self,
@@ -72,15 +57,14 @@ class KBParseDisplayCompatibilityFacade:
     ) -> Tuple[List[Dict[str, Any]], Optional[str]]:
         from ..parse.parse_display import _reconstruct_parse_result_from_db_impl
 
-        vector_store = self._resolve_vector_store(collection, user_id, is_admin)
-        return _reconstruct_parse_result_from_db_impl(
-            collection,
-            doc_id,
-            parse_hash=parse_hash,
-            user_id=user_id,
-            is_admin=is_admin,
-            vector_store=vector_store,
-        )
+        with self._storage_context():
+            return _reconstruct_parse_result_from_db_impl(
+                collection,
+                doc_id,
+                parse_hash=parse_hash,
+                user_id=user_id,
+                is_admin=is_admin,
+            )
 
     def paginate_parse_results(
         self,

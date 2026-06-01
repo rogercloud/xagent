@@ -5,6 +5,7 @@ from __future__ import annotations
 import inspect
 import json
 from datetime import datetime, timedelta
+from types import SimpleNamespace
 from typing import Any, Optional
 
 import pytest
@@ -324,6 +325,63 @@ def test_parse_display_lookup_after_rolled_back_ingest_keeps_not_found_behavior(
         "doc_id": "doc-rolled-back",
     }
     assert vector_store.iter_calls == []
+
+
+def test_parse_display_facade_rebinds_coordinator_storage_for_legacy_impl(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Facade delegation rebinds storage factory access to its coordinator shim."""
+    from xagent.core.tools.core.RAG_tools.kb import KBParseDisplayCompatibilityFacade
+    from xagent.core.tools.core.RAG_tools.parse import parse_display
+    from xagent.core.tools.core.RAG_tools.storage.factory import (
+        bind_storage_shim_for_current_context,
+        get_vector_index_store,
+    )
+
+    outer_store = _FakeVectorStore([])
+    inner_store = _FakeVectorStore([])
+    outer_shim = _FakeStorageShim(outer_store)
+    inner_shim = _FakeStorageShim(inner_store)
+
+    class _FakeCoordinator:
+        @property
+        def storage_shim(self) -> _FakeStorageShim:
+            return inner_shim
+
+        def get_context_sync(self, _request: Any) -> Any:
+            return SimpleNamespace(vector_index_store=inner_store)
+
+    def fake_impl(
+        collection: str,
+        doc_id: str,
+        parse_hash: Optional[str] = None,
+        user_id: Optional[int] = None,
+        is_admin: bool = False,
+        **_kwargs: Any,
+    ) -> tuple[list[dict[str, Any]], Optional[str]]:
+        assert collection == "docs"
+        assert doc_id == "doc-inner"
+        assert parse_hash is None
+        assert user_id == 1
+        assert is_admin is False
+        assert get_vector_index_store() is inner_store
+        return ([{"type": "text", "text": "inner", "metadata": {}}], "inner")
+
+    monkeypatch.setattr(
+        parse_display,
+        "_reconstruct_parse_result_from_db_impl",
+        fake_impl,
+    )
+
+    facade = KBParseDisplayCompatibilityFacade(coordinator=_FakeCoordinator())
+    with bind_storage_shim_for_current_context(outer_shim):
+        elements, parse_hash = facade.reconstruct_parse_result_from_db(
+            "docs", "doc-inner", user_id=1, is_admin=False
+        )
+        assert get_vector_index_store() is outer_store
+
+    assert parse_hash == "inner"
+    assert elements[0]["text"] == "inner"
 
 
 def test_parse_display_facade_preserves_json_corruption_mapping() -> None:
