@@ -11,7 +11,10 @@ from __future__ import annotations
 
 import logging
 import threading
-from typing import TYPE_CHECKING, Any, Optional
+from collections.abc import Iterator
+from contextlib import contextmanager
+from contextvars import ContextVar
+from typing import TYPE_CHECKING, Any, Optional, cast
 
 from .contracts import (
     IngestionStatusStore,
@@ -35,9 +38,35 @@ from .vector_backend import (
 )
 
 logger = logging.getLogger(__name__)
+_storage_shim_override: ContextVar[Any] = ContextVar(
+    "xagent_kb_storage_shim_override",
+    default=None,
+)
 
 if TYPE_CHECKING:
     from ..kb.storage_shim import KBStorageShimCompatibilityFacade
+
+
+def get_bound_storage_shim_for_current_context() -> (
+    KBStorageShimCompatibilityFacade | None
+):
+    """Return the storage shim already bound to this execution context."""
+    return cast(
+        "KBStorageShimCompatibilityFacade | None",
+        _storage_shim_override.get(),
+    )
+
+
+@contextmanager
+def bind_storage_shim_for_current_context(
+    storage_shim: KBStorageShimCompatibilityFacade,
+) -> Iterator[None]:
+    """Route legacy storage accessors through a coordinator-owned shim."""
+    token = _storage_shim_override.set(storage_shim)
+    try:
+        yield
+    finally:
+        _storage_shim_override.reset(token)
 
 
 class StorageFactory:
@@ -228,6 +257,10 @@ class StorageFactory:
 
 def _get_storage_shim() -> KBStorageShimCompatibilityFacade:
     """Return the coordinator-owned low-level storage compatibility facade."""
+    override = get_bound_storage_shim_for_current_context()
+    if override is not None:
+        return override
+
     from ..kb import get_kb_coordinator
 
     return get_kb_coordinator().storage_shim

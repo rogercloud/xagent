@@ -82,6 +82,60 @@ def test_write_ingestion_status_overwrites_existing(temp_lancedb_dir: str) -> No
     assert records[0]["message"] == "Completed"
 
 
+def test_failed_ingest_status_can_be_restored_then_cleared(
+    temp_lancedb_dir: str,
+) -> None:
+    """Failed ingest rollback status can be restored and then cleared."""
+
+    collection = "failed_status_collection"
+    doc_id = "failed_doc"
+
+    write_ingestion_status(
+        collection=collection,
+        doc_id=doc_id,
+        status="failed",
+        message="Initial ingest failed",
+        user_id=7,
+    )
+    failed_records = load_ingestion_status(
+        collection=collection,
+        doc_id=doc_id,
+        user_id=7,
+        is_admin=False,
+    )
+    assert len(failed_records) == 1
+    assert failed_records[0]["status"] == "failed"
+
+    write_ingestion_status(
+        collection=collection,
+        doc_id=doc_id,
+        status="pending",
+        message="Rollback restored status",
+        user_id=7,
+    )
+    restored_records = load_ingestion_status(
+        collection=collection,
+        doc_id=doc_id,
+        user_id=7,
+        is_admin=False,
+    )
+    assert len(restored_records) == 1
+    assert restored_records[0]["status"] == "pending"
+    assert restored_records[0]["message"] == "Rollback restored status"
+
+    clear_ingestion_status(collection, doc_id, user_id=7, is_admin=False)
+
+    assert (
+        load_ingestion_status(
+            collection=collection,
+            doc_id=doc_id,
+            user_id=7,
+            is_admin=False,
+        )
+        == []
+    )
+
+
 def test_load_ingestion_status_by_collection(temp_lancedb_dir: str) -> None:
     """Test loading status records filtered by collection."""
 

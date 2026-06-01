@@ -38,7 +38,10 @@ from src.xagent.core.tools.core.RAG_tools.management import (
     list_documents,
     retry_document,
 )
-from src.xagent.core.tools.core.RAG_tools.management.status import load_ingestion_status
+from src.xagent.core.tools.core.RAG_tools.management.status import (
+    load_ingestion_status,
+    write_ingestion_status,
+)
 from src.xagent.core.tools.core.RAG_tools.storage import get_vector_index_store
 from src.xagent.core.tools.core.RAG_tools.storage.contracts import DocumentRecord
 from src.xagent.core.tools.core.RAG_tools.storage.factory import get_metadata_store
@@ -1153,6 +1156,53 @@ def test_delete_document_clears_status_with_caller_scope() -> None:
         "doc-1",
         user_id=9,
         is_admin=True,
+    )
+
+
+def test_delete_document_cleans_failed_ingest_status_by_doc_id(
+    temp_lancedb_dir: str,
+) -> None:
+    """Failed ingest rollback cleanup should remove document data and status."""
+
+    collection = "failed_ingest_cleanup"
+    doc_id = "failed-doc"
+    now = datetime.now(timezone.utc)
+
+    _insert_documents(
+        [
+            {
+                "collection": collection,
+                "doc_id": doc_id,
+                "source_path": "/uploads/user_7/failed-doc.pdf",
+                "file_type": "pdf",
+                "content_hash": "failed-hash",
+                "uploaded_at": now,
+                "title": "Failed",
+                "language": "zh",
+                "user_id": 7,
+            }
+        ]
+    )
+    write_ingestion_status(
+        collection,
+        doc_id,
+        status=DocumentProcessingStatus.FAILED.value,
+        message="Failed during ingest",
+        user_id=7,
+    )
+
+    result = delete_document(collection, doc_id, user_id=7, is_admin=False)
+
+    assert result.status == "success"
+    assert result.details.get("documents") == 1
+    assert (
+        load_ingestion_status(
+            collection=collection,
+            doc_id=doc_id,
+            user_id=7,
+            is_admin=False,
+        )
+        == []
     )
 
 
