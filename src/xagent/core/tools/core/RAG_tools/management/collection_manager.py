@@ -1114,7 +1114,7 @@ def _coerce_stat_count(stats: dict[str, Any], key: str) -> int:
 async def rebuild_collection_stats(
     collection_name: str,
 ) -> Optional["CollectionInfo"]:
-    """Rebuild collection stats from the storage backend after commit/rollback."""
+    """Rebuild global collection metadata stats after commit/rollback."""
     return await _get_maintenance_compatibility_facade().rebuild_collection_stats(
         collection_name
     )
@@ -1130,6 +1130,7 @@ async def _rebuild_collection_stats_impl(
     except Exception:
         existing_info = None
 
+    # collection_metadata is a global cache; never persist user-scoped counts here.
     stats_by_collection = get_vector_index_store().aggregate_collection_stats(
         user_id=None,
         is_admin=True,
