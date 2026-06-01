@@ -9,7 +9,10 @@ from typing import Any, Optional
 
 import pytest
 
-from xagent.core.tools.core.RAG_tools.core.exceptions import DatabaseOperationError
+from xagent.core.tools.core.RAG_tools.core.exceptions import (
+    DatabaseOperationError,
+    DocumentNotFoundError,
+)
 
 
 class _FakeRow:
@@ -292,6 +295,35 @@ def test_parse_display_facade_preserves_sync_tuple_shapes_and_latest_selection()
         "doc_id": "doc-1",
         "parse_hash": "old",
     }
+
+
+def test_parse_display_lookup_after_rolled_back_ingest_keeps_not_found_behavior() -> (
+    None
+):
+    """Rolled-back ingest leaves no parse row, so lookup stays legacy not-found."""
+    from xagent.core.tools.core.RAG_tools.kb import KBParseDisplayCompatibilityFacade
+
+    vector_store = _FakeVectorStore([])
+    facade = KBParseDisplayCompatibilityFacade(
+        storage_shim=_FakeStorageShim(vector_store)
+    )
+
+    with pytest.raises(
+        DocumentNotFoundError,
+        match="No parse results found for document: doc_id=doc-rolled-back",
+    ):
+        facade.reconstruct_parse_result_from_db(
+            "docs",
+            "doc-rolled-back",
+            user_id=1,
+            is_admin=False,
+        )
+
+    assert vector_store.count_calls[0]["filters"] == {
+        "collection": "docs",
+        "doc_id": "doc-rolled-back",
+    }
+    assert vector_store.iter_calls == []
 
 
 def test_parse_display_facade_preserves_json_corruption_mapping() -> None:
