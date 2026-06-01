@@ -13,7 +13,7 @@ import re
 import warnings as py_warnings
 from collections import defaultdict
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Sequence, Set
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence, Set
 
 import pyarrow as pa  # type: ignore
 from lancedb.db import DBConnection
@@ -52,7 +52,16 @@ from .collection_manager import delete_collection_metadata_sync
 
 logger = logging.getLogger(__name__)
 
+if TYPE_CHECKING:
+    from ..kb import KBCoreManagementCompatibilityFacade
+
 DEFAULT_BATCH_SIZE = DEFAULT_LANCEDB_SCAN_BATCH_SIZE
+
+
+def _get_management_facade() -> "KBCoreManagementCompatibilityFacade":
+    from ..kb import get_kb_coordinator
+
+    return get_kb_coordinator().management
 
 
 def _extract_user_id_from_source_path(source_path: Optional[str]) -> Optional[int]:
@@ -566,6 +575,19 @@ async def list_collections(
     is_admin: Optional[bool] = None,
     force_realtime: bool = False,
 ) -> ListCollectionsResult:
+    """List all knowledge base collections through the coordinator facade."""
+    return await _get_management_facade().list_collections(
+        user_id=user_id,
+        is_admin=is_admin,
+        force_realtime=force_realtime,
+    )
+
+
+async def _list_collections_impl(
+    user_id: Optional[int] = None,
+    is_admin: Optional[bool] = None,
+    force_realtime: bool = False,
+) -> ListCollectionsResult:
     """List all knowledge base collections along with aggregated statistics.
 
     This function returns a list of all available knowledge bases (collections)
@@ -953,6 +975,23 @@ def get_document_stats(
     user_id: Optional[int] = None,
     is_admin: bool = False,
 ) -> DocumentStatsResult:
+    """Return document statistics through the coordinator facade."""
+    return _get_management_facade().get_document_stats(
+        collection=collection,
+        doc_id=doc_id,
+        model_tag=model_tag,
+        user_id=user_id,
+        is_admin=is_admin,
+    )
+
+
+def _get_document_stats_impl(
+    collection: str,
+    doc_id: str,
+    model_tag: Optional[str] = None,
+    user_id: Optional[int] = None,
+    is_admin: bool = False,
+) -> DocumentStatsResult:
     """Return statistics for a single document within a collection.
 
     Args:
@@ -1106,6 +1145,19 @@ def list_documents(
     user_id: Optional[int] = None,
     is_admin: bool = False,
 ) -> DocumentListResult:
+    """List documents for a collection through the coordinator facade."""
+    return _get_management_facade().list_documents(
+        collection=collection,
+        user_id=user_id,
+        is_admin=is_admin,
+    )
+
+
+def _list_documents_impl(
+    collection: str,
+    user_id: Optional[int] = None,
+    is_admin: bool = False,
+) -> DocumentListResult:
     """List documents for a collection including latest processing status.
 
     Uses batch processing to minimize memory footprint.
@@ -1238,6 +1290,19 @@ def list_documents(
 
 
 def delete_collection(
+    collection: str,
+    user_id: Optional[int] = None,
+    is_admin: bool = False,
+) -> CollectionOperationResult:
+    """Delete a collection through the coordinator facade."""
+    return _get_management_facade().delete_collection(
+        collection=collection,
+        user_id=user_id,
+        is_admin=is_admin,
+    )
+
+
+def _delete_collection_impl(
     collection: str,
     user_id: Optional[int] = None,
     is_admin: bool = False,
@@ -1419,6 +1484,18 @@ def delete_collection(
 def delete_document(
     collection: str, doc_id: str, user_id: int, is_admin: bool = False
 ) -> DocumentOperationResult:
+    """Delete a document through the coordinator facade."""
+    return _get_management_facade().delete_document(
+        collection=collection,
+        doc_id=doc_id,
+        user_id=user_id,
+        is_admin=is_admin,
+    )
+
+
+def _delete_document_impl(
+    collection: str, doc_id: str, user_id: int, is_admin: bool = False
+) -> DocumentOperationResult:
     """Delete a document and all its associated data.
 
     This performs a cascade delete of the document's parses, chunks,
@@ -1531,6 +1608,18 @@ def delete_document(
 def retry_document(
     collection: str, doc_id: str, user_id: int, is_admin: bool = False
 ) -> DocumentOperationResult:
+    """Mark a document for retry through the coordinator facade."""
+    return _get_management_facade().retry_document(
+        collection=collection,
+        doc_id=doc_id,
+        user_id=user_id,
+        is_admin=is_admin,
+    )
+
+
+def _retry_document_impl(
+    collection: str, doc_id: str, user_id: int, is_admin: bool = False
+) -> DocumentOperationResult:
     """Mark a document for retry by resetting its status to pending."""
 
     try:
@@ -1572,6 +1661,23 @@ def cancel_document(
     is_admin: bool = False,
     reason: Optional[str] = None,
 ) -> DocumentOperationResult:
+    """Mark a document as cancelled through the coordinator facade."""
+    return _get_management_facade().cancel_document(
+        collection=collection,
+        doc_id=doc_id,
+        user_id=user_id,
+        is_admin=is_admin,
+        reason=reason,
+    )
+
+
+def _cancel_document_impl(
+    collection: str,
+    doc_id: str,
+    user_id: int,
+    is_admin: bool = False,
+    reason: Optional[str] = None,
+) -> DocumentOperationResult:
     """Mark a document ingestion process as cancelled."""
 
     message = reason or "Cancelled by user."
@@ -1606,6 +1712,21 @@ def cancel_document(
 
 
 def cancel_collection(
+    collection: str,
+    reason: Optional[str] = None,
+    user_id: Optional[int] = None,
+    is_admin: bool = False,
+) -> CollectionOperationResult:
+    """Mark all documents in a collection as cancelled through the facade."""
+    return _get_management_facade().cancel_collection(
+        collection=collection,
+        reason=reason,
+        user_id=user_id,
+        is_admin=is_admin,
+    )
+
+
+def _cancel_collection_impl(
     collection: str,
     reason: Optional[str] = None,
     user_id: Optional[int] = None,
@@ -1695,6 +1816,14 @@ def cancel_collection(
 
 
 def get_document_status(collection: str, doc_id: str) -> Dict[str, Any]:
+    """Get document status through the coordinator facade."""
+    return _get_management_facade().get_document_status(
+        collection=collection,
+        doc_id=doc_id,
+    )
+
+
+def _get_document_status_impl(collection: str, doc_id: str) -> Dict[str, Any]:
     """Get the current ingestion status for a document.
 
     Args:

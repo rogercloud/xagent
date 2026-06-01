@@ -12,6 +12,7 @@ from ..storage.factory import StorageFactory
 from ..utils.user_scope import resolve_user_scope
 from .collection_handle import KBHandleProvider, LanceDBCollectionHandle
 from .file_compatibility import KBFileCompatibilityFacade
+from .management_facade import KBCoreManagementCompatibilityFacade
 from .models import (
     KBAccessMode,
     KBBackendCapabilities,
@@ -36,6 +37,7 @@ class KBCoordinator:
         handle_provider: KBHandleProvider | None = None,
         storage_shim: KBStorageShimCompatibilityFacade | None = None,
         file_compatibility: KBFileCompatibilityFacade | None = None,
+        management_facade: KBCoreManagementCompatibilityFacade | None = None,
     ) -> None:
         self._storage_factory = storage_factory or StorageFactory.get_factory()
         self._handle_provider = handle_provider or KBHandleProvider()
@@ -43,6 +45,9 @@ class KBCoordinator:
             storage_factory=self._storage_factory
         )
         self._file_compatibility = file_compatibility or KBFileCompatibilityFacade()
+        self._management = management_facade or KBCoreManagementCompatibilityFacade(
+            coordinator=self
+        )
 
     @property
     def storage_shim(self) -> KBStorageShimCompatibilityFacade:
@@ -58,6 +63,11 @@ class KBCoordinator:
     def file_compat(self) -> KBFileCompatibilityFacade:
         """Backward-friendly short alias for the file compatibility facade."""
         return self._file_compatibility
+
+    @property
+    def management(self) -> KBCoreManagementCompatibilityFacade:
+        """Return the core management compatibility facade."""
+        return self._management
 
     async def get_context(self, request: KBContextRequest) -> KBCollectionContext:
         """Resolve collection, caller scope, stores, backend, and capabilities."""

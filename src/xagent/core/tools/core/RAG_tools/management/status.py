@@ -10,15 +10,24 @@ from __future__ import annotations
 
 import logging
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 from ..storage.factory import get_ingestion_status_store
 
 logger = logging.getLogger(__name__)
 
+if TYPE_CHECKING:
+    from ..kb import KBCoreManagementCompatibilityFacade
+
 
 def _now() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def _get_management_facade() -> "KBCoreManagementCompatibilityFacade":
+    from ..kb import get_kb_coordinator
+
+    return get_kb_coordinator().management
 
 
 def write_ingestion_status(
@@ -49,6 +58,25 @@ def write_ingestion_status(
     Raises:
         DatabaseOperationError: If write operation fails.
     """
+    _get_management_facade().write_ingestion_status(
+        collection=collection,
+        doc_id=doc_id,
+        status=status,
+        message=message,
+        parse_hash=parse_hash,
+        user_id=user_id,
+    )
+
+
+def _write_ingestion_status_impl(
+    collection: str,
+    doc_id: str,
+    *,
+    status: str,
+    message: Optional[str] = None,
+    parse_hash: Optional[str] = None,
+    user_id: Optional[int] = None,
+) -> None:
     store = get_ingestion_status_store()
     store.write_ingestion_status(
         collection=collection,
@@ -92,6 +120,20 @@ def load_ingestion_status(
     Raises:
         DatabaseOperationError: If read operation fails.
     """
+    return _get_management_facade().load_ingestion_status(
+        collection=collection,
+        doc_id=doc_id,
+        user_id=user_id,
+        is_admin=is_admin,
+    )
+
+
+def _load_ingestion_status_impl(
+    collection: Optional[str] = None,
+    doc_id: Optional[str] = None,
+    user_id: Optional[int] = None,
+    is_admin: bool = False,
+) -> List[Dict[str, Any]]:
     store = get_ingestion_status_store()
     return store.load_ingestion_status(
         collection=collection,
@@ -121,6 +163,17 @@ def clear_ingestion_status(
     Raises:
         DatabaseOperationError: If delete operation fails.
     """
+    _get_management_facade().clear_ingestion_status(
+        collection=collection,
+        doc_id=doc_id,
+        user_id=user_id,
+        is_admin=is_admin,
+    )
+
+
+def _clear_ingestion_status_impl(
+    collection: str, doc_id: str, user_id: Optional[int] = None, is_admin: bool = False
+) -> None:
     store = get_ingestion_status_store()
     store.clear_ingestion_status(
         collection=collection,
@@ -160,6 +213,25 @@ async def write_ingestion_status_async(
     Raises:
         DatabaseOperationError: If write operation fails.
     """
+    await _get_management_facade().write_ingestion_status_async(
+        collection=collection,
+        doc_id=doc_id,
+        status=status,
+        message=message,
+        parse_hash=parse_hash,
+        user_id=user_id,
+    )
+
+
+async def _write_ingestion_status_async_impl(
+    collection: str,
+    doc_id: str,
+    *,
+    status: str,
+    message: Optional[str] = None,
+    parse_hash: Optional[str] = None,
+    user_id: Optional[int] = None,
+) -> None:
     store = get_ingestion_status_store()
     await store.write_ingestion_status_async(
         collection=collection,
@@ -191,6 +263,20 @@ async def load_ingestion_status_async(
     Raises:
         DatabaseOperationError: If read operation fails.
     """
+    return await _get_management_facade().load_ingestion_status_async(
+        collection=collection,
+        doc_id=doc_id,
+        user_id=user_id,
+        is_admin=is_admin,
+    )
+
+
+async def _load_ingestion_status_async_impl(
+    collection: Optional[str] = None,
+    doc_id: Optional[str] = None,
+    user_id: Optional[int] = None,
+    is_admin: bool = False,
+) -> List[Dict[str, Any]]:
     store = get_ingestion_status_store()
     return await store.load_ingestion_status_async(
         collection=collection,
@@ -217,6 +303,17 @@ async def clear_ingestion_status_async(
     Raises:
         DatabaseOperationError: If delete operation fails.
     """
+    await _get_management_facade().clear_ingestion_status_async(
+        collection=collection,
+        doc_id=doc_id,
+        user_id=user_id,
+        is_admin=is_admin,
+    )
+
+
+async def _clear_ingestion_status_async_impl(
+    collection: str, doc_id: str, user_id: Optional[int] = None, is_admin: bool = False
+) -> None:
     store = get_ingestion_status_store()
     await store.clear_ingestion_status_async(
         collection=collection,

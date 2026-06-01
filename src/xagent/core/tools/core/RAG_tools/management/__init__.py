@@ -14,8 +14,11 @@ from .collections import (
 )
 from .status import (
     clear_ingestion_status,
+    clear_ingestion_status_async,
     load_ingestion_status,
+    load_ingestion_status_async,
     write_ingestion_status,
+    write_ingestion_status_async,
 )
 
 __all__ = [
@@ -32,4 +35,7 @@ __all__ = [
     "write_ingestion_status",
     "load_ingestion_status",
     "clear_ingestion_status",
+    "write_ingestion_status_async",
+    "load_ingestion_status_async",
+    "clear_ingestion_status_async",
 ]
