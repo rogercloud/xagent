@@ -39,9 +39,9 @@ from ..core.schemas import (
 from ..LanceDB.model_tag_utils import embeddings_table_name
 from ..LanceDB.schema_manager import _safe_close_table
 from ..management.status import (
-    clear_ingestion_status,
-    load_ingestion_status,
-    write_ingestion_status,
+    _clear_ingestion_status_impl,
+    _load_ingestion_status_impl,
+    _write_ingestion_status_impl,
 )
 from ..storage.factory import get_metadata_store, get_vector_index_store
 from ..utils.lancedb_query_utils import _safe_count_rows, list_table_names
@@ -486,7 +486,7 @@ def _collect_document_ids(
         )
         doc_ids.update(embed_docs.keys())
 
-    for status_entry in load_ingestion_status(collection=collection):
+    for status_entry in _load_ingestion_status_impl(collection=collection):
         raw_doc = status_entry.get("doc_id")
         if isinstance(raw_doc, str):
             doc_ids.add(raw_doc)
@@ -1078,7 +1078,7 @@ def _get_document_stats_impl(
 
     # Load ingestion status
     status_record = None
-    status_entries = load_ingestion_status(collection=collection, doc_id=doc_id)
+    status_entries = _load_ingestion_status_impl(collection=collection, doc_id=doc_id)
     if status_entries:
         status_record = status_entries[-1]
 
@@ -1226,7 +1226,8 @@ def _list_documents_impl(
 
     # Load status records
     status_records = {
-        entry["doc_id"]: entry for entry in load_ingestion_status(collection=collection)
+        entry["doc_id"]: entry
+        for entry in _load_ingestion_status_impl(collection=collection)
     }
 
     # Combine all doc_ids from various sources
@@ -1576,7 +1577,7 @@ def _delete_document_impl(
             user_id=user_id,
             is_admin=is_admin,
         )
-        clear_ingestion_status(
+        _clear_ingestion_status_impl(
             collection,
             doc_id,
             user_id=None if authorized_via_legacy_source_path else user_id,
@@ -1623,7 +1624,7 @@ def _retry_document_impl(
     """Mark a document for retry by resetting its status to pending."""
 
     try:
-        write_ingestion_status(
+        _write_ingestion_status_impl(
             collection,
             doc_id,
             status=DocumentProcessingStatus.PENDING.value,
@@ -1682,7 +1683,7 @@ def _cancel_document_impl(
 
     message = reason or "Cancelled by user."
     try:
-        write_ingestion_status(
+        _write_ingestion_status_impl(
             collection,
             doc_id,
             status=DocumentProcessingStatus.FAILED.value,
@@ -1767,7 +1768,7 @@ def _cancel_collection_impl(
 
     for doc_id in doc_ids:
         try:
-            write_ingestion_status(
+            _write_ingestion_status_impl(
                 collection=collection,
                 doc_id=doc_id,
                 status=DocumentProcessingStatus.FAILED.value,
@@ -1834,7 +1835,9 @@ def _get_document_status_impl(collection: str, doc_id: str) -> Dict[str, Any]:
         Dictionary with status information, or empty dict if not found.
     """
     try:
-        status_records = load_ingestion_status(collection=collection, doc_id=doc_id)
+        status_records = _load_ingestion_status_impl(
+            collection=collection, doc_id=doc_id
+        )
         if status_records:
             return status_records[0]
         return {}

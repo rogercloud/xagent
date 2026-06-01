@@ -44,10 +44,8 @@ class KBCoreManagementCompatibilityFacade:
 
     @contextmanager
     def _storage_context(self) -> Iterator[None]:
-        from ..storage.factory import get_bound_storage_shim_for_current_context
-
         storage_shim = self._active_storage_shim()
-        if storage_shim is None or get_bound_storage_shim_for_current_context():
+        if storage_shim is None:
             yield
             return
 

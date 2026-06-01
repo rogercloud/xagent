@@ -515,7 +515,7 @@ def test_delete_collection_invokes_cleanup_all_documents(
 
     monkeypatch.setattr(
         collections_module,
-        "clear_ingestion_status",
+        "_clear_ingestion_status_impl",
         _fake_clear,
     )
 
@@ -545,7 +545,7 @@ def test_delete_collection_preserves_partial_vector_cleanup(
         collections_module, "get_vector_index_store", lambda: mock_store
     )
     monkeypatch.setattr(
-        collections_module, "clear_ingestion_status", lambda *args, **kwargs: None
+        collections_module, "_clear_ingestion_status_impl", lambda *args, **kwargs: None
     )
     monkeypatch.setattr(
         collections_module,
@@ -598,7 +598,7 @@ def test_delete_collection_non_admin_uses_batched_document_scoped_delete(
     monkeypatch.setattr(collections_module, "get_vector_index_store", lambda: store)
     monkeypatch.setattr(
         collections_module,
-        "clear_ingestion_status",
+        "_clear_ingestion_status_impl",
         lambda *args, **kwargs: None,
     )
 
@@ -1027,7 +1027,7 @@ def test_delete_document_authorizes_before_cascade() -> None:
             collections_module, "get_vector_index_store", return_value=vector_store
         ),
         patch.object(vector_store, "delete_document_data") as mock_delete_data,
-        patch.object(collections_module, "clear_ingestion_status") as mock_clear,
+        patch.object(collections_module, "_clear_ingestion_status_impl") as mock_clear,
     ):
         result = delete_document("demo", "doc-1", user_id=7, is_admin=False)
 
@@ -1068,7 +1068,7 @@ def test_delete_document_allows_legacy_owner_recovered_from_source_path() -> Non
             "delete_document_data",
             return_value={"documents": 1, "main_pointers": 1},
         ) as mock_delete_data,
-        patch.object(collections_module, "clear_ingestion_status") as mock_clear,
+        patch.object(collections_module, "_clear_ingestion_status_impl") as mock_clear,
     ):
         result = delete_document("demo", "doc-legacy", user_id=7, is_admin=False)
 
@@ -1116,7 +1116,7 @@ def test_delete_document_rejects_legacy_row_owned_by_another_user() -> None:
             collections_module, "get_vector_index_store", return_value=vector_store
         ),
         patch.object(vector_store, "delete_document_data") as mock_delete_data,
-        patch.object(collections_module, "clear_ingestion_status") as mock_clear,
+        patch.object(collections_module, "_clear_ingestion_status_impl") as mock_clear,
     ):
         result = delete_document("demo", "doc-foreign", user_id=7, is_admin=False)
 
@@ -1139,7 +1139,7 @@ def test_delete_document_clears_status_with_caller_scope() -> None:
             "delete_document_data",
             return_value={"documents": 1, "main_pointers": 1},
         ) as mock_delete_data,
-        patch.object(collections_module, "clear_ingestion_status") as mock_clear,
+        patch.object(collections_module, "_clear_ingestion_status_impl") as mock_clear,
     ):
         result = delete_document("demo", "doc-1", user_id=9, is_admin=True)
 

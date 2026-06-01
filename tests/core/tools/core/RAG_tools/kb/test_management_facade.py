@@ -230,6 +230,65 @@ def test_coordinator_management_facade_uses_instance_storage() -> None:
     ]
 
 
+def test_nested_management_facade_rebinds_inner_coordinator_storage() -> None:
+    from xagent.core.tools.core.RAG_tools.kb import KBCoordinator
+    from xagent.core.tools.core.RAG_tools.storage.factory import (
+        StorageFactory,
+        bind_storage_shim_for_current_context,
+        get_ingestion_status_store,
+    )
+
+    class IngestionStatusStore:
+        def __init__(self, name: str) -> None:
+            self.name = name
+            self.load_calls: list[dict[str, object]] = []
+
+        def load_ingestion_status(self, **kwargs: object) -> list[dict[str, object]]:
+            self.load_calls.append(dict(kwargs))
+            return [
+                {
+                    "collection": kwargs.get("collection"),
+                    "doc_id": self.name,
+                    "status": "success",
+                }
+            ]
+
+    class StorageFactoryStub:
+        def __init__(self, status_store: IngestionStatusStore) -> None:
+            self.status_store = status_store
+
+        def get_ingestion_status_store(self) -> IngestionStatusStore:
+            return self.status_store
+
+    outer_store = IngestionStatusStore("outer-store")
+    inner_store = IngestionStatusStore("inner-store")
+    outer = KBCoordinator(
+        storage_factory=cast(StorageFactory, StorageFactoryStub(outer_store))
+    )
+    inner = KBCoordinator(
+        storage_factory=cast(StorageFactory, StorageFactoryStub(inner_store))
+    )
+
+    with bind_storage_shim_for_current_context(outer.storage_shim):
+        assert get_ingestion_status_store() is outer_store
+        records = inner.management.load_ingestion_status(
+            collection="docs",
+            doc_id="doc-inner",
+        )
+        assert records[0]["doc_id"] == "inner-store"
+        assert get_ingestion_status_store() is outer_store
+
+    assert outer_store.load_calls == []
+    assert inner_store.load_calls == [
+        {
+            "collection": "docs",
+            "doc_id": "doc-inner",
+            "user_id": None,
+            "is_admin": False,
+        }
+    ]
+
+
 def test_facade_delegates_document_cleanup_to_existing_management_impl(
     monkeypatch,
 ) -> None:
