@@ -10,7 +10,7 @@ import os
 import threading
 from datetime import datetime, timezone
 from functools import wraps
-from typing import Any, Awaitable, Callable, Optional, TypeVar
+from typing import TYPE_CHECKING, Any, Awaitable, Callable, Optional, TypeVar
 
 import pyarrow as pa  # type: ignore
 
@@ -22,6 +22,13 @@ from ..storage.factory import get_metadata_store, get_vector_index_store
 from ..utils.lancedb_query_utils import list_table_names
 from ..utils.model_resolver import resolve_embedding_adapter
 from ..utils.tag_mapping import register_tag_mapping
+
+if TYPE_CHECKING:
+    from ..kb import (
+        CollectionConfigSnapshot,
+        CollectionRollbackMaintenanceResult,
+        KBMaintenanceCompatibilityFacade,
+    )
 
 T = TypeVar("T")
 
@@ -38,6 +45,11 @@ def reset_locks_for_testing() -> None:
     """Clear in-memory collection locks for test isolation."""
     with _collection_locks_lock:
         _collection_locks.clear()
+
+
+def _normalize_collection_config_user_id(user_id: Optional[int]) -> int:
+    """Normalize legacy collection_config ownership scope."""
+    return 0 if user_id is None else int(user_id)
 
 
 def _normalize_model_id(model_id: Optional[str]) -> Optional[str]:
@@ -625,6 +637,13 @@ class CollectionManager:
 collection_manager = CollectionManager()
 
 
+def _get_maintenance_compatibility_facade() -> "KBMaintenanceCompatibilityFacade":
+    """Return the coordinator-owned collection maintenance facade."""
+    from ..kb import get_kb_coordinator
+
+    return get_kb_coordinator().maintenance_compatibility
+
+
 # Synchronous wrapper functions using decorator
 def get_collection_sync(collection_name: str) -> "CollectionInfo":
     """Synchronous version of get_collection for non-async contexts.
@@ -638,6 +657,10 @@ def get_collection_sync(collection_name: str) -> "CollectionInfo":
     Raises:
         ValueError: If collection not found
     """
+    return _get_maintenance_compatibility_facade().get_collection_sync(collection_name)
+
+
+def _get_collection_sync_impl(collection_name: str) -> "CollectionInfo":
     return _sync_wrapper(collection_manager.get_collection)(collection_name)
 
 
@@ -656,6 +679,14 @@ def initialize_collection_embedding_sync(
     Raises:
         ValueError: If collection already initialized with different model
     """
+    return _get_maintenance_compatibility_facade().initialize_collection_embedding_sync(
+        collection_name, embedding_model_id
+    )
+
+
+def _initialize_collection_embedding_sync_impl(
+    collection_name: str, embedding_model_id: str
+) -> "CollectionInfo":
     return _sync_wrapper(collection_manager.initialize_collection_embedding)(
         collection_name, embedding_model_id
     )
@@ -675,6 +706,14 @@ def validate_document_processing_sync(
     Raises:
         ValueError: If validation fails
     """
+    _get_maintenance_compatibility_facade().validate_document_processing_sync(
+        collection_name, file_path, parsing_method, chunking_method
+    )
+
+
+def _validate_document_processing_sync_impl(
+    collection_name: str, file_path: str, parsing_method: str, chunking_method: str
+) -> None:
     _sync_wrapper(collection_manager.validate_document_processing)(
         collection_name, file_path, parsing_method, chunking_method
     )
@@ -703,6 +742,26 @@ def update_collection_stats_sync(
     Returns:
         Updated CollectionInfo
     """
+    return _get_maintenance_compatibility_facade().update_collection_stats_sync(
+        collection_name,
+        documents_delta,
+        processed_documents_delta,
+        parses_delta,
+        chunks_delta,
+        embeddings_delta,
+        document_name,
+    )
+
+
+def _update_collection_stats_sync_impl(
+    collection_name: str,
+    documents_delta: int = 0,
+    processed_documents_delta: int = 0,
+    parses_delta: int = 0,
+    chunks_delta: int = 0,
+    embeddings_delta: int = 0,
+    document_name: Optional[str] = None,
+) -> "CollectionInfo":
     return _sync_wrapper(collection_manager.update_collection_stats)(
         collection_name,
         documents_delta,
@@ -720,6 +779,12 @@ def mark_collection_accessed_sync(collection_name: str) -> None:
     Args:
         collection_name: Name of the collection to mark as accessed
     """
+    _get_maintenance_compatibility_facade().mark_collection_accessed_sync(
+        collection_name
+    )
+
+
+def _mark_collection_accessed_sync_impl(collection_name: str) -> None:
     _sync_wrapper(collection_manager.mark_collection_accessed)(collection_name)
 
 
@@ -730,11 +795,400 @@ def delete_collection_metadata_sync(
     delete_orphaned_metadata: bool = False,
 ) -> dict[str, int]:
     """Synchronous version of delete_collection_metadata."""
+    return _get_maintenance_compatibility_facade().delete_collection_metadata_sync(
+        collection_name,
+        user_id,
+        is_admin,
+        delete_orphaned_metadata,
+    )
+
+
+def _delete_collection_metadata_sync_impl(
+    collection_name: str,
+    user_id: Optional[int],
+    is_admin: bool = False,
+    delete_orphaned_metadata: bool = False,
+) -> dict[str, int]:
     return _sync_wrapper(collection_manager.delete_collection_metadata)(
         collection_name,
         user_id,
         is_admin,
         delete_orphaned_metadata,
+    )
+
+
+def _collection_rollback_guard_warning(
+    *, rollback_complete: bool, side_effects_may_remain: bool
+) -> tuple[Optional[str], tuple[str, ...]]:
+    if side_effects_may_remain:
+        return (
+            "side_effects_may_remain",
+            (
+                "Skipped collection rollback maintenance because side effects may remain.",
+            ),
+        )
+    if not rollback_complete:
+        return (
+            "rollback_not_complete",
+            (
+                "Skipped collection rollback maintenance because rollback is incomplete.",
+            ),
+        )
+    return None, ()
+
+
+def _collection_rollback_result(
+    collection_name: str,
+    *,
+    status: str,
+    skipped: bool = False,
+    reason: Optional[str] = None,
+    cleanup_counts: Optional[dict[str, int]] = None,
+    warnings: tuple[str, ...] = (),
+    side_effects_may_remain: bool = False,
+) -> "CollectionRollbackMaintenanceResult":
+    from ..kb.maintenance_compatibility import CollectionRollbackMaintenanceResult
+
+    return CollectionRollbackMaintenanceResult(
+        collection_name=collection_name,
+        status=status,
+        skipped=skipped,
+        reason=reason,
+        cleanup_counts=cleanup_counts or {},
+        warnings=warnings,
+        side_effects_may_remain=side_effects_may_remain,
+    )
+
+
+async def capture_collection_config_snapshot(
+    collection_name: str, user_id: Optional[int]
+) -> "CollectionConfigSnapshot":
+    """Capture the exact collection_config row before rollback-sensitive mutation."""
+    return await _get_maintenance_compatibility_facade().capture_collection_config_snapshot(
+        collection_name, user_id
+    )
+
+
+async def _capture_collection_config_snapshot_impl(
+    collection_name: str, user_id: Optional[int]
+) -> "CollectionConfigSnapshot":
+    from ..kb.maintenance_compatibility import CollectionConfigSnapshot
+
+    config_user_id = _normalize_collection_config_user_id(user_id)
+    config_json = await get_metadata_store().get_collection_config(
+        collection_name,
+        config_user_id,
+        is_admin=False,
+    )
+    return CollectionConfigSnapshot(
+        collection_name=collection_name,
+        user_id=user_id,
+        config_user_id=config_user_id,
+        config_json=config_json,
+        existed=config_json is not None,
+    )
+
+
+def capture_collection_config_snapshot_sync(
+    collection_name: str, user_id: Optional[int]
+) -> "CollectionConfigSnapshot":
+    """Synchronous version of capture_collection_config_snapshot."""
+    return (
+        _get_maintenance_compatibility_facade().capture_collection_config_snapshot_sync(
+            collection_name, user_id
+        )
+    )
+
+
+def _capture_collection_config_snapshot_sync_impl(
+    collection_name: str, user_id: Optional[int]
+) -> "CollectionConfigSnapshot":
+    return _sync_wrapper(_capture_collection_config_snapshot_impl)(
+        collection_name, user_id
+    )
+
+
+async def restore_collection_config_snapshot(
+    snapshot: "CollectionConfigSnapshot",
+    *,
+    rollback_complete: bool,
+    side_effects_may_remain: bool = False,
+) -> "CollectionRollbackMaintenanceResult":
+    """Restore or remove collection_config from a rollback snapshot."""
+    return await _get_maintenance_compatibility_facade().restore_collection_config_snapshot(
+        snapshot,
+        rollback_complete=rollback_complete,
+        side_effects_may_remain=side_effects_may_remain,
+    )
+
+
+async def _restore_collection_config_snapshot_impl(
+    snapshot: "CollectionConfigSnapshot",
+    *,
+    rollback_complete: bool,
+    side_effects_may_remain: bool = False,
+) -> "CollectionRollbackMaintenanceResult":
+    reason, warnings = _collection_rollback_guard_warning(
+        rollback_complete=rollback_complete,
+        side_effects_may_remain=side_effects_may_remain,
+    )
+    if reason is not None:
+        return _collection_rollback_result(
+            snapshot.collection_name,
+            status="skipped",
+            skipped=True,
+            reason=reason,
+            warnings=warnings,
+            side_effects_may_remain=side_effects_may_remain,
+        )
+
+    lock = _get_collection_lock(snapshot.collection_name)
+    async with lock:
+        if snapshot.existed:
+            if snapshot.config_json is None:
+                return _collection_rollback_result(
+                    snapshot.collection_name,
+                    status="skipped",
+                    skipped=True,
+                    reason="snapshot_missing_config",
+                    warnings=(
+                        "Skipped collection config restore because the snapshot has no config JSON.",
+                    ),
+                    side_effects_may_remain=side_effects_may_remain,
+                )
+            await get_metadata_store().save_collection_config(
+                snapshot.collection_name,
+                snapshot.config_json,
+                snapshot.config_user_id,
+            )
+            return _collection_rollback_result(
+                snapshot.collection_name,
+                status="restored",
+                side_effects_may_remain=side_effects_may_remain,
+            )
+
+        cleanup_counts = await get_metadata_store().delete_collection_metadata(
+            snapshot.collection_name,
+            user_id=snapshot.config_user_id,
+            is_admin=False,
+            delete_orphaned_metadata=False,
+        )
+        return _collection_rollback_result(
+            snapshot.collection_name,
+            status="removed",
+            cleanup_counts=cleanup_counts,
+            side_effects_may_remain=side_effects_may_remain,
+        )
+
+
+def restore_collection_config_snapshot_sync(
+    snapshot: "CollectionConfigSnapshot",
+    *,
+    rollback_complete: bool,
+    side_effects_may_remain: bool = False,
+) -> "CollectionRollbackMaintenanceResult":
+    """Synchronous version of restore_collection_config_snapshot."""
+    return (
+        _get_maintenance_compatibility_facade().restore_collection_config_snapshot_sync(
+            snapshot,
+            rollback_complete=rollback_complete,
+            side_effects_may_remain=side_effects_may_remain,
+        )
+    )
+
+
+def _restore_collection_config_snapshot_sync_impl(
+    snapshot: "CollectionConfigSnapshot",
+    *,
+    rollback_complete: bool,
+    side_effects_may_remain: bool = False,
+) -> "CollectionRollbackMaintenanceResult":
+    return _sync_wrapper(_restore_collection_config_snapshot_impl)(
+        snapshot,
+        rollback_complete=rollback_complete,
+        side_effects_may_remain=side_effects_may_remain,
+    )
+
+
+async def cleanup_collection_metadata_after_rollback(
+    collection_name: str,
+    user_id: Optional[int],
+    is_admin: bool = False,
+    *,
+    rollback_complete: bool,
+    side_effects_may_remain: bool = False,
+    delete_orphaned_metadata: bool = True,
+) -> "CollectionRollbackMaintenanceResult":
+    """Delete metadata/config rows only when rollback completed safely."""
+    return await _get_maintenance_compatibility_facade().cleanup_collection_metadata_after_rollback(
+        collection_name,
+        user_id,
+        is_admin,
+        rollback_complete=rollback_complete,
+        side_effects_may_remain=side_effects_may_remain,
+        delete_orphaned_metadata=delete_orphaned_metadata,
+    )
+
+
+async def _cleanup_collection_metadata_after_rollback_impl(
+    collection_name: str,
+    user_id: Optional[int],
+    is_admin: bool = False,
+    *,
+    rollback_complete: bool,
+    side_effects_may_remain: bool = False,
+    delete_orphaned_metadata: bool = True,
+) -> "CollectionRollbackMaintenanceResult":
+    reason, warnings = _collection_rollback_guard_warning(
+        rollback_complete=rollback_complete,
+        side_effects_may_remain=side_effects_may_remain,
+    )
+    if reason is not None:
+        return _collection_rollback_result(
+            collection_name,
+            status="skipped",
+            skipped=True,
+            reason=reason,
+            warnings=warnings,
+            side_effects_may_remain=side_effects_may_remain,
+        )
+
+    cleanup_counts = await collection_manager.delete_collection_metadata(
+        collection_name,
+        user_id=user_id,
+        is_admin=is_admin,
+        delete_orphaned_metadata=delete_orphaned_metadata,
+    )
+    return _collection_rollback_result(
+        collection_name,
+        status="cleaned",
+        cleanup_counts=cleanup_counts,
+        side_effects_may_remain=side_effects_may_remain,
+    )
+
+
+def cleanup_collection_metadata_after_rollback_sync(
+    collection_name: str,
+    user_id: Optional[int],
+    is_admin: bool = False,
+    *,
+    rollback_complete: bool,
+    side_effects_may_remain: bool = False,
+    delete_orphaned_metadata: bool = True,
+) -> "CollectionRollbackMaintenanceResult":
+    """Synchronous version of cleanup_collection_metadata_after_rollback."""
+    return _get_maintenance_compatibility_facade().cleanup_collection_metadata_after_rollback_sync(
+        collection_name,
+        user_id,
+        is_admin,
+        rollback_complete=rollback_complete,
+        side_effects_may_remain=side_effects_may_remain,
+        delete_orphaned_metadata=delete_orphaned_metadata,
+    )
+
+
+def _cleanup_collection_metadata_after_rollback_sync_impl(
+    collection_name: str,
+    user_id: Optional[int],
+    is_admin: bool = False,
+    *,
+    rollback_complete: bool,
+    side_effects_may_remain: bool = False,
+    delete_orphaned_metadata: bool = True,
+) -> "CollectionRollbackMaintenanceResult":
+    return _sync_wrapper(_cleanup_collection_metadata_after_rollback_impl)(
+        collection_name,
+        user_id,
+        is_admin,
+        rollback_complete=rollback_complete,
+        side_effects_may_remain=side_effects_may_remain,
+        delete_orphaned_metadata=delete_orphaned_metadata,
+    )
+
+
+async def rebuild_collection_stats(
+    collection_name: str,
+    user_id: Optional[int] = None,
+    is_admin: bool = True,
+) -> Optional["CollectionInfo"]:
+    """Rebuild collection stats from the storage backend after commit/rollback."""
+    return await _get_maintenance_compatibility_facade().rebuild_collection_stats(
+        collection_name, user_id, is_admin
+    )
+
+
+async def _rebuild_collection_stats_impl(
+    collection_name: str,
+    user_id: Optional[int] = None,
+    is_admin: bool = True,
+) -> Optional["CollectionInfo"]:
+    try:
+        existing_info: Optional[
+            CollectionInfo
+        ] = await get_metadata_store().get_collection(collection_name)
+    except Exception:
+        existing_info = None
+
+    stats_by_collection = get_vector_index_store().aggregate_collection_stats(
+        user_id=None,
+        is_admin=True,
+    )
+    rebuilt_stats = stats_by_collection.get(collection_name)
+    if existing_info is None and rebuilt_stats is None:
+        return None
+
+    if rebuilt_stats is None:
+        rebuilt_stats = {
+            "documents": 0,
+            "parses": 0,
+            "chunks": 0,
+            "embeddings": 0,
+        }
+
+    document_count = int(rebuilt_stats.get("documents", 0))
+    base_info = existing_info or CollectionInfo(name=collection_name)
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    update_data: dict[str, Any] = {
+        "documents": document_count,
+        "processed_documents": int(rebuilt_stats.get("parses", 0)),
+        "parses": int(rebuilt_stats.get("parses", 0)),
+        "chunks": int(rebuilt_stats.get("chunks", 0)),
+        "embeddings": int(rebuilt_stats.get("embeddings", 0)),
+        "updated_at": now,
+        "last_accessed_at": now,
+    }
+    if document_count == 0:
+        update_data.update(
+            {
+                "document_names": [],
+                "document_metadata": [],
+                "owners": [],
+            }
+        )
+
+    rebuilt = base_info.model_copy(update=update_data)
+    await collection_manager.save_collection(rebuilt)
+    return rebuilt
+
+
+def rebuild_collection_stats_sync(
+    collection_name: str,
+    user_id: Optional[int] = None,
+    is_admin: bool = True,
+) -> Optional["CollectionInfo"]:
+    """Synchronous version of rebuild_collection_stats."""
+    return _get_maintenance_compatibility_facade().rebuild_collection_stats_sync(
+        collection_name, user_id, is_admin
+    )
+
+
+def _rebuild_collection_stats_sync_impl(
+    collection_name: str,
+    user_id: Optional[int] = None,
+    is_admin: bool = True,
+) -> Optional["CollectionInfo"]:
+    return _sync_wrapper(_rebuild_collection_stats_impl)(
+        collection_name, user_id, is_admin
     )
 
 
@@ -760,6 +1214,17 @@ def resolve_effective_embedding_model_sync(
     Raises:
         ValueError: If model cannot be resolved or collection not found.
     """
+    return (
+        _get_maintenance_compatibility_facade().resolve_effective_embedding_model_sync(
+            collection_name, config_model_id
+        )
+    )
+
+
+def _resolve_effective_embedding_model_sync_impl(
+    collection_name: str, config_model_id: Optional[str] = None
+) -> str:
+    """Implementation for resolve_effective_embedding_model_sync."""
 
     # Treat empty/whitespace-only IDs and the tool-layer "none" placeholder as missing.
     config_model_id = _normalize_model_id(config_model_id)
@@ -875,6 +1340,11 @@ async def rebuild_collection_metadata() -> None:
 
     Use this to migrate existing data when collection_metadata table is missing or outdated.
     """
+    await _get_maintenance_compatibility_facade().rebuild_collection_metadata()
+
+
+async def _rebuild_collection_metadata_impl() -> None:
+    """Implementation for rebuild_collection_metadata."""
     from . import collections
 
     # Get all existing collections (use is_admin=True to bypass user filtering)

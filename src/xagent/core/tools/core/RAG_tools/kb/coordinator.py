@@ -12,6 +12,7 @@ from ..storage.factory import StorageFactory
 from ..utils.user_scope import resolve_user_scope
 from .collection_handle import KBHandleProvider, LanceDBCollectionHandle
 from .file_compatibility import KBFileCompatibilityFacade
+from .maintenance_compatibility import KBMaintenanceCompatibilityFacade
 from .management_facade import KBCoreManagementCompatibilityFacade
 from .models import (
     KBAccessMode,
@@ -40,6 +41,7 @@ class KBCoordinator:
         file_compatibility: KBFileCompatibilityFacade | None = None,
         management_facade: KBCoreManagementCompatibilityFacade | None = None,
         parse_display_compatibility: KBParseDisplayCompatibilityFacade | None = None,
+        maintenance_compatibility: KBMaintenanceCompatibilityFacade | None = None,
     ) -> None:
         self._storage_factory = storage_factory or StorageFactory.get_factory()
         self._handle_provider = handle_provider or KBHandleProvider()
@@ -53,6 +55,9 @@ class KBCoordinator:
         self._parse_display_compatibility = (
             parse_display_compatibility
             or KBParseDisplayCompatibilityFacade(coordinator=self)
+        )
+        self._maintenance_compatibility = (
+            maintenance_compatibility or KBMaintenanceCompatibilityFacade()
         )
 
     @property
@@ -84,6 +89,16 @@ class KBCoordinator:
     def parse_display(self) -> KBParseDisplayCompatibilityFacade:
         """Backward-friendly short alias for the parse display facade."""
         return self._parse_display_compatibility
+
+    @property
+    def maintenance_compatibility(self) -> KBMaintenanceCompatibilityFacade:
+        """Return the collection metadata maintenance compatibility facade."""
+        return self._maintenance_compatibility
+
+    @property
+    def maintenance_compat(self) -> KBMaintenanceCompatibilityFacade:
+        """Backward-friendly short alias for the maintenance facade."""
+        return self._maintenance_compatibility
 
     async def get_context(self, request: KBContextRequest) -> KBCollectionContext:
         """Resolve collection, caller scope, stores, backend, and capabilities."""

@@ -7,6 +7,11 @@ from .coordinator import (
     reset_kb_coordinator_for_tests,
 )
 from .file_compatibility import KBFileCompatibilityFacade
+from .maintenance_compatibility import (
+    CollectionConfigSnapshot,
+    CollectionRollbackMaintenanceResult,
+    KBMaintenanceCompatibilityFacade,
+)
 from .management_facade import KBCoreManagementCompatibilityFacade
 from .models import (
     KBAccessMode,
@@ -25,9 +30,12 @@ __all__ = [
     "KBCollectionContext",
     "KBContextRequest",
     "KBHandleProvider",
+    "CollectionConfigSnapshot",
+    "CollectionRollbackMaintenanceResult",
     "KBCoreManagementCompatibilityFacade",
     "KBCoordinator",
     "KBFileCompatibilityFacade",
+    "KBMaintenanceCompatibilityFacade",
     "KBParseDisplayCompatibilityFacade",
     "KBStorageShimCompatibilityFacade",
     "KBStorageBackend",
