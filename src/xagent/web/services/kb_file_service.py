@@ -19,7 +19,9 @@ from ...core.tools.core.RAG_tools.LanceDB.schema_manager import (
     _safe_close_table,
     ensure_documents_table,
 )
-from ...core.tools.core.RAG_tools.management.status import load_ingestion_status
+from ...core.tools.core.RAG_tools.management.status import (
+    _load_ingestion_status_impl,
+)
 from ...core.tools.core.RAG_tools.storage.contracts import DocumentRecord
 from ...core.tools.core.RAG_tools.utils.lancedb_query_utils import (
     list_embeddings_table_names,
@@ -737,7 +739,7 @@ def _aggregate_uploaded_file_statuses_impl(
     )
     status_by_doc: Dict[tuple[str, str], str] = {}
     for collection in collections:
-        for entry in load_ingestion_status(
+        for entry in _load_ingestion_status_impl(
             collection=collection,
             user_id=user_id,
             is_admin=is_admin,

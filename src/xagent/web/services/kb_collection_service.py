@@ -16,7 +16,7 @@ from ...config import get_uploads_dir
 from ..config import get_upload_path, sanitize_path_component
 from ..kb_physical_sync import collection_physical_lock, move_collection_dir_to_trash
 from ..models.uploaded_file import UploadedFile
-from .kb_file_service import delete_uploaded_file_if_orphaned
+from .kb_file_service import _delete_uploaded_file_if_orphaned_impl
 from .uploaded_file_store import UploadedFileStore
 
 if TYPE_CHECKING:
@@ -202,7 +202,7 @@ def _delete_collection_uploaded_files_impl(
     deleted_file_ids: Set[str] = set()
 
     for current_file_id in collection_file_ids:
-        if delete_uploaded_file_if_orphaned(
+        if _delete_uploaded_file_if_orphaned_impl(
             db,
             file_id=current_file_id,
             user_id=user_id,
