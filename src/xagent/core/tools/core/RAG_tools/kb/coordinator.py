@@ -57,7 +57,8 @@ class KBCoordinator:
             or KBParseDisplayCompatibilityFacade(coordinator=self)
         )
         self._maintenance_compatibility = (
-            maintenance_compatibility or KBMaintenanceCompatibilityFacade()
+            maintenance_compatibility
+            or KBMaintenanceCompatibilityFacade(coordinator=self)
         )
 
     @property

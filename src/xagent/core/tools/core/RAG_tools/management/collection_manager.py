@@ -8,6 +8,7 @@ import asyncio
 import logging
 import os
 import threading
+from contextvars import copy_context
 from datetime import datetime, timezone
 from functools import wraps
 from typing import TYPE_CHECKING, Any, Awaitable, Callable, Optional, TypeVar
@@ -109,19 +110,21 @@ def _run_in_separate_loop(coro: Awaitable[T]) -> T:
         Any exception raised by the coroutine
     """
     result: Optional[T] = None
-    exception: Optional[Exception] = None
+    exception: Optional[BaseException] = None
+    context = copy_context()
 
     def target() -> None:
         """Thread target function that runs the coroutine in its own event loop."""
         nonlocal result, exception
+        # Create a fresh event loop for this thread
+        loop = asyncio.new_event_loop()
         try:
-            # Create a fresh event loop for this thread
-            loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
-            result = loop.run_until_complete(coro)
-            loop.close()
-        except Exception as e:
+            result = context.run(lambda: loop.run_until_complete(coro))
+        except BaseException as e:
             exception = e
+        finally:
+            loop.close()
 
     try:
         # Check if we are already in a running event loop

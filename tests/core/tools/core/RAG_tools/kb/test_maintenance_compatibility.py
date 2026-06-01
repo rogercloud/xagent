@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from inspect import signature
+from typing import cast
 
 import pytest
 
@@ -135,6 +136,97 @@ def test_reset_helpers_keep_maintenance_facade_reusable(monkeypatch) -> None:
     second_facade = get_kb_coordinator().maintenance_compatibility
     assert second_facade.get_collection_sync("after") == "collection:after"
     assert second_facade is not first_facade
+
+
+@pytest.mark.asyncio
+async def test_coordinator_maintenance_facade_uses_instance_storage_for_config_snapshot() -> (
+    None
+):
+    """Given injected storage, maintenance calls use coordinator-owned stores."""
+    from xagent.core.tools.core.RAG_tools.kb import KBCoordinator
+    from xagent.core.tools.core.RAG_tools.storage.factory import StorageFactory
+
+    class MetadataStore:
+        def __init__(self) -> None:
+            self.config_calls: list[dict[str, object]] = []
+
+        async def get_collection_config(
+            self, collection_name: str, user_id: int | None, is_admin: bool = False
+        ) -> str | None:
+            self.config_calls.append(
+                {
+                    "collection_name": collection_name,
+                    "user_id": user_id,
+                    "is_admin": is_admin,
+                }
+            )
+            return '{"source":"injected"}'
+
+    class StorageFactoryStub:
+        def __init__(self, metadata_store: MetadataStore) -> None:
+            self.metadata_store = metadata_store
+
+        def get_metadata_store(self) -> MetadataStore:
+            return self.metadata_store
+
+    metadata_store = MetadataStore()
+    coordinator = KBCoordinator(
+        storage_factory=cast(StorageFactory, StorageFactoryStub(metadata_store))
+    )
+
+    snapshot = (
+        await coordinator.maintenance_compatibility.capture_collection_config_snapshot(
+            "docs", 7
+        )
+    )
+
+    assert snapshot.config_json == '{"source":"injected"}'
+    assert snapshot.existed
+    assert metadata_store.config_calls == [
+        {
+            "collection_name": "docs",
+            "user_id": 7,
+            "is_admin": False,
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_coordinator_maintenance_sync_helper_keeps_storage_binding_in_running_loop() -> (
+    None
+):
+    """Given an active event loop, sync maintenance helpers keep storage binding."""
+    from xagent.core.tools.core.RAG_tools.core.schemas import CollectionInfo
+    from xagent.core.tools.core.RAG_tools.kb import KBCoordinator
+    from xagent.core.tools.core.RAG_tools.storage.factory import StorageFactory
+
+    class MetadataStore:
+        def __init__(self) -> None:
+            self.collection_calls: list[str] = []
+
+        async def get_collection(self, collection_name: str) -> CollectionInfo:
+            self.collection_calls.append(collection_name)
+            return CollectionInfo(name=collection_name, documents=12)
+
+    class StorageFactoryStub:
+        def __init__(self, metadata_store: MetadataStore) -> None:
+            self.metadata_store = metadata_store
+
+        def get_metadata_store(self) -> MetadataStore:
+            return self.metadata_store
+
+    metadata_store = MetadataStore()
+    coordinator = KBCoordinator(
+        storage_factory=cast(StorageFactory, StorageFactoryStub(metadata_store))
+    )
+
+    collection = coordinator.maintenance_compatibility.get_collection_sync(
+        "thread_bound_docs"
+    )
+
+    assert collection.name == "thread_bound_docs"
+    assert collection.documents == 12
+    assert metadata_store.collection_calls == ["thread_bound_docs"]
 
 
 @pytest.mark.asyncio
