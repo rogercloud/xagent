@@ -435,3 +435,68 @@ async def test_rebuild_collection_stats_refreshes_metadata_from_storage_state() 
     assert stored.chunks == 0
     assert stored.embeddings == 0
     assert stored.extra_metadata == extra_metadata
+
+
+@pytest.mark.asyncio
+async def test_rebuild_collection_stats_treats_null_storage_counts_as_zero(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Given nullable aggregate counts, stats rebuild stores zero counts."""
+    from xagent.core.tools.core.RAG_tools.core.schemas import CollectionInfo
+    from xagent.core.tools.core.RAG_tools.kb import get_kb_coordinator
+    from xagent.core.tools.core.RAG_tools.management import collection_manager
+    from xagent.core.tools.core.RAG_tools.storage.factory import get_metadata_store
+
+    metadata_store = get_metadata_store()
+    facade = get_kb_coordinator().maintenance_compatibility
+    collection_name = "stats_rebuild_nullable_counts"
+
+    await metadata_store.save_collection(
+        CollectionInfo(
+            name=collection_name,
+            documents=9,
+            processed_documents=8,
+            parses=7,
+            chunks=6,
+            embeddings=5,
+            document_names=["stale.pdf"],
+        )
+    )
+
+    class _FakeVectorIndexStore:
+        def aggregate_collection_stats(
+            self, *, user_id: int | None, is_admin: bool
+        ) -> dict[str, dict[str, int | None]]:
+            assert user_id is None
+            assert is_admin is True
+            return {
+                collection_name: {
+                    "documents": None,
+                    "parses": None,
+                    "chunks": None,
+                    "embeddings": None,
+                }
+            }
+
+    monkeypatch.setattr(
+        collection_manager,
+        "get_vector_index_store",
+        lambda: _FakeVectorIndexStore(),
+    )
+
+    rebuilt = await facade.rebuild_collection_stats(collection_name)
+
+    assert rebuilt is not None
+    assert rebuilt.documents == 0
+    assert rebuilt.processed_documents == 0
+    assert rebuilt.parses == 0
+    assert rebuilt.chunks == 0
+    assert rebuilt.embeddings == 0
+    assert rebuilt.document_names == []
+
+    stored = await metadata_store.get_collection(collection_name)
+    assert stored.documents == 0
+    assert stored.processed_documents == 0
+    assert stored.parses == 0
+    assert stored.chunks == 0
+    assert stored.embeddings == 0

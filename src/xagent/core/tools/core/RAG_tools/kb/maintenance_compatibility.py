@@ -217,22 +217,18 @@ class KBMaintenanceCompatibilityFacade:
     async def rebuild_collection_stats(
         self,
         collection_name: str,
-        user_id: Optional[int] = None,
-        is_admin: bool = True,
     ) -> Optional["CollectionInfo"]:
         from ..management.collection_manager import _rebuild_collection_stats_impl
 
-        return await _rebuild_collection_stats_impl(collection_name, user_id, is_admin)
+        return await _rebuild_collection_stats_impl(collection_name)
 
     def rebuild_collection_stats_sync(
         self,
         collection_name: str,
-        user_id: Optional[int] = None,
-        is_admin: bool = True,
     ) -> Optional["CollectionInfo"]:
         from ..management.collection_manager import _rebuild_collection_stats_sync_impl
 
-        return _rebuild_collection_stats_sync_impl(collection_name, user_id, is_admin)
+        return _rebuild_collection_stats_sync_impl(collection_name)
 
     def resolve_effective_embedding_model_sync(
         self, collection_name: str, config_model_id: Optional[str] = None

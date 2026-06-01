@@ -1106,21 +1106,22 @@ def _cleanup_collection_metadata_after_rollback_sync_impl(
     )
 
 
+def _coerce_stat_count(stats: dict[str, Any], key: str) -> int:
+    value = stats.get(key)
+    return int(value) if value is not None else 0
+
+
 async def rebuild_collection_stats(
     collection_name: str,
-    user_id: Optional[int] = None,
-    is_admin: bool = True,
 ) -> Optional["CollectionInfo"]:
     """Rebuild collection stats from the storage backend after commit/rollback."""
     return await _get_maintenance_compatibility_facade().rebuild_collection_stats(
-        collection_name, user_id, is_admin
+        collection_name
     )
 
 
 async def _rebuild_collection_stats_impl(
     collection_name: str,
-    user_id: Optional[int] = None,
-    is_admin: bool = True,
 ) -> Optional["CollectionInfo"]:
     try:
         existing_info: Optional[
@@ -1145,15 +1146,18 @@ async def _rebuild_collection_stats_impl(
             "embeddings": 0,
         }
 
-    document_count = int(rebuilt_stats.get("documents", 0))
+    document_count = _coerce_stat_count(rebuilt_stats, "documents")
+    parse_count = _coerce_stat_count(rebuilt_stats, "parses")
+    chunk_count = _coerce_stat_count(rebuilt_stats, "chunks")
+    embedding_count = _coerce_stat_count(rebuilt_stats, "embeddings")
     base_info = existing_info or CollectionInfo(name=collection_name)
     now = datetime.now(timezone.utc).replace(tzinfo=None)
     update_data: dict[str, Any] = {
         "documents": document_count,
-        "processed_documents": int(rebuilt_stats.get("parses", 0)),
-        "parses": int(rebuilt_stats.get("parses", 0)),
-        "chunks": int(rebuilt_stats.get("chunks", 0)),
-        "embeddings": int(rebuilt_stats.get("embeddings", 0)),
+        "processed_documents": parse_count,
+        "parses": parse_count,
+        "chunks": chunk_count,
+        "embeddings": embedding_count,
         "updated_at": now,
         "last_accessed_at": now,
     }
@@ -1173,23 +1177,17 @@ async def _rebuild_collection_stats_impl(
 
 def rebuild_collection_stats_sync(
     collection_name: str,
-    user_id: Optional[int] = None,
-    is_admin: bool = True,
 ) -> Optional["CollectionInfo"]:
     """Synchronous version of rebuild_collection_stats."""
     return _get_maintenance_compatibility_facade().rebuild_collection_stats_sync(
-        collection_name, user_id, is_admin
+        collection_name
     )
 
 
 def _rebuild_collection_stats_sync_impl(
     collection_name: str,
-    user_id: Optional[int] = None,
-    is_admin: bool = True,
 ) -> Optional["CollectionInfo"]:
-    return _sync_wrapper(_rebuild_collection_stats_impl)(
-        collection_name, user_id, is_admin
-    )
+    return _sync_wrapper(_rebuild_collection_stats_impl)(collection_name)
 
 
 def resolve_effective_embedding_model_sync(
