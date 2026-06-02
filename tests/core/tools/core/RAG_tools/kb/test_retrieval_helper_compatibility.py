@@ -325,6 +325,166 @@ def test_retrieval_facade_preserves_sync_tuple_filter_scope_and_conversion() -> 
     ]
 
 
+def test_retrieval_search_after_rollback_cleanup_returns_no_removed_artifacts() -> None:
+    """Given rollback-cleaned artifacts, search does not return removed rows."""
+    from xagent.core.tools.core.RAG_tools.kb import (
+        KBRetrievalHelperCompatibilityFacade,
+    )
+
+    vector_store = _FakeVectorStore(
+        [
+            _search_row(collection="other", doc_id="doc-rolled-back", user_id=7),
+            _search_row(collection="docs", doc_id="doc-rolled-back", user_id=8),
+            _search_row(collection="docs", doc_id="doc-active", user_id=7),
+        ]
+    )
+    facade = KBRetrievalHelperCompatibilityFacade(
+        storage_shim=_FakeStorageShim(vector_store)
+    )
+
+    results, _, _ = facade.search_dense_engine(
+        "docs",
+        "model-a",
+        [0.5],
+        top_k=5,
+        filters={"doc_id": "doc-rolled-back"},
+        readonly=True,
+        user_id=7,
+        is_admin=False,
+    )
+
+    assert results == []
+    assert _filter_conditions(vector_store.sync_search_calls[0]["filters"]) == [
+        ("collection", "eq", "docs"),
+        ("doc_id", "eq", "doc-rolled-back"),
+    ]
+
+
+def test_retrieval_incomplete_rollback_artifacts_keep_existing_filters() -> None:
+    """Given rollback leftovers, retrieval still applies collection and user scope."""
+    from xagent.core.tools.core.RAG_tools.kb import (
+        KBRetrievalHelperCompatibilityFacade,
+    )
+
+    vector_store = _FakeVectorStore(
+        [
+            _search_row(
+                collection="docs",
+                doc_id="doc-rollback-leftover",
+                user_id=8,
+                distance=0.0,
+            ),
+            _search_row(
+                collection="other",
+                doc_id="doc-rollback-leftover",
+                user_id=7,
+                distance=1.0,
+            ),
+            _search_row(collection="docs", doc_id="doc-visible", user_id=7),
+        ]
+    )
+    facade = KBRetrievalHelperCompatibilityFacade(
+        storage_shim=_FakeStorageShim(vector_store)
+    )
+
+    non_admin_results, _, _ = facade.search_dense_engine(
+        "docs",
+        "model-a",
+        [0.5],
+        top_k=5,
+        filters={"doc_id": "doc-rollback-leftover"},
+        readonly=True,
+        user_id=7,
+        is_admin=False,
+    )
+    admin_results, _, _ = facade.search_dense_engine(
+        "docs",
+        "model-a",
+        [0.5],
+        top_k=5,
+        filters={"doc_id": "doc-rollback-leftover"},
+        readonly=True,
+        user_id=None,
+        is_admin=True,
+    )
+
+    assert non_admin_results == []
+    assert [result.doc_id for result in admin_results] == ["doc-rollback-leftover"]
+    assert [result.score for result in admin_results] == [1.0]
+
+
+def test_retrieval_facade_preserves_invalid_legacy_filter_errors() -> None:
+    """Given invalid legacy filters, facade search keeps the existing error."""
+    from xagent.core.tools.core.RAG_tools.kb import (
+        KBRetrievalHelperCompatibilityFacade,
+    )
+
+    facade = KBRetrievalHelperCompatibilityFacade(
+        storage_shim=_FakeStorageShim(_FakeVectorStore([]))
+    )
+
+    with pytest.raises(ValueError, match="Unknown filter operator: between"):
+        facade.search_dense_engine(
+            "docs",
+            "model-a",
+            [0.5],
+            top_k=5,
+            filters={
+                "page_number": {
+                    "operator": "between",
+                    "value": [1, 3],
+                }
+            },
+            readonly=True,
+            user_id=7,
+            is_admin=False,
+        )
+
+
+def test_retrieval_facade_preserves_filter_depth_validation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Given too-deep parsed filters, facade search keeps the depth guard."""
+    from xagent.core.tools.core.RAG_tools.kb import (
+        KBRetrievalHelperCompatibilityFacade,
+    )
+    from xagent.core.tools.core.RAG_tools.retrieval import search_engine
+    from xagent.core.tools.core.RAG_tools.storage.contracts import (
+        FilterCondition,
+        FilterOperator,
+    )
+
+    too_deep_filter: Any = FilterCondition(
+        field="doc_id",
+        operator=FilterOperator.EQ,
+        value="doc-1",
+    )
+    for _ in range(12):
+        too_deep_filter = [too_deep_filter]
+
+    monkeypatch.setattr(
+        search_engine,
+        "parse_legacy_filters",
+        lambda _filters: too_deep_filter,
+    )
+
+    facade = KBRetrievalHelperCompatibilityFacade(
+        storage_shim=_FakeStorageShim(_FakeVectorStore([]))
+    )
+
+    with pytest.raises(ValueError, match="Filter expression depth exceeds"):
+        facade.search_dense_engine(
+            "docs",
+            "model-a",
+            [0.5],
+            top_k=5,
+            filters={"doc_id": "doc-1"},
+            readonly=True,
+            user_id=7,
+            is_admin=False,
+        )
+
+
 @pytest.mark.asyncio
 async def test_retrieval_facade_preserves_async_tuple_shape_and_admin_filtering() -> (
     None
