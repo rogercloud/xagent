@@ -35,7 +35,7 @@ def resolve_cleanup_scope(
     collection: str,
     doc_id: Optional[str] = None,
     parse_hash: Optional[str] = None,
-    chunk_ids: Optional[Sequence[str]] = None,
+    chunk_ids: Optional[Sequence[object]] = None,
     model_tag: Optional[str] = None,
     user_id: Optional[int] = None,
     is_admin: Optional[bool] = None,
@@ -69,12 +69,19 @@ def resolve_cleanup_scope(
 
 
 def normalize_cleanup_chunk_ids(
-    chunk_ids: Optional[Sequence[str]],
+    chunk_ids: Optional[Sequence[object]],
 ) -> tuple[str, ...]:
     """Return a stable deduplicated chunk-id tuple."""
     if not chunk_ids:
         return ()
-    return tuple(sorted({str(chunk_id) for chunk_id in chunk_ids if str(chunk_id)}))
+    normalized: set[str] = set()
+    for chunk_id in chunk_ids:
+        if chunk_id is None:
+            continue
+        value = str(chunk_id)
+        if value:
+            normalized.add(value)
+    return tuple(sorted(normalized))
 
 
 def select_embedding_tables(conn: Any, model_tag: Optional[str] = None) -> list[str]:
@@ -113,25 +120,29 @@ def build_embedding_cleanup_filters_from_base(
     user_id: Optional[int],
     is_admin: bool,
     model_tag: Optional[str] = None,
-) -> dict[str, str]:
-    """Build per-embeddings-table predicates from an existing base filter."""
-    table_filters: dict[str, str] = {}
+) -> dict[str, list[str]]:
+    """Build per-embeddings-table predicate lists from an existing base filter."""
+    table_filters: dict[str, list[str]] = {}
     for table_name in select_embedding_tables(conn, model_tag=model_tag):
         table = None
         try:
             table = conn.open_table(table_name)
-            table_filters[table_name] = append_user_filter_for_table(
-                table=table,
-                filter_expr=base_filter,
-                user_id=user_id,
-                is_admin=is_admin,
-            )
+            table_filters[table_name] = [
+                append_user_filter_for_table(
+                    table=table,
+                    filter_expr=base_filter,
+                    user_id=user_id,
+                    is_admin=is_admin,
+                )
+            ]
         except Exception:
-            table_filters[table_name] = append_user_filter_without_schema(
-                filter_expr=base_filter,
-                user_id=user_id,
-                is_admin=is_admin,
-            )
+            table_filters[table_name] = [
+                append_user_filter_without_schema(
+                    filter_expr=base_filter,
+                    user_id=user_id,
+                    is_admin=is_admin,
+                )
+            ]
         finally:
             _safe_close_table(table)
     return table_filters

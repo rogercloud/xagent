@@ -13,6 +13,9 @@ from xagent.core.tools.core.RAG_tools.kb import (
     KBVectorStorageCleanupResult,
     KBVectorStorageCompatibilityFacade,
 )
+from xagent.core.tools.core.RAG_tools.kb.cleanup_filters import (
+    normalize_cleanup_chunk_ids,
+)
 from xagent.core.tools.core.RAG_tools.utils.user_scope import user_scope_context
 from xagent.core.tools.core.RAG_tools.vector_storage import vector_manager
 
@@ -116,6 +119,12 @@ def test_coordinator_exposes_vector_storage_facade():
         KBVectorStorageCompatibilityFacade,
     )
     assert coordinator.vector_storage is coordinator.vector_storage_compatibility
+
+
+def test_normalize_cleanup_chunk_ids_skips_none_and_empty_values():
+    result = normalize_cleanup_chunk_ids(["ch2", None, "", "ch1", "ch1"])
+
+    assert result == ("ch1", "ch2")
 
 
 def test_cleanup_vectors_for_chunks_uses_model_tag_table_and_reports_counts(
