@@ -237,13 +237,18 @@ class KBVersionCompatibilityFacade:
                 snapshot.model_tag,
             )
 
+        semantic_id = snapshot.pointer.get("semantic_id")
+        technical_id = snapshot.pointer.get("technical_id")
+        if not semantic_id or not technical_id:
+            return False
+
         self.set_main_pointer(
             lancedb_dir,
             snapshot.collection,
             snapshot.doc_id,
             snapshot.step_type,
-            snapshot.pointer["semantic_id"],
-            snapshot.pointer["technical_id"],
+            semantic_id,
+            technical_id,
             model_tag=snapshot.model_tag,
             operator=operator,
         )

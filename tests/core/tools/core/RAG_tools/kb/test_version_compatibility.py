@@ -408,6 +408,36 @@ def test_main_pointer_snapshot_restore_reverts_mutated_pointer() -> None:
     assert restored["technical_id"] == "old-hash"
 
 
+def test_main_pointer_snapshot_restore_returns_false_for_incomplete_pointer() -> None:
+    """Incomplete main-pointer snapshots report restore failure without crashing."""
+    from xagent.core.tools.core.RAG_tools.kb import (
+        KBMainPointerSnapshot,
+        KBVersionCompatibilityFacade,
+    )
+
+    facade = KBVersionCompatibilityFacade(
+        storage_shim=_FakeStorageShim(_FakeMainPointerStore())
+    )
+    missing_semantic = KBMainPointerSnapshot(
+        collection="docs",
+        doc_id="doc-1",
+        step_type="parse",
+        model_tag=None,
+        pointer={"technical_id": "parse-hash"},
+    )
+    missing_technical = KBMainPointerSnapshot(
+        collection="docs",
+        doc_id="doc-1",
+        step_type="parse",
+        model_tag=None,
+        pointer={"semantic_id": "parse_manual_hash"},
+    )
+
+    assert not facade.restore_main_pointer_snapshot(missing_semantic)
+    assert not facade.restore_main_pointer_snapshot(missing_technical)
+    assert facade.list_main_pointers("docs") == []
+
+
 def test_candidate_cleanup_snapshot_records_preview_counts(monkeypatch) -> None:
     """Candidate cleanup snapshots record preview counts without deleting rows."""
     from xagent.core.tools.core.RAG_tools.kb import KBVersionCompatibilityFacade

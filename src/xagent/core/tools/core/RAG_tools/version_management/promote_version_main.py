@@ -111,7 +111,7 @@ def _call_cleanup_cascade(
         return cleanup_cascade(
             collection=collection,
             doc_id=doc_id,
-            scope="embed",
+            scope="embeddings",
             model_tag=model_tag,
             preview_only=preview_only,
             confirm=confirm,
