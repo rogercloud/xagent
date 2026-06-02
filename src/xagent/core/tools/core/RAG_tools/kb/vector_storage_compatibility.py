@@ -8,12 +8,12 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
-from ..LanceDB.model_tag_utils import to_model_tag
 from ..LanceDB.schema_manager import _safe_close_table
-from ..utils.lancedb_query_utils import _safe_count_rows, list_embeddings_table_names
-from ..utils.string_utils import (
-    build_lancedb_filter_expression,
-    build_user_id_filter_for_table,
+from ..utils.lancedb_query_utils import _safe_count_rows
+from .cleanup_filters import (
+    KBCleanupScope,
+    build_embedding_cleanup_filters,
+    resolve_cleanup_scope,
 )
 
 if TYPE_CHECKING:
@@ -144,7 +144,7 @@ class KBVectorStorageCompatibilityFacade:
         doc_id: str,
         model_tag: Optional[str] = None,
         user_id: Optional[int] = None,
-        is_admin: bool = False,
+        is_admin: Optional[bool] = None,
         preview_only: bool = True,
         confirm: bool = False,
     ) -> KBVectorStorageCleanupResult:
@@ -168,7 +168,7 @@ class KBVectorStorageCompatibilityFacade:
         parse_hash: Optional[str] = None,
         model_tag: Optional[str] = None,
         user_id: Optional[int] = None,
-        is_admin: bool = False,
+        is_admin: Optional[bool] = None,
         preview_only: bool = True,
         confirm: bool = False,
     ) -> KBVectorStorageCleanupResult:
@@ -194,7 +194,7 @@ class KBVectorStorageCompatibilityFacade:
         chunk_ids: Optional[Sequence[str]] = None,
         model_tag: Optional[str] = None,
         user_id: Optional[int] = None,
-        is_admin: bool = False,
+        is_admin: Optional[bool] = None,
         preview_only: bool = True,
         confirm: bool = False,
     ) -> KBVectorStorageCleanupResult:
@@ -205,24 +205,19 @@ class KBVectorStorageCompatibilityFacade:
         and model tag. Future handle-level embedding rollback can replace this
         adapter without changing coordinator rollback code.
         """
-        normalized_collection = collection.strip() if isinstance(collection, str) else ""
-        if not normalized_collection:
-            raise ValueError("collection must be a non-empty string")
-        normalized_chunk_ids = _normalize_chunk_ids(chunk_ids)
-        if not any([doc_id, parse_hash, normalized_chunk_ids]):
-            raise ValueError(
-                "At least one of doc_id, parse_hash, or chunk_ids is required"
-            )
+        scope = resolve_cleanup_scope(
+            collection=collection,
+            doc_id=doc_id,
+            parse_hash=parse_hash,
+            chunk_ids=chunk_ids,
+            model_tag=model_tag,
+            user_id=user_id,
+            is_admin=is_admin,
+        )
 
         with self._storage_context():
             return self._cleanup_vectors_for_operation_impl(
-                collection=normalized_collection,
-                doc_id=doc_id,
-                parse_hash=parse_hash,
-                chunk_ids=normalized_chunk_ids,
-                model_tag=model_tag,
-                user_id=user_id,
-                is_admin=is_admin,
+                scope=scope,
                 preview_only=preview_only,
                 confirm=confirm,
             )
@@ -230,13 +225,7 @@ class KBVectorStorageCompatibilityFacade:
     def _cleanup_vectors_for_operation_impl(
         self,
         *,
-        collection: str,
-        doc_id: Optional[str],
-        parse_hash: Optional[str],
-        chunk_ids: tuple[str, ...],
-        model_tag: Optional[str],
-        user_id: Optional[int],
-        is_admin: bool,
+        scope: KBCleanupScope,
         preview_only: bool,
         confirm: bool,
     ) -> KBVectorStorageCleanupResult:
@@ -252,43 +241,24 @@ class KBVectorStorageCompatibilityFacade:
         warnings: list[str] = []
         side_effects_may_remain = False
         should_delete = bool(confirm and not preview_only)
-        target_tables = _target_embedding_tables(conn, model_tag=model_tag)
+        table_filters = build_embedding_cleanup_filters(conn, scope)
 
-        if not target_tables:
+        if not table_filters:
             return KBVectorStorageCleanupResult(
-                collection=collection,
+                collection=scope.collection,
                 status="skipped",
                 deleted_count=0,
                 table_counts={},
-                model_tag=model_tag,
+                model_tag=scope.model_tag,
                 preview_only=preview_only,
             )
 
-        filter_inputs = _build_filter_inputs(
-            collection=collection,
-            doc_id=doc_id,
-            parse_hash=parse_hash,
-            chunk_ids=chunk_ids,
-        )
-
-        for table_name in target_tables:
+        for table_name, filter_exprs in table_filters.items():
             table = None
             try:
                 table = conn.open_table(table_name)
                 count = 0
-                for filter_values in filter_inputs:
-                    filter_expr = build_lancedb_filter_expression(
-                        filter_values,
-                        user_id=user_id,
-                        is_admin=is_admin,
-                        skip_user_filter=True,
-                    )
-                    filter_expr = _append_table_user_filter(
-                        table=table,
-                        filter_expr=filter_expr,
-                        user_id=user_id,
-                        is_admin=is_admin,
-                    )
+                for filter_expr in filter_exprs:
                     matched = _safe_count_rows(table, filter_expr, on_error="raise")
                     if should_delete and matched > 0:
                         table.delete(filter_expr)
@@ -311,76 +281,12 @@ class KBVectorStorageCompatibilityFacade:
             status = "planned"
 
         return KBVectorStorageCleanupResult(
-            collection=collection,
+            collection=scope.collection,
             status=status,
             deleted_count=deleted_count,
             table_counts=table_counts,
-            model_tag=model_tag,
+            model_tag=scope.model_tag,
             preview_only=preview_only,
             warnings=tuple(warnings),
             side_effects_may_remain=side_effects_may_remain,
         )
-
-
-def _normalize_chunk_ids(chunk_ids: Optional[Sequence[str]]) -> tuple[str, ...]:
-    if not chunk_ids:
-        return ()
-    return tuple(sorted({str(chunk_id) for chunk_id in chunk_ids if str(chunk_id)}))
-
-
-def _build_filter_inputs(
-    *,
-    collection: str,
-    doc_id: Optional[str],
-    parse_hash: Optional[str],
-    chunk_ids: tuple[str, ...],
-) -> list[dict[str, Any]]:
-    base: dict[str, Any] = {"collection": collection}
-    if doc_id is not None:
-        base["doc_id"] = doc_id
-    if parse_hash is not None:
-        base["parse_hash"] = parse_hash
-    if not chunk_ids:
-        return [base]
-    return [dict(base, chunk_id=chunk_id) for chunk_id in chunk_ids]
-
-
-def _target_embedding_tables(conn: Any, model_tag: Optional[str]) -> list[str]:
-    table_names = list_embeddings_table_names(conn)
-    if model_tag is None:
-        return table_names
-
-    candidate_tags = {model_tag, to_model_tag(model_tag)}
-    candidate_tables = {f"embeddings_{tag}" for tag in candidate_tags}
-    return [table_name for table_name in table_names if table_name in candidate_tables]
-
-
-def _append_table_user_filter(
-    *,
-    table: Any,
-    filter_expr: str,
-    user_id: Optional[int],
-    is_admin: bool,
-) -> str:
-    if is_admin or user_id is None:
-        return filter_expr
-    if not _table_has_column(table, "user_id"):
-        return filter_expr
-    user_filter = build_user_id_filter_for_table(table, int(user_id))
-    if not filter_expr:
-        return user_filter
-    return f"{filter_expr} AND {user_filter}"
-
-
-def _table_has_column(table: Any, column_name: str) -> bool:
-    try:
-        schema = getattr(table, "schema", None)
-        if schema is None:
-            return False
-        names = getattr(schema, "names", None)
-        if names is not None:
-            return str(column_name) in {str(name) for name in names}
-        field = schema.field(column_name)
-        return field is not None
-    except Exception:
-        return False

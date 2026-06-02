@@ -1,6 +1,8 @@
 from __future__ import annotations
 
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, call
+
+import pytest
 
 from xagent.core.tools.core.RAG_tools.core.schemas import (
     EmbeddingReadResponse,
@@ -11,6 +13,7 @@ from xagent.core.tools.core.RAG_tools.kb import (
     KBVectorStorageCleanupResult,
     KBVectorStorageCompatibilityFacade,
 )
+from xagent.core.tools.core.RAG_tools.utils.user_scope import user_scope_context
 from xagent.core.tools.core.RAG_tools.vector_storage import vector_manager
 
 
@@ -127,7 +130,7 @@ def test_cleanup_vectors_for_chunks_uses_model_tag_table_and_reports_counts(
     facade = KBVectorStorageCompatibilityFacade(storage_shim=storage_shim)
 
     monkeypatch.setattr(
-        "xagent.core.tools.core.RAG_tools.kb.vector_storage_compatibility."
+        "xagent.core.tools.core.RAG_tools.kb.cleanup_filters."
         "build_lancedb_filter_expression",
         lambda filters, **kwargs: " AND ".join(
             f"{key} == '{value}'" for key, value in filters.items()
@@ -153,13 +156,91 @@ def test_cleanup_vectors_for_chunks_uses_model_tag_table_and_reports_counts(
         model_tag="model_a",
         preview_only=False,
     )
-    conn.open_table.assert_called_once_with("embeddings_model_a")
+    assert conn.open_table.call_args_list == [
+        call("embeddings_model_a"),
+        call("embeddings_model_a"),
+    ]
     table.count_rows.assert_called_once_with(
         "collection == 'c' AND doc_id == 'd' AND chunk_id == 'ch1' AND user_id == 7"
     )
     table.delete.assert_called_once_with(
         "collection == 'c' AND doc_id == 'd' AND chunk_id == 'ch1' AND user_id == 7"
     )
+
+
+def test_cleanup_vectors_for_operation_uses_request_user_scope(monkeypatch):
+    table = _table_with_user_id(count=1)
+    conn = MagicMock()
+    conn.list_tables.return_value = ["embeddings_model_a"]
+    conn.open_table.return_value = table
+    storage_shim = MagicMock()
+    storage_shim.get_vector_store_raw_connection.return_value = conn
+    facade = KBVectorStorageCompatibilityFacade(storage_shim=storage_shim)
+
+    monkeypatch.setattr(
+        "xagent.core.tools.core.RAG_tools.kb.cleanup_filters."
+        "build_lancedb_filter_expression",
+        lambda filters, **kwargs: " AND ".join(
+            f"{key} == '{value}'" for key, value in filters.items()
+        ),
+    )
+
+    with user_scope_context(user_id=42, is_admin=False):
+        result = facade.cleanup_vectors_for_document(
+            collection="c",
+            doc_id="d",
+            preview_only=True,
+            confirm=False,
+        )
+
+    assert result.status == "planned"
+    table.count_rows.assert_called_once_with(
+        "collection == 'c' AND doc_id == 'd' AND user_id == 42"
+    )
+
+
+def test_cleanup_vectors_for_operation_without_user_scope_fails_closed(monkeypatch):
+    table = _table_with_user_id(count=0)
+    conn = MagicMock()
+    conn.list_tables.return_value = ["embeddings_model_a"]
+    conn.open_table.return_value = table
+    storage_shim = MagicMock()
+    storage_shim.get_vector_store_raw_connection.return_value = conn
+    facade = KBVectorStorageCompatibilityFacade(storage_shim=storage_shim)
+
+    monkeypatch.setattr(
+        "xagent.core.tools.core.RAG_tools.kb.cleanup_filters."
+        "build_lancedb_filter_expression",
+        lambda filters, **kwargs: " AND ".join(
+            f"{key} == '{value}'" for key, value in filters.items()
+        ),
+    )
+
+    facade.cleanup_vectors_for_document(
+        collection="c",
+        doc_id="d",
+        user_id=None,
+        is_admin=False,
+        preview_only=True,
+        confirm=False,
+    )
+
+    filter_expr = table.count_rows.call_args.args[0]
+    assert "collection == 'c'" in filter_expr
+    assert "doc_id == 'd'" in filter_expr
+    assert "user_id IS NULL" in filter_expr
+    assert "user_id IS NOT NULL" in filter_expr
+
+
+def test_cleanup_vectors_for_operation_rejects_chunk_ids_without_doc_id():
+    facade = KBVectorStorageCompatibilityFacade(storage_shim=MagicMock())
+
+    with pytest.raises(ValueError, match="doc_id is required"):
+        facade.cleanup_vectors_for_operation(
+            collection="c",
+            chunk_ids=["ch1"],
+            model_tag="model_a",
+        )
 
 
 def test_cleanup_vectors_for_operation_preview_does_not_delete(monkeypatch):
@@ -172,7 +253,7 @@ def test_cleanup_vectors_for_operation_preview_does_not_delete(monkeypatch):
     facade = KBVectorStorageCompatibilityFacade(storage_shim=storage_shim)
 
     monkeypatch.setattr(
-        "xagent.core.tools.core.RAG_tools.kb.vector_storage_compatibility."
+        "xagent.core.tools.core.RAG_tools.kb.cleanup_filters."
         "build_lancedb_filter_expression",
         lambda filters, **kwargs: "base_filter",
     )
@@ -201,7 +282,7 @@ def test_cleanup_vectors_for_operation_reports_partial_cleanup_failure(monkeypat
     facade = KBVectorStorageCompatibilityFacade(storage_shim=storage_shim)
 
     monkeypatch.setattr(
-        "xagent.core.tools.core.RAG_tools.kb.vector_storage_compatibility."
+        "xagent.core.tools.core.RAG_tools.kb.cleanup_filters."
         "build_lancedb_filter_expression",
         lambda filters, **kwargs: "base_filter",
     )
