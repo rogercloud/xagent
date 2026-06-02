@@ -837,7 +837,9 @@ def _cleanup_cascade_impl(
 def _collapse_embedding_table_counts(counts: Dict[str, int]) -> Dict[str, int]:
     """Collapse concrete embeddings table counts into the legacy summary key."""
     collapsed = dict(counts)
-    embeddings_total = int(collapsed.pop("__embeddings__", 0))
+    embeddings_total = int(collapsed.pop("__embeddings__", 0)) + int(
+        collapsed.pop("embeddings", 0)
+    )
     for table_name in list(collapsed):
         if str(table_name).startswith("embeddings_"):
             embeddings_total += int(collapsed.pop(table_name, 0))

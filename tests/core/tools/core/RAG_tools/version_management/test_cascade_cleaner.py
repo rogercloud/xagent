@@ -9,6 +9,7 @@ import pytest
 
 from xagent.core.tools.core.RAG_tools.utils.user_scope import user_scope_context
 from xagent.core.tools.core.RAG_tools.version_management.cascade_cleaner import (
+    _collapse_embedding_table_counts,
     cascade_delete,
     cascade_delete_documents,
     cleanup_chunk_cascade,
@@ -1289,6 +1290,18 @@ def test_cleanup_parse_cascade_expands_embeddings_predicates_per_table(
     assert "user_id == 7" in predicates["embeddings_m1"][0]
     assert "user_id == 7" not in predicates["embeddings_legacy"][0]
     assert result["embeddings"] == 5
+
+
+def test_collapse_embedding_table_counts_preserves_existing_summary_key() -> None:
+    result = _collapse_embedding_table_counts(
+        {
+            "embeddings": 2,
+            "embeddings_m1": 3,
+            "chunks": 1,
+        }
+    )
+
+    assert result == {"chunks": 1, "embeddings": 5}
 
 
 @patch(
