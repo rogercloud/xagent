@@ -413,6 +413,25 @@ def _delete_by_predicates(
     return deleted
 
 
+def _should_execute_delete(*, preview_only: bool, confirm: bool) -> bool:
+    """Return whether a destructive cleanup should execute."""
+    return bool(confirm and not preview_only)
+
+
+def _execute_or_plan_by_predicates(
+    conn: Any,
+    predicates: FilterPredicateMap,
+    *,
+    preview_only: bool,
+    confirm: bool,
+    model_tag: Optional[str] = None,
+) -> Dict[str, int]:
+    """Plan unless deletion is explicitly confirmed outside preview mode."""
+    if not _should_execute_delete(preview_only=preview_only, confirm=confirm):
+        return _plan_by_predicates(conn, predicates, model_tag=model_tag)
+    return _delete_by_predicates(conn, predicates, model_tag=model_tag)
+
+
 def cascade_delete(
     *,
     target: Literal["collection", "document"],
@@ -529,10 +548,13 @@ def _cascade_delete_impl(
             )
         _replace_predicate(predicates, table_name, filter_expr)
 
-    if preview_only and not confirm:
-        return _plan_by_predicates(conn, predicates, model_tag=None)
-
-    return _delete_by_predicates(conn, predicates, model_tag=None)
+    return _execute_or_plan_by_predicates(
+        conn,
+        predicates,
+        preview_only=preview_only,
+        confirm=confirm,
+        model_tag=None,
+    )
 
 
 def cascade_delete_documents(
@@ -597,10 +619,13 @@ def cascade_delete_documents(
         )
         _replace_predicate(predicates, table_name, filter_expr)
 
-    if preview_only and not confirm:
-        return _plan_by_predicates(conn, predicates, model_tag=None)
-
-    return _delete_by_predicates(conn, predicates, model_tag=None)
+    return _execute_or_plan_by_predicates(
+        conn,
+        predicates,
+        preview_only=preview_only,
+        confirm=confirm,
+        model_tag=None,
+    )
 
 
 def cleanup_cascade(
@@ -834,16 +859,16 @@ def _cleanup_cascade_impl(
     else:
         raise CascadeCleanupError(f"Unsupported scope: {scope}")
 
-    if preview_only and not confirm:
-        planned = _plan_by_predicates(conn, predicates, model_tag=model_tag)
-        if scope in {"parse", "chunk", "embeddings"}:
-            return _collapse_embedding_table_counts(planned)
-        return planned
-
-    deleted = _delete_by_predicates(conn, predicates, model_tag=model_tag)
+    result = _execute_or_plan_by_predicates(
+        conn,
+        predicates,
+        preview_only=preview_only,
+        confirm=confirm,
+        model_tag=model_tag,
+    )
     if scope in {"parse", "chunk", "embeddings"}:
-        return _collapse_embedding_table_counts(deleted)
-    return deleted
+        return _collapse_embedding_table_counts(result)
+    return result
 
 
 def _collapse_embedding_table_counts(counts: Dict[str, int]) -> Dict[str, int]:

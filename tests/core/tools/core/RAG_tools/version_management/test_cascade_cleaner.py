@@ -13,6 +13,7 @@ from xagent.core.tools.core.RAG_tools.version_management.cascade_cleaner import 
     _collapse_embedding_table_counts,
     _replace_predicate,
     _replace_predicates,
+    _should_execute_delete,
     cascade_delete,
     cascade_delete_documents,
     cleanup_chunk_cascade,
@@ -78,6 +79,13 @@ def test_predicate_helpers_distinguish_replace_and_append() -> None:
 
     _replace_predicates(predicates, "table", ["final"])
     assert predicates["table"] == ["final"]
+
+
+def test_should_execute_delete_requires_confirm_and_non_preview() -> None:
+    assert _should_execute_delete(preview_only=False, confirm=True) is True
+    assert _should_execute_delete(preview_only=True, confirm=True) is False
+    assert _should_execute_delete(preview_only=False, confirm=False) is False
+    assert _should_execute_delete(preview_only=True, confirm=False) is False
 
 
 @patch(
@@ -1364,6 +1372,139 @@ def test_collapse_embedding_table_counts_preserves_existing_summary_key() -> Non
     )
 
     assert result == {"chunks": 1, "embeddings": 5}
+
+
+@pytest.mark.parametrize(
+    ("preview_only", "confirm"),
+    [
+        (False, False),
+        (True, True),
+    ],
+)
+@patch(
+    "xagent.core.tools.core.RAG_tools.version_management.cascade_cleaner.get_vector_store_raw_connection"
+)
+def test_cascade_delete_plans_unless_confirmed_outside_preview(
+    mock_get_conn: MagicMock,
+    preview_only: bool,
+    confirm: bool,
+) -> None:
+    conn = MagicMock(spec=["table_names", "open_table"])
+    conn.table_names.return_value = ["documents"]
+    table = _create_mock_table_with_columns(["collection", "doc_id", "user_id"])
+    conn.open_table.return_value = table
+    mock_get_conn.return_value = conn
+
+    with (
+        patch(
+            "xagent.core.tools.core.RAG_tools.version_management.cascade_cleaner._plan_by_predicates"
+        ) as mock_plan,
+        patch(
+            "xagent.core.tools.core.RAG_tools.version_management.cascade_cleaner._delete_by_predicates"
+        ) as mock_delete,
+    ):
+        mock_plan.return_value = {"documents": 1}
+        result = cascade_delete(
+            target="document",
+            collection="c_gate",
+            doc_id="d_gate",
+            user_id=7,
+            is_admin=False,
+            preview_only=preview_only,
+            confirm=confirm,
+        )
+
+    assert result == {"documents": 1}
+    mock_plan.assert_called_once()
+    mock_delete.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("preview_only", "confirm"),
+    [
+        (False, False),
+        (True, True),
+    ],
+)
+@patch(
+    "xagent.core.tools.core.RAG_tools.version_management.cascade_cleaner.get_vector_store_raw_connection"
+)
+def test_cascade_delete_documents_plans_unless_confirmed_outside_preview(
+    mock_get_conn: MagicMock,
+    preview_only: bool,
+    confirm: bool,
+) -> None:
+    conn = MagicMock(spec=["table_names", "open_table"])
+    conn.table_names.return_value = ["documents"]
+    table = _create_mock_table_with_columns(["collection", "doc_id", "user_id"])
+    conn.open_table.return_value = table
+    mock_get_conn.return_value = conn
+
+    with (
+        patch(
+            "xagent.core.tools.core.RAG_tools.version_management.cascade_cleaner._plan_by_predicates"
+        ) as mock_plan,
+        patch(
+            "xagent.core.tools.core.RAG_tools.version_management.cascade_cleaner._delete_by_predicates"
+        ) as mock_delete,
+    ):
+        mock_plan.return_value = {"documents": 1}
+        result = cascade_delete_documents(
+            collection="c_gate",
+            doc_ids=["d_gate"],
+            user_id=7,
+            is_admin=False,
+            preview_only=preview_only,
+            confirm=confirm,
+        )
+
+    assert result == {"documents": 1}
+    mock_plan.assert_called_once()
+    mock_delete.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("preview_only", "confirm"),
+    [
+        (False, False),
+        (True, True),
+    ],
+)
+def test_cleanup_cascade_plans_unless_confirmed_outside_preview(
+    preview_only: bool,
+    confirm: bool,
+) -> None:
+    with (
+        patch(
+            "xagent.core.tools.core.RAG_tools.version_management.cascade_cleaner.get_vector_store_raw_connection"
+        ) as mock_get_conn,
+        patch(
+            "xagent.core.tools.core.RAG_tools.version_management.cascade_cleaner.build_embedding_cleanup_filters"
+        ) as mock_build_filters,
+        patch(
+            "xagent.core.tools.core.RAG_tools.version_management.cascade_cleaner._plan_by_predicates"
+        ) as mock_plan,
+        patch(
+            "xagent.core.tools.core.RAG_tools.version_management.cascade_cleaner._delete_by_predicates"
+        ) as mock_delete,
+    ):
+        conn = MagicMock(spec=["table_names", "open_table"])
+        mock_get_conn.return_value = conn
+        mock_build_filters.return_value = {"embeddings_m1": ["collection == 'c_gate'"]}
+        mock_plan.return_value = {"embeddings_m1": 1}
+
+        result = cleanup_embed_cascade(
+            "c_gate",
+            "d_gate",
+            user_id=7,
+            is_admin=False,
+            preview_only=preview_only,
+            confirm=confirm,
+        )
+
+    assert result == {"embeddings": 1}
+    mock_plan.assert_called_once()
+    mock_delete.assert_not_called()
 
 
 @patch(
