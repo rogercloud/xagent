@@ -408,6 +408,28 @@ def test_main_pointer_snapshot_restore_reverts_mutated_pointer() -> None:
     assert restored["technical_id"] == "old-hash"
 
 
+def test_main_pointer_snapshot_restore_succeeds_when_pointer_already_absent() -> None:
+    """Restoring an absent pointer succeeds when the desired state is already met."""
+    from xagent.core.tools.core.RAG_tools.kb import (
+        KBMainPointerSnapshot,
+        KBVersionCompatibilityFacade,
+    )
+
+    store = _FakeMainPointerStore()
+    facade = KBVersionCompatibilityFacade(storage_shim=_FakeStorageShim(store))
+    snapshot = KBMainPointerSnapshot(
+        collection="docs",
+        doc_id="doc-1",
+        step_type="parse",
+        model_tag=None,
+        pointer=None,
+    )
+
+    assert facade.restore_main_pointer_snapshot(snapshot)
+    assert store.calls[-1][0] == "delete"
+    assert facade.list_main_pointers("docs") == []
+
+
 def test_main_pointer_snapshot_restore_returns_false_for_incomplete_pointer() -> None:
     """Incomplete main-pointer snapshots report restore failure without crashing."""
     from xagent.core.tools.core.RAG_tools.kb import (

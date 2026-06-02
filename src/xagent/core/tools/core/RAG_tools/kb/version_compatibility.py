@@ -233,12 +233,13 @@ class KBVersionCompatibilityFacade:
         operator: Optional[str] = None,
     ) -> bool:
         if snapshot.pointer is None:
-            return self.delete_main_pointer(
+            self.delete_main_pointer(
                 snapshot.collection,
                 snapshot.doc_id,
                 snapshot.step_type,
                 snapshot.model_tag,
             )
+            return True
 
         semantic_id = snapshot.pointer.get("semantic_id")
         technical_id = snapshot.pointer.get("technical_id")
