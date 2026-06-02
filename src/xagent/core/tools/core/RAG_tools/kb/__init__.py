@@ -24,6 +24,10 @@ from .models import (
 from .parse_display_compatibility import KBParseDisplayCompatibilityFacade
 from .retrieval_compatibility import KBRetrievalHelperCompatibilityFacade
 from .storage_shim import KBStorageShimCompatibilityFacade
+from .vector_storage_compatibility import (
+    KBVectorStorageCleanupResult,
+    KBVectorStorageCompatibilityFacade,
+)
 from .version_compatibility import (
     KBMainPointerSnapshot,
     KBVersionCandidateCleanupSnapshot,
@@ -50,6 +54,8 @@ __all__ = [
     "KBRetrievalHelperCompatibilityFacade",
     "KBStorageShimCompatibilityFacade",
     "KBStorageBackend",
+    "KBVectorStorageCleanupResult",
+    "KBVectorStorageCompatibilityFacade",
     "KBUserScope",
     "KBVersionCompatibilityFacade",
     "LanceDBCollectionHandle",

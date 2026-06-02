@@ -25,6 +25,7 @@ from .models import (
 from .parse_display_compatibility import KBParseDisplayCompatibilityFacade
 from .retrieval_compatibility import KBRetrievalHelperCompatibilityFacade
 from .storage_shim import KBStorageShimCompatibilityFacade
+from .vector_storage_compatibility import KBVectorStorageCompatibilityFacade
 from .version_compatibility import KBVersionCompatibilityFacade
 
 T = TypeVar("T")
@@ -48,6 +49,7 @@ class KBCoordinator:
         retrieval_helper_compatibility: (
             KBRetrievalHelperCompatibilityFacade | None
         ) = None,
+        vector_storage_compatibility: KBVectorStorageCompatibilityFacade | None = None,
     ) -> None:
         self._storage_factory = storage_factory or StorageFactory.get_factory()
         self._handle_provider = handle_provider or KBHandleProvider()
@@ -72,6 +74,10 @@ class KBCoordinator:
         self._retrieval_helper_compatibility = (
             retrieval_helper_compatibility
             or KBRetrievalHelperCompatibilityFacade(coordinator=self)
+        )
+        self._vector_storage_compatibility = (
+            vector_storage_compatibility
+            or KBVectorStorageCompatibilityFacade(coordinator=self)
         )
 
     @property
@@ -133,6 +139,16 @@ class KBCoordinator:
     def retrieval_helper(self) -> KBRetrievalHelperCompatibilityFacade:
         """Backward-friendly short alias for the retrieval helper facade."""
         return self._retrieval_helper_compatibility
+
+    @property
+    def vector_storage_compatibility(self) -> KBVectorStorageCompatibilityFacade:
+        """Return the vector storage compatibility facade."""
+        return self._vector_storage_compatibility
+
+    @property
+    def vector_storage(self) -> KBVectorStorageCompatibilityFacade:
+        """Backward-friendly short alias for the vector storage facade."""
+        return self._vector_storage_compatibility
 
     async def get_context(self, request: KBContextRequest) -> KBCollectionContext:
         """Resolve collection, caller scope, stores, backend, and capabilities."""

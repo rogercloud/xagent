@@ -15,7 +15,7 @@ import logging
 import numbers
 import os
 import time
-from typing import Any, Dict, List, Optional, cast
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, cast
 
 import numpy as np
 import pandas as pd
@@ -44,6 +44,18 @@ from ..utils.lancedb_query_utils import list_table_names
 from ..utils.metadata_utils import deserialize_metadata, serialize_metadata
 
 logger = logging.getLogger(__name__)
+
+if TYPE_CHECKING:
+    from ..kb.vector_storage_compatibility import (
+        KBVectorStorageCompatibilityFacade,
+    )
+
+
+def _get_vector_storage_compatibility_facade() -> "KBVectorStorageCompatibilityFacade":
+    """Return the coordinator-owned vector storage compatibility facade."""
+    from ..kb import get_kb_coordinator
+
+    return get_kb_coordinator().vector_storage_compatibility
 
 
 def _is_non_recoverable_merge_error(error: Exception) -> bool:
@@ -113,6 +125,23 @@ def _is_non_recoverable_merge_error(error: Exception) -> bool:
 
 
 def validate_query_vector(
+    query_vector: List[float],
+    model_tag: Optional[str] = None,
+    conn: Any = None,
+    user_id: Optional[int] = None,
+    is_admin: bool = False,
+) -> None:
+    """Validate query vector format and content through the coordinator facade."""
+    _get_vector_storage_compatibility_facade().validate_query_vector(
+        query_vector,
+        model_tag=model_tag,
+        conn=conn,
+        user_id=user_id,
+        is_admin=is_admin,
+    )
+
+
+def _validate_query_vector_impl(
     query_vector: List[float],
     model_tag: Optional[str] = None,
     conn: Any = None,
@@ -202,6 +231,27 @@ def _safe_str_value(value: Any) -> Optional[str]:
 
 
 def read_chunks_for_embedding(
+    collection: str,
+    doc_id: str,
+    parse_hash: str,
+    model: str,
+    filters: Optional[Dict[str, Any]] = None,
+    user_id: Optional[int] = None,
+    is_admin: bool = False,
+) -> EmbeddingReadResponse:
+    """Read chunks from database for embedding computation through the facade."""
+    return _get_vector_storage_compatibility_facade().read_chunks_for_embedding(
+        collection=collection,
+        doc_id=doc_id,
+        parse_hash=parse_hash,
+        model=model,
+        filters=filters,
+        user_id=user_id,
+        is_admin=is_admin,
+    )
+
+
+def _read_chunks_for_embedding_impl(
     collection: str,
     doc_id: str,
     parse_hash: str,
@@ -761,6 +811,21 @@ def _process_model_embeddings(
 
 
 def write_vectors_to_db(
+    collection: str,
+    embeddings: List[ChunkEmbeddingData],
+    create_index: bool = True,
+    user_id: Optional[int] = None,
+) -> EmbeddingWriteResponse:
+    """Write embedding vectors to database with idempotency."""
+    return _get_vector_storage_compatibility_facade().write_vectors_to_db(
+        collection=collection,
+        embeddings=embeddings,
+        create_index=create_index,
+        user_id=user_id,
+    )
+
+
+def _write_vectors_to_db_impl(
     collection: str,
     embeddings: List[ChunkEmbeddingData],
     create_index: bool = True,
