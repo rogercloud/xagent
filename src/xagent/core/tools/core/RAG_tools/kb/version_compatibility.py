@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -10,6 +11,8 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
 from typing_extensions import Literal
 
 from ..core.schemas import StepType
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from .coordinator import KBCoordinator
@@ -240,6 +243,13 @@ class KBVersionCompatibilityFacade:
         semantic_id = snapshot.pointer.get("semantic_id")
         technical_id = snapshot.pointer.get("technical_id")
         if not semantic_id or not technical_id:
+            logger.warning(
+                "Failed to restore main pointer snapshot for %s/%s/%s: "
+                "missing semantic_id or technical_id",
+                snapshot.collection,
+                snapshot.doc_id,
+                snapshot.step_type,
+            )
             return False
 
         self.set_main_pointer(
