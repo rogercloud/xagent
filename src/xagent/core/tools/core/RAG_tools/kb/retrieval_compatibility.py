@@ -62,7 +62,7 @@ class KBRetrievalHelperCompatibilityFacade:
         nprobes: Optional[int] = None,
         refine_factor: Optional[int] = None,
         user_id: Optional[int] = None,
-        is_admin: bool = False,
+        is_admin: Optional[bool] = None,
     ) -> Tuple[List[SearchResult], str, Optional[str]]:
         from ..retrieval.search_engine import _search_dense_engine_impl
 
@@ -93,7 +93,7 @@ class KBRetrievalHelperCompatibilityFacade:
         nprobes: Optional[int] = None,
         refine_factor: Optional[int] = None,
         user_id: Optional[int] = None,
-        is_admin: bool = False,
+        is_admin: Optional[bool] = None,
     ) -> Tuple[List[SearchResult], str, Optional[str]]:
         from ..retrieval.search_engine import _search_dense_engine_async_impl
 

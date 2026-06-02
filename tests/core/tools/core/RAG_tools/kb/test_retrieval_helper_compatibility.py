@@ -325,6 +325,146 @@ def test_retrieval_facade_preserves_sync_tuple_filter_scope_and_conversion() -> 
     ]
 
 
+def test_retrieval_facade_falls_back_to_request_user_scope() -> None:
+    """Given omitted user scope, facade search uses request-scoped values."""
+    from xagent.core.tools.core.RAG_tools.kb import (
+        KBRetrievalHelperCompatibilityFacade,
+    )
+    from xagent.core.tools.core.RAG_tools.utils.user_scope import user_scope_context
+
+    vector_store = _FakeVectorStore(
+        [
+            _search_row(doc_id="doc-1", user_id=7),
+            _search_row(doc_id="doc-1", user_id=8),
+        ]
+    )
+    facade = KBRetrievalHelperCompatibilityFacade(
+        storage_shim=_FakeStorageShim(vector_store)
+    )
+
+    with user_scope_context(user_id=7, is_admin=False):
+        results, _, _ = facade.search_dense_engine(
+            "docs",
+            "model-a",
+            [0.5],
+            top_k=5,
+            filters={"doc_id": "doc-1"},
+            readonly=True,
+        )
+
+    assert [result.doc_id for result in results] == ["doc-1"]
+    search_call = vector_store.sync_search_calls[0]
+    assert search_call["user_id"] == 7
+    assert search_call["is_admin"] is False
+
+
+@pytest.mark.asyncio
+async def test_retrieval_facade_async_falls_back_to_request_user_scope() -> None:
+    """Given omitted user scope, facade async search uses request-scoped values."""
+    from xagent.core.tools.core.RAG_tools.kb import (
+        KBRetrievalHelperCompatibilityFacade,
+    )
+    from xagent.core.tools.core.RAG_tools.utils.user_scope import user_scope_context
+
+    vector_store = _FakeVectorStore(
+        [
+            _search_row(doc_id="doc-1", user_id=7),
+            _search_row(doc_id="doc-1", user_id=8),
+        ]
+    )
+    facade = KBRetrievalHelperCompatibilityFacade(
+        storage_shim=_FakeStorageShim(vector_store)
+    )
+
+    with user_scope_context(user_id=7, is_admin=False):
+        results, _, _ = await facade.search_dense_engine_async(
+            "docs",
+            "model-a",
+            [0.5],
+            top_k=5,
+            filters={"doc_id": "doc-1"},
+            readonly=True,
+        )
+
+    assert [result.doc_id for result in results] == ["doc-1"]
+    search_call = vector_store.async_search_calls[0]
+    assert search_call["user_id"] == 7
+    assert search_call["is_admin"] is False
+
+
+def test_public_retrieval_helper_falls_back_to_request_user_scope(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Given omitted user scope, public helper lets facade read request context."""
+    from xagent.core.tools.core.RAG_tools.retrieval import search_engine
+    from xagent.core.tools.core.RAG_tools.utils.user_scope import user_scope_context
+
+    vector_store = _FakeVectorStore(
+        [
+            _search_row(doc_id="doc-1", user_id=7),
+            _search_row(doc_id="doc-1", user_id=8),
+        ]
+    )
+    facade = search_engine._get_retrieval_helper_compatibility_facade()
+    monkeypatch.setattr(
+        facade,
+        "_storage_shim",
+        _FakeStorageShim(vector_store),
+    )
+
+    with user_scope_context(user_id=7, is_admin=False):
+        results, _, _ = search_engine.search_dense_engine(
+            "docs",
+            "model-a",
+            [0.5],
+            top_k=5,
+            filters={"doc_id": "doc-1"},
+            readonly=True,
+        )
+
+    assert [result.doc_id for result in results] == ["doc-1"]
+    search_call = vector_store.sync_search_calls[0]
+    assert search_call["user_id"] == 7
+    assert search_call["is_admin"] is False
+
+
+@pytest.mark.asyncio
+async def test_public_retrieval_helper_async_falls_back_to_request_user_scope(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Given omitted user scope, public async helper lets facade read context."""
+    from xagent.core.tools.core.RAG_tools.retrieval import search_engine
+    from xagent.core.tools.core.RAG_tools.utils.user_scope import user_scope_context
+
+    vector_store = _FakeVectorStore(
+        [
+            _search_row(doc_id="doc-1", user_id=7),
+            _search_row(doc_id="doc-1", user_id=8),
+        ]
+    )
+    facade = search_engine._get_retrieval_helper_compatibility_facade()
+    monkeypatch.setattr(
+        facade,
+        "_storage_shim",
+        _FakeStorageShim(vector_store),
+    )
+
+    with user_scope_context(user_id=7, is_admin=False):
+        results, _, _ = await search_engine.search_dense_engine_async(
+            "docs",
+            "model-a",
+            [0.5],
+            top_k=5,
+            filters={"doc_id": "doc-1"},
+            readonly=True,
+        )
+
+    assert [result.doc_id for result in results] == ["doc-1"]
+    search_call = vector_store.async_search_calls[0]
+    assert search_call["user_id"] == 7
+    assert search_call["is_admin"] is False
+
+
 def test_retrieval_search_after_rollback_cleanup_returns_no_removed_artifacts() -> None:
     """Given rollback-cleaned artifacts, search does not return removed rows."""
     from xagent.core.tools.core.RAG_tools.kb import (

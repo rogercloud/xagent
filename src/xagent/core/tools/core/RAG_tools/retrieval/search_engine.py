@@ -33,7 +33,7 @@ def search_dense_engine(
     nprobes: Optional[int] = None,
     refine_factor: Optional[int] = None,
     user_id: Optional[int] = None,
-    is_admin: bool = False,
+    is_admin: Optional[bool] = None,
 ) -> Tuple[List[SearchResult], str, Optional[str]]:
     """
     Execute dense vector search against LanceDB embeddings table.
@@ -186,7 +186,7 @@ async def search_dense_engine_async(
     nprobes: Optional[int] = None,
     refine_factor: Optional[int] = None,
     user_id: Optional[int] = None,
-    is_admin: bool = False,
+    is_admin: Optional[bool] = None,
 ) -> Tuple[List[SearchResult], str, Optional[str]]:
     """
     Execute dense vector search using async vector store abstraction.
