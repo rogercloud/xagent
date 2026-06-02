@@ -1,7 +1,10 @@
 import logging
-from typing import List, Optional
+from typing import TYPE_CHECKING, List, Optional
 
 from ..core.schemas import SearchResult
+
+if TYPE_CHECKING:
+    from ..kb import KBRetrievalHelperCompatibilityFacade
 
 logger = logging.getLogger(__name__)
 
@@ -32,6 +35,21 @@ def format_search_results_for_llm(
         A single string containing the formatted content of the search results,
         ready to be used as context for an LLM.
     """
+    return _get_retrieval_helper_compatibility_facade().format_search_results_for_llm(
+        search_results,
+        top_k=top_k,
+        include_metadata=include_metadata,
+        separator=separator,
+    )
+
+
+def _format_search_results_for_llm_impl(
+    search_results: List[SearchResult],
+    top_k: Optional[int] = None,
+    include_metadata: bool = False,
+    separator: str = "\n---\n",
+) -> str:
+    """Format search results into an LLM context string."""
     if not search_results:
         logger.info("No search results provided for formatting.")
         return ""
@@ -59,3 +77,11 @@ def format_search_results_for_llm(
             formatted_chunks.append(f"[{i + 1}]\n{chunk_content}")
 
     return separator.join(formatted_chunks)
+
+
+def _get_retrieval_helper_compatibility_facade() -> (
+    "KBRetrievalHelperCompatibilityFacade"
+):
+    from ..kb import get_kb_coordinator
+
+    return get_kb_coordinator().retrieval_helper_compatibility

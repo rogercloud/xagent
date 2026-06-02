@@ -22,6 +22,7 @@ from .models import (
     KBUserScope,
 )
 from .parse_display_compatibility import KBParseDisplayCompatibilityFacade
+from .retrieval_compatibility import KBRetrievalHelperCompatibilityFacade
 from .storage_shim import KBStorageShimCompatibilityFacade
 from .version_compatibility import (
     KBMainPointerSnapshot,
@@ -46,6 +47,7 @@ __all__ = [
     "KBVersionCandidateCleanupSnapshot",
     "KBVersionCandidateRollbackResult",
     "KBParseDisplayCompatibilityFacade",
+    "KBRetrievalHelperCompatibilityFacade",
     "KBStorageShimCompatibilityFacade",
     "KBStorageBackend",
     "KBUserScope",

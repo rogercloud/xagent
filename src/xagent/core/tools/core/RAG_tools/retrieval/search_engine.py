@@ -8,13 +8,16 @@ Phase 1A Option C: Provides both sync and async search functions.
 """
 
 import logging
-from typing import Any, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 from ..core.schemas import SearchResult
 from ..storage.contracts import FilterExpression
 from ..storage.factory import get_vector_index_store
 from ..utils.filter_utils import parse_legacy_filters, validate_filter_depth
 from ..utils.metadata_utils import deserialize_metadata
+
+if TYPE_CHECKING:
+    from ..kb import KBRetrievalHelperCompatibilityFacade
 
 logger = logging.getLogger(__name__)
 
@@ -50,6 +53,34 @@ def search_dense_engine(
     Returns:
         Tuple of (search_results, index_status, index_advice)
     """
+    return _get_retrieval_helper_compatibility_facade().search_dense_engine(
+        collection=collection,
+        model_tag=model_tag,
+        query_vector=query_vector,
+        top_k=top_k,
+        filters=filters,
+        readonly=readonly,
+        nprobes=nprobes,
+        refine_factor=refine_factor,
+        user_id=user_id,
+        is_admin=is_admin,
+    )
+
+
+def _search_dense_engine_impl(
+    collection: str,
+    model_tag: str,
+    query_vector: List[float],
+    *,
+    top_k: int,
+    filters: Optional[Dict[str, Any]] = None,
+    readonly: bool = False,
+    nprobes: Optional[int] = None,
+    refine_factor: Optional[int] = None,
+    user_id: Optional[int] = None,
+    is_admin: bool = False,
+) -> Tuple[List[SearchResult], str, Optional[str]]:
+    """Execute dense vector search against the currently bound vector store."""
     try:
         vector_store = get_vector_index_store()
 
@@ -179,6 +210,34 @@ async def search_dense_engine_async(
     Returns:
         Tuple of (search_results, index_status, index_advice)
     """
+    return await _get_retrieval_helper_compatibility_facade().search_dense_engine_async(
+        collection=collection,
+        model_tag=model_tag,
+        query_vector=query_vector,
+        top_k=top_k,
+        filters=filters,
+        readonly=readonly,
+        nprobes=nprobes,
+        refine_factor=refine_factor,
+        user_id=user_id,
+        is_admin=is_admin,
+    )
+
+
+async def _search_dense_engine_async_impl(
+    collection: str,
+    model_tag: str,
+    query_vector: List[float],
+    *,
+    top_k: int,
+    filters: Optional[Dict[str, Any]] = None,
+    readonly: bool = False,
+    nprobes: Optional[int] = None,
+    refine_factor: Optional[int] = None,
+    user_id: Optional[int] = None,
+    is_admin: bool = False,
+) -> Tuple[List[SearchResult], str, Optional[str]]:
+    """Execute async dense vector search against the currently bound vector store."""
     try:
         vector_store = get_vector_index_store()
 
@@ -261,3 +320,11 @@ async def search_dense_engine_async(
     except Exception as e:
         logger.error("Failed to execute async dense search: %s", str(e))
         raise
+
+
+def _get_retrieval_helper_compatibility_facade() -> (
+    "KBRetrievalHelperCompatibilityFacade"
+):
+    from ..kb import get_kb_coordinator
+
+    return get_kb_coordinator().retrieval_helper_compatibility

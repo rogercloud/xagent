@@ -23,6 +23,7 @@ from .models import (
     KBUserScope,
 )
 from .parse_display_compatibility import KBParseDisplayCompatibilityFacade
+from .retrieval_compatibility import KBRetrievalHelperCompatibilityFacade
 from .storage_shim import KBStorageShimCompatibilityFacade
 from .version_compatibility import KBVersionCompatibilityFacade
 
@@ -44,6 +45,9 @@ class KBCoordinator:
         parse_display_compatibility: KBParseDisplayCompatibilityFacade | None = None,
         maintenance_compatibility: KBMaintenanceCompatibilityFacade | None = None,
         version_compatibility: KBVersionCompatibilityFacade | None = None,
+        retrieval_helper_compatibility: (
+            KBRetrievalHelperCompatibilityFacade | None
+        ) = None,
     ) -> None:
         self._storage_factory = storage_factory or StorageFactory.get_factory()
         self._handle_provider = handle_provider or KBHandleProvider()
@@ -64,6 +68,10 @@ class KBCoordinator:
         )
         self._version_compatibility = (
             version_compatibility or KBVersionCompatibilityFacade(coordinator=self)
+        )
+        self._retrieval_helper_compatibility = (
+            retrieval_helper_compatibility
+            or KBRetrievalHelperCompatibilityFacade(coordinator=self)
         )
 
     @property
@@ -115,6 +123,16 @@ class KBCoordinator:
     def version(self) -> KBVersionCompatibilityFacade:
         """Backward-friendly short alias for the version facade."""
         return self._version_compatibility
+
+    @property
+    def retrieval_helper_compatibility(self) -> KBRetrievalHelperCompatibilityFacade:
+        """Return the low-level retrieval helper compatibility facade."""
+        return self._retrieval_helper_compatibility
+
+    @property
+    def retrieval_helper(self) -> KBRetrievalHelperCompatibilityFacade:
+        """Backward-friendly short alias for the retrieval helper facade."""
+        return self._retrieval_helper_compatibility
 
     async def get_context(self, request: KBContextRequest) -> KBCollectionContext:
         """Resolve collection, caller scope, stores, backend, and capabilities."""
