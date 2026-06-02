@@ -25,6 +25,8 @@ from .parse_display_compatibility import KBParseDisplayCompatibilityFacade
 from .storage_shim import KBStorageShimCompatibilityFacade
 from .version_compatibility import (
     KBMainPointerSnapshot,
+    KBVersionCandidateCleanupSnapshot,
+    KBVersionCandidateRollbackResult,
     KBVersionCompatibilityFacade,
 )
 
@@ -41,6 +43,8 @@ __all__ = [
     "KBFileCompatibilityFacade",
     "KBMainPointerSnapshot",
     "KBMaintenanceCompatibilityFacade",
+    "KBVersionCandidateCleanupSnapshot",
+    "KBVersionCandidateRollbackResult",
     "KBParseDisplayCompatibilityFacade",
     "KBStorageShimCompatibilityFacade",
     "KBStorageBackend",

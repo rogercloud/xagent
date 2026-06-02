@@ -4,11 +4,12 @@ from __future__ import annotations
 
 from collections.abc import Iterator
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
 
-from ..core.schemas import StepType
 from typing_extensions import Literal
+
+from ..core.schemas import StepType
 
 if TYPE_CHECKING:
     from .coordinator import KBCoordinator
@@ -24,6 +25,36 @@ class KBMainPointerSnapshot:
     step_type: str
     model_tag: Optional[str]
     pointer: Optional[Dict[str, Any]]
+
+
+@dataclass(frozen=True)
+class KBVersionCandidateCleanupSnapshot:
+    """Preview snapshot for candidate cleanup before a version mutation."""
+
+    collection: str
+    doc_id: str
+    scope: str
+    cleanup_counts: Dict[str, int] = field(default_factory=dict)
+    new_parse_hash: Optional[str] = None
+    old_parse_hash: Optional[str] = None
+    model_tag: Optional[str] = None
+    user_id: Optional[int] = None
+    is_admin: Optional[bool] = None
+
+
+@dataclass(frozen=True)
+class KBVersionCandidateRollbackResult:
+    """Rollback outcome for version candidate cleanup side effects."""
+
+    collection: str
+    doc_id: str
+    status: str
+    skipped: bool = False
+    restorable: bool = False
+    reason: Optional[str] = None
+    cleanup_counts: Dict[str, int] = field(default_factory=dict)
+    warnings: tuple[str, ...] = ()
+    side_effects_may_remain: bool = False
 
 
 class KBVersionCompatibilityFacade:
@@ -217,6 +248,75 @@ class KBVersionCompatibilityFacade:
             operator=operator,
         )
         return True
+
+    def capture_candidate_cleanup_snapshot(
+        self,
+        collection: str,
+        doc_id: str,
+        scope: str,
+        new_parse_hash: Optional[str] = None,
+        old_parse_hash: Optional[str] = None,
+        model_tag: Optional[str] = None,
+        user_id: Optional[int] = None,
+        is_admin: Optional[bool] = None,
+    ) -> KBVersionCandidateCleanupSnapshot:
+        cleanup_counts = self.cleanup_cascade(
+            collection=collection,
+            doc_id=doc_id,
+            scope=scope,
+            new_parse_hash=new_parse_hash,
+            old_parse_hash=old_parse_hash,
+            model_tag=model_tag,
+            user_id=user_id,
+            is_admin=is_admin,
+            preview_only=True,
+            confirm=False,
+        )
+        return KBVersionCandidateCleanupSnapshot(
+            collection=collection,
+            doc_id=doc_id,
+            scope=scope,
+            cleanup_counts=cleanup_counts,
+            new_parse_hash=new_parse_hash,
+            old_parse_hash=old_parse_hash,
+            model_tag=model_tag,
+            user_id=user_id,
+            is_admin=is_admin,
+        )
+
+    def restore_candidate_cleanup_snapshot(
+        self,
+        snapshot: KBVersionCandidateCleanupSnapshot,
+        *,
+        cleanup_executed: bool = False,
+    ) -> KBVersionCandidateRollbackResult:
+        cleanup_counts = dict(snapshot.cleanup_counts)
+        has_candidate_side_effects = any(
+            int(count) > 0 for count in cleanup_counts.values()
+        )
+        if not cleanup_executed or not has_candidate_side_effects:
+            return KBVersionCandidateRollbackResult(
+                collection=snapshot.collection,
+                doc_id=snapshot.doc_id,
+                status="not_needed",
+                restorable=True,
+                cleanup_counts=cleanup_counts,
+            )
+
+        return KBVersionCandidateRollbackResult(
+            collection=snapshot.collection,
+            doc_id=snapshot.doc_id,
+            status="incomplete",
+            skipped=True,
+            restorable=False,
+            reason="candidate_cleanup_not_restorable",
+            cleanup_counts=cleanup_counts,
+            warnings=(
+                "Version candidate cleanup cannot be restored from the compatibility facade; "
+                "preserve visible rollback state and report remaining side effects.",
+            ),
+            side_effects_may_remain=True,
+        )
 
     def cascade_delete(
         self,

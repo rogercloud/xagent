@@ -109,6 +109,8 @@ def test_kb_version_compatibility_public_surface_imports() -> None:
     import xagent.core.tools.core.RAG_tools.kb as kb
     from xagent.core.tools.core.RAG_tools.kb import (
         KBMainPointerSnapshot,
+        KBVersionCandidateCleanupSnapshot,
+        KBVersionCandidateRollbackResult,
         KBVersionCompatibilityFacade,
         get_kb_coordinator,
         reset_kb_coordinator_for_tests,
@@ -116,11 +118,20 @@ def test_kb_version_compatibility_public_surface_imports() -> None:
 
     assert hasattr(kb, "KBVersionCompatibilityFacade")
     assert hasattr(kb, "KBMainPointerSnapshot")
+    assert hasattr(kb, "KBVersionCandidateCleanupSnapshot")
+    assert hasattr(kb, "KBVersionCandidateRollbackResult")
     reset_kb_coordinator_for_tests()
     coordinator = get_kb_coordinator()
     assert isinstance(coordinator.version_compatibility, KBVersionCompatibilityFacade)
     assert coordinator.version is coordinator.version_compatibility
     assert KBMainPointerSnapshot.__name__ == "KBMainPointerSnapshot"
+    assert (
+        KBVersionCandidateCleanupSnapshot.__name__
+        == "KBVersionCandidateCleanupSnapshot"
+    )
+    assert (
+        KBVersionCandidateRollbackResult.__name__ == "KBVersionCandidateRollbackResult"
+    )
 
 
 def test_version_facade_methods_match_public_helper_signatures() -> None:
@@ -395,6 +406,146 @@ def test_main_pointer_snapshot_restore_reverts_mutated_pointer() -> None:
     assert restored is not None
     assert restored["semantic_id"] == "parse_old"
     assert restored["technical_id"] == "old-hash"
+
+
+def test_candidate_cleanup_snapshot_records_preview_counts(monkeypatch) -> None:
+    """Candidate cleanup snapshots record preview counts without deleting rows."""
+    from xagent.core.tools.core.RAG_tools.kb import KBVersionCompatibilityFacade
+
+    cascade_cleaner = importlib.import_module(
+        "xagent.core.tools.core.RAG_tools.version_management.cascade_cleaner"
+    )
+    calls: list[dict[str, Any]] = []
+
+    def fake_cleanup_cascade_impl(**kwargs: Any) -> dict[str, int]:
+        calls.append(dict(kwargs))
+        return {"chunks": 2, "embeddings": 5}
+
+    monkeypatch.setattr(
+        cascade_cleaner,
+        "_cleanup_cascade_impl",
+        fake_cleanup_cascade_impl,
+    )
+
+    snapshot = KBVersionCompatibilityFacade().capture_candidate_cleanup_snapshot(
+        "docs",
+        "doc-1",
+        "parse",
+        new_parse_hash="new-hash",
+        old_parse_hash="old-hash",
+        model_tag="text-embedding-3-small",
+        user_id=7,
+        is_admin=False,
+    )
+
+    assert snapshot.cleanup_counts == {"chunks": 2, "embeddings": 5}
+    assert snapshot.collection == "docs"
+    assert snapshot.doc_id == "doc-1"
+    assert snapshot.scope == "parse"
+    assert calls == [
+        {
+            "collection": "docs",
+            "doc_id": "doc-1",
+            "scope": "parse",
+            "new_parse_hash": "new-hash",
+            "old_parse_hash": "old-hash",
+            "model_tag": "text-embedding-3-small",
+            "user_id": 7,
+            "is_admin": False,
+            "preview_only": True,
+            "confirm": False,
+        }
+    ]
+
+
+def test_candidate_cleanup_restore_marks_remaining_side_effects() -> None:
+    """Executed candidate cleanup is reported as incomplete, not fake-restored."""
+    from xagent.core.tools.core.RAG_tools.kb import (
+        KBVersionCandidateCleanupSnapshot,
+        KBVersionCompatibilityFacade,
+    )
+
+    snapshot = KBVersionCandidateCleanupSnapshot(
+        collection="docs",
+        doc_id="doc-1",
+        scope="parse",
+        cleanup_counts={"chunks": 2, "embeddings": 5},
+        new_parse_hash="new-hash",
+        old_parse_hash="old-hash",
+    )
+
+    result = KBVersionCompatibilityFacade().restore_candidate_cleanup_snapshot(
+        snapshot, cleanup_executed=True
+    )
+
+    assert result.status == "incomplete"
+    assert result.skipped
+    assert result.reason == "candidate_cleanup_not_restorable"
+    assert not result.restorable
+    assert result.side_effects_may_remain
+    assert result.cleanup_counts == {"chunks": 2, "embeddings": 5}
+    assert result.warnings
+
+
+def test_candidate_cleanup_restore_does_not_delete_active_artifacts(
+    monkeypatch,
+) -> None:
+    """Rollback-incomplete restore reports state without issuing more cleanup."""
+    from xagent.core.tools.core.RAG_tools.kb import (
+        KBVersionCandidateCleanupSnapshot,
+        KBVersionCompatibilityFacade,
+    )
+
+    cascade_cleaner = importlib.import_module(
+        "xagent.core.tools.core.RAG_tools.version_management.cascade_cleaner"
+    )
+    cleanup_calls: list[dict[str, Any]] = []
+
+    def fake_cleanup_cascade_impl(**kwargs: Any) -> dict[str, int]:
+        cleanup_calls.append(dict(kwargs))
+        raise AssertionError("restore must not delete active version artifacts")
+
+    monkeypatch.setattr(
+        cascade_cleaner,
+        "_cleanup_cascade_impl",
+        fake_cleanup_cascade_impl,
+    )
+
+    snapshot = KBVersionCandidateCleanupSnapshot(
+        collection="docs",
+        doc_id="doc-1",
+        scope="parse",
+        cleanup_counts={"parses": 1, "chunks": 2},
+    )
+    result = KBVersionCompatibilityFacade().restore_candidate_cleanup_snapshot(
+        snapshot, cleanup_executed=True
+    )
+
+    assert result.status == "incomplete"
+    assert result.side_effects_may_remain
+    assert cleanup_calls == []
+
+
+def test_candidate_cleanup_restore_not_needed_when_cleanup_was_not_executed() -> None:
+    """A captured plan does not imply residual side effects before cleanup runs."""
+    from xagent.core.tools.core.RAG_tools.kb import (
+        KBVersionCandidateCleanupSnapshot,
+        KBVersionCompatibilityFacade,
+    )
+
+    snapshot = KBVersionCandidateCleanupSnapshot(
+        collection="docs",
+        doc_id="doc-1",
+        scope="parse",
+        cleanup_counts={"chunks": 2},
+    )
+
+    result = KBVersionCompatibilityFacade().restore_candidate_cleanup_snapshot(snapshot)
+
+    assert result.status == "not_needed"
+    assert result.restorable
+    assert not result.skipped
+    assert not result.side_effects_may_remain
 
 
 def test_cleanup_count_shape_is_preserved_through_version_facade(monkeypatch) -> None:
