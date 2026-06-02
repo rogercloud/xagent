@@ -1162,10 +1162,11 @@ def test_delete_document_clears_status_with_caller_scope() -> None:
 def test_delete_document_cleans_failed_ingest_status_by_doc_id(
     temp_lancedb_dir: str,
 ) -> None:
-    """Failed ingest rollback cleanup should remove document data and status."""
+    """Failed ingest rollback cleanup should remove document data, vectors, and status."""
 
     collection = "failed_ingest_cleanup"
     doc_id = "failed-doc"
+    model_name = "text-embedding-v3"
     now = datetime.now(timezone.utc)
 
     _insert_documents(
@@ -1183,6 +1184,25 @@ def test_delete_document_cleans_failed_ingest_status_by_doc_id(
             }
         ]
     )
+    _insert_embeddings(
+        model_name,
+        [
+            {
+                "collection": collection,
+                "doc_id": doc_id,
+                "chunk_id": "chunk-1",
+                "parse_hash": "parse-failed",
+                "model": model_name,
+                "vector": [0.1, 0.2, 0.3],
+                "vector_dimension": 3,
+                "text": "partial vector written before ingest failed",
+                "chunk_hash": "failed-chunk-hash",
+                "created_at": now,
+                "metadata": "{}",
+                "user_id": 7,
+            }
+        ],
+    )
     write_ingestion_status(
         collection,
         doc_id,
@@ -1191,10 +1211,17 @@ def test_delete_document_cleans_failed_ingest_status_by_doc_id(
         user_id=7,
     )
 
+    conn = get_vector_index_store().get_raw_connection()
+    embedding_table = conn.open_table(embeddings_table_name(model_name))
+    assert embedding_table.count_rows() == 1
+
     result = delete_document(collection, doc_id, user_id=7, is_admin=False)
 
     assert result.status == "success"
     assert result.details.get("documents") == 1
+    assert result.details.get(embeddings_table_name(model_name)) == 1
+    embedding_table = conn.open_table(embeddings_table_name(model_name))
+    assert embedding_table.count_rows() == 0
     assert (
         load_ingestion_status(
             collection=collection,
