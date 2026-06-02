@@ -7,7 +7,7 @@ ensuring data consistency across processing stages.
 from __future__ import annotations
 
 import logging
-from typing import Any, Dict, Optional
+from typing import TYPE_CHECKING, Any, Dict, Optional
 
 from typing_extensions import Literal
 
@@ -29,9 +29,18 @@ from ..utils.string_utils import (
 )
 from ..utils.user_permissions import UserPermissions
 from ..utils.user_scope import resolve_user_scope
-from .main_pointer_manager import get_main_pointer
+from .main_pointer_manager import _get_main_pointer_impl as get_main_pointer
 
 logger = logging.getLogger(__name__)
+
+if TYPE_CHECKING:
+    from ..kb import KBVersionCompatibilityFacade
+
+
+def _get_version_compatibility_facade() -> "KBVersionCompatibilityFacade":
+    from ..kb import get_kb_coordinator
+
+    return get_kb_coordinator().version_compatibility
 
 
 def _table_has_column(table: Any, column: str) -> bool:
@@ -407,6 +416,31 @@ def cascade_delete(
     confirm: bool = False,
     conn: Any | None = None,
 ) -> Dict[str, int]:
+    return _get_version_compatibility_facade().cascade_delete(
+        target=target,
+        collection=collection,
+        doc_id=doc_id,
+        user_id=user_id,
+        is_admin=is_admin,
+        model_tag=model_tag,
+        preview_only=preview_only,
+        confirm=confirm,
+        conn=conn,
+    )
+
+
+def _cascade_delete_impl(
+    *,
+    target: Literal["collection", "document"],
+    collection: str,
+    doc_id: Optional[str] = None,
+    user_id: Optional[int] = None,
+    is_admin: Optional[bool] = None,
+    model_tag: Optional[str] = None,
+    preview_only: bool = True,
+    confirm: bool = False,
+    conn: Any | None = None,
+) -> Dict[str, int]:
     """Unified cascade delete for collection or document targets.
 
     This is intended for user-facing destructive operations (e.g. KB delete)
@@ -576,6 +610,32 @@ def cleanup_cascade(
     preview_only: bool = True,
     confirm: bool = False,
 ) -> Dict[str, int]:
+    return _get_version_compatibility_facade().cleanup_cascade(
+        collection=collection,
+        doc_id=doc_id,
+        scope=scope,
+        new_parse_hash=new_parse_hash,
+        old_parse_hash=old_parse_hash,
+        model_tag=model_tag,
+        user_id=user_id,
+        is_admin=is_admin,
+        preview_only=preview_only,
+        confirm=confirm,
+    )
+
+
+def _cleanup_cascade_impl(
+    collection: str,
+    doc_id: str,
+    scope: str,
+    new_parse_hash: Optional[str] = None,
+    old_parse_hash: Optional[str] = None,
+    model_tag: Optional[str] = None,
+    user_id: Optional[int] = None,
+    is_admin: Optional[bool] = None,
+    preview_only: bool = True,
+    confirm: bool = False,
+) -> Dict[str, int]:
     """Unified cascade cleanup by scope with preview/confirm semantics.
 
     Args:
@@ -608,7 +668,7 @@ def cleanup_cascade(
     ensure_main_pointers_table(conn)
 
     if scope == "document":
-        raw = cascade_delete(
+        raw = _cascade_delete_impl(
             target="document",
             collection=collection,
             doc_id=doc_id,
@@ -788,6 +848,26 @@ def cleanup_document_cascade(
     preview_only: bool = True,
     confirm: bool = False,
 ) -> Dict[str, int]:
+    return _get_version_compatibility_facade().cleanup_document_cascade(
+        collection=collection,
+        doc_id=doc_id,
+        model_tag=model_tag,
+        user_id=user_id,
+        is_admin=is_admin,
+        preview_only=preview_only,
+        confirm=confirm,
+    )
+
+
+def _cleanup_document_cascade_impl(
+    collection: str,
+    doc_id: str,
+    model_tag: Optional[str] = None,
+    user_id: Optional[int] = None,
+    is_admin: bool = True,
+    preview_only: bool = True,
+    confirm: bool = False,
+) -> Dict[str, int]:
     """Cascade delete all data for a document across all stages.
 
     Order: embeddings_* -> chunks -> parses -> main_pointers -> documents
@@ -802,7 +882,7 @@ def cleanup_document_cascade(
     """
     try:
         # Delegate to unified entry
-        return cleanup_cascade(
+        return _cleanup_cascade_impl(
             collection=collection,
             doc_id=doc_id,
             scope="document",
@@ -818,6 +898,28 @@ def cleanup_document_cascade(
 
 
 def cleanup_parse_cascade(
+    collection: str,
+    doc_id: str,
+    old_parse_hash: Optional[str] = None,
+    new_parse_hash: Optional[str] = None,
+    user_id: Optional[int] = None,
+    is_admin: bool = True,
+    preview_only: bool = True,
+    confirm: bool = False,
+) -> Dict[str, int]:
+    return _get_version_compatibility_facade().cleanup_parse_cascade(
+        collection=collection,
+        doc_id=doc_id,
+        old_parse_hash=old_parse_hash,
+        new_parse_hash=new_parse_hash,
+        user_id=user_id,
+        is_admin=is_admin,
+        preview_only=preview_only,
+        confirm=confirm,
+    )
+
+
+def _cleanup_parse_cascade_impl(
     collection: str,
     doc_id: str,
     old_parse_hash: Optional[str] = None,
@@ -846,7 +948,7 @@ def cleanup_parse_cascade(
         CascadeCleanupError: If cleanup fails
     """
     try:
-        return cleanup_cascade(
+        return _cleanup_cascade_impl(
             collection=collection,
             doc_id=doc_id,
             scope="parse",
@@ -863,6 +965,28 @@ def cleanup_parse_cascade(
 
 
 def cleanup_chunk_cascade(
+    collection: str,
+    doc_id: str,
+    old_parse_hash: Optional[str] = None,
+    new_parse_hash: Optional[str] = None,
+    user_id: Optional[int] = None,
+    is_admin: bool = True,
+    preview_only: bool = True,
+    confirm: bool = False,
+) -> Dict[str, int]:
+    return _get_version_compatibility_facade().cleanup_chunk_cascade(
+        collection=collection,
+        doc_id=doc_id,
+        old_parse_hash=old_parse_hash,
+        new_parse_hash=new_parse_hash,
+        user_id=user_id,
+        is_admin=is_admin,
+        preview_only=preview_only,
+        confirm=confirm,
+    )
+
+
+def _cleanup_chunk_cascade_impl(
     collection: str,
     doc_id: str,
     old_parse_hash: Optional[str] = None,
@@ -891,7 +1015,7 @@ def cleanup_chunk_cascade(
         CascadeCleanupError: If cleanup fails
     """
     try:
-        return cleanup_cascade(
+        return _cleanup_cascade_impl(
             collection=collection,
             doc_id=doc_id,
             scope="chunk",
@@ -908,6 +1032,30 @@ def cleanup_chunk_cascade(
 
 
 def cleanup_embed_cascade(
+    collection: str,
+    doc_id: str,
+    model_tag: Optional[str] = None,
+    old_technical_id: Optional[str] = None,
+    new_technical_id: Optional[str] = None,
+    user_id: Optional[int] = None,
+    is_admin: bool = True,
+    preview_only: bool = True,
+    confirm: bool = False,
+) -> Dict[str, int]:
+    return _get_version_compatibility_facade().cleanup_embed_cascade(
+        collection=collection,
+        doc_id=doc_id,
+        model_tag=model_tag,
+        old_technical_id=old_technical_id,
+        new_technical_id=new_technical_id,
+        user_id=user_id,
+        is_admin=is_admin,
+        preview_only=preview_only,
+        confirm=confirm,
+    )
+
+
+def _cleanup_embed_cascade_impl(
     collection: str,
     doc_id: str,
     model_tag: Optional[str] = None,
@@ -938,7 +1086,7 @@ def cleanup_embed_cascade(
     """
     try:
         # Delegate to unified entry; old/new technical ids are not used in current schema
-        return cleanup_cascade(
+        return _cleanup_cascade_impl(
             collection=collection,
             doc_id=doc_id,
             scope="embeddings",

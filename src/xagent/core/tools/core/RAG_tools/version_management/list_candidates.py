@@ -7,7 +7,7 @@ across different processing stages (parse, chunk, embed).
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
 
 from ..core.exceptions import DatabaseOperationError, VersionManagementError
 from ..core.schemas import StepType
@@ -15,6 +15,15 @@ from ..LanceDB.schema_manager import _safe_close_table
 from ..storage.factory import get_vector_store_raw_connection
 from ..utils.lancedb_query_utils import list_table_names, query_to_list
 from ..utils.string_utils import build_lancedb_filter_expression
+
+if TYPE_CHECKING:
+    from ..kb import KBVersionCompatibilityFacade
+
+
+def _get_version_compatibility_facade() -> "KBVersionCompatibilityFacade":
+    from ..kb import get_kb_coordinator
+
+    return get_kb_coordinator().version_compatibility
 
 
 def _resolve_step_type(step_type_input: Union[StepType, str]) -> StepType:
@@ -320,6 +329,26 @@ def _get_candidates(
 
 
 def list_candidates(
+    collection: str,
+    doc_id: str,
+    step_type: Union[StepType, str],
+    model_tag: Optional[str] = None,
+    state: Optional[str] = None,
+    limit: int = 50,
+    order_by: str = "created_at desc",
+) -> Dict[str, Any]:
+    return _get_version_compatibility_facade().list_candidates(
+        collection=collection,
+        doc_id=doc_id,
+        step_type=step_type,
+        model_tag=model_tag,
+        state=state,
+        limit=limit,
+        order_by=order_by,
+    )
+
+
+def _list_candidates_impl(
     collection: str,
     doc_id: str,
     step_type: Union[StepType, str],

@@ -23,6 +23,10 @@ from .models import (
 )
 from .parse_display_compatibility import KBParseDisplayCompatibilityFacade
 from .storage_shim import KBStorageShimCompatibilityFacade
+from .version_compatibility import (
+    KBMainPointerSnapshot,
+    KBVersionCompatibilityFacade,
+)
 
 __all__ = [
     "KBAccessMode",
@@ -35,11 +39,13 @@ __all__ = [
     "KBCoreManagementCompatibilityFacade",
     "KBCoordinator",
     "KBFileCompatibilityFacade",
+    "KBMainPointerSnapshot",
     "KBMaintenanceCompatibilityFacade",
     "KBParseDisplayCompatibilityFacade",
     "KBStorageShimCompatibilityFacade",
     "KBStorageBackend",
     "KBUserScope",
+    "KBVersionCompatibilityFacade",
     "LanceDBCollectionHandle",
     "get_kb_coordinator",
     "reset_kb_coordinator_for_tests",

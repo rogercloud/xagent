@@ -24,6 +24,7 @@ from .models import (
 )
 from .parse_display_compatibility import KBParseDisplayCompatibilityFacade
 from .storage_shim import KBStorageShimCompatibilityFacade
+from .version_compatibility import KBVersionCompatibilityFacade
 
 T = TypeVar("T")
 
@@ -42,6 +43,7 @@ class KBCoordinator:
         management_facade: KBCoreManagementCompatibilityFacade | None = None,
         parse_display_compatibility: KBParseDisplayCompatibilityFacade | None = None,
         maintenance_compatibility: KBMaintenanceCompatibilityFacade | None = None,
+        version_compatibility: KBVersionCompatibilityFacade | None = None,
     ) -> None:
         self._storage_factory = storage_factory or StorageFactory.get_factory()
         self._handle_provider = handle_provider or KBHandleProvider()
@@ -59,6 +61,9 @@ class KBCoordinator:
         self._maintenance_compatibility = (
             maintenance_compatibility
             or KBMaintenanceCompatibilityFacade(coordinator=self)
+        )
+        self._version_compatibility = (
+            version_compatibility or KBVersionCompatibilityFacade(coordinator=self)
         )
 
     @property
@@ -100,6 +105,16 @@ class KBCoordinator:
     def maintenance_compat(self) -> KBMaintenanceCompatibilityFacade:
         """Backward-friendly short alias for the maintenance facade."""
         return self._maintenance_compatibility
+
+    @property
+    def version_compatibility(self) -> KBVersionCompatibilityFacade:
+        """Return the version-management compatibility facade."""
+        return self._version_compatibility
+
+    @property
+    def version(self) -> KBVersionCompatibilityFacade:
+        """Backward-friendly short alias for the version facade."""
+        return self._version_compatibility
 
     async def get_context(self, request: KBContextRequest) -> KBCollectionContext:
         """Resolve collection, caller scope, stores, backend, and capabilities."""

@@ -8,15 +8,25 @@ from __future__ import annotations
 
 import logging
 import os
-from typing import Any, Dict, Optional, Union
+from typing import TYPE_CHECKING, Any, Dict, Optional, Union
 
 from ..core.exceptions import VersionManagementError
 from ..core.schemas import StepType
-from .cascade_cleaner import cleanup_cascade
-from .list_candidates import list_candidates
-from .main_pointer_manager import get_main_pointer, set_main_pointer
+from .cascade_cleaner import _cleanup_cascade_impl as cleanup_cascade
+from .list_candidates import _list_candidates_impl as list_candidates
+from .main_pointer_manager import _get_main_pointer_impl as get_main_pointer
+from .main_pointer_manager import _set_main_pointer_impl as set_main_pointer
 
 logger = logging.getLogger(__name__)
+
+if TYPE_CHECKING:
+    from ..kb import KBVersionCompatibilityFacade
+
+
+def _get_version_compatibility_facade() -> "KBVersionCompatibilityFacade":
+    from ..kb import get_kb_coordinator
+
+    return get_kb_coordinator().version_compatibility
 
 
 def _resolve_step_type(step_type_input: Union[StepType, str]) -> StepType:
@@ -233,6 +243,28 @@ def _calculate_cleanup_plan(
 
 
 def promote_version_main(
+    collection: str,
+    doc_id: str,
+    step_type: Union[StepType, str],
+    selected_id: str,
+    operator: Optional[str] = None,
+    preview_only: bool = False,
+    confirm: bool = False,
+    model_tag: Optional[str] = None,
+) -> Dict[str, Any]:
+    return _get_version_compatibility_facade().promote_version_main(
+        collection=collection,
+        doc_id=doc_id,
+        step_type=step_type,
+        selected_id=selected_id,
+        operator=operator,
+        preview_only=preview_only,
+        confirm=confirm,
+        model_tag=model_tag,
+    )
+
+
+def _promote_version_main_impl(
     collection: str,
     doc_id: str,
     step_type: Union[StepType, str],

@@ -9,12 +9,21 @@ Phase 1A Part 2: Refactored to use MainPointerStore abstraction layer.
 from __future__ import annotations
 
 import logging
-from typing import Any, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 from ..core.exceptions import MainPointerError
 from ..storage.factory import get_main_pointer_store
 
 logger = logging.getLogger(__name__)
+
+if TYPE_CHECKING:
+    from ..kb import KBVersionCompatibilityFacade
+
+
+def _get_version_compatibility_facade() -> "KBVersionCompatibilityFacade":
+    from ..kb import get_kb_coordinator
+
+    return get_kb_coordinator().version_compatibility
 
 
 def _normalize_model_tag(model_tag: Optional[str]) -> str:
@@ -23,6 +32,17 @@ def _normalize_model_tag(model_tag: Optional[str]) -> str:
 
 
 def get_main_pointer(
+    collection: str, doc_id: str, step_type: str, model_tag: Optional[str] = None
+) -> Optional[Dict[str, Any]]:
+    return _get_version_compatibility_facade().get_main_pointer(
+        collection=collection,
+        doc_id=doc_id,
+        step_type=step_type,
+        model_tag=model_tag,
+    )
+
+
+def _get_main_pointer_impl(
     collection: str, doc_id: str, step_type: str, model_tag: Optional[str] = None
 ) -> Optional[Dict[str, Any]]:
     """Get the main pointer for a specific document and stage.
@@ -53,6 +73,28 @@ def get_main_pointer(
 
 
 def set_main_pointer(
+    lancedb_dir: str,  # Kept for backward compatibility
+    collection: str,
+    doc_id: str,
+    step_type: str,
+    semantic_id: str,
+    technical_id: str,
+    model_tag: Optional[str] = None,
+    operator: Optional[str] = None,
+) -> None:
+    _get_version_compatibility_facade().set_main_pointer(
+        lancedb_dir=lancedb_dir,
+        collection=collection,
+        doc_id=doc_id,
+        step_type=step_type,
+        semantic_id=semantic_id,
+        technical_id=technical_id,
+        model_tag=model_tag,
+        operator=operator,
+    )
+
+
+def _set_main_pointer_impl(
     lancedb_dir: str,  # Kept for backward compatibility
     collection: str,
     doc_id: str,
@@ -105,6 +147,15 @@ def set_main_pointer(
 def list_main_pointers(
     collection: str, doc_id: Optional[str] = None
 ) -> List[Dict[str, Any]]:
+    return _get_version_compatibility_facade().list_main_pointers(
+        collection=collection,
+        doc_id=doc_id,
+    )
+
+
+def _list_main_pointers_impl(
+    collection: str, doc_id: Optional[str] = None
+) -> List[Dict[str, Any]]:
     """List main pointers for a collection and optionally a specific document.
 
     Args:
@@ -131,6 +182,17 @@ def list_main_pointers(
 
 
 def delete_main_pointer(
+    collection: str, doc_id: str, step_type: str, model_tag: Optional[str] = None
+) -> bool:
+    return _get_version_compatibility_facade().delete_main_pointer(
+        collection=collection,
+        doc_id=doc_id,
+        step_type=step_type,
+        model_tag=model_tag,
+    )
+
+
+def _delete_main_pointer_impl(
     collection: str, doc_id: str, step_type: str, model_tag: Optional[str] = None
 ) -> bool:
     """Delete a main pointer.

@@ -5,6 +5,7 @@ maintaining main pointers with cascade cleanup.
 """
 
 from .cascade_cleaner import (
+    cascade_delete,
     cleanup_cascade,
     cleanup_chunk_cascade,
     cleanup_document_cascade,
@@ -28,6 +29,7 @@ __all__ = [
     "list_main_pointers",
     "delete_main_pointer",
     "cleanup_parse_cascade",
+    "cascade_delete",
     "cleanup_chunk_cascade",
     "cleanup_embed_cascade",
     "cleanup_document_cascade",
