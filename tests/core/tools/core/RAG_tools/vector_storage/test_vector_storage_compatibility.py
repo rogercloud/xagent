@@ -177,6 +177,44 @@ def test_cleanup_vectors_for_chunks_uses_model_tag_table_and_reports_counts(
     )
 
 
+def test_cleanup_vectors_for_chunks_batches_chunk_ids_with_in_filter(monkeypatch):
+    table = _table_with_user_id(count=4)
+    conn = MagicMock()
+    conn.list_tables.return_value = ["embeddings_model_a"]
+    conn.open_table.return_value = table
+    storage_shim = MagicMock()
+    storage_shim.get_vector_store_raw_connection.return_value = conn
+    facade = KBVectorStorageCompatibilityFacade(storage_shim=storage_shim)
+
+    monkeypatch.setattr(
+        "xagent.core.tools.core.RAG_tools.kb.cleanup_filters."
+        "build_lancedb_filter_expression",
+        lambda filters, **kwargs: " AND ".join(
+            f"{key} == '{value}'" for key, value in filters.items()
+        ),
+    )
+
+    result = facade.cleanup_vectors_for_chunks(
+        collection="c",
+        doc_id="d",
+        chunk_ids=["ch2", "ch1", "ch1"],
+        model_tag="model_a",
+        user_id=7,
+        is_admin=False,
+        preview_only=False,
+        confirm=True,
+    )
+
+    assert result.deleted_count == 4
+    assert result.table_counts == {"embeddings_model_a": 4}
+    expected_filter = (
+        "collection == 'c' AND doc_id == 'd' "
+        "AND chunk_id IN ('ch1', 'ch2') AND user_id == 7"
+    )
+    table.count_rows.assert_called_once_with(expected_filter)
+    table.delete.assert_called_once_with(expected_filter)
+
+
 def test_cleanup_vectors_for_operation_uses_request_user_scope(monkeypatch):
     table = _table_with_user_id(count=1)
     conn = MagicMock()

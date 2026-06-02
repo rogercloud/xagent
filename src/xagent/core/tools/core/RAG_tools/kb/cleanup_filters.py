@@ -12,6 +12,7 @@ from ..utils.lancedb_query_utils import list_embeddings_table_names
 from ..utils.string_utils import (
     build_lancedb_filter_expression,
     build_user_id_filter_for_table,
+    escape_lancedb_string,
 )
 from ..utils.user_permissions import UserPermissions
 from ..utils.user_scope import resolve_user_scope
@@ -196,42 +197,28 @@ def table_has_column(table: Any, column_name: str) -> bool:
 
 
 def _build_filters_for_table(table: Any, scope: KBCleanupScope) -> list[str]:
-    filters: list[str] = []
-    for filter_values in _build_filter_inputs(scope):
-        base_filter = build_lancedb_filter_expression(
-            filter_values,
+    base_filter = _build_base_filter(scope)
+    filter_expr = _append_chunk_id_filter_if_needed(base_filter, scope.chunk_ids)
+    return [
+        append_user_filter_for_table(
+            table=table,
+            filter_expr=filter_expr,
             user_id=scope.user_id,
             is_admin=scope.is_admin,
-            skip_user_filter=True,
         )
-        filters.append(
-            append_user_filter_for_table(
-                table=table,
-                filter_expr=base_filter,
-                user_id=scope.user_id,
-                is_admin=scope.is_admin,
-            )
-        )
-    return filters
+    ]
 
 
 def _build_filters_without_schema(scope: KBCleanupScope) -> list[str]:
-    filters: list[str] = []
-    for filter_values in _build_filter_inputs(scope):
-        base_filter = build_lancedb_filter_expression(
-            filter_values,
+    base_filter = _build_base_filter(scope)
+    filter_expr = _append_chunk_id_filter_if_needed(base_filter, scope.chunk_ids)
+    return [
+        append_user_filter_without_schema(
+            filter_expr=filter_expr,
             user_id=scope.user_id,
             is_admin=scope.is_admin,
-            skip_user_filter=True,
         )
-        filters.append(
-            append_user_filter_without_schema(
-                filter_expr=base_filter,
-                user_id=scope.user_id,
-                is_admin=scope.is_admin,
-            )
-        )
-    return filters
+    ]
 
 
 def _and_filter(base_filter: str, extra_filter: str) -> str:
@@ -240,15 +227,33 @@ def _and_filter(base_filter: str, extra_filter: str) -> str:
     return f"{base_filter} AND {extra_filter}"
 
 
-def _build_filter_inputs(scope: KBCleanupScope) -> list[dict[str, Any]]:
-    base: dict[str, Any] = {"collection": scope.collection}
+def _build_base_filter(scope: KBCleanupScope) -> str:
+    filter_values: dict[str, Any] = {"collection": scope.collection}
     if scope.doc_id is not None:
-        base["doc_id"] = scope.doc_id
+        filter_values["doc_id"] = scope.doc_id
     if scope.parse_hash is not None:
-        base["parse_hash"] = scope.parse_hash
-    if not scope.chunk_ids:
-        return [base]
-    return [dict(base, chunk_id=chunk_id) for chunk_id in scope.chunk_ids]
+        filter_values["parse_hash"] = scope.parse_hash
+    return build_lancedb_filter_expression(
+        filter_values,
+        user_id=scope.user_id,
+        is_admin=scope.is_admin,
+        skip_user_filter=True,
+    )
+
+
+def _append_chunk_id_filter_if_needed(
+    base_filter: str, chunk_ids: tuple[str, ...]
+) -> str:
+    if not chunk_ids:
+        return base_filter
+    return _and_filter(base_filter, _chunk_ids_filter(chunk_ids))
+
+
+def _chunk_ids_filter(chunk_ids: tuple[str, ...]) -> str:
+    if len(chunk_ids) == 1:
+        return f"chunk_id == '{escape_lancedb_string(chunk_ids[0])}'"
+    values = ", ".join(f"'{escape_lancedb_string(chunk_id)}'" for chunk_id in chunk_ids)
+    return f"chunk_id IN ({values})"
 
 
 def _normalize_optional_string(value: Optional[str]) -> Optional[str]:

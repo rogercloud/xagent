@@ -55,10 +55,22 @@ def _get_version_compatibility_facade() -> "KBVersionCompatibilityFacade":
 FilterPredicateMap = Dict[str, list[str]]
 
 
-def _set_predicate(
+def _replace_predicate(
     predicates: FilterPredicateMap, table_name: str, filter_expr: str
 ) -> None:
-    predicates[table_name] = [filter_expr]
+    _replace_predicates(predicates, table_name, [filter_expr])
+
+
+def _replace_predicates(
+    predicates: FilterPredicateMap, table_name: str, filter_exprs: list[str]
+) -> None:
+    predicates[table_name] = list(filter_exprs)
+
+
+def _append_predicates(
+    predicates: FilterPredicateMap, table_name: str, filter_exprs: list[str]
+) -> None:
+    predicates.setdefault(table_name, []).extend(filter_exprs)
 
 
 def _count_rows_by_filters(table: Any, filter_exprs: list[str]) -> int:
@@ -212,7 +224,7 @@ def _append_user_filter_if_needed(
         _safe_close_table(table)
 
 
-def _add_embedding_predicates(
+def _replace_embedding_predicates(
     *,
     predicates: FilterPredicateMap,
     conn: Any,
@@ -231,7 +243,7 @@ def _add_embedding_predicates(
     )
     for table_name, filter_exprs in table_filters.items():
         if filter_exprs:
-            predicates[table_name] = list(filter_exprs)
+            _replace_predicates(predicates, table_name, filter_exprs)
 
 
 def _get_table_names(conn: Any) -> list[str]:
@@ -495,7 +507,7 @@ def _cascade_delete_impl(
                 user_id=user_id,
                 is_admin=is_admin,
             )
-        _set_predicate(predicates, table_name, filter_expr)
+        _replace_predicate(predicates, table_name, filter_expr)
 
     for table_name in select_embedding_tables(conn, model_tag=model_tag):
         if target == "collection":
@@ -515,7 +527,7 @@ def _cascade_delete_impl(
                 user_id=user_id,
                 is_admin=is_admin,
             )
-        _set_predicate(predicates, table_name, filter_expr)
+        _replace_predicate(predicates, table_name, filter_expr)
 
     if preview_only and not confirm:
         return _plan_by_predicates(conn, predicates, model_tag=None)
@@ -572,7 +584,7 @@ def cascade_delete_documents(
             user_id=user_id,
             is_admin=is_admin,
         )
-        _set_predicate(predicates, table_name, filter_expr)
+        _replace_predicate(predicates, table_name, filter_expr)
 
     for table_name in select_embedding_tables(conn):
         filter_expr = _build_documents_filter(
@@ -583,7 +595,7 @@ def cascade_delete_documents(
             user_id=user_id,
             is_admin=is_admin,
         )
-        _set_predicate(predicates, table_name, filter_expr)
+        _replace_predicate(predicates, table_name, filter_expr)
 
     if preview_only and not confirm:
         return _plan_by_predicates(conn, predicates, model_tag=None)
@@ -698,7 +710,7 @@ def _cleanup_cascade_impl(
             base = build_lancedb_filter_expression(
                 base_filters, user_id=user_id, is_admin=is_admin, skip_user_filter=True
             )
-            _add_embedding_predicates(
+            _replace_embedding_predicates(
                 predicates=predicates,
                 conn=conn,
                 base_expr=base,
@@ -706,7 +718,7 @@ def _cleanup_cascade_impl(
                 is_admin=is_admin,
                 model_tag=model_tag,
             )
-            _set_predicate(
+            _replace_predicate(
                 predicates,
                 "chunks",
                 _append_user_filter_if_needed(
@@ -722,7 +734,7 @@ def _cleanup_cascade_impl(
             escaped_doc_id = escape_lancedb_string(doc_id)
             escaped_new_parse_hash = escape_lancedb_string(new_parse_hash)
             other = f"collection == '{escaped_collection}' AND doc_id == '{escaped_doc_id}' AND parse_hash != '{escaped_new_parse_hash}'"
-            _add_embedding_predicates(
+            _replace_embedding_predicates(
                 predicates=predicates,
                 conn=conn,
                 base_expr=other,
@@ -730,7 +742,7 @@ def _cleanup_cascade_impl(
                 is_admin=is_admin,
                 model_tag=model_tag,
             )
-            _set_predicate(
+            _replace_predicate(
                 predicates,
                 "chunks",
                 _append_user_filter_if_needed(
@@ -741,7 +753,7 @@ def _cleanup_cascade_impl(
                     is_admin=is_admin,
                 ),
             )
-            _set_predicate(
+            _replace_predicate(
                 predicates,
                 "parses",
                 _append_user_filter_if_needed(
@@ -765,7 +777,7 @@ def _cleanup_cascade_impl(
             base = build_lancedb_filter_expression(
                 base_filters, user_id=user_id, is_admin=is_admin, skip_user_filter=True
             )
-            _add_embedding_predicates(
+            _replace_embedding_predicates(
                 predicates=predicates,
                 conn=conn,
                 base_expr=base,
@@ -778,7 +790,7 @@ def _cleanup_cascade_impl(
             escaped_doc_id = escape_lancedb_string(doc_id)
             escaped_parse_hash = escape_lancedb_string(new_parse_hash)
             other = f"collection == '{escaped_collection}' AND doc_id == '{escaped_doc_id}' AND parse_hash != '{escaped_parse_hash}'"
-            _add_embedding_predicates(
+            _replace_embedding_predicates(
                 predicates=predicates,
                 conn=conn,
                 base_expr=other,
@@ -786,7 +798,7 @@ def _cleanup_cascade_impl(
                 is_admin=is_admin,
                 model_tag=model_tag,
             )
-            _set_predicate(
+            _replace_predicate(
                 predicates,
                 "chunks",
                 _append_user_filter_if_needed(
@@ -808,7 +820,7 @@ def _cleanup_cascade_impl(
         filters_by_table = build_embedding_cleanup_filters(conn, scope_obj)
         for table_name, filter_exprs in filters_by_table.items():
             if filter_exprs:
-                predicates[table_name] = list(filter_exprs)
+                _append_predicates(predicates, table_name, filter_exprs)
     elif scope == "pointers":
         filt = _build_document_filter(
             conn=conn,
@@ -818,7 +830,7 @@ def _cleanup_cascade_impl(
             user_id=user_id,
             is_admin=is_admin,
         )
-        _set_predicate(predicates, "main_pointers", filt)
+        _replace_predicate(predicates, "main_pointers", filt)
     else:
         raise CascadeCleanupError(f"Unsupported scope: {scope}")
 

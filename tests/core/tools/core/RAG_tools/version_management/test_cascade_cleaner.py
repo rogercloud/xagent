@@ -9,7 +9,10 @@ import pytest
 
 from xagent.core.tools.core.RAG_tools.utils.user_scope import user_scope_context
 from xagent.core.tools.core.RAG_tools.version_management.cascade_cleaner import (
+    _append_predicates,
     _collapse_embedding_table_counts,
+    _replace_predicate,
+    _replace_predicates,
     cascade_delete,
     cascade_delete_documents,
     cleanup_chunk_cascade,
@@ -62,6 +65,19 @@ def _create_mock_table_with_columns(columns: list[str]) -> MagicMock:
     table.count_rows.return_value = 1
     table.delete = MagicMock()
     return table
+
+
+def test_predicate_helpers_distinguish_replace_and_append() -> None:
+    predicates = {"table": ["old"]}
+
+    _replace_predicate(predicates, "table", "new")
+    assert predicates["table"] == ["new"]
+
+    _append_predicates(predicates, "table", ["extra"])
+    assert predicates["table"] == ["new", "extra"]
+
+    _replace_predicates(predicates, "table", ["final"])
+    assert predicates["table"] == ["final"]
 
 
 @patch(
@@ -1290,6 +1306,52 @@ def test_cleanup_parse_cascade_expands_embeddings_predicates_per_table(
     assert "user_id == 7" in predicates["embeddings_m1"][0]
     assert "user_id == 7" not in predicates["embeddings_legacy"][0]
     assert result["embeddings"] == 5
+
+
+@patch(
+    "xagent.core.tools.core.RAG_tools.version_management.cascade_cleaner.get_vector_store_raw_connection"
+)
+def test_cleanup_parse_cascade_replaces_superseded_predicates(
+    mock_get_conn: MagicMock,
+) -> None:
+    conn = MagicMock(spec=["table_names", "open_table"])
+    conn.table_names.return_value = ["chunks", "parses", "embeddings_m1"]
+    table_map = {
+        "chunks": _create_mock_table_with_columns(
+            ["collection", "doc_id", "parse_hash", "user_id"]
+        ),
+        "parses": _create_mock_table_with_columns(
+            ["collection", "doc_id", "parse_hash", "user_id"]
+        ),
+        "embeddings_m1": _create_mock_table_with_columns(
+            ["collection", "doc_id", "parse_hash", "user_id"]
+        ),
+    }
+    conn.open_table.side_effect = lambda name: table_map[name]
+    mock_get_conn.return_value = conn
+
+    with patch(
+        "xagent.core.tools.core.RAG_tools.version_management.cascade_cleaner._plan_by_predicates"
+    ) as mock_plan:
+        mock_plan.return_value = {"embeddings_m1": 1, "chunks": 1, "parses": 1}
+        cleanup_parse_cascade(
+            "c_replace",
+            "d_replace",
+            old_parse_hash="old",
+            new_parse_hash="new",
+            user_id=7,
+            is_admin=False,
+            preview_only=True,
+            confirm=False,
+        )
+
+    predicates = mock_plan.call_args.args[1]
+    assert len(predicates["embeddings_m1"]) == 1
+    assert "parse_hash != 'new'" in predicates["embeddings_m1"][0]
+    assert "parse_hash == 'old'" not in predicates["embeddings_m1"][0]
+    assert len(predicates["chunks"]) == 1
+    assert "parse_hash != 'new'" in predicates["chunks"][0]
+    assert "parse_hash == 'old'" not in predicates["chunks"][0]
 
 
 def test_collapse_embedding_table_counts_preserves_existing_summary_key() -> None:
