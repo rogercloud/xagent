@@ -63,6 +63,8 @@ def test_kb_public_surface_imports() -> None:
         "KBStorageBackend",
         "KBBackendCapabilities",
         "KBHandleProvider",
+        "KBPipelineCompatibilityFacade",
+        "KBLegacyStepCompatibilityFacade",
         "LanceDBCollectionHandle",
     ]
 

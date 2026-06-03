@@ -10,7 +10,7 @@ import tempfile
 from contextvars import copy_context
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Callable, Optional, TypedDict
+from typing import TYPE_CHECKING, Callable, Optional, TypedDict
 
 from ..core.schemas import (
     CrawlResult,
@@ -25,6 +25,9 @@ from ..utils.string_utils import sanitize_for_doc_id
 from ..utils.user_scope import resolve_user_scope
 from ..web_crawler import WebCrawler
 from .document_ingestion import run_document_ingestion
+
+if TYPE_CHECKING:
+    from ..kb import KBPipelineCompatibilityFacade
 
 logger = logging.getLogger(__name__)
 
@@ -67,7 +70,36 @@ def _looks_like_crawler_block(error: str) -> bool:
     return any(marker in normalized_error for marker in _CRAWLER_BLOCK_ERROR_MARKERS)
 
 
+def _get_pipeline_compatibility_facade() -> "KBPipelineCompatibilityFacade":
+    """Return the coordinator-owned pipeline compatibility facade."""
+    from ..kb import get_kb_coordinator
+
+    return get_kb_coordinator().pipeline_compatibility
+
+
 async def run_web_ingestion(
+    collection: str,
+    crawl_config: WebCrawlConfig,
+    *,
+    ingestion_config: Optional[IngestionConfig] = None,
+    progress_callback: Optional[Callable[[str, int, int], None]] = None,
+    user_id: Optional[int] = None,
+    is_admin: Optional[bool] = None,
+    file_handler: Optional[Callable[[Path, str, str, str], FileHandlerResult]] = None,
+) -> WebIngestionResult:
+    """Crawl a website and ingest all pages into the knowledge base."""
+    return await _get_pipeline_compatibility_facade().run_web_ingestion(
+        collection=collection,
+        crawl_config=crawl_config,
+        ingestion_config=ingestion_config,
+        progress_callback=progress_callback,
+        user_id=user_id,
+        is_admin=is_admin,
+        file_handler=file_handler,
+    )
+
+
+async def _run_web_ingestion_impl(
     collection: str,
     crawl_config: WebCrawlConfig,
     *,

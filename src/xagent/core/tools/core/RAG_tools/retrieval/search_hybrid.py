@@ -5,7 +5,7 @@ full-text search results using RRF or linear weighted combination.
 """
 
 import logging
-from typing import Any, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 from ..core.schemas import (
     FusionConfig,
@@ -16,6 +16,9 @@ from ..core.schemas import (
 )
 from ..retrieval.search_dense import search_dense
 from ..retrieval.search_sparse import search_sparse
+
+if TYPE_CHECKING:
+    from ..kb import KBLegacyStepCompatibilityFacade
 
 logger = logging.getLogger(__name__)
 
@@ -166,7 +169,46 @@ def _linear_fusion(
     return fused_results
 
 
+def _get_legacy_step_compatibility_facade() -> "KBLegacyStepCompatibilityFacade":
+    """Return the coordinator-owned legacy step compatibility facade."""
+    from ..kb import get_kb_coordinator
+
+    return get_kb_coordinator().legacy_step_compatibility
+
+
 def search_hybrid(
+    collection: str,
+    model_tag: str,
+    query_text: str,
+    query_vector: List[float],
+    *,
+    top_k: int = 10,
+    filters: Optional[Dict[str, Any]] = None,
+    fusion_config: Optional[FusionConfig] = None,
+    readonly: bool = False,
+    nprobes: Optional[int] = None,
+    refine_factor: Optional[int] = None,
+    user_id: Optional[int] = None,
+    is_admin: bool = False,
+) -> HybridSearchResponse:
+    """Performs hybrid search, combining dense and sparse retrieval."""
+    return _get_legacy_step_compatibility_facade().search_hybrid(
+        collection=collection,
+        model_tag=model_tag,
+        query_text=query_text,
+        query_vector=query_vector,
+        top_k=top_k,
+        filters=filters,
+        fusion_config=fusion_config,
+        readonly=readonly,
+        nprobes=nprobes,
+        refine_factor=refine_factor,
+        user_id=user_id,
+        is_admin=is_admin,
+    )
+
+
+def _search_hybrid_impl(
     collection: str,
     model_tag: str,
     query_text: str,
