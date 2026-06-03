@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from contextvars import Context
+
 import pytest
 
 from xagent.core.tools.core.RAG_tools.kb import (
@@ -55,6 +57,34 @@ def test_operation_compensation_steps_are_idempotent_and_lifo() -> None:
     ]
     assert outcome.rollback_status is RollbackStatus.INCOMPLETE
     assert outcome.side_effects_may_remain is True
+
+
+def test_last_outcome_is_isolated_by_execution_context() -> None:
+    facade = KBOperationCompatibilityFacade()
+    initial_current_context_outcome = facade.last_outcome
+
+    def run_operation(collection: str):
+        with facade.start_operation(
+            operation_type="document_ingestion",
+            collection=collection,
+        ):
+            pass
+
+        outcome = facade.last_outcome
+        assert outcome is not None
+        return outcome
+
+    context_a = Context()
+    context_b = Context()
+
+    outcome_a = context_a.run(run_operation, "collection-a")
+    outcome_b = context_b.run(run_operation, "collection-b")
+
+    assert outcome_a.collection == "collection-a"
+    assert outcome_b.collection == "collection-b"
+    assert context_a.run(lambda: facade.last_outcome) is outcome_a
+    assert context_b.run(lambda: facade.last_outcome) is outcome_b
+    assert facade.last_outcome is initial_current_context_outcome
 
 
 class _OperationCancelled(BaseException):

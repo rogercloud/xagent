@@ -218,6 +218,11 @@ _CURRENT_OPERATION: ContextVar[KBOperation | None] = ContextVar(
     default=None,
 )
 
+_LAST_OUTCOME: ContextVar[KBOperationOutcome | None] = ContextVar(
+    "xagent_kb_last_outcome",
+    default=None,
+)
+
 
 class KBOperationCompatibilityFacade:
     """Compatibility facade for rollback-aware coordinator operations.
@@ -227,13 +232,10 @@ class KBOperationCompatibilityFacade:
     effects for future handle-level compensation.
     """
 
-    def __init__(self) -> None:
-        self._last_outcome: KBOperationOutcome | None = None
-
     @property
     def last_outcome(self) -> KBOperationOutcome | None:
         """Return the most recently finalized operation outcome."""
-        return self._last_outcome
+        return _LAST_OUTCOME.get()
 
     def current_operation(self) -> KBOperation | None:
         """Return the operation active in the current context, if any."""
@@ -287,7 +289,7 @@ class KBOperationCompatibilityFacade:
             if outcome is not None:
                 if parent_operation is not None:
                     parent_operation.add_child_outcome(outcome)
-                self._last_outcome = outcome
+                _LAST_OUTCOME.set(outcome)
 
     @contextmanager
     def start_child_operation(
