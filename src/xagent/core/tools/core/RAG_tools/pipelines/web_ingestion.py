@@ -4,7 +4,6 @@ Crawls a website and imports all discovered pages into the knowledge base.
 """
 
 import asyncio
-import concurrent.futures
 import logging
 import tempfile
 from contextvars import copy_context
@@ -325,10 +324,9 @@ async def _run_web_ingestion_impl(
                         # Copy the current ContextVars after the page child operation is active.
                         # This preserves user scope and lets document ingestion record into the same child.
                         request_context = copy_context()
-                        with concurrent.futures.ThreadPoolExecutor() as executor:
-                            ingest_result: IngestionResult = await loop.run_in_executor(
-                                executor, lambda: request_context.run(_ingest_file)
-                            )
+                        ingest_result: IngestionResult = await loop.run_in_executor(
+                            None, lambda: request_context.run(_ingest_file)
+                        )
 
                         # Track statistics
                         if ingest_result.status == "success":
