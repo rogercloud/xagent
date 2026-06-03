@@ -60,6 +60,22 @@ def test_ensure_collection_backend_binding_sets_lancedb_when_missing() -> None:
     assert metadata_store.saved == [updated]
 
 
+@pytest.mark.asyncio
+async def test_ensure_collection_backend_binding_async_sets_lancedb_when_missing() -> (
+    None
+):
+    metadata_store = _FakeMetadataStore(CollectionInfo(name="demo"))
+    facade = KBPipelineCompatibilityFacade(
+        storage_shim=_FakeStorageShim(metadata_store)
+    )
+
+    updated = await facade.ensure_collection_backend_binding_async("demo")
+
+    assert updated is not None
+    assert updated.extra_metadata["kb_storage"] == {"backend": "lancedb"}
+    assert metadata_store.saved == [updated]
+
+
 def test_ensure_collection_backend_binding_preserves_existing_binding() -> None:
     existing_binding = {"backend": "postgresql", "dsn": "kept"}
     metadata_store = _FakeMetadataStore(

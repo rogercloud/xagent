@@ -119,7 +119,7 @@ class KBPipelineCompatibilityFacade:
         ) as operation:
             yield operation
 
-    def ensure_collection_backend_binding(
+    async def ensure_collection_backend_binding_async(
         self, collection: str
     ) -> CollectionInfo | None:
         """Ensure direct pipeline-created collections carry a backend binding."""
@@ -127,13 +127,9 @@ class KBPipelineCompatibilityFacade:
         if storage_shim is None:
             return None
 
-        from .coordinator import _run_in_separate_loop
-
         metadata_store = storage_shim.get_metadata_store()
         try:
-            collection_info = _run_in_separate_loop(
-                metadata_store.get_collection(collection)
-            )
+            collection_info = await metadata_store.get_collection(collection)
         except ValueError:
             return None
 
@@ -147,8 +143,18 @@ class KBPipelineCompatibilityFacade:
         updated_collection = collection_info.model_copy(
             update={"extra_metadata": extra_metadata}
         )
-        _run_in_separate_loop(metadata_store.save_collection(updated_collection))
+        await metadata_store.save_collection(updated_collection)
         return updated_collection
+
+    def ensure_collection_backend_binding(
+        self, collection: str
+    ) -> CollectionInfo | None:
+        """Ensure direct pipeline-created collections carry a backend binding."""
+        from .coordinator import _run_in_separate_loop
+
+        return _run_in_separate_loop(
+            self.ensure_collection_backend_binding_async(collection)
+        )
 
     def process_document(
         self,
@@ -317,8 +323,8 @@ class KBPipelineCompatibilityFacade:
                     file_handler=file_handler,
                     pipeline_facade=self,
                 )
+                await self.ensure_collection_backend_binding_async(collection)
                 self._record_web_ingestion_outcome(operation, result)
-                self.ensure_collection_backend_binding(collection)
                 return result
 
     @contextmanager

@@ -263,7 +263,7 @@ class KBOperationCompatibilityFacade:
 
         try:
             yield operation
-        except Exception as exc:
+        except BaseException as exc:  # noqa: BLE001 - record outcome before propagating
             if operation.outcome is None:
                 operation.finish(
                     status="error",
