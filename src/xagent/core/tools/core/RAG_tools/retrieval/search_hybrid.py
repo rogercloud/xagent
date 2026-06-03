@@ -14,8 +14,8 @@ from ..core.schemas import (
     SearchResult,
     SearchWarning,
 )
-from ..retrieval.search_dense import search_dense
-from ..retrieval.search_sparse import search_sparse
+from ..retrieval.search_dense import _search_dense_impl
+from ..retrieval.search_sparse import _search_sparse_impl
 
 if TYPE_CHECKING:
     from ..kb import KBLegacyStepCompatibilityFacade
@@ -249,7 +249,7 @@ def _search_hybrid_impl(
 
     # 1. Execute Dense Search
     logger.info("Executing dense search for model %s...", model_tag)
-    dense_response = search_dense(
+    dense_response = _search_dense_impl(
         collection=collection,
         model_tag=model_tag,
         query_vector=query_vector,
@@ -266,7 +266,7 @@ def _search_hybrid_impl(
 
     # 2. Execute Sparse Search
     logger.info("Executing sparse search for model %s...", model_tag)
-    sparse_response = search_sparse(
+    sparse_response = _search_sparse_impl(
         collection=collection,
         model_tag=model_tag,
         query_text=query_text,

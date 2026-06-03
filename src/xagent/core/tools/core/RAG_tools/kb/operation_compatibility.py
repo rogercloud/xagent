@@ -198,7 +198,9 @@ class KBOperation:
 
         child_statuses = {child.status for child in self.child_outcomes}
         has_successful_child = "success" in child_statuses
-        has_failed_child = any(status != "success" for status in child_statuses)
+        has_failed_child = any(
+            child_status != "success" for child_status in child_statuses
+        )
         if (
             self.persistence_policy is PersistencePolicy.PRESERVE_SUCCESSFUL_CHILDREN
             and has_successful_child

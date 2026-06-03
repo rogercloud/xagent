@@ -150,6 +150,8 @@ class KBPipelineCompatibilityFacade:
         self, collection: str
     ) -> CollectionInfo | None:
         """Ensure direct pipeline-created collections carry a backend binding."""
+        # Compatibility wrapper for sync document ingestion paths. Async
+        # callers should await ensure_collection_backend_binding_async().
         from .coordinator import _run_in_separate_loop
 
         return _run_in_separate_loop(
