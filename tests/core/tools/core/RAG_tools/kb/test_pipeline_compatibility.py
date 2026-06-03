@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+from datetime import datetime
+from pathlib import Path
 from typing import Optional
 
 import pytest
 
 from xagent.core.tools.core.RAG_tools.core.schemas import (
     CollectionInfo,
+    CrawlResult,
     IngestionResult,
     IngestionStepResult,
     WebCrawlConfig,
@@ -425,3 +428,162 @@ async def test_web_ingestion_zero_success_reports_incomplete_rollback_outcome(
     assert outcome.side_effects_may_remain is True
     assert len(outcome.child_outcomes) == 1
     assert outcome.child_outcomes[0].rollback_status is RollbackStatus.INCOMPLETE
+
+
+class _FailingSaveMetadataStore(_FakeMetadataStore):
+    async def save_collection(self, collection: CollectionInfo) -> None:
+        raise RuntimeError("save failed")
+
+
+def test_process_document_binding_failure_marks_operation_incomplete(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from xagent.core.tools.core.RAG_tools.pipelines import document_ingestion
+
+    operation_facade = KBOperationCompatibilityFacade()
+    facade = KBPipelineCompatibilityFacade(
+        storage_shim=_FakeStorageShim(
+            _FailingSaveMetadataStore(CollectionInfo(name="demo"))
+        ),
+        operation_compatibility=operation_facade,
+    )
+
+    def fake_process_document_impl(**_: object) -> IngestionResult:
+        return _successful_ingestion_result("doc-binding")
+
+    monkeypatch.setattr(
+        document_ingestion,
+        "_process_document_impl",
+        fake_process_document_impl,
+    )
+
+    with pytest.raises(RuntimeError, match="save failed"):
+        facade.process_document("demo", "/tmp/doc.md")
+
+    outcome = operation_facade.last_outcome
+    assert outcome is not None
+    assert outcome.status == "error"
+    assert outcome.rollback_status is RollbackStatus.INCOMPLETE
+    assert outcome.side_effects_may_remain is True
+    assert {step.plane for step in outcome.compensation_steps} >= {
+        SideEffectPlane.DOCUMENT,
+        SideEffectPlane.PARSE,
+        SideEffectPlane.CHUNK,
+        SideEffectPlane.EMBEDDING,
+    }
+
+
+class _SinglePageCrawler:
+    def __init__(
+        self, config: WebCrawlConfig, progress_callback: object = None
+    ) -> None:
+        self.total_urls_found = 1
+        self.failed_urls: dict[str, str] = {}
+
+    async def crawl(self) -> list[CrawlResult]:
+        return [
+            CrawlResult(
+                url="https://example.com/page",
+                title="Example Page",
+                content_markdown="body",
+                status="success",
+                depth=0,
+                timestamp=datetime.utcnow(),
+                content_length=4,
+            )
+        ]
+
+
+@pytest.mark.asyncio
+async def test_web_ingestion_file_handler_failure_records_page_child_outcome(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from xagent.core.tools.core.RAG_tools.pipelines import web_ingestion
+
+    operation_facade = KBOperationCompatibilityFacade()
+    facade = KBPipelineCompatibilityFacade(operation_compatibility=operation_facade)
+    monkeypatch.setattr(web_ingestion, "WebCrawler", _SinglePageCrawler)
+
+    def failing_file_handler(
+        temp_file: Path, title: str, collection: str, url: str
+    ) -> dict[str, str]:
+        raise RuntimeError("file handler failed")
+
+    result = await facade.run_web_ingestion(
+        "demo",
+        WebCrawlConfig(start_url="https://example.com", max_pages=1),
+        file_handler=failing_file_handler,
+    )
+
+    assert result.status == "error"
+    outcome = operation_facade.last_outcome
+    assert outcome is not None
+    assert outcome.status == "error"
+    assert outcome.rollback_status is RollbackStatus.INCOMPLETE
+    assert outcome.side_effects_may_remain is True
+    assert len(outcome.child_outcomes) == 1
+    child = outcome.child_outcomes[0]
+    assert child.operation_type == "web_page_ingestion"
+    assert child.status == "error"
+    assert child.rollback_status is RollbackStatus.INCOMPLETE
+    assert {step.plane for step in child.compensation_steps} == {SideEffectPlane.FILE}
+
+
+@pytest.mark.asyncio
+async def test_web_ingestion_file_and_document_side_effects_share_page_child(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from xagent.core.tools.core.RAG_tools.pipelines import (
+        document_ingestion,
+        web_ingestion,
+    )
+
+    operation_facade = KBOperationCompatibilityFacade()
+    facade = KBPipelineCompatibilityFacade(operation_compatibility=operation_facade)
+    monkeypatch.setattr(web_ingestion, "WebCrawler", _SinglePageCrawler)
+    monkeypatch.setattr(
+        web_ingestion, "run_document_ingestion", facade.run_document_ingestion
+    )
+
+    def fake_run_document_ingestion_impl(**_: object) -> IngestionResult:
+        return IngestionResult(
+            status="partial",
+            doc_id="doc-failed",
+            parse_hash=None,
+            completed_steps=[
+                _ingestion_step("initialize_collection", embedding_model_id="model-a"),
+                _ingestion_step("register_document", doc_id="doc-failed", created=True),
+            ],
+            failed_step="parse_document",
+            message="parse failed",
+        )
+
+    def file_handler(
+        temp_file: Path, title: str, collection: str, url: str
+    ) -> dict[str, str]:
+        return {"file_path": str(temp_file), "file_id": "file-1"}
+
+    monkeypatch.setattr(
+        document_ingestion,
+        "_run_document_ingestion_impl",
+        fake_run_document_ingestion_impl,
+    )
+
+    result = await facade.run_web_ingestion(
+        "demo",
+        WebCrawlConfig(start_url="https://example.com", max_pages=1),
+        file_handler=file_handler,
+    )
+
+    assert result.status == "error"
+    outcome = operation_facade.last_outcome
+    assert outcome is not None
+    assert len(outcome.child_outcomes) == 1
+    child = outcome.child_outcomes[0]
+    assert child.status == "partial"
+    assert child.rollback_status is RollbackStatus.INCOMPLETE
+    assert {step.plane for step in child.compensation_steps} >= {
+        SideEffectPlane.FILE,
+        SideEffectPlane.DOCUMENT,
+        SideEffectPlane.STATUS,
+    }

@@ -182,7 +182,7 @@ class KBPipelineCompatibilityFacade:
                     metadata_source_path=metadata_source_path,
                     commit_gate=commit_gate,
                 )
-                self._record_document_ingestion_outcome(
+                self._record_document_ingestion_side_effects(
                     operation,
                     result,
                     collection=collection,
@@ -192,6 +192,7 @@ class KBPipelineCompatibilityFacade:
                     is_admin=is_admin,
                 )
                 self.ensure_collection_backend_binding(collection)
+                self._finish_document_ingestion_outcome(operation, result)
                 return result
 
     def run_document_ingestion(
@@ -227,7 +228,7 @@ class KBPipelineCompatibilityFacade:
                     commit_gate=commit_gate,
                 )
                 if operation is not None and operation.outcome is None:
-                    self._record_document_ingestion_outcome(
+                    self._record_document_ingestion_side_effects(
                         operation,
                         result,
                         collection=collection,
@@ -236,7 +237,10 @@ class KBPipelineCompatibilityFacade:
                         user_id=user_id,
                         is_admin=is_admin,
                     )
-                self.ensure_collection_backend_binding(collection)
+                    self.ensure_collection_backend_binding(collection)
+                    self._finish_document_ingestion_outcome(operation, result)
+                elif operation is None:
+                    self.ensure_collection_backend_binding(collection)
                 return result
 
     def search_documents(
@@ -311,12 +315,94 @@ class KBPipelineCompatibilityFacade:
                     user_id=user_id,
                     is_admin=is_admin,
                     file_handler=file_handler,
+                    pipeline_facade=self,
                 )
                 self._record_web_ingestion_outcome(operation, result)
                 self.ensure_collection_backend_binding(collection)
                 return result
 
-    def _record_document_ingestion_outcome(
+    @contextmanager
+    def web_page_operation(
+        self,
+        *,
+        collection: str,
+        url: str,
+        title: Optional[str] = None,
+    ) -> Iterator[KBOperation | None]:
+        operation_facade = self._active_operation_facade()
+        if operation_facade is None:
+            yield None
+            return
+
+        current_operation = operation_facade.current_operation()
+        if current_operation is None:
+            yield None
+            return
+
+        if current_operation.operation_type == "web_ingestion":
+            with operation_facade.start_child_operation(
+                operation_type="web_page_ingestion",
+                collection=collection,
+                persistence_policy=PersistencePolicy.PRESERVE_SUCCESSFUL_CHILDREN,
+                details={"url": url, "title": title},
+            ) as child_operation:
+                yield child_operation
+            return
+
+        yield current_operation
+
+    def record_web_page_file_side_effect(
+        self,
+        operation: KBOperation | None,
+        *,
+        collection: str,
+        url: str,
+        file_path: Optional[str],
+        file_id: Optional[str],
+        reason: str = "file_handler",
+    ) -> None:
+        if operation is None:
+            return
+        operation.record_side_effect(
+            name="cleanup_web_page_persistence",
+            plane=SideEffectPlane.FILE,
+            payload={
+                "collection": collection,
+                "url": url,
+                "file_path": file_path,
+                "file_id": file_id,
+                "reason": reason,
+            },
+            idempotency_key=f"file:{collection}:{file_id or file_path or url}",
+        )
+
+    @staticmethod
+    def finish_web_page_operation(
+        operation: KBOperation | None,
+        *,
+        status: str,
+        message: str,
+        side_effects_may_remain: Optional[bool] = None,
+    ) -> None:
+        if operation is None or operation.outcome is not None:
+            return
+        if side_effects_may_remain is None:
+            side_effects_may_remain = (
+                status != "success" and operation.has_side_effects()
+            )
+        rollback_status = (
+            RollbackStatus.NOT_NEEDED
+            if status == "success" or not side_effects_may_remain
+            else RollbackStatus.INCOMPLETE
+        )
+        operation.finish(
+            status=status,
+            rollback_status=rollback_status,
+            side_effects_may_remain=side_effects_may_remain,
+            details={"message": message},
+        )
+
+    def _record_document_ingestion_side_effects(
         self,
         operation: KBOperation | None,
         result: IngestionResult,
@@ -426,6 +512,13 @@ class KBPipelineCompatibilityFacade:
                 idempotency_key=f"embedding:{collection}:{result.doc_id}:{result.parse_hash}",
             )
 
+    @staticmethod
+    def _finish_document_ingestion_outcome(
+        operation: KBOperation | None,
+        result: IngestionResult,
+    ) -> None:
+        if operation is None or operation.outcome is not None:
+            return
         side_effects_may_remain = (
             result.status != "success" and operation.has_side_effects()
         )

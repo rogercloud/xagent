@@ -124,9 +124,7 @@ class KBOperation:
     ) -> None:
         """Register an idempotent compensation boundary for one side effect."""
         step_payload = dict(payload or {})
-        dedupe_key = (
-            idempotency_key or f"{plane.value}:{name}:{step_payload!r}"
-        )
+        dedupe_key = idempotency_key or f"{plane.value}:{name}:{step_payload!r}"
         if dedupe_key in self._idempotency_keys:
             return
 
@@ -202,8 +200,7 @@ class KBOperation:
         has_successful_child = "success" in child_statuses
         has_failed_child = any(status != "success" for status in child_statuses)
         if (
-            self.persistence_policy
-            is PersistencePolicy.PRESERVE_SUCCESSFUL_CHILDREN
+            self.persistence_policy is PersistencePolicy.PRESERVE_SUCCESSFUL_CHILDREN
             and has_successful_child
             and has_failed_child
         ):
