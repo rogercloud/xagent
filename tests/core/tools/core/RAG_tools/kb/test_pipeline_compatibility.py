@@ -4,8 +4,21 @@ from __future__ import annotations
 
 from typing import Optional
 
-from xagent.core.tools.core.RAG_tools.core.schemas import CollectionInfo
-from xagent.core.tools.core.RAG_tools.kb import KBPipelineCompatibilityFacade
+import pytest
+
+from xagent.core.tools.core.RAG_tools.core.schemas import (
+    CollectionInfo,
+    IngestionResult,
+    IngestionStepResult,
+    WebCrawlConfig,
+    WebIngestionResult,
+)
+from xagent.core.tools.core.RAG_tools.kb import (
+    KBOperationCompatibilityFacade,
+    KBPipelineCompatibilityFacade,
+    RollbackStatus,
+    SideEffectPlane,
+)
 
 
 class _FakeMetadataStore:
@@ -73,3 +86,342 @@ def test_ensure_collection_backend_binding_ignores_missing_collection() -> None:
 
     assert facade.ensure_collection_backend_binding("missing") is None
     assert metadata_store.saved == []
+
+
+def _ingestion_step(name: str, **metadata: object) -> IngestionStepResult:
+    return IngestionStepResult(name=name, metadata=dict(metadata))
+
+
+def _successful_ingestion_result(doc_id: str = "doc-ok") -> IngestionResult:
+    return IngestionResult(
+        status="success",
+        doc_id=doc_id,
+        parse_hash="parse-ok",
+        chunk_count=1,
+        embedding_count=1,
+        vector_count=1,
+        completed_steps=[
+            _ingestion_step("initialize_collection", embedding_model_id="model-a"),
+            _ingestion_step("register_document", doc_id=doc_id, created=True),
+            _ingestion_step("parse_document", parse_hash="parse-ok", written=True),
+            _ingestion_step("chunk_document", chunk_count=1, created=True),
+            _ingestion_step("write_vectors_to_db", vector_count=1),
+        ],
+        message="ok",
+    )
+
+
+def test_process_document_binds_collection_after_first_ingest(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from xagent.core.tools.core.RAG_tools.pipelines import document_ingestion
+
+    metadata_store = _FakeMetadataStore(CollectionInfo(name="demo"))
+    facade = KBPipelineCompatibilityFacade(
+        storage_shim=_FakeStorageShim(metadata_store)
+    )
+
+    def fake_process_document_impl(**_: object) -> IngestionResult:
+        return _successful_ingestion_result()
+
+    monkeypatch.setattr(
+        document_ingestion,
+        "_process_document_impl",
+        fake_process_document_impl,
+    )
+
+    result = facade.process_document("demo", "/tmp/doc.md")
+
+    assert result.status == "success"
+    assert metadata_store.collection is not None
+    assert metadata_store.collection.extra_metadata["kb_storage"] == {
+        "backend": "lancedb"
+    }
+    assert metadata_store.saved == [metadata_store.collection]
+
+
+@pytest.mark.parametrize(
+    ("failed_step", "completed_steps", "chunk_count", "vector_count", "planes"),
+    [
+        (
+            "register_document",
+            [
+                _ingestion_step("initialize_collection", embedding_model_id="model-a"),
+                _ingestion_step("register_document", doc_id="doc-1", created=True),
+            ],
+            0,
+            0,
+            {
+                SideEffectPlane.COLLECTION,
+                SideEffectPlane.DOCUMENT,
+                SideEffectPlane.STATUS,
+            },
+        ),
+        (
+            "parse_document",
+            [
+                _ingestion_step("initialize_collection", embedding_model_id="model-a"),
+                _ingestion_step("register_document", doc_id="doc-1", created=True),
+                _ingestion_step("parse_document", parse_hash="parse-1", written=True),
+            ],
+            0,
+            0,
+            {
+                SideEffectPlane.COLLECTION,
+                SideEffectPlane.DOCUMENT,
+                SideEffectPlane.STATUS,
+                SideEffectPlane.PARSE,
+            },
+        ),
+        (
+            "chunk_document",
+            [
+                _ingestion_step("initialize_collection", embedding_model_id="model-a"),
+                _ingestion_step("register_document", doc_id="doc-1", created=True),
+                _ingestion_step("parse_document", parse_hash="parse-1", written=True),
+                _ingestion_step("chunk_document", chunk_count=2, created=True),
+            ],
+            2,
+            0,
+            {
+                SideEffectPlane.COLLECTION,
+                SideEffectPlane.DOCUMENT,
+                SideEffectPlane.STATUS,
+                SideEffectPlane.PARSE,
+                SideEffectPlane.CHUNK,
+            },
+        ),
+        (
+            "write_vectors_to_db",
+            [
+                _ingestion_step("initialize_collection", embedding_model_id="model-a"),
+                _ingestion_step("register_document", doc_id="doc-1", created=True),
+                _ingestion_step("parse_document", parse_hash="parse-1", written=True),
+                _ingestion_step("chunk_document", chunk_count=2, created=True),
+                _ingestion_step("write_vectors_to_db", vector_count=2),
+            ],
+            2,
+            2,
+            {
+                SideEffectPlane.COLLECTION,
+                SideEffectPlane.DOCUMENT,
+                SideEffectPlane.STATUS,
+                SideEffectPlane.PARSE,
+                SideEffectPlane.CHUNK,
+                SideEffectPlane.EMBEDDING,
+            },
+        ),
+    ],
+)
+def test_process_document_records_failed_ingest_operation_outcome(
+    monkeypatch: pytest.MonkeyPatch,
+    failed_step: str,
+    completed_steps: list[IngestionStepResult],
+    chunk_count: int,
+    vector_count: int,
+    planes: set[SideEffectPlane],
+) -> None:
+    from xagent.core.tools.core.RAG_tools.pipelines import document_ingestion
+
+    operation_facade = KBOperationCompatibilityFacade()
+    facade = KBPipelineCompatibilityFacade(
+        storage_shim=_FakeStorageShim(_FakeMetadataStore(CollectionInfo(name="demo"))),
+        operation_compatibility=operation_facade,
+    )
+
+    def fake_process_document_impl(**_: object) -> IngestionResult:
+        return IngestionResult(
+            status="partial",
+            doc_id="doc-1",
+            parse_hash="parse-1" if failed_step != "register_document" else None,
+            chunk_count=chunk_count,
+            embedding_count=vector_count,
+            vector_count=vector_count,
+            completed_steps=completed_steps,
+            failed_step=failed_step,
+            message=f"failed at {failed_step}",
+        )
+
+    monkeypatch.setattr(
+        document_ingestion,
+        "_process_document_impl",
+        fake_process_document_impl,
+    )
+
+    result = facade.process_document("demo", "/tmp/doc.md")
+
+    assert result.failed_step == failed_step
+    outcome = operation_facade.last_outcome
+    assert outcome is not None
+    assert outcome.status == "partial"
+    assert outcome.rollback_status is RollbackStatus.INCOMPLETE
+    assert outcome.side_effects_may_remain is True
+    assert {step.plane for step in outcome.compensation_steps} == planes
+    assert [step.name for step in outcome.compensation_plan] == [
+        step.name for step in reversed(outcome.compensation_steps)
+    ]
+
+
+@pytest.mark.asyncio
+async def test_web_ingestion_records_page_child_outcomes_and_preserve_policy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from xagent.core.tools.core.RAG_tools.pipelines import (
+        document_ingestion,
+        web_ingestion,
+    )
+
+    operation_facade = KBOperationCompatibilityFacade()
+    facade = KBPipelineCompatibilityFacade(
+        storage_shim=_FakeStorageShim(_FakeMetadataStore(CollectionInfo(name="demo"))),
+        operation_compatibility=operation_facade,
+    )
+
+    def fake_run_document_ingestion_impl(
+        collection: str,
+        source_path: str,
+        **_: object,
+    ) -> IngestionResult:
+        if source_path.endswith("ok.md"):
+            return _successful_ingestion_result("doc-ok")
+        return IngestionResult(
+            status="partial",
+            doc_id="doc-bad",
+            parse_hash=None,
+            completed_steps=[
+                _ingestion_step("initialize_collection", embedding_model_id="model-a"),
+                _ingestion_step("register_document", doc_id="doc-bad", created=True),
+            ],
+            failed_step="parse_document",
+            message="parse failed",
+        )
+
+    async def fake_run_web_ingestion_impl(
+        collection: str,
+        crawl_config: WebCrawlConfig,
+        **_: object,
+    ) -> WebIngestionResult:
+        facade.run_document_ingestion(collection, "/tmp/ok.md")
+        facade.run_document_ingestion(collection, "/tmp/bad.md")
+        return WebIngestionResult(
+            status="partial",
+            collection=collection,
+            total_urls_found=2,
+            pages_crawled=2,
+            pages_failed=1,
+            documents_created=1,
+            chunks_created=1,
+            embeddings_created=1,
+            crawled_urls=[crawl_config.start_url, "https://example.com/bad"],
+            failed_urls={"https://example.com/bad": "parse failed"},
+            message="partial",
+            warnings=["parse failed"],
+            elapsed_time_ms=1,
+        )
+
+    monkeypatch.setattr(
+        document_ingestion,
+        "_run_document_ingestion_impl",
+        fake_run_document_ingestion_impl,
+    )
+    monkeypatch.setattr(
+        web_ingestion,
+        "_run_web_ingestion_impl",
+        fake_run_web_ingestion_impl,
+    )
+
+    result = await facade.run_web_ingestion(
+        "demo",
+        WebCrawlConfig(start_url="https://example.com", max_pages=2),
+    )
+
+    assert result.status == "partial"
+    outcome = operation_facade.last_outcome
+    assert outcome is not None
+    assert outcome.operation_type == "web_ingestion"
+    assert outcome.status == "partial"
+    assert outcome.rollback_status is RollbackStatus.SKIPPED_BY_POLICY
+    assert outcome.side_effects_may_remain is True
+    assert [child.operation_type for child in outcome.child_outcomes] == [
+        "web_page_ingestion",
+        "web_page_ingestion",
+    ]
+    assert [child.status for child in outcome.child_outcomes] == [
+        "success",
+        "partial",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_web_ingestion_zero_success_reports_incomplete_rollback_outcome(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from xagent.core.tools.core.RAG_tools.pipelines import (
+        document_ingestion,
+        web_ingestion,
+    )
+
+    operation_facade = KBOperationCompatibilityFacade()
+    facade = KBPipelineCompatibilityFacade(
+        storage_shim=_FakeStorageShim(_FakeMetadataStore(CollectionInfo(name="demo"))),
+        operation_compatibility=operation_facade,
+    )
+
+    def fake_run_document_ingestion_impl(**_: object) -> IngestionResult:
+        return IngestionResult(
+            status="partial",
+            doc_id="doc-failed",
+            parse_hash=None,
+            completed_steps=[
+                _ingestion_step("initialize_collection", embedding_model_id="model-a"),
+                _ingestion_step("register_document", doc_id="doc-failed", created=True),
+            ],
+            failed_step="parse_document",
+            message="parse failed",
+        )
+
+    async def fake_run_web_ingestion_impl(
+        collection: str,
+        crawl_config: WebCrawlConfig,
+        **_: object,
+    ) -> WebIngestionResult:
+        facade.run_document_ingestion(collection, "/tmp/failed.md")
+        return WebIngestionResult(
+            status="error",
+            collection=collection,
+            total_urls_found=1,
+            pages_crawled=1,
+            pages_failed=1,
+            documents_created=0,
+            chunks_created=0,
+            embeddings_created=0,
+            crawled_urls=[crawl_config.start_url],
+            failed_urls={crawl_config.start_url: "parse failed"},
+            message="failed",
+            warnings=["parse failed"],
+            elapsed_time_ms=1,
+        )
+
+    monkeypatch.setattr(
+        document_ingestion,
+        "_run_document_ingestion_impl",
+        fake_run_document_ingestion_impl,
+    )
+    monkeypatch.setattr(
+        web_ingestion,
+        "_run_web_ingestion_impl",
+        fake_run_web_ingestion_impl,
+    )
+
+    result = await facade.run_web_ingestion(
+        "demo",
+        WebCrawlConfig(start_url="https://example.com", max_pages=1),
+    )
+
+    assert result.status == "error"
+    outcome = operation_facade.last_outcome
+    assert outcome is not None
+    assert outcome.rollback_status is RollbackStatus.INCOMPLETE
+    assert outcome.side_effects_may_remain is True
+    assert len(outcome.child_outcomes) == 1
+    assert outcome.child_outcomes[0].rollback_status is RollbackStatus.INCOMPLETE

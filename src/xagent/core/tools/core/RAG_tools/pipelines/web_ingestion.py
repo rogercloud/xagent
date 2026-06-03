@@ -200,6 +200,7 @@ async def _run_web_ingestion_impl(
     # Create temporary directory for markdown files
     with tempfile.TemporaryDirectory(prefix="xagent_web_ingest_") as temp_dir:
         documents_created = 0
+        successful_page_ingestions = 0
         total_chunks = 0
         total_embeddings = 0
 
@@ -298,6 +299,7 @@ async def _run_web_ingestion_impl(
                     # Track statistics
                     if ingest_result.status == "success":
                         documents_created += 1
+                        successful_page_ingestions += 1
                         total_chunks += ingest_result.chunk_count
                         total_embeddings += ingest_result.embedding_count
                         logger.info(
@@ -359,7 +361,8 @@ async def _run_web_ingestion_impl(
     # - "success": No failures (empty results are successful)
     total_failures = pages_failed
 
-    if documents_created == 0 and total_failures > 0:
+    has_successful_ingestion = successful_page_ingestions > 0
+    if not has_successful_ingestion and total_failures > 0:
         status = "error"
     elif total_failures > 0:
         status = "partial"

@@ -23,6 +23,7 @@ from .models import (
     KBStorageBackend,
     KBUserScope,
 )
+from .operation_compatibility import KBOperationCompatibilityFacade
 from .parse_display_compatibility import KBParseDisplayCompatibilityFacade
 from .pipeline_compatibility import KBPipelineCompatibilityFacade
 from .retrieval_compatibility import KBRetrievalHelperCompatibilityFacade
@@ -52,6 +53,7 @@ class KBCoordinator:
             KBRetrievalHelperCompatibilityFacade | None
         ) = None,
         vector_storage_compatibility: KBVectorStorageCompatibilityFacade | None = None,
+        operation_compatibility: KBOperationCompatibilityFacade | None = None,
         pipeline_compatibility: KBPipelineCompatibilityFacade | None = None,
         legacy_step_compatibility: KBLegacyStepCompatibilityFacade | None = None,
     ) -> None:
@@ -82,6 +84,9 @@ class KBCoordinator:
         self._vector_storage_compatibility = (
             vector_storage_compatibility
             or KBVectorStorageCompatibilityFacade(coordinator=self)
+        )
+        self._operation_compatibility = (
+            operation_compatibility or KBOperationCompatibilityFacade()
         )
         self._pipeline_compatibility = (
             pipeline_compatibility or KBPipelineCompatibilityFacade(coordinator=self)
@@ -160,6 +165,16 @@ class KBCoordinator:
     def vector_storage(self) -> KBVectorStorageCompatibilityFacade:
         """Backward-friendly short alias for the vector storage facade."""
         return self._vector_storage_compatibility
+
+    @property
+    def operation_compatibility(self) -> KBOperationCompatibilityFacade:
+        """Return the rollback-aware operation compatibility facade."""
+        return self._operation_compatibility
+
+    @property
+    def operations(self) -> KBOperationCompatibilityFacade:
+        """Backward-friendly short alias for the operation facade."""
+        return self._operation_compatibility
 
     @property
     def pipeline_compatibility(self) -> KBPipelineCompatibilityFacade:

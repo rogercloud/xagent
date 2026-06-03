@@ -19,6 +19,13 @@ from ..core.schemas import (
     ParseMethod,
     SparseSearchResponse,
 )
+from .operation_compatibility import (
+    KBOperation,
+    KBOperationCompatibilityFacade,
+    PersistencePolicy,
+    RollbackStatus,
+    SideEffectPlane,
+)
 
 if TYPE_CHECKING:
     from .coordinator import KBCoordinator
@@ -38,9 +45,11 @@ class KBLegacyStepCompatibilityFacade:
         self,
         coordinator: KBCoordinator | None = None,
         storage_shim: KBStorageShimCompatibilityFacade | None = None,
+        operation_compatibility: KBOperationCompatibilityFacade | None = None,
     ) -> None:
         self._coordinator = coordinator
         self._storage_shim = storage_shim
+        self._operation_compatibility = operation_compatibility
 
     def _active_storage_shim(self) -> KBStorageShimCompatibilityFacade | None:
         if self._storage_shim is not None:
@@ -48,6 +57,34 @@ class KBLegacyStepCompatibilityFacade:
         if self._coordinator is not None:
             return self._coordinator.storage_shim
         return None
+
+    def _active_operation_facade(self) -> KBOperationCompatibilityFacade | None:
+        if self._operation_compatibility is not None:
+            return self._operation_compatibility
+        if self._coordinator is not None:
+            return self._coordinator.operation_compatibility
+        return None
+
+    @contextmanager
+    def _operation_context(
+        self, *, operation_type: str, collection: str
+    ) -> Iterator[tuple[KBOperation | None, bool]]:
+        operation_facade = self._active_operation_facade()
+        if operation_facade is None:
+            yield None, False
+            return
+
+        current_operation = operation_facade.current_operation()
+        if current_operation is not None:
+            yield current_operation, False
+            return
+
+        with operation_facade.start_operation(
+            operation_type=operation_type,
+            collection=collection,
+            persistence_policy=PersistencePolicy.PRESERVE_SUCCESSFUL_CHILDREN,
+        ) as operation:
+            yield operation, True
 
     @contextmanager
     def _storage_context(self) -> Iterator[None]:
@@ -74,17 +111,30 @@ class KBLegacyStepCompatibilityFacade:
     ) -> Dict[str, Any]:
         from ..file.register_document import _register_document_public_impl
 
-        with self._storage_context():
-            return _register_document_public_impl(
+        with self._operation_context(
+            operation_type="legacy_register_document", collection=collection
+        ) as (operation, owns_operation):
+            with self._storage_context():
+                result = _register_document_public_impl(
+                    collection=collection,
+                    source_path=source_path,
+                    file_type=file_type,
+                    doc_id=doc_id,
+                    uploaded_at=uploaded_at,
+                    user_id=user_id,
+                    file_id=file_id,
+                    metadata_source_path=metadata_source_path,
+                )
+            self._record_document_side_effect(
+                operation,
                 collection=collection,
                 source_path=source_path,
-                file_type=file_type,
-                doc_id=doc_id,
-                uploaded_at=uploaded_at,
-                user_id=user_id,
                 file_id=file_id,
-                metadata_source_path=metadata_source_path,
+                user_id=user_id,
+                result=result,
             )
+            self._finish_owned_operation(operation, owns_operation, status="success")
+            return result
 
     def get_document(self, db_dir: str, collection: str, doc_id: str) -> Optional[Any]:
         from ..file.register_document import _get_document_impl
@@ -112,16 +162,24 @@ class KBLegacyStepCompatibilityFacade:
     ) -> Dict[str, Any]:
         from ..parse.parse_document import _parse_document_impl
 
-        with self._storage_context():
-            return _parse_document_impl(
-                collection=collection,
-                doc_id=doc_id,
-                parse_method=parse_method,
-                params=params,
-                user_id=user_id,
-                is_admin=is_admin,
-                progress_callback=progress_callback,
+        with self._operation_context(
+            operation_type="legacy_parse_document", collection=collection
+        ) as (operation, owns_operation):
+            with self._storage_context():
+                result = _parse_document_impl(
+                    collection=collection,
+                    doc_id=doc_id,
+                    parse_method=parse_method,
+                    params=params,
+                    user_id=user_id,
+                    is_admin=is_admin,
+                    progress_callback=progress_callback,
+                )
+            self._record_parse_side_effect(
+                operation, collection=collection, doc_id=doc_id, result=result
             )
+            self._finish_owned_operation(operation, owns_operation, status="success")
+            return result
 
     def chunk_document(
         self,
@@ -145,26 +203,38 @@ class KBLegacyStepCompatibilityFacade:
     ) -> Dict[str, Any]:
         from ..chunk.chunk_document import _chunk_document_impl
 
-        with self._storage_context():
-            return _chunk_document_impl(
+        with self._operation_context(
+            operation_type="legacy_chunk_document", collection=collection
+        ) as (operation, owns_operation):
+            with self._storage_context():
+                result = _chunk_document_impl(
+                    collection=collection,
+                    doc_id=doc_id,
+                    parse_hash=parse_hash,
+                    chunk_strategy=chunk_strategy,
+                    chunk_size=chunk_size,
+                    chunk_overlap=chunk_overlap,
+                    headers_to_split_on=headers_to_split_on,
+                    separators=separators,
+                    use_token_count=use_token_count,
+                    tiktoken_encoding=tiktoken_encoding,
+                    enable_protected_content=enable_protected_content,
+                    protected_patterns=protected_patterns,
+                    table_context_size=table_context_size,
+                    image_context_size=image_context_size,
+                    user_id=user_id,
+                    is_admin=is_admin,
+                    **kwargs,
+                )
+            self._record_chunk_side_effect(
+                operation,
                 collection=collection,
                 doc_id=doc_id,
                 parse_hash=parse_hash,
-                chunk_strategy=chunk_strategy,
-                chunk_size=chunk_size,
-                chunk_overlap=chunk_overlap,
-                headers_to_split_on=headers_to_split_on,
-                separators=separators,
-                use_token_count=use_token_count,
-                tiktoken_encoding=tiktoken_encoding,
-                enable_protected_content=enable_protected_content,
-                protected_patterns=protected_patterns,
-                table_context_size=table_context_size,
-                image_context_size=image_context_size,
-                user_id=user_id,
-                is_admin=is_admin,
-                **kwargs,
+                result=result,
             )
+            self._finish_owned_operation(operation, owns_operation, status="success")
+            return result
 
     def chunk_recursive(
         self,
@@ -178,16 +248,28 @@ class KBLegacyStepCompatibilityFacade:
     ) -> Dict[str, Any]:
         from ..chunk.chunk_document import _chunk_recursive_impl
 
-        with self._storage_context():
-            return _chunk_recursive_impl(
+        with self._operation_context(
+            operation_type="legacy_chunk_recursive", collection=collection
+        ) as (operation, owns_operation):
+            with self._storage_context():
+                result = _chunk_recursive_impl(
+                    collection=collection,
+                    doc_id=doc_id,
+                    parse_hash=parse_hash,
+                    chunk_size=chunk_size,
+                    chunk_overlap=chunk_overlap,
+                    separators=separators,
+                    **kwargs,
+                )
+            self._record_chunk_side_effect(
+                operation,
                 collection=collection,
                 doc_id=doc_id,
                 parse_hash=parse_hash,
-                chunk_size=chunk_size,
-                chunk_overlap=chunk_overlap,
-                separators=separators,
-                **kwargs,
+                result=result,
             )
+            self._finish_owned_operation(operation, owns_operation, status="success")
+            return result
 
     def chunk_markdown(
         self,
@@ -202,17 +284,29 @@ class KBLegacyStepCompatibilityFacade:
     ) -> Dict[str, Any]:
         from ..chunk.chunk_document import _chunk_markdown_impl
 
-        with self._storage_context():
-            return _chunk_markdown_impl(
+        with self._operation_context(
+            operation_type="legacy_chunk_markdown", collection=collection
+        ) as (operation, owns_operation):
+            with self._storage_context():
+                result = _chunk_markdown_impl(
+                    collection=collection,
+                    doc_id=doc_id,
+                    parse_hash=parse_hash,
+                    chunk_size=chunk_size,
+                    chunk_overlap=chunk_overlap,
+                    headers_to_split_on=headers_to_split_on,
+                    separators=separators,
+                    **kwargs,
+                )
+            self._record_chunk_side_effect(
+                operation,
                 collection=collection,
                 doc_id=doc_id,
                 parse_hash=parse_hash,
-                chunk_size=chunk_size,
-                chunk_overlap=chunk_overlap,
-                headers_to_split_on=headers_to_split_on,
-                separators=separators,
-                **kwargs,
+                result=result,
             )
+            self._finish_owned_operation(operation, owns_operation, status="success")
+            return result
 
     def chunk_fixed_size(
         self,
@@ -225,15 +319,126 @@ class KBLegacyStepCompatibilityFacade:
     ) -> Dict[str, Any]:
         from ..chunk.chunk_document import _chunk_fixed_size_impl
 
-        with self._storage_context():
-            return _chunk_fixed_size_impl(
+        with self._operation_context(
+            operation_type="legacy_chunk_fixed_size", collection=collection
+        ) as (operation, owns_operation):
+            with self._storage_context():
+                result = _chunk_fixed_size_impl(
+                    collection=collection,
+                    doc_id=doc_id,
+                    parse_hash=parse_hash,
+                    chunk_size=chunk_size,
+                    chunk_overlap=chunk_overlap,
+                    **kwargs,
+                )
+            self._record_chunk_side_effect(
+                operation,
                 collection=collection,
                 doc_id=doc_id,
                 parse_hash=parse_hash,
-                chunk_size=chunk_size,
-                chunk_overlap=chunk_overlap,
-                **kwargs,
+                result=result,
             )
+            self._finish_owned_operation(operation, owns_operation, status="success")
+            return result
+
+    def _record_document_side_effect(
+        self,
+        operation: KBOperation | None,
+        *,
+        collection: str,
+        source_path: str,
+        file_id: Optional[str],
+        user_id: Optional[int],
+        result: Dict[str, Any],
+    ) -> None:
+        if operation is None:
+            return
+        doc_id = result.get("doc_id")
+        if not doc_id:
+            return
+        operation.record_side_effect(
+            name="remove_registered_document",
+            plane=SideEffectPlane.DOCUMENT,
+            payload={
+                "collection": collection,
+                "doc_id": doc_id,
+                "created": result.get("created"),
+                "source_path": source_path,
+                "file_id": file_id,
+            },
+            idempotency_key=f"document:{collection}:{doc_id}",
+        )
+        operation.record_side_effect(
+            name="clear_ingestion_status",
+            plane=SideEffectPlane.STATUS,
+            payload={"collection": collection, "doc_id": doc_id, "user_id": user_id},
+            idempotency_key=f"status:{collection}:{doc_id}",
+        )
+
+    def _record_parse_side_effect(
+        self,
+        operation: KBOperation | None,
+        *,
+        collection: str,
+        doc_id: str,
+        result: Dict[str, Any],
+    ) -> None:
+        if operation is None or result.get("written") is False:
+            return
+        parse_hash = result.get("parse_hash")
+        if not parse_hash:
+            return
+        operation.record_side_effect(
+            name="remove_parse_record",
+            plane=SideEffectPlane.PARSE,
+            payload={
+                "collection": collection,
+                "doc_id": doc_id,
+                "parse_hash": parse_hash,
+            },
+            idempotency_key=f"parse:{collection}:{doc_id}:{parse_hash}",
+        )
+
+    def _record_chunk_side_effect(
+        self,
+        operation: KBOperation | None,
+        *,
+        collection: str,
+        doc_id: str,
+        parse_hash: str,
+        result: Dict[str, Any],
+    ) -> None:
+        if operation is None or result.get("created") is False:
+            return
+        chunk_count = int(result.get("chunk_count", 0) or 0)
+        if chunk_count <= 0:
+            return
+        operation.record_side_effect(
+            name="remove_chunk_records",
+            plane=SideEffectPlane.CHUNK,
+            payload={
+                "collection": collection,
+                "doc_id": doc_id,
+                "parse_hash": parse_hash,
+                "chunk_count": chunk_count,
+            },
+            idempotency_key=f"chunk:{collection}:{doc_id}:{parse_hash}",
+        )
+
+    @staticmethod
+    def _finish_owned_operation(
+        operation: KBOperation | None,
+        owns_operation: bool,
+        *,
+        status: str,
+    ) -> None:
+        if operation is None or not owns_operation or operation.outcome is not None:
+            return
+        operation.finish(
+            status=status,
+            rollback_status=RollbackStatus.NOT_NEEDED,
+            side_effects_may_remain=False,
+        )
 
     def search_dense(
         self,

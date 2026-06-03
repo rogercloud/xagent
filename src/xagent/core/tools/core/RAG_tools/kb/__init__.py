@@ -22,6 +22,14 @@ from .models import (
     KBStorageBackend,
     KBUserScope,
 )
+from .operation_compatibility import (
+    CompensationStep,
+    KBOperationCompatibilityFacade,
+    KBOperationOutcome,
+    PersistencePolicy,
+    RollbackStatus,
+    SideEffectPlane,
+)
 from .parse_display_compatibility import KBParseDisplayCompatibilityFacade
 from .pipeline_compatibility import KBPipelineCompatibilityFacade
 from .retrieval_compatibility import KBRetrievalHelperCompatibilityFacade
@@ -49,8 +57,11 @@ __all__ = [
     "KBCoordinator",
     "KBFileCompatibilityFacade",
     "KBLegacyStepCompatibilityFacade",
+    "CompensationStep",
     "KBMainPointerSnapshot",
     "KBMaintenanceCompatibilityFacade",
+    "KBOperationCompatibilityFacade",
+    "KBOperationOutcome",
     "KBVersionCandidateCleanupSnapshot",
     "KBVersionCandidateRollbackResult",
     "KBParseDisplayCompatibilityFacade",
@@ -63,6 +74,9 @@ __all__ = [
     "KBUserScope",
     "KBVersionCompatibilityFacade",
     "LanceDBCollectionHandle",
+    "PersistencePolicy",
+    "RollbackStatus",
+    "SideEffectPlane",
     "get_kb_coordinator",
     "reset_kb_coordinator_for_tests",
 ]

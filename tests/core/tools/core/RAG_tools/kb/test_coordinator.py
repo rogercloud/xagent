@@ -65,6 +65,12 @@ def test_kb_public_surface_imports() -> None:
         "KBHandleProvider",
         "KBPipelineCompatibilityFacade",
         "KBLegacyStepCompatibilityFacade",
+        "KBOperationCompatibilityFacade",
+        "KBOperationOutcome",
+        "RollbackStatus",
+        "PersistencePolicy",
+        "SideEffectPlane",
+        "CompensationStep",
         "LanceDBCollectionHandle",
     ]
 
