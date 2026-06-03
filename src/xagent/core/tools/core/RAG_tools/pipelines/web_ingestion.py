@@ -260,7 +260,7 @@ async def _run_web_ingestion_impl(
                                     "File handler returned no file information"
                                 )
                             final_file_path = Path(
-                                file_info.get("file_path", temp_file)
+                                file_info.get("file_path") or temp_file
                             )
                             final_file_id = file_info.get("file_id")
 

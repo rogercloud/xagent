@@ -112,4 +112,21 @@ def test_operation_base_exception_records_error_outcome() -> None:
     assert outcome.status == "error"
     assert outcome.rollback_status is RollbackStatus.INCOMPLETE
     assert outcome.side_effects_may_remain is True
-    assert outcome.warnings == ("cancelled",)
+    assert outcome.warnings == ("_OperationCancelled: cancelled",)
+
+
+def test_operation_exception_warning_includes_exception_type() -> None:
+    facade = KBOperationCompatibilityFacade()
+
+    with pytest.raises(KeyError):
+        with facade.start_operation(
+            operation_type="document_ingestion",
+            collection="demo",
+        ):
+            raise KeyError("doc_id")
+
+    outcome = facade.last_outcome
+    assert outcome is not None
+    assert outcome.status == "error"
+    assert outcome.rollback_status is RollbackStatus.NOT_NEEDED
+    assert outcome.warnings == ("KeyError: 'doc_id'",)

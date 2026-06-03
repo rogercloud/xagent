@@ -224,6 +224,13 @@ _LAST_OUTCOME: ContextVar[KBOperationOutcome | None] = ContextVar(
 )
 
 
+def _format_exception_warning(exc: BaseException) -> str:
+    message = str(exc)
+    if message:
+        return f"{type(exc).__name__}: {message}"
+    return type(exc).__name__
+
+
 class KBOperationCompatibilityFacade:
     """Compatibility facade for rollback-aware coordinator operations.
 
@@ -277,7 +284,7 @@ class KBOperationCompatibilityFacade:
                         else RollbackStatus.NOT_NEEDED
                     ),
                     side_effects_may_remain=operation.has_side_effects(),
-                    warnings=(str(exc),),
+                    warnings=(_format_exception_warning(exc),),
                 )
             raise
         finally:

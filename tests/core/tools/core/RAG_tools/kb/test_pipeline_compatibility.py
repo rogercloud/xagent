@@ -601,6 +601,44 @@ async def test_web_ingestion_empty_file_handler_result_is_explicit_failure(
 
 
 @pytest.mark.asyncio
+async def test_web_ingestion_none_file_handler_path_uses_temp_file(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from xagent.core.tools.core.RAG_tools.pipelines import web_ingestion
+
+    operation_facade = KBOperationCompatibilityFacade()
+    facade = KBPipelineCompatibilityFacade(operation_compatibility=operation_facade)
+    monkeypatch.setattr(web_ingestion, "WebCrawler", _SinglePageCrawler)
+    captured: dict[str, object] = {}
+
+    def file_handler(
+        temp_file: Path, title: str, collection: str, url: str
+    ) -> dict[str, object]:
+        return {"file_path": None, "file_id": "file-1"}
+
+    def fake_run_document_ingestion(**kwargs: object) -> IngestionResult:
+        captured.update(kwargs)
+        return _successful_ingestion_result(doc_id="doc-ok")
+
+    monkeypatch.setattr(
+        web_ingestion,
+        "run_document_ingestion",
+        fake_run_document_ingestion,
+    )
+
+    result = await facade.run_web_ingestion(
+        "demo",
+        WebCrawlConfig(start_url="https://example.com", max_pages=1),
+        file_handler=file_handler,
+    )
+
+    assert result.status == "success"
+    assert captured["file_id"] == "file-1"
+    assert "xagent_web_ingest" in str(captured["source_path"])
+    assert str(captured["source_path"]).endswith(".md")
+
+
+@pytest.mark.asyncio
 async def test_web_ingestion_file_and_document_side_effects_share_page_child(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
