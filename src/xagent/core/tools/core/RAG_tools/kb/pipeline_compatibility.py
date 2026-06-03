@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Iterator
 from contextlib import contextmanager
-from typing import TYPE_CHECKING, Any, Callable, Mapping, Optional
+from typing import TYPE_CHECKING, Any, Callable, Mapping, Optional, cast
 
 from ..core.schemas import (
     IngestionConfig,
@@ -224,7 +224,7 @@ class KBPipelineCompatibilityFacade:
             details={"source_path": source_path, "file_id": file_id},
         ) as operation:
             with self._storage_context():
-                result = _run_document_ingestion_impl(
+                result: object = _run_document_ingestion_impl(
                     collection=collection,
                     source_path=source_path,
                     ingestion_config=ingestion_config,
@@ -235,6 +235,11 @@ class KBPipelineCompatibilityFacade:
                     metadata_source_path=metadata_source_path,
                     commit_gate=commit_gate,
                 )
+                # Phase-1 compatibility: _run_document_ingestion_impl() still calls
+                # the public process_document symbol, which legacy tests/callers may
+                # monkeypatch. Only structured results carry rollback metadata.
+                if not isinstance(result, IngestionResult):
+                    return cast(IngestionResult, result)
                 if operation is not None and operation.outcome is None:
                     self._record_document_ingestion_side_effects(
                         operation,

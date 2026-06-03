@@ -302,6 +302,39 @@ def test_process_document_records_failed_ingest_operation_outcome(
     ]
 
 
+def test_run_document_ingestion_preserves_legacy_non_result_boundary(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from xagent.core.tools.core.RAG_tools.pipelines import document_ingestion
+
+    expected_result = object()
+    facade = KBPipelineCompatibilityFacade(
+        storage_shim=_FakeStorageShim(_FakeMetadataStore(CollectionInfo(name="demo"))),
+        operation_compatibility=KBOperationCompatibilityFacade(),
+    )
+
+    def fake_run_document_ingestion_impl(**_: object) -> object:
+        return expected_result
+
+    def fail_if_called(*_: object, **__: object) -> None:
+        raise AssertionError("structured ingestion hooks should not run")
+
+    monkeypatch.setattr(
+        document_ingestion,
+        "_run_document_ingestion_impl",
+        fake_run_document_ingestion_impl,
+    )
+    monkeypatch.setattr(
+        facade, "_record_document_ingestion_side_effects", fail_if_called
+    )
+    monkeypatch.setattr(facade, "ensure_collection_backend_binding", fail_if_called)
+    monkeypatch.setattr(facade, "_finish_document_ingestion_outcome", fail_if_called)
+
+    result = facade.run_document_ingestion("demo", "/tmp/doc.md")
+
+    assert result is expected_result
+
+
 @pytest.mark.asyncio
 async def test_web_ingestion_records_page_child_outcomes_and_preserve_policy(
     monkeypatch: pytest.MonkeyPatch,
