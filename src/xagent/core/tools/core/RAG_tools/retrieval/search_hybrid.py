@@ -14,8 +14,8 @@ from ..core.schemas import (
     SearchResult,
     SearchWarning,
 )
-from ..retrieval.search_dense import _search_dense_impl
-from ..retrieval.search_sparse import _search_sparse_impl
+from .search_dense import _search_dense_impl
+from .search_sparse import _search_sparse_impl
 
 if TYPE_CHECKING:
     from ..kb import KBLegacyStepCompatibilityFacade

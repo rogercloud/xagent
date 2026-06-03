@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -525,7 +525,7 @@ class _SinglePageCrawler:
                 content_markdown="body",
                 status="success",
                 depth=0,
-                timestamp=datetime.utcnow(),
+                timestamp=datetime.now(timezone.utc),
                 content_length=4,
             )
         ]
