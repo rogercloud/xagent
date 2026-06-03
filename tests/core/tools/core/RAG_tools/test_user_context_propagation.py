@@ -8,7 +8,11 @@ from typing import Any
 import pytest
 
 from xagent.core.tools.core.RAG_tools.core.exceptions import VectorValidationError
-from xagent.core.tools.core.RAG_tools.core.schemas import SearchConfig, SearchType
+from xagent.core.tools.core.RAG_tools.core.schemas import (
+    IngestionResult,
+    SearchConfig,
+    SearchType,
+)
 from xagent.core.tools.core.RAG_tools.pipelines import (
     document_ingestion,
     document_search,
@@ -77,9 +81,9 @@ def test_run_document_ingestion_omitted_scope_falls_back_to_context(
     """Document ingestion entrypoint should use request scope when args are omitted."""
     captured: dict[str, Any] = {}
 
-    def _fake_process_document(*args: Any, **kwargs: Any) -> object:
+    def _fake_process_document(*args: Any, **kwargs: Any) -> IngestionResult:
         captured.update(kwargs)
-        return object()
+        return IngestionResult(status="success", message="ok")
 
     monkeypatch.setattr(document_ingestion, "process_document", _fake_process_document)
 
