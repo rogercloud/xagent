@@ -130,6 +130,27 @@ def _successful_ingestion_result(doc_id: str = "doc-ok") -> IngestionResult:
     )
 
 
+def test_step_metadata_preserves_present_step_with_empty_metadata() -> None:
+    empty_metadata_step = IngestionStepResult(name="initialize_collection")
+    none_metadata_step = IngestionStepResult.model_construct(
+        name="register_document", metadata=None
+    )
+
+    assert (
+        KBPipelineCompatibilityFacade._step_metadata(
+            [empty_metadata_step], "initialize_collection"
+        )
+        == {}
+    )
+    assert (
+        KBPipelineCompatibilityFacade._step_metadata(
+            [none_metadata_step], "register_document"
+        )
+        == {}
+    )
+    assert KBPipelineCompatibilityFacade._step_metadata([], "missing") is None
+
+
 def test_process_document_binds_collection_after_first_ingest(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -542,6 +563,40 @@ async def test_web_ingestion_file_handler_failure_records_page_child_outcome(
     assert child.operation_type == "web_page_ingestion"
     assert child.status == "error"
     assert child.rollback_status is RollbackStatus.INCOMPLETE
+    assert {step.plane for step in child.compensation_steps} == {SideEffectPlane.FILE}
+
+
+@pytest.mark.asyncio
+async def test_web_ingestion_empty_file_handler_result_is_explicit_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from xagent.core.tools.core.RAG_tools.pipelines import web_ingestion
+
+    operation_facade = KBOperationCompatibilityFacade()
+    facade = KBPipelineCompatibilityFacade(operation_compatibility=operation_facade)
+    monkeypatch.setattr(web_ingestion, "WebCrawler", _SinglePageCrawler)
+
+    def empty_file_handler(
+        temp_file: Path, title: str, collection: str, url: str
+    ) -> dict[str, str]:
+        return {}
+
+    result = await facade.run_web_ingestion(
+        "demo",
+        WebCrawlConfig(start_url="https://example.com", max_pages=1),
+        file_handler=empty_file_handler,
+    )
+
+    assert result.status == "error"
+    assert "File handler returned no file information" in next(
+        iter(result.failed_urls.values())
+    )
+    outcome = operation_facade.last_outcome
+    assert outcome is not None
+    assert outcome.rollback_status is RollbackStatus.INCOMPLETE
+    assert len(outcome.child_outcomes) == 1
+    child = outcome.child_outcomes[0]
+    assert child.status == "error"
     assert {step.plane for step in child.compensation_steps} == {SideEffectPlane.FILE}
 
 

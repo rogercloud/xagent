@@ -255,6 +255,10 @@ async def _run_web_ingestion_impl(
                                 collection,
                                 crawl_result.url,
                             )
+                            if not file_info:
+                                raise ValueError(
+                                    "File handler returned no file information"
+                                )
                             final_file_path = Path(
                                 file_info.get("file_path", temp_file)
                             )

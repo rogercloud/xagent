@@ -594,5 +594,5 @@ class KBPipelineCompatibilityFacade:
     ) -> dict[str, Any] | None:
         for step in completed_steps:
             if step.name == name:
-                return dict(step.metadata)
+                return dict(step.metadata or {})
         return None
