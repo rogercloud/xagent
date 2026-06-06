@@ -250,14 +250,20 @@ class KBToolCompatibilityFacade:
                 collection_info = CollectionInfo(name=collection, owners=owners)
 
             extra_metadata = dict(collection_info.extra_metadata or {})
-            if extra_metadata.get(KB_STORAGE_METADATA_KEY) is not None:
+            has_backend_binding = (
+                extra_metadata.get(KB_STORAGE_METADATA_KEY) is not None
+            )
+            owners = list(collection_info.owners)
+            has_owner = user_id is None or user_id in owners
+            if has_backend_binding and has_owner:
                 return collection_info
 
-            extra_metadata[KB_STORAGE_METADATA_KEY] = {
-                "backend": KBStorageBackend.LANCEDB.value
-            }
-            update: dict[str, Any] = {"extra_metadata": extra_metadata}
-            owners = list(collection_info.owners)
+            update: dict[str, Any] = {}
+            if not has_backend_binding:
+                extra_metadata[KB_STORAGE_METADATA_KEY] = {
+                    "backend": KBStorageBackend.LANCEDB.value
+                }
+                update["extra_metadata"] = extra_metadata
             if user_id is not None and user_id not in owners:
                 owners.append(user_id)
                 update["owners"] = owners

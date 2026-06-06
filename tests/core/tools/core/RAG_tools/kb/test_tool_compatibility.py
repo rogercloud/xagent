@@ -155,6 +155,24 @@ async def test_ensure_agent_collection_backend_binding_preserves_existing_bindin
     assert metadata_store.saved == []
 
 
+@pytest.mark.asyncio
+async def test_ensure_agent_collection_backend_binding_adds_owner_to_existing_binding():
+    existing = CollectionInfo(
+        name="demo",
+        owners=[3],
+        extra_metadata={"kb_storage": {"backend": "postgresql"}, "other": "kept"},
+    )
+    metadata_store = _FakeMetadataStore(existing)
+    facade = KBToolCompatibilityFacade(storage_shim=_FakeStorageShim(metadata_store))
+
+    result = await facade.ensure_agent_collection_backend_binding("demo", user_id=7)
+
+    assert result.owners == [3, 7]
+    assert result.extra_metadata["kb_storage"] == {"backend": "postgresql"}
+    assert result.extra_metadata["other"] == "kept"
+    assert metadata_store.saved == [result]
+
+
 def test_tool_factories_keep_names_models_and_async_only_sync_errors() -> None:
     facade = KBToolCompatibilityFacade()
 

@@ -205,9 +205,7 @@ async def _create_knowledge_base_from_file_impl(
             )
             try:
                 request_context = copy_context()
-                result = await loop.run_in_executor(
-                    None, lambda: request_context.run(func)
-                )
+                result = await loop.run_in_executor(None, request_context.run, func)
             except Exception as exc:
                 errors.append(
                     f"Failed to ingest {record.filename} due to unexpected error: {exc}"

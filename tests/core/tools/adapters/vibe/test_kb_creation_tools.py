@@ -154,7 +154,7 @@ async def test_agent_kb_service_prepare_collection_persists_config_and_sanitizes
 
 
 @pytest.mark.asyncio
-async def test_agent_kb_service_prepare_collection_preserves_existing_backend_binding():
+async def test_agent_kb_service_prepare_collection_preserves_existing_backend_binding_and_adds_owner():
     existing = CollectionInfo(
         name="agent url kb",
         extra_metadata={"kb_storage": {"backend": "postgresql"}, "other": "kept"},
@@ -176,8 +176,11 @@ async def test_agent_kb_service_prepare_collection_preserves_existing_backend_bi
 
     assert collection_name == "agent url kb"
     metadata_store.save_collection_config.assert_awaited_once()
-    metadata_store.save_collection.assert_not_awaited()
-    assert existing.extra_metadata["kb_storage"] == {"backend": "postgresql"}
+    metadata_store.save_collection.assert_awaited_once()
+    saved_collection = metadata_store.save_collection.await_args.args[0]
+    assert saved_collection.owners == [71]
+    assert saved_collection.extra_metadata["kb_storage"] == {"backend": "postgresql"}
+    assert saved_collection.extra_metadata["other"] == "kept"
 
 
 @pytest.mark.asyncio
