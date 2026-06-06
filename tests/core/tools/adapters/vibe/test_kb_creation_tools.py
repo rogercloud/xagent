@@ -112,6 +112,13 @@ def _successful_ingestion_result(doc_id: str = "doc-ok") -> IngestionResult:
     )
 
 
+def _fake_db_generator(db):
+    try:
+        yield db
+    finally:
+        db.close()
+
+
 @pytest.mark.asyncio
 async def test_agent_kb_service_prepare_collection_persists_config_and_sanitizes():
     metadata_store = MagicMock()
@@ -359,7 +366,7 @@ async def test_create_kb_from_file_uses_shared_service(tmp_path):
     db.query.return_value = query
 
     def fake_get_db():
-        yield db
+        yield from _fake_db_generator(db)
 
     ingest_result = IngestionResult(
         status="success",
@@ -407,6 +414,83 @@ async def test_create_kb_from_file_uses_shared_service(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_create_kb_from_file_continues_after_unexpected_ingest_error(tmp_path):
+    bad_file = tmp_path / "bad.txt"
+    good_file = tmp_path / "good.txt"
+    bad_file.write_text("bad", encoding="utf-8")
+    good_file.write_text("good", encoding="utf-8")
+    bad_record = SimpleNamespace(
+        filename="bad.txt",
+        storage_path=str(bad_file),
+        file_id="file-bad",
+    )
+    good_record = SimpleNamespace(
+        filename="good.txt",
+        storage_path=str(good_file),
+        file_id="file-good",
+    )
+
+    query = MagicMock()
+    query.filter.return_value = query
+    query.all.return_value = [bad_record, good_record]
+
+    db = MagicMock()
+    db.query.return_value = query
+
+    def fake_get_db():
+        yield from _fake_db_generator(db)
+
+    def fake_run_ingestion(*, source_path: str, file_id: str, **_: object):
+        if source_path == str(bad_file):
+            raise RuntimeError("parser exploded")
+        return IngestionResult(
+            status="success",
+            doc_id=f"doc-{file_id}",
+            parse_hash="parse-good",
+            chunk_count=2,
+            embedding_count=2,
+            vector_count=2,
+            completed_steps=[],
+            failed_step=None,
+            message="ok",
+            warnings=[],
+            file_id=file_id,
+        )
+
+    service = MagicMock()
+    service.prepare_collection = AsyncMock(return_value="agent_file_kb")
+    service.refresh_collection_metadata = AsyncMock()
+    run_ingestion = Mock(side_effect=fake_run_ingestion)
+
+    with (
+        patch("xagent.web.models.database.get_db", side_effect=fake_get_db),
+        patch(
+            "xagent.core.tools.adapters.vibe.agent_kb_service.AgentKnowledgeBaseService",
+            return_value=service,
+        ),
+        patch(
+            "xagent.core.tools.core.RAG_tools.pipelines.document_ingestion.run_document_ingestion",
+            new=run_ingestion,
+        ),
+    ):
+        tool = CreateKnowledgeBaseFromFileTool(user_id=71, is_admin=False)
+        result = await tool.run_json_async(
+            {"file_ids": ["file-bad", "file-good"], "collection_name": "agent_file_kb"}
+        )
+
+    assert result["success"] is True
+    assert result["collection_name"] == "agent_file_kb"
+    assert result["files_ingested"] == 1
+    assert (
+        "Failed to ingest bad.txt due to unexpected error: parser exploded"
+        in result["message"]
+    )
+    service.refresh_collection_metadata.assert_awaited_once_with("agent_file_kb")
+    assert run_ingestion.call_count == 2
+    db.close.assert_called_once()
+
+
+@pytest.mark.asyncio
 async def test_create_kb_from_file_failed_ingest_records_operation_outcome(
     tmp_path,
     monkeypatch,
@@ -430,7 +514,7 @@ async def test_create_kb_from_file_failed_ingest_records_operation_outcome(
     db.query.return_value = query
 
     def fake_get_db():
-        yield db
+        yield from _fake_db_generator(db)
 
     def fake_run_document_ingestion_impl(**_: object) -> IngestionResult:
         return IngestionResult(
@@ -526,7 +610,7 @@ async def test_create_kb_from_file_restores_durable_only_upload_before_ingestion
     db.query.return_value = query
 
     def fake_get_db():
-        yield db
+        yield from _fake_db_generator(db)
 
     ingest_result = IngestionResult(
         status="success",
@@ -591,7 +675,7 @@ async def test_create_kb_from_file_returns_error_when_metadata_refresh_fails(tmp
     db.query.return_value = query
 
     def fake_get_db():
-        yield db
+        yield from _fake_db_generator(db)
 
     ingest_result = IngestionResult(
         status="success",

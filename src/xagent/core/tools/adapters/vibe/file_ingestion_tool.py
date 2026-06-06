@@ -174,7 +174,17 @@ async def _create_knowledge_base_from_file_impl(
                     is_admin=is_admin,
                     file_id=str(record.file_id),
                 )
-                result = await loop.run_in_executor(None, func)
+                try:
+                    result = await loop.run_in_executor(None, func)
+                except Exception as exc:
+                    errors.append(
+                        f"Failed to ingest {record.filename} due to unexpected error: {exc}"
+                    )
+                    logger.exception(
+                        "Unexpected error ingesting file %s",
+                        record.filename,
+                    )
+                    continue
 
                 if result.status == "error":
                     errors.append(
@@ -213,7 +223,7 @@ async def _create_knowledge_base_from_file_impl(
             ).model_dump()
 
         finally:
-            db.close()
+            db_gen.close()
 
     except Exception as e:
         logger.exception("Error creating knowledge base from file: %s", e)
