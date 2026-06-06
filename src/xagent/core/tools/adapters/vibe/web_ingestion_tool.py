@@ -1,5 +1,5 @@
 import logging
-from typing import Any, Mapping, Optional, Type
+from typing import TYPE_CHECKING, Any, Mapping, Optional, Type
 
 from pydantic import BaseModel, Field, ValidationError
 
@@ -8,6 +8,9 @@ from .base import AbstractBaseTool, ToolCategory, ToolVisibility
 from .factory import register_tool
 
 logger = logging.getLogger(__name__)
+
+if TYPE_CHECKING:
+    from ...core.RAG_tools.kb import KBToolCompatibilityFacade
 
 
 class CreateKnowledgeBaseFromUrlArgs(BaseModel):
@@ -65,106 +68,129 @@ class CreateKnowledgeBaseFromUrlTool(AbstractBaseTool):
         raise NotImplementedError("Only supports async execution.")
 
     async def run_json_async(self, args: Mapping[str, Any]) -> Any:
-        try:
-            import time
+        return await _get_tool_compatibility_facade().create_knowledge_base_from_url(
+            args,
+            user_id=self.user_id,
+            is_admin=self.is_admin,
+        )
 
-            from ...core.RAG_tools.core.schemas import (
-                DEFAULT_EMBEDDING_MODEL_ID,
-                IngestionConfig,
-                WebCrawlConfig,
-            )
-            from ...core.RAG_tools.pipelines.web_ingestion import run_web_ingestion
-            from .agent_kb_service import AgentKnowledgeBaseService
 
-            tool_args = CreateKnowledgeBaseFromUrlArgs.model_validate(args)
+def _get_tool_compatibility_facade() -> "KBToolCompatibilityFacade":
+    """Return the coordinator-owned KB tool compatibility facade."""
+    from ...core.RAG_tools.kb import get_kb_coordinator
 
-            # Generate a safe collection name if not provided
-            if not tool_args.collection_name:
-                import hashlib
-                import re
+    return get_kb_coordinator().tool_compatibility
 
-                base_name = re.sub(
-                    r"[^a-zA-Z0-9_-]", "_", tool_args.url.split("//")[-1].split("/")[0]
-                )[:30]
-                url_hash = hashlib.md5(tool_args.url.encode()).hexdigest()[:6]
-                collection_name = f"{base_name}_{url_hash}_{int(time.time())}"
-            else:
-                collection_name = tool_args.collection_name
 
-            crawl_config = WebCrawlConfig(
-                start_url=tool_args.url,
-                max_pages=min(
-                    tool_args.max_pages, 50
-                ),  # Cap at 50 to avoid long blocking
-                max_depth=2,
-            )
+async def _create_knowledge_base_from_url_impl(
+    args: Mapping[str, Any],
+    *,
+    user_id: int,
+    is_admin: bool = False,
+) -> Any:
+    try:
+        import hashlib
+        import re
+        import time
 
-            ingest_config = IngestionConfig(
-                embedding_model_id=DEFAULT_EMBEDDING_MODEL_ID
-            )
-            kb_service = AgentKnowledgeBaseService(
-                user_id=self.user_id,
-                is_admin=self.is_admin,
-            )
-            collection_name = await kb_service.prepare_collection(
-                collection_name=collection_name,
-                ingestion_config=ingest_config,
-            )
+        from ...core.RAG_tools.core.schemas import (
+            DEFAULT_EMBEDDING_MODEL_ID,
+            IngestionConfig,
+            WebCrawlConfig,
+        )
+        from ...core.RAG_tools.pipelines.web_ingestion import run_web_ingestion
+        from .agent_kb_service import AgentKnowledgeBaseService
 
-            logger.info(
-                f"Starting background web ingestion for {tool_args.url} into {collection_name}"
-            )
+        tool_args = CreateKnowledgeBaseFromUrlArgs.model_validate(args)
 
-            # Run ingestion
-            result = await run_web_ingestion(
-                collection=collection_name,
-                crawl_config=crawl_config,
-                ingestion_config=ingest_config,
-                user_id=self.user_id,
-                is_admin=self.is_admin,
-            )
+        # Generate a safe collection name if not provided
+        if not tool_args.collection_name:
+            base_name = re.sub(
+                r"[^a-zA-Z0-9_-]", "_", tool_args.url.split("//")[-1].split("/")[0]
+            )[:30]
+            url_hash = hashlib.md5(tool_args.url.encode()).hexdigest()[:6]
+            collection_name = f"{base_name}_{url_hash}_{int(time.time())}"
+        else:
+            collection_name = tool_args.collection_name
 
-            if result.status == "error":
-                return CreateKnowledgeBaseFromUrlResult(
-                    success=False,
-                    collection_name=collection_name,
-                    message=f"Failed to crawl website: {result.message}",
-                    pages_crawled=0,
-                ).model_dump()
+        crawl_config = WebCrawlConfig(
+            start_url=tool_args.url,
+            max_pages=min(tool_args.max_pages, 50),
+            max_depth=2,
+        )
 
-            await kb_service.refresh_collection_metadata(collection_name)
+        ingest_config = IngestionConfig(embedding_model_id=DEFAULT_EMBEDDING_MODEL_ID)
+        kb_service = AgentKnowledgeBaseService(
+            user_id=user_id,
+            is_admin=is_admin,
+        )
+        collection_name = await kb_service.prepare_collection(
+            collection_name=collection_name,
+            ingestion_config=ingest_config,
+        )
 
-            return CreateKnowledgeBaseFromUrlResult(
-                success=True,
-                collection_name=collection_name,
-                message=f"Successfully imported website {tool_args.url} into knowledge base '{collection_name}'",
-                pages_crawled=result.pages_crawled,
-            ).model_dump()
-        except ValidationError as e:
-            errors = e.errors()
-            message = errors[0]["msg"] if errors else str(e)
-            if isinstance(message, str) and message.startswith("Value error, "):
-                message = message.removeprefix("Value error, ")
-            logger.warning("Invalid URL for knowledge base creation: %s", message)
+        logger.info(
+            "Starting background web ingestion for %s into %s",
+            tool_args.url,
+            collection_name,
+        )
+
+        result = await run_web_ingestion(
+            collection=collection_name,
+            crawl_config=crawl_config,
+            ingestion_config=ingest_config,
+            user_id=user_id,
+            is_admin=is_admin,
+        )
+
+        if result.status == "error":
             return CreateKnowledgeBaseFromUrlResult(
                 success=False,
-                collection_name="",
-                message=message,
+                collection_name=collection_name,
+                message=f"Failed to crawl website: {result.message}",
                 pages_crawled=0,
             ).model_dump()
 
-        except Exception as e:
-            logger.exception(f"Error creating knowledge base from URL: {e}")
-            return CreateKnowledgeBaseFromUrlResult(
-                success=False,
-                collection_name="",
-                message=str(e),
-                pages_crawled=0,
-            ).model_dump()
+        await kb_service.refresh_collection_metadata(collection_name)
+
+        return CreateKnowledgeBaseFromUrlResult(
+            success=True,
+            collection_name=collection_name,
+            message=f"Successfully imported website {tool_args.url} into knowledge base '{collection_name}'",
+            pages_crawled=result.pages_crawled,
+        ).model_dump()
+    except ValidationError as e:
+        errors = e.errors()
+        message = errors[0]["msg"] if errors else str(e)
+        if isinstance(message, str) and message.startswith("Value error, "):
+            message = message.removeprefix("Value error, ")
+        logger.warning("Invalid URL for knowledge base creation: %s", message)
+        return CreateKnowledgeBaseFromUrlResult(
+            success=False,
+            collection_name="",
+            message=message,
+            pages_crawled=0,
+        ).model_dump()
+
+    except Exception as e:
+        logger.exception("Error creating knowledge base from URL: %s", e)
+        return CreateKnowledgeBaseFromUrlResult(
+            success=False,
+            collection_name="",
+            message=str(e),
+            pages_crawled=0,
+        ).model_dump()
 
 
 @register_tool(categories={"knowledge"})
 async def create_web_ingestion_tools(config: WebToolConfig) -> list[AbstractBaseTool]:
+    """Create web ingestion tools."""
+    return await _get_tool_compatibility_facade().create_web_ingestion_tools(config)
+
+
+async def _create_web_ingestion_tools_impl(
+    config: WebToolConfig,
+) -> list[AbstractBaseTool]:
     """Create web ingestion tools."""
     try:
         user_id = config.get_user_id()

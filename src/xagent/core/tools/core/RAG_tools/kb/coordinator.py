@@ -28,6 +28,7 @@ from .parse_display_compatibility import KBParseDisplayCompatibilityFacade
 from .pipeline_compatibility import KBPipelineCompatibilityFacade
 from .retrieval_compatibility import KBRetrievalHelperCompatibilityFacade
 from .storage_shim import KBStorageShimCompatibilityFacade
+from .tool_compatibility import KBToolCompatibilityFacade
 from .vector_storage_compatibility import KBVectorStorageCompatibilityFacade
 from .version_compatibility import KBVersionCompatibilityFacade
 
@@ -56,6 +57,7 @@ class KBCoordinator:
         operation_compatibility: KBOperationCompatibilityFacade | None = None,
         pipeline_compatibility: KBPipelineCompatibilityFacade | None = None,
         legacy_step_compatibility: KBLegacyStepCompatibilityFacade | None = None,
+        tool_compatibility: KBToolCompatibilityFacade | None = None,
     ) -> None:
         self._storage_factory = storage_factory or StorageFactory.get_factory()
         self._handle_provider = handle_provider or KBHandleProvider()
@@ -94,6 +96,9 @@ class KBCoordinator:
         self._legacy_step_compatibility = (
             legacy_step_compatibility
             or KBLegacyStepCompatibilityFacade(coordinator=self)
+        )
+        self._tool_compatibility = tool_compatibility or KBToolCompatibilityFacade(
+            coordinator=self
         )
 
     @property
@@ -195,6 +200,16 @@ class KBCoordinator:
     def legacy_steps(self) -> KBLegacyStepCompatibilityFacade:
         """Backward-friendly short alias for the legacy step facade."""
         return self._legacy_step_compatibility
+
+    @property
+    def tool_compatibility(self) -> KBToolCompatibilityFacade:
+        """Return the agent/tool compatibility facade."""
+        return self._tool_compatibility
+
+    @property
+    def tools(self) -> KBToolCompatibilityFacade:
+        """Backward-friendly short alias for the tool facade."""
+        return self._tool_compatibility
 
     async def get_context(self, request: KBContextRequest) -> KBCollectionContext:
         """Resolve collection, caller scope, stores, backend, and capabilities."""

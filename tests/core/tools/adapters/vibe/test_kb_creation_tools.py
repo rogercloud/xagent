@@ -17,6 +17,7 @@ from xagent.core.tools.adapters.vibe.web_ingestion_tool import (
 )
 from xagent.core.tools.core.RAG_tools.core.schemas import (
     DEFAULT_EMBEDDING_MODEL_ID,
+    CollectionInfo,
     IngestionConfig,
     IngestionResult,
     WebIngestionResult,
@@ -27,6 +28,10 @@ from xagent.core.tools.core.RAG_tools.core.schemas import (
 async def test_agent_kb_service_prepare_collection_persists_config_and_sanitizes():
     metadata_store = MagicMock()
     metadata_store.save_collection_config = AsyncMock()
+    metadata_store.get_collection = AsyncMock(
+        side_effect=ValueError("Collection 'agent url kb' not found")
+    )
+    metadata_store.save_collection = AsyncMock()
     service = AgentKnowledgeBaseService(user_id=71, is_admin=False)
     ingest_config = IngestionConfig(embedding_model_id=DEFAULT_EMBEDDING_MODEL_ID)
 
@@ -46,6 +51,37 @@ async def test_agent_kb_service_prepare_collection_persists_config_and_sanitizes
     assert json.loads(save_kwargs["config_json"]) == {
         "embedding_model_id": DEFAULT_EMBEDDING_MODEL_ID
     }
+    metadata_store.save_collection.assert_awaited_once()
+    saved_collection = metadata_store.save_collection.await_args.args[0]
+    assert saved_collection.name == "agent url kb"
+    assert saved_collection.extra_metadata["kb_storage"] == {"backend": "lancedb"}
+
+
+@pytest.mark.asyncio
+async def test_agent_kb_service_prepare_collection_preserves_existing_backend_binding():
+    existing = CollectionInfo(
+        name="agent url kb",
+        extra_metadata={"kb_storage": {"backend": "postgresql"}, "other": "kept"},
+    )
+    metadata_store = MagicMock()
+    metadata_store.save_collection_config = AsyncMock()
+    metadata_store.get_collection = AsyncMock(return_value=existing)
+    metadata_store.save_collection = AsyncMock()
+    service = AgentKnowledgeBaseService(user_id=71, is_admin=False)
+    ingest_config = IngestionConfig(embedding_model_id=DEFAULT_EMBEDDING_MODEL_ID)
+
+    with patch(
+        "xagent.core.tools.core.RAG_tools.storage.factory.get_metadata_store",
+        return_value=metadata_store,
+    ):
+        collection_name = await service.prepare_collection(
+            "agent url kb", ingest_config
+        )
+
+    assert collection_name == "agent url kb"
+    metadata_store.save_collection_config.assert_awaited_once()
+    metadata_store.save_collection.assert_not_awaited()
+    assert existing.extra_metadata["kb_storage"] == {"backend": "postgresql"}
 
 
 @pytest.mark.asyncio

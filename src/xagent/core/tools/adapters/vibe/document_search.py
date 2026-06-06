@@ -1,7 +1,7 @@
 """Knowledge base search tools for Vibe agents."""
 
 import logging
-from typing import Any, Mapping, Optional, Type
+from typing import TYPE_CHECKING, Any, Mapping, Optional, Type
 
 from pydantic import BaseModel
 
@@ -10,12 +10,20 @@ from ...core.document_search import (
     KnowledgeSearchResult,
     ListKnowledgeBasesArgs,
     ListKnowledgeBasesResult,
-    list_knowledge_bases,
-    search_knowledge_base,
 )
 from .base import AbstractBaseTool, ToolCategory, ToolVisibility
 
 logger = logging.getLogger(__name__)
+
+if TYPE_CHECKING:
+    from ...core.RAG_tools.kb import KBToolCompatibilityFacade
+
+
+def _get_tool_compatibility_facade() -> "KBToolCompatibilityFacade":
+    """Return the coordinator-owned KB tool compatibility facade."""
+    from ...core.RAG_tools.kb import get_kb_coordinator
+
+    return get_kb_coordinator().tool_compatibility
 
 
 class ListKnowledgeBasesTool(AbstractBaseTool):
@@ -64,12 +72,25 @@ class ListKnowledgeBasesTool(AbstractBaseTool):
             args = dict(args)
             args.setdefault("allowed_collections", self.allowed_collections)
         tool_args = ListKnowledgeBasesArgs.model_validate(args)
-        return await list_knowledge_bases(
+        return await _get_tool_compatibility_facade().list_knowledge_bases(
             tool_args, user_id=self.user_id, is_admin=self.is_admin
         )
 
 
 def get_list_knowledge_bases_tool(
+    allowed_collections: Optional[list[str]] = None,
+    user_id: Optional[int] = None,
+    is_admin: bool = False,
+) -> ListKnowledgeBasesTool:
+    """Create a tool to list all knowledge bases through the tool facade."""
+    return _get_tool_compatibility_facade().get_list_knowledge_bases_tool(
+        allowed_collections=allowed_collections,
+        user_id=user_id,
+        is_admin=is_admin,
+    )
+
+
+def _get_list_knowledge_bases_tool_impl(
     allowed_collections: Optional[list[str]] = None,
     user_id: Optional[int] = None,
     is_admin: bool = False,
@@ -151,12 +172,27 @@ class KnowledgeSearchTool(AbstractBaseTool):
             )
 
         tool_args = KnowledgeSearchArgs.model_validate(args)
-        return await search_knowledge_base(
+        return await _get_tool_compatibility_facade().search_knowledge_base(
             tool_args, user_id=self.user_id, is_admin=self.is_admin
         )
 
 
 def get_knowledge_search_tool(
+    embedding_model_id: Optional[str] = None,
+    allowed_collections: Optional[list[str]] = None,
+    user_id: Optional[int] = None,
+    is_admin: bool = False,
+) -> KnowledgeSearchTool:
+    """Create a knowledge base search tool through the tool facade."""
+    return _get_tool_compatibility_facade().get_knowledge_search_tool(
+        embedding_model_id=embedding_model_id,
+        allowed_collections=allowed_collections,
+        user_id=user_id,
+        is_admin=is_admin,
+    )
+
+
+def _get_knowledge_search_tool_impl(
     embedding_model_id: Optional[str] = None,
     allowed_collections: Optional[list[str]] = None,
     user_id: Optional[int] = None,

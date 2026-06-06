@@ -34,6 +34,7 @@ from .parse_display_compatibility import KBParseDisplayCompatibilityFacade
 from .pipeline_compatibility import KBPipelineCompatibilityFacade
 from .retrieval_compatibility import KBRetrievalHelperCompatibilityFacade
 from .storage_shim import KBStorageShimCompatibilityFacade
+from .tool_compatibility import KBToolCompatibilityFacade
 from .vector_storage_compatibility import (
     KBVectorStorageCleanupResult,
     KBVectorStorageCompatibilityFacade,
@@ -71,6 +72,7 @@ __all__ = [
     "KBStorageBackend",
     "KBVectorStorageCleanupResult",
     "KBVectorStorageCompatibilityFacade",
+    "KBToolCompatibilityFacade",
     "KBUserScope",
     "KBVersionCompatibilityFacade",
     "LanceDBCollectionHandle",

@@ -1,7 +1,7 @@
 """Core document search functionality for RAG pipelines."""
 
 import logging
-from typing import Any, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 from pydantic import BaseModel, Field
 
@@ -9,6 +9,16 @@ from .RAG_tools.management.collections import list_collections
 from .RAG_tools.pipelines.document_search import run_document_search
 
 logger = logging.getLogger(__name__)
+
+if TYPE_CHECKING:
+    from .RAG_tools.kb import KBToolCompatibilityFacade
+
+
+def _get_tool_compatibility_facade() -> "KBToolCompatibilityFacade":
+    """Return the coordinator-owned tool compatibility facade."""
+    from .RAG_tools.kb import get_kb_coordinator
+
+    return get_kb_coordinator().tool_compatibility
 
 
 class ListKnowledgeBasesArgs(BaseModel):
@@ -75,6 +85,19 @@ async def list_knowledge_bases(
     user_id: Optional[int] = None,
     is_admin: bool = False,
 ) -> ListKnowledgeBasesResult:
+    """List all available knowledge bases through the tool compatibility facade."""
+    return await _get_tool_compatibility_facade().list_knowledge_bases(
+        tool_args,
+        user_id=user_id,
+        is_admin=is_admin,
+    )
+
+
+async def _list_knowledge_bases_impl(
+    tool_args: ListKnowledgeBasesArgs,
+    user_id: Optional[int] = None,
+    is_admin: bool = False,
+) -> ListKnowledgeBasesResult:
     """List all available knowledge bases with their statistics.
 
     Args:
@@ -123,6 +146,19 @@ async def find_missing_knowledge_bases(
     user_id: Optional[int] = None,
     is_admin: bool = False,
 ) -> List[str]:
+    """Return missing KB names through the tool compatibility facade."""
+    return await _get_tool_compatibility_facade().find_missing_knowledge_bases(
+        knowledge_bases,
+        user_id=user_id,
+        is_admin=is_admin,
+    )
+
+
+async def _find_missing_knowledge_bases_impl(
+    knowledge_bases: List[str],
+    user_id: Optional[int] = None,
+    is_admin: bool = False,
+) -> List[str]:
     """Return requested knowledge base names that are not visible to the user."""
     requested = [name.strip() for name in knowledge_bases if name and name.strip()]
     if not requested:
@@ -134,6 +170,19 @@ async def find_missing_knowledge_bases(
 
 
 async def search_knowledge_base(
+    tool_args: KnowledgeSearchArgs,
+    user_id: Optional[int] = None,
+    is_admin: bool = False,
+) -> KnowledgeSearchResult:
+    """Search across knowledge bases through the tool compatibility facade."""
+    return await _get_tool_compatibility_facade().search_knowledge_base(
+        tool_args,
+        user_id=user_id,
+        is_admin=is_admin,
+    )
+
+
+async def _search_knowledge_base_impl(
     tool_args: KnowledgeSearchArgs,
     user_id: Optional[int] = None,
     is_admin: bool = False,
