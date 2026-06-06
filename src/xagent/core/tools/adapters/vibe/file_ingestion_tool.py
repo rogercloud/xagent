@@ -2,6 +2,7 @@ import asyncio
 import logging
 import re
 import time
+from contextvars import copy_context
 from functools import partial
 from pathlib import Path
 from types import SimpleNamespace
@@ -193,7 +194,10 @@ async def _create_knowledge_base_from_file_impl(
                 file_id=str(record.file_id),
             )
             try:
-                result = await loop.run_in_executor(None, func)
+                request_context = copy_context()
+                result = await loop.run_in_executor(
+                    None, lambda: request_context.run(func)
+                )
             except Exception as exc:
                 errors.append(
                     f"Failed to ingest {record.filename} due to unexpected error: {exc}"

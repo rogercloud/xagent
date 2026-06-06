@@ -590,6 +590,69 @@ async def test_create_kb_from_file_failed_ingest_records_operation_outcome(
 
 
 @pytest.mark.asyncio
+async def test_create_kb_from_file_preserves_storage_context_in_executor(
+    tmp_path,
+    monkeypatch,
+):
+    from xagent.core.tools.core.RAG_tools import kb as kb_module
+    from xagent.core.tools.core.RAG_tools.pipelines import document_ingestion
+    from xagent.core.tools.core.RAG_tools.storage.factory import (
+        get_bound_storage_shim_for_current_context,
+    )
+
+    source_file = tmp_path / "notes.txt"
+    source_file.write_text("hello", encoding="utf-8")
+    file_record = SimpleNamespace(
+        filename="notes.txt",
+        storage_path=str(source_file),
+        file_id="file-1",
+    )
+
+    query = MagicMock()
+    query.filter.return_value = query
+    query.all.return_value = [file_record]
+
+    db = MagicMock()
+    db.query.return_value = query
+
+    def fake_get_db():
+        yield from _fake_db_generator(db)
+
+    metadata_store = _FakeMetadataStore(CollectionInfo(name="agent_file_kb"))
+    coordinator = KBCoordinator(
+        storage_shim=_FakeStorageShim(metadata_store),
+        operation_compatibility=_RecordingOperationFacade(),
+    )
+
+    def fake_run_document_ingestion_impl(**_: object) -> IngestionResult:
+        assert get_bound_storage_shim_for_current_context() is coordinator.storage_shim
+        return _successful_ingestion_result("doc-1")
+
+    monkeypatch.setattr(kb_module, "get_kb_coordinator", lambda: coordinator)
+    monkeypatch.setattr(
+        document_ingestion,
+        "_run_document_ingestion_impl",
+        fake_run_document_ingestion_impl,
+    )
+
+    with (
+        patch("xagent.web.models.database.get_db", side_effect=fake_get_db),
+        patch(
+            "xagent.web.services.managed_file_ref.ensure_uploaded_file_local_path",
+            return_value=source_file,
+        ),
+    ):
+        tool = CreateKnowledgeBaseFromFileTool(user_id=71, is_admin=False)
+        result = await tool.run_json_async(
+            {"file_ids": ["file-1"], "collection_name": "agent_file_kb"}
+        )
+
+    assert result["success"] is True
+    assert result["files_ingested"] == 1
+    db.close.assert_called_once()
+
+
+@pytest.mark.asyncio
 async def test_create_kb_from_file_restores_durable_only_upload_before_ingestion(
     tmp_path,
 ):
