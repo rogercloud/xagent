@@ -11,6 +11,7 @@ from .models import KBStorageBackend
 from .pipeline_compatibility import KB_STORAGE_METADATA_KEY
 
 if TYPE_CHECKING:
+    from ......web.tools.config import WebToolConfig
     from ....adapters.vibe.base import AbstractBaseTool
     from ....adapters.vibe.config import BaseToolConfig
     from ....adapters.vibe.document_search import (
@@ -23,7 +24,6 @@ if TYPE_CHECKING:
         ListKnowledgeBasesArgs,
         ListKnowledgeBasesResult,
     )
-    from ......web.tools.config import WebToolConfig
     from .coordinator import KBCoordinator
     from .storage_shim import KBStorageShimCompatibilityFacade
 
