@@ -212,7 +212,6 @@ class KBToolCompatibilityFacade:
             )
             await self.ensure_agent_collection_backend_binding(
                 safe_collection,
-                user_id=user_id,
             )
             return safe_collection
 
@@ -235,8 +234,6 @@ class KBToolCompatibilityFacade:
     async def ensure_agent_collection_backend_binding(
         self,
         collection: str,
-        *,
-        user_id: Optional[int] = None,
     ) -> CollectionInfo:
         """Create a collection-level backend binding for agent/tool-created KBs."""
         from ..storage.factory import get_metadata_store
@@ -246,27 +243,17 @@ class KBToolCompatibilityFacade:
             try:
                 collection_info = await metadata_store.get_collection(collection)
             except ValueError:
-                owners = [user_id] if user_id is not None else []
-                collection_info = CollectionInfo(name=collection, owners=owners)
+                collection_info = CollectionInfo(name=collection)
 
             extra_metadata = dict(collection_info.extra_metadata or {})
-            has_backend_binding = (
-                extra_metadata.get(KB_STORAGE_METADATA_KEY) is not None
-            )
-            owners = list(collection_info.owners)
-            has_owner = user_id is None or user_id in owners
-            if has_backend_binding and has_owner:
+            if extra_metadata.get(KB_STORAGE_METADATA_KEY) is not None:
                 return collection_info
 
-            update: dict[str, Any] = {}
-            if not has_backend_binding:
-                extra_metadata[KB_STORAGE_METADATA_KEY] = {
-                    "backend": KBStorageBackend.LANCEDB.value
-                }
-                update["extra_metadata"] = extra_metadata
-            if user_id is not None and user_id not in owners:
-                owners.append(user_id)
-                update["owners"] = owners
-            updated_collection = collection_info.model_copy(update=update)
+            extra_metadata[KB_STORAGE_METADATA_KEY] = {
+                "backend": KBStorageBackend.LANCEDB.value
+            }
+            updated_collection = collection_info.model_copy(
+                update={"extra_metadata": extra_metadata}
+            )
             await metadata_store.save_collection(updated_collection)
             return updated_collection

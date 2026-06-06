@@ -93,16 +93,18 @@ async def test_ensure_agent_collection_backend_binding_creates_missing_metadata(
     metadata_store = _FakeMetadataStore(None)
     facade = KBToolCompatibilityFacade(storage_shim=_FakeStorageShim(metadata_store))
 
-    updated = await facade.ensure_agent_collection_backend_binding("demo", user_id=7)
+    updated = await facade.ensure_agent_collection_backend_binding("demo")
 
     assert updated.name == "demo"
-    assert updated.owners == [7]
+    assert updated.owners == []
     assert updated.extra_metadata["kb_storage"] == {"backend": "lancedb"}
     assert metadata_store.saved == [updated]
 
 
 @pytest.mark.asyncio
-async def test_prepare_agent_collection_passes_owner_to_backend_binding(monkeypatch):
+async def test_prepare_agent_collection_saves_user_config_before_backend_binding(
+    monkeypatch,
+):
     from xagent.core.tools.adapters.vibe import agent_kb_service
 
     metadata_store = _FakeMetadataStore(None)
@@ -132,7 +134,7 @@ async def test_prepare_agent_collection_passes_owner_to_backend_binding(monkeypa
 
     assert collection == "demo"
     assert prepare_calls == [7]
-    assert metadata_store.saved[-1].owners == [7]
+    assert metadata_store.saved[-1].owners == []
     assert metadata_store.saved[-1].extra_metadata["kb_storage"] == {
         "backend": "lancedb"
     }
@@ -156,7 +158,7 @@ async def test_ensure_agent_collection_backend_binding_preserves_existing_bindin
 
 
 @pytest.mark.asyncio
-async def test_ensure_agent_collection_backend_binding_adds_owner_to_existing_binding():
+async def test_ensure_agent_collection_backend_binding_preserves_existing_owners():
     existing = CollectionInfo(
         name="demo",
         owners=[3],
@@ -165,12 +167,13 @@ async def test_ensure_agent_collection_backend_binding_adds_owner_to_existing_bi
     metadata_store = _FakeMetadataStore(existing)
     facade = KBToolCompatibilityFacade(storage_shim=_FakeStorageShim(metadata_store))
 
-    result = await facade.ensure_agent_collection_backend_binding("demo", user_id=7)
+    result = await facade.ensure_agent_collection_backend_binding("demo")
 
-    assert result.owners == [3, 7]
+    assert result is existing
+    assert result.owners == [3]
     assert result.extra_metadata["kb_storage"] == {"backend": "postgresql"}
     assert result.extra_metadata["other"] == "kept"
-    assert metadata_store.saved == [result]
+    assert metadata_store.saved == []
 
 
 def test_tool_factories_keep_names_models_and_async_only_sync_errors() -> None:

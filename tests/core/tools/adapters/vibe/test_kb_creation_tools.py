@@ -154,7 +154,7 @@ async def test_agent_kb_service_prepare_collection_persists_config_and_sanitizes
 
 
 @pytest.mark.asyncio
-async def test_agent_kb_service_prepare_collection_preserves_existing_backend_binding_and_adds_owner():
+async def test_agent_kb_service_prepare_collection_preserves_existing_backend_binding():
     existing = CollectionInfo(
         name="agent url kb",
         extra_metadata={"kb_storage": {"backend": "postgresql"}, "other": "kept"},
@@ -176,11 +176,9 @@ async def test_agent_kb_service_prepare_collection_preserves_existing_backend_bi
 
     assert collection_name == "agent url kb"
     metadata_store.save_collection_config.assert_awaited_once()
-    metadata_store.save_collection.assert_awaited_once()
-    saved_collection = metadata_store.save_collection.await_args.args[0]
-    assert saved_collection.owners == [71]
-    assert saved_collection.extra_metadata["kb_storage"] == {"backend": "postgresql"}
-    assert saved_collection.extra_metadata["other"] == "kept"
+    metadata_store.save_collection.assert_not_awaited()
+    assert existing.extra_metadata["kb_storage"] == {"backend": "postgresql"}
+    assert existing.extra_metadata["other"] == "kept"
 
 
 @pytest.mark.asyncio
@@ -572,8 +570,10 @@ async def test_create_kb_from_file_failed_ingest_records_operation_outcome(
     assert result["success"] is False
     assert result["collection_name"] == "agent_file_kb"
     assert "embedding failed" in result["message"]
+    assert metadata_store.saved_configs[-1]["collection"] == "agent_file_kb"
+    assert metadata_store.saved_configs[-1]["user_id"] == 71
     assert metadata_store.saved_collections
-    assert metadata_store.saved_collections[-1].owners == [71]
+    assert metadata_store.saved_collections[-1].owners == []
     assert metadata_store.saved_collections[-1].extra_metadata["kb_storage"] == {
         "backend": "lancedb"
     }
@@ -879,8 +879,10 @@ async def test_create_kb_from_url_partial_failure_preserves_pipeline_policy(
         "message": "Successfully imported website https://example.com into knowledge base 'agent_url_kb'",
         "pages_crawled": 2,
     }
+    assert metadata_store.saved_configs[-1]["collection"] == "agent_url_kb"
+    assert metadata_store.saved_configs[-1]["user_id"] == 71
     assert metadata_store.saved_collections
-    assert metadata_store.saved_collections[-1].owners == [71]
+    assert metadata_store.saved_collections[-1].owners == []
     assert metadata_store.saved_collections[-1].extra_metadata["kb_storage"] == {
         "backend": "lancedb"
     }
