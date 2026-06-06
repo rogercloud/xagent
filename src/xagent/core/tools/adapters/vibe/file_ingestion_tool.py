@@ -3,10 +3,10 @@ import logging
 import re
 import time
 from contextvars import copy_context
+from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
-from types import SimpleNamespace
-from typing import TYPE_CHECKING, Any, List, Mapping, Optional, Type, cast
+from typing import TYPE_CHECKING, Any, List, Mapping, Optional, Type
 
 from pydantic import BaseModel, Field
 
@@ -18,6 +18,18 @@ logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from ...core.RAG_tools.kb import KBToolCompatibilityFacade
+
+
+@dataclass(frozen=True)
+class UploadedFileSnapshot:
+    """Scalar upload metadata retained after closing the DB session."""
+
+    file_id: str
+    filename: str
+    storage_path: str
+    storage_key: str | None
+    storage_status: str | None
+    checksum: str | None
 
 
 class CreateKnowledgeBaseFromFileArgs(BaseModel):
@@ -84,8 +96,8 @@ def _get_tool_compatibility_facade() -> "KBToolCompatibilityFacade":
     return get_kb_coordinator().tool_compatibility
 
 
-def _snapshot_uploaded_file_record(record: Any) -> SimpleNamespace:
-    return SimpleNamespace(
+def _snapshot_uploaded_file_record(record: Any) -> UploadedFileSnapshot:
+    return UploadedFileSnapshot(
         file_id=str(record.file_id),
         filename=str(record.filename),
         storage_path=str(record.storage_path),
@@ -169,9 +181,7 @@ async def _create_knowledge_base_from_file_impl(
 
         for record in file_records:
             try:
-                source_path = ensure_uploaded_file_local_path(
-                    cast(UploadedFile, record)
-                )
+                source_path = ensure_uploaded_file_local_path(record)
             except DurableStorageOperationError as exc:
                 errors.append(
                     f"Failed to restore {record.filename} from durable storage: {exc}"

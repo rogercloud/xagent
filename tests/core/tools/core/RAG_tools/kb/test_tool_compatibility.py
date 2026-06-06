@@ -12,7 +12,10 @@ from xagent.core.tools.adapters.vibe.document_search import (
     KnowledgeSearchTool,
     ListKnowledgeBasesTool,
 )
-from xagent.core.tools.core.RAG_tools.core.schemas import CollectionInfo
+from xagent.core.tools.core.RAG_tools.core.schemas import (
+    CollectionInfo,
+    IngestionConfig,
+)
 from xagent.core.tools.core.RAG_tools.kb import (
     KBCoordinator,
     KBToolCompatibilityFacade,
@@ -90,11 +93,49 @@ async def test_ensure_agent_collection_backend_binding_creates_missing_metadata(
     metadata_store = _FakeMetadataStore(None)
     facade = KBToolCompatibilityFacade(storage_shim=_FakeStorageShim(metadata_store))
 
-    updated = await facade.ensure_agent_collection_backend_binding("demo")
+    updated = await facade.ensure_agent_collection_backend_binding("demo", user_id=7)
 
     assert updated.name == "demo"
+    assert updated.owners == [7]
     assert updated.extra_metadata["kb_storage"] == {"backend": "lancedb"}
     assert metadata_store.saved == [updated]
+
+
+@pytest.mark.asyncio
+async def test_prepare_agent_collection_passes_owner_to_backend_binding(monkeypatch):
+    from xagent.core.tools.adapters.vibe import agent_kb_service
+
+    metadata_store = _FakeMetadataStore(None)
+    facade = KBToolCompatibilityFacade(storage_shim=_FakeStorageShim(metadata_store))
+    prepare_calls: list[int] = []
+
+    async def fake_prepare_collection_impl(
+        *,
+        collection_name: str,
+        ingestion_config: IngestionConfig,
+        user_id: int,
+    ) -> str:
+        prepare_calls.append(user_id)
+        return collection_name
+
+    monkeypatch.setattr(
+        agent_kb_service,
+        "_prepare_collection_impl",
+        fake_prepare_collection_impl,
+    )
+
+    collection = await facade.prepare_agent_collection(
+        collection_name="demo",
+        ingestion_config=IngestionConfig(),
+        user_id=7,
+    )
+
+    assert collection == "demo"
+    assert prepare_calls == [7]
+    assert metadata_store.saved[-1].owners == [7]
+    assert metadata_store.saved[-1].extra_metadata["kb_storage"] == {
+        "backend": "lancedb"
+    }
 
 
 @pytest.mark.asyncio

@@ -12,6 +12,7 @@ from xagent.core.tools.adapters.vibe.agent_kb_service import (
 )
 from xagent.core.tools.adapters.vibe.file_ingestion_tool import (
     CreateKnowledgeBaseFromFileTool,
+    UploadedFileSnapshot,
 )
 from xagent.core.tools.adapters.vibe.web_ingestion_tool import (
     CreateKnowledgeBaseFromUrlTool,
@@ -569,6 +570,7 @@ async def test_create_kb_from_file_failed_ingest_records_operation_outcome(
     assert result["collection_name"] == "agent_file_kb"
     assert "embedding failed" in result["message"]
     assert metadata_store.saved_collections
+    assert metadata_store.saved_collections[-1].owners == [71]
     assert metadata_store.saved_collections[-1].extra_metadata["kb_storage"] == {
         "backend": "lancedb"
     }
@@ -677,6 +679,7 @@ async def test_create_kb_from_file_restores_durable_only_upload_before_ingestion
 
     def fake_ensure_local(record):
         db.close.assert_called_once()
+        assert isinstance(record, UploadedFileSnapshot)
         assert record.filename == file_record.filename
         assert record.storage_path == file_record.storage_path
         assert record.file_id == file_record.file_id
@@ -874,6 +877,7 @@ async def test_create_kb_from_url_partial_failure_preserves_pipeline_policy(
         "pages_crawled": 2,
     }
     assert metadata_store.saved_collections
+    assert metadata_store.saved_collections[-1].owners == [71]
     assert metadata_store.saved_collections[-1].extra_metadata["kb_storage"] == {
         "backend": "lancedb"
     }

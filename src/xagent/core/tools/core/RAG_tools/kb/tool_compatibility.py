@@ -210,7 +210,10 @@ class KBToolCompatibilityFacade:
                 ingestion_config=ingestion_config,
                 user_id=user_id,
             )
-            await self.ensure_agent_collection_backend_binding(safe_collection)
+            await self.ensure_agent_collection_backend_binding(
+                safe_collection,
+                user_id=user_id,
+            )
             return safe_collection
 
     async def refresh_agent_collection_metadata(
@@ -232,6 +235,8 @@ class KBToolCompatibilityFacade:
     async def ensure_agent_collection_backend_binding(
         self,
         collection: str,
+        *,
+        user_id: Optional[int] = None,
     ) -> CollectionInfo:
         """Create a collection-level backend binding for agent/tool-created KBs."""
         from ..storage.factory import get_metadata_store
@@ -241,7 +246,8 @@ class KBToolCompatibilityFacade:
             try:
                 collection_info = await metadata_store.get_collection(collection)
             except ValueError:
-                collection_info = CollectionInfo(name=collection)
+                owners = [user_id] if user_id is not None else []
+                collection_info = CollectionInfo(name=collection, owners=owners)
 
             extra_metadata = dict(collection_info.extra_metadata or {})
             if extra_metadata.get(KB_STORAGE_METADATA_KEY) is not None:
@@ -250,8 +256,11 @@ class KBToolCompatibilityFacade:
             extra_metadata[KB_STORAGE_METADATA_KEY] = {
                 "backend": KBStorageBackend.LANCEDB.value
             }
-            updated_collection = collection_info.model_copy(
-                update={"extra_metadata": extra_metadata}
-            )
+            update: dict[str, Any] = {"extra_metadata": extra_metadata}
+            owners = list(collection_info.owners)
+            if user_id is not None and user_id not in owners:
+                owners.append(user_id)
+                update["owners"] = owners
+            updated_collection = collection_info.model_copy(update=update)
             await metadata_store.save_collection(updated_collection)
             return updated_collection

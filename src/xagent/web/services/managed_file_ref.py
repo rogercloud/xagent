@@ -8,7 +8,7 @@ import mimetypes
 import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, BinaryIO, Literal, NoReturn
+from typing import Any, BinaryIO, Literal, NoReturn, Protocol
 
 from ...core.file_storage import FsspecFileStorage, StoredObject, get_file_storage
 from ..models.uploaded_file import UploadedFile
@@ -29,6 +29,28 @@ class DurableStorageOperationError(RuntimeError):
 
 class DurableObjectIntegrityError(DurableStorageOperationError):
     """Raised when restored durable bytes do not match the DB checksum."""
+
+
+class UploadedFileLocalPathRecord(Protocol):
+    """Fields needed to restore or locate an uploaded file without an ORM session."""
+
+    @property
+    def file_id(self) -> Any: ...
+
+    @property
+    def filename(self) -> Any: ...
+
+    @property
+    def storage_path(self) -> Any: ...
+
+    @property
+    def storage_key(self) -> Any: ...
+
+    @property
+    def storage_status(self) -> Any: ...
+
+    @property
+    def checksum(self) -> Any: ...
 
 
 def safe_storage_filename(filename: str) -> str:
@@ -107,7 +129,7 @@ def _checksum_matches(expected_checksum: str, actual_checksum: str) -> bool:
 class ManagedFileRef:
     """Registered file handle with local-first durable fallback semantics."""
 
-    record: UploadedFile
+    record: UploadedFileLocalPathRecord
     storage: FsspecFileStorage = field(default_factory=get_file_storage)
 
     @property
@@ -383,7 +405,7 @@ def managed_file_from_record(file_record: UploadedFile) -> ManagedFileRef:
     return ManagedFileRef(file_record)
 
 
-def ensure_uploaded_file_local_path(file_record: UploadedFile) -> Path:
+def ensure_uploaded_file_local_path(file_record: UploadedFileLocalPathRecord) -> Path:
     try:
         return ManagedFileRef(file_record).ensure_local()
     except DurableObjectMissingError:
