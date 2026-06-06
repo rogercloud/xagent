@@ -612,6 +612,13 @@ async def test_create_kb_from_file_restores_durable_only_upload_before_ingestion
     def fake_get_db():
         yield from _fake_db_generator(db)
 
+    def fake_ensure_local(record):
+        db.close.assert_called_once()
+        assert record.filename == file_record.filename
+        assert record.storage_path == file_record.storage_path
+        assert record.file_id == file_record.file_id
+        return restored_source
+
     ingest_result = IngestionResult(
         status="success",
         doc_id="doc-1",
@@ -638,7 +645,7 @@ async def test_create_kb_from_file_restores_durable_only_upload_before_ingestion
         ),
         patch(
             "xagent.web.services.managed_file_ref.ensure_uploaded_file_local_path",
-            return_value=restored_source,
+            side_effect=fake_ensure_local,
         ) as ensure_local,
         patch(
             "xagent.core.tools.core.RAG_tools.pipelines.document_ingestion.run_document_ingestion",
@@ -651,7 +658,7 @@ async def test_create_kb_from_file_restores_durable_only_upload_before_ingestion
         )
 
     assert result["success"] is True
-    ensure_local.assert_called_once_with(file_record)
+    ensure_local.assert_called_once()
     _, ingestion_kwargs = run_ingestion.call_args
     assert ingestion_kwargs["source_path"] == str(restored_source)
     db.close.assert_called_once()

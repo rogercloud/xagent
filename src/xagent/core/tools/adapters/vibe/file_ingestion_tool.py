@@ -4,7 +4,8 @@ import re
 import time
 from functools import partial
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, List, Mapping, Optional, Type
+from types import SimpleNamespace
+from typing import TYPE_CHECKING, Any, List, Mapping, Optional, Type, cast
 
 from pydantic import BaseModel, Field
 
@@ -82,6 +83,17 @@ def _get_tool_compatibility_facade() -> "KBToolCompatibilityFacade":
     return get_kb_coordinator().tool_compatibility
 
 
+def _snapshot_uploaded_file_record(record: Any) -> SimpleNamespace:
+    return SimpleNamespace(
+        file_id=str(record.file_id),
+        filename=str(record.filename),
+        storage_path=str(record.storage_path),
+        storage_key=getattr(record, "storage_key", None),
+        storage_status=getattr(record, "storage_status", None),
+        checksum=getattr(record, "checksum", None),
+    )
+
+
 async def _create_knowledge_base_from_file_impl(
     args: Mapping[str, Any],
     *,
@@ -117,113 +129,114 @@ async def _create_knowledge_base_from_file_impl(
             )
             if not is_admin:
                 query = query.filter(UploadedFile.user_id == user_id)
-            file_records = query.all()
-
-            if not file_records:
-                return CreateKnowledgeBaseFromFileResult(
-                    success=False,
-                    collection_name="",
-                    message=f"No files found for the provided file_ids: {tool_args.file_ids}",
-                    files_ingested=0,
-                ).model_dump()
-
-            if tool_args.collection_name:
-                collection_name = tool_args.collection_name
-            else:
-                base_name = re.sub(
-                    r"[^a-zA-Z0-9_-]",
-                    "_",
-                    Path(file_records[0].filename).stem,
-                )[:30]
-                collection_name = f"{base_name}_{int(time.time())}"
-
-            config = IngestionConfig(embedding_model_id=DEFAULT_EMBEDDING_MODEL_ID)
-            kb_service = AgentKnowledgeBaseService(
-                user_id=user_id,
-                is_admin=is_admin,
-            )
-            collection_name = await kb_service.prepare_collection(
-                collection_name=collection_name,
-                ingestion_config=config,
-            )
-
-            ingested_count = 0
-            errors = []
-
-            for record in file_records:
-                try:
-                    source_path = ensure_uploaded_file_local_path(record)
-                except DurableStorageOperationError as exc:
-                    errors.append(
-                        f"Failed to restore {record.filename} from durable storage: {exc}"
-                    )
-                    continue
-                if not source_path.exists():
-                    errors.append(
-                        f"File not found on disk: {record.filename} (file_id={record.file_id})"
-                    )
-                    continue
-
-                loop = asyncio.get_running_loop()
-                func = partial(
-                    run_document_ingestion,
-                    collection=collection_name,
-                    source_path=str(source_path),
-                    ingestion_config=config,
-                    user_id=user_id,
-                    is_admin=is_admin,
-                    file_id=str(record.file_id),
-                )
-                try:
-                    result = await loop.run_in_executor(None, func)
-                except Exception as exc:
-                    errors.append(
-                        f"Failed to ingest {record.filename} due to unexpected error: {exc}"
-                    )
-                    logger.exception(
-                        "Unexpected error ingesting file %s",
-                        record.filename,
-                    )
-                    continue
-
-                if result.status == "error":
-                    errors.append(
-                        f"Failed to ingest {record.filename}: {result.message}"
-                    )
-                else:
-                    ingested_count += 1
-                    logger.info(
-                        "Ingested file %s into collection %s",
-                        record.filename,
-                        collection_name,
-                    )
-
-            if ingested_count == 0:
-                return CreateKnowledgeBaseFromFileResult(
-                    success=False,
-                    collection_name=collection_name,
-                    message=f"Failed to ingest any files. Errors: {'; '.join(errors)}",
-                    files_ingested=0,
-                ).model_dump()
-
-            message = (
-                f"Successfully created knowledge base '{collection_name}' "
-                f"with {ingested_count} file(s)."
-            )
-            if errors:
-                message += f" Warnings: {'; '.join(errors)}"
-
-            await kb_service.refresh_collection_metadata(collection_name)
-
-            return CreateKnowledgeBaseFromFileResult(
-                success=True,
-                collection_name=collection_name,
-                message=message,
-                files_ingested=ingested_count,
-            ).model_dump()
-
+            file_records = [
+                _snapshot_uploaded_file_record(record) for record in query.all()
+            ]
         finally:
             db_gen.close()
+
+        if not file_records:
+            return CreateKnowledgeBaseFromFileResult(
+                success=False,
+                collection_name="",
+                message=f"No files found for the provided file_ids: {tool_args.file_ids}",
+                files_ingested=0,
+            ).model_dump()
+
+        if tool_args.collection_name:
+            collection_name = tool_args.collection_name
+        else:
+            base_name = re.sub(
+                r"[^a-zA-Z0-9_-]",
+                "_",
+                Path(file_records[0].filename).stem,
+            )[:30]
+            collection_name = f"{base_name}_{int(time.time())}"
+
+        config = IngestionConfig(embedding_model_id=DEFAULT_EMBEDDING_MODEL_ID)
+        kb_service = AgentKnowledgeBaseService(
+            user_id=user_id,
+            is_admin=is_admin,
+        )
+        collection_name = await kb_service.prepare_collection(
+            collection_name=collection_name,
+            ingestion_config=config,
+        )
+
+        ingested_count = 0
+        errors = []
+
+        for record in file_records:
+            try:
+                source_path = ensure_uploaded_file_local_path(
+                    cast(UploadedFile, record)
+                )
+            except DurableStorageOperationError as exc:
+                errors.append(
+                    f"Failed to restore {record.filename} from durable storage: {exc}"
+                )
+                continue
+            if not source_path.exists():
+                errors.append(
+                    f"File not found on disk: {record.filename} (file_id={record.file_id})"
+                )
+                continue
+
+            loop = asyncio.get_running_loop()
+            func = partial(
+                run_document_ingestion,
+                collection=collection_name,
+                source_path=str(source_path),
+                ingestion_config=config,
+                user_id=user_id,
+                is_admin=is_admin,
+                file_id=str(record.file_id),
+            )
+            try:
+                result = await loop.run_in_executor(None, func)
+            except Exception as exc:
+                errors.append(
+                    f"Failed to ingest {record.filename} due to unexpected error: {exc}"
+                )
+                logger.exception(
+                    "Unexpected error ingesting file %s",
+                    record.filename,
+                )
+                continue
+
+            if result.status == "error":
+                errors.append(f"Failed to ingest {record.filename}: {result.message}")
+            else:
+                ingested_count += 1
+                logger.info(
+                    "Ingested file %s into collection %s",
+                    record.filename,
+                    collection_name,
+                )
+
+        if ingested_count == 0:
+            return CreateKnowledgeBaseFromFileResult(
+                success=False,
+                collection_name=collection_name,
+                message=f"Failed to ingest any files. Errors: {'; '.join(errors)}",
+                files_ingested=0,
+            ).model_dump()
+
+        message = (
+            f"Successfully created knowledge base '{collection_name}' "
+            f"with {ingested_count} file(s)."
+        )
+        if errors:
+            message += f" Warnings: {'; '.join(errors)}"
+
+        await kb_service.refresh_collection_metadata(collection_name)
+
+        return CreateKnowledgeBaseFromFileResult(
+            success=True,
+            collection_name=collection_name,
+            message=message,
+            files_ingested=ingested_count,
+        ).model_dump()
 
     except Exception as e:
         logger.exception("Error creating knowledge base from file: %s", e)
