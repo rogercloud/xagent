@@ -4104,14 +4104,14 @@ async def ingest_cloud(
                                 ),
                                 rollback_complete=False,
                             )
-                            return KBApiOperationResult(
-                                result=IngestionResult(
-                                    status="error",
-                                    message=f"Download failed: {str(e)}",
-                                    doc_id=file_info.fileName,
-                                ),
-                                rollback_complete=True,
-                            )
+                        return KBApiOperationResult(
+                            result=IngestionResult(
+                                status="error",
+                                message=f"Download failed: {str(e)}",
+                                doc_id=file_info.fileName,
+                            ),
+                            rollback_complete=True,
+                        )
 
                     uploaded_file_existed_before = (
                         db.query(UploadedFile)

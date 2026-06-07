@@ -2910,6 +2910,57 @@ def test_kb_ingest_cloud_surfaces_restore_failure_on_download_error(
     assert "Failed to fully roll back cloud ingest" in data[0]["message"]
 
 
+def test_kb_ingest_cloud_returns_download_failure_after_restore_success(
+    test_env, temp_uploads
+):
+    """Cloud download failures should stop after restoring the local backup."""
+
+    app, headers, _user, _ = test_env
+    client = TestClient(app)
+
+    class _FakeFilesService:
+        def get_media(self, fileId: str):
+            return {"fileId": fileId}
+
+    class _FakeDriveService:
+        def files(self):
+            return _FakeFilesService()
+
+    class _FailingDownloader:
+        def __init__(self, fh, request_file):
+            self._fh = fh
+
+        def next_chunk(self):
+            raise RuntimeError("download blew up")
+
+    with (
+        patch("xagent.web.api.kb.get_google_credentials", return_value=object()),
+        patch("xagent.web.api.kb.build", return_value=_FakeDriveService()),
+        patch("xagent.web.api.kb.MediaIoBaseDownload", _FailingDownloader),
+        patch("xagent.web.api.kb.run_document_ingestion") as run_ingestion,
+    ):
+        response = client.post(
+            "/api/kb/ingest-cloud",
+            json={
+                "collection": "cloud_coll",
+                "files": [
+                    {
+                        "provider": "google-drive",
+                        "fileId": "drive-file-1",
+                        "fileName": "cloud.csv",
+                    }
+                ],
+            },
+            headers=headers,
+        )
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data[0]["status"] == "error"
+    assert "Download failed: download blew up" in data[0]["message"]
+    run_ingestion.assert_not_called()
+
+
 def test_kb_ingest_cloud_surfaces_restore_failure_on_unexpected_error(
     test_env, temp_uploads
 ):
