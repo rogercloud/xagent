@@ -5,7 +5,8 @@ from __future__ import annotations
 import inspect
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
-from typing import TYPE_CHECKING, Any, Optional
+from dataclasses import dataclass, replace
+from typing import TYPE_CHECKING, Any, Awaitable, Callable, Generic, Optional, TypeVar
 
 from ..core.schemas import (
     CollectionInfo,
@@ -20,11 +21,15 @@ from ..core.schemas import (
     WebIngestionResult,
 )
 from .models import KBStorageBackend
+from .operation_compatibility import KBOperationOutcome, RollbackStatus
 from .pipeline_compatibility import KB_STORAGE_METADATA_KEY
 
 if TYPE_CHECKING:
     from .coordinator import KBCoordinator
+    from .operation_compatibility import KBOperationCompatibilityFacade
     from .storage_shim import KBStorageShimCompatibilityFacade
+
+T_Result = TypeVar("T_Result")
 
 
 async def _maybe_await(value: Any) -> Any:
@@ -36,6 +41,23 @@ async def _maybe_await(value: Any) -> Any:
 def _has_store_method(metadata_store: object, name: str) -> bool:
     """Return True for real MetadataStore implementations, not loose mocks."""
     return callable(getattr(type(metadata_store), name, None))
+
+
+@dataclass(frozen=True)
+class KBApiOperationResult(Generic[T_Result]):
+    """Route-internal result plus the rollback outcome produced by the coordinator."""
+
+    result: T_Result
+    operation_outcome: KBOperationOutcome | None = None
+    rollback_complete: bool | None = None
+
+
+@dataclass(frozen=True)
+class KBApiFailedIngestCleanupDecision:
+    """API-facing cleanup policy derived from operation rollback state."""
+
+    successful_documents: int = 0
+    side_effects_may_remain: bool = False
 
 
 class KBApiCompatibilityFacade:
@@ -61,6 +83,18 @@ class KBApiCompatibilityFacade:
             return self._coordinator.storage_shim
         return None
 
+    def _active_operation_facade(self) -> KBOperationCompatibilityFacade | None:
+        if self._coordinator is not None:
+            return self._coordinator.operation_compatibility
+        return None
+
+    def last_operation_outcome(self) -> KBOperationOutcome | None:
+        """Return the last finalized coordinator operation in the current context."""
+        operation_facade = self._active_operation_facade()
+        if operation_facade is None:
+            return None
+        return operation_facade.last_outcome
+
     @contextmanager
     def _storage_context(self) -> Iterator[None]:
         storage_shim = self._active_storage_shim()
@@ -72,6 +106,172 @@ class KBApiCompatibilityFacade:
 
         with bind_storage_shim_for_current_context(storage_shim):
             yield
+
+    def wrap_operation_result(
+        self,
+        result: T_Result,
+        *,
+        previous_outcome: KBOperationOutcome | None = None,
+        operation_type: str | tuple[str, ...] | None = None,
+        collection: str | None = None,
+        rollback_complete: bool | None = None,
+    ) -> KBApiOperationResult[T_Result]:
+        """Attach the current coordinator outcome to an API-compatible result."""
+        outcome = self.last_operation_outcome()
+        if outcome is previous_outcome:
+            outcome = None
+        if outcome is not None and operation_type is not None:
+            expected = (
+                (operation_type,) if isinstance(operation_type, str) else operation_type
+            )
+            if outcome.operation_type not in expected:
+                outcome = None
+        if (
+            outcome is not None
+            and collection is not None
+            and outcome.collection != collection
+        ):
+            outcome = None
+
+        return KBApiOperationResult(
+            result=result,
+            operation_outcome=outcome,
+            rollback_complete=rollback_complete,
+        )
+
+    def run_with_operation_outcome(
+        self,
+        operation: Callable[[], T_Result],
+        *,
+        operation_type: str | tuple[str, ...],
+        collection: str,
+        rollback_complete: bool | None = None,
+    ) -> KBApiOperationResult[T_Result]:
+        """Run a sync API operation and consume its coordinator outcome."""
+        previous_outcome = self.last_operation_outcome()
+        result = operation()
+        return self.wrap_operation_result(
+            result,
+            previous_outcome=previous_outcome,
+            operation_type=operation_type,
+            collection=collection,
+            rollback_complete=rollback_complete,
+        )
+
+    async def run_async_with_operation_outcome(
+        self,
+        operation: Callable[[], Awaitable[T_Result]],
+        *,
+        operation_type: str | tuple[str, ...],
+        collection: str,
+        rollback_complete: bool | None = None,
+    ) -> KBApiOperationResult[T_Result]:
+        """Run an async API operation and consume its coordinator outcome."""
+        previous_outcome = self.last_operation_outcome()
+        result = await operation()
+        return self.wrap_operation_result(
+            result,
+            previous_outcome=previous_outcome,
+            operation_type=operation_type,
+            collection=collection,
+            rollback_complete=rollback_complete,
+        )
+
+    @staticmethod
+    def with_result(
+        operation_result: KBApiOperationResult[Any],
+        result: T_Result,
+    ) -> KBApiOperationResult[T_Result]:
+        """Replace the legacy result while preserving internal operation metadata."""
+        return KBApiOperationResult(
+            result=result,
+            operation_outcome=operation_result.operation_outcome,
+            rollback_complete=operation_result.rollback_complete,
+        )
+
+    @staticmethod
+    def with_rollback_complete(
+        operation_result: KBApiOperationResult[T_Result],
+        rollback_complete: bool,
+    ) -> KBApiOperationResult[T_Result]:
+        """Record whether API-level compensation completed after a failed operation."""
+        return replace(operation_result, rollback_complete=rollback_complete)
+
+    def failed_ingest_cleanup_decision(
+        self,
+        operation_result: KBApiOperationResult[Any],
+        *,
+        successful_documents: int | None = None,
+        rollback_complete: bool | None = None,
+    ) -> KBApiFailedIngestCleanupDecision:
+        """Derive config/metadata cleanup inputs from operation rollback state."""
+        effective_rollback_complete = (
+            operation_result.rollback_complete
+            if rollback_complete is None
+            else rollback_complete
+        )
+        if successful_documents is None:
+            successful_documents = self._legacy_successful_document_count(
+                operation_result.result
+            )
+
+        return KBApiFailedIngestCleanupDecision(
+            successful_documents=max(0, int(successful_documents)),
+            side_effects_may_remain=self._side_effects_may_remain_after_api_rollback(
+                operation_result,
+                rollback_complete=effective_rollback_complete,
+            ),
+        )
+
+    def failed_batch_ingest_cleanup_decision(
+        self,
+        operation_results: list[KBApiOperationResult[Any]],
+        *,
+        successful_documents: int | None = None,
+    ) -> KBApiFailedIngestCleanupDecision:
+        """Aggregate child operation rollback state for batch/cloud ingest cleanup."""
+        if successful_documents is None:
+            successful_documents = sum(
+                self._legacy_successful_document_count(item.result)
+                for item in operation_results
+            )
+        return KBApiFailedIngestCleanupDecision(
+            successful_documents=max(0, int(successful_documents)),
+            side_effects_may_remain=any(
+                self.failed_ingest_cleanup_decision(item).side_effects_may_remain
+                for item in operation_results
+            ),
+        )
+
+    @staticmethod
+    def _legacy_successful_document_count(result: Any) -> int:
+        documents_created = getattr(result, "documents_created", None)
+        if documents_created is not None:
+            try:
+                return int(documents_created)
+            except (TypeError, ValueError):
+                return 0
+        return 1 if getattr(result, "status", None) == "success" else 0
+
+    @staticmethod
+    def _side_effects_may_remain_after_api_rollback(
+        operation_result: KBApiOperationResult[Any],
+        *,
+        rollback_complete: bool | None,
+    ) -> bool:
+        if rollback_complete is False:
+            return True
+        if rollback_complete is True:
+            return False
+
+        outcome = operation_result.operation_outcome
+        if outcome is not None:
+            return bool(
+                outcome.side_effects_may_remain
+                or outcome.rollback_status is RollbackStatus.INCOMPLETE
+            )
+
+        return bool(getattr(operation_result.result, "side_effects_may_remain", False))
 
     async def save_collection_config(
         self,
@@ -167,13 +367,11 @@ class KBApiCompatibilityFacade:
         delete_orphaned_metadata: bool = False,
     ) -> dict[str, int]:
         if self._coordinator is not None:
-            return (
-                self._coordinator.maintenance_compatibility.delete_collection_metadata_sync(
-                    collection_name=collection_name,
-                    user_id=user_id,
-                    is_admin=is_admin,
-                    delete_orphaned_metadata=delete_orphaned_metadata,
-                )
+            return self._coordinator.maintenance_compatibility.delete_collection_metadata_sync(
+                collection_name=collection_name,
+                user_id=user_id,
+                is_admin=is_admin,
+                delete_orphaned_metadata=delete_orphaned_metadata,
             )
 
         from ..management.collection_manager import delete_collection_metadata_sync

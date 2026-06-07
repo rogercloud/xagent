@@ -1,6 +1,10 @@
 """KB semantic coordinator public surface."""
 
-from .api_compatibility import KBApiCompatibilityFacade
+from .api_compatibility import (
+    KBApiCompatibilityFacade,
+    KBApiFailedIngestCleanupDecision,
+    KBApiOperationResult,
+)
 from .collection_handle import KBHandleProvider, LanceDBCollectionHandle
 from .coordinator import (
     KBCoordinator,
@@ -50,6 +54,8 @@ from .version_compatibility import (
 __all__ = [
     "KBAccessMode",
     "KBApiCompatibilityFacade",
+    "KBApiFailedIngestCleanupDecision",
+    "KBApiOperationResult",
     "KBBackendCapabilities",
     "KBCollectionContext",
     "KBContextRequest",

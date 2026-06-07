@@ -6,10 +6,15 @@ from typing import Optional
 
 import pytest
 
-from xagent.core.tools.core.RAG_tools.core.schemas import CollectionInfo
+from xagent.core.tools.core.RAG_tools.core.schemas import (
+    CollectionInfo,
+    IngestionResult,
+)
 from xagent.core.tools.core.RAG_tools.kb import (
     KBApiCompatibilityFacade,
     KBCoordinator,
+    KBOperationCompatibilityFacade,
+    RollbackStatus,
     get_kb_coordinator,
     reset_kb_coordinator_for_tests,
 )
@@ -67,9 +72,7 @@ def test_kb_api_facade_public_surface_imports() -> None:
 
     assert hasattr(kb, "KBApiCompatibilityFacade")
     reset_kb_coordinator_for_tests()
-    assert isinstance(
-        get_kb_coordinator().api_compatibility, KBApiCompatibilityFacade
-    )
+    assert isinstance(get_kb_coordinator().api_compatibility, KBApiCompatibilityFacade)
     assert get_kb_coordinator().api is get_kb_coordinator().api_compatibility
 
 
@@ -108,7 +111,7 @@ async def test_save_collection_config_preserves_existing_backend_binding() -> No
         user_id=7,
     )
 
-    assert metadata_store.saved_configs == [('demo', '{"chunk_size": 1000}', 7)]
+    assert metadata_store.saved_configs == [("demo", '{"chunk_size": 1000}', 7)]
     assert existing.extra_metadata["kb_storage"] == {"backend": "postgresql"}
     assert existing.extra_metadata["other"] == "kept"
     assert metadata_store.saved_collections == []
@@ -134,6 +137,63 @@ def test_coordinator_accepts_injected_api_facade() -> None:
 
     assert coordinator.api_compatibility is facade
     assert coordinator.api is facade
+
+
+def test_api_operation_result_consumes_new_operation_outcome() -> None:
+    operation_facade = KBOperationCompatibilityFacade()
+    coordinator = KBCoordinator(operation_compatibility=operation_facade)
+    facade = coordinator.api_compatibility
+
+    def operation() -> IngestionResult:
+        with operation_facade.start_operation(
+            operation_type="document_ingestion",
+            collection="demo",
+        ) as active_operation:
+            active_operation.finish(
+                status="error",
+                rollback_status=RollbackStatus.INCOMPLETE,
+                side_effects_may_remain=True,
+            )
+        return IngestionResult(status="error", message="failed")
+
+    api_result = facade.run_with_operation_outcome(
+        operation,
+        operation_type="document_ingestion",
+        collection="demo",
+    )
+
+    assert api_result.result.status == "error"
+    assert api_result.operation_outcome is operation_facade.last_outcome
+    cleanup_decision = facade.failed_ingest_cleanup_decision(api_result)
+    assert cleanup_decision.successful_documents == 0
+    assert cleanup_decision.side_effects_may_remain is True
+
+    completed_rollback = facade.with_rollback_complete(api_result, True)
+    cleanup_after_rollback = facade.failed_ingest_cleanup_decision(completed_rollback)
+    assert cleanup_after_rollback.side_effects_may_remain is False
+
+
+def test_api_operation_result_ignores_stale_operation_outcome() -> None:
+    operation_facade = KBOperationCompatibilityFacade()
+    coordinator = KBCoordinator(operation_compatibility=operation_facade)
+    facade = coordinator.api_compatibility
+
+    with operation_facade.start_operation(
+        operation_type="document_ingestion",
+        collection="demo",
+    ) as active_operation:
+        active_operation.finish(status="success")
+    assert operation_facade.last_outcome is not None
+
+    api_result = facade.run_with_operation_outcome(
+        lambda: IngestionResult(status="error", message="patched failure"),
+        operation_type="document_ingestion",
+        collection="demo",
+    )
+
+    assert api_result.operation_outcome is None
+    cleanup_decision = facade.failed_ingest_cleanup_decision(api_result)
+    assert cleanup_decision.side_effects_may_remain is False
 
 
 def test_list_document_records_omits_none_max_results(

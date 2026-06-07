@@ -68,6 +68,7 @@ from ...core.tools.core.RAG_tools.core.schemas import (
 )
 from ...core.tools.core.RAG_tools.kb import (
     KBApiCompatibilityFacade,
+    KBApiOperationResult,
     get_kb_coordinator,
 )
 from ...core.tools.core.RAG_tools.management.status import clear_ingestion_status
@@ -280,6 +281,37 @@ def run_document_ingestion(
     )
 
 
+def run_document_ingestion_with_outcome(
+    collection: str,
+    source_path: str,
+    *,
+    ingestion_config: Optional[Any] = None,
+    progress_manager: Optional[Any] = None,
+    user_id: Optional[int] = None,
+    is_admin: Optional[bool] = None,
+    file_id: Optional[str] = None,
+    metadata_source_path: Optional[str] = None,
+    commit_gate: Optional[Callable[[], None]] = None,
+) -> KBApiOperationResult[IngestionResult]:
+    """Run local-file ingestion and attach coordinator rollback outcome."""
+    facade = _get_api_compatibility_facade()
+    return facade.run_with_operation_outcome(
+        lambda: run_document_ingestion(
+            collection=collection,
+            source_path=source_path,
+            ingestion_config=ingestion_config,
+            progress_manager=progress_manager,
+            user_id=user_id,
+            is_admin=is_admin,
+            file_id=file_id,
+            metadata_source_path=metadata_source_path,
+            commit_gate=commit_gate,
+        ),
+        operation_type="document_ingestion",
+        collection=collection,
+    )
+
+
 def run_document_search(
     collection: str,
     query_text: str,
@@ -319,6 +351,33 @@ async def run_web_ingestion(
         user_id=user_id,
         is_admin=is_admin,
         file_handler=file_handler,
+    )
+
+
+async def run_web_ingestion_with_outcome(
+    collection: str,
+    crawl_config: WebCrawlConfig,
+    *,
+    ingestion_config: Optional[Any] = None,
+    progress_callback: Optional[Any] = None,
+    user_id: Optional[int] = None,
+    is_admin: Optional[bool] = None,
+    file_handler: Optional[Any] = None,
+) -> KBApiOperationResult[WebIngestionResult]:
+    """Run web ingestion and attach coordinator rollback outcome."""
+    facade = _get_api_compatibility_facade()
+    return await facade.run_async_with_operation_outcome(
+        lambda: run_web_ingestion(
+            collection=collection,
+            crawl_config=crawl_config,
+            ingestion_config=ingestion_config,
+            progress_callback=progress_callback,
+            user_id=user_id,
+            is_admin=is_admin,
+            file_handler=file_handler,
+        ),
+        operation_type="web_ingestion",
+        collection=collection,
     )
 
 
@@ -3526,8 +3585,8 @@ async def ingest(
             file_size=int(total_size),
         )
 
-        def _run_ingestion() -> IngestionResult:
-            return run_document_ingestion(
+        def _run_ingestion() -> KBApiOperationResult[IngestionResult]:
+            return run_document_ingestion_with_outcome(
                 collection=safe_collection,
                 source_path=str(file_path),
                 ingestion_config=config,
@@ -3538,11 +3597,13 @@ async def ingest(
             )
 
         loop = asyncio.get_running_loop()
-        result: IngestionResult = await loop.run_in_executor(None, _run_ingestion)
+        api_result = await loop.run_in_executor(None, _run_ingestion)
+        result = api_result.result
         result = _with_user_actionable_ingestion_message(
             result,
             embedding_model_id=embedding_model_id,
         )
+        api_result = _get_api_compatibility_facade().with_result(api_result, result)
 
         if result.status in {"error", "partial"}:
             await _rollback_failed_ingestion(
@@ -3558,13 +3619,24 @@ async def ingest(
                 had_existing_file=had_existing_file,
                 embedding_model_id=embedding_model_id,
             )
+            api_result = _get_api_compatibility_facade().with_rollback_complete(
+                api_result,
+                True,
+            )
             if effective_collection_existed_before:
+                cleanup_decision = (
+                    _get_api_compatibility_facade().failed_ingest_cleanup_decision(
+                        api_result
+                    )
+                )
                 await _restore_or_cleanup_collection_config_after_failed_ingest(
                     snapshot=config_snapshot,
                     collection_existed_before=collection_existed_before,
                     collection_name=collection,
                     user=_user,
                     context="ingest",
+                    successful_documents=cleanup_decision.successful_documents,
+                    side_effects_may_remain=cleanup_decision.side_effects_may_remain,
                 )
 
         if result.status == "error":
@@ -3604,6 +3676,7 @@ async def ingest(
                 doc_id=safe_filename,
                 message="Ingestion setup failed before completion.",
             )
+            rollback_api_result = KBApiOperationResult(result=rollback_result)
             await _rollback_failed_ingestion(
                 db=db,
                 user=_user,
@@ -3617,13 +3690,26 @@ async def ingest(
                 had_existing_file=had_existing_file,
                 embedding_model_id=embedding_model_id,
             )
+            rollback_api_result = (
+                _get_api_compatibility_facade().with_rollback_complete(
+                    rollback_api_result,
+                    True,
+                )
+            )
             if effective_collection_existed_before:
+                cleanup_decision = (
+                    _get_api_compatibility_facade().failed_ingest_cleanup_decision(
+                        rollback_api_result
+                    )
+                )
                 await _restore_or_cleanup_collection_config_after_failed_ingest(
                     snapshot=config_snapshot,
                     collection_existed_before=collection_existed_before,
                     collection_name=collection,
                     user=_user,
                     context="ingest",
+                    successful_documents=cleanup_decision.successful_documents,
+                    side_effects_may_remain=cleanup_decision.side_effects_may_remain,
                 )
         else:
             _restore_ingest_file_backup(
@@ -3631,12 +3717,27 @@ async def ingest(
                 backup_path=file_backup_path,
                 had_existing_file=had_existing_file,
             )
+            rollback_api_result = KBApiOperationResult(
+                result=IngestionResult(
+                    status="error",
+                    doc_id=safe_filename,
+                    message="Ingestion setup failed before document registration.",
+                ),
+                rollback_complete=True,
+            )
+            cleanup_decision = (
+                _get_api_compatibility_facade().failed_ingest_cleanup_decision(
+                    rollback_api_result
+                )
+            )
             await _restore_or_cleanup_collection_config_after_failed_ingest(
                 snapshot=config_snapshot,
                 collection_existed_before=collection_existed_before,
                 collection_name=collection,
                 user=_user,
                 context="ingest",
+                successful_documents=cleanup_decision.successful_documents,
+                side_effects_may_remain=cleanup_decision.side_effects_may_remain,
             )
         raise
 
@@ -3912,7 +4013,9 @@ async def ingest_cloud(
     # Concurrency limit for cloud ingestion to avoid overloading
     semaphore = asyncio.Semaphore(5)
 
-    async def process_file(file_info: CloudFile) -> IngestionResult:
+    async def process_file(
+        file_info: CloudFile,
+    ) -> KBApiOperationResult[IngestionResult]:
         async with semaphore:
             file_record: Optional[UploadedFile] = None
             file_backup_path: Optional[Path] = None
@@ -3931,10 +4034,12 @@ async def ingest_cloud(
                     user_id=int(_user.id),
                 )
             except HTTPException as ve:
-                return IngestionResult(
-                    status="error",
-                    message=ve.detail,
-                    doc_id=file_info.fileName,
+                return KBApiOperationResult(
+                    result=IngestionResult(
+                        status="error",
+                        message=ve.detail,
+                        doc_id=file_info.fileName,
+                    )
                 )
             try:
                 if file_info.provider == "google-drive":
@@ -3944,10 +4049,12 @@ async def ingest_cloud(
                             get_google_credentials, int(_user.id), db
                         )
                     except HTTPException as e:
-                        return IngestionResult(
-                            status="error",
-                            message=f"Authentication error: {e.detail}",
-                            doc_id=file_info.fileName,
+                        return KBApiOperationResult(
+                            result=IngestionResult(
+                                status="error",
+                                message=f"Authentication error: {e.detail}",
+                                doc_id=file_info.fileName,
+                            )
                         )
 
                     # Build service (blocking)
@@ -3986,19 +4093,25 @@ async def ingest_cloud(
                                 had_existing_file=had_existing_file,
                             )
                         except Exception as restore_exc:  # noqa: BLE001
-                            return IngestionResult(
-                                status="error",
-                                message=(
-                                    "Failed to fully roll back cloud ingest for "
-                                    f"{safe_collection}/{file_info.fileName}: {restore_exc}"
+                            return KBApiOperationResult(
+                                result=IngestionResult(
+                                    status="error",
+                                    message=(
+                                        "Failed to fully roll back cloud ingest for "
+                                        f"{safe_collection}/{file_info.fileName}: {restore_exc}"
+                                    ),
+                                    doc_id=file_info.fileName,
                                 ),
-                                doc_id=file_info.fileName,
+                                rollback_complete=False,
                             )
-                        return IngestionResult(
-                            status="error",
-                            message=f"Download failed: {str(e)}",
-                            doc_id=file_info.fileName,
-                        )
+                            return KBApiOperationResult(
+                                result=IngestionResult(
+                                    status="error",
+                                    message=f"Download failed: {str(e)}",
+                                    doc_id=file_info.fileName,
+                                ),
+                                rollback_complete=True,
+                            )
 
                     uploaded_file_existed_before = (
                         db.query(UploadedFile)
@@ -4028,8 +4141,8 @@ async def ingest_cloud(
                         file_config = config.model_copy(
                             update={"parse_method": normalized_parse_method}
                         )
-                        result = await asyncio.to_thread(
-                            run_document_ingestion,
+                        api_result = await asyncio.to_thread(
+                            run_document_ingestion_with_outcome,
                             collection=safe_collection,
                             source_path=str(file_path),
                             ingestion_config=file_config,
@@ -4038,9 +4151,14 @@ async def ingest_cloud(
                             is_admin=bool(_user.is_admin),
                             file_id=str(file_record.file_id),
                         )
+                        result = api_result.result
                         result = _with_user_actionable_ingestion_message(
                             result,
                             embedding_model_id=request.embedding_model_id,
+                        )
+                        api_result = _get_api_compatibility_facade().with_result(
+                            api_result,
+                            result,
                         )
                         if result.status in {"error", "partial"}:
                             await _rollback_failed_cloud_ingestion(
@@ -4056,23 +4174,41 @@ async def ingest_cloud(
                                 had_existing_file=had_existing_file,
                                 embedding_model_id=request.embedding_model_id,
                             )
+                            api_result = (
+                                _get_api_compatibility_facade().with_rollback_complete(
+                                    api_result,
+                                    True,
+                                )
+                            )
                         elif file_backup_path is not None:
                             try:
                                 file_backup_path.unlink(missing_ok=True)
                             except OSError:
                                 pass
-                        return result
+                        return api_result
                     except RollbackFailureError as rollback_exc:
-                        return IngestionResult(
-                            status="error",
-                            message=str(rollback_exc),
-                            doc_id=file_info.fileName,
+                        return KBApiOperationResult(
+                            result=IngestionResult(
+                                status="error",
+                                message=str(rollback_exc),
+                                doc_id=file_info.fileName,
+                            ),
+                            operation_outcome=api_result.operation_outcome
+                            if "api_result" in locals()
+                            else None,
+                            rollback_complete=False,
                         )
                     except Exception as e:
                         rollback_result = IngestionResult(
                             status="error",
                             doc_id=file_info.fileName,
                             message=f"Ingestion failed: {str(e)}",
+                        )
+                        rollback_api_result = KBApiOperationResult(
+                            result=rollback_result,
+                            operation_outcome=api_result.operation_outcome
+                            if "api_result" in locals()
+                            else None,
                         )
                         await _rollback_failed_cloud_ingestion(
                             db=db,
@@ -4087,25 +4223,34 @@ async def ingest_cloud(
                             had_existing_file=had_existing_file,
                             embedding_model_id=request.embedding_model_id,
                         )
-                        return IngestionResult(
-                            status="error",
-                            message=f"Ingestion failed: {str(e)}",
-                            doc_id=file_info.fileName,
+                        return KBApiOperationResult(
+                            result=IngestionResult(
+                                status="error",
+                                message=f"Ingestion failed: {str(e)}",
+                                doc_id=file_info.fileName,
+                            ),
+                            operation_outcome=rollback_api_result.operation_outcome,
+                            rollback_complete=True,
                         )
 
                 else:
-                    return IngestionResult(
-                        status="error",
-                        message=f"Unsupported provider: {file_info.provider}",
-                        doc_id=file_info.fileName,
+                    return KBApiOperationResult(
+                        result=IngestionResult(
+                            status="error",
+                            message=f"Unsupported provider: {file_info.provider}",
+                            doc_id=file_info.fileName,
+                        )
                     )
 
             except RollbackFailureError as e:
                 logger.exception("Rollback failed for %s: %s", file_info.fileName, e)
-                return IngestionResult(
-                    status="error",
-                    message=str(e),
-                    doc_id=file_info.fileName,
+                return KBApiOperationResult(
+                    result=IngestionResult(
+                        status="error",
+                        message=str(e),
+                        doc_id=file_info.fileName,
+                    ),
+                    rollback_complete=False,
                 )
             except Exception as e:
                 try:
@@ -4118,37 +4263,52 @@ async def ingest_cloud(
                     logger.exception(
                         "Rollback failed for %s: %s", file_info.fileName, restore_exc
                     )
-                    return IngestionResult(
-                        status="error",
-                        message=(
-                            "Failed to fully roll back cloud ingest for "
-                            f"{safe_collection}/{file_info.fileName}: {restore_exc}"
+                    return KBApiOperationResult(
+                        result=IngestionResult(
+                            status="error",
+                            message=(
+                                "Failed to fully roll back cloud ingest for "
+                                f"{safe_collection}/{file_info.fileName}: {restore_exc}"
+                            ),
+                            doc_id=file_info.fileName,
                         ),
-                        doc_id=file_info.fileName,
+                        rollback_complete=False,
                     )
                 logger.exception(
                     "Unexpected error ingesting %s: %s", file_info.fileName, e
                 )
-                return IngestionResult(
-                    status="error",
-                    message=f"Unexpected error: {str(e)}",
-                    doc_id=file_info.fileName,
+                return KBApiOperationResult(
+                    result=IngestionResult(
+                        status="error",
+                        message=f"Unexpected error: {str(e)}",
+                        doc_id=file_info.fileName,
+                    ),
+                    rollback_complete=True,
                 )
 
     # Run all file processings concurrently
-    results = await asyncio.gather(*[process_file(f) for f in request.files])
+    api_results = await asyncio.gather(*[process_file(f) for f in request.files])
+    results = [api_result.result for api_result in api_results]
 
-    has_success = any(result.status == "success" for result in results)
     has_failure = any(result.status in {"error", "partial"} for result in results)
 
     if has_failure:
+        cleanup_decision = (
+            _get_api_compatibility_facade().failed_batch_ingest_cleanup_decision(
+                list(api_results),
+                successful_documents=sum(
+                    1 for result in results if result.status == "success"
+                ),
+            )
+        )
         await _restore_or_cleanup_collection_config_after_failed_ingest(
             snapshot=config_snapshot,
             collection_existed_before=collection_existed_before,
             collection_name=safe_collection,
             user=_user,
             context="ingest_cloud",
-            successful_documents=1 if has_success else 0,
+            successful_documents=cleanup_decision.successful_documents,
+            side_effects_may_remain=cleanup_decision.side_effects_may_remain,
         )
 
     return results
@@ -4965,10 +5125,10 @@ async def ingest_web(
             finally:
                 db_session.close()
 
-        result = await asyncio.get_event_loop().run_in_executor(
+        api_result = await asyncio.get_event_loop().run_in_executor(
             None,
             lambda: asyncio.run(
-                run_web_ingestion(
+                run_web_ingestion_with_outcome(
                     collection=safe_collection,
                     crawl_config=crawl_config,
                     ingestion_config=ingestion_config,
@@ -4978,22 +5138,33 @@ async def ingest_web(
                 )
             ),
         )
+        result = api_result.result
         web_updated_message = _build_user_actionable_ingestion_message(
             result.message,
             embedding_model_id=embedding_model_id,
         )
         if web_updated_message != result.message:
             result = result.model_copy(update={"message": web_updated_message})
+            api_result = _get_api_compatibility_facade().with_result(
+                api_result,
+                result,
+            )
 
         if result.status == "error":
+            cleanup_decision = (
+                _get_api_compatibility_facade().failed_ingest_cleanup_decision(
+                    api_result,
+                    successful_documents=result.documents_created,
+                )
+            )
             await _restore_or_cleanup_collection_config_after_failed_ingest(
                 snapshot=config_snapshot,
                 collection_existed_before=collection_existed_before,
                 collection_name=safe_collection,
                 user=_user,
                 context="ingest_web",
-                successful_documents=result.documents_created,
-                side_effects_may_remain=result.side_effects_may_remain,
+                successful_documents=cleanup_decision.successful_documents,
+                side_effects_may_remain=cleanup_decision.side_effects_may_remain,
             )
             return JSONResponse(status_code=500, content=result.model_dump())
         if result.status == "partial":
@@ -5004,14 +5175,20 @@ async def ingest_web(
                 _user.id,
                 result.message,
             )
+            cleanup_decision = (
+                _get_api_compatibility_facade().failed_ingest_cleanup_decision(
+                    api_result,
+                    successful_documents=result.documents_created,
+                )
+            )
             await _restore_or_cleanup_collection_config_after_failed_ingest(
                 snapshot=config_snapshot,
                 collection_existed_before=collection_existed_before,
                 collection_name=safe_collection,
                 user=_user,
                 context="ingest_web",
-                successful_documents=result.documents_created,
-                side_effects_may_remain=result.side_effects_may_remain,
+                successful_documents=cleanup_decision.successful_documents,
+                side_effects_may_remain=cleanup_decision.side_effects_may_remain,
             )
 
         return result

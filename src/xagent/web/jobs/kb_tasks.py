@@ -14,6 +14,10 @@ from ...core.tools.core.RAG_tools.core.schemas import (
     IngestionResult,
     WebCrawlConfig,
 )
+from ...core.tools.core.RAG_tools.kb import (
+    KBApiCompatibilityFacade,
+    get_kb_coordinator,
+)
 from ...core.tools.core.RAG_tools.pipelines.document_ingestion import (
     run_document_ingestion,
 )
@@ -39,6 +43,10 @@ _SUPERSEDED_STAGED_INGEST_MESSAGE = "KB ingest job superseded by a newer upload"
 
 class StagedDocumentIngestSuperseded(RuntimeError):
     pass
+
+
+def _get_api_compatibility_facade() -> KBApiCompatibilityFacade:
+    return get_kb_coordinator().api_compatibility
 
 
 def _get_job_user(
@@ -142,17 +150,22 @@ def handle_kb_ingest_document(db: Session, job: BackgroundJob) -> dict[str, Any]
             user_id=int(payload["user_id"]),
             is_admin=bool(payload.get("is_admin", False)),
         ):
-            result = run_document_ingestion(
+            api_result = _get_api_compatibility_facade().run_with_operation_outcome(
+                lambda: run_document_ingestion(
+                    collection=str(payload["collection"]),
+                    source_path=str(payload["source_path"]),
+                    ingestion_config=ingestion_config,
+                    progress_manager=progress_manager,
+                    user_id=int(payload["user_id"]),
+                    is_admin=bool(payload.get("is_admin", False)),
+                    file_id=str(file_id) if file_id else None,
+                    metadata_source_path=str(target_path) if target_path else None,
+                    commit_gate=_assert_latest_generation if is_staged_input else None,
+                ),
+                operation_type="document_ingestion",
                 collection=str(payload["collection"]),
-                source_path=str(payload["source_path"]),
-                ingestion_config=ingestion_config,
-                progress_manager=progress_manager,
-                user_id=int(payload["user_id"]),
-                is_admin=bool(payload.get("is_admin", False)),
-                file_id=str(file_id) if file_id else None,
-                metadata_source_path=str(target_path) if target_path else None,
-                commit_gate=_assert_latest_generation if is_staged_input else None,
             )
+            result = api_result.result
     except StagedDocumentIngestSuperseded:
         _restore_or_cleanup_failed_staged_job_collection_config_if_current(
             db,
@@ -203,11 +216,22 @@ def handle_kb_ingest_document(db: Session, job: BackgroundJob) -> dict[str, Any]
                     context="background stale staged document ingest",
                 )
                 return _superseded_staged_document_result(payload)
+            api_result = _get_api_compatibility_facade().with_rollback_complete(
+                api_result,
+                True,
+            )
+            cleanup_decision = (
+                _get_api_compatibility_facade().failed_ingest_cleanup_decision(
+                    api_result
+                )
+            )
             _restore_or_cleanup_failed_job_collection_config(
                 db,
                 payload,
                 snapshot=config_snapshot,
                 context="background staged document ingest",
+                successful_documents=cleanup_decision.successful_documents,
+                side_effects_may_remain=cleanup_decision.side_effects_may_remain,
             )
         else:
             _rollback_failed_document_ingestion(
@@ -216,11 +240,22 @@ def handle_kb_ingest_document(db: Session, job: BackgroundJob) -> dict[str, Any]
                 result,
                 config_snapshot=config_snapshot,
             )
+            api_result = _get_api_compatibility_facade().with_rollback_complete(
+                api_result,
+                True,
+            )
+            cleanup_decision = (
+                _get_api_compatibility_facade().failed_ingest_cleanup_decision(
+                    api_result
+                )
+            )
             _restore_or_cleanup_failed_job_collection_config(
                 db,
                 payload,
                 snapshot=config_snapshot,
                 context="background document ingest",
+                successful_documents=cleanup_decision.successful_documents,
+                side_effects_may_remain=cleanup_decision.side_effects_may_remain,
             )
         raise BackgroundJobHandlerError(
             result.message,
@@ -258,11 +293,23 @@ def handle_kb_ingest_document(db: Session, job: BackgroundJob) -> dict[str, Any]
                     context="background stale staged document publish rollback",
                 )
                 return _superseded_staged_document_result(payload)
+            api_result = _get_api_compatibility_facade().with_rollback_complete(
+                api_result,
+                True,
+            )
+            cleanup_decision = (
+                _get_api_compatibility_facade().failed_ingest_cleanup_decision(
+                    api_result,
+                    successful_documents=0,
+                )
+            )
             _restore_or_cleanup_failed_job_collection_config(
                 db,
                 payload,
                 snapshot=config_snapshot,
                 context="background staged document publish",
+                successful_documents=cleanup_decision.successful_documents,
+                side_effects_may_remain=cleanup_decision.side_effects_may_remain,
             )
             raise BackgroundJobHandlerError(
                 f"Document ingestion succeeded but publishing uploaded file failed: {exc}",
@@ -324,17 +371,22 @@ def handle_kb_ingest_web(db: Session, job: BackgroundJob) -> dict[str, Any]:
     update_job_progress(db, job, message="Crawling website")
     try:
         with user_scope_context(user_id=user_id, is_admin=is_admin):
-            result = asyncio.run(
-                run_web_ingestion(
+            api_result = asyncio.run(
+                _get_api_compatibility_facade().run_async_with_operation_outcome(
+                    lambda: run_web_ingestion(
+                        collection=collection,
+                        crawl_config=crawl_config,
+                        ingestion_config=ingestion_config,
+                        progress_callback=_progress,
+                        user_id=user_id,
+                        is_admin=is_admin,
+                        file_handler=_file_handler_with_db,
+                    ),
+                    operation_type="web_ingestion",
                     collection=collection,
-                    crawl_config=crawl_config,
-                    ingestion_config=ingestion_config,
-                    progress_callback=_progress,
-                    user_id=user_id,
-                    is_admin=is_admin,
-                    file_handler=_file_handler_with_db,
                 )
             )
+            result = api_result.result
     except Exception:
         _cleanup_failed_web_collection_metadata_if_new(
             db,
@@ -345,12 +397,18 @@ def handle_kb_ingest_web(db: Session, job: BackgroundJob) -> dict[str, Any]:
 
     result_payload = result.model_dump(mode="json")
     if result.status in {"error", "partial"}:
+        cleanup_decision = (
+            _get_api_compatibility_facade().failed_ingest_cleanup_decision(
+                api_result,
+                successful_documents=int(result.documents_created or 0),
+            )
+        )
         _cleanup_failed_web_collection_metadata_if_new(
             db,
             payload,
             snapshot=config_snapshot,
-            successful_documents=int(result.documents_created or 0),
-            side_effects_may_remain=bool(result.side_effects_may_remain),
+            successful_documents=cleanup_decision.successful_documents,
+            side_effects_may_remain=cleanup_decision.side_effects_may_remain,
         )
     if result.status == "error":
         raise BackgroundJobHandlerError(result.message, result=result_payload)
