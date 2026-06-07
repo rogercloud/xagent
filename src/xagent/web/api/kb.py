@@ -22,6 +22,7 @@ from typing import (
     Dict,
     List,
     Literal,
+    Mapping,
     Optional,
     TypedDict,
     TypeVar,
@@ -65,33 +66,15 @@ from ...core.tools.core.RAG_tools.core.schemas import (
     WebCrawlConfig,
     WebIngestionResult,
 )
-from ...core.tools.core.RAG_tools.management.collection_manager import (
-    delete_collection_metadata_sync,
-    get_collection_sync,
-)
-from ...core.tools.core.RAG_tools.management.collections import (
-    delete_collection,
-    delete_document,
-    list_collections,
-    list_documents,
+from ...core.tools.core.RAG_tools.kb import (
+    KBApiCompatibilityFacade,
+    get_kb_coordinator,
 )
 from ...core.tools.core.RAG_tools.management.status import clear_ingestion_status
-from ...core.tools.core.RAG_tools.parse.parse_display import (
-    paginate_parse_results,
-    reconstruct_parse_result_from_db,
-)
-from ...core.tools.core.RAG_tools.pipelines.document_ingestion import (
-    run_document_ingestion,
-)
-from ...core.tools.core.RAG_tools.pipelines.document_search import run_document_search
-from ...core.tools.core.RAG_tools.pipelines.web_ingestion import (
-    FileHandlerResult,
-    run_web_ingestion,
-)
+from ...core.tools.core.RAG_tools.pipelines.web_ingestion import FileHandlerResult
 from ...core.tools.core.RAG_tools.progress import get_progress_manager
 from ...core.tools.core.RAG_tools.storage.contracts import DocumentRecord
 from ...core.tools.core.RAG_tools.storage.factory import (
-    get_ingestion_status_store,
     get_metadata_store,
     get_vector_index_store,
 )
@@ -173,6 +156,202 @@ from .cloud_storage import get_google_credentials
 
 T = TypeVar("T", bound=Callable[..., Any])
 logger = logging.getLogger(__name__)
+
+
+def _get_api_compatibility_facade() -> KBApiCompatibilityFacade:
+    """Return the coordinator-owned KB API compatibility facade."""
+    return get_kb_coordinator().api_compatibility
+
+
+def get_collection_sync(collection_name: str) -> Any:
+    """API compatibility wrapper for legacy collection metadata lookup."""
+    return _get_api_compatibility_facade().get_collection_sync(collection_name)
+
+
+def delete_collection_metadata_sync(
+    *,
+    collection_name: str,
+    user_id: Optional[int],
+    is_admin: bool = False,
+    delete_orphaned_metadata: bool = False,
+) -> dict[str, int]:
+    """API compatibility wrapper for collection config/metadata cleanup."""
+    return _get_api_compatibility_facade().delete_collection_metadata_sync(
+        collection_name=collection_name,
+        user_id=user_id,
+        is_admin=is_admin,
+        delete_orphaned_metadata=delete_orphaned_metadata,
+    )
+
+
+async def list_collections(
+    user_id: Optional[int] = None,
+    is_admin: Optional[bool] = None,
+    force_realtime: bool = False,
+) -> ListCollectionsResult:
+    """API compatibility wrapper for collection listing."""
+    return await _get_api_compatibility_facade().list_collections(
+        user_id=user_id,
+        is_admin=is_admin,
+        force_realtime=force_realtime,
+    )
+
+
+def list_documents(
+    collection: str,
+    user_id: Optional[int] = None,
+    is_admin: bool = False,
+) -> Any:
+    """API compatibility wrapper for document listing."""
+    return _get_api_compatibility_facade().list_documents(
+        collection=collection,
+        user_id=user_id,
+        is_admin=is_admin,
+    )
+
+
+def list_document_records(
+    *,
+    collection_name: Optional[str],
+    user_id: Optional[int],
+    is_admin: bool = False,
+    max_results: Optional[int] = None,
+) -> list[Any]:
+    """API compatibility wrapper for document-record scans."""
+    return _get_api_compatibility_facade().list_document_records(
+        collection_name=collection_name,
+        user_id=user_id,
+        is_admin=is_admin,
+        max_results=max_results,
+    )
+
+
+def delete_document(
+    collection: str,
+    doc_id: str,
+    user_id: int,
+    is_admin: bool = False,
+) -> Any:
+    """API compatibility wrapper for document deletion."""
+    return _get_api_compatibility_facade().delete_document(
+        collection=collection,
+        doc_id=doc_id,
+        user_id=user_id,
+        is_admin=is_admin,
+    )
+
+
+def delete_collection(
+    collection: str,
+    user_id: Optional[int] = None,
+    is_admin: bool = False,
+) -> CollectionOperationResult:
+    """API compatibility wrapper for collection deletion."""
+    return _get_api_compatibility_facade().delete_collection(
+        collection=collection,
+        user_id=user_id,
+        is_admin=is_admin,
+    )
+
+
+def run_document_ingestion(
+    collection: str,
+    source_path: str,
+    *,
+    ingestion_config: Optional[Any] = None,
+    progress_manager: Optional[Any] = None,
+    user_id: Optional[int] = None,
+    is_admin: Optional[bool] = None,
+    file_id: Optional[str] = None,
+    metadata_source_path: Optional[str] = None,
+    commit_gate: Optional[Callable[[], None]] = None,
+) -> IngestionResult:
+    """API compatibility wrapper for local-file ingestion."""
+    return _get_api_compatibility_facade().run_document_ingestion(
+        collection=collection,
+        source_path=source_path,
+        ingestion_config=ingestion_config,
+        progress_manager=progress_manager,
+        user_id=user_id,
+        is_admin=is_admin,
+        file_id=file_id,
+        metadata_source_path=metadata_source_path,
+        commit_gate=commit_gate,
+    )
+
+
+def run_document_search(
+    collection: str,
+    query_text: str,
+    *,
+    config: Optional[SearchConfig | Mapping[str, Any]] = None,
+    progress_manager: Optional[Any] = None,
+    user_id: Optional[int] = None,
+    is_admin: Optional[bool] = None,
+) -> SearchPipelineResult:
+    """API compatibility wrapper for document search."""
+    return _get_api_compatibility_facade().run_document_search(
+        collection=collection,
+        query_text=query_text,
+        config=config,
+        progress_manager=progress_manager,
+        user_id=user_id,
+        is_admin=is_admin,
+    )
+
+
+async def run_web_ingestion(
+    collection: str,
+    crawl_config: WebCrawlConfig,
+    *,
+    ingestion_config: Optional[Any] = None,
+    progress_callback: Optional[Any] = None,
+    user_id: Optional[int] = None,
+    is_admin: Optional[bool] = None,
+    file_handler: Optional[Any] = None,
+) -> WebIngestionResult:
+    """API compatibility wrapper for web ingestion."""
+    return await _get_api_compatibility_facade().run_web_ingestion(
+        collection=collection,
+        crawl_config=crawl_config,
+        ingestion_config=ingestion_config,
+        progress_callback=progress_callback,
+        user_id=user_id,
+        is_admin=is_admin,
+        file_handler=file_handler,
+    )
+
+
+def reconstruct_parse_result_from_db(
+    collection: str,
+    doc_id: str,
+    parse_hash: Optional[str] = None,
+    *,
+    user_id: Optional[int] = None,
+    is_admin: bool = False,
+) -> tuple[list[dict[str, Any]], str | None]:
+    """API compatibility wrapper for parse result reconstruction."""
+    return _get_api_compatibility_facade().reconstruct_parse_result_from_db(
+        collection=collection,
+        doc_id=doc_id,
+        parse_hash=parse_hash,
+        user_id=user_id,
+        is_admin=is_admin,
+    )
+
+
+def paginate_parse_results(
+    elements: list[dict[str, Any]],
+    page: int,
+    page_size: int,
+) -> tuple[list[Any], dict[str, Any]]:
+    """API compatibility wrapper for parse-result pagination."""
+    return _get_api_compatibility_facade().paginate_parse_results(
+        elements,
+        page,
+        page_size,
+    )
+
 
 _SQL_LIKE_ESCAPE = "\\"
 _PDF_ONLY_PARSE_METHODS = {
@@ -2800,10 +2979,11 @@ async def _save_collection_config_with_snapshot(
         )
 
     try:
-        await metadata_store.save_collection_config(
+        await _get_api_compatibility_facade().save_collection_config(
             collection=collection,
             config_json=config_json,
             user_id=int(user.id),
+            metadata_store=metadata_store,
         )
         return _CollectionConfigSnapshot(
             metadata_store=metadata_store,
@@ -3080,10 +3260,11 @@ async def save_collection_config(
 
     try:
         metadata_store = get_metadata_store()
-        await metadata_store.save_collection_config(
+        await _get_api_compatibility_facade().save_collection_config(
             collection=safe_collection,
             config_json=config_json,
             user_id=int(_user.id),
+            metadata_store=metadata_store,
         )
 
         return CollectionOperationResult(
@@ -5869,9 +6050,8 @@ async def check_documents_exist_api(
 
         await _ensure_collection_access(safe_collection, _user, allow_create=True)
 
-        # Use storage abstraction layer to fetch document records
-        vector_store = get_vector_index_store()
-        records = vector_store.list_document_records(
+        # Fetch document records through the API compatibility boundary.
+        records = list_document_records(
             collection_name=safe_collection,
             user_id=int(_user.id),
             is_admin=False,
@@ -6753,7 +6933,7 @@ async def rename_collection_api(
     # Step 2: Update collection name in all tables (documents, parses, chunks, embeddings)
     # Use storage abstraction layer which handles all tables including embeddings
     warnings.extend(
-        vector_store.rename_collection_data(
+        _get_api_compatibility_facade().rename_collection_data(
             collection_name=safe_old_collection,
             new_name=safe_new_collection,
             user_id=int(_user.id),
@@ -6762,8 +6942,7 @@ async def rename_collection_api(
     )
 
     try:
-        metadata_store = get_metadata_store()
-        await metadata_store.rename_collection(
+        await _get_api_compatibility_facade().rename_collection_metadata(
             old_name=safe_old_collection,
             new_name=safe_new_collection,
             user_id=int(_user.id),
@@ -6777,7 +6956,7 @@ async def rename_collection_api(
     # collection/user filters map to its backend tables.
     try:
         warnings.extend(
-            get_ingestion_status_store().rename_collection_status(
+            _get_api_compatibility_facade().rename_collection_status(
                 old_name=safe_old_collection,
                 new_name=safe_new_collection,
                 user_id=int(_user.id),
