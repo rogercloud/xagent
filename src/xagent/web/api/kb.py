@@ -5150,7 +5150,7 @@ async def ingest_web(
             finally:
                 db_session.close()
 
-        api_result = await asyncio.get_event_loop().run_in_executor(
+        api_result = await asyncio.get_running_loop().run_in_executor(
             None,
             lambda: asyncio.run(
                 run_web_ingestion_with_outcome(

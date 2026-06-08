@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import inspect
-import unittest.mock
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
@@ -49,9 +48,7 @@ async def _maybe_await(value: Any) -> Any:
 
 
 def _has_store_method(metadata_store: object, name: str) -> bool:
-    """Return True for real MetadataStore implementations, not loose mocks."""
-    if isinstance(metadata_store, unittest.mock.NonCallableMock):
-        return False
+    """Return True when the store exposes a callable method."""
     return callable(getattr(metadata_store, name, None))
 
 
@@ -442,10 +439,10 @@ class KBApiCompatibilityFacade:
                 collection_name
             )
 
-        from ..management.collection_manager import get_collection_sync
+        from ..management import collection_manager as collection_manager_module
 
         with self._storage_context():
-            return get_collection_sync(collection_name)
+            return collection_manager_module.get_collection_sync(collection_name)
 
     def delete_collection_metadata_sync(
         self,
@@ -463,10 +460,10 @@ class KBApiCompatibilityFacade:
                 delete_orphaned_metadata=delete_orphaned_metadata,
             )
 
-        from ..management.collection_manager import delete_collection_metadata_sync
+        from ..management import collection_manager as collection_manager_module
 
         with self._storage_context():
-            return delete_collection_metadata_sync(
+            return collection_manager_module.delete_collection_metadata_sync(
                 collection_name=collection_name,
                 user_id=user_id,
                 is_admin=is_admin,
@@ -486,10 +483,10 @@ class KBApiCompatibilityFacade:
                 force_realtime=force_realtime,
             )
 
-        from ..management.collections import list_collections
+        from ..management import collections as collections_module
 
         with self._storage_context():
-            return await list_collections(
+            return await collections_module.list_collections(
                 user_id=user_id,
                 is_admin=is_admin,
                 force_realtime=force_realtime,
@@ -508,10 +505,10 @@ class KBApiCompatibilityFacade:
                 is_admin=is_admin,
             )
 
-        from ..management.collections import list_documents
+        from ..management import collections as collections_module
 
         with self._storage_context():
-            return list_documents(
+            return collections_module.list_documents(
                 collection=collection,
                 user_id=user_id,
                 is_admin=is_admin,
@@ -553,10 +550,10 @@ class KBApiCompatibilityFacade:
                 is_admin=is_admin,
             )
 
-        from ..management.collections import delete_document
+        from ..management import collections as collections_module
 
         with self._storage_context():
-            return delete_document(
+            return collections_module.delete_document(
                 collection,
                 doc_id,
                 user_id,
@@ -576,10 +573,10 @@ class KBApiCompatibilityFacade:
                 is_admin=is_admin,
             )
 
-        from ..management.collections import delete_collection
+        from ..management import collections as collections_module
 
         with self._storage_context():
-            return delete_collection(collection, user_id, is_admin)
+            return collections_module.delete_collection(collection, user_id, is_admin)
 
     def rename_collection_data(
         self,
@@ -664,10 +661,10 @@ class KBApiCompatibilityFacade:
                 commit_gate=commit_gate,
             )
 
-        from ..pipelines.document_ingestion import run_document_ingestion
+        from ..pipelines import document_ingestion as document_ingestion_pipeline
 
         with self._storage_context():
-            return run_document_ingestion(
+            return document_ingestion_pipeline.run_document_ingestion(
                 collection=collection,
                 source_path=source_path,
                 ingestion_config=ingestion_config,
@@ -699,10 +696,10 @@ class KBApiCompatibilityFacade:
                 is_admin=is_admin,
             )
 
-        from ..pipelines.document_search import run_document_search
+        from ..pipelines import document_search as document_search_pipeline
 
         with self._storage_context():
-            return run_document_search(
+            return document_search_pipeline.run_document_search(
                 collection=collection,
                 query_text=query_text,
                 config=config,
@@ -733,10 +730,10 @@ class KBApiCompatibilityFacade:
                 file_handler=file_handler,
             )
 
-        from ..pipelines.web_ingestion import run_web_ingestion
+        from ..pipelines import web_ingestion as web_ingestion_pipeline
 
         with self._storage_context():
-            return await run_web_ingestion(
+            return await web_ingestion_pipeline.run_web_ingestion(
                 collection=collection,
                 crawl_config=crawl_config,
                 ingestion_config=ingestion_config,
@@ -764,10 +761,10 @@ class KBApiCompatibilityFacade:
                 is_admin=is_admin,
             )
 
-        from ..parse.parse_display import reconstruct_parse_result_from_db
+        from ..parse import parse_display as parse_display_module
 
         with self._storage_context():
-            return reconstruct_parse_result_from_db(
+            return parse_display_module.reconstruct_parse_result_from_db(
                 collection,
                 doc_id,
                 parse_hash,
@@ -788,6 +785,6 @@ class KBApiCompatibilityFacade:
                 page_size,
             )
 
-        from ..parse.parse_display import paginate_parse_results
+        from ..parse import parse_display as parse_display_module
 
-        return paginate_parse_results(elements, page, page_size)
+        return parse_display_module.paginate_parse_results(elements, page, page_size)
