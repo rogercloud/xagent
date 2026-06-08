@@ -7,7 +7,16 @@ import unittest.mock
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
-from typing import TYPE_CHECKING, Any, Awaitable, Callable, Generic, Optional, TypeVar
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Awaitable,
+    Callable,
+    Generic,
+    Optional,
+    TypeVar,
+    cast,
+)
 
 from ..core.schemas import (
     CollectionInfo,
@@ -292,15 +301,12 @@ class KBApiCompatibilityFacade:
         collection: str,
         config_json: str,
         user_id: int,
-        metadata_store: Any | None = None,
     ) -> None:
         """Save tenant-scoped config and ensure owner-neutral backend binding."""
         with self._storage_context():
-            store = metadata_store
-            if store is None:
-                from ..storage.factory import get_metadata_store
+            from ..storage.factory import get_metadata_store
 
-                store = get_metadata_store()
+            store = get_metadata_store()
 
             await _maybe_await(
                 store.save_collection_config(
@@ -309,58 +315,126 @@ class KBApiCompatibilityFacade:
                     user_id=user_id,
                 )
             )
-            await self.ensure_collection_backend_binding(
-                collection,
-                metadata_store=store,
-            )
+            await self._ensure_collection_backend_binding_with_store(collection, store)
 
     async def ensure_collection_backend_binding(
         self,
         collection: str,
-        *,
-        metadata_store: Any | None = None,
     ) -> CollectionInfo | None:
         """Create a collection-level backend binding without changing owners."""
         with self._storage_context():
-            store = metadata_store
-            if store is None:
-                from ..storage.factory import get_metadata_store
+            from ..storage.factory import get_metadata_store
 
-                store = get_metadata_store()
-
-            if not _has_store_method(store, "save_collection"):
-                return None
-
-            collection_info: CollectionInfo | None = None
-            if _has_store_method(store, "get_collection"):
-                try:
-                    loaded = store.get_collection(collection)
-                    loaded = await _maybe_await(loaded)
-                except ValueError:
-                    collection_info = CollectionInfo(name=collection)
-                else:
-                    if isinstance(loaded, CollectionInfo):
-                        collection_info = loaded
-                    elif loaded is None:
-                        collection_info = CollectionInfo(name=collection)
-            else:
-                collection_info = CollectionInfo(name=collection)
-
-            if collection_info is None:
-                return None
-
-            extra_metadata = dict(collection_info.extra_metadata or {})
-            if extra_metadata.get(KB_STORAGE_METADATA_KEY) is not None:
-                return collection_info
-
-            extra_metadata[KB_STORAGE_METADATA_KEY] = {
-                "backend": KBStorageBackend.LANCEDB.value
-            }
-            updated_collection = collection_info.model_copy(
-                update={"extra_metadata": extra_metadata}
+            store = get_metadata_store()
+            return await self._ensure_collection_backend_binding_with_store(
+                collection,
+                store,
             )
-            await _maybe_await(store.save_collection(updated_collection))
-            return updated_collection
+
+    async def _ensure_collection_backend_binding_with_store(
+        self,
+        collection: str,
+        store: Any,
+    ) -> CollectionInfo | None:
+        if not _has_store_method(store, "save_collection"):
+            return None
+
+        collection_info: CollectionInfo | None = None
+        if _has_store_method(store, "get_collection"):
+            try:
+                loaded = store.get_collection(collection)
+                loaded = await _maybe_await(loaded)
+            except ValueError:
+                collection_info = CollectionInfo(name=collection)
+            else:
+                if isinstance(loaded, CollectionInfo):
+                    collection_info = loaded
+                elif loaded is None:
+                    collection_info = CollectionInfo(name=collection)
+        else:
+            collection_info = CollectionInfo(name=collection)
+
+        if collection_info is None:
+            return None
+
+        extra_metadata = dict(collection_info.extra_metadata or {})
+        if extra_metadata.get(KB_STORAGE_METADATA_KEY) is not None:
+            return collection_info
+
+        extra_metadata[KB_STORAGE_METADATA_KEY] = {
+            "backend": KBStorageBackend.LANCEDB.value
+        }
+        updated_collection = collection_info.model_copy(
+            update={"extra_metadata": extra_metadata}
+        )
+        await _maybe_await(store.save_collection(updated_collection))
+        return updated_collection
+
+    async def get_collection_config(
+        self,
+        *,
+        collection: str,
+        user_id: Optional[int],
+        is_admin: bool = False,
+    ) -> str | None:
+        """Read tenant-scoped config through the facade-bound metadata store."""
+        with self._storage_context():
+            from ..storage.factory import get_metadata_store
+
+            return cast(
+                str | None,
+                await _maybe_await(
+                    get_metadata_store().get_collection_config(
+                        collection=collection,
+                        user_id=user_id,
+                        is_admin=is_admin,
+                    )
+                ),
+            )
+
+    async def delete_collection_metadata(
+        self,
+        *,
+        collection_name: str,
+        user_id: Optional[int],
+        is_admin: bool = False,
+        delete_orphaned_metadata: bool = False,
+    ) -> dict[str, int]:
+        """Delete collection metadata through the facade-bound metadata store."""
+        with self._storage_context():
+            from ..storage.factory import get_metadata_store
+
+            return cast(
+                dict[str, int],
+                await _maybe_await(
+                    get_metadata_store().delete_collection_metadata(
+                        collection_name=collection_name,
+                        user_id=user_id,
+                        is_admin=is_admin,
+                        delete_orphaned_metadata=delete_orphaned_metadata,
+                    )
+                ),
+            )
+
+    async def delete_collection_metadata_entry(self, collection_name: str) -> bool:
+        """Delete the collection metadata row when the store supports it."""
+        with self._storage_context():
+            from ..storage.factory import get_metadata_store
+
+            delete_metadata = getattr(get_metadata_store(), "delete_collection", None)
+            if not callable(delete_metadata):
+                return False
+            await _maybe_await(delete_metadata(collection_name))
+            return True
+
+    def list_collection_config_owner_ids(self, collection_name: str) -> set[int]:
+        """List tenant config owners through the facade-bound metadata store."""
+        with self._storage_context():
+            from ..storage.factory import get_metadata_store
+
+            return set(
+                get_metadata_store().list_collection_config_owner_ids(collection_name)
+            )
 
     def get_collection_sync(self, collection_name: str) -> CollectionInfo:
         if self._coordinator is not None:
@@ -450,14 +524,11 @@ class KBApiCompatibilityFacade:
         user_id: Optional[int],
         is_admin: bool = False,
         max_results: Optional[int] = None,
-        vector_store: Any | None = None,
     ) -> list[Any]:
         with self._storage_context():
-            store = vector_store
-            if store is None:
-                from ..storage.factory import get_vector_index_store
+            from ..storage.factory import get_vector_index_store
 
-                store = get_vector_index_store()
+            store = get_vector_index_store()
             kwargs: dict[str, Any] = {
                 "collection_name": collection_name,
                 "user_id": user_id,
@@ -517,14 +588,11 @@ class KBApiCompatibilityFacade:
         new_name: str,
         user_id: Optional[int],
         is_admin: bool = False,
-        vector_store: Any | None = None,
     ) -> list[str]:
         with self._storage_context():
-            store = vector_store
-            if store is None:
-                from ..storage.factory import get_vector_index_store
+            from ..storage.factory import get_vector_index_store
 
-                store = get_vector_index_store()
+            store = get_vector_index_store()
             return store.rename_collection_data(
                 collection_name=collection_name,
                 new_name=new_name,
@@ -539,14 +607,11 @@ class KBApiCompatibilityFacade:
         new_name: str,
         user_id: Optional[int],
         is_admin: bool = False,
-        metadata_store: Any | None = None,
     ) -> None:
         with self._storage_context():
-            store = metadata_store
-            if store is None:
-                from ..storage.factory import get_metadata_store
+            from ..storage.factory import get_metadata_store
 
-                store = get_metadata_store()
+            store = get_metadata_store()
             await store.rename_collection(
                 old_name=old_name,
                 new_name=new_name,
@@ -561,14 +626,11 @@ class KBApiCompatibilityFacade:
         new_name: str,
         user_id: Optional[int],
         is_admin: bool = False,
-        status_store: Any | None = None,
     ) -> list[str]:
         with self._storage_context():
-            store = status_store
-            if store is None:
-                from ..storage.factory import get_ingestion_status_store
+            from ..storage.factory import get_ingestion_status_store
 
-                store = get_ingestion_status_store()
+            store = get_ingestion_status_store()
             return store.rename_collection_status(
                 old_name=old_name,
                 new_name=new_name,

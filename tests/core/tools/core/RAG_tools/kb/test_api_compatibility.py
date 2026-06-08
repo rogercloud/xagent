@@ -71,11 +71,28 @@ class _NoneReturningMetadataStore(_FakeMetadataStore):
 
 
 class _FakeStorageShim:
-    def __init__(self, metadata_store: object) -> None:
+    def __init__(
+        self,
+        metadata_store: object,
+        vector_store: object | None = None,
+        status_store: object | None = None,
+    ) -> None:
         self.metadata_store = metadata_store
+        self.vector_store = vector_store
+        self.status_store = status_store
 
     def get_metadata_store(self) -> object:
         return self.metadata_store
+
+    def get_vector_index_store(self) -> object:
+        if self.vector_store is None:
+            raise AssertionError("vector store was not configured")
+        return self.vector_store
+
+    def get_ingestion_status_store(self) -> object:
+        if self.status_store is None:
+            raise AssertionError("status store was not configured")
+        return self.status_store
 
 
 def test_kb_api_facade_public_surface_imports() -> None:
@@ -298,6 +315,167 @@ async def test_run_async_with_operation_outcome_rebinds_storage_context() -> Non
     assert seen_shims == [inner_shim]
 
 
+@pytest.mark.asyncio
+async def test_api_facade_storage_operations_rebind_storage_context() -> None:
+    from xagent.core.tools.core.RAG_tools.storage.factory import (
+        bind_storage_shim_for_current_context,
+        get_bound_storage_shim_for_current_context,
+    )
+
+    class VectorStore:
+        def __init__(self) -> None:
+            self.list_calls: list[dict[str, object]] = []
+            self.rename_calls: list[dict[str, object]] = []
+
+        def list_document_records(self, **kwargs: object) -> list[str]:
+            self.list_calls.append(kwargs)
+            return ["record"]
+
+        def rename_collection_data(self, **kwargs: object) -> list[str]:
+            self.rename_calls.append(kwargs)
+            return ["vector warning"]
+
+    class MetadataStore(_FakeMetadataStore):
+        def __init__(self) -> None:
+            super().__init__(CollectionInfo(name="old"))
+            self.loaded_configs: list[dict[str, object]] = []
+            self.deleted_metadata: list[dict[str, object]] = []
+            self.deleted_entries: list[str] = []
+            self.renamed: list[dict[str, object]] = []
+            self.config_owner_ids = {7, 8}
+
+        async def get_collection_config(
+            self,
+            *,
+            collection: str,
+            user_id: int | None,
+            is_admin: bool = False,
+        ) -> str | None:
+            self.loaded_configs.append(
+                {"collection": collection, "user_id": user_id, "is_admin": is_admin}
+            )
+            return "{}"
+
+        async def delete_collection_metadata(self, **kwargs: object) -> dict[str, int]:
+            self.deleted_metadata.append(kwargs)
+            return {"collection_config": 1}
+
+        async def delete_collection(self, collection_name: str) -> None:
+            self.deleted_entries.append(collection_name)
+
+        def list_collection_config_owner_ids(self, collection_name: str) -> set[int]:
+            assert collection_name == "old"
+            return self.config_owner_ids
+
+        async def rename_collection(self, **kwargs: object) -> None:
+            self.renamed.append(kwargs)
+
+    class StatusStore:
+        def __init__(self) -> None:
+            self.renamed: list[dict[str, object]] = []
+
+        def rename_collection_status(self, **kwargs: object) -> list[str]:
+            self.renamed.append(kwargs)
+            return ["status warning"]
+
+    outer_metadata = MetadataStore()
+    outer_vector = VectorStore()
+    outer_status = StatusStore()
+    inner_metadata = MetadataStore()
+    inner_vector = VectorStore()
+    inner_status = StatusStore()
+    outer_shim = _FakeStorageShim(outer_metadata, outer_vector, outer_status)
+    inner_shim = _FakeStorageShim(inner_metadata, inner_vector, inner_status)
+    facade = KBApiCompatibilityFacade(storage_shim=inner_shim)
+
+    with bind_storage_shim_for_current_context(outer_shim):
+        assert facade.list_document_records(
+            collection_name="old",
+            user_id=7,
+            is_admin=False,
+        ) == ["record"]
+        await facade.save_collection_config(
+            collection="old",
+            config_json="{}",
+            user_id=7,
+        )
+        assert (
+            await facade.get_collection_config(
+                collection="old",
+                user_id=7,
+                is_admin=False,
+            )
+            == "{}"
+        )
+        await facade.delete_collection_metadata(
+            collection_name="old",
+            user_id=7,
+            is_admin=False,
+            delete_orphaned_metadata=True,
+        )
+        assert await facade.delete_collection_metadata_entry("old") is True
+        assert facade.list_collection_config_owner_ids("old") == {7, 8}
+        assert facade.rename_collection_data(
+            collection_name="old",
+            new_name="new",
+            user_id=7,
+            is_admin=False,
+        ) == ["vector warning"]
+        await facade.rename_collection_metadata(
+            old_name="old",
+            new_name="new",
+            user_id=7,
+            is_admin=False,
+        )
+        assert facade.rename_collection_status(
+            old_name="old",
+            new_name="new",
+            user_id=7,
+            is_admin=False,
+        ) == ["status warning"]
+        assert get_bound_storage_shim_for_current_context() is outer_shim
+
+    assert outer_vector.list_calls == []
+    assert outer_vector.rename_calls == []
+    assert outer_metadata.saved_configs == []
+    assert outer_metadata.loaded_configs == []
+    assert outer_metadata.deleted_metadata == []
+    assert outer_metadata.deleted_entries == []
+    assert outer_metadata.renamed == []
+    assert outer_status.renamed == []
+
+    assert inner_vector.list_calls == [
+        {"collection_name": "old", "user_id": 7, "is_admin": False}
+    ]
+    assert inner_vector.rename_calls == [
+        {
+            "collection_name": "old",
+            "new_name": "new",
+            "user_id": 7,
+            "is_admin": False,
+        }
+    ]
+    assert inner_metadata.saved_configs == [("old", "{}", 7)]
+    assert inner_metadata.loaded_configs == [
+        {"collection": "old", "user_id": 7, "is_admin": False}
+    ]
+    assert inner_metadata.deleted_metadata == [
+        {
+            "collection_name": "old",
+            "user_id": 7,
+            "is_admin": False,
+            "delete_orphaned_metadata": True,
+        }
+    ]
+    assert inner_metadata.deleted_entries == ["old"]
+    assert inner_metadata.renamed == [
+        {"old_name": "old", "new_name": "new", "user_id": 7, "is_admin": False}
+    ]
+    assert inner_status.renamed == [
+        {"old_name": "old", "new_name": "new", "user_id": 7, "is_admin": False}
+    ]
+
+
 def test_api_operation_result_ignores_stale_operation_outcome() -> None:
     operation_facade = KBOperationCompatibilityFacade()
     coordinator = KBCoordinator(operation_compatibility=operation_facade)
@@ -449,19 +627,23 @@ def test_list_document_records_omits_none_max_results(
     ]
 
 
-def test_web_api_list_document_records_uses_route_vector_store(
+def test_web_api_list_document_records_routes_through_api_facade(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from xagent.web.api import kb as kb_api
 
     calls: list[dict[str, object]] = []
 
-    class VectorStore:
+    class Facade:
         def list_document_records(self, **kwargs: object) -> list[str]:
             calls.append(kwargs)
             return ["record"]
 
-    monkeypatch.setattr(kb_api, "get_vector_index_store", lambda: VectorStore())
+    monkeypatch.setattr(
+        kb_api,
+        "_get_api_compatibility_facade",
+        lambda: Facade(),
+    )
 
     records = kb_api.list_document_records(
         collection_name="demo",

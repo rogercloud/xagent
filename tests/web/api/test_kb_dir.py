@@ -1625,9 +1625,16 @@ def test_kb_rename_physical_directory_rename(test_env, temp_uploads):
         patch(
             "xagent.core.tools.core.RAG_tools.management.collections._list_table_names"
         ) as mock_list_tables,
-        patch("xagent.web.api.kb.get_vector_index_store") as mock_store_factory,
+        patch(
+            "xagent.core.tools.core.RAG_tools.storage.factory.get_vector_index_store"
+        ) as mock_store_factory,
+        patch(
+            "xagent.core.tools.core.RAG_tools.storage.factory.get_metadata_store"
+        ) as mock_get_metadata_store,
         patch("xagent.web.api.kb.rename_collection_storage") as mock_rename_storage,
-        patch("xagent.web.api.kb.get_ingestion_status_store") as mock_get_status_store,
+        patch(
+            "xagent.core.tools.core.RAG_tools.storage.factory.get_ingestion_status_store"
+        ) as mock_get_status_store,
     ):
         mock_list_tables.return_value = []
 
@@ -1636,6 +1643,9 @@ def test_kb_rename_physical_directory_rename(test_env, temp_uploads):
         mock_store.list_document_records.return_value = []  # No documents
         mock_store.rename_collection_data.return_value = []  # No warnings
         mock_store_factory.return_value = mock_store
+        mock_metadata_store = mock_get_metadata_store.return_value
+        mock_metadata_store.list_collection_config_owner_ids.return_value = set()
+        mock_metadata_store.rename_collection = AsyncMock()
 
         # Mock rename_collection_storage to simulate success
         mock_rename_result = MagicMock()
@@ -1677,9 +1687,16 @@ def test_kb_rename_normalizes_padded_collection_names(test_env, temp_uploads):
         patch(
             "xagent.core.tools.core.RAG_tools.management.collections._list_table_names"
         ) as mock_list_tables,
-        patch("xagent.web.api.kb.get_vector_index_store") as mock_store_factory,
+        patch(
+            "xagent.core.tools.core.RAG_tools.storage.factory.get_vector_index_store"
+        ) as mock_store_factory,
+        patch(
+            "xagent.core.tools.core.RAG_tools.storage.factory.get_metadata_store"
+        ) as mock_get_metadata_store,
         patch("xagent.web.api.kb.rename_collection_storage") as mock_rename_storage,
-        patch("xagent.web.api.kb.get_ingestion_status_store") as mock_get_status_store,
+        patch(
+            "xagent.core.tools.core.RAG_tools.storage.factory.get_ingestion_status_store"
+        ) as mock_get_status_store,
     ):
         mock_list_tables.return_value = []
 
@@ -1688,6 +1705,9 @@ def test_kb_rename_normalizes_padded_collection_names(test_env, temp_uploads):
         mock_store.list_document_records.return_value = []
         mock_store.rename_collection_data.return_value = []
         mock_store_factory.return_value = mock_store
+        mock_metadata_store = mock_get_metadata_store.return_value
+        mock_metadata_store.list_collection_config_owner_ids.return_value = set()
+        mock_metadata_store.rename_collection = AsyncMock()
 
         # Mock rename_collection_storage
         mock_rename_result = MagicMock()
@@ -1732,9 +1752,16 @@ def test_kb_rename_accepts_unicode_collection_name(test_env, temp_uploads):
         patch(
             "xagent.core.tools.core.RAG_tools.management.collections._list_table_names"
         ) as mock_list_tables,
-        patch("xagent.web.api.kb.get_vector_index_store") as mock_store_factory,
+        patch(
+            "xagent.core.tools.core.RAG_tools.storage.factory.get_vector_index_store"
+        ) as mock_store_factory,
+        patch(
+            "xagent.core.tools.core.RAG_tools.storage.factory.get_metadata_store"
+        ) as mock_get_metadata_store,
         patch("xagent.web.api.kb.rename_collection_storage") as mock_rename_storage,
-        patch("xagent.web.api.kb.get_ingestion_status_store") as mock_get_status_store,
+        patch(
+            "xagent.core.tools.core.RAG_tools.storage.factory.get_ingestion_status_store"
+        ) as mock_get_status_store,
     ):
         mock_list_tables.return_value = []
 
@@ -1743,6 +1770,9 @@ def test_kb_rename_accepts_unicode_collection_name(test_env, temp_uploads):
         mock_store.list_document_records.return_value = []
         mock_store.rename_collection_data.return_value = []
         mock_store_factory.return_value = mock_store
+        mock_metadata_store = mock_get_metadata_store.return_value
+        mock_metadata_store.list_collection_config_owner_ids.return_value = set()
+        mock_metadata_store.rename_collection = AsyncMock()
 
         # Mock rename_collection_storage
         mock_rename_result = MagicMock()
@@ -1949,15 +1979,25 @@ def test_delete_after_rename_not_denied_by_stale_list_collections(test_env):
     with (
         patch("xagent.web.api.kb._ensure_collection_access", new_callable=AsyncMock),
         patch("xagent.web.api.kb._list_collections_with_retry") as mock_retry,
-        patch("xagent.web.api.kb.get_vector_index_store") as mock_store_factory,
+        patch(
+            "xagent.core.tools.core.RAG_tools.storage.factory.get_vector_index_store"
+        ) as mock_store_factory,
+        patch(
+            "xagent.core.tools.core.RAG_tools.storage.factory.get_metadata_store"
+        ) as mock_get_metadata_store,
         patch("xagent.web.api.kb.rename_collection_storage") as mock_rename_storage,
-        patch("xagent.web.api.kb.get_ingestion_status_store") as mock_get_status_store,
+        patch(
+            "xagent.core.tools.core.RAG_tools.storage.factory.get_ingestion_status_store"
+        ) as mock_get_status_store,
     ):
         mock_retry.side_effect = [stale_old_only, stale_old_only]
         mock_store = MagicMock()
         mock_store.list_document_records.return_value = []
         mock_store.rename_collection_data.return_value = []
         mock_store_factory.return_value = mock_store
+        mock_metadata_store = mock_get_metadata_store.return_value
+        mock_metadata_store.list_collection_config_owner_ids.return_value = set()
+        mock_metadata_store.rename_collection = AsyncMock()
         mock_rename_result = MagicMock()
         mock_rename_result.status = "not_found"
         mock_rename_result.error = None
@@ -2042,15 +2082,25 @@ def test_delete_after_rename_not_blocked_when_new_collection_is_visible(test_env
     with (
         patch("xagent.web.api.kb._ensure_collection_access", new_callable=AsyncMock),
         patch("xagent.web.api.kb._list_collections_with_retry") as mock_retry,
-        patch("xagent.web.api.kb.get_vector_index_store") as mock_store_factory,
+        patch(
+            "xagent.core.tools.core.RAG_tools.storage.factory.get_vector_index_store"
+        ) as mock_store_factory,
+        patch(
+            "xagent.core.tools.core.RAG_tools.storage.factory.get_metadata_store"
+        ) as mock_get_metadata_store,
         patch("xagent.web.api.kb.rename_collection_storage") as mock_rename_storage,
-        patch("xagent.web.api.kb.get_ingestion_status_store") as mock_get_status_store,
+        patch(
+            "xagent.core.tools.core.RAG_tools.storage.factory.get_ingestion_status_store"
+        ) as mock_get_status_store,
     ):
         mock_retry.side_effect = [visible_old, visible_old]
         mock_store = MagicMock()
         mock_store.list_document_records.return_value = []
         mock_store.rename_collection_data.return_value = []
         mock_store_factory.return_value = mock_store
+        mock_metadata_store = mock_get_metadata_store.return_value
+        mock_metadata_store.list_collection_config_owner_ids.return_value = set()
+        mock_metadata_store.rename_collection = AsyncMock()
         mock_rename_result = MagicMock()
         mock_rename_result.status = "not_found"
         mock_rename_result.error = None
@@ -2278,25 +2328,25 @@ async def test_failed_ingest_config_restore_skips_delete_when_snapshot_unknown()
         _restore_collection_config_after_failed_ingest,
     )
 
-    metadata_store = MagicMock()
-    metadata_store.save_collection_config = AsyncMock()
-    metadata_store.delete_collection_metadata = AsyncMock()
+    facade = MagicMock()
+    facade.save_collection_config = AsyncMock()
+    facade.delete_collection_metadata = AsyncMock()
 
-    await _restore_collection_config_after_failed_ingest(
-        snapshot=_CollectionConfigSnapshot(
-            metadata_store=metadata_store,
-            collection="existing_collection",
-            user_id=1,
-            previous_config_json=None,
-            previous_config_known=False,
-            saved=True,
-        ),
-        collection_existed_before=True,
-        context="unit-test",
-    )
+    with patch("xagent.web.api.kb._get_api_compatibility_facade", return_value=facade):
+        await _restore_collection_config_after_failed_ingest(
+            snapshot=_CollectionConfigSnapshot(
+                collection="existing_collection",
+                user_id=1,
+                previous_config_json=None,
+                previous_config_known=False,
+                saved=True,
+            ),
+            collection_existed_before=True,
+            context="unit-test",
+        )
 
-    metadata_store.save_collection_config.assert_not_awaited()
-    metadata_store.delete_collection_metadata.assert_not_awaited()
+    facade.save_collection_config.assert_not_awaited()
+    facade.delete_collection_metadata.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -3154,7 +3204,9 @@ def test_check_documents_exist_prefers_uploaded_file_filename(test_env, temp_upl
         ),
     ]
 
-    with patch("xagent.web.api.kb.get_vector_index_store") as mock_get_store:
+    with patch(
+        "xagent.core.tools.core.RAG_tools.storage.factory.get_vector_index_store"
+    ) as mock_get_store:
         mock_store = mock_get_store.return_value
         mock_store.list_document_records.return_value = records
         response = client.post(
@@ -3173,7 +3225,9 @@ def test_check_documents_exist_accepts_unicode_collection_name(test_env, temp_up
 
     collection_name = "示例知识库集合"
 
-    with patch("xagent.web.api.kb.get_vector_index_store") as mock_get_store:
+    with patch(
+        "xagent.core.tools.core.RAG_tools.storage.factory.get_vector_index_store"
+    ) as mock_get_store:
         mock_store = mock_get_store.return_value
         mock_store.list_document_records.return_value = []
 
@@ -4407,9 +4461,13 @@ def test_kb_delete_collection_cleans_file_id_managed_root_file(
     with (
         patch("xagent.web.api.kb._ensure_collection_access", new_callable=AsyncMock),
         patch("xagent.web.api.kb.get_vector_index_store") as mock_get_store,
+        patch(
+            "xagent.core.tools.core.RAG_tools.storage.factory.get_vector_index_store"
+        ) as mock_factory_get_store,
         patch("xagent.web.api.kb.delete_collection") as mock_delete,
     ):
         mock_store = mock_get_store.return_value
+        mock_factory_get_store.return_value = mock_store
         mock_store.list_document_records.side_effect = _fake_list_documents_for_user
         from xagent.core.tools.core.RAG_tools.core.schemas import (
             CollectionOperationResult,

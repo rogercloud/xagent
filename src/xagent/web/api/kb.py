@@ -76,8 +76,6 @@ from ...core.tools.core.RAG_tools.pipelines.web_ingestion import FileHandlerResu
 from ...core.tools.core.RAG_tools.progress import get_progress_manager
 from ...core.tools.core.RAG_tools.storage.contracts import DocumentRecord
 from ...core.tools.core.RAG_tools.storage.factory import (
-    get_ingestion_status_store,
-    get_metadata_store,
     get_vector_index_store,
 )
 from ...core.tools.core.RAG_tools.utils.string_utils import (
@@ -225,7 +223,6 @@ def list_document_records(
         user_id=user_id,
         is_admin=is_admin,
         max_results=max_results,
-        vector_store=get_vector_index_store(),
     )
 
 
@@ -818,10 +815,7 @@ async def _cleanup_failed_new_collection_metadata(
     user: User,
 ) -> None:
     """Remove config rows left behind when a brand-new collection ingest fails."""
-    from ...core.tools.core.RAG_tools.storage.factory import get_metadata_store
-
-    metadata_store = get_metadata_store()
-    cleanup_result = await metadata_store.delete_collection_metadata(
+    cleanup_result = await _get_api_compatibility_facade().delete_collection_metadata(
         collection_name=collection_name,
         user_id=int(user.id),
         is_admin=bool(user.is_admin),
@@ -889,11 +883,9 @@ async def _restore_or_cleanup_collection_config_after_failed_ingest(
             and not side_effects_may_remain
             and snapshot is not None
         ):
-            delete_metadata = getattr(
-                snapshot.metadata_store, "delete_collection", None
-            )
-            if callable(delete_metadata):
-                await _maybe_await(delete_metadata(collection_name))
+            if await _get_api_compatibility_facade().delete_collection_metadata_entry(
+                collection_name
+            ):
                 logger.info(
                     "Removed collection metadata created by failed %s while "
                     "preserving previous config: %s/user_%s",
@@ -3037,7 +3029,6 @@ class RollbackFailureError(RuntimeError):
 
 @dataclass
 class _CollectionConfigSnapshot:
-    metadata_store: Any
     collection: str
     user_id: int
     previous_config_json: Optional[str]
@@ -3059,32 +3050,26 @@ async def _save_collection_config_with_snapshot(
     context: str,
 ) -> _CollectionConfigSnapshot:
     """Save collection config while retaining the caller's previous config."""
-    from ...core.tools.core.RAG_tools.storage.factory import get_metadata_store
-
-    metadata_store = get_metadata_store()
     previous_config_json: Optional[str] = None
     previous_config_known = False
 
     try:
-        get_config = getattr(metadata_store, "get_collection_config", None)
-        if callable(get_config):
-            loaded = get_config(
-                collection=collection,
-                user_id=int(user.id),
-                is_admin=False,
+        loaded = await _get_api_compatibility_facade().get_collection_config(
+            collection=collection,
+            user_id=int(user.id),
+            is_admin=False,
+        )
+        if isinstance(loaded, str):
+            previous_config_json = loaded
+            previous_config_known = True
+        elif loaded is None:
+            previous_config_known = True
+        else:
+            logger.warning(
+                "Unexpected collection config snapshot type during %s: %s",
+                context,
+                type(loaded).__name__,
             )
-            loaded = await _maybe_await(loaded)
-            if isinstance(loaded, str):
-                previous_config_json = loaded
-                previous_config_known = True
-            elif loaded is None:
-                previous_config_known = True
-            else:
-                logger.warning(
-                    "Unexpected collection config snapshot type during %s: %s",
-                    context,
-                    type(loaded).__name__,
-                )
     except Exception as exc:  # noqa: BLE001
         logger.warning(
             "Failed to snapshot collection config during %s: %s",
@@ -3101,7 +3086,6 @@ async def _save_collection_config_with_snapshot(
             int(user.id),
         )
         return _CollectionConfigSnapshot(
-            metadata_store=metadata_store,
             collection=collection,
             user_id=int(user.id),
             previous_config_json=previous_config_json,
@@ -3114,10 +3098,8 @@ async def _save_collection_config_with_snapshot(
             collection=collection,
             config_json=config_json,
             user_id=int(user.id),
-            metadata_store=metadata_store,
         )
         return _CollectionConfigSnapshot(
-            metadata_store=metadata_store,
             collection=collection,
             user_id=int(user.id),
             previous_config_json=previous_config_json,
@@ -3127,7 +3109,6 @@ async def _save_collection_config_with_snapshot(
     except Exception as exc:  # noqa: BLE001
         logger.warning("Failed to save collection config during %s: %s", context, exc)
         return _CollectionConfigSnapshot(
-            metadata_store=metadata_store,
             collection=collection,
             user_id=int(user.id),
             previous_config_json=previous_config_json,
@@ -3148,7 +3129,7 @@ async def _restore_collection_config_after_failed_ingest(
 
     try:
         if snapshot.previous_config_json is not None:
-            await snapshot.metadata_store.save_collection_config(
+            await _get_api_compatibility_facade().save_collection_config(
                 collection=snapshot.collection,
                 config_json=snapshot.previous_config_json,
                 user_id=snapshot.user_id,
@@ -3171,13 +3152,12 @@ async def _restore_collection_config_after_failed_ingest(
             )
             return
 
-        delete_result = snapshot.metadata_store.delete_collection_metadata(
+        await _get_api_compatibility_facade().delete_collection_metadata(
             collection_name=snapshot.collection,
             user_id=snapshot.user_id,
             is_admin=False,
             delete_orphaned_metadata=not collection_existed_before,
         )
-        await _maybe_await(delete_result)
         logger.info(
             "Removed collection config created by failed %s: %s/user_%s",
             context,
@@ -3376,8 +3356,6 @@ async def save_collection_config(
     _user: User = Depends(get_current_user),
 ) -> CollectionOperationResult:
     """Save ingestion configuration for a specific collection."""
-    from ...core.tools.core.RAG_tools.storage.factory import get_metadata_store
-
     try:
         safe_collection = sanitize_path_component(collection, "collection")
     except ValueError as e:
@@ -3390,12 +3368,10 @@ async def save_collection_config(
     config_json = config.model_dump_json(exclude_unset=True)
 
     try:
-        metadata_store = get_metadata_store()
         await _get_api_compatibility_facade().save_collection_config(
             collection=safe_collection,
             config_json=config_json,
             user_id=int(_user.id),
-            metadata_store=metadata_store,
         )
 
         return CollectionOperationResult(
@@ -5605,12 +5581,9 @@ def _resolve_collection_mutation_scope(
     requester_user_id: int,
     is_admin: bool,
     db: Session,
-    vector_store: Any = None,
 ) -> CollectionMutationScope:
     """Resolve tenant/global mutation ownership once for delete and rename."""
-    if vector_store is None:
-        vector_store = get_vector_index_store()
-    document_records = vector_store.list_document_records(
+    document_records = list_document_records(
         collection_name=collection_name,
         user_id=requester_user_id,
         is_admin=is_admin,
@@ -5642,7 +5615,9 @@ def _resolve_collection_mutation_scope(
         else set()
     )
     owner_user_ids.update(
-        get_metadata_store().list_collection_config_owner_ids(collection_name)
+        _get_api_compatibility_facade().list_collection_config_owner_ids(
+            collection_name
+        )
     )
     owner_user_ids.update(
         list_collection_uploaded_file_owner_ids(db, collection_name=collection_name)
@@ -7008,8 +6983,6 @@ async def rename_collection_api(
     Returns:
         Success message
     """
-    vector_store = get_vector_index_store()
-
     if not new_name or not new_name.strip():
         raise HTTPException(
             status_code=422,
@@ -7062,7 +7035,6 @@ async def rename_collection_api(
         requester_user_id=int(_user.id),
         is_admin=bool(_user.is_admin),
         db=db,
-        vector_store=vector_store,
     )
 
     for owner_id in sorted(mutation_scope.owner_user_ids):
@@ -7149,7 +7121,6 @@ async def rename_collection_api(
             new_name=safe_new_collection,
             user_id=int(_user.id),
             is_admin=bool(_user.is_admin),
-            vector_store=vector_store,
         )
     )
 
@@ -7159,7 +7130,6 @@ async def rename_collection_api(
             new_name=safe_new_collection,
             user_id=int(_user.id),
             is_admin=bool(_user.is_admin),
-            metadata_store=get_metadata_store(),
         )
     except Exception as e:
         logger.warning("Failed to rename metadata store keys: %s", e)
@@ -7174,7 +7144,6 @@ async def rename_collection_api(
                 new_name=safe_new_collection,
                 user_id=int(_user.id),
                 is_admin=bool(_user.is_admin),
-                status_store=get_ingestion_status_store(),
             )
         )
     except Exception as e:
