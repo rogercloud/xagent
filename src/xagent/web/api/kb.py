@@ -76,6 +76,7 @@ from ...core.tools.core.RAG_tools.pipelines.web_ingestion import FileHandlerResu
 from ...core.tools.core.RAG_tools.progress import get_progress_manager
 from ...core.tools.core.RAG_tools.storage.contracts import DocumentRecord
 from ...core.tools.core.RAG_tools.storage.factory import (
+    get_ingestion_status_store,
     get_metadata_store,
     get_vector_index_store,
 )
@@ -224,6 +225,7 @@ def list_document_records(
         user_id=user_id,
         is_admin=is_admin,
         max_results=max_results,
+        vector_store=get_vector_index_store(),
     )
 
 
@@ -295,18 +297,23 @@ def run_document_ingestion_with_outcome(
 ) -> KBApiOperationResult[IngestionResult]:
     """Run local-file ingestion and attach coordinator rollback outcome."""
     facade = _get_api_compatibility_facade()
+
+    ingestion_kwargs: dict[str, Any] = {
+        "collection": collection,
+        "source_path": source_path,
+        "ingestion_config": ingestion_config,
+        "progress_manager": progress_manager,
+        "user_id": user_id,
+        "is_admin": is_admin,
+        "file_id": file_id,
+    }
+    if metadata_source_path is not None:
+        ingestion_kwargs["metadata_source_path"] = metadata_source_path
+    if commit_gate is not None:
+        ingestion_kwargs["commit_gate"] = commit_gate
+
     return facade.run_with_operation_outcome(
-        lambda: run_document_ingestion(
-            collection=collection,
-            source_path=source_path,
-            ingestion_config=ingestion_config,
-            progress_manager=progress_manager,
-            user_id=user_id,
-            is_admin=is_admin,
-            file_id=file_id,
-            metadata_source_path=metadata_source_path,
-            commit_gate=commit_gate,
-        ),
+        lambda: run_document_ingestion(**ingestion_kwargs),
         operation_type="document_ingestion",
         collection=collection,
     )
@@ -366,16 +373,20 @@ async def run_web_ingestion_with_outcome(
 ) -> KBApiOperationResult[WebIngestionResult]:
     """Run web ingestion and attach coordinator rollback outcome."""
     facade = _get_api_compatibility_facade()
+
+    ingestion_kwargs: dict[str, Any] = {
+        "collection": collection,
+        "crawl_config": crawl_config,
+        "ingestion_config": ingestion_config,
+        "user_id": user_id,
+        "is_admin": is_admin,
+        "file_handler": file_handler,
+    }
+    if progress_callback is not None:
+        ingestion_kwargs["progress_callback"] = progress_callback
+
     return await facade.run_async_with_operation_outcome(
-        lambda: run_web_ingestion(
-            collection=collection,
-            crawl_config=crawl_config,
-            ingestion_config=ingestion_config,
-            progress_callback=progress_callback,
-            user_id=user_id,
-            is_admin=is_admin,
-            file_handler=file_handler,
-        ),
+        lambda: run_web_ingestion(**ingestion_kwargs),
         operation_type="web_ingestion",
         collection=collection,
     )
@@ -7145,6 +7156,7 @@ async def rename_collection_api(
             new_name=safe_new_collection,
             user_id=int(_user.id),
             is_admin=bool(_user.is_admin),
+            vector_store=vector_store,
         )
     )
 
@@ -7154,6 +7166,7 @@ async def rename_collection_api(
             new_name=safe_new_collection,
             user_id=int(_user.id),
             is_admin=bool(_user.is_admin),
+            metadata_store=get_metadata_store(),
         )
     except Exception as e:
         logger.warning("Failed to rename metadata store keys: %s", e)
@@ -7168,6 +7181,7 @@ async def rename_collection_api(
                 new_name=safe_new_collection,
                 user_id=int(_user.id),
                 is_admin=bool(_user.is_admin),
+                status_store=get_ingestion_status_store(),
             )
         )
     except Exception as e:

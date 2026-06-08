@@ -435,10 +435,14 @@ class KBApiCompatibilityFacade:
         user_id: Optional[int],
         is_admin: bool = False,
         max_results: Optional[int] = None,
+        vector_store: Any | None = None,
     ) -> list[Any]:
-        from ..storage.factory import get_vector_index_store
-
         with self._storage_context():
+            store = vector_store
+            if store is None:
+                from ..storage.factory import get_vector_index_store
+
+                store = get_vector_index_store()
             kwargs: dict[str, Any] = {
                 "collection_name": collection_name,
                 "user_id": user_id,
@@ -446,7 +450,7 @@ class KBApiCompatibilityFacade:
             }
             if max_results is not None:
                 kwargs["max_results"] = max_results
-            return get_vector_index_store().list_document_records(**kwargs)
+            return store.list_document_records(**kwargs)
 
     def delete_document(
         self,
@@ -498,11 +502,15 @@ class KBApiCompatibilityFacade:
         new_name: str,
         user_id: Optional[int],
         is_admin: bool = False,
+        vector_store: Any | None = None,
     ) -> list[str]:
-        from ..storage.factory import get_vector_index_store
-
         with self._storage_context():
-            return get_vector_index_store().rename_collection_data(
+            store = vector_store
+            if store is None:
+                from ..storage.factory import get_vector_index_store
+
+                store = get_vector_index_store()
+            return store.rename_collection_data(
                 collection_name=collection_name,
                 new_name=new_name,
                 user_id=user_id,
@@ -516,11 +524,15 @@ class KBApiCompatibilityFacade:
         new_name: str,
         user_id: Optional[int],
         is_admin: bool = False,
+        metadata_store: Any | None = None,
     ) -> None:
-        from ..storage.factory import get_metadata_store
-
         with self._storage_context():
-            await get_metadata_store().rename_collection(
+            store = metadata_store
+            if store is None:
+                from ..storage.factory import get_metadata_store
+
+                store = get_metadata_store()
+            await store.rename_collection(
                 old_name=old_name,
                 new_name=new_name,
                 user_id=user_id,
@@ -534,11 +546,15 @@ class KBApiCompatibilityFacade:
         new_name: str,
         user_id: Optional[int],
         is_admin: bool = False,
+        status_store: Any | None = None,
     ) -> list[str]:
-        from ..storage.factory import get_ingestion_status_store
-
         with self._storage_context():
-            return get_ingestion_status_store().rename_collection_status(
+            store = status_store
+            if store is None:
+                from ..storage.factory import get_ingestion_status_store
+
+                store = get_ingestion_status_store()
+            return store.rename_collection_status(
                 old_name=old_name,
                 new_name=new_name,
                 user_id=user_id,

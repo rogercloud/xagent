@@ -10,6 +10,8 @@ import pytest
 from xagent.core.tools.core.RAG_tools.core.schemas import (
     CollectionInfo,
     IngestionResult,
+    WebCrawlConfig,
+    WebIngestionResult,
 )
 from xagent.core.tools.core.RAG_tools.kb import (
     KBApiCompatibilityFacade,
@@ -257,6 +259,159 @@ def test_list_document_records_omits_none_max_results(
             "collection_name": "demo",
             "user_id": 7,
             "is_admin": False,
+        }
+    ]
+
+
+def test_web_api_list_document_records_uses_route_vector_store(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from xagent.web.api import kb as kb_api
+
+    calls: list[dict[str, object]] = []
+
+    class VectorStore:
+        def list_document_records(self, **kwargs: object) -> list[str]:
+            calls.append(kwargs)
+            return ["record"]
+
+    monkeypatch.setattr(kb_api, "get_vector_index_store", lambda: VectorStore())
+
+    records = kb_api.list_document_records(
+        collection_name="demo",
+        user_id=7,
+        is_admin=False,
+        max_results=25,
+    )
+
+    assert records == ["record"]
+    assert calls == [
+        {
+            "collection_name": "demo",
+            "user_id": 7,
+            "is_admin": False,
+            "max_results": 25,
+        }
+    ]
+
+
+def test_web_api_document_ingestion_outcome_keeps_legacy_runner_signature(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from xagent.web.api import kb as kb_api
+
+    calls: list[dict[str, object]] = []
+
+    def fake_run_document_ingestion(
+        collection: str,
+        source_path: str,
+        *,
+        ingestion_config: object,
+        file_id: str | None = None,
+        user_id: int | None = None,
+        progress_manager: object | None = None,
+        is_admin: bool = False,
+    ) -> IngestionResult:
+        calls.append(
+            {
+                "collection": collection,
+                "source_path": source_path,
+                "ingestion_config": ingestion_config,
+                "file_id": file_id,
+                "user_id": user_id,
+                "progress_manager": progress_manager,
+                "is_admin": is_admin,
+            }
+        )
+        return IngestionResult(status="success", message="ok")
+
+    config = object()
+    monkeypatch.setattr(kb_api, "run_document_ingestion", fake_run_document_ingestion)
+
+    result = kb_api.run_document_ingestion_with_outcome(
+        collection="demo",
+        source_path="/tmp/demo.txt",
+        ingestion_config=config,
+        user_id=7,
+        is_admin=False,
+        file_id="file-1",
+    )
+
+    assert result.result.status == "success"
+    assert calls == [
+        {
+            "collection": "demo",
+            "source_path": "/tmp/demo.txt",
+            "ingestion_config": config,
+            "file_id": "file-1",
+            "user_id": 7,
+            "progress_manager": None,
+            "is_admin": False,
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_web_api_web_ingestion_outcome_keeps_legacy_runner_signature(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from xagent.web.api import kb as kb_api
+
+    calls: list[dict[str, object]] = []
+
+    async def fake_run_web_ingestion(
+        collection: str,
+        crawl_config: WebCrawlConfig,
+        *,
+        ingestion_config: object,
+        user_id: int,
+        is_admin: bool = False,
+        file_handler: object | None = None,
+    ) -> WebIngestionResult:
+        calls.append(
+            {
+                "collection": collection,
+                "crawl_config": crawl_config,
+                "ingestion_config": ingestion_config,
+                "user_id": user_id,
+                "is_admin": is_admin,
+                "file_handler": file_handler,
+            }
+        )
+        return WebIngestionResult(
+            status="success",
+            collection=collection,
+            total_urls_found=0,
+            pages_crawled=0,
+            pages_failed=0,
+            documents_created=0,
+            chunks_created=0,
+            embeddings_created=0,
+            message="ok",
+            elapsed_time_ms=0,
+        )
+
+    crawl_config = WebCrawlConfig(start_url="https://example.com")
+    config = object()
+    monkeypatch.setattr(kb_api, "run_web_ingestion", fake_run_web_ingestion)
+
+    result = await kb_api.run_web_ingestion_with_outcome(
+        collection="web",
+        crawl_config=crawl_config,
+        ingestion_config=config,
+        user_id=7,
+        is_admin=True,
+    )
+
+    assert result.result.status == "success"
+    assert calls == [
+        {
+            "collection": "web",
+            "crawl_config": crawl_config,
+            "ingestion_config": config,
+            "user_id": 7,
+            "is_admin": True,
+            "file_handler": None,
         }
     ]
 
