@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import inspect
+import unittest.mock
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
@@ -40,7 +41,9 @@ async def _maybe_await(value: Any) -> Any:
 
 def _has_store_method(metadata_store: object, name: str) -> bool:
     """Return True for real MetadataStore implementations, not loose mocks."""
-    return callable(getattr(type(metadata_store), name, None))
+    if isinstance(metadata_store, unittest.mock.NonCallableMock):
+        return False
+    return callable(getattr(metadata_store, name, None))
 
 
 @dataclass(frozen=True)
@@ -118,7 +121,7 @@ class KBApiCompatibilityFacade:
     ) -> KBApiOperationResult[T_Result]:
         """Attach the current coordinator outcome to an API-compatible result."""
         outcome = self.last_operation_outcome()
-        if outcome is previous_outcome:
+        if outcome == previous_outcome:
             outcome = None
         if outcome is not None and operation_type is not None:
             expected = (
@@ -245,13 +248,18 @@ class KBApiCompatibilityFacade:
 
     @staticmethod
     def _legacy_successful_document_count(result: Any) -> int:
-        documents_created = getattr(result, "documents_created", None)
+        if isinstance(result, dict):
+            documents_created = result.get("documents_created")
+            status = result.get("status")
+        else:
+            documents_created = getattr(result, "documents_created", None)
+            status = getattr(result, "status", None)
         if documents_created is not None:
             try:
                 return int(documents_created)
             except (TypeError, ValueError):
                 return 0
-        return 1 if getattr(result, "status", None) == "success" else 0
+        return 1 if status == "success" else 0
 
     @staticmethod
     def _side_effects_may_remain_after_api_rollback(
@@ -271,7 +279,10 @@ class KBApiCompatibilityFacade:
                 or outcome.rollback_status is RollbackStatus.INCOMPLETE
             )
 
-        return bool(getattr(operation_result.result, "side_effects_may_remain", False))
+        result = operation_result.result
+        if isinstance(result, dict):
+            return bool(result.get("side_effects_may_remain", False))
+        return bool(getattr(result, "side_effects_may_remain", False))
 
     async def save_collection_config(
         self,
@@ -328,6 +339,8 @@ class KBApiCompatibilityFacade:
                 else:
                     if isinstance(loaded, CollectionInfo):
                         collection_info = loaded
+                    elif loaded is None:
+                        collection_info = CollectionInfo(name=collection)
             else:
                 collection_info = CollectionInfo(name=collection)
 

@@ -65,6 +65,11 @@ class _ConfigOnlyMetadataStore:
         self.saved_configs.append((collection, config_json, user_id))
 
 
+class _NoneReturningMetadataStore(_FakeMetadataStore):
+    async def get_collection(self, collection: str) -> CollectionInfo | None:
+        return None
+
+
 class _FakeStorageShim:
     def __init__(self, metadata_store: object) -> None:
         self.metadata_store = metadata_store
@@ -121,6 +126,51 @@ async def test_save_collection_config_preserves_existing_backend_binding() -> No
     assert existing.extra_metadata["kb_storage"] == {"backend": "postgresql"}
     assert existing.extra_metadata["other"] == "kept"
     assert metadata_store.saved_collections == []
+
+
+@pytest.mark.asyncio
+async def test_save_collection_config_creates_backend_binding_when_store_returns_none() -> (
+    None
+):
+    metadata_store = _NoneReturningMetadataStore(None)
+    facade = KBApiCompatibilityFacade(storage_shim=_FakeStorageShim(metadata_store))
+
+    await facade.save_collection_config(
+        collection="demo",
+        config_json="{}",
+        user_id=7,
+    )
+
+    assert metadata_store.saved_collections == [metadata_store.collection]
+    assert metadata_store.collection is not None
+    assert metadata_store.collection.name == "demo"
+    assert metadata_store.collection.extra_metadata["kb_storage"] == {
+        "backend": "lancedb"
+    }
+
+
+@pytest.mark.asyncio
+async def test_save_collection_config_uses_proxy_store_methods() -> None:
+    metadata_store = _FakeMetadataStore(None)
+
+    class MetadataStoreProxy:
+        def __getattr__(self, name: str) -> object:
+            return getattr(metadata_store, name)
+
+    facade = KBApiCompatibilityFacade(
+        storage_shim=_FakeStorageShim(MetadataStoreProxy())
+    )
+
+    await facade.save_collection_config(
+        collection="demo",
+        config_json="{}",
+        user_id=7,
+    )
+
+    assert metadata_store.collection is not None
+    assert metadata_store.collection.extra_metadata["kb_storage"] == {
+        "backend": "lancedb"
+    }
 
 
 @pytest.mark.asyncio
@@ -202,6 +252,42 @@ def test_api_operation_result_ignores_stale_operation_outcome() -> None:
     assert cleanup_decision.side_effects_may_remain is False
 
 
+def test_api_operation_result_ignores_equal_stale_operation_outcome_copy() -> None:
+    operation_facade = KBOperationCompatibilityFacade()
+    coordinator = KBCoordinator(operation_compatibility=operation_facade)
+    facade = coordinator.api_compatibility
+
+    with operation_facade.start_operation(
+        operation_type="document_ingestion",
+        collection="demo",
+    ) as active_operation:
+        active_operation.finish(status="success")
+    assert operation_facade.last_outcome is not None
+
+    copied_previous_outcome = KBOperationOutcome(
+        operation_id=operation_facade.last_outcome.operation_id,
+        operation_type=operation_facade.last_outcome.operation_type,
+        collection=operation_facade.last_outcome.collection,
+        status=operation_facade.last_outcome.status,
+        rollback_status=operation_facade.last_outcome.rollback_status,
+        persistence_policy=operation_facade.last_outcome.persistence_policy,
+        compensation_steps=operation_facade.last_outcome.compensation_steps,
+        child_outcomes=operation_facade.last_outcome.child_outcomes,
+        warnings=operation_facade.last_outcome.warnings,
+        side_effects_may_remain=operation_facade.last_outcome.side_effects_may_remain,
+        details=operation_facade.last_outcome.details,
+    )
+
+    api_result = facade.wrap_operation_result(
+        IngestionResult(status="error", message="patched failure"),
+        previous_outcome=copied_previous_outcome,
+        operation_type="document_ingestion",
+        collection="demo",
+    )
+
+    assert api_result.operation_outcome is None
+
+
 def test_failed_batch_ingest_cleanup_decision_aggregates_operation_outcomes() -> None:
     facade = KBApiCompatibilityFacade()
     side_effect_outcome = KBOperationOutcome(
@@ -231,6 +317,37 @@ def test_failed_batch_ingest_cleanup_decision_aggregates_operation_outcomes() ->
 
     assert cleanup_decision.successful_documents == 1
     assert cleanup_decision.side_effects_may_remain is True
+
+
+def test_failed_ingest_cleanup_decision_accepts_dict_results() -> None:
+    facade = KBApiCompatibilityFacade()
+
+    cleanup_decision = facade.failed_ingest_cleanup_decision(
+        KBApiOperationResult(
+            result={
+                "status": "partial",
+                "documents_created": "2",
+                "side_effects_may_remain": True,
+            }
+        )
+    )
+
+    assert cleanup_decision.successful_documents == 2
+    assert cleanup_decision.side_effects_may_remain is True
+
+
+def test_failed_batch_ingest_cleanup_decision_counts_dict_successes() -> None:
+    facade = KBApiCompatibilityFacade()
+
+    cleanup_decision = facade.failed_batch_ingest_cleanup_decision(
+        [
+            KBApiOperationResult(result={"status": "success"}),
+            KBApiOperationResult(result={"status": "error"}),
+        ]
+    )
+
+    assert cleanup_decision.successful_documents == 1
+    assert cleanup_decision.side_effects_may_remain is False
 
 
 def test_list_document_records_omits_none_max_results(
