@@ -16,6 +16,7 @@ from ...core.tools.core.RAG_tools.core.schemas import (
 )
 from ...core.tools.core.RAG_tools.kb import (
     KBApiCompatibilityFacade,
+    KBApiOperationResult,
     get_kb_coordinator,
 )
 from ...core.tools.core.RAG_tools.pipelines.document_ingestion import (
@@ -121,6 +122,42 @@ def _restore_or_cleanup_failed_job_collection_config(
     )
 
 
+def _restore_or_cleanup_failed_job_collection_config_after_api_ingest(
+    db: Session,
+    payload: dict[str, Any],
+    *,
+    api_result: KBApiOperationResult[Any],
+    snapshot: Any,
+    context: str,
+    successful_documents: int | None = None,
+    rollback_complete: bool | None = None,
+) -> None:
+    user = _get_job_user(
+        db,
+        payload,
+        context=f"restore failed-ingest collection config during {context}",
+    )
+    if user is None:
+        return
+
+    from ..api.kb import _restore_or_cleanup_collection_config_after_failed_api_ingest
+
+    asyncio.run(
+        _restore_or_cleanup_collection_config_after_failed_api_ingest(
+            api_result=api_result,
+            snapshot=snapshot,
+            collection_existed_before=bool(
+                payload.get("collection_existed_before", True)
+            ),
+            collection_name=str(payload["collection"]),
+            user=user,
+            context=context,
+            successful_documents=successful_documents,
+            rollback_complete=rollback_complete,
+        )
+    )
+
+
 def handle_kb_ingest_document(db: Session, job: BackgroundJob) -> dict[str, Any]:
     payload = dict(job.payload or {})
     ingestion_config = IngestionConfig.model_validate(payload["ingestion_config"])
@@ -216,22 +253,13 @@ def handle_kb_ingest_document(db: Session, job: BackgroundJob) -> dict[str, Any]
                     context="background stale staged document ingest",
                 )
                 return _superseded_staged_document_result(payload)
-            api_result = _get_api_compatibility_facade().with_rollback_complete(
-                api_result,
-                True,
-            )
-            cleanup_decision = (
-                _get_api_compatibility_facade().failed_ingest_cleanup_decision(
-                    api_result
-                )
-            )
-            _restore_or_cleanup_failed_job_collection_config(
+            _restore_or_cleanup_failed_job_collection_config_after_api_ingest(
                 db,
                 payload,
+                api_result=api_result,
                 snapshot=config_snapshot,
                 context="background staged document ingest",
-                successful_documents=cleanup_decision.successful_documents,
-                side_effects_may_remain=cleanup_decision.side_effects_may_remain,
+                rollback_complete=True,
             )
         else:
             _rollback_failed_document_ingestion(
@@ -240,22 +268,13 @@ def handle_kb_ingest_document(db: Session, job: BackgroundJob) -> dict[str, Any]
                 result,
                 config_snapshot=config_snapshot,
             )
-            api_result = _get_api_compatibility_facade().with_rollback_complete(
-                api_result,
-                True,
-            )
-            cleanup_decision = (
-                _get_api_compatibility_facade().failed_ingest_cleanup_decision(
-                    api_result
-                )
-            )
-            _restore_or_cleanup_failed_job_collection_config(
+            _restore_or_cleanup_failed_job_collection_config_after_api_ingest(
                 db,
                 payload,
+                api_result=api_result,
                 snapshot=config_snapshot,
                 context="background document ingest",
-                successful_documents=cleanup_decision.successful_documents,
-                side_effects_may_remain=cleanup_decision.side_effects_may_remain,
+                rollback_complete=True,
             )
         raise BackgroundJobHandlerError(
             result.message,
@@ -293,23 +312,14 @@ def handle_kb_ingest_document(db: Session, job: BackgroundJob) -> dict[str, Any]
                     context="background stale staged document publish rollback",
                 )
                 return _superseded_staged_document_result(payload)
-            api_result = _get_api_compatibility_facade().with_rollback_complete(
-                api_result,
-                True,
-            )
-            cleanup_decision = (
-                _get_api_compatibility_facade().failed_ingest_cleanup_decision(
-                    api_result,
-                    successful_documents=0,
-                )
-            )
-            _restore_or_cleanup_failed_job_collection_config(
+            _restore_or_cleanup_failed_job_collection_config_after_api_ingest(
                 db,
                 payload,
+                api_result=api_result,
                 snapshot=config_snapshot,
                 context="background staged document publish",
-                successful_documents=cleanup_decision.successful_documents,
-                side_effects_may_remain=cleanup_decision.side_effects_may_remain,
+                successful_documents=0,
+                rollback_complete=True,
             )
             raise BackgroundJobHandlerError(
                 f"Document ingestion succeeded but publishing uploaded file failed: {exc}",
@@ -397,18 +407,12 @@ def handle_kb_ingest_web(db: Session, job: BackgroundJob) -> dict[str, Any]:
 
     result_payload = result.model_dump(mode="json")
     if result.status in {"error", "partial"}:
-        cleanup_decision = (
-            _get_api_compatibility_facade().failed_ingest_cleanup_decision(
-                api_result,
-                successful_documents=int(result.documents_created or 0),
-            )
-        )
         _cleanup_failed_web_collection_metadata_if_new(
             db,
             payload,
+            api_result=api_result,
             snapshot=config_snapshot,
-            successful_documents=cleanup_decision.successful_documents,
-            side_effects_may_remain=cleanup_decision.side_effects_may_remain,
+            successful_documents=int(result.documents_created or 0),
         )
     if result.status == "error":
         raise BackgroundJobHandlerError(result.message, result=result_payload)
@@ -832,15 +836,25 @@ def _cleanup_failed_web_collection_metadata_if_new(
     db: Session,
     payload: dict[str, Any],
     *,
+    api_result: KBApiOperationResult[Any] | None = None,
     snapshot: Any = None,
-    successful_documents: int = 0,
-    side_effects_may_remain: bool = False,
+    successful_documents: int | None = None,
 ) -> None:
-    _restore_or_cleanup_failed_job_collection_config(
+    if api_result is None:
+        _restore_or_cleanup_failed_job_collection_config(
+            db,
+            payload,
+            snapshot=snapshot,
+            context="background web ingest",
+            successful_documents=int(successful_documents or 0),
+        )
+        return
+
+    _restore_or_cleanup_failed_job_collection_config_after_api_ingest(
         db,
         payload,
+        api_result=api_result,
         snapshot=snapshot,
         context="background web ingest",
         successful_documents=successful_documents,
-        side_effects_may_remain=side_effects_may_remain,
     )

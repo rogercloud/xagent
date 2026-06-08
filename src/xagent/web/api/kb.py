@@ -908,6 +908,67 @@ async def _restore_or_cleanup_collection_config_after_failed_ingest(
     )
 
 
+async def _restore_or_cleanup_collection_config_after_failed_api_ingest(
+    *,
+    api_result: KBApiOperationResult[Any],
+    snapshot: Optional["_CollectionConfigSnapshot"],
+    collection_existed_before: bool,
+    collection_name: str,
+    user: User,
+    context: str,
+    successful_documents: int | None = None,
+    rollback_complete: bool | None = None,
+) -> KBApiOperationResult[Any]:
+    """Apply failed-ingest config cleanup using API rollback outcome semantics."""
+    if rollback_complete is not None:
+        api_result = _get_api_compatibility_facade().with_rollback_complete(
+            api_result,
+            rollback_complete,
+        )
+    cleanup_decision = _get_api_compatibility_facade().failed_ingest_cleanup_decision(
+        api_result,
+        successful_documents=successful_documents,
+    )
+    await _restore_or_cleanup_collection_config_after_failed_ingest(
+        snapshot=snapshot,
+        collection_existed_before=collection_existed_before,
+        collection_name=collection_name,
+        user=user,
+        context=context,
+        successful_documents=cleanup_decision.successful_documents,
+        side_effects_may_remain=cleanup_decision.side_effects_may_remain,
+    )
+    return api_result
+
+
+async def _restore_or_cleanup_collection_config_after_failed_batch_api_ingest(
+    *,
+    api_results: list[KBApiOperationResult[Any]],
+    snapshot: Optional["_CollectionConfigSnapshot"],
+    collection_existed_before: bool,
+    collection_name: str,
+    user: User,
+    context: str,
+    successful_documents: int | None = None,
+) -> None:
+    """Apply batch failed-ingest config cleanup using API rollback outcomes."""
+    cleanup_decision = (
+        _get_api_compatibility_facade().failed_batch_ingest_cleanup_decision(
+            api_results,
+            successful_documents=successful_documents,
+        )
+    )
+    await _restore_or_cleanup_collection_config_after_failed_ingest(
+        snapshot=snapshot,
+        collection_existed_before=collection_existed_before,
+        collection_name=collection_name,
+        user=user,
+        context=context,
+        successful_documents=cleanup_decision.successful_documents,
+        side_effects_may_remain=cleanup_decision.side_effects_may_remain,
+    )
+
+
 async def _rollback_failed_ingestion(
     *,
     db: Session,
@@ -3619,24 +3680,22 @@ async def ingest(
                 had_existing_file=had_existing_file,
                 embedding_model_id=embedding_model_id,
             )
-            api_result = _get_api_compatibility_facade().with_rollback_complete(
-                api_result,
-                True,
-            )
             if effective_collection_existed_before:
-                cleanup_decision = (
-                    _get_api_compatibility_facade().failed_ingest_cleanup_decision(
-                        api_result
+                api_result = (
+                    await _restore_or_cleanup_collection_config_after_failed_api_ingest(
+                        api_result=api_result,
+                        snapshot=config_snapshot,
+                        collection_existed_before=collection_existed_before,
+                        collection_name=collection,
+                        user=_user,
+                        context="ingest",
+                        rollback_complete=True,
                     )
                 )
-                await _restore_or_cleanup_collection_config_after_failed_ingest(
-                    snapshot=config_snapshot,
-                    collection_existed_before=collection_existed_before,
-                    collection_name=collection,
-                    user=_user,
-                    context="ingest",
-                    successful_documents=cleanup_decision.successful_documents,
-                    side_effects_may_remain=cleanup_decision.side_effects_may_remain,
+            else:
+                api_result = _get_api_compatibility_facade().with_rollback_complete(
+                    api_result,
+                    True,
                 )
 
         if result.status == "error":
@@ -3690,26 +3749,24 @@ async def ingest(
                 had_existing_file=had_existing_file,
                 embedding_model_id=embedding_model_id,
             )
-            rollback_api_result = (
-                _get_api_compatibility_facade().with_rollback_complete(
-                    rollback_api_result,
-                    True,
-                )
-            )
             if effective_collection_existed_before:
-                cleanup_decision = (
-                    _get_api_compatibility_facade().failed_ingest_cleanup_decision(
-                        rollback_api_result
+                rollback_api_result = (
+                    await _restore_or_cleanup_collection_config_after_failed_api_ingest(
+                        api_result=rollback_api_result,
+                        snapshot=config_snapshot,
+                        collection_existed_before=collection_existed_before,
+                        collection_name=collection,
+                        user=_user,
+                        context="ingest",
+                        rollback_complete=True,
                     )
                 )
-                await _restore_or_cleanup_collection_config_after_failed_ingest(
-                    snapshot=config_snapshot,
-                    collection_existed_before=collection_existed_before,
-                    collection_name=collection,
-                    user=_user,
-                    context="ingest",
-                    successful_documents=cleanup_decision.successful_documents,
-                    side_effects_may_remain=cleanup_decision.side_effects_may_remain,
+            else:
+                rollback_api_result = (
+                    _get_api_compatibility_facade().with_rollback_complete(
+                        rollback_api_result,
+                        True,
+                    )
                 )
         else:
             _restore_ingest_file_backup(
@@ -3725,19 +3782,13 @@ async def ingest(
                 ),
                 rollback_complete=True,
             )
-            cleanup_decision = (
-                _get_api_compatibility_facade().failed_ingest_cleanup_decision(
-                    rollback_api_result
-                )
-            )
-            await _restore_or_cleanup_collection_config_after_failed_ingest(
+            await _restore_or_cleanup_collection_config_after_failed_api_ingest(
+                api_result=rollback_api_result,
                 snapshot=config_snapshot,
                 collection_existed_before=collection_existed_before,
                 collection_name=collection,
                 user=_user,
                 context="ingest",
-                successful_documents=cleanup_decision.successful_documents,
-                side_effects_may_remain=cleanup_decision.side_effects_may_remain,
             )
         raise
 
@@ -4293,22 +4344,16 @@ async def ingest_cloud(
     has_failure = any(result.status in {"error", "partial"} for result in results)
 
     if has_failure:
-        cleanup_decision = (
-            _get_api_compatibility_facade().failed_batch_ingest_cleanup_decision(
-                list(api_results),
-                successful_documents=sum(
-                    1 for result in results if result.status == "success"
-                ),
-            )
-        )
-        await _restore_or_cleanup_collection_config_after_failed_ingest(
+        await _restore_or_cleanup_collection_config_after_failed_batch_api_ingest(
+            api_results=list(api_results),
             snapshot=config_snapshot,
             collection_existed_before=collection_existed_before,
             collection_name=safe_collection,
             user=_user,
             context="ingest_cloud",
-            successful_documents=cleanup_decision.successful_documents,
-            side_effects_may_remain=cleanup_decision.side_effects_may_remain,
+            successful_documents=sum(
+                1 for result in results if result.status == "success"
+            ),
         )
 
     return results
@@ -5151,20 +5196,14 @@ async def ingest_web(
             )
 
         if result.status == "error":
-            cleanup_decision = (
-                _get_api_compatibility_facade().failed_ingest_cleanup_decision(
-                    api_result,
-                    successful_documents=result.documents_created,
-                )
-            )
-            await _restore_or_cleanup_collection_config_after_failed_ingest(
+            await _restore_or_cleanup_collection_config_after_failed_api_ingest(
+                api_result=api_result,
                 snapshot=config_snapshot,
                 collection_existed_before=collection_existed_before,
                 collection_name=safe_collection,
                 user=_user,
                 context="ingest_web",
-                successful_documents=cleanup_decision.successful_documents,
-                side_effects_may_remain=cleanup_decision.side_effects_may_remain,
+                successful_documents=result.documents_created,
             )
             return JSONResponse(status_code=500, content=result.model_dump())
         if result.status == "partial":
@@ -5175,20 +5214,14 @@ async def ingest_web(
                 _user.id,
                 result.message,
             )
-            cleanup_decision = (
-                _get_api_compatibility_facade().failed_ingest_cleanup_decision(
-                    api_result,
-                    successful_documents=result.documents_created,
-                )
-            )
-            await _restore_or_cleanup_collection_config_after_failed_ingest(
+            await _restore_or_cleanup_collection_config_after_failed_api_ingest(
+                api_result=api_result,
                 snapshot=config_snapshot,
                 collection_existed_before=collection_existed_before,
                 collection_name=safe_collection,
                 user=_user,
                 context="ingest_web",
-                successful_documents=cleanup_decision.successful_documents,
-                side_effects_may_remain=cleanup_decision.side_effects_may_remain,
+                successful_documents=result.documents_created,
             )
 
         return result
