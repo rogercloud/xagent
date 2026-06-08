@@ -13,8 +13,11 @@ from xagent.core.tools.core.RAG_tools.core.schemas import (
 )
 from xagent.core.tools.core.RAG_tools.kb import (
     KBApiCompatibilityFacade,
+    KBApiOperationResult,
     KBCoordinator,
     KBOperationCompatibilityFacade,
+    KBOperationOutcome,
+    PersistencePolicy,
     RollbackStatus,
     get_kb_coordinator,
     reset_kb_coordinator_for_tests,
@@ -195,6 +198,37 @@ def test_api_operation_result_ignores_stale_operation_outcome() -> None:
     assert api_result.operation_outcome is None
     cleanup_decision = facade.failed_ingest_cleanup_decision(api_result)
     assert cleanup_decision.side_effects_may_remain is False
+
+
+def test_failed_batch_ingest_cleanup_decision_aggregates_operation_outcomes() -> None:
+    facade = KBApiCompatibilityFacade()
+    side_effect_outcome = KBOperationOutcome(
+        operation_id="op-1",
+        operation_type="document_ingestion",
+        collection="demo",
+        status="error",
+        rollback_status=RollbackStatus.INCOMPLETE,
+        persistence_policy=PersistencePolicy.PRESERVE_SUCCESSFUL_CHILDREN,
+        side_effects_may_remain=True,
+    )
+    clean_result = KBApiOperationResult(
+        result=IngestionResult(status="error", message="rolled back"),
+        rollback_complete=True,
+    )
+    dirty_result = KBApiOperationResult(
+        result=IngestionResult(status="error", message="rollback failed"),
+        operation_outcome=side_effect_outcome,
+    )
+    success_result = KBApiOperationResult(
+        result=IngestionResult(status="success", message="ok")
+    )
+
+    cleanup_decision = facade.failed_batch_ingest_cleanup_decision(
+        [clean_result, dirty_result, success_result]
+    )
+
+    assert cleanup_decision.successful_documents == 1
+    assert cleanup_decision.side_effects_may_remain is True
 
 
 def test_list_document_records_omits_none_max_results(
