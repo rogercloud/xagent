@@ -229,6 +229,75 @@ def test_api_operation_result_consumes_new_operation_outcome() -> None:
     assert cleanup_after_rollback.side_effects_may_remain is False
 
 
+def test_run_with_operation_outcome_rebinds_storage_context() -> None:
+    from xagent.core.tools.core.RAG_tools.storage.factory import (
+        bind_storage_shim_for_current_context,
+        get_bound_storage_shim_for_current_context,
+    )
+
+    outer_shim = _FakeStorageShim(_ConfigOnlyMetadataStore())
+    inner_shim = _FakeStorageShim(_ConfigOnlyMetadataStore())
+    facade = KBApiCompatibilityFacade(storage_shim=inner_shim)
+    seen_shims: list[object | None] = []
+
+    def operation() -> IngestionResult:
+        seen_shims.append(get_bound_storage_shim_for_current_context())
+        return IngestionResult(status="success", message="ok")
+
+    with bind_storage_shim_for_current_context(outer_shim):
+        api_result = facade.run_with_operation_outcome(
+            operation,
+            operation_type="document_ingestion",
+            collection="demo",
+        )
+        assert get_bound_storage_shim_for_current_context() is outer_shim
+
+    assert api_result.result.status == "success"
+    assert seen_shims == [inner_shim]
+
+
+@pytest.mark.asyncio
+async def test_run_async_with_operation_outcome_rebinds_storage_context() -> None:
+    from xagent.core.tools.core.RAG_tools.storage.factory import (
+        bind_storage_shim_for_current_context,
+        get_bound_storage_shim_for_current_context,
+    )
+
+    outer_shim = _FakeStorageShim(_ConfigOnlyMetadataStore())
+    inner_shim = _FakeStorageShim(_ConfigOnlyMetadataStore())
+    facade = KBApiCompatibilityFacade(storage_shim=inner_shim)
+    seen_shims: list[object | None] = []
+
+    async def operation() -> WebIngestionResult:
+        seen_shims.append(get_bound_storage_shim_for_current_context())
+        return WebIngestionResult(
+            status="success",
+            collection="demo",
+            total_urls_found=0,
+            pages_crawled=0,
+            pages_failed=0,
+            documents_created=0,
+            chunks_created=0,
+            embeddings_created=0,
+            crawled_urls=[],
+            failed_urls={},
+            message="ok",
+            warnings=[],
+            elapsed_time_ms=0,
+        )
+
+    with bind_storage_shim_for_current_context(outer_shim):
+        api_result = await facade.run_async_with_operation_outcome(
+            operation,
+            operation_type="web_ingestion",
+            collection="demo",
+        )
+        assert get_bound_storage_shim_for_current_context() is outer_shim
+
+    assert api_result.result.status == "success"
+    assert seen_shims == [inner_shim]
+
+
 def test_api_operation_result_ignores_stale_operation_outcome() -> None:
     operation_facade = KBOperationCompatibilityFacade()
     coordinator = KBCoordinator(operation_compatibility=operation_facade)

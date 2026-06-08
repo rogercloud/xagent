@@ -3772,13 +3772,6 @@ async def ingest(
                         rollback_complete=True,
                     )
                 )
-            else:
-                rollback_api_result = (
-                    _get_api_compatibility_facade().with_rollback_complete(
-                        rollback_api_result,
-                        True,
-                    )
-                )
         else:
             _restore_ingest_file_backup(
                 file_path=file_path,

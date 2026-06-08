@@ -152,7 +152,8 @@ class KBApiCompatibilityFacade:
     ) -> KBApiOperationResult[T_Result]:
         """Run a sync API operation and consume its coordinator outcome."""
         previous_outcome = self.last_operation_outcome()
-        result = operation()
+        with self._storage_context():
+            result = operation()
         return self.wrap_operation_result(
             result,
             previous_outcome=previous_outcome,
@@ -171,7 +172,8 @@ class KBApiCompatibilityFacade:
     ) -> KBApiOperationResult[T_Result]:
         """Run an async API operation and consume its coordinator outcome."""
         previous_outcome = self.last_operation_outcome()
-        result = await operation()
+        with self._storage_context():
+            result = await operation()
         return self.wrap_operation_result(
             result,
             previous_outcome=previous_outcome,
