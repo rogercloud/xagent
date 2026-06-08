@@ -6297,9 +6297,6 @@ async def delete_document_api(
         This endpoint prefers `file_id` or `doc_id` when provided. The path
         `filename` is retained as a compatibility fallback for older clients.
     """
-    # NOTE: Exceptions are normalized by @handle_kb_exceptions for consistent API responses.
-    from ...core.tools.core.RAG_tools.management.collections import delete_document
-
     # Parameter validation
     try:
         safe_collection_name = sanitize_path_component(collection_name, "collection")

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import inspect
 from typing import Optional
 
 import pytest
@@ -338,3 +339,47 @@ def test_web_api_search_wrapper_routes_through_api_facade(monkeypatch) -> None:
 
     assert result is sentinel
     assert calls == [("demo", "question", 7, True)]
+
+
+def test_web_api_delete_document_wrapper_routes_through_api_facade(
+    monkeypatch,
+) -> None:
+    from xagent.web.api import kb as kb_api
+
+    sentinel = object()
+    calls: list[tuple[str, str, int, bool]] = []
+
+    class Facade:
+        def delete_document(
+            self,
+            collection: str,
+            doc_id: str,
+            user_id: int,
+            is_admin: bool,
+        ) -> object:
+            calls.append((collection, doc_id, user_id, is_admin))
+            return sentinel
+
+    monkeypatch.setattr(
+        kb_api,
+        "_get_api_compatibility_facade",
+        lambda: Facade(),
+    )
+
+    result = kb_api.delete_document(
+        collection="demo",
+        doc_id="doc-1",
+        user_id=7,
+        is_admin=True,
+    )
+
+    assert result is sentinel
+    assert calls == [("demo", "doc-1", 7, True)]
+
+
+def test_delete_document_api_does_not_shadow_api_facade_wrapper() -> None:
+    from xagent.web.api import kb as kb_api
+
+    source = inspect.getsource(kb_api.delete_document_api)
+
+    assert "management.collections import delete_document" not in source

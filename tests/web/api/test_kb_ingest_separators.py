@@ -687,9 +687,7 @@ def test_delete_document_forbidden_for_non_admin_other_users_doc(
         patch(
             "xagent.core.tools.core.RAG_tools.utils.lancedb_query_utils.query_to_list"
         ) as mock_query_to_list,
-        patch(
-            "xagent.core.tools.core.RAG_tools.management.collections.delete_document"
-        ) as mock_delete_document,
+        patch("xagent.web.api.kb.delete_document") as mock_delete_document,
     ):
         mock_ensure_docs.return_value = None
 
@@ -724,9 +722,7 @@ def test_delete_document_keeps_success_when_config_cleanup_fails(
 
     with (
         patch("xagent.web.api.kb.get_vector_index_store") as mock_get_vector_store,
-        patch(
-            "xagent.core.tools.core.RAG_tools.management.collections.delete_document"
-        ) as mock_delete_document,
+        patch("xagent.web.api.kb.delete_document") as mock_delete_document,
         patch(
             "xagent.web.api.kb._cleanup_collection_config_if_no_owned_documents",
             side_effect=_HTTPException(
@@ -767,9 +763,7 @@ def test_delete_document_allowed_for_admin_any_doc(app_with_kb_admin, admin_user
     """Admin user can delete documents regardless of owner."""
     with (
         patch("xagent.web.api.kb.get_vector_index_store") as mock_get_vector_store,
-        patch(
-            "xagent.core.tools.core.RAG_tools.management.collections.delete_document"
-        ) as mock_delete_document,
+        patch("xagent.web.api.kb.delete_document") as mock_delete_document,
     ):
         # New API flow resolves by vector_store.list_document_records first.
         mock_record = MagicMock()

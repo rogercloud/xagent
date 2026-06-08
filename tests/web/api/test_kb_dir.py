@@ -3269,7 +3269,7 @@ def test_delete_document_prefers_file_id_and_cleans_orphan_file(
         patch("xagent.web.api.kb._ensure_collection_access", new_callable=AsyncMock),
         patch("xagent.web.api.kb.get_vector_index_store", return_value=mock_store),
         patch(
-            "xagent.core.tools.core.RAG_tools.management.collections.delete_document",
+            "xagent.web.api.kb.delete_document",
             side_effect=_fake_delete_document,
         ),
     ):
@@ -3359,7 +3359,7 @@ def test_delete_document_keeps_uploaded_file_when_other_docs_still_reference_it(
             side_effect=_fake_list_documents_for_user,
         ),
         patch(
-            "xagent.core.tools.core.RAG_tools.management.collections.delete_document",
+            "xagent.web.api.kb.delete_document",
             side_effect=_fake_delete_document,
         ),
     ):
@@ -3452,7 +3452,7 @@ def test_delete_document_skips_orphan_cleanup_when_remaining_doc_refresh_fails(
             side_effect=_fake_list_documents_for_user,
         ),
         patch(
-            "xagent.core.tools.core.RAG_tools.management.collections.delete_document",
+            "xagent.web.api.kb.delete_document",
             side_effect=_fake_delete_document,
         ),
     ):
@@ -3542,7 +3542,7 @@ def test_delete_document_does_not_cleanup_uploaded_file_when_delete_fails(
             side_effect=_fake_list_documents_for_user,
         ),
         patch(
-            "xagent.core.tools.core.RAG_tools.management.collections.delete_document",
+            "xagent.web.api.kb.delete_document",
             side_effect=_fake_delete_document,
         ),
     ):
@@ -3600,7 +3600,7 @@ def test_delete_document_accepts_unicode_collection_name(test_env, temp_uploads)
         patch("xagent.web.api.kb._ensure_collection_access", new_callable=AsyncMock),
         patch("xagent.web.api.kb.get_vector_index_store", return_value=mock_store),
         patch(
-            "xagent.core.tools.core.RAG_tools.management.collections.delete_document",
+            "xagent.web.api.kb.delete_document",
             side_effect=_fake_delete_document,
         ),
     ):
@@ -3728,7 +3728,7 @@ def test_delete_document_by_doc_id_disambiguates_duplicate_filename(
         patch("xagent.web.api.kb._ensure_collection_access", new_callable=AsyncMock),
         patch("xagent.web.api.kb.get_vector_index_store", return_value=mock_store),
         patch(
-            "xagent.core.tools.core.RAG_tools.management.collections.delete_document",
+            "xagent.web.api.kb.delete_document",
             side_effect=_fake_delete_document,
         ),
     ):
@@ -3785,7 +3785,7 @@ def test_delete_document_by_file_id_survives_degraded_document_listing(
         ),
         patch("xagent.web.api.kb.get_vector_index_store", return_value=mock_store),
         patch(
-            "xagent.core.tools.core.RAG_tools.management.collections.delete_document",
+            "xagent.web.api.kb.delete_document",
             side_effect=_fake_delete_document,
         ),
     ):
@@ -3847,7 +3847,7 @@ def test_delete_document_by_file_id_prefers_documents_table_doc_id(
         ),
         patch("xagent.web.api.kb.get_vector_index_store", return_value=mock_store),
         patch(
-            "xagent.core.tools.core.RAG_tools.management.collections.delete_document",
+            "xagent.web.api.kb.delete_document",
             side_effect=_fake_delete_document,
         ),
     ):
@@ -3926,7 +3926,7 @@ def test_delete_document_without_file_id_does_not_resurface_on_collection_refres
         patch("xagent.web.api.kb._ensure_collection_access", new_callable=AsyncMock),
         patch("xagent.web.api.kb.get_vector_index_store", return_value=mock_store),
         patch(
-            "xagent.core.tools.core.RAG_tools.management.collections.delete_document",
+            "xagent.web.api.kb.delete_document",
             side_effect=_fake_delete_document,
         ),
     ):
@@ -4014,7 +4014,7 @@ def test_delete_document_without_file_id_preserves_uploaded_file_on_cleanup_refr
         patch("xagent.web.api.kb._ensure_collection_access", new_callable=AsyncMock),
         patch("xagent.web.api.kb.get_vector_index_store", return_value=mock_store),
         patch(
-            "xagent.core.tools.core.RAG_tools.management.collections.delete_document",
+            "xagent.web.api.kb.delete_document",
             side_effect=_fake_delete_document,
         ),
     ):
@@ -4090,7 +4090,7 @@ def test_delete_document_by_file_id_resolves_doc_id_via_list_documents(
         patch("xagent.web.api.kb.get_vector_index_store", return_value=mock_store),
         patch("xagent.web.api.kb.list_documents", return_value=doc_list),
         patch(
-            "xagent.core.tools.core.RAG_tools.management.collections.delete_document",
+            "xagent.web.api.kb.delete_document",
             side_effect=_fake_delete_document,
         ),
     ):
@@ -4144,7 +4144,7 @@ def test_delete_document_by_doc_id_succeeds_without_uploaded_file_record(
         patch("xagent.web.api.kb.get_vector_index_store", return_value=mock_store),
         patch("xagent.web.api.kb.list_documents", return_value=doc_list),
         patch(
-            "xagent.core.tools.core.RAG_tools.management.collections.delete_document",
+            "xagent.web.api.kb.delete_document",
             side_effect=_fake_delete_document,
         ),
     ):
@@ -4213,9 +4213,7 @@ def test_delete_document_by_file_id_rejects_unlinked_basename_match(
         patch("xagent.web.api.kb._ensure_collection_access", new_callable=AsyncMock),
         patch("xagent.web.api.kb.get_vector_index_store", return_value=mock_store),
         patch("xagent.web.api.kb.list_documents", return_value=doc_list),
-        patch(
-            "xagent.core.tools.core.RAG_tools.management.collections.delete_document"
-        ) as mock_delete_document,
+        patch("xagent.web.api.kb.delete_document") as mock_delete_document,
     ):
         response = client.delete(
             f"/api/kb/collections/demo/documents/shared-name.txt?file_id={target_file_id}",
@@ -4289,7 +4287,7 @@ def test_delete_document_reports_cleanup_commit_failure(test_env, temp_uploads):
             ),
             patch("xagent.web.api.kb.get_vector_index_store", return_value=mock_store),
             patch(
-                "xagent.core.tools.core.RAG_tools.management.collections.delete_document",
+                "xagent.web.api.kb.delete_document",
                 side_effect=_fake_delete_document,
             ),
         ):
@@ -4343,9 +4341,7 @@ def test_delete_document_rejects_mismatched_doc_id_and_file_id(test_env, temp_up
             "xagent.web.api.kb.list_documents",
             side_effect=RuntimeError("documents unavailable"),
         ),
-        patch(
-            "xagent.core.tools.core.RAG_tools.management.collections.delete_document"
-        ) as mock_delete_document,
+        patch("xagent.web.api.kb.delete_document") as mock_delete_document,
     ):
         response = client.delete(
             (
