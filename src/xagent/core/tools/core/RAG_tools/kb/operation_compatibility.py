@@ -347,11 +347,6 @@ class KBOperationCompatibilityFacade:
             if operation.outcome is None:
                 operation.finish(
                     status="error",
-                    rollback_status=(
-                        RollbackStatus.INCOMPLETE
-                        if operation.has_side_effects()
-                        else RollbackStatus.NOT_NEEDED
-                    ),
                     side_effects_may_remain=operation.has_side_effects(),
                     warnings=(_format_exception_warning(exc),),
                 )

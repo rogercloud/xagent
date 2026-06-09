@@ -20,7 +20,6 @@ from .operation_compatibility import (
     KBOperation,
     KBOperationCompatibilityFacade,
     PersistencePolicy,
-    RollbackStatus,
     SideEffectPlane,
 )
 
@@ -566,14 +565,12 @@ class KBPipelineCompatibilityFacade:
         side_effects_may_remain = (
             result.status != "success" and operation.has_side_effects()
         )
-        rollback_status = (
-            RollbackStatus.NOT_NEEDED
-            if result.status == "success" or not side_effects_may_remain
-            else RollbackStatus.INCOMPLETE
-        )
         operation.finish(
             status=result.status,
-            rollback_status=rollback_status,
+            rollback_status=operation.infer_rollback_status(
+                result.status,
+                side_effects_may_remain=side_effects_may_remain,
+            ),
             side_effects_may_remain=side_effects_may_remain,
             details={"message": result.message},
         )
