@@ -27,6 +27,7 @@ from ..core.schemas import (
     WebCrawlConfig,
     WebIngestionResult,
 )
+from ..kb.operation_compatibility import _close_awaitable_if_possible
 from ..progress import get_progress_manager
 from ..utils.config_utils import coerce_ingestion_config
 from ..utils.string_utils import sanitize_for_doc_id
@@ -103,12 +104,6 @@ def _callback_accepts_ingestion_result(callback: FileHandlerCallback) -> bool:
     except TypeError:
         return False
     return True
-
-
-def _close_awaitable_if_possible(value: Any) -> None:
-    close = getattr(value, "close", None)
-    if callable(close):
-        close()
 
 
 def _run_sync_file_handler_callback(

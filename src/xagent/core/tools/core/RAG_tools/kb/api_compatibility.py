@@ -30,7 +30,11 @@ from ..core.schemas import (
     WebIngestionResult,
 )
 from .models import KBStorageBackend
-from .operation_compatibility import KBOperationOutcome, RollbackStatus
+from .operation_compatibility import (
+    KBOperationOutcome,
+    RollbackStatus,
+    _close_awaitable_if_possible,
+)
 from .pipeline_compatibility import KB_STORAGE_METADATA_KEY
 
 if TYPE_CHECKING:
@@ -45,13 +49,6 @@ async def _maybe_await(value: Any) -> Any:
     if inspect.isawaitable(value):
         return await value
     return value
-
-
-def _close_awaitable_if_possible(value: Any) -> None:
-    """Close coroutine-like objects that cannot be awaited by a sync caller."""
-    close = getattr(value, "close", None)
-    if callable(close):
-        close()
 
 
 def _has_store_method(metadata_store: object, name: str) -> bool:
