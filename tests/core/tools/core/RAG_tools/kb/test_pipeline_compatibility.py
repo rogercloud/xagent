@@ -732,7 +732,7 @@ async def test_web_ingestion_file_and_document_side_effects_share_page_child(
 
 
 @pytest.mark.asyncio
-async def test_web_ingestion_file_compensation_success_marks_child_complete(
+async def test_web_ingestion_file_compensation_leaves_document_effects_incomplete(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from xagent.core.tools.core.RAG_tools.pipelines import (
@@ -785,17 +785,22 @@ async def test_web_ingestion_file_compensation_success_marks_child_complete(
     )
 
     assert result.status == "error"
-    assert result.side_effects_may_remain is False
+    assert result.side_effects_may_remain is True
     assert len(compensation_calls) == 1
     assert compensation_calls[0] is not None
     outcome = operation_facade.last_outcome
     assert outcome is not None
-    assert outcome.rollback_status is RollbackStatus.COMPLETE
-    assert outcome.side_effects_may_remain is False
+    assert outcome.rollback_status is RollbackStatus.INCOMPLETE
+    assert outcome.side_effects_may_remain is True
     child = outcome.child_outcomes[0]
-    assert child.rollback_status is RollbackStatus.COMPLETE
-    assert child.side_effects_may_remain is False
+    assert child.rollback_status is RollbackStatus.INCOMPLETE
+    assert child.side_effects_may_remain is True
     assert child.compensation_steps[0].payload["rollback_kind"] == "new_web_file"
+    assert {step.plane for step in child.compensation_steps} == {
+        SideEffectPlane.FILE,
+        SideEffectPlane.DOCUMENT,
+        SideEffectPlane.STATUS,
+    }
 
 
 def test_web_ingestion_root_compensation_success_marks_outcome_complete() -> None:

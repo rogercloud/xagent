@@ -19,6 +19,7 @@ from .models import KBStorageBackend
 from .operation_compatibility import (
     KBOperation,
     KBOperationCompatibilityFacade,
+    KBOperationOutcome,
     PersistencePolicy,
     SideEffectPlane,
 )
@@ -332,7 +333,17 @@ class KBPipelineCompatibilityFacade:
                     pipeline_facade=self,
                 )
                 await self.ensure_collection_backend_binding_async(collection)
-                self._record_web_ingestion_outcome(operation, result)
+                outcome = self._record_web_ingestion_outcome(operation, result)
+                if (
+                    outcome is not None
+                    and result.side_effects_may_remain
+                    != outcome.side_effects_may_remain
+                ):
+                    result = result.model_copy(
+                        update={
+                            "side_effects_may_remain": outcome.side_effects_may_remain
+                        }
+                    )
                 return result
 
     @contextmanager
@@ -579,16 +590,16 @@ class KBPipelineCompatibilityFacade:
         self,
         operation: KBOperation | None,
         result: WebIngestionResult,
-    ) -> None:
-        if operation is None or operation.outcome is not None:
-            return
+    ) -> KBOperationOutcome | None:
+        if operation is None:
+            return None
+        if operation.outcome is not None:
+            return operation.outcome
 
         child_side_effects_may_remain = any(
             child.side_effects_may_remain for child in operation.child_outcomes
         )
-        own_side_effects_may_remain = bool(operation.compensation_steps) and not (
-            operation.compensation_attempted
-        )
+        own_side_effects_may_remain = bool(operation.uncompensated_steps())
 
         if result.status == "success":
             side_effects_may_remain = False
@@ -597,7 +608,7 @@ class KBPipelineCompatibilityFacade:
                 child_side_effects_may_remain or own_side_effects_may_remain
             )
 
-        operation.finish(
+        return operation.finish(
             status=result.status,
             rollback_status=operation.infer_rollback_status(
                 result.status,

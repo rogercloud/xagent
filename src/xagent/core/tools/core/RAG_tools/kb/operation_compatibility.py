@@ -99,7 +99,6 @@ class KBOperation:
         self._compensation_callbacks: dict[str, Callable[[], Any]] = {}
         self._completed_compensation_keys: set[str] = set()
         self._compensation_attempted = False
-        self._compensation_errors_pending = False
         self._outcome: KBOperationOutcome | None = None
 
     @property
@@ -111,6 +110,27 @@ class KBOperation:
         """Return whether this operation or any child recorded side effects."""
         return bool(self.compensation_steps) or any(
             child.side_effects_may_remain or child.compensation_steps
+            for child in self.child_outcomes
+        )
+
+    def uncompensated_steps(self) -> tuple[CompensationStep, ...]:
+        """Return own side effects not covered by successful compensation."""
+        return tuple(
+            step
+            for step in self.compensation_steps
+            if (
+                step.idempotency_key is None
+                or step.idempotency_key not in self._completed_compensation_keys
+            )
+        )
+
+    def has_uncompensated_side_effects(self) -> bool:
+        """Return whether any recorded side effect still lacks compensation."""
+        if self.uncompensated_steps():
+            return True
+        return any(
+            child.side_effects_may_remain
+            or child.rollback_status is RollbackStatus.INCOMPLETE
             for child in self.child_outcomes
         )
 
@@ -195,7 +215,6 @@ class KBOperation:
                 self._completed_compensation_keys.add(step.idempotency_key)
 
         if attempted:
-            self._compensation_errors_pending = bool(errors)
             self.side_effects_may_remain = bool(errors)
         return tuple(errors)
 
@@ -214,8 +233,13 @@ class KBOperation:
         if warnings:
             self.warnings.extend(warnings)
 
+        inferred_side_effects_may_remain = self._infer_side_effects_may_remain(status)
         if side_effects_may_remain is None:
-            side_effects_may_remain = self._infer_side_effects_may_remain(status)
+            side_effects_may_remain = inferred_side_effects_may_remain
+        elif status != "success":
+            side_effects_may_remain = (
+                side_effects_may_remain or inferred_side_effects_may_remain
+            )
 
         if rollback_status is None:
             rollback_status = self.infer_rollback_status(
@@ -242,9 +266,7 @@ class KBOperation:
     def _infer_side_effects_may_remain(self, status: str) -> bool:
         if status == "success":
             return False
-        if self._compensation_attempted:
-            return self._compensation_errors_pending
-        return self.has_side_effects()
+        return self.has_uncompensated_side_effects()
 
     def infer_rollback_status(
         self,
@@ -268,7 +290,7 @@ class KBOperation:
         ):
             return RollbackStatus.SKIPPED_BY_POLICY
 
-        if side_effects_may_remain:
+        if side_effects_may_remain or self.has_uncompensated_side_effects():
             return RollbackStatus.INCOMPLETE
         if self._compensation_attempted and self.has_side_effects():
             return RollbackStatus.COMPLETE

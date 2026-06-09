@@ -91,6 +91,41 @@ def test_operation_executes_registered_compensations_lifo_and_marks_complete() -
     assert outcome.side_effects_may_remain is False
 
 
+def test_operation_partial_compensation_leaves_uncovered_steps_incomplete() -> None:
+    facade = KBOperationCompatibilityFacade()
+    calls: list[str] = []
+
+    with facade.start_operation(
+        operation_type="web_page_ingestion",
+        collection="demo",
+    ) as operation:
+        operation.record_side_effect(
+            name="cleanup_web_page_persistence",
+            plane=SideEffectPlane.FILE,
+            idempotency_key="file:page-1",
+            compensation=lambda: calls.append("file"),
+        )
+        operation.record_side_effect(
+            name="remove_registered_document",
+            plane=SideEffectPlane.DOCUMENT,
+            idempotency_key="document:doc-1",
+        )
+
+        assert operation.execute_compensations(planes={SideEffectPlane.FILE}) == ()
+        operation.finish(status="error", side_effects_may_remain=False)
+
+    outcome = facade.last_outcome
+
+    assert calls == ["file"]
+    assert outcome is not None
+    assert outcome.rollback_status is RollbackStatus.INCOMPLETE
+    assert outcome.side_effects_may_remain is True
+    assert [step.plane for step in outcome.compensation_steps] == [
+        SideEffectPlane.FILE,
+        SideEffectPlane.DOCUMENT,
+    ]
+
+
 def test_failed_compensation_remains_retryable_until_it_succeeds() -> None:
     facade = KBOperationCompatibilityFacade()
     attempts = 0
