@@ -59,6 +59,74 @@ def test_operation_compensation_steps_are_idempotent_and_lifo() -> None:
     assert outcome.side_effects_may_remain is True
 
 
+def test_operation_executes_registered_compensations_lifo_and_marks_complete() -> None:
+    facade = KBOperationCompatibilityFacade()
+    calls: list[str] = []
+
+    with facade.start_operation(
+        operation_type="document_ingestion",
+        collection="demo",
+    ) as operation:
+        operation.record_side_effect(
+            name="remove_document",
+            plane=SideEffectPlane.DOCUMENT,
+            idempotency_key="document:doc-1",
+            compensation=lambda: calls.append("document"),
+        )
+        operation.record_side_effect(
+            name="remove_parse",
+            plane=SideEffectPlane.PARSE,
+            idempotency_key="parse:parse-1",
+            compensation=lambda: calls.append("parse"),
+        )
+
+        assert operation.execute_compensations() == ()
+        operation.finish(status="error")
+
+    outcome = facade.last_outcome
+
+    assert calls == ["parse", "document"]
+    assert outcome is not None
+    assert outcome.rollback_status is RollbackStatus.COMPLETE
+    assert outcome.side_effects_may_remain is False
+
+
+def test_failed_compensation_remains_retryable_until_it_succeeds() -> None:
+    facade = KBOperationCompatibilityFacade()
+    attempts = 0
+
+    def compensation() -> None:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise RuntimeError("first failure")
+
+    with facade.start_operation(
+        operation_type="document_ingestion",
+        collection="demo",
+    ) as operation:
+        operation.record_side_effect(
+            name="remove_document",
+            plane=SideEffectPlane.DOCUMENT,
+            idempotency_key="document:doc-1",
+            compensation=compensation,
+        )
+
+        first_errors = operation.execute_compensations()
+        second_errors = operation.execute_compensations()
+        operation.finish(status="error", side_effects_may_remain=bool(second_errors))
+
+    outcome = facade.last_outcome
+
+    assert len(first_errors) == 1
+    assert second_errors == ()
+    assert attempts == 2
+    assert outcome is not None
+    assert outcome.rollback_status is RollbackStatus.COMPLETE
+    assert outcome.side_effects_may_remain is False
+    assert "first failure" in outcome.warnings[0]
+
+
 def test_last_outcome_is_isolated_by_execution_context() -> None:
     facade = KBOperationCompatibilityFacade()
     initial_current_context_outcome = facade.last_outcome

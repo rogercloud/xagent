@@ -7,7 +7,7 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from enum import StrEnum
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 from uuid import uuid4
 
 
@@ -96,6 +96,10 @@ class KBOperation:
         self.warnings: list[str] = []
         self.side_effects_may_remain = False
         self._idempotency_keys: set[str] = set()
+        self._compensation_callbacks: dict[str, Callable[[], Any]] = {}
+        self._completed_compensation_keys: set[str] = set()
+        self._compensation_attempted = False
+        self._compensation_errors_pending = False
         self._outcome: KBOperationOutcome | None = None
 
     @property
@@ -110,6 +114,11 @@ class KBOperation:
             for child in self.child_outcomes
         )
 
+    @property
+    def compensation_attempted(self) -> bool:
+        """Return whether this operation attempted executable compensation."""
+        return self._compensation_attempted
+
     def update_details(self, **details: Any) -> None:
         """Merge operation metadata captured during execution."""
         self.details.update(details)
@@ -121,14 +130,19 @@ class KBOperation:
         plane: SideEffectPlane,
         payload: Optional[Mapping[str, Any]] = None,
         idempotency_key: Optional[str] = None,
+        compensation: Optional[Callable[[], Any]] = None,
     ) -> None:
         """Register an idempotent compensation boundary for one side effect."""
         step_payload = dict(payload or {})
         dedupe_key = idempotency_key or f"{plane.value}:{name}:{step_payload!r}"
         if dedupe_key in self._idempotency_keys:
+            if compensation is not None:
+                self._compensation_callbacks.setdefault(dedupe_key, compensation)
             return
 
         self._idempotency_keys.add(dedupe_key)
+        if compensation is not None:
+            self._compensation_callbacks[dedupe_key] = compensation
         self.compensation_steps.append(
             CompensationStep(
                 name=name,
@@ -141,6 +155,49 @@ class KBOperation:
     def add_child_outcome(self, outcome: KBOperationOutcome) -> None:
         """Attach a finalized child operation outcome."""
         self.child_outcomes.append(outcome)
+
+    def execute_compensations(
+        self,
+        *,
+        step_names: Optional[set[str]] = None,
+        planes: Optional[set[SideEffectPlane]] = None,
+    ) -> tuple[BaseException, ...]:
+        """Execute registered compensation callbacks in LIFO order.
+
+        Callbacks are kept outside the immutable outcome so public result shapes
+        stay serializable. Successful callbacks are not re-run, while failed
+        callbacks remain retryable because the idempotency key stays registered.
+        """
+        errors: list[BaseException] = []
+        attempted = False
+        for step in reversed(self.compensation_steps):
+            if step_names is not None and step.name not in step_names:
+                continue
+            if planes is not None and step.plane not in planes:
+                continue
+            if step.idempotency_key is None:
+                continue
+            if step.idempotency_key in self._completed_compensation_keys:
+                continue
+
+            callback = self._compensation_callbacks.get(step.idempotency_key)
+            if callback is None:
+                continue
+
+            self._compensation_attempted = True
+            attempted = True
+            try:
+                callback()
+            except BaseException as exc:  # noqa: BLE001 - preserve retryability
+                errors.append(exc)
+                self.warnings.append(f"{step.name}: {_format_exception_warning(exc)}")
+            else:
+                self._completed_compensation_keys.add(step.idempotency_key)
+
+        if attempted:
+            self._compensation_errors_pending = bool(errors)
+            self.side_effects_may_remain = bool(errors)
+        return tuple(errors)
 
     def finish(
         self,
@@ -185,6 +242,8 @@ class KBOperation:
     def _infer_side_effects_may_remain(self, status: str) -> bool:
         if status == "success":
             return False
+        if self._compensation_attempted:
+            return self._compensation_errors_pending
         return self.has_side_effects()
 
     def _infer_rollback_status(
@@ -210,6 +269,13 @@ class KBOperation:
 
         if side_effects_may_remain:
             return RollbackStatus.INCOMPLETE
+        if self._compensation_attempted and self.has_side_effects():
+            return RollbackStatus.COMPLETE
+        if any(
+            child.rollback_status is RollbackStatus.COMPLETE
+            for child in self.child_outcomes
+        ):
+            return RollbackStatus.COMPLETE
         return RollbackStatus.NOT_NEEDED
 
 

@@ -729,3 +729,139 @@ async def test_web_ingestion_file_and_document_side_effects_share_page_child(
         SideEffectPlane.DOCUMENT,
         SideEffectPlane.STATUS,
     }
+
+
+@pytest.mark.asyncio
+async def test_web_ingestion_file_compensation_success_marks_child_complete(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from xagent.core.tools.core.RAG_tools.pipelines import (
+        document_ingestion,
+        web_ingestion,
+    )
+
+    operation_facade = KBOperationCompatibilityFacade()
+    facade = KBPipelineCompatibilityFacade(operation_compatibility=operation_facade)
+    monkeypatch.setattr(web_ingestion, "WebCrawler", _SinglePageCrawler)
+    monkeypatch.setattr(
+        web_ingestion, "run_document_ingestion", facade.run_document_ingestion
+    )
+    compensation_calls: list[IngestionResult | None] = []
+
+    def fake_run_document_ingestion_impl(**_: object) -> IngestionResult:
+        return IngestionResult(
+            status="partial",
+            doc_id="doc-failed",
+            parse_hash=None,
+            completed_steps=[
+                _ingestion_step("register_document", doc_id="doc-failed", created=True)
+            ],
+            failed_step="parse_document",
+            message="parse failed",
+        )
+
+    def file_handler(
+        temp_file: Path, title: str, collection: str, url: str
+    ) -> dict[str, object]:
+        return {
+            "file_path": str(temp_file),
+            "file_id": "file-1",
+            "rollback_on_failure": lambda result=None: compensation_calls.append(
+                result
+            ),
+            "rollback_context": {"rollback_kind": "new_web_file"},
+        }
+
+    monkeypatch.setattr(
+        document_ingestion,
+        "_run_document_ingestion_impl",
+        fake_run_document_ingestion_impl,
+    )
+
+    result = await facade.run_web_ingestion(
+        "demo",
+        WebCrawlConfig(start_url="https://example.com", max_pages=1),
+        file_handler=file_handler,
+    )
+
+    assert result.status == "error"
+    assert result.side_effects_may_remain is False
+    assert len(compensation_calls) == 1
+    assert compensation_calls[0] is not None
+    outcome = operation_facade.last_outcome
+    assert outcome is not None
+    assert outcome.rollback_status is RollbackStatus.COMPLETE
+    assert outcome.side_effects_may_remain is False
+    child = outcome.child_outcomes[0]
+    assert child.rollback_status is RollbackStatus.COMPLETE
+    assert child.side_effects_may_remain is False
+    assert child.compensation_steps[0].payload["rollback_kind"] == "new_web_file"
+
+
+@pytest.mark.asyncio
+async def test_web_ingestion_file_compensation_failure_marks_side_effects_remaining(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from xagent.core.tools.core.RAG_tools.pipelines import (
+        document_ingestion,
+        web_ingestion,
+    )
+
+    operation_facade = KBOperationCompatibilityFacade()
+    facade = KBPipelineCompatibilityFacade(operation_compatibility=operation_facade)
+    monkeypatch.setattr(web_ingestion, "WebCrawler", _SinglePageCrawler)
+    monkeypatch.setattr(
+        web_ingestion, "run_document_ingestion", facade.run_document_ingestion
+    )
+
+    def fake_run_document_ingestion_impl(**_: object) -> IngestionResult:
+        return IngestionResult(
+            status="partial",
+            doc_id="doc-failed",
+            parse_hash=None,
+            completed_steps=[
+                _ingestion_step("register_document", doc_id="doc-failed", created=True)
+            ],
+            failed_step="parse_document",
+            message="parse failed",
+        )
+
+    def rollback(_result=None) -> None:
+        raise RuntimeError("rollback exploded")
+
+    def file_handler(
+        temp_file: Path, title: str, collection: str, url: str
+    ) -> dict[str, object]:
+        return {
+            "file_path": str(temp_file),
+            "file_id": "file-1",
+            "rollback_on_failure": rollback,
+            "rollback_context": {"rollback_kind": "existing_web_file_refresh"},
+        }
+
+    monkeypatch.setattr(
+        document_ingestion,
+        "_run_document_ingestion_impl",
+        fake_run_document_ingestion_impl,
+    )
+
+    result = await facade.run_web_ingestion(
+        "demo",
+        WebCrawlConfig(start_url="https://example.com", max_pages=1),
+        file_handler=file_handler,
+    )
+
+    assert result.status == "error"
+    assert result.side_effects_may_remain is True
+    assert result.failed_urls == {"https://example.com/page": "parse failed"}
+    assert "rollback exploded" in result.message
+    assert any("rollback_on_failure failed" in item for item in result.warnings)
+    outcome = operation_facade.last_outcome
+    assert outcome is not None
+    assert outcome.rollback_status is RollbackStatus.INCOMPLETE
+    child = outcome.child_outcomes[0]
+    assert child.rollback_status is RollbackStatus.INCOMPLETE
+    assert child.side_effects_may_remain is True
+    assert child.compensation_steps[0].payload["rollback_kind"] == (
+        "existing_web_file_refresh"
+    )

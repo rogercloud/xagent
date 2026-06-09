@@ -200,7 +200,8 @@ class KBPipelineCompatibilityFacade:
                     is_admin=is_admin,
                 )
                 self.ensure_collection_backend_binding(collection)
-                self._finish_document_ingestion_outcome(operation, result)
+                if self._should_finish_document_ingestion_operation(operation):
+                    self._finish_document_ingestion_outcome(operation, result)
                 return result
 
     def run_document_ingestion(
@@ -251,7 +252,8 @@ class KBPipelineCompatibilityFacade:
                         is_admin=is_admin,
                     )
                     self.ensure_collection_backend_binding(collection)
-                    self._finish_document_ingestion_outcome(operation, result)
+                    if self._should_finish_document_ingestion_operation(operation):
+                        self._finish_document_ingestion_outcome(operation, result)
                 elif operation is None:
                     self.ensure_collection_backend_binding(collection)
                 return result
@@ -373,20 +375,38 @@ class KBPipelineCompatibilityFacade:
         file_path: Optional[str],
         file_id: Optional[str],
         reason: str = "file_handler",
+        extra_payload: Optional[Mapping[str, Any]] = None,
+        compensation: Optional[Callable[[], Any]] = None,
     ) -> None:
         if operation is None:
             return
+        payload = {
+            "collection": collection,
+            "url": url,
+            "file_path": file_path,
+            "file_id": file_id,
+            "reason": reason,
+        }
+        if extra_payload:
+            payload.update(dict(extra_payload))
         operation.record_side_effect(
             name="cleanup_web_page_persistence",
             plane=SideEffectPlane.FILE,
-            payload={
-                "collection": collection,
-                "url": url,
-                "file_path": file_path,
-                "file_id": file_id,
-                "reason": reason,
-            },
+            payload=payload,
             idempotency_key=f"file:{collection}:{file_id or file_path or url}",
+            compensation=compensation,
+        )
+
+    @staticmethod
+    def compensate_web_page_file_side_effect(
+        operation: KBOperation | None,
+    ) -> tuple[BaseException, ...]:
+        """Execute registered web-file compensation callbacks for a page."""
+        if operation is None or operation.outcome is not None:
+            return ()
+        return operation.execute_compensations(
+            step_names={"cleanup_web_page_persistence"},
+            planes={SideEffectPlane.FILE},
         )
 
     @staticmethod
@@ -403,11 +423,16 @@ class KBPipelineCompatibilityFacade:
             side_effects_may_remain = (
                 status != "success" and operation.has_side_effects()
             )
-        rollback_status = (
-            RollbackStatus.NOT_NEEDED
-            if status == "success" or not side_effects_may_remain
-            else RollbackStatus.INCOMPLETE
-        )
+        if status == "success":
+            rollback_status = RollbackStatus.NOT_NEEDED
+        elif side_effects_may_remain:
+            rollback_status = RollbackStatus.INCOMPLETE
+        elif operation.compensation_attempted and operation.has_side_effects():
+            rollback_status = RollbackStatus.COMPLETE
+        elif operation.has_side_effects():
+            rollback_status = RollbackStatus.INCOMPLETE
+        else:
+            rollback_status = RollbackStatus.NOT_NEEDED
         operation.finish(
             status=status,
             rollback_status=rollback_status,
@@ -526,6 +551,19 @@ class KBPipelineCompatibilityFacade:
             )
 
     @staticmethod
+    def _should_finish_document_ingestion_operation(
+        operation: KBOperation | None,
+    ) -> bool:
+        if operation is None:
+            return False
+        if operation.operation_type == "document_ingestion":
+            return True
+        return (
+            operation.operation_type == "web_page_ingestion"
+            and "url" not in operation.details
+        )
+
+    @staticmethod
     def _finish_document_ingestion_outcome(
         operation: KBOperation | None,
         result: IngestionResult,
@@ -558,6 +596,9 @@ class KBPipelineCompatibilityFacade:
         child_side_effects_may_remain = any(
             child.side_effects_may_remain for child in operation.child_outcomes
         )
+        own_side_effects_may_remain = bool(operation.compensation_steps) and not (
+            operation.compensation_attempted
+        )
         successful_child_count = sum(
             1 for child in operation.child_outcomes if child.status == "success"
         )
@@ -573,13 +614,19 @@ class KBPipelineCompatibilityFacade:
             side_effects_may_remain = child_side_effects_may_remain
         else:
             side_effects_may_remain = (
-                child_side_effects_may_remain or operation.has_side_effects()
+                child_side_effects_may_remain or own_side_effects_may_remain
             )
-            rollback_status = (
-                RollbackStatus.INCOMPLETE
-                if side_effects_may_remain
-                else RollbackStatus.NOT_NEEDED
-            )
+            if side_effects_may_remain:
+                rollback_status = RollbackStatus.INCOMPLETE
+            elif any(
+                child.rollback_status is RollbackStatus.COMPLETE
+                for child in operation.child_outcomes
+            ):
+                rollback_status = RollbackStatus.COMPLETE
+            elif operation.has_side_effects():
+                rollback_status = RollbackStatus.INCOMPLETE
+            else:
+                rollback_status = RollbackStatus.NOT_NEEDED
 
         operation.finish(
             status=result.status,
