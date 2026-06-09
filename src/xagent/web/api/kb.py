@@ -71,6 +71,9 @@ from ...core.tools.core.RAG_tools.kb import (
     KBApiOperationResult,
     get_kb_coordinator,
 )
+from ...core.tools.core.RAG_tools.kb.pipeline_compatibility import (
+    WEB_ROLLBACK_COMPENSATED_PLANES_KEY,
+)
 from ...core.tools.core.RAG_tools.management.status import clear_ingestion_status
 from ...core.tools.core.RAG_tools.pipelines.web_ingestion import FileHandlerResult
 from ...core.tools.core.RAG_tools.progress import get_progress_manager
@@ -156,6 +159,17 @@ from .cloud_storage import get_google_credentials
 
 T = TypeVar("T", bound=Callable[..., Any])
 logger = logging.getLogger(__name__)
+
+_WEB_FAILED_INGEST_CLEANUP_COMPENSATED_PLANES = (
+    # Collection initialization is completed by the outer failed-ingest cleanup.
+    # Marking it here lets that cleanup run after the page rollback succeeds.
+    "collection",
+    "document",
+    "status",
+    "parse",
+    "chunk",
+    "embedding",
+)
 
 
 def _get_api_compatibility_facade() -> KBApiCompatibilityFacade:
@@ -2235,6 +2249,9 @@ def _existing_web_file_result_with_rollback(
             "rollback_kind": "existing_web_file_reuse",
             "context": context,
             "file_id": file_record_id,
+            WEB_ROLLBACK_COMPENSATED_PLANES_KEY: (
+                _WEB_FAILED_INGEST_CLEANUP_COMPENSATED_PLANES
+            ),
         },
     )
 
@@ -2333,6 +2350,9 @@ def _create_new_web_file_handler_result(
                 "filename": filename,
                 "storage_path": str(persistent_file),
                 "file_id": file_record_id,
+                WEB_ROLLBACK_COMPENSATED_PLANES_KEY: (
+                    _WEB_FAILED_INGEST_CLEANUP_COMPENSATED_PLANES
+                ),
             },
         )
     except Exception:
@@ -2641,6 +2661,9 @@ def _refresh_existing_file_if_changed(
             "filename": filename,
             "backup_path": str(backup_path),
             "file_id": file_record_id,
+            WEB_ROLLBACK_COMPENSATED_PLANES_KEY: (
+                _WEB_FAILED_INGEST_CLEANUP_COMPENSATED_PLANES
+            ),
         },
     )
 
@@ -2907,6 +2930,9 @@ def _recreate_missing_existing_file(
             if backup_for_failure is not None
             else None,
             "file_id": file_record_id,
+            WEB_ROLLBACK_COMPENSATED_PLANES_KEY: (
+                _WEB_FAILED_INGEST_CLEANUP_COMPENSATED_PLANES
+            ),
         },
     )
 

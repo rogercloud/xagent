@@ -22,6 +22,9 @@ from xagent.core.tools.core.RAG_tools.kb import (
     RollbackStatus,
     SideEffectPlane,
 )
+from xagent.core.tools.core.RAG_tools.kb.pipeline_compatibility import (
+    WEB_ROLLBACK_COMPENSATED_PLANES_KEY,
+)
 
 
 class _FakeMetadataStore:
@@ -800,6 +803,97 @@ async def test_web_ingestion_file_compensation_leaves_document_effects_incomplet
         SideEffectPlane.FILE,
         SideEffectPlane.DOCUMENT,
         SideEffectPlane.STATUS,
+    }
+
+
+@pytest.mark.asyncio
+async def test_web_ingestion_declared_file_compensation_coverage_clears_document_effects(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from xagent.core.tools.core.RAG_tools.pipelines import (
+        document_ingestion,
+        web_ingestion,
+    )
+
+    operation_facade = KBOperationCompatibilityFacade()
+    facade = KBPipelineCompatibilityFacade(operation_compatibility=operation_facade)
+    monkeypatch.setattr(web_ingestion, "WebCrawler", _SinglePageCrawler)
+    monkeypatch.setattr(
+        web_ingestion, "run_document_ingestion", facade.run_document_ingestion
+    )
+    compensation_calls: list[IngestionResult | None] = []
+
+    def fake_run_document_ingestion_impl(**_: object) -> IngestionResult:
+        return IngestionResult(
+            status="partial",
+            doc_id="doc-failed",
+            parse_hash="parse-failed",
+            chunk_count=2,
+            embedding_count=2,
+            vector_count=2,
+            completed_steps=[
+                _ingestion_step("initialize_collection", embedding_model_id="model-a"),
+                _ingestion_step("register_document", doc_id="doc-failed", created=True),
+                _ingestion_step("parse_document", parse_hash="parse-failed"),
+                _ingestion_step("chunk_document", chunk_count=2, created=True),
+                _ingestion_step("write_vectors_to_db", vector_count=2),
+            ],
+            failed_step="finalize_document",
+            message="finalize failed",
+        )
+
+    def file_handler(
+        temp_file: Path, title: str, collection: str, url: str
+    ) -> dict[str, object]:
+        return {
+            "file_path": str(temp_file),
+            "file_id": "file-1",
+            "rollback_on_failure": lambda result=None: compensation_calls.append(
+                result
+            ),
+            "rollback_context": {
+                "rollback_kind": "new_web_file",
+                WEB_ROLLBACK_COMPENSATED_PLANES_KEY: [
+                    "collection",
+                    "document",
+                    "status",
+                    "parse",
+                    "chunk",
+                    "embedding",
+                ],
+            },
+        }
+
+    monkeypatch.setattr(
+        document_ingestion,
+        "_run_document_ingestion_impl",
+        fake_run_document_ingestion_impl,
+    )
+
+    result = await facade.run_web_ingestion(
+        "demo",
+        WebCrawlConfig(start_url="https://example.com", max_pages=1),
+        file_handler=file_handler,
+    )
+
+    assert result.status == "error"
+    assert result.side_effects_may_remain is False
+    assert len(compensation_calls) == 1
+    outcome = operation_facade.last_outcome
+    assert outcome is not None
+    assert outcome.rollback_status is RollbackStatus.COMPLETE
+    assert outcome.side_effects_may_remain is False
+    child = outcome.child_outcomes[0]
+    assert child.rollback_status is RollbackStatus.COMPLETE
+    assert child.side_effects_may_remain is False
+    assert {step.plane for step in child.compensation_steps} == {
+        SideEffectPlane.FILE,
+        SideEffectPlane.COLLECTION,
+        SideEffectPlane.DOCUMENT,
+        SideEffectPlane.STATUS,
+        SideEffectPlane.PARSE,
+        SideEffectPlane.CHUNK,
+        SideEffectPlane.EMBEDDING,
     }
 
 

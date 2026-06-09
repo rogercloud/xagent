@@ -184,6 +184,34 @@ class KBOperation:
         """Attach a finalized child operation outcome."""
         self.child_outcomes.append(outcome)
 
+    def mark_compensated_steps(
+        self,
+        *,
+        step_names: Optional[set[str]] = None,
+        planes: Optional[set[SideEffectPlane]] = None,
+    ) -> int:
+        """Mark steps covered by a broader successful compensation callback."""
+        if step_names is None and planes is None:
+            return 0
+
+        completed = 0
+        for step in self.compensation_steps:
+            if step_names is not None and step.name not in step_names:
+                continue
+            if planes is not None and step.plane not in planes:
+                continue
+            if step.idempotency_key is None:
+                continue
+            if step.idempotency_key in self._completed_compensation_keys:
+                continue
+
+            self._completed_compensation_keys.add(step.idempotency_key)
+            completed += 1
+
+        if completed:
+            self.side_effects_may_remain = self.has_uncompensated_side_effects()
+        return completed
+
     def execute_compensations(
         self,
         *,

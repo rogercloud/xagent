@@ -183,6 +183,7 @@ def _run_file_handler_compensation(
     callback = cast(Optional[FileHandlerCallback], file_info.get("rollback_on_failure"))
     if callback is None:
         return None
+    rollback_context = _rollback_context_payload(file_info)
 
     def _compensate() -> None:
         try:
@@ -206,11 +207,15 @@ def _run_file_handler_compensation(
         file_path=cast(Optional[str], file_info.get("file_path")),
         file_id=cast(Optional[str], file_info.get("file_id")),
         reason="rollback_on_failure",
-        extra_payload=_rollback_context_payload(file_info),
+        extra_payload=rollback_context,
         compensation=_compensate,
     )
     errors = pipeline_facade.compensate_web_page_file_side_effect(page_operation)
     if not errors:
+        pipeline_facade.mark_web_page_compensation_coverage(
+            page_operation,
+            extra_payload=rollback_context,
+        )
         return None
 
     first_error = errors[0]
