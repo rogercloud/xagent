@@ -218,7 +218,7 @@ class KBOperation:
             side_effects_may_remain = self._infer_side_effects_may_remain(status)
 
         if rollback_status is None:
-            rollback_status = self._infer_rollback_status(
+            rollback_status = self.infer_rollback_status(
                 status,
                 side_effects_may_remain=side_effects_may_remain,
             )
@@ -246,12 +246,13 @@ class KBOperation:
             return self._compensation_errors_pending
         return self.has_side_effects()
 
-    def _infer_rollback_status(
+    def infer_rollback_status(
         self,
         status: str,
         *,
         side_effects_may_remain: bool,
     ) -> RollbackStatus:
+        """Infer rollback status from current compensation and child state."""
         if status == "success":
             return RollbackStatus.NOT_NEEDED
 
@@ -276,6 +277,8 @@ class KBOperation:
             for child in self.child_outcomes
         ):
             return RollbackStatus.COMPLETE
+        if self.has_side_effects():
+            return RollbackStatus.INCOMPLETE
         return RollbackStatus.NOT_NEEDED
 
 

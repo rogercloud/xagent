@@ -798,6 +798,46 @@ async def test_web_ingestion_file_compensation_success_marks_child_complete(
     assert child.compensation_steps[0].payload["rollback_kind"] == "new_web_file"
 
 
+def test_web_ingestion_root_compensation_success_marks_outcome_complete() -> None:
+    operation_facade = KBOperationCompatibilityFacade()
+    facade = KBPipelineCompatibilityFacade(operation_compatibility=operation_facade)
+
+    with operation_facade.start_operation(
+        operation_type="web_ingestion",
+        collection="demo",
+    ) as operation:
+        operation.record_side_effect(
+            name="cleanup_root_persistence",
+            plane=SideEffectPlane.FILE,
+            idempotency_key="root:file",
+            compensation=lambda: None,
+        )
+        assert operation.execute_compensations() == ()
+        facade._record_web_ingestion_outcome(
+            operation,
+            WebIngestionResult(
+                status="error",
+                collection="demo",
+                total_urls_found=1,
+                pages_crawled=1,
+                pages_failed=1,
+                documents_created=0,
+                chunks_created=0,
+                embeddings_created=0,
+                crawled_urls=[],
+                failed_urls={"https://example.com": "failed"},
+                message="failed",
+                warnings=[],
+                elapsed_time_ms=1,
+            ),
+        )
+
+    outcome = operation_facade.last_outcome
+    assert outcome is not None
+    assert outcome.rollback_status is RollbackStatus.COMPLETE
+    assert outcome.side_effects_may_remain is False
+
+
 @pytest.mark.asyncio
 async def test_web_ingestion_file_compensation_failure_marks_side_effects_remaining(
     monkeypatch: pytest.MonkeyPatch,

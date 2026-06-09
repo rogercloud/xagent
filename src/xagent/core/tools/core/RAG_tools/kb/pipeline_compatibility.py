@@ -423,19 +423,12 @@ class KBPipelineCompatibilityFacade:
             side_effects_may_remain = (
                 status != "success" and operation.has_side_effects()
             )
-        if status == "success":
-            rollback_status = RollbackStatus.NOT_NEEDED
-        elif side_effects_may_remain:
-            rollback_status = RollbackStatus.INCOMPLETE
-        elif operation.compensation_attempted and operation.has_side_effects():
-            rollback_status = RollbackStatus.COMPLETE
-        elif operation.has_side_effects():
-            rollback_status = RollbackStatus.INCOMPLETE
-        else:
-            rollback_status = RollbackStatus.NOT_NEEDED
         operation.finish(
             status=status,
-            rollback_status=rollback_status,
+            rollback_status=operation.infer_rollback_status(
+                status,
+                side_effects_may_remain=side_effects_may_remain,
+            ),
             side_effects_may_remain=side_effects_may_remain,
             details={"message": message},
         )
@@ -599,38 +592,20 @@ class KBPipelineCompatibilityFacade:
         own_side_effects_may_remain = bool(operation.compensation_steps) and not (
             operation.compensation_attempted
         )
-        successful_child_count = sum(
-            1 for child in operation.child_outcomes if child.status == "success"
-        )
-        failed_child_count = sum(
-            1 for child in operation.child_outcomes if child.status != "success"
-        )
 
         if result.status == "success":
-            rollback_status = RollbackStatus.NOT_NEEDED
             side_effects_may_remain = False
-        elif successful_child_count > 0 and failed_child_count > 0:
-            rollback_status = RollbackStatus.SKIPPED_BY_POLICY
-            side_effects_may_remain = child_side_effects_may_remain
         else:
             side_effects_may_remain = (
                 child_side_effects_may_remain or own_side_effects_may_remain
             )
-            if side_effects_may_remain:
-                rollback_status = RollbackStatus.INCOMPLETE
-            elif any(
-                child.rollback_status is RollbackStatus.COMPLETE
-                for child in operation.child_outcomes
-            ):
-                rollback_status = RollbackStatus.COMPLETE
-            elif operation.has_side_effects():
-                rollback_status = RollbackStatus.INCOMPLETE
-            else:
-                rollback_status = RollbackStatus.NOT_NEEDED
 
         operation.finish(
             status=result.status,
-            rollback_status=rollback_status,
+            rollback_status=operation.infer_rollback_status(
+                result.status,
+                side_effects_may_remain=side_effects_may_remain,
+            ),
             side_effects_may_remain=side_effects_may_remain,
             details={
                 "documents_created": result.documents_created,
