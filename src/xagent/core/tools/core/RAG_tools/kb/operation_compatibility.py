@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
+import inspect
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from enum import StrEnum
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Optional, cast
 from uuid import uuid4
 
 
@@ -72,6 +73,13 @@ class KBOperationOutcome:
         return tuple(reversed(self.compensation_steps))
 
 
+def _close_awaitable_if_possible(value: Any) -> None:
+    """Close coroutine-like objects that cannot be awaited by a sync caller."""
+    close = getattr(value, "close", None)
+    if callable(close):
+        close()
+
+
 class KBOperation:
     """Mutable operation builder stored only in the current execution context."""
 
@@ -96,7 +104,7 @@ class KBOperation:
         self.warnings: list[str] = []
         self.side_effects_may_remain = False
         self._idempotency_keys: set[str] = set()
-        self._compensation_callbacks: dict[str, Callable[[], Any]] = {}
+        self._compensation_callbacks: dict[str, Callable[[], None]] = {}
         self._completed_compensation_keys: set[str] = set()
         self._compensation_attempted = False
         self._outcome: KBOperationOutcome | None = None
@@ -150,7 +158,7 @@ class KBOperation:
         plane: SideEffectPlane,
         payload: Optional[Mapping[str, Any]] = None,
         idempotency_key: Optional[str] = None,
-        compensation: Optional[Callable[[], Any]] = None,
+        compensation: Optional[Callable[[], None]] = None,
     ) -> None:
         """Register an idempotent compensation boundary for one side effect."""
         step_payload = dict(payload or {})
@@ -207,7 +215,13 @@ class KBOperation:
             self._compensation_attempted = True
             attempted = True
             try:
-                callback()
+                result = cast(Callable[[], Any], callback)()
+                if inspect.isawaitable(result):
+                    _close_awaitable_if_possible(result)
+                    raise TypeError(
+                        "Async compensation callback is not supported in synchronous "
+                        f"execute_compensations for step {step.name}"
+                    )
             except Exception as exc:  # noqa: BLE001 - preserve retryability
                 errors.append(exc)
                 self.warnings.append(f"{step.name}: {_format_exception_warning(exc)}")

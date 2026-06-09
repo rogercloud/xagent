@@ -386,7 +386,7 @@ class KBPipelineCompatibilityFacade:
         file_id: Optional[str],
         reason: str = "file_handler",
         extra_payload: Optional[Mapping[str, Any]] = None,
-        compensation: Optional[Callable[[], Any]] = None,
+        compensation: Optional[Callable[[], None]] = None,
     ) -> None:
         if operation is None:
             return

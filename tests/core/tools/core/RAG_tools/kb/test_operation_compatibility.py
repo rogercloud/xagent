@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from contextvars import Context
+from typing import Callable, cast
 
 import pytest
 
@@ -160,6 +161,43 @@ def test_failed_compensation_remains_retryable_until_it_succeeds() -> None:
     assert outcome.rollback_status is RollbackStatus.COMPLETE
     assert outcome.side_effects_may_remain is False
     assert "first failure" in outcome.warnings[0]
+
+
+def test_async_compensation_is_rejected_without_marking_complete(recwarn) -> None:
+    facade = KBOperationCompatibilityFacade()
+    calls: list[str] = []
+
+    async def compensation() -> None:
+        calls.append("compensated")
+
+    with facade.start_operation(
+        operation_type="document_ingestion",
+        collection="demo",
+    ) as operation:
+        operation.record_side_effect(
+            name="remove_document",
+            plane=SideEffectPlane.DOCUMENT,
+            idempotency_key="document:doc-1",
+            compensation=cast(Callable[[], None], compensation),
+        )
+
+        first_errors = operation.execute_compensations()
+        second_errors = operation.execute_compensations()
+        operation.finish(status="error")
+
+    outcome = facade.last_outcome
+
+    assert calls == []
+    assert len(first_errors) == 1
+    assert len(second_errors) == 1
+    assert isinstance(first_errors[0], TypeError)
+    assert isinstance(second_errors[0], TypeError)
+    assert outcome is not None
+    assert outcome.rollback_status is RollbackStatus.INCOMPLETE
+    assert outcome.side_effects_may_remain is True
+    assert len(outcome.warnings) == 2
+    assert "Async compensation callback is not supported" in outcome.warnings[0]
+    assert not any("was never awaited" in str(item.message) for item in recwarn)
 
 
 def test_system_exit_from_compensation_propagates_and_records_outcome() -> None:
