@@ -421,12 +421,9 @@ class KBPipelineCompatibilityFacade:
 
         planes: set[SideEffectPlane] = set()
         for raw_plane in raw_planes:
-            if isinstance(raw_plane, SideEffectPlane):
-                planes.add(raw_plane)
-                continue
             try:
-                planes.add(SideEffectPlane(str(raw_plane)))
-            except ValueError:
+                planes.add(SideEffectPlane(raw_plane))
+            except (TypeError, ValueError):
                 continue
         return planes
 
