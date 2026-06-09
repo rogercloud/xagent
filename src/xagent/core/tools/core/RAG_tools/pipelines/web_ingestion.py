@@ -39,7 +39,7 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-FileHandlerCallback = Callable[..., None]
+FileHandlerCallback = Callable[..., Any]
 
 
 _CRAWLER_BLOCK_ERROR_MARKERS: tuple[str, ...] = (
@@ -105,6 +105,28 @@ def _callback_accepts_ingestion_result(callback: FileHandlerCallback) -> bool:
     return True
 
 
+def _close_awaitable_if_possible(value: Any) -> None:
+    close = getattr(value, "close", None)
+    if callable(close):
+        close()
+
+
+def _run_sync_file_handler_callback(
+    callback: FileHandlerCallback,
+    *,
+    callback_name: str,
+    url: str,
+    ingestion_result: Optional[IngestionResult],
+) -> None:
+    if _callback_accepts_ingestion_result(callback):
+        result = callback(ingestion_result)
+    else:
+        result = callback()
+    if inspect.isawaitable(result):
+        _close_awaitable_if_possible(result)
+        raise TypeError(f"Async {callback_name} callback is not supported for {url}")
+
+
 def _run_file_handler_callback(
     file_info: Optional[FileHandlerResult],
     callback_name: str,
@@ -121,10 +143,12 @@ def _run_file_handler_callback(
         return None
 
     try:
-        if _callback_accepts_ingestion_result(callback):
-            callback(ingestion_result)
-        else:
-            callback()
+        _run_sync_file_handler_callback(
+            callback,
+            callback_name=callback_name,
+            url=url,
+            ingestion_result=ingestion_result,
+        )
     except Exception as cleanup_error:  # noqa: BLE001
         cleanup_reason = str(cleanup_error)
         message = f"File persistence {callback_name} failed for {url}: {cleanup_reason}"
@@ -162,10 +186,12 @@ def _run_file_handler_compensation(
 
     def _compensate() -> None:
         try:
-            if _callback_accepts_ingestion_result(callback):
-                callback(ingestion_result)
-            else:
-                callback()
+            _run_sync_file_handler_callback(
+                callback,
+                callback_name="rollback_on_failure",
+                url=url,
+                ingestion_result=ingestion_result,
+            )
         except Exception as cleanup_error:  # noqa: BLE001
             raise _FileHandlerRollbackError(
                 "rollback_on_failure",

@@ -47,6 +47,13 @@ async def _maybe_await(value: Any) -> Any:
     return value
 
 
+def _close_awaitable_if_possible(value: Any) -> None:
+    """Close coroutine-like objects that cannot be awaited by a sync caller."""
+    close = getattr(value, "close", None)
+    if callable(close):
+        close()
+
+
 def _has_store_method(metadata_store: object, name: str) -> bool:
     """Return True when the store exposes a callable method."""
     return callable(getattr(metadata_store, name, None))
@@ -264,6 +271,7 @@ class KBApiCompatibilityFacade:
             with self._storage_context():
                 result = rollback()
                 if inspect.isawaitable(result):
+                    _close_awaitable_if_possible(result)
                     raise TypeError(
                         "run_failed_ingest_rollback_async must be used for "
                         "awaitable rollback callbacks"

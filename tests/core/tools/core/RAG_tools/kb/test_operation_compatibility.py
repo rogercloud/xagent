@@ -162,6 +162,33 @@ def test_failed_compensation_remains_retryable_until_it_succeeds() -> None:
     assert "first failure" in outcome.warnings[0]
 
 
+def test_system_exit_from_compensation_propagates_and_records_outcome() -> None:
+    facade = KBOperationCompatibilityFacade()
+
+    def compensation() -> None:
+        raise SystemExit("stop")
+
+    with pytest.raises(SystemExit):
+        with facade.start_operation(
+            operation_type="document_ingestion",
+            collection="demo",
+        ) as operation:
+            operation.record_side_effect(
+                name="remove_document",
+                plane=SideEffectPlane.DOCUMENT,
+                idempotency_key="document:doc-1",
+                compensation=compensation,
+            )
+            operation.execute_compensations()
+
+    outcome = facade.last_outcome
+    assert outcome is not None
+    assert outcome.status == "error"
+    assert outcome.rollback_status is RollbackStatus.INCOMPLETE
+    assert outcome.side_effects_may_remain is True
+    assert outcome.warnings == ("SystemExit: stop",)
+
+
 def test_last_outcome_is_isolated_by_execution_context() -> None:
     facade = KBOperationCompatibilityFacade()
     initial_current_context_outcome = facade.last_outcome

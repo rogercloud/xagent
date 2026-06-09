@@ -347,6 +347,33 @@ def test_run_failed_ingest_rollback_marks_failed_compensation_incomplete() -> No
     )
 
 
+def test_run_failed_ingest_rollback_closes_awaitable_result(recwarn) -> None:
+    facade = KBApiCompatibilityFacade()
+    outcome = KBOperationOutcome(
+        operation_id="op-1",
+        operation_type="document_ingestion",
+        collection="demo",
+        status="error",
+        rollback_status=RollbackStatus.INCOMPLETE,
+        persistence_policy=PersistencePolicy.PRESERVE_SUCCESSFUL_CHILDREN,
+        side_effects_may_remain=True,
+    )
+    api_result = KBApiOperationResult(
+        result=IngestionResult(status="error", message="failed"),
+        operation_outcome=outcome,
+    )
+
+    async def rollback() -> None:
+        return None
+
+    rollback_result = facade.run_failed_ingest_rollback(api_result, rollback)
+
+    assert rollback_result.rollback_complete is False
+    assert isinstance(rollback_result.error, TypeError)
+    assert "run_failed_ingest_rollback_async" in str(rollback_result.error)
+    assert not any("was never awaited" in str(item.message) for item in recwarn)
+
+
 def test_run_failed_ingest_rollback_can_compensate_successful_operation() -> None:
     facade = KBApiCompatibilityFacade()
     outcome = KBOperationOutcome(

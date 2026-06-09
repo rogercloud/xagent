@@ -208,7 +208,7 @@ class KBOperation:
             attempted = True
             try:
                 callback()
-            except BaseException as exc:  # noqa: BLE001 - preserve retryability
+            except Exception as exc:  # noqa: BLE001 - preserve retryability
                 errors.append(exc)
                 self.warnings.append(f"{step.name}: {_format_exception_warning(exc)}")
             else:
