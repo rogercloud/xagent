@@ -237,6 +237,7 @@ def _run_per_boundary_compensation(
 
     rollback_context = _rollback_context_payload(file_info)
     succeeded: set[Any] = set()
+    first_error: Optional[str] = None
 
     # FILE boundary
     file_compensation = cast(
@@ -247,6 +248,8 @@ def _run_per_boundary_compensation(
             file_compensation()
         except Exception as exc:  # noqa: BLE001
             _handle_boundary_failure(warnings, url, "FILE", exc, rollback_context)
+            if first_error is None:
+                first_error = f"FILE boundary compensation failed: {exc}"
         else:
             succeeded.add(SideEffectPlane.FILE)
 
@@ -263,6 +266,8 @@ def _run_per_boundary_compensation(
             callback()
         except Exception as exc:  # noqa: BLE001
             _handle_boundary_failure(warnings, url, "DOCUMENT", exc, rollback_context)
+            if first_error is None:
+                first_error = f"DOCUMENT boundary compensation failed: {exc}"
         else:
             succeeded.add(SideEffectPlane.DOCUMENT)
             # delete_document() cascades to parse, chunk, and embedding.
@@ -285,26 +290,35 @@ def _run_per_boundary_compensation(
             callback()
         except Exception as exc:  # noqa: BLE001
             _handle_boundary_failure(warnings, url, "STATUS", exc, rollback_context)
+            if first_error is None:
+                first_error = f"STATUS boundary compensation failed: {exc}"
         else:
             succeeded.add(SideEffectPlane.STATUS)
 
-    # SNAPSHOT boundary
+    # SNAPSHOT boundary — only cleanup backup if FILE restoration succeeded
     snapshot_compensation = cast(
         Optional[FileHandlerCallback], file_info.get("snapshot_compensation")
     )
     if snapshot_compensation is not None:
-        try:
-            snapshot_compensation()
-        except Exception as exc:  # noqa: BLE001
-            _handle_boundary_failure(warnings, url, "SNAPSHOT", exc, rollback_context)
-        else:
-            succeeded.add(SideEffectPlane.SNAPSHOT)
+        file_registered = file_info.get("file_compensation") is not None
+        file_succeeded = SideEffectPlane.FILE in succeeded
+        if not file_registered or file_succeeded:
+            try:
+                snapshot_compensation()
+            except Exception as exc:  # noqa: BLE001
+                _handle_boundary_failure(
+                    warnings, url, "SNAPSHOT", exc, rollback_context
+                )
+                if first_error is None:
+                    first_error = f"SNAPSHOT boundary compensation failed: {exc}"
+            else:
+                succeeded.add(SideEffectPlane.SNAPSHOT)
 
     # Mark succeeded planes on the operation
     if succeeded and page_operation is not None:
         page_operation.mark_compensated_steps(planes=succeeded)
 
-    return None
+    return first_error
 
 
 def _run_legacy_rollback_compensation(
