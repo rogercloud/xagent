@@ -1097,5 +1097,43 @@ def test_delete_document_api_does_not_shadow_api_facade_wrapper() -> None:
     from xagent.web.api import kb as kb_api
 
     source = inspect.getsource(kb_api.delete_document_api)
-
     assert "management.collections import delete_document" not in source
+
+
+def test_failed_ingest_cleanup_decision_uses_operation_outcome() -> None:
+    """Cleanup decision reads from operation outcome, not opaque coverage metadata."""
+    operation_facade = KBOperationCompatibilityFacade()
+    coordinator = KBCoordinator(operation_compatibility=operation_facade)
+    api_facade = KBApiCompatibilityFacade(coordinator=coordinator)
+
+    with operation_facade.start_operation(
+        operation_type="web_ingestion",
+        collection="demo",
+        persistence_policy=PersistencePolicy.PRESERVE_SUCCESSFUL_CHILDREN,
+    ) as operation:
+        operation.record_side_effect(
+            name="test_side_effect",
+            plane=SideEffectPlane.FILE,
+            payload={"file_id": "f1"},
+            idempotency_key="file:demo:f1",
+        )
+        operation.mark_compensated_steps(planes={SideEffectPlane.FILE})
+
+        outcome = operation.finish(
+            status="error",
+            rollback_status=RollbackStatus.COMPLETE,
+            side_effects_may_remain=False,
+        )
+
+    operation_result = KBApiOperationResult(
+        result={"status": "error"},
+        operation_outcome=outcome,
+        rollback_complete=None,
+    )
+    decision = api_facade.failed_ingest_cleanup_decision(
+        operation_result=operation_result,
+    )
+
+    # When no opaque rollback_complete flag is set, fall back to
+    # operation_outcome.side_effects_may_remain
+    assert decision.side_effects_may_remain is False
