@@ -1043,18 +1043,14 @@ def test_file_compensation_restore_handles_recreated_file_without_existing(
             }
         )
 
-    monkeypatch.setattr(
-        "xagent.web.api.kb._restore_ingest_file_backup", _fake_restore
-    )
+    monkeypatch.setattr("xagent.web.api.kb._restore_ingest_file_backup", _fake_restore)
 
     def _fake_get_session_local():
         session = MagicMock()
         session.query().filter().first.return_value = None
         return session
 
-    monkeypatch.setattr(
-        "xagent.web.api.kb.get_session_local", _fake_get_session_local
-    )
+    monkeypatch.setattr("xagent.web.api.kb.get_session_local", _fake_get_session_local)
 
     compensation = _create_file_compensation_restore(
         file_record_id="recreate-no-file",
@@ -1108,8 +1104,10 @@ def test_rollback_on_failure_compat_wrapper_delegates_to_per_boundary(
     """rollback_on_failure compat wrapper calls all per-boundary callbacks."""
     from unittest.mock import MagicMock
 
-    from xagent.web.api.kb import _create_document_compensation
-    from xagent.web.api.kb import _create_status_compensation
+    from xagent.web.api.kb import (
+        _create_document_compensation,
+        _create_status_compensation,
+    )
 
     monkeypatch.setattr(
         "xagent.web.api.kb.get_session_local",

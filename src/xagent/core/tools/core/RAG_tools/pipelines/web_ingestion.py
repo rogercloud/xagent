@@ -310,9 +310,7 @@ def _run_per_boundary_compensation(
             idempotency_key=f"snapshot:{collection}:{cast(Optional[str], file_info.get('file_id')) or url}",
             compensation=snapshot_compensation,
         )
-        errors = page_operation.execute_compensations(
-            planes={SideEffectPlane.SNAPSHOT}
-        )
+        errors = page_operation.execute_compensations(planes={SideEffectPlane.SNAPSHOT})
         if not errors:
             succeeded.add(SideEffectPlane.SNAPSHOT)
         else:
