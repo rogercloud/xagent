@@ -2483,6 +2483,11 @@ def _create_new_web_file_handler_result(
             is_admin=is_admin,
             file_record_id=file_record_id,
         )
+        status_compensation = _create_status_compensation(
+            collection_name=collection_name,
+            user_id=user_id,
+            is_admin=is_admin,
+        )
 
         def _rollback_new_web_file(
             ingestion_result: Optional[IngestionResult] = None,
@@ -2512,6 +2517,19 @@ def _create_new_web_file_handler_result(
                     exc,
                     exc_info=True,
                 )
+            try:
+                status_cb = status_compensation(ingestion_result)
+                status_cb()
+            except Exception as exc:  # noqa: BLE001
+                if rollback_error is None:
+                    rollback_error = exc
+                logger.warning(
+                    "Failed to clear ingestion status during new web file "
+                    "rollback: file_id=%s, error=%s",
+                    file_record_id,
+                    exc,
+                    exc_info=True,
+                )
             if rollback_error is not None:
                 raise rollback_error
 
@@ -2521,6 +2539,7 @@ def _create_new_web_file_handler_result(
             rollback_on_failure=_rollback_new_web_file,
             file_compensation=file_compensation,
             document_compensation=document_compensation,
+            status_compensation=status_compensation,
             rollback_context={
                 "rollback_kind": "new_web_file",
                 "filename": filename,
@@ -3810,21 +3829,23 @@ async def ingest(
         api_result = _get_api_compatibility_facade().with_result(api_result, result)
 
         if result.status in {"error", "partial"}:
-            rollback_execution = await _get_api_compatibility_facade().run_failed_ingest_rollback_async(
-                api_result,
-                lambda: _rollback_failed_ingestion(
-                    db=db,
-                    user=_user,
-                    collection_name=collection,
-                    result=result,
-                    file_path=file_path,
-                    file_record=file_record,
-                    collection_existed_before=effective_collection_existed_before,
-                    uploaded_file_existed_before=uploaded_file_existed_before,
-                    file_backup_path=file_backup_path,
-                    had_existing_file=had_existing_file,
-                    embedding_model_id=embedding_model_id,
-                ),
+            rollback_execution = (
+                await _get_api_compatibility_facade().run_failed_ingest_rollback_async(
+                    api_result,
+                    lambda: _rollback_failed_ingestion(
+                        db=db,
+                        user=_user,
+                        collection_name=collection,
+                        result=result,
+                        file_path=file_path,
+                        file_record=file_record,
+                        collection_existed_before=effective_collection_existed_before,
+                        uploaded_file_existed_before=uploaded_file_existed_before,
+                        file_backup_path=file_backup_path,
+                        had_existing_file=had_existing_file,
+                        embedding_model_id=embedding_model_id,
+                    ),
+                )
             )
             api_result = rollback_execution.operation_result
             if rollback_execution.error is not None:
@@ -3879,21 +3900,23 @@ async def ingest(
                 message="Ingestion setup failed before completion.",
             )
             rollback_api_result = KBApiOperationResult(result=rollback_result)
-            rollback_execution = await _get_api_compatibility_facade().run_failed_ingest_rollback_async(
-                rollback_api_result,
-                lambda: _rollback_failed_ingestion(
-                    db=db,
-                    user=_user,
-                    collection_name=collection,
-                    result=rollback_result,
-                    file_path=file_path,
-                    file_record=file_record,
-                    collection_existed_before=effective_collection_existed_before,
-                    uploaded_file_existed_before=uploaded_file_existed_before,
-                    file_backup_path=file_backup_path,
-                    had_existing_file=had_existing_file,
-                    embedding_model_id=embedding_model_id,
-                ),
+            rollback_execution = (
+                await _get_api_compatibility_facade().run_failed_ingest_rollback_async(
+                    rollback_api_result,
+                    lambda: _rollback_failed_ingestion(
+                        db=db,
+                        user=_user,
+                        collection_name=collection,
+                        result=rollback_result,
+                        file_path=file_path,
+                        file_record=file_record,
+                        collection_existed_before=effective_collection_existed_before,
+                        uploaded_file_existed_before=uploaded_file_existed_before,
+                        file_backup_path=file_backup_path,
+                        had_existing_file=had_existing_file,
+                        embedding_model_id=embedding_model_id,
+                    ),
+                )
             )
             rollback_api_result = rollback_execution.operation_result
             if rollback_execution.error is not None:
