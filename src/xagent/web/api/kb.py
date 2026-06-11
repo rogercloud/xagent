@@ -2390,10 +2390,34 @@ def _existing_web_file_result_with_rollback(
     def _rollback_existing(
         ingestion_result: Optional[IngestionResult] = None,
     ) -> None:
-        doc_cb = document_compensation(ingestion_result)
-        doc_cb()
-        status_cb = status_compensation(ingestion_result)
-        status_cb()
+        rollback_error: Optional[Exception] = None
+        try:
+            doc_cb = document_compensation(ingestion_result)
+            doc_cb()
+        except Exception as exc:  # noqa: BLE001
+            rollback_error = exc
+            logger.warning(
+                "Failed to restore RAG rows during existing web file rollback: "
+                "file_id=%s, error=%s",
+                file_record_id,
+                exc,
+                exc_info=True,
+            )
+        try:
+            status_cb = status_compensation(ingestion_result)
+            status_cb()
+        except Exception as exc:  # noqa: BLE001
+            if rollback_error is None:
+                rollback_error = exc
+            logger.warning(
+                "Failed to restore ingestion runs during existing web file rollback: "
+                "file_id=%s, error=%s",
+                file_record_id,
+                exc,
+                exc_info=True,
+            )
+        if rollback_error is not None:
+            raise rollback_error
 
     return FileHandlerResult(
         file_path=str(file_path),
@@ -2463,9 +2487,33 @@ def _create_new_web_file_handler_result(
         def _rollback_new_web_file(
             ingestion_result: Optional[IngestionResult] = None,
         ) -> None:
-            file_compensation()
-            doc_cb = document_compensation(ingestion_result)
-            doc_cb()
+            rollback_error: Optional[Exception] = None
+            try:
+                file_compensation()
+            except Exception as exc:  # noqa: BLE001
+                rollback_error = exc
+                logger.warning(
+                    "Failed to clean file during new web file rollback: "
+                    "file_id=%s, error=%s",
+                    file_record_id,
+                    exc,
+                    exc_info=True,
+                )
+            try:
+                doc_cb = document_compensation(ingestion_result)
+                doc_cb()
+            except Exception as exc:  # noqa: BLE001
+                if rollback_error is None:
+                    rollback_error = exc
+                logger.warning(
+                    "Failed to clean RAG rows during new web file rollback: "
+                    "file_id=%s, error=%s",
+                    file_record_id,
+                    exc,
+                    exc_info=True,
+                )
+            if rollback_error is not None:
+                raise rollback_error
 
         return FileHandlerResult(
             file_path=str(persistent_file),
@@ -2686,12 +2734,58 @@ def _refresh_existing_file_if_changed(
     def _rollback_refresh(
         ingestion_result: Optional[IngestionResult] = None,
     ) -> None:
-        file_compensation()
-        doc_cb = document_compensation(ingestion_result)
-        doc_cb()
-        status_cb = status_compensation(ingestion_result)
-        status_cb()
-        snapshot_compensation()
+        rollback_error: Optional[Exception] = None
+        try:
+            file_compensation()
+        except Exception as exc:  # noqa: BLE001
+            rollback_error = exc
+            logger.warning(
+                "Failed to restore file during web file refresh rollback: "
+                "file_id=%s, error=%s",
+                file_record_id,
+                exc,
+                exc_info=True,
+            )
+        try:
+            doc_cb = document_compensation(ingestion_result)
+            doc_cb()
+        except Exception as exc:  # noqa: BLE001
+            if rollback_error is None:
+                rollback_error = exc
+            logger.warning(
+                "Failed to restore RAG rows during web file refresh rollback: "
+                "file_id=%s, error=%s",
+                file_record_id,
+                exc,
+                exc_info=True,
+            )
+        try:
+            status_cb = status_compensation(ingestion_result)
+            status_cb()
+        except Exception as exc:  # noqa: BLE001
+            if rollback_error is None:
+                rollback_error = exc
+            logger.warning(
+                "Failed to restore ingestion runs during web file refresh "
+                "rollback: file_id=%s, error=%s",
+                file_record_id,
+                exc,
+                exc_info=True,
+            )
+        try:
+            snapshot_compensation()
+        except Exception as exc:  # noqa: BLE001
+            if rollback_error is None:
+                rollback_error = exc
+            logger.warning(
+                "Failed to cleanup backup file during web file refresh "
+                "rollback: file_id=%s, error=%s",
+                file_record_id,
+                exc,
+                exc_info=True,
+            )
+        if rollback_error is not None:
+            raise rollback_error
 
     def _commit_refresh() -> None:
         backup_path.unlink(missing_ok=True)
@@ -2875,12 +2969,58 @@ def _recreate_missing_existing_file(
     def _rollback_recreate(
         ingestion_result: Optional[IngestionResult] = None,
     ) -> None:
-        file_compensation()
-        doc_cb = document_compensation(ingestion_result)
-        doc_cb()
-        status_cb = status_compensation(ingestion_result)
-        status_cb()
-        snapshot_compensation()
+        rollback_error: Optional[Exception] = None
+        try:
+            file_compensation()
+        except Exception as exc:  # noqa: BLE001
+            rollback_error = exc
+            logger.warning(
+                "Failed to restore file during recreated web file rollback: "
+                "file_id=%s, error=%s",
+                file_record_id,
+                exc,
+                exc_info=True,
+            )
+        try:
+            doc_cb = document_compensation(ingestion_result)
+            doc_cb()
+        except Exception as exc:  # noqa: BLE001
+            if rollback_error is None:
+                rollback_error = exc
+            logger.warning(
+                "Failed to restore RAG rows during recreated web file rollback: "
+                "file_id=%s, error=%s",
+                file_record_id,
+                exc,
+                exc_info=True,
+            )
+        try:
+            status_cb = status_compensation(ingestion_result)
+            status_cb()
+        except Exception as exc:  # noqa: BLE001
+            if rollback_error is None:
+                rollback_error = exc
+            logger.warning(
+                "Failed to restore ingestion runs during recreated web file "
+                "rollback: file_id=%s, error=%s",
+                file_record_id,
+                exc,
+                exc_info=True,
+            )
+        try:
+            snapshot_compensation()
+        except Exception as exc:  # noqa: BLE001
+            if rollback_error is None:
+                rollback_error = exc
+            logger.warning(
+                "Failed to cleanup backup file during recreated web file "
+                "rollback: file_id=%s, error=%s",
+                file_record_id,
+                exc,
+                exc_info=True,
+            )
+        if rollback_error is not None:
+            raise rollback_error
 
     def _commit_recreate() -> None:
         if backup_for_failure is not None:
@@ -3674,23 +3814,21 @@ async def ingest(
         api_result = _get_api_compatibility_facade().with_result(api_result, result)
 
         if result.status in {"error", "partial"}:
-            rollback_execution = (
-                await _get_api_compatibility_facade().run_failed_ingest_rollback_async(
-                    api_result,
-                    lambda: _rollback_failed_ingestion(
-                        db=db,
-                        user=_user,
-                        collection_name=collection,
-                        result=result,
-                        file_path=file_path,
-                        file_record=file_record,
-                        collection_existed_before=effective_collection_existed_before,
-                        uploaded_file_existed_before=uploaded_file_existed_before,
-                        file_backup_path=file_backup_path,
-                        had_existing_file=had_existing_file,
-                        embedding_model_id=embedding_model_id,
-                    ),
-                )
+            rollback_execution = await _get_api_compatibility_facade().run_failed_ingest_rollback_async(
+                api_result,
+                lambda: _rollback_failed_ingestion(
+                    db=db,
+                    user=_user,
+                    collection_name=collection,
+                    result=result,
+                    file_path=file_path,
+                    file_record=file_record,
+                    collection_existed_before=effective_collection_existed_before,
+                    uploaded_file_existed_before=uploaded_file_existed_before,
+                    file_backup_path=file_backup_path,
+                    had_existing_file=had_existing_file,
+                    embedding_model_id=embedding_model_id,
+                ),
             )
             api_result = rollback_execution.operation_result
             if rollback_execution.error is not None:
@@ -3745,23 +3883,21 @@ async def ingest(
                 message="Ingestion setup failed before completion.",
             )
             rollback_api_result = KBApiOperationResult(result=rollback_result)
-            rollback_execution = (
-                await _get_api_compatibility_facade().run_failed_ingest_rollback_async(
-                    rollback_api_result,
-                    lambda: _rollback_failed_ingestion(
-                        db=db,
-                        user=_user,
-                        collection_name=collection,
-                        result=rollback_result,
-                        file_path=file_path,
-                        file_record=file_record,
-                        collection_existed_before=effective_collection_existed_before,
-                        uploaded_file_existed_before=uploaded_file_existed_before,
-                        file_backup_path=file_backup_path,
-                        had_existing_file=had_existing_file,
-                        embedding_model_id=embedding_model_id,
-                    ),
-                )
+            rollback_execution = await _get_api_compatibility_facade().run_failed_ingest_rollback_async(
+                rollback_api_result,
+                lambda: _rollback_failed_ingestion(
+                    db=db,
+                    user=_user,
+                    collection_name=collection,
+                    result=rollback_result,
+                    file_path=file_path,
+                    file_record=file_record,
+                    collection_existed_before=effective_collection_existed_before,
+                    uploaded_file_existed_before=uploaded_file_existed_before,
+                    file_backup_path=file_backup_path,
+                    had_existing_file=had_existing_file,
+                    embedding_model_id=embedding_model_id,
+                ),
             )
             rollback_api_result = rollback_execution.operation_result
             if rollback_execution.error is not None:

@@ -233,6 +233,8 @@ def _run_per_boundary_compensation(
     warnings: list[str],
     ingestion_result: Optional[IngestionResult] = None,
 ) -> Optional[str]:
+    from ..kb.operation_compatibility import SideEffectPlane
+
     rollback_context = _rollback_context_payload(file_info)
     succeeded: set[Any] = set()
 
@@ -246,8 +248,6 @@ def _run_per_boundary_compensation(
         except Exception as exc:  # noqa: BLE001
             _handle_boundary_failure(warnings, url, "FILE", exc, rollback_context)
         else:
-            from ..kb.operation_compatibility import SideEffectPlane
-
             succeeded.add(SideEffectPlane.FILE)
 
     # DOCUMENT boundary
@@ -264,8 +264,6 @@ def _run_per_boundary_compensation(
         except Exception as exc:  # noqa: BLE001
             _handle_boundary_failure(warnings, url, "DOCUMENT", exc, rollback_context)
         else:
-            from ..kb.operation_compatibility import SideEffectPlane
-
             succeeded.add(SideEffectPlane.DOCUMENT)
             # delete_document() cascades to parse, chunk, and embedding.
             # Mark those planes as well so the operation outcome correctly
@@ -288,8 +286,6 @@ def _run_per_boundary_compensation(
         except Exception as exc:  # noqa: BLE001
             _handle_boundary_failure(warnings, url, "STATUS", exc, rollback_context)
         else:
-            from ..kb.operation_compatibility import SideEffectPlane
-
             succeeded.add(SideEffectPlane.STATUS)
 
     # SNAPSHOT boundary
@@ -297,30 +293,12 @@ def _run_per_boundary_compensation(
         Optional[FileHandlerCallback], file_info.get("snapshot_compensation")
     )
     if snapshot_compensation is not None:
-        from ..kb.operation_compatibility import SideEffectPlane
-
-        page_operation.record_side_effect(
-            name="cleanup_backup_file",
-            plane=SideEffectPlane.SNAPSHOT,
-            payload={
-                "collection": collection,
-                "url": url,
-                "file_id": cast(Optional[str], file_info.get("file_id")),
-            },
-            idempotency_key=f"snapshot:{collection}:{cast(Optional[str], file_info.get('file_id')) or url}",
-            compensation=snapshot_compensation,
-        )
-        errors = page_operation.execute_compensations(planes={SideEffectPlane.SNAPSHOT})
-        if not errors:
-            succeeded.add(SideEffectPlane.SNAPSHOT)
+        try:
+            snapshot_compensation()
+        except Exception as exc:  # noqa: BLE001
+            _handle_boundary_failure(warnings, url, "SNAPSHOT", exc, rollback_context)
         else:
-            _handle_boundary_failure(
-                warnings,
-                url,
-                "SNAPSHOT",
-                errors[0],
-                rollback_context,
-            )
+            succeeded.add(SideEffectPlane.SNAPSHOT)
 
     # Mark succeeded planes on the operation
     if succeeded and page_operation is not None:

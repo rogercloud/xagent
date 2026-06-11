@@ -1317,23 +1317,13 @@ class TestIngestWebHandleWebFile:
             file_info = file_handler(temp_md, title, collection, url)
             captured["file_id"] = str(file_info["file_id"])
 
-            from xagent.core.tools.core.RAG_tools.core.schemas import WebIngestionResult
+            from xagent.core.tools.core.RAG_tools.core.schemas import IngestionResult
             from xagent.web.services.managed_file_ref import build_upload_storage_key
 
-            result = WebIngestionResult(
+            result = IngestionResult(
                 status="error",
-                collection=collection,
-                total_urls_found=1,
-                pages_crawled=1,
-                pages_failed=1,
-                documents_created=0,
-                chunks_created=0,
-                embeddings_created=0,
-                crawled_urls=[url],
-                failed_urls={url: "embedding failed"},
-                message="failed",
-                warnings=[],
-                elapsed_time_ms=1,
+                doc_id=None,
+                message="embedding failed",
             )
             captured["storage_key"] = build_upload_storage_key(
                 user.id,
@@ -1587,11 +1577,11 @@ class TestIngestWebHandleWebFile:
             ),
             patch(
                 "xagent.web.api.kb._snapshot_ingestion_runs_for_uploaded_file",
-                return_value=object(),
+                return_value=MagicMock(),
             ) as mock_snapshot_runs,
             patch(
                 "xagent.web.api.kb._snapshot_rag_documents_for_uploaded_file",
-                return_value=object(),
+                return_value=MagicMock(),
             ) as mock_snapshot_rag,
             patch(
                 "xagent.web.api.kb._restore_ingestion_runs_snapshot"
