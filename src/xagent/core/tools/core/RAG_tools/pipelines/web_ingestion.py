@@ -183,11 +183,31 @@ def _run_file_handler_compensation(
     if not file_info:
         return None
 
-    # Check for legacy monolithic rollback_on_failure callback (custom callbacks)
+    # Per-boundary compensation takes priority over legacy rollback_on_failure.
+    has_per_boundary = any(
+        file_info.get(key)
+        for key in (
+            "file_compensation",
+            "document_compensation",
+            "status_compensation",
+            "snapshot_compensation",
+        )
+    )
+    if has_per_boundary:
+        return _run_per_boundary_compensation(
+            pipeline_facade=pipeline_facade,
+            page_operation=page_operation,
+            file_info=file_info,
+            collection=collection,
+            url=url,
+            warnings=warnings,
+            ingestion_result=ingestion_result,
+        )
+
+    # Legacy monolithic rollback_on_failure callback (custom callbacks only)
     legacy_callback = cast(
         Optional[FileHandlerCallback], file_info.get("rollback_on_failure")
     )
-
     if legacy_callback is not None:
         return _run_legacy_rollback_compensation(
             pipeline_facade=pipeline_facade,
@@ -200,7 +220,19 @@ def _run_file_handler_compensation(
             ingestion_result=ingestion_result,
         )
 
-    # Per-boundary compensation (production paths)
+    return None
+
+
+def _run_per_boundary_compensation(
+    *,
+    pipeline_facade: "KBPipelineCompatibilityFacade",
+    page_operation: Any,
+    file_info: FileHandlerResult,
+    collection: str,
+    url: str,
+    warnings: list[str],
+    ingestion_result: Optional[IngestionResult] = None,
+) -> Optional[str]:
     rollback_context = _rollback_context_payload(file_info)
     succeeded: set[Any] = set()
 
@@ -235,6 +267,12 @@ def _run_file_handler_compensation(
             from ..kb.operation_compatibility import SideEffectPlane
 
             succeeded.add(SideEffectPlane.DOCUMENT)
+            # delete_document() cascades to parse, chunk, and embedding.
+            # Mark those planes as well so the operation outcome correctly
+            # reports complete compensation.
+            succeeded.add(SideEffectPlane.PARSE)
+            succeeded.add(SideEffectPlane.CHUNK)
+            succeeded.add(SideEffectPlane.EMBEDDING)
 
     # STATUS boundary
     status_compensation = cast(

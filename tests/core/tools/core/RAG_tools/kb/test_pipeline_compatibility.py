@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 import pytest
 
@@ -1068,3 +1068,85 @@ def test_file_compensation_restore_handles_recreated_file_without_existing(
     assert len(restore_calls) == 1
     assert restore_calls[0]["had_existing_file"] is False
     assert restore_calls[0]["backup_path"] is None
+
+
+def test_document_compensation_marks_cascaded_planes() -> None:
+    """Doc compensation also marks PARSE/CHUNK/EMBEDDING because delete_document cascades."""
+    facade = KBOperationCompatibilityFacade()
+
+    with facade.start_operation(
+        operation_type="web_page_ingestion",
+        collection="demo",
+    ) as operation:
+        for plane in (
+            SideEffectPlane.DOCUMENT,
+            SideEffectPlane.PARSE,
+            SideEffectPlane.CHUNK,
+            SideEffectPlane.EMBEDDING,
+        ):
+            operation.record_side_effect(
+                name=f"remove_{plane.value}",
+                plane=plane,
+                payload={},
+                idempotency_key=f"{plane.value}:demo:doc-1",
+            )
+
+        operation.mark_compensated_steps(
+            planes={
+                SideEffectPlane.DOCUMENT,
+                SideEffectPlane.PARSE,
+                SideEffectPlane.CHUNK,
+                SideEffectPlane.EMBEDDING,
+            }
+        )
+        assert operation.has_uncompensated_side_effects() is False
+
+
+def test_rollback_on_failure_compat_wrapper_delegates_to_per_boundary(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """rollback_on_failure compat wrapper calls all per-boundary callbacks."""
+    from unittest.mock import MagicMock
+
+    from xagent.web.api.kb import _create_document_compensation
+    from xagent.web.api.kb import _create_status_compensation
+
+    monkeypatch.setattr(
+        "xagent.web.api.kb.get_session_local",
+        MagicMock(side_effect=RuntimeError("unused in this test")),
+    )
+
+    calls: list[str] = []
+
+    def _file_cb() -> None:
+        calls.append("file")
+
+    def _snap_cb() -> None:
+        calls.append("snapshot")
+
+    file_cb: Callable = _file_cb
+    doc_factory = _create_document_compensation(
+        collection_name="demo",
+        user_id=1,
+        is_admin=True,
+        file_record_id="f1",
+    )
+    status_factory = _create_status_compensation(
+        collection_name="demo",
+        user_id=1,
+        is_admin=True,
+        ingestion_runs_snapshot=None,
+    )
+    snap_cb: Callable = _snap_cb
+
+    def _rollback_compat(ingestion_result=None) -> None:
+        calls.append("called")
+        file_cb()
+        doc_cb = doc_factory(ingestion_result)
+        doc_cb()
+        status_cb = status_factory(ingestion_result)
+        status_cb()
+        snap_cb()
+
+    _rollback_compat(None)
+    assert calls == ["called", "file", "snapshot"]
