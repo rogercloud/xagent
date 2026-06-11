@@ -276,6 +276,10 @@ def _run_per_boundary_compensation(
             succeeded.add(SideEffectPlane.PARSE)
             succeeded.add(SideEffectPlane.CHUNK)
             succeeded.add(SideEffectPlane.EMBEDDING)
+            # Collection initialization is shared and not rolled back at the
+            # page level. Mark it compensated so the page-level rollback
+            # status is COMPLETE when all boundaries succeed.
+            succeeded.add(SideEffectPlane.COLLECTION)
 
     # STATUS boundary
     status_compensation = cast(
