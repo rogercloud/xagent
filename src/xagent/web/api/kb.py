@@ -236,7 +236,7 @@ def _create_file_compensation_restore(
                 _restore_uploaded_file_record_snapshot(
                     refreshed_record, record_snapshot
                 )
-                if previous_storage_key:
+                if previous_storage_key and backup_path is not None:
                     UploadedFileStore(rollback_db).sync_existing(
                         refreshed_record,
                         storage_key=previous_storage_key,
@@ -759,6 +759,18 @@ def _restore_ingest_file_backup(
     backup_path: Optional[Path],
     had_existing_file: bool,
 ) -> None:
+    """Undo a file introduced or mutated during failed ingestion.
+
+    Three behaviors, resolved in order:
+
+    1. **Restore**: when *backup_path* exists, delete *file_path* and
+       replace it with the backup.
+    2. **Error**: when *had_existing_file* is True but *backup_path* is
+       missing, the backup was expected and its absence is unrecoverable.
+    3. **Cleanup**: when *had_existing_file* is False, this is a
+       newly-created file with no pre-existing version to restore.
+       Simply delete *file_path*.
+    """
     if backup_path is not None and backup_path.exists():
         if file_path.exists():
             file_path.unlink()
