@@ -2772,11 +2772,11 @@ def _refresh_existing_file_if_changed(
                 exc,
                 exc_info=True,
             )
+        if rollback_error is not None:
+            raise rollback_error
         try:
             snapshot_compensation()
         except Exception as exc:  # noqa: BLE001
-            if rollback_error is None:
-                rollback_error = exc
             logger.warning(
                 "Failed to cleanup backup file during web file refresh "
                 "rollback: file_id=%s, error=%s",
@@ -2784,8 +2784,6 @@ def _refresh_existing_file_if_changed(
                 exc,
                 exc_info=True,
             )
-        if rollback_error is not None:
-            raise rollback_error
 
     def _commit_refresh() -> None:
         backup_path.unlink(missing_ok=True)
@@ -3007,11 +3005,11 @@ def _recreate_missing_existing_file(
                 exc,
                 exc_info=True,
             )
+        if rollback_error is not None:
+            raise rollback_error
         try:
             snapshot_compensation()
         except Exception as exc:  # noqa: BLE001
-            if rollback_error is None:
-                rollback_error = exc
             logger.warning(
                 "Failed to cleanup backup file during recreated web file "
                 "rollback: file_id=%s, error=%s",
@@ -3019,8 +3017,6 @@ def _recreate_missing_existing_file(
                 exc,
                 exc_info=True,
             )
-        if rollback_error is not None:
-            raise rollback_error
 
     def _commit_recreate() -> None:
         if backup_for_failure is not None:
