@@ -71,9 +71,6 @@ from ...core.tools.core.RAG_tools.kb import (
     KBApiOperationResult,
     get_kb_coordinator,
 )
-from ...core.tools.core.RAG_tools.kb.pipeline_compatibility import (
-    WEB_ROLLBACK_COMPENSATED_PLANES_KEY,
-)
 from ...core.tools.core.RAG_tools.management.status import clear_ingestion_status
 from ...core.tools.core.RAG_tools.pipelines.web_ingestion import FileHandlerResult
 from ...core.tools.core.RAG_tools.progress import get_progress_manager
@@ -160,16 +157,181 @@ from .cloud_storage import get_google_credentials
 T = TypeVar("T", bound=Callable[..., Any])
 logger = logging.getLogger(__name__)
 
-_WEB_FAILED_INGEST_CLEANUP_COMPENSATED_PLANES = (
-    # Collection initialization is completed by the outer failed-ingest cleanup.
-    # Marking it here lets that cleanup run after the page rollback succeeds.
-    "collection",
-    "document",
-    "status",
-    "parse",
-    "chunk",
-    "embedding",
-)
+
+def _create_file_compensation_delete(
+    *,
+    file_record_id: str,
+    persistent_file_path: Path,
+) -> Callable[[], None]:
+    """Create a FILE-boundary compensation callback for deleting a new web file."""
+
+    def _compensate() -> None:
+        SessionLocal = get_session_local()
+        rollback_db = SessionLocal()
+        try:
+            rollback_record = (
+                rollback_db.query(UploadedFile)
+                .filter(UploadedFile.file_id == file_record_id)
+                .first()
+            )
+            if rollback_record is not None:
+                UploadedFileStore(rollback_db).delete(
+                    rollback_record,
+                    delete_local=True,
+                )
+            else:
+                persistent_file_path.unlink(missing_ok=True)
+            rollback_db.commit()
+        except Exception:
+            rollback_db.rollback()
+            raise
+        finally:
+            rollback_db.close()
+
+    return _compensate
+
+
+def _create_file_compensation_restore(
+    *,
+    file_record_id: str,
+    existing_path: Path,
+    backup_path: Path,
+    record_snapshot: dict[str, Any],
+) -> Callable[[], None]:
+    """Create a FILE-boundary compensation callback for restoring a refreshed/recreated web file."""
+
+    def _compensate() -> None:
+        if not backup_path.exists():
+            raise FileNotFoundError(
+                f"Missing web ingest rollback backup: {backup_path}"
+            )
+        SessionLocal = get_session_local()
+        rollback_db = SessionLocal()
+        try:
+            refreshed_record = (
+                rollback_db.query(UploadedFile)
+                .filter(UploadedFile.file_id == file_record_id)
+                .first()
+            )
+            if refreshed_record is None:
+                _restore_ingest_file_backup(
+                    file_path=existing_path,
+                    backup_path=backup_path,
+                    had_existing_file=True,
+                )
+            else:
+                current_storage_key = str(
+                    getattr(refreshed_record, "storage_key", "") or ""
+                )
+                previous_storage_key = str(record_snapshot.get("storage_key") or "")
+                if current_storage_key and current_storage_key != previous_storage_key:
+                    ManagedFileRef(refreshed_record).delete_durable()
+
+                _restore_ingest_file_backup(
+                    file_path=existing_path,
+                    backup_path=backup_path,
+                    had_existing_file=True,
+                )
+                _restore_uploaded_file_record_snapshot(
+                    refreshed_record, record_snapshot
+                )
+                if previous_storage_key:
+                    UploadedFileStore(rollback_db).sync_existing(
+                        refreshed_record,
+                        storage_key=previous_storage_key,
+                        mime_type=record_snapshot.get("mime_type"),
+                    )
+                else:
+                    rollback_db.flush()
+            rollback_db.commit()
+        except Exception:
+            rollback_db.rollback()
+            raise
+        finally:
+            rollback_db.close()
+
+    return _compensate
+
+
+def _create_document_compensation(
+    *,
+    collection_name: str,
+    user_id: int,
+    is_admin: bool,
+    file_record_id: str,
+    rag_document_snapshot: Optional["_RagDocumentSnapshot"] = None,
+) -> Callable[[], Callable[[], None]]:
+    """Create a DOCUMENT-boundary compensation factory.
+
+    Returns a factory that accepts an optional IngestionResult and produces
+    the actual compensation callback. This two-phase pattern is needed because
+    the ingestion result is only available at compensation execution time.
+    """
+
+    def _factory(
+        ingestion_result: Optional[Any] = None,
+    ) -> Callable[[], None]:
+        def _compensate() -> None:
+            _rollback_failed_web_document_ingestion(
+                collection_name=collection_name,
+                result=ingestion_result,
+                user_id=user_id,
+                is_admin=is_admin,
+                rag_snapshot=rag_document_snapshot,
+                file_id=file_record_id,
+            )
+
+        return _compensate
+
+    return _factory
+
+
+def _create_status_compensation(
+    *,
+    collection_name: str,
+    user_id: int,
+    is_admin: bool,
+    ingestion_runs_snapshot: Optional[Any] = None,
+) -> Callable[[], Callable[[], None]]:
+    """Create a STATUS-boundary compensation factory."""
+
+    def _factory(
+        ingestion_result: Optional[Any] = None,
+    ) -> Callable[[], None]:
+        def _compensate() -> None:
+            if ingestion_runs_snapshot is not None:
+                _restore_ingestion_runs_snapshot(ingestion_runs_snapshot)
+            elif ingestion_result is not None:
+                doc_id = (
+                    ingestion_result.doc_id
+                    if isinstance(ingestion_result.doc_id, str)
+                    and ingestion_result.doc_id
+                    else None
+                )
+                if doc_id:
+                    clear_ingestion_status(
+                        collection_name,
+                        doc_id,
+                        user_id=user_id,
+                        is_admin=is_admin,
+                    )
+
+        return _compensate
+
+    return _factory
+
+
+def _create_snapshot_compensation(
+    *,
+    backup_path: Optional[Path],
+) -> Callable[[], None]:
+    """Create a SNAPSHOT-boundary compensation callback for cleanup on success."""
+
+    def _compensate() -> None:
+        if backup_path is not None:
+            backup_path.unlink(missing_ok=True)
+
+    return _compensate
 
 
 def _get_api_compatibility_facade() -> KBApiCompatibilityFacade:
@@ -2198,60 +2360,29 @@ def _existing_web_file_result_with_rollback(
             "Failed to snapshot RAG document rows before reusing existing web file"
         )
 
-    def _rollback_existing(
-        ingestion_result: Optional[IngestionResult] = None,
-    ) -> None:
-        rollback_error: Optional[Exception] = None
-        try:
-            _rollback_failed_web_document_ingestion(
-                collection_name=collection_name,
-                result=ingestion_result,
-                user_id=user_id,
-                is_admin=is_admin,
-                rag_snapshot=rag_document_snapshot,
-                file_id=file_record_id,
-            )
-        except Exception as exc:  # noqa: BLE001
-            rollback_error = exc
-            logger.warning(
-                "Failed to restore RAG rows during existing web file rollback: "
-                "url=%s, file_id=%s, context=%s, error=%s",
-                url,
-                file_record_id,
-                context,
-                exc,
-                exc_info=True,
-            )
-
-        try:
-            _restore_ingestion_runs_snapshot(ingestion_runs_snapshot)
-        except Exception as exc:  # noqa: BLE001
-            if rollback_error is None:
-                rollback_error = exc
-            logger.warning(
-                "Failed to restore ingestion runs during existing web file rollback: "
-                "url=%s, file_id=%s, context=%s, error=%s",
-                url,
-                file_record_id,
-                context,
-                exc,
-                exc_info=True,
-            )
-
-        if rollback_error is not None:
-            raise rollback_error
+    document_compensation = _create_document_compensation(
+        collection_name=collection_name,
+        user_id=user_id,
+        is_admin=is_admin,
+        file_record_id=file_record_id,
+        rag_document_snapshot=rag_document_snapshot,
+    )
+    status_compensation = _create_status_compensation(
+        collection_name=collection_name,
+        user_id=user_id,
+        is_admin=is_admin,
+        ingestion_runs_snapshot=ingestion_runs_snapshot,
+    )
 
     return FileHandlerResult(
         file_path=str(file_path),
         file_id=file_record_id,
-        rollback_on_failure=_rollback_existing,
+        document_compensation=document_compensation,
+        status_compensation=status_compensation,
         rollback_context={
             "rollback_kind": "existing_web_file_reuse",
             "context": context,
             "file_id": file_record_id,
-            WEB_ROLLBACK_COMPENSATED_PLANES_KEY: (
-                _WEB_FAILED_INGEST_CLEANUP_COMPENSATED_PLANES
-            ),
         },
     )
 
@@ -2296,63 +2427,27 @@ def _create_new_web_file_handler_result(
         file_record_id = str(file_record.file_id)
         persistent_file_path = Path(persistent_file)
 
-        def _rollback_new_web_file(
-            ingestion_result: Optional[IngestionResult] = None,
-        ) -> None:
-            rollback_error: Optional[Exception] = None
-            try:
-                _rollback_failed_web_document_ingestion(
-                    collection_name=collection_name,
-                    result=ingestion_result,
-                    user_id=user_id,
-                    is_admin=is_admin,
-                    file_id=file_record_id,
-                )
-            except Exception as exc:  # noqa: BLE001
-                rollback_error = exc
-                logger.warning(
-                    "Failed to clean RAG rows during new web file rollback: "
-                    "file_id=%s, error=%s",
-                    file_record_id,
-                    exc,
-                    exc_info=True,
-                )
-            SessionLocal = get_session_local()
-            rollback_db = SessionLocal()
-            try:
-                rollback_record = (
-                    rollback_db.query(UploadedFile)
-                    .filter(UploadedFile.file_id == file_record_id)
-                    .first()
-                )
-                if rollback_record is not None:
-                    UploadedFileStore(rollback_db).delete(
-                        rollback_record,
-                        delete_local=True,
-                    )
-                else:
-                    persistent_file_path.unlink(missing_ok=True)
-                rollback_db.commit()
-            except Exception:
-                rollback_db.rollback()
-                raise
-            finally:
-                rollback_db.close()
-            if rollback_error is not None:
-                raise rollback_error
+        file_compensation = _create_file_compensation_delete(
+            file_record_id=file_record_id,
+            persistent_file_path=persistent_file_path,
+        )
+        document_compensation = _create_document_compensation(
+            collection_name=collection_name,
+            user_id=user_id,
+            is_admin=is_admin,
+            file_record_id=file_record_id,
+        )
 
         return FileHandlerResult(
             file_path=str(persistent_file),
             file_id=file_record_id,
-            rollback_on_failure=_rollback_new_web_file,
+            file_compensation=file_compensation,
+            document_compensation=document_compensation,
             rollback_context={
                 "rollback_kind": "new_web_file",
                 "filename": filename,
                 "storage_path": str(persistent_file),
                 "file_id": file_record_id,
-                WEB_ROLLBACK_COMPENSATED_PLANES_KEY: (
-                    _WEB_FAILED_INGEST_CLEANUP_COMPENSATED_PLANES
-                ),
             },
         )
     except Exception:
@@ -2535,118 +2630,28 @@ def _refresh_existing_file_if_changed(
 
     file_record_id = str(file_record.file_id)
 
-    def _rollback_refresh(
-        ingestion_result: Optional[IngestionResult] = None,
-    ) -> None:
-        if not backup_path.exists():
-            raise FileNotFoundError(
-                f"Missing web ingest rollback backup: {backup_path}"
-            )
-
-        SessionLocal = get_session_local()
-        rollback_db = SessionLocal()
-        rollback_succeeded = False
-        try:
-            rollback_error: Optional[Exception] = None
-            try:
-                _rollback_failed_web_document_ingestion(
-                    collection_name=collection_name,
-                    result=ingestion_result,
-                    user_id=user_id,
-                    is_admin=is_admin,
-                    rag_snapshot=rag_document_snapshot,
-                    file_id=file_record_id,
-                )
-            except Exception as exc:  # noqa: BLE001
-                rollback_error = exc
-                logger.warning(
-                    "Failed to restore RAG rows during web file refresh rollback: "
-                    "file_id=%s, error=%s",
-                    file_record_id,
-                    exc,
-                    exc_info=True,
-                )
-
-            try:
-                refreshed_record = (
-                    rollback_db.query(UploadedFile)
-                    .filter(UploadedFile.file_id == file_record_id)
-                    .first()
-                )
-                if refreshed_record is None:
-                    _restore_ingest_file_backup(
-                        file_path=existing_path,
-                        backup_path=backup_path,
-                        had_existing_file=True,
-                    )
-                    rollback_db.commit()
-                else:
-                    current_storage_key = str(
-                        getattr(refreshed_record, "storage_key", "") or ""
-                    )
-                    previous_storage_key = str(record_snapshot.get("storage_key") or "")
-                    if (
-                        current_storage_key
-                        and current_storage_key != previous_storage_key
-                    ):
-                        ManagedFileRef(refreshed_record).delete_durable()
-
-                    _restore_ingest_file_backup(
-                        file_path=existing_path,
-                        backup_path=backup_path,
-                        had_existing_file=True,
-                    )
-                    _restore_uploaded_file_record_snapshot(
-                        refreshed_record, record_snapshot
-                    )
-                    if previous_storage_key:
-                        UploadedFileStore(rollback_db).sync_existing(
-                            refreshed_record,
-                            storage_key=previous_storage_key,
-                            mime_type=record_snapshot.get("mime_type"),
-                        )
-                    else:
-                        rollback_db.flush()
-                    rollback_db.commit()
-            except Exception as exc:  # noqa: BLE001
-                rollback_db.rollback()
-                if rollback_error is None:
-                    rollback_error = exc
-                logger.warning(
-                    "Failed to restore UploadedFile/local file during web file "
-                    "refresh rollback: file_id=%s, error=%s",
-                    file_record_id,
-                    exc,
-                    exc_info=True,
-                )
-
-            try:
-                _restore_ingestion_runs_snapshot(ingestion_runs_snapshot)
-            except Exception as exc:  # noqa: BLE001
-                if rollback_error is None:
-                    rollback_error = exc
-                logger.warning(
-                    "Failed to restore ingestion runs during web file refresh "
-                    "rollback: file_id=%s, error=%s",
-                    file_record_id,
-                    exc,
-                    exc_info=True,
-                )
-
-            if rollback_error is not None:
-                raise rollback_error
-            rollback_succeeded = True
-        except Exception:
-            raise
-        finally:
-            rollback_db.close()
-            if rollback_succeeded:
-                backup_path.unlink(missing_ok=True)
-            elif backup_path.exists():
-                logger.warning(
-                    "Preserving web ingest rollback backup after failed rollback: %s",
-                    backup_path,
-                )
+    file_compensation = _create_file_compensation_restore(
+        file_record_id=file_record_id,
+        existing_path=existing_path,
+        backup_path=backup_path,
+        record_snapshot=record_snapshot,
+    )
+    document_compensation = _create_document_compensation(
+        collection_name=collection_name,
+        user_id=user_id,
+        is_admin=is_admin,
+        file_record_id=file_record_id,
+        rag_document_snapshot=rag_document_snapshot,
+    )
+    status_compensation = _create_status_compensation(
+        collection_name=collection_name,
+        user_id=user_id,
+        is_admin=is_admin,
+        ingestion_runs_snapshot=ingestion_runs_snapshot,
+    )
+    snapshot_compensation = _create_snapshot_compensation(
+        backup_path=backup_path,
+    )
 
     def _commit_refresh() -> None:
         backup_path.unlink(missing_ok=True)
@@ -2654,16 +2659,16 @@ def _refresh_existing_file_if_changed(
     return FileHandlerResult(
         file_path=str(existing_record.storage_path),
         file_id=str(existing_record.file_id),
-        rollback_on_failure=_rollback_refresh,
         commit_on_success=_commit_refresh,
+        file_compensation=file_compensation,
+        document_compensation=document_compensation,
+        status_compensation=status_compensation,
+        snapshot_compensation=snapshot_compensation,
         rollback_context={
             "rollback_kind": "existing_web_file_refresh",
             "filename": filename,
             "backup_path": str(backup_path),
             "file_id": file_record_id,
-            WEB_ROLLBACK_COMPENSATED_PLANES_KEY: (
-                _WEB_FAILED_INGEST_CLEANUP_COMPENSATED_PLANES
-            ),
         },
     )
 
@@ -2802,117 +2807,30 @@ def _recreate_missing_existing_file(
     file_record_id = str(file_record.file_id)
     backup_for_failure = backup_path
 
-    def _rollback_recreate(
-        ingestion_result: Optional[IngestionResult] = None,
-    ) -> None:
-        SessionLocal = get_session_local()
-        rollback_db = SessionLocal()
-        rollback_succeeded = False
-        try:
-            rollback_error: Optional[Exception] = None
-            try:
-                _rollback_failed_web_document_ingestion(
-                    collection_name=collection_name,
-                    result=ingestion_result,
-                    user_id=user_id,
-                    is_admin=is_admin,
-                    rag_snapshot=rag_document_snapshot,
-                    file_id=file_record_id,
-                )
-            except Exception as exc:  # noqa: BLE001
-                rollback_error = exc
-                logger.warning(
-                    "Failed to clean RAG rows during recreated web file rollback: "
-                    "file_id=%s, error=%s",
-                    file_record_id,
-                    exc,
-                    exc_info=True,
-                )
-
-            try:
-                refreshed_record = (
-                    rollback_db.query(UploadedFile)
-                    .filter(UploadedFile.file_id == file_record_id)
-                    .first()
-                )
-                if refreshed_record is not None:
-                    current_storage_key = str(
-                        getattr(refreshed_record, "storage_key", "") or ""
-                    )
-                    previous_storage_key = str(record_snapshot.get("storage_key") or "")
-                    if (
-                        current_storage_key
-                        and current_storage_key != previous_storage_key
-                    ):
-                        ManagedFileRef(refreshed_record).delete_durable()
-
-                    _restore_uploaded_file_record_snapshot(
-                        refreshed_record, record_snapshot
-                    )
-                    if previous_storage_key and backup_for_failure is not None:
-                        _restore_ingest_file_backup(
-                            file_path=existing_path,
-                            backup_path=backup_for_failure,
-                            had_existing_file=True,
-                        )
-                        UploadedFileStore(rollback_db).sync_existing(
-                            refreshed_record,
-                            storage_key=previous_storage_key,
-                            mime_type=record_snapshot.get("mime_type"),
-                        )
-                    else:
-                        _restore_ingest_file_backup(
-                            file_path=existing_path,
-                            backup_path=backup_for_failure,
-                            had_existing_file=had_existing_file,
-                        )
-                        rollback_db.flush()
-                else:
-                    _restore_ingest_file_backup(
-                        file_path=existing_path,
-                        backup_path=backup_for_failure,
-                        had_existing_file=had_existing_file,
-                    )
-                rollback_db.commit()
-            except Exception as exc:  # noqa: BLE001
-                rollback_db.rollback()
-                if rollback_error is None:
-                    rollback_error = exc
-                logger.warning(
-                    "Failed to restore UploadedFile/local file during recreated "
-                    "web file rollback: file_id=%s, error=%s",
-                    file_record_id,
-                    exc,
-                    exc_info=True,
-                )
-
-            try:
-                _restore_ingestion_runs_snapshot(ingestion_runs_snapshot)
-            except Exception as exc:  # noqa: BLE001
-                if rollback_error is None:
-                    rollback_error = exc
-                logger.warning(
-                    "Failed to restore ingestion runs during recreated web file "
-                    "rollback: file_id=%s, error=%s",
-                    file_record_id,
-                    exc,
-                    exc_info=True,
-                )
-
-            if rollback_error is not None:
-                raise rollback_error
-            rollback_succeeded = True
-        except Exception:
-            raise
-        finally:
-            rollback_db.close()
-            if rollback_succeeded and backup_for_failure is not None:
-                backup_for_failure.unlink(missing_ok=True)
-            elif backup_for_failure is not None and backup_for_failure.exists():
-                logger.warning(
-                    "Preserving web ingest rollback backup after failed rollback: %s",
-                    backup_for_failure,
-                )
+    file_compensation = _create_file_compensation_restore(
+        file_record_id=file_record_id,
+        existing_path=existing_path,
+        backup_path=backup_for_failure
+        if backup_for_failure is not None
+        else existing_path,
+        record_snapshot=record_snapshot,
+    )
+    document_compensation = _create_document_compensation(
+        collection_name=collection_name,
+        user_id=user_id,
+        is_admin=is_admin,
+        file_record_id=file_record_id,
+        rag_document_snapshot=rag_document_snapshot,
+    )
+    status_compensation = _create_status_compensation(
+        collection_name=collection_name,
+        user_id=user_id,
+        is_admin=is_admin,
+        ingestion_runs_snapshot=ingestion_runs_snapshot,
+    )
+    snapshot_compensation = _create_snapshot_compensation(
+        backup_path=backup_for_failure,
+    )
 
     def _commit_recreate() -> None:
         if backup_for_failure is not None:
@@ -2921,18 +2839,18 @@ def _recreate_missing_existing_file(
     return FileHandlerResult(
         file_path=str(existing_record.storage_path),
         file_id=str(existing_record.file_id),
-        rollback_on_failure=_rollback_recreate,
         commit_on_success=_commit_recreate,
+        file_compensation=file_compensation,
+        document_compensation=document_compensation,
+        status_compensation=status_compensation,
+        snapshot_compensation=snapshot_compensation,
         rollback_context={
             "rollback_kind": "missing_existing_web_file_recreate",
             "filename": filename,
             "backup_path": str(backup_for_failure)
             if backup_for_failure is not None
-            else None,
+            else "",
             "file_id": file_record_id,
-            WEB_ROLLBACK_COMPENSATED_PLANES_KEY: (
-                _WEB_FAILED_INGEST_CLEANUP_COMPENSATED_PLANES
-            ),
         },
     )
 

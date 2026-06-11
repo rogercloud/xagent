@@ -76,6 +76,10 @@ class FileHandlerResult(TypedDict):
         rollback_context: Optional operation-outcome metadata describing the
             web file side effect. This is internal and does not affect public
             web ingestion result schemas.
+        file_compensation: Optional FILE-boundary compensation callback.
+        document_compensation: Optional DOCUMENT-boundary compensation callback.
+        status_compensation: Optional STATUS-boundary compensation callback.
+        snapshot_compensation: Optional SNAPSHOT-boundary compensation callback.
     """
 
     file_path: str
@@ -83,6 +87,10 @@ class FileHandlerResult(TypedDict):
     rollback_on_failure: NotRequired[FileHandlerCallback]
     commit_on_success: NotRequired[FileHandlerCallback]
     rollback_context: NotRequired[dict[str, object]]
+    file_compensation: NotRequired[FileHandlerCallback]
+    document_compensation: NotRequired[FileHandlerCallback]
+    status_compensation: NotRequired[FileHandlerCallback]
+    snapshot_compensation: NotRequired[FileHandlerCallback]
 
 
 class _FileHandlerRollbackError(RuntimeError):
@@ -175,15 +183,116 @@ def _run_file_handler_compensation(
     if not file_info:
         return None
 
-    callback = cast(Optional[FileHandlerCallback], file_info.get("rollback_on_failure"))
-    if callback is None:
-        return None
+    # Check for legacy monolithic rollback_on_failure callback (custom callbacks)
+    legacy_callback = cast(
+        Optional[FileHandlerCallback], file_info.get("rollback_on_failure")
+    )
+
+    if legacy_callback is not None:
+        return _run_legacy_rollback_compensation(
+            pipeline_facade=pipeline_facade,
+            page_operation=page_operation,
+            file_info=file_info,
+            collection=collection,
+            url=url,
+            warnings=warnings,
+            legacy_callback=legacy_callback,
+            ingestion_result=ingestion_result,
+        )
+
+    # Per-boundary compensation (production paths)
+    rollback_context = _rollback_context_payload(file_info)
+    succeeded: set[Any] = set()
+
+    # FILE boundary
+    file_compensation = cast(
+        Optional[FileHandlerCallback], file_info.get("file_compensation")
+    )
+    if file_compensation is not None:
+        try:
+            file_compensation()
+        except Exception as exc:  # noqa: BLE001
+            _handle_boundary_failure(warnings, url, "FILE", exc, rollback_context)
+        else:
+            from ..kb.operation_compatibility import SideEffectPlane
+
+            succeeded.add(SideEffectPlane.FILE)
+
+    # DOCUMENT boundary
+    document_compensation = cast(
+        Optional[FileHandlerCallback], file_info.get("document_compensation")
+    )
+    if document_compensation is not None:
+        try:
+            factory = document_compensation
+            callback = (
+                factory(ingestion_result) if ingestion_result is not None else factory()
+            )
+            callback()
+        except Exception as exc:  # noqa: BLE001
+            _handle_boundary_failure(warnings, url, "DOCUMENT", exc, rollback_context)
+        else:
+            from ..kb.operation_compatibility import SideEffectPlane
+
+            succeeded.add(SideEffectPlane.DOCUMENT)
+
+    # STATUS boundary
+    status_compensation = cast(
+        Optional[FileHandlerCallback], file_info.get("status_compensation")
+    )
+    if status_compensation is not None:
+        try:
+            factory = status_compensation
+            callback = (
+                factory(ingestion_result) if ingestion_result is not None else factory()
+            )
+            callback()
+        except Exception as exc:  # noqa: BLE001
+            _handle_boundary_failure(warnings, url, "STATUS", exc, rollback_context)
+        else:
+            from ..kb.operation_compatibility import SideEffectPlane
+
+            succeeded.add(SideEffectPlane.STATUS)
+
+    # SNAPSHOT boundary
+    snapshot_compensation = cast(
+        Optional[FileHandlerCallback], file_info.get("snapshot_compensation")
+    )
+    if snapshot_compensation is not None:
+        try:
+            snapshot_compensation()
+        except Exception as exc:  # noqa: BLE001
+            _handle_boundary_failure(warnings, url, "SNAPSHOT", exc, rollback_context)
+        else:
+            from ..kb.operation_compatibility import SideEffectPlane
+
+            succeeded.add(SideEffectPlane.FILE)
+
+    # Mark succeeded planes on the operation
+    if succeeded and page_operation is not None:
+        page_operation.mark_compensated_steps(planes=succeeded)
+
+    return None
+
+
+def _run_legacy_rollback_compensation(
+    *,
+    pipeline_facade: "KBPipelineCompatibilityFacade",
+    page_operation: Any,
+    file_info: FileHandlerResult,
+    collection: str,
+    url: str,
+    warnings: list[str],
+    legacy_callback: FileHandlerCallback,
+    ingestion_result: Optional[IngestionResult] = None,
+) -> Optional[str]:
+    """Handle legacy monolithic rollback_on_failure (custom callbacks)."""
     rollback_context = _rollback_context_payload(file_info)
 
     def _compensate() -> None:
         try:
             _run_sync_file_handler_callback(
-                callback,
+                legacy_callback,
                 callback_name="rollback_on_failure",
                 url=url,
                 ingestion_result=ingestion_result,
@@ -207,10 +316,6 @@ def _run_file_handler_compensation(
     )
     errors = pipeline_facade.compensate_web_page_file_side_effect(page_operation)
     if not errors:
-        pipeline_facade.mark_web_page_compensation_coverage(
-            page_operation,
-            extra_payload=rollback_context,
-        )
         return None
 
     first_error = errors[0]
@@ -225,6 +330,19 @@ def _run_file_handler_compensation(
     return cleanup_reason
 
 
+def _handle_boundary_failure(
+    warnings: list[str],
+    url: str,
+    boundary: str,
+    exc: Exception,
+    rollback_context: Optional[dict[str, object]],
+) -> None:
+    """Log and record a per-boundary compensation failure."""
+    message = f"Web rollback {boundary} compensation failed for {url}: {exc}"
+    logger.warning(message)
+    warnings.append(message)
+
+
 def _run_legacy_persistent_file_compensation(
     *,
     pipeline_facade: "KBPipelineCompatibilityFacade",
@@ -237,7 +355,9 @@ def _run_legacy_persistent_file_compensation(
 ) -> Optional[str]:
     if not copied_persistent_file or not copied_persistent_file.exists():
         return None
-    if file_info and "rollback_on_failure" in file_info:
+    if file_info and (
+        "rollback_on_failure" in file_info or "file_compensation" in file_info
+    ):
         return None
 
     def _compensate() -> None:

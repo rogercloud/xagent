@@ -30,7 +30,6 @@ if TYPE_CHECKING:
     from .storage_shim import KBStorageShimCompatibilityFacade
 
 KB_STORAGE_METADATA_KEY = "kb_storage"
-WEB_ROLLBACK_COMPENSATED_PLANES_KEY = "compensated_side_effect_planes"
 
 
 class KBPipelineCompatibilityFacade:
@@ -407,41 +406,6 @@ class KBPipelineCompatibilityFacade:
             idempotency_key=f"file:{collection}:{file_id or file_path or url}",
             compensation=compensation,
         )
-
-    @staticmethod
-    def _compensated_side_effect_planes(
-        payload: Optional[Mapping[str, Any]],
-    ) -> set[SideEffectPlane]:
-        if not payload:
-            return set()
-
-        raw_planes = payload.get(WEB_ROLLBACK_COMPENSATED_PLANES_KEY)
-        if not isinstance(raw_planes, (list, tuple, set)):
-            return set()
-
-        planes: set[SideEffectPlane] = set()
-        for raw_plane in raw_planes:
-            try:
-                planes.add(SideEffectPlane(raw_plane))
-            except (TypeError, ValueError):
-                continue
-        return planes
-
-    def mark_web_page_compensation_coverage(
-        self,
-        operation: KBOperation | None,
-        *,
-        extra_payload: Optional[Mapping[str, Any]] = None,
-    ) -> int:
-        """Mark side effects covered by a successful web rollback callback."""
-        if operation is None or operation.outcome is not None:
-            return 0
-
-        planes = self._compensated_side_effect_planes(extra_payload)
-        if not planes:
-            return 0
-
-        return operation.mark_compensated_steps(planes=planes)
 
     @staticmethod
     def compensate_web_page_file_side_effect(
