@@ -298,3 +298,26 @@ def test_operation_exception_warning_includes_exception_type() -> None:
     assert outcome.status == "error"
     assert outcome.rollback_status is RollbackStatus.NOT_NEEDED
     assert outcome.warnings == ("KeyError: 'doc_id'",)
+
+
+def test_snapshot_plane_mark_and_uncompensated_tracking() -> None:
+    """SNAPSHOT plane participates in mark_compensated_steps and uncompensated_steps."""
+    facade = KBOperationCompatibilityFacade()
+
+    with facade.start_operation(
+        operation_type="web_page_ingestion",
+        collection="demo",
+    ) as operation:
+        operation.record_side_effect(
+            name="cleanup_backup_file",
+            plane=SideEffectPlane.SNAPSHOT,
+            payload={"backup_path": "/tmp/backup"},
+            idempotency_key="snapshot:/tmp/backup",
+        )
+        assert SideEffectPlane.SNAPSHOT.value == "snapshot"
+        uncompensated = operation.uncompensated_steps()
+        assert len(uncompensated) == 1
+        assert uncompensated[0].plane is SideEffectPlane.SNAPSHOT
+
+        operation.mark_compensated_steps(planes={SideEffectPlane.SNAPSHOT})
+        assert operation.has_uncompensated_side_effects() is False

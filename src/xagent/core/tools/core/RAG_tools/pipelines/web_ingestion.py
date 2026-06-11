@@ -259,14 +259,32 @@ def _run_file_handler_compensation(
         Optional[FileHandlerCallback], file_info.get("snapshot_compensation")
     )
     if snapshot_compensation is not None:
-        try:
-            snapshot_compensation()
-        except Exception as exc:  # noqa: BLE001
-            _handle_boundary_failure(warnings, url, "SNAPSHOT", exc, rollback_context)
-        else:
-            from ..kb.operation_compatibility import SideEffectPlane
+        from ..kb.operation_compatibility import SideEffectPlane
 
-            succeeded.add(SideEffectPlane.FILE)
+        page_operation.record_side_effect(
+            name="cleanup_backup_file",
+            plane=SideEffectPlane.SNAPSHOT,
+            payload={
+                "collection": collection,
+                "url": url,
+                "file_id": cast(Optional[str], file_info.get("file_id")),
+            },
+            idempotency_key=f"snapshot:{collection}:{cast(Optional[str], file_info.get('file_id')) or url}",
+            compensation=snapshot_compensation,
+        )
+        errors = page_operation.execute_compensations(
+            planes={SideEffectPlane.SNAPSHOT}
+        )
+        if not errors:
+            succeeded.add(SideEffectPlane.SNAPSHOT)
+        else:
+            _handle_boundary_failure(
+                warnings,
+                url,
+                "SNAPSHOT",
+                errors[0],
+                rollback_context,
+            )
 
     # Mark succeeded planes on the operation
     if succeeded and page_operation is not None:

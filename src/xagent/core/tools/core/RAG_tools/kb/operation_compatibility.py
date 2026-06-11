@@ -38,6 +38,7 @@ class SideEffectPlane(StrEnum):
     EMBEDDING = "embedding"
     STATUS = "status"
     FILE = "file"
+    SNAPSHOT = "snapshot"
     WEB_PAGE = "web_page"
 
 

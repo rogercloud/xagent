@@ -1020,3 +1020,51 @@ async def test_web_ingestion_file_compensation_failure_marks_side_effects_remain
     assert child.compensation_steps[0].payload["rollback_kind"] == (
         "existing_web_file_refresh"
     )
+
+
+def test_file_compensation_restore_handles_recreated_file_without_existing(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from unittest.mock import MagicMock
+
+    from xagent.web.api.kb import _create_file_compensation_restore
+
+    existing_file = tmp_path / "test-file"
+    existing_file.write_text("content")
+    restore_calls: list[dict] = []
+
+    def _fake_restore(*, file_path, backup_path, had_existing_file):
+        restore_calls.append(
+            {
+                "file_path": file_path,
+                "backup_path": backup_path,
+                "had_existing_file": had_existing_file,
+            }
+        )
+
+    monkeypatch.setattr(
+        "xagent.web.api.kb._restore_ingest_file_backup", _fake_restore
+    )
+
+    def _fake_get_session_local():
+        session = MagicMock()
+        session.query().filter().first.return_value = None
+        return session
+
+    monkeypatch.setattr(
+        "xagent.web.api.kb.get_session_local", _fake_get_session_local
+    )
+
+    compensation = _create_file_compensation_restore(
+        file_record_id="recreate-no-file",
+        existing_path=existing_file,
+        backup_path=None,
+        record_snapshot={"storage_key": "", "mime_type": "text/markdown"},
+        had_existing_file=False,
+    )
+    compensation()
+
+    assert len(restore_calls) == 1
+    assert restore_calls[0]["had_existing_file"] is False
+    assert restore_calls[0]["backup_path"] is None

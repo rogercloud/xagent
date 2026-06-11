@@ -195,13 +195,14 @@ def _create_file_compensation_restore(
     *,
     file_record_id: str,
     existing_path: Path,
-    backup_path: Path,
+    backup_path: Optional[Path],
     record_snapshot: dict[str, Any],
+    had_existing_file: bool = True,
 ) -> Callable[[], None]:
     """Create a FILE-boundary compensation callback for restoring a refreshed/recreated web file."""
 
     def _compensate() -> None:
-        if not backup_path.exists():
+        if had_existing_file and (backup_path is None or not backup_path.exists()):
             raise FileNotFoundError(
                 f"Missing web ingest rollback backup: {backup_path}"
             )
@@ -217,7 +218,7 @@ def _create_file_compensation_restore(
                 _restore_ingest_file_backup(
                     file_path=existing_path,
                     backup_path=backup_path,
-                    had_existing_file=True,
+                    had_existing_file=had_existing_file,
                 )
             else:
                 current_storage_key = str(
@@ -230,7 +231,7 @@ def _create_file_compensation_restore(
                 _restore_ingest_file_backup(
                     file_path=existing_path,
                     backup_path=backup_path,
-                    had_existing_file=True,
+                    had_existing_file=had_existing_file,
                 )
                 _restore_uploaded_file_record_snapshot(
                     refreshed_record, record_snapshot
@@ -260,7 +261,7 @@ def _create_document_compensation(
     is_admin: bool,
     file_record_id: str,
     rag_document_snapshot: Optional["_RagDocumentSnapshot"] = None,
-) -> Callable[[], Callable[[], None]]:
+) -> Callable[[Optional[IngestionResult]], Callable[[], None]]:
     """Create a DOCUMENT-boundary compensation factory.
 
     Returns a factory that accepts an optional IngestionResult and produces
@@ -292,7 +293,7 @@ def _create_status_compensation(
     user_id: int,
     is_admin: bool,
     ingestion_runs_snapshot: Optional[Any] = None,
-) -> Callable[[], Callable[[], None]]:
+) -> Callable[[Optional[IngestionResult]], Callable[[], None]]:
     """Create a STATUS-boundary compensation factory."""
 
     def _factory(
@@ -2810,10 +2811,9 @@ def _recreate_missing_existing_file(
     file_compensation = _create_file_compensation_restore(
         file_record_id=file_record_id,
         existing_path=existing_path,
-        backup_path=backup_for_failure
-        if backup_for_failure is not None
-        else existing_path,
+        backup_path=backup_for_failure,
         record_snapshot=record_snapshot,
+        had_existing_file=had_existing_file,
     )
     document_compensation = _create_document_compensation(
         collection_name=collection_name,
