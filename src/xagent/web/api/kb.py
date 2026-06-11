@@ -292,7 +292,7 @@ def _create_status_compensation(
     collection_name: str,
     user_id: int,
     is_admin: bool,
-    ingestion_runs_snapshot: Optional[Any] = None,
+    ingestion_runs_snapshot: Optional["_IngestionRunsSnapshot"] = None,
 ) -> Callable[[Optional[IngestionResult]], Callable[[], None]]:
     """Create a STATUS-boundary compensation factory."""
 
@@ -2754,8 +2754,10 @@ def _refresh_existing_file_if_changed(
         ingestion_result: Optional[IngestionResult] = None,
     ) -> None:
         rollback_error: Optional[Exception] = None
+        file_succeeded = False
         try:
             file_compensation()
+            file_succeeded = True
         except Exception as exc:  # noqa: BLE001
             rollback_error = exc
             logger.warning(
@@ -2791,18 +2793,19 @@ def _refresh_existing_file_if_changed(
                 exc,
                 exc_info=True,
             )
+        if file_succeeded:
+            try:
+                snapshot_compensation()
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "Failed to cleanup backup file during web file refresh "
+                    "rollback: file_id=%s, error=%s",
+                    file_record_id,
+                    exc,
+                    exc_info=True,
+                )
         if rollback_error is not None:
             raise rollback_error
-        try:
-            snapshot_compensation()
-        except Exception as exc:  # noqa: BLE001
-            logger.warning(
-                "Failed to cleanup backup file during web file refresh "
-                "rollback: file_id=%s, error=%s",
-                file_record_id,
-                exc,
-                exc_info=True,
-            )
 
     def _commit_refresh() -> None:
         backup_path.unlink(missing_ok=True)
@@ -2987,8 +2990,10 @@ def _recreate_missing_existing_file(
         ingestion_result: Optional[IngestionResult] = None,
     ) -> None:
         rollback_error: Optional[Exception] = None
+        file_succeeded = False
         try:
             file_compensation()
+            file_succeeded = True
         except Exception as exc:  # noqa: BLE001
             rollback_error = exc
             logger.warning(
@@ -3024,18 +3029,19 @@ def _recreate_missing_existing_file(
                 exc,
                 exc_info=True,
             )
+        if file_succeeded:
+            try:
+                snapshot_compensation()
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "Failed to cleanup backup file during recreated web file "
+                    "rollback: file_id=%s, error=%s",
+                    file_record_id,
+                    exc,
+                    exc_info=True,
+                )
         if rollback_error is not None:
             raise rollback_error
-        try:
-            snapshot_compensation()
-        except Exception as exc:  # noqa: BLE001
-            logger.warning(
-                "Failed to cleanup backup file during recreated web file "
-                "rollback: file_id=%s, error=%s",
-                file_record_id,
-                exc,
-                exc_info=True,
-            )
 
     def _commit_recreate() -> None:
         if backup_for_failure is not None:

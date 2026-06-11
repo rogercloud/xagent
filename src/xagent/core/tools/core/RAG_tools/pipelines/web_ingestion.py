@@ -260,9 +260,7 @@ def _run_per_boundary_compensation(
     if document_compensation is not None:
         try:
             factory = document_compensation
-            callback = (
-                factory(ingestion_result) if ingestion_result is not None else factory()
-            )
+            callback = factory(ingestion_result)
             callback()
         except Exception as exc:  # noqa: BLE001
             _handle_boundary_failure(warnings, url, "DOCUMENT", exc, rollback_context)
@@ -288,9 +286,7 @@ def _run_per_boundary_compensation(
     if status_compensation is not None:
         try:
             factory = status_compensation
-            callback = (
-                factory(ingestion_result) if ingestion_result is not None else factory()
-            )
+            callback = factory(ingestion_result)
             callback()
         except Exception as exc:  # noqa: BLE001
             _handle_boundary_failure(warnings, url, "STATUS", exc, rollback_context)
