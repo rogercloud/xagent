@@ -1,0 +1,564 @@
+"""Issue #507 - Public API surface guard tests.
+
+Every retained KB/RAG public symbol is asserted importable from its declared
+path. Every retained function is asserted to keep its current sync/async shape.
+
+This test is the executable form of the C13 public-surface audit. If a symbol
+is removed, renamed, or changes sync/async shape, this test will fail before
+Phase 2 handle-replacement issues (#508-#514) can merge.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import importlib
+import warnings
+
+import pytest
+
+
+# Each entry: (module_dotted, symbol, kind)
+# kind: "sync"=sync function, "async"=async function, "class"=class, "value"=non-callable
+PUBLIC_SURFACE: list[tuple[str, str, str]] = [
+    ("xagent.core.tools.core.RAG_tools.chunk.__init__", "chunk_document", "sync"),
+    ("xagent.core.tools.core.RAG_tools.chunk.__init__", "chunk_fixed_size", "sync"),
+    ("xagent.core.tools.core.RAG_tools.chunk.__init__", "chunk_markdown", "sync"),
+    ("xagent.core.tools.core.RAG_tools.chunk.__init__", "chunk_recursive", "sync"),
+    (
+        "xagent.core.tools.core.RAG_tools.generate.__init__",
+        "format_generation_prompt",
+        "sync",
+    ),
+    (
+        "xagent.core.tools.core.RAG_tools.kb.__init__",
+        "CollectionConfigSnapshot",
+        "class",
+    ),
+    (
+        "xagent.core.tools.core.RAG_tools.kb.__init__",
+        "CollectionRollbackMaintenanceResult",
+        "class",
+    ),
+    ("xagent.core.tools.core.RAG_tools.kb.__init__", "CompensationStep", "class"),
+    ("xagent.core.tools.core.RAG_tools.kb.__init__", "KBAccessMode", "class"),
+    (
+        "xagent.core.tools.core.RAG_tools.kb.__init__",
+        "KBApiCompatibilityFacade",
+        "class",
+    ),
+    (
+        "xagent.core.tools.core.RAG_tools.kb.__init__",
+        "KBApiFailedIngestCleanupDecision",
+        "class",
+    ),
+    (
+        "xagent.core.tools.core.RAG_tools.kb.__init__",
+        "KBApiFailedIngestRollbackResult",
+        "class",
+    ),
+    ("xagent.core.tools.core.RAG_tools.kb.__init__", "KBApiOperationResult", "class"),
+    ("xagent.core.tools.core.RAG_tools.kb.__init__", "KBBackendCapabilities", "class"),
+    ("xagent.core.tools.core.RAG_tools.kb.__init__", "KBCollectionContext", "class"),
+    ("xagent.core.tools.core.RAG_tools.kb.__init__", "KBContextRequest", "class"),
+    ("xagent.core.tools.core.RAG_tools.kb.__init__", "KBCoordinator", "class"),
+    (
+        "xagent.core.tools.core.RAG_tools.kb.__init__",
+        "KBCoreManagementCompatibilityFacade",
+        "class",
+    ),
+    (
+        "xagent.core.tools.core.RAG_tools.kb.__init__",
+        "KBFileCompatibilityFacade",
+        "class",
+    ),
+    ("xagent.core.tools.core.RAG_tools.kb.__init__", "KBHandleProvider", "class"),
+    (
+        "xagent.core.tools.core.RAG_tools.kb.__init__",
+        "KBLegacyStepCompatibilityFacade",
+        "class",
+    ),
+    ("xagent.core.tools.core.RAG_tools.kb.__init__", "KBMainPointerSnapshot", "class"),
+    (
+        "xagent.core.tools.core.RAG_tools.kb.__init__",
+        "KBMaintenanceCompatibilityFacade",
+        "class",
+    ),
+    (
+        "xagent.core.tools.core.RAG_tools.kb.__init__",
+        "KBOperationCompatibilityFacade",
+        "class",
+    ),
+    ("xagent.core.tools.core.RAG_tools.kb.__init__", "KBOperationOutcome", "class"),
+    (
+        "xagent.core.tools.core.RAG_tools.kb.__init__",
+        "KBParseDisplayCompatibilityFacade",
+        "class",
+    ),
+    (
+        "xagent.core.tools.core.RAG_tools.kb.__init__",
+        "KBPipelineCompatibilityFacade",
+        "class",
+    ),
+    (
+        "xagent.core.tools.core.RAG_tools.kb.__init__",
+        "KBRetrievalHelperCompatibilityFacade",
+        "class",
+    ),
+    ("xagent.core.tools.core.RAG_tools.kb.__init__", "KBStorageBackend", "class"),
+    (
+        "xagent.core.tools.core.RAG_tools.kb.__init__",
+        "KBStorageShimCompatibilityFacade",
+        "class",
+    ),
+    (
+        "xagent.core.tools.core.RAG_tools.kb.__init__",
+        "KBToolCompatibilityFacade",
+        "class",
+    ),
+    ("xagent.core.tools.core.RAG_tools.kb.__init__", "KBUserScope", "class"),
+    (
+        "xagent.core.tools.core.RAG_tools.kb.__init__",
+        "KBVectorStorageCleanupResult",
+        "class",
+    ),
+    (
+        "xagent.core.tools.core.RAG_tools.kb.__init__",
+        "KBVectorStorageCompatibilityFacade",
+        "class",
+    ),
+    (
+        "xagent.core.tools.core.RAG_tools.kb.__init__",
+        "KBVersionCandidateCleanupSnapshot",
+        "class",
+    ),
+    (
+        "xagent.core.tools.core.RAG_tools.kb.__init__",
+        "KBVersionCandidateRollbackResult",
+        "class",
+    ),
+    (
+        "xagent.core.tools.core.RAG_tools.kb.__init__",
+        "KBVersionCompatibilityFacade",
+        "class",
+    ),
+    (
+        "xagent.core.tools.core.RAG_tools.kb.__init__",
+        "LanceDBCollectionHandle",
+        "class",
+    ),
+    ("xagent.core.tools.core.RAG_tools.kb.__init__", "PersistencePolicy", "class"),
+    ("xagent.core.tools.core.RAG_tools.kb.__init__", "RollbackStatus", "class"),
+    ("xagent.core.tools.core.RAG_tools.kb.__init__", "SideEffectPlane", "class"),
+    ("xagent.core.tools.core.RAG_tools.kb.__init__", "get_kb_coordinator", "sync"),
+    (
+        "xagent.core.tools.core.RAG_tools.kb.__init__",
+        "reset_kb_coordinator_for_tests",
+        "sync",
+    ),
+    (
+        "xagent.core.tools.core.RAG_tools.management.__init__",
+        "DocumentProcessingStatus",
+        "class",
+    ),
+    (
+        "xagent.core.tools.core.RAG_tools.management.__init__",
+        "cancel_collection",
+        "sync",
+    ),
+    ("xagent.core.tools.core.RAG_tools.management.__init__", "cancel_document", "sync"),
+    (
+        "xagent.core.tools.core.RAG_tools.management.__init__",
+        "clear_ingestion_status",
+        "sync",
+    ),
+    (
+        "xagent.core.tools.core.RAG_tools.management.__init__",
+        "clear_ingestion_status_async",
+        "async",
+    ),
+    (
+        "xagent.core.tools.core.RAG_tools.management.__init__",
+        "delete_collection",
+        "sync",
+    ),
+    ("xagent.core.tools.core.RAG_tools.management.__init__", "delete_document", "sync"),
+    (
+        "xagent.core.tools.core.RAG_tools.management.__init__",
+        "get_document_stats",
+        "sync",
+    ),
+    (
+        "xagent.core.tools.core.RAG_tools.management.__init__",
+        "get_document_status",
+        "sync",
+    ),
+    (
+        "xagent.core.tools.core.RAG_tools.management.__init__",
+        "list_collections",
+        "async",
+    ),
+    ("xagent.core.tools.core.RAG_tools.management.__init__", "list_documents", "sync"),
+    (
+        "xagent.core.tools.core.RAG_tools.management.__init__",
+        "load_ingestion_status",
+        "sync",
+    ),
+    (
+        "xagent.core.tools.core.RAG_tools.management.__init__",
+        "load_ingestion_status_async",
+        "async",
+    ),
+    ("xagent.core.tools.core.RAG_tools.management.__init__", "retry_document", "sync"),
+    (
+        "xagent.core.tools.core.RAG_tools.management.__init__",
+        "write_ingestion_status",
+        "sync",
+    ),
+    (
+        "xagent.core.tools.core.RAG_tools.management.__init__",
+        "write_ingestion_status_async",
+        "async",
+    ),
+    ("xagent.core.tools.core.RAG_tools.parse.__init__", "parse_document", "sync"),
+    ("xagent.core.tools.core.RAG_tools.pipelines.__init__", "process_document", "sync"),
+    (
+        "xagent.core.tools.core.RAG_tools.pipelines.__init__",
+        "run_web_ingestion",
+        "async",
+    ),
+    ("xagent.core.tools.core.RAG_tools.pipelines.__init__", "search_documents", "sync"),
+    (
+        "xagent.core.tools.core.RAG_tools.progress.__init__",
+        "DeepDocProgressAdapter",
+        "class",
+    ),
+    (
+        "xagent.core.tools.core.RAG_tools.progress.__init__",
+        "FallbackProgressAdapter",
+        "class",
+    ),
+    (
+        "xagent.core.tools.core.RAG_tools.progress.__init__",
+        "ProgressBroadcaster",
+        "class",
+    ),
+    ("xagent.core.tools.core.RAG_tools.progress.__init__", "ProgressCallback", "class"),
+    ("xagent.core.tools.core.RAG_tools.progress.__init__", "ProgressManager", "class"),
+    (
+        "xagent.core.tools.core.RAG_tools.progress.__init__",
+        "ProgressPersistence",
+        "class",
+    ),
+    ("xagent.core.tools.core.RAG_tools.progress.__init__", "ProgressTracker", "class"),
+    ("xagent.core.tools.core.RAG_tools.progress.__init__", "StepTracker", "class"),
+    ("xagent.core.tools.core.RAG_tools.progress.__init__", "TaskProgress", "class"),
+    (
+        "xagent.core.tools.core.RAG_tools.progress.__init__",
+        "create_progress_adapter",
+        "sync",
+    ),
+    (
+        "xagent.core.tools.core.RAG_tools.progress.__init__",
+        "get_progress_manager",
+        "sync",
+    ),
+    (
+        "xagent.core.tools.core.RAG_tools.progress.__init__",
+        "progress_broadcaster",
+        "value",
+    ),
+    (
+        "xagent.core.tools.core.RAG_tools.prompt_manager.__init__",
+        "create_prompt_template",
+        "sync",
+    ),
+    (
+        "xagent.core.tools.core.RAG_tools.prompt_manager.__init__",
+        "delete_prompt_template",
+        "sync",
+    ),
+    (
+        "xagent.core.tools.core.RAG_tools.prompt_manager.__init__",
+        "get_latest_prompt_template",
+        "sync",
+    ),
+    (
+        "xagent.core.tools.core.RAG_tools.prompt_manager.__init__",
+        "list_prompt_templates",
+        "sync",
+    ),
+    (
+        "xagent.core.tools.core.RAG_tools.prompt_manager.__init__",
+        "read_prompt_template",
+        "sync",
+    ),
+    (
+        "xagent.core.tools.core.RAG_tools.prompt_manager.__init__",
+        "update_prompt_template",
+        "sync",
+    ),
+    ("xagent.core.tools.core.RAG_tools.retrieval.__init__", "search_dense", "sync"),
+    ("xagent.core.tools.core.RAG_tools.retrieval.__init__", "search_hybrid", "sync"),
+    ("xagent.core.tools.core.RAG_tools.retrieval.__init__", "search_sparse", "sync"),
+    (
+        "xagent.core.tools.core.RAG_tools.storage.__init__",
+        "IngestionStatusStore",
+        "class",
+    ),
+    (
+        "xagent.core.tools.core.RAG_tools.storage.__init__",
+        "KBWriteCoordinator",
+        "class",
+    ),
+    ("xagent.core.tools.core.RAG_tools.storage.__init__", "MainPointerStore", "class"),
+    ("xagent.core.tools.core.RAG_tools.storage.__init__", "MetadataStore", "class"),
+    (
+        "xagent.core.tools.core.RAG_tools.storage.__init__",
+        "PromptTemplateStore",
+        "class",
+    ),
+    ("xagent.core.tools.core.RAG_tools.storage.__init__", "StorageFactory", "class"),
+    (
+        "xagent.core.tools.core.RAG_tools.storage.__init__",
+        "VECTOR_BACKEND_ENV",
+        "value",
+    ),
+    (
+        "xagent.core.tools.core.RAG_tools.storage.__init__",
+        "VECTOR_BACKEND_ENV_LEGACY",
+        "value",
+    ),
+    ("xagent.core.tools.core.RAG_tools.storage.__init__", "VectorBackend", "class"),
+    ("xagent.core.tools.core.RAG_tools.storage.__init__", "VectorIndexStore", "class"),
+    (
+        "xagent.core.tools.core.RAG_tools.storage.__init__",
+        "get_configured_vector_backend",
+        "sync",
+    ),
+    (
+        "xagent.core.tools.core.RAG_tools.storage.__init__",
+        "get_ingestion_status_store",
+        "sync",
+    ),
+    (
+        "xagent.core.tools.core.RAG_tools.storage.__init__",
+        "get_kb_write_coordinator",
+        "sync",
+    ),
+    (
+        "xagent.core.tools.core.RAG_tools.storage.__init__",
+        "get_main_pointer_store",
+        "sync",
+    ),
+    ("xagent.core.tools.core.RAG_tools.storage.__init__", "get_metadata_store", "sync"),
+    (
+        "xagent.core.tools.core.RAG_tools.storage.__init__",
+        "get_prompt_template_store",
+        "sync",
+    ),
+    (
+        "xagent.core.tools.core.RAG_tools.storage.__init__",
+        "get_vector_index_store",
+        "sync",
+    ),
+    (
+        "xagent.core.tools.core.RAG_tools.storage.__init__",
+        "get_vector_store_raw_connection",
+        "sync",
+    ),
+    (
+        "xagent.core.tools.core.RAG_tools.storage.__init__",
+        "reset_kb_write_coordinator",
+        "sync",
+    ),
+    (
+        "xagent.core.tools.core.RAG_tools.storage.__init__",
+        "reset_rag_storage_for_tests",
+        "sync",
+    ),
+    (
+        "xagent.core.tools.core.RAG_tools.utils.__init__",
+        "build_lancedb_filter_expression",
+        "sync",
+    ),
+    ("xagent.core.tools.core.RAG_tools.utils.__init__", "check_file_type", "sync"),
+    ("xagent.core.tools.core.RAG_tools.utils.__init__", "compute_content_hash", "sync"),
+    ("xagent.core.tools.core.RAG_tools.utils.__init__", "compute_file_hash", "sync"),
+    ("xagent.core.tools.core.RAG_tools.utils.__init__", "deserialize_metadata", "sync"),
+    (
+        "xagent.core.tools.core.RAG_tools.utils.__init__",
+        "escape_lancedb_string",
+        "sync",
+    ),
+    (
+        "xagent.core.tools.core.RAG_tools.utils.__init__",
+        "generate_doc_id_from_filename",
+        "sync",
+    ),
+    (
+        "xagent.core.tools.core.RAG_tools.utils.__init__",
+        "normalize_raw_embedding_to_vectors",
+        "sync",
+    ),
+    (
+        "xagent.core.tools.core.RAG_tools.utils.__init__",
+        "normalize_single_embedding",
+        "sync",
+    ),
+    ("xagent.core.tools.core.RAG_tools.utils.__init__", "query_to_list", "sync"),
+    ("xagent.core.tools.core.RAG_tools.utils.__init__", "sanitize_for_doc_id", "sync"),
+    ("xagent.core.tools.core.RAG_tools.utils.__init__", "serialize_metadata", "sync"),
+    (
+        "xagent.core.tools.core.RAG_tools.utils.__init__",
+        "validate_and_convert_user_id",
+        "sync",
+    ),
+    ("xagent.core.tools.core.RAG_tools.utils.__init__", "validate_file_path", "sync"),
+    ("xagent.core.tools.core.RAG_tools.utils.__init__", "validate_hash_format", "sync"),
+    (
+        "xagent.core.tools.core.RAG_tools.vector_storage.__init__",
+        "read_chunks_for_embedding",
+        "sync",
+    ),
+    (
+        "xagent.core.tools.core.RAG_tools.vector_storage.__init__",
+        "validate_query_vector",
+        "sync",
+    ),
+    (
+        "xagent.core.tools.core.RAG_tools.vector_storage.__init__",
+        "write_vectors_to_db",
+        "sync",
+    ),
+    (
+        "xagent.core.tools.core.RAG_tools.version_management.__init__",
+        "cascade_delete",
+        "sync",
+    ),
+    (
+        "xagent.core.tools.core.RAG_tools.version_management.__init__",
+        "cleanup_cascade",
+        "sync",
+    ),
+    (
+        "xagent.core.tools.core.RAG_tools.version_management.__init__",
+        "cleanup_chunk_cascade",
+        "sync",
+    ),
+    (
+        "xagent.core.tools.core.RAG_tools.version_management.__init__",
+        "cleanup_document_cascade",
+        "sync",
+    ),
+    (
+        "xagent.core.tools.core.RAG_tools.version_management.__init__",
+        "cleanup_embed_cascade",
+        "sync",
+    ),
+    (
+        "xagent.core.tools.core.RAG_tools.version_management.__init__",
+        "cleanup_parse_cascade",
+        "sync",
+    ),
+    (
+        "xagent.core.tools.core.RAG_tools.version_management.__init__",
+        "delete_main_pointer",
+        "sync",
+    ),
+    (
+        "xagent.core.tools.core.RAG_tools.version_management.__init__",
+        "get_main_pointer",
+        "sync",
+    ),
+    (
+        "xagent.core.tools.core.RAG_tools.version_management.__init__",
+        "list_candidates",
+        "sync",
+    ),
+    (
+        "xagent.core.tools.core.RAG_tools.version_management.__init__",
+        "list_main_pointers",
+        "sync",
+    ),
+    (
+        "xagent.core.tools.core.RAG_tools.version_management.__init__",
+        "promote_version_main",
+        "sync",
+    ),
+    (
+        "xagent.core.tools.core.RAG_tools.version_management.__init__",
+        "set_main_pointer",
+        "sync",
+    ),
+    (
+        "xagent.core.tools.core.RAG_tools.web_crawler.__init__",
+        "ContentCleaner",
+        "class",
+    ),
+    ("xagent.core.tools.core.RAG_tools.web_crawler.__init__", "LinkExtractor", "class"),
+    ("xagent.core.tools.core.RAG_tools.web_crawler.__init__", "URLFilter", "class"),
+    ("xagent.core.tools.core.RAG_tools.web_crawler.__init__", "WebCrawler", "class"),
+    ("xagent.core.tools.core.RAG_tools.web_crawler.__init__", "crawl_website", "async"),
+]
+
+
+@pytest.mark.parametrize(
+    "module_path,symbol,kind", PUBLIC_SURFACE, ids=[s for _, s, _ in PUBLIC_SURFACE]
+)
+def test_public_symbol_importable(module_path, symbol, kind):
+    """Every public symbol must remain importable from its declared module path."""
+    mod = importlib.import_module(module_path)
+    assert hasattr(mod, symbol), f"{symbol} not found in {module_path}"
+
+
+@pytest.mark.parametrize(
+    "module_path,symbol,kind",
+    [(m, s, k) for m, s, k in PUBLIC_SURFACE if k in ("sync", "async")],
+    ids=[s for m, s, k in PUBLIC_SURFACE if k in ("sync", "async")],
+)
+def test_public_function_keeps_sync_async_shape(module_path, symbol, kind):
+    """Function retained surfaces must keep current sync/async shape.
+
+    Per #507: "Callable retained surfaces keep current sync/async shape."
+    """
+    mod = importlib.import_module(module_path)
+    obj = getattr(mod, symbol)
+    runtime_async = asyncio.iscoroutinefunction(obj)
+    if kind == "async":
+        assert runtime_async, f"{symbol} must remain async (currently sync)"
+    else:
+        assert not runtime_async, f"{symbol} must remain sync (currently async)"
+
+
+def test_public_surface_completeness():
+    """Guard against accidental surface drift.
+
+    The audit classified exactly 139 public symbols. If __all__ grows or shrinks,
+    this test forces an audit update so the classification stays in sync.
+    """
+    assert len(PUBLIC_SURFACE) == 139, (
+        f"Public surface changed: expected 139 symbols, got {len(PUBLIC_SURFACE)}. "
+        "Update PUBLIC_SURFACE and the audit document."
+    )
+
+
+# Deprecation candidates (per #507: documented only, no runtime change)
+DEPRECATION_CANDIDATES = [
+    ("xagent.core.tools.core.RAG_tools.management.__init__", "cancel_collection"),
+    ("xagent.core.tools.core.RAG_tools.management.__init__", "cancel_document"),
+    ("xagent.core.tools.core.RAG_tools.management.__init__", "retry_document"),
+]
+
+
+def test_deprecation_candidates_import_without_warning():
+    """Per #507: deprecation candidates are documented only.
+
+    No @deprecated runtime decorator, no __all__ removal. They must import cleanly
+    without emitting DeprecationWarning as of this issue.
+    """
+    for module_path, symbol in DEPRECATION_CANDIDATES:
+        mod = importlib.import_module(module_path)
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            obj = getattr(mod, symbol)
+            assert obj is not None, f"{symbol} missing from {module_path}"
