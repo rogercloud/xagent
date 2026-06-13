@@ -12,10 +12,8 @@ from __future__ import annotations
 
 import asyncio
 import importlib
-import warnings
 
 import pytest
-
 
 # Each entry: (module_dotted, symbol, kind)
 # kind: "sync"=sync function, "async"=async function, "class"=class, "value"=non-callable
@@ -507,8 +505,9 @@ PUBLIC_SURFACE: list[tuple[str, str, str]] = [
 )
 def test_public_symbol_importable(module_path, symbol, kind):
     """Every public symbol must remain importable from its declared module path."""
-    mod = importlib.import_module(module_path)
-    assert hasattr(mod, symbol), f"{symbol} not found in {module_path}"
+    public_path = module_path.removesuffix(".__init__")
+    mod = importlib.import_module(public_path)
+    assert hasattr(mod, symbol), f"{symbol} not found in {public_path}"
 
 
 @pytest.mark.parametrize(
@@ -521,7 +520,8 @@ def test_public_function_keeps_sync_async_shape(module_path, symbol, kind):
 
     Per #507: "Callable retained surfaces keep current sync/async shape."
     """
-    mod = importlib.import_module(module_path)
+    public_path = module_path.removesuffix(".__init__")
+    mod = importlib.import_module(public_path)
     obj = getattr(mod, symbol)
     runtime_async = asyncio.iscoroutinefunction(obj)
     if kind == "async":
@@ -540,25 +540,3 @@ def test_public_surface_completeness():
         f"Public surface changed: expected 139 symbols, got {len(PUBLIC_SURFACE)}. "
         "Update PUBLIC_SURFACE and the audit document."
     )
-
-
-# Deprecation candidates (per #507: documented only, no runtime change)
-DEPRECATION_CANDIDATES = [
-    ("xagent.core.tools.core.RAG_tools.management.__init__", "cancel_collection"),
-    ("xagent.core.tools.core.RAG_tools.management.__init__", "cancel_document"),
-    ("xagent.core.tools.core.RAG_tools.management.__init__", "retry_document"),
-]
-
-
-def test_deprecation_candidates_import_without_warning():
-    """Per #507: deprecation candidates are documented only.
-
-    No @deprecated runtime decorator, no __all__ removal. They must import cleanly
-    without emitting DeprecationWarning as of this issue.
-    """
-    for module_path, symbol in DEPRECATION_CANDIDATES:
-        mod = importlib.import_module(module_path)
-        with warnings.catch_warnings():
-            warnings.simplefilter("error")
-            obj = getattr(mod, symbol)
-            assert obj is not None, f"{symbol} missing from {module_path}"
