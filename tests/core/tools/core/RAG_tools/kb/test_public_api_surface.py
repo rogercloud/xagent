@@ -533,10 +533,28 @@ def test_public_function_keeps_sync_async_shape(module_path, symbol, kind):
 def test_public_surface_completeness():
     """Guard against accidental surface drift.
 
-    The audit classified exactly 139 public symbols. If __all__ grows or shrinks,
-    this test forces an audit update so the classification stays in sync.
+    Dynamically reads every audited module's __all__ and compares against the
+    hardcoded PUBLIC_SURFACE list. Catches both additions and removals, including
+    the case where one symbol is added and another removed (net length unchanged).
     """
-    assert len(PUBLIC_SURFACE) == 139, (
-        f"Public surface changed: expected 139 symbols, got {len(PUBLIC_SURFACE)}. "
-        "Update PUBLIC_SURFACE and the audit document."
+    expected = {(m.removesuffix(".__init__"), s) for m, s, _ in PUBLIC_SURFACE}
+    actual: set[tuple[str, str]] = set()
+    for module_path, _symbol, _kind in PUBLIC_SURFACE:
+        public_path = module_path.removesuffix(".__init__")
+        mod = importlib.import_module(public_path)
+        exported = getattr(mod, "__all__", None)
+        if exported is None:
+            continue
+        for symbol in exported:
+            actual.add((public_path, symbol))
+
+    un_audited = actual - expected
+    missing = expected - actual
+    assert not un_audited, (
+        f"Public symbols found in __all__ but not in audit: {sorted(un_audited)}. "
+        "Add them to PUBLIC_SURFACE and classify in the audit document."
+    )
+    assert not missing, (
+        f"Audited symbols no longer exported in __all__: {sorted(missing)}. "
+        "Remove them from PUBLIC_SURFACE and update the audit document."
     )
