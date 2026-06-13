@@ -12,8 +12,11 @@ from __future__ import annotations
 
 import asyncio
 import importlib
+from pathlib import Path
 
 import pytest
+
+import xagent.core.tools.core.RAG_tools as rag_tools_pkg
 
 # Each entry: (module_dotted, symbol, kind)
 # kind: "sync"=sync function, "async"=async function, "class"=class, "value"=non-callable
@@ -25,6 +28,56 @@ PUBLIC_SURFACE: list[tuple[str, str, str]] = [
     (
         "xagent.core.tools.core.RAG_tools.generate.__init__",
         "format_generation_prompt",
+        "sync",
+    ),
+    (
+        "xagent.core.tools.core.RAG_tools.LanceDB.schema_manager",
+        "check_table_needs_migration",
+        "sync",
+    ),
+    (
+        "xagent.core.tools.core.RAG_tools.LanceDB.schema_manager",
+        "ensure_chunks_table",
+        "sync",
+    ),
+    (
+        "xagent.core.tools.core.RAG_tools.LanceDB.schema_manager",
+        "ensure_collection_config_table",
+        "sync",
+    ),
+    (
+        "xagent.core.tools.core.RAG_tools.LanceDB.schema_manager",
+        "ensure_collection_metadata_table",
+        "sync",
+    ),
+    (
+        "xagent.core.tools.core.RAG_tools.LanceDB.schema_manager",
+        "ensure_documents_table",
+        "sync",
+    ),
+    (
+        "xagent.core.tools.core.RAG_tools.LanceDB.schema_manager",
+        "ensure_embeddings_table",
+        "sync",
+    ),
+    (
+        "xagent.core.tools.core.RAG_tools.LanceDB.schema_manager",
+        "ensure_ingestion_runs_table",
+        "sync",
+    ),
+    (
+        "xagent.core.tools.core.RAG_tools.LanceDB.schema_manager",
+        "ensure_main_pointers_table",
+        "sync",
+    ),
+    (
+        "xagent.core.tools.core.RAG_tools.LanceDB.schema_manager",
+        "ensure_parses_table",
+        "sync",
+    ),
+    (
+        "xagent.core.tools.core.RAG_tools.LanceDB.schema_manager",
+        "ensure_prompt_templates_table",
         "sync",
     ),
     (
@@ -500,12 +553,52 @@ PUBLIC_SURFACE: list[tuple[str, str, str]] = [
 ]
 
 
+EXCLUDED_PUBLIC_SURFACE: dict[tuple[str, str], str] = {
+    (
+        "xagent.core.tools.core.RAG_tools.LanceDB.model_tag_utils",
+        "embeddings_table_name",
+    ): "module-local table naming helper; no product-code imports outside RAG_tools",
+    (
+        "xagent.core.tools.core.RAG_tools.LanceDB.model_tag_utils",
+        "to_model_tag",
+    ): "module-local table naming helper; no product-code imports outside RAG_tools",
+}
+
+
+def _public_path(module_path: str) -> str:
+    return module_path.removesuffix(".__init__")
+
+
+def _all_declared_rag_exports() -> set[tuple[str, str]]:
+    package_root = Path(rag_tools_pkg.__file__).parent
+    package_name = rag_tools_pkg.__name__
+    actual: set[tuple[str, str]] = set()
+    for py_file in package_root.rglob("*.py"):
+        if "__all__" not in py_file.read_text(encoding="utf-8"):
+            continue
+        relative_module = py_file.relative_to(package_root).with_suffix("")
+        parts = relative_module.parts
+        if parts == ("__init__",):
+            module_name = package_name
+        elif parts[-1] == "__init__":
+            module_name = ".".join((package_name, *parts[:-1]))
+        else:
+            module_name = ".".join((package_name, *parts))
+        mod = importlib.import_module(module_name)
+        exported = getattr(mod, "__all__", None)
+        if exported is None:
+            continue
+        for symbol in exported:
+            actual.add((module_name, symbol))
+    return actual
+
+
 @pytest.mark.parametrize(
     "module_path,symbol,kind", PUBLIC_SURFACE, ids=[s for _, s, _ in PUBLIC_SURFACE]
 )
 def test_public_symbol_importable(module_path, symbol, kind):
     """Every public symbol must remain importable from its declared module path."""
-    public_path = module_path.removesuffix(".__init__")
+    public_path = _public_path(module_path)
     mod = importlib.import_module(public_path)
     assert hasattr(mod, symbol), f"{symbol} not found in {public_path}"
 
@@ -520,7 +613,7 @@ def test_public_function_keeps_sync_async_shape(module_path, symbol, kind):
 
     Per #507: "Callable retained surfaces keep current sync/async shape."
     """
-    public_path = module_path.removesuffix(".__init__")
+    public_path = _public_path(module_path)
     mod = importlib.import_module(public_path)
     obj = getattr(mod, symbol)
     runtime_async = asyncio.iscoroutinefunction(obj)
@@ -533,23 +626,26 @@ def test_public_function_keeps_sync_async_shape(module_path, symbol, kind):
 def test_public_surface_completeness():
     """Guard against accidental surface drift.
 
-    Dynamically reads every audited module's __all__ and compares against the
-    hardcoded PUBLIC_SURFACE list. Catches both additions and removals, including
-    the case where one symbol is added and another removed (net length unchanged).
+    Dynamically reads every RAG_tools module's __all__ and compares against the
+    hardcoded PUBLIC_SURFACE list plus explicitly documented exclusions. Catches
+    both additions and removals, including the case where one symbol is added and
+    another removed (net length unchanged).
     """
-    expected = {(m.removesuffix(".__init__"), s) for m, s, _ in PUBLIC_SURFACE}
-    actual: set[tuple[str, str]] = set()
-    for module_path, _symbol, _kind in PUBLIC_SURFACE:
-        public_path = module_path.removesuffix(".__init__")
-        mod = importlib.import_module(public_path)
-        exported = getattr(mod, "__all__", None)
-        if exported is None:
-            continue
-        for symbol in exported:
-            actual.add((public_path, symbol))
+    expected = {(_public_path(m), s) for m, s, _ in PUBLIC_SURFACE}
+    excluded = set(EXCLUDED_PUBLIC_SURFACE)
+    actual = _all_declared_rag_exports()
 
-    un_audited = actual - expected
+    overlap = expected & excluded
+    stale_exclusions = excluded - actual
+    un_audited = actual - expected - excluded
     missing = expected - actual
+    assert not overlap, (
+        f"Symbols cannot be both audited and excluded: {sorted(overlap)}."
+    )
+    assert not stale_exclusions, (
+        f"Excluded symbols are no longer exported in __all__: "
+        f"{sorted(stale_exclusions)}. Remove them from EXCLUDED_PUBLIC_SURFACE."
+    )
     assert not un_audited, (
         f"Public symbols found in __all__ but not in audit: {sorted(un_audited)}. "
         "Add them to PUBLIC_SURFACE and classify in the audit document."
