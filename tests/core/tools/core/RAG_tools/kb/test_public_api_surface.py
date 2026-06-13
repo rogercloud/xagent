@@ -10,8 +10,8 @@ Phase 2 handle-replacement issues (#508-#514) can merge.
 
 from __future__ import annotations
 
-import asyncio
 import importlib
+import inspect
 from pathlib import Path
 
 import pytest
@@ -616,7 +616,7 @@ def test_public_function_keeps_sync_async_shape(module_path, symbol, kind):
     public_path = _public_path(module_path)
     mod = importlib.import_module(public_path)
     obj = getattr(mod, symbol)
-    runtime_async = asyncio.iscoroutinefunction(obj)
+    runtime_async = inspect.iscoroutinefunction(obj)
     if kind == "async":
         assert runtime_async, f"{symbol} must remain async (currently sync)"
     else:
