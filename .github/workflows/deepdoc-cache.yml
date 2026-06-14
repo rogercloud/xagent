@@ -1,0 +1,76 @@
+name: Warm Deepdoc Cache
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '17 3 */3 * *'
+
+permissions:
+  contents: read
+
+env:
+  DEEPDOC_CACHE_PATH: .cache/deepdoc
+  DEEPDOC_MODEL_HOME: ${{ github.workspace }}/.cache/deepdoc
+  DEEPDOC_VISION_MODEL_DIR: ${{ github.workspace }}/.cache/deepdoc/modelscope/Xorbits__deepdoc/master
+  DEEPDOC_XGB_MODEL_DIR: ${{ github.workspace }}/.cache/deepdoc/modelscope/Xorbits__deepdoc/master
+  DEEPDOC_NLTK_DATA_DIR: ${{ github.workspace }}/.cache/deepdoc/nltk_data
+  DEEPDOC_TIKTOKEN_CACHE_DIR: ${{ github.workspace }}/.cache/deepdoc/tiktoken_cache
+
+jobs:
+  warm-deepdoc-cache:
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Restore Deepdoc cache
+        id: deepdoc-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ env.DEEPDOC_CACHE_PATH }}
+          key: deepdoc-${{ runner.os }}-py312-modelscope-deepdoc-lib-0.2.0-v1
+          restore-keys: |
+            deepdoc-${{ runner.os }}-py312-modelscope-deepdoc-lib-0.2.0-
+            deepdoc-${{ runner.os }}-py312-modelscope-
+
+      - name: Ensure uv is available
+        if: steps.deepdoc-cache.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          set -e
+          if ! command -v uv >/dev/null 2>&1; then
+            echo "uv not found, installing..."
+            python3 -m pip install --user uv
+            echo "$HOME/.local/bin" >> $GITHUB_PATH
+          fi
+          python3 -m uv --version || uv --version
+
+      - name: Create virtual environment
+        if: steps.deepdoc-cache.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          set -e
+          python3 -m uv venv --python 3.12
+
+      - name: Install dependencies
+        if: steps.deepdoc-cache.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          set -e
+          python3 -m uv sync --all-extras
+
+      - name: Download Deepdoc models
+        if: steps.deepdoc-cache.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          set -e
+          python3 -m uv run deepdoc-download-models
+
+      - name: Save Deepdoc cache
+        if: steps.deepdoc-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ env.DEEPDOC_CACHE_PATH }}
+          key: deepdoc-${{ runner.os }}-py312-modelscope-deepdoc-lib-0.2.0-v1

@@ -8,11 +8,89 @@ on:
   push:
     branches: [main]
 
+env:
+  DEEPDOC_CACHE_PATH: .cache/deepdoc
+  DEEPDOC_MODEL_HOME: ${{ github.workspace }}/.cache/deepdoc
+  DEEPDOC_VISION_MODEL_DIR: ${{ github.workspace }}/.cache/deepdoc/modelscope/Xorbits__deepdoc/master
+  DEEPDOC_XGB_MODEL_DIR: ${{ github.workspace }}/.cache/deepdoc/modelscope/Xorbits__deepdoc/master
+  DEEPDOC_NLTK_DATA_DIR: ${{ github.workspace }}/.cache/deepdoc/nltk_data
+  DEEPDOC_TIKTOKEN_CACHE_DIR: ${{ github.workspace }}/.cache/deepdoc/tiktoken_cache
+
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 jobs:
+  prepare-deepdoc-cache:
+    name: Prepare Deepdoc Cache
+    runs-on: ubuntu-latest
+    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
+    outputs:
+      cache-hit: ${{ steps.deepdoc-cache.outputs.cache-hit }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Check Deepdoc cache
+        id: deepdoc-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ env.DEEPDOC_CACHE_PATH }}
+          key: deepdoc-${{ runner.os }}-py312-modelscope-deepdoc-lib-0.2.0-v1
+          lookup-only: true
+
+      - name: Ensure uv is available
+        if: steps.deepdoc-cache.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          set -e
+          if ! command -v uv >/dev/null 2>&1; then
+            echo "uv not found, installing..."
+            python3 -m pip install --user uv
+            echo "$HOME/.local/bin" >> $GITHUB_PATH
+          fi
+          python3 -m uv --version || uv --version
+
+      - name: Create virtual environment
+        if: steps.deepdoc-cache.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          set -e
+          python3 -m uv venv --python 3.12
+
+      - name: Install dependencies
+        if: steps.deepdoc-cache.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          set -e
+          python3 -m uv sync --all-extras
+
+      - name: Download Deepdoc models
+        if: steps.deepdoc-cache.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          set -e
+          python3 -m uv run deepdoc-download-models
+
+      - name: Save Deepdoc cache
+        if: steps.deepdoc-cache.outputs.cache-hit != 'true' && github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ env.DEEPDOC_CACHE_PATH }}
+          key: deepdoc-${{ runner.os }}-py312-modelscope-deepdoc-lib-0.2.0-v1
+
+      - name: Upload Deepdoc cache artifact
+        if: steps.deepdoc-cache.outputs.cache-hit != 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: deepdoc-cache
+          path: ${{ env.DEEPDOC_CACHE_PATH }}
+          if-no-files-found: error
+          include-hidden-files: true
+          compression-level: 0
+          retention-days: 1
+
   pre-commit:
     runs-on: ubuntu-latest
     if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
@@ -94,6 +172,68 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          - name: web
+            paths: tests/web
+          - name: integration
+            paths: tests/integration
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Ensure uv is available
+        shell: bash
+        run: |
+          set -e
+          if ! command -v uv >/dev/null 2>&1; then
+            echo "uv not found, installing..."
+            python3 -m pip install --user uv
+            echo "$HOME/.local/bin" >> $GITHUB_PATH
+          fi
+          # Use python -m uv to be safe
+          python3 -m uv --version || uv --version
+
+      - name: Create virtual environment (if not exists)
+        shell: bash
+        run: |
+          set -e
+          # 使用 python3 -m uv 确保 uv 命令可用
+          _UV="python3 -m uv"
+          $_UV --version
+          # Use Python 3.12 for onnxruntime-gpu compatibility
+          $_UV venv --python 3.12
+
+      - name: Install dependencies
+        shell: bash
+        run: |
+          set -e
+          python3 -m uv sync --all-extras
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install pptxgenjs globally
+        run: |
+          set -e
+          npm install -g pptxgenjs@4.0.1
+
+      - name: Run tests
+        shell: bash
+        run: |
+          set -e
+          python3 -m uv run python -m pytest ${{ matrix.paths }} -m "not slow and not postgresql" -n 4 --dist=loadscope -v
+
+  pytest-fast-deepdoc:
+    name: Pytest Fast Deepdoc (${{ matrix.name }})
+    runs-on: ubuntu-latest
+    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
+    needs: prepare-deepdoc-cache
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
           - name: core
             paths: >-
               tests/test_docker_workflow_versions.py
@@ -107,10 +247,6 @@ jobs:
               tests/skills
               tests/templates
               tests/utils
-          - name: web
-            paths: tests/web
-          - name: integration
-            paths: tests/integration
           - name: web-integration
             paths: tests/web_integration
 
@@ -146,11 +282,25 @@ jobs:
           set -e
           python3 -m uv sync --all-extras
 
-      - name: Download Deepdoc models
+      - name: Restore Deepdoc cache
+        if: needs.prepare-deepdoc-cache.outputs.cache-hit == 'true'
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ env.DEEPDOC_CACHE_PATH }}
+          key: deepdoc-${{ runner.os }}-py312-modelscope-deepdoc-lib-0.2.0-v1
+
+      - name: Download Deepdoc cache artifact
+        if: needs.prepare-deepdoc-cache.outputs.cache-hit != 'true'
+        uses: actions/download-artifact@v4
+        with:
+          name: deepdoc-cache
+          path: ${{ env.DEEPDOC_CACHE_PATH }}
+
+      - name: Verify Deepdoc cache
         shell: bash
         run: |
           set -e
-          python3 -m uv run deepdoc-download-models
+          python3 -m uv run deepdoc-download-models --provider local --offline
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
@@ -171,6 +321,7 @@ jobs:
   pytest-slow:
     runs-on: ubuntu-latest
     if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
+    needs: prepare-deepdoc-cache
 
     steps:
       - name: Checkout code
@@ -204,11 +355,25 @@ jobs:
           set -e
           python3 -m uv sync --all-extras
 
-      - name: Download Deepdoc models
+      - name: Restore Deepdoc cache
+        if: needs.prepare-deepdoc-cache.outputs.cache-hit == 'true'
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ env.DEEPDOC_CACHE_PATH }}
+          key: deepdoc-${{ runner.os }}-py312-modelscope-deepdoc-lib-0.2.0-v1
+
+      - name: Download Deepdoc cache artifact
+        if: needs.prepare-deepdoc-cache.outputs.cache-hit != 'true'
+        uses: actions/download-artifact@v4
+        with:
+          name: deepdoc-cache
+          path: ${{ env.DEEPDOC_CACHE_PATH }}
+
+      - name: Verify Deepdoc cache
         shell: bash
         run: |
           set -e
-          python3 -m uv run deepdoc-download-models
+          python3 -m uv run deepdoc-download-models --provider local --offline
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
@@ -308,8 +473,10 @@ jobs:
     runs-on: ubuntu-latest
     if: always() && (github.event_name != 'pull_request' || github.event.pull_request.draft == false)
     needs:
+      - prepare-deepdoc-cache
       - pre-commit
       - pytest-fast
+      - pytest-fast-deepdoc
       - pytest-slow
       - e2e
       - frontend-build
@@ -330,8 +497,10 @@ jobs:
             fi
           }
 
+          check_job "prepare-deepdoc-cache" "${{ needs['prepare-deepdoc-cache'].result }}"
           check_job "pre-commit" "${{ needs['pre-commit'].result }}"
           check_job "pytest-fast" "${{ needs['pytest-fast'].result }}"
+          check_job "pytest-fast-deepdoc" "${{ needs['pytest-fast-deepdoc'].result }}"
           check_job "pytest-slow" "${{ needs['pytest-slow'].result }}"
           check_job "e2e" "${{ needs.e2e.result }}"
           check_job "frontend-build" "${{ needs['frontend-build'].result }}"
