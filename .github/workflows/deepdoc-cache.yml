@@ -11,8 +11,6 @@ permissions:
 env:
   DEEPDOC_CACHE_PATH: .cache/deepdoc
   DEEPDOC_MODEL_HOME: ${{ github.workspace }}/.cache/deepdoc
-  DEEPDOC_VISION_MODEL_DIR: ${{ github.workspace }}/.cache/deepdoc/modelscope/Xorbits__deepdoc/master
-  DEEPDOC_XGB_MODEL_DIR: ${{ github.workspace }}/.cache/deepdoc/modelscope/Xorbits__deepdoc/master
   DEEPDOC_NLTK_DATA_DIR: ${{ github.workspace }}/.cache/deepdoc/nltk_data
   DEEPDOC_TIKTOKEN_CACHE_DIR: ${{ github.workspace }}/.cache/deepdoc/tiktoken_cache
 
@@ -67,6 +65,66 @@ jobs:
         run: |
           set -e
           python3 -m uv run deepdoc-download-models
+
+      - name: Verify Deepdoc cache
+        if: steps.deepdoc-cache.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          set -e
+          python3 -m uv run python - <<'PY'
+          import os
+          import sys
+          from pathlib import Path
+
+          from deepdoc.common import model_store
+          from deepdoc.common.tiktoken_cache import cl100k_base_cache_key
+          from deepdoc.depend.nltk_manager import ensure_nltk_data
+
+          cache_root = Path(os.environ["DEEPDOC_MODEL_HOME"]).resolve()
+          failures = []
+
+          for bundle_name, spec in model_store.BUNDLES.items():
+              candidates = {cache_root / spec.subdir}
+              for required_file in spec.required_files:
+                  candidates.update(hit.parent for hit in cache_root.rglob(required_file))
+
+              found = None
+              for candidate in sorted(candidates):
+                  exists, missing = model_store.validate_bundle_dir(bundle_name, candidate)
+                  if exists:
+                      found = candidate
+                      break
+
+              if found is None:
+                  failures.append(
+                      f"{bundle_name}: missing {', '.join(spec.required_files)} under {cache_root}"
+                  )
+              else:
+                  print(f"{bundle_name}\t{found}")
+
+          tiktoken_file = (
+              Path(os.environ["DEEPDOC_TIKTOKEN_CACHE_DIR"]).resolve()
+              / cl100k_base_cache_key()
+          )
+          if not tiktoken_file.exists():
+              failures.append(f"tiktoken: missing {tiktoken_file}")
+          else:
+              print(f"tiktoken\t{tiktoken_file}")
+
+          try:
+              ensure_nltk_data(
+                  data_dir=os.environ["DEEPDOC_NLTK_DATA_DIR"],
+                  offline=True,
+              )
+              print(f"nltk\t{Path(os.environ['DEEPDOC_NLTK_DATA_DIR']).resolve()}")
+          except Exception as exc:
+              failures.append(f"nltk: {exc}")
+
+          if failures:
+              for failure in failures:
+                  print(f"ERROR\t{failure}", file=sys.stderr)
+              raise SystemExit(1)
+          PY
 
       - name: Save Deepdoc cache
         if: steps.deepdoc-cache.outputs.cache-hit != 'true'
