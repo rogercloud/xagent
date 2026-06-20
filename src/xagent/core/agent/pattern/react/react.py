@@ -482,7 +482,9 @@ class ReActPattern(AgentPattern):
             )
         elif has_tools:
             available_tools = ", ".join(tool_names or []) or "(none)"
-            current_date = context.created_at.astimezone(timezone.utc).date().isoformat()
+            current_date = (
+                context.created_at.astimezone(timezone.utc).date().isoformat()
+            )
             instruction = (
                 "Use available tools when the user asks you to generate, compute, run, "
                 "execute, inspect, read, write, or otherwise produce a concrete result "
