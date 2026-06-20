@@ -344,7 +344,7 @@ class ExecutionContext:
     def _current_time_context(self) -> str:
         return (
             "Current date and time: "
-            f"{self.created_at.strftime('%Y-%m-%d %H:%M:%S UTC')}. "
+            f"{self.created_at.astimezone(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}. "
             "Use this as the reference for relative dates such as today, recent, "
             "latest, yesterday, and tomorrow."
         )
