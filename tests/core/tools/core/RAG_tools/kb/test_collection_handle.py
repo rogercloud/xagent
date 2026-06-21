@@ -9,6 +9,7 @@ Storage isolation/reset is provided by the autouse ``isolate_rag_storage``
 fixture in ``tests/conftest.py``.
 """
 
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
@@ -239,3 +240,38 @@ class TestHandleListDocuments:
         assert result.total_count == 0
         assert result.documents == []
         assert result.to_legacy_dicts() == []
+
+
+class TestHandleDeleteDocumentRecord:
+    def test_deletes_row_only_and_is_idempotent(self, tmp_path: Path) -> None:
+        handle = make_handle("coll")
+        _register(handle, tmp_path / "a.txt", "del")
+
+        # A parse row for the same doc proves the handle delete does not cascade.
+        store = get_vector_index_store()
+        store.upsert_parses(
+            [
+                {
+                    "collection": "coll",
+                    "doc_id": "del",
+                    "parse_hash": "h1",
+                    "parser": "p",
+                    "created_at": datetime.now(timezone.utc),
+                    "params_json": "{}",
+                    "parsed_content": "x",
+                    "user_id": None,
+                }
+            ]
+        )
+
+        assert handle.delete_document_record("del", is_admin=True) == 1
+        assert handle.load_document("del", is_admin=True) is None
+        # Parse row is untouched (row-only delete, no cascade).
+        assert (
+            store.count_rows(
+                "parses", {"collection": "coll", "doc_id": "del"}, is_admin=True
+            )
+            == 1
+        )
+        # Idempotent: deleting again returns 0.
+        assert handle.delete_document_record("del", is_admin=True) == 0

@@ -92,6 +92,16 @@ class KBCollectionHandle(ABC):
     ) -> DocumentRecordListResult:
         """List document rows for this collection as a semantic result."""
 
+    @abstractmethod
+    def delete_document_record(
+        self, doc_id: str, *, user_id: int | None = None, is_admin: bool = False
+    ) -> int:
+        """Delete only this document's row (no cascade).
+
+        Idempotent; returns the number of rows deleted. Parse/chunk/embedding
+        cleanup is intentionally out of scope here.
+        """
+
 
 @dataclass(frozen=True)
 class LanceDBCollectionHandle(KBCollectionHandle):
@@ -283,3 +293,14 @@ class LanceDBCollectionHandle(KBCollectionHandle):
         except Exception as e:
             raise DatabaseOperationError(f"Failed to list documents: {e}") from e
         return DocumentRecordListResult(documents=records, total_count=len(records))
+
+    def delete_document_record(
+        self, doc_id: str, *, user_id: int | None = None, is_admin: bool = False
+    ) -> int:
+        """Delete only this document's row via the bound store (no cascade)."""
+        return self.vector_index_store.delete_document_record(
+            collection_name=self.context.collection,
+            doc_id=doc_id,
+            user_id=user_id,
+            is_admin=is_admin,
+        )
