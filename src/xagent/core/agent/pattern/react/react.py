@@ -1,3 +1,31 @@
+"""ReAct execution pattern for the agent runtime.
+
+In-turn tool concurrency (off by default; gated by ``tool_parallel_enabled``)
+lets consecutive concurrency-safe tool calls in a single turn run as a bounded
+concurrent batch instead of strictly serially. The implementation preserves
+these invariants — referenced as I1–I6 in the code below — so that enabling the
+flag never changes observable results, only latency:
+
+- I1 (ordered backfill): tool results are written to the context in the model's
+  original tool-call order, regardless of which tool finishes first.
+- I2 (one result per call): every ``tool_call_id`` gets exactly one result,
+  including failures.
+- I3 (ledger order): ``tool_ledger`` insertion order matches input order after a
+  batch, because the consecutive-count walks read it in reverse insertion order.
+- I4 (control short-circuit): a control tool (final_answer / send_message /
+  ask_user_question) owns its segment and ends the turn's tool execution; later
+  tool calls in the same turn do not run.
+- I5 (interrupt / resume): an interrupt is honored at a segment boundary with
+  the remaining calls left pending; a crash mid-batch leaves the whole segment
+  pending so resume re-runs it (safe because batched tools are read-only).
+- I6 (trace pairing): tool trace spans pair START with END/ERROR by
+  ``tool_call_id`` rather than tool name, so concurrent same-name calls do not
+  cross-attribute (see ``tracing/langfuse/handler.py``).
+
+When ``tool_parallel_enabled`` is False every segment is a single serial call,
+making the loop byte-for-byte equivalent to the pre-concurrency behavior.
+"""
+
 from __future__ import annotations
 
 import asyncio
@@ -1209,6 +1237,16 @@ class ReActPattern(AgentPattern):
             if not self._tool_is_concurrency_safe(name, tools):
                 break
             segment.append(tool_call)
+            # Cap a batch at the concurrency width. The loop re-checks the
+            # interrupt before each segment, so a mid-turn interrupt is honored
+            # after at most one wave instead of after every safe call the model
+            # emitted. Tradeoff: a run longer than the width is split into
+            # successive gather() barriers rather than one continuously
+            # pipelined batch, so under skewed tool latencies a straggler in one
+            # wave can briefly idle the next wave's slots. Acceptable for v1;
+            # decouple batch size from the semaphore if profiling shows it costs.
+            if len(segment) >= self.tool_max_concurrency:
+                break
         # A lone safe tool degrades to serial: no gather/Semaphore overhead and
         # byte-for-byte identical behavior to the current serial path.
         if len(segment) == 1:
@@ -1873,44 +1911,63 @@ class ReActPattern(AgentPattern):
         tool_call = self._with_tool_call_content(tool_call)
         tool_call = self._with_runtime_step(tool_call, runtime)
         self._record_tool_call(tool_call, status="running")
-        await runtime.on_tool_start(tool_call=tool_call)
+        recorded_terminal = False
         try:
-            result = await self._execute_tool(tool_call, tools)
-        except Exception as exc:  # noqa: BLE001
-            error_result = {
-                "success": False,
-                "error": str(exc),
-                "tool_name": tool_call["name"],
-            }
-            await runtime.on_tool_error(
-                tool_call=tool_call, error=exc, result=error_result
-            )
-            self._record_tool_call(
-                tool_call,
-                status="failed",
-                result=error_result,
-                error=str(exc),
-            )
-            return error_result
+            await runtime.on_tool_start(tool_call=tool_call)
+            try:
+                result = await self._execute_tool(tool_call, tools)
+            except Exception as exc:  # noqa: BLE001
+                error_result = {
+                    "success": False,
+                    "error": str(exc),
+                    "tool_name": tool_call["name"],
+                }
+                await runtime.on_tool_error(
+                    tool_call=tool_call, error=exc, result=error_result
+                )
+                self._record_tool_call(
+                    tool_call,
+                    status="failed",
+                    result=error_result,
+                    error=str(exc),
+                )
+                recorded_terminal = True
+                return error_result
 
-        if not self._tool_result_success(result):
-            error_message = str(result.get("error") or result.get("message") or result)
-            await runtime.on_tool_error(
-                tool_call=tool_call,
-                error=RuntimeError(error_message),
-                result=result,
-            )
-            self._record_tool_call(
-                tool_call,
-                status="failed",
-                result=result,
-                error=error_message,
-            )
+            if not self._tool_result_success(result):
+                error_message = str(
+                    result.get("error") or result.get("message") or result
+                )
+                await runtime.on_tool_error(
+                    tool_call=tool_call,
+                    error=RuntimeError(error_message),
+                    result=result,
+                )
+                self._record_tool_call(
+                    tool_call,
+                    status="failed",
+                    result=result,
+                    error=error_message,
+                )
+                recorded_terminal = True
+                return result
+
+            self._record_tool_call(tool_call, status="completed", result=result)
+            recorded_terminal = True
+            await runtime.on_tool_end(tool_call=tool_call, result=result)
             return result
-
-        self._record_tool_call(tool_call, status="completed", result=result)
-        await runtime.on_tool_end(tool_call=tool_call, result=result)
-        return result
+        finally:
+            # An infra callback (on_tool_start) can raise before any terminal
+            # record is written. Never leave the ledger stuck at "running": the
+            # consecutive-count walks skip non-terminal records, which would
+            # undercount repeated-tool-decision triggers. The exception still
+            # propagates (serial path) or is captured by the batch gather.
+            if not recorded_terminal:
+                self._record_tool_call(
+                    tool_call,
+                    status="failed",
+                    error="tool execution aborted before completion",
+                )
 
     def _with_runtime_step(
         self, tool_call: dict[str, Any], runtime: PatternRuntime

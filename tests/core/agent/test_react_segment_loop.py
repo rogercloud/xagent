@@ -118,6 +118,33 @@ async def test_interrupt_before_batch_preserves_pending() -> None:
     assert [tc["name"] for tc in pattern.pending_tool_calls] == ["s1", "s2"]
 
 
+async def test_interrupt_after_capped_batch_preserves_remaining() -> None:
+    # The batch cap (= max_concurrency) turns a long safe run into multiple
+    # batches, so an interrupt requested after the first batch leaves the rest
+    # pending. Without the cap all four would run as one uninterruptible batch.
+    class _InterruptAfterFirstBatch(FakeRuntime):
+        async def should_interrupt(self) -> bool:
+            return len(self.events_of("on_tool_end")) >= 2
+
+    tools = [FakeTool(name, read_only=True) for name in ("s1", "s2", "s3", "s4")]
+    pattern = _make_pattern(max_concurrency=2)
+    pattern.pending_tool_calls = [
+        make_tool_call(name) for name in ("s1", "s2", "s3", "s4")
+    ]
+    context = RecordingContext()
+    runtime = _InterruptAfterFirstBatch()
+
+    result = await pattern._execute_pending_tool_calls(
+        context=context, tools=tools, llm=None, runtime=runtime
+    )
+
+    assert result is not None
+    assert result.get("status") == "interrupted"
+    # Only the first capped batch ran; the remainder is preserved for resume.
+    assert [r["tool_name"] for r in context.tool_results] == ["s1", "s2"]
+    assert [tc["name"] for tc in pattern.pending_tool_calls] == ["s3", "s4"]
+
+
 async def test_concurrent_batch_then_unsafe_serial_preserves_order() -> None:
     tools = [
         FakeTool("s1", read_only=True),

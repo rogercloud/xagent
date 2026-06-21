@@ -17,6 +17,8 @@ from __future__ import annotations
 
 import asyncio
 
+import pytest
+
 from tests.core.agent.concurrency_harness import (
     ConcurrencyTracker,
     FakeRuntime,
@@ -127,6 +129,52 @@ async def test_exception_isolation_within_batch() -> None:
     assert results[1]["success"] is False
     assert "kaboom" in results[1]["error"]
     assert results[2]["success"] is True
+
+
+async def test_infra_callback_failure_marks_ledger_terminal() -> None:
+    # If an infra callback (on_tool_start) raises after the "running" record is
+    # written, the ledger must reach a terminal state. The consecutive-count
+    # walks only count {completed, failed}, so a record stuck at "running" would
+    # be silently skipped and undercount the repeated-tool-decision triggers.
+    class _BoomOnStart(FakeRuntime):
+        async def on_tool_start(self, *, tool_call: dict) -> None:
+            raise RuntimeError("trace backend down")
+
+    tools = [FakeTool("s1", concurrency_safe=True)]
+    pattern = make_react(parallel=True)
+    call = make_tool_call("s1")
+
+    with pytest.raises(RuntimeError, match="trace backend down"):
+        await pattern._execute_tool_safely(call, tools, _BoomOnStart())
+
+    assert pattern.tool_ledger[call["id"]].status == "failed"
+
+
+async def test_concurrent_batch_isolates_infra_callback_failure() -> None:
+    # An infra callback failure for one call becomes that call's error result
+    # (gather swallows it) and a terminal ledger record, while its siblings
+    # complete normally.
+    class _BoomOnFirst(FakeRuntime):
+        async def on_tool_start(self, *, tool_call: dict) -> None:
+            if tool_call["name"] == "boom":
+                raise RuntimeError("trace down")
+            await super().on_tool_start(tool_call=tool_call)
+
+    tools = [
+        FakeTool("s1", concurrency_safe=True),
+        FakeTool("boom", concurrency_safe=True),
+        FakeTool("s3", concurrency_safe=True),
+    ]
+    pattern = make_react(parallel=True, max_concurrency=3)
+    context = RecordingContext()
+    batch = [make_tool_call(name) for name in ["s1", "boom", "s3"]]
+
+    results = await pattern._run_concurrent_batch(batch, tools, _BoomOnFirst(), context)
+
+    assert results[1]["success"] is False
+    assert pattern.tool_ledger[batch[1]["id"]].status == "failed"
+    assert pattern.tool_ledger[batch[0]["id"]].status == "completed"
+    assert pattern.tool_ledger[batch[2]["id"]].status == "completed"
 
 
 # --- Inc.4: tool_ledger ordering after a concurrent batch (I3) -------------

@@ -91,6 +91,27 @@ def test_three_consecutive_safe_tools_merge() -> None:
     ]
 
 
+def test_concurrent_batch_capped_at_max_concurrency() -> None:
+    # A batch never grows past the concurrency width, so a mid-turn interrupt is
+    # honored after at most one wave. With max_concurrency=2 the trailing lone
+    # safe tool falls into its own (serial) segment.
+    pattern = make_react(parallel=True, max_concurrency=2)
+    assert _segments(pattern, ["s1", "s2", "s3"]) == [
+        ("concurrent", ["s1", "s2"]),
+        ("serial", ["s3"]),
+    ]
+
+
+def test_capping_splits_long_run_into_multiple_concurrent_batches() -> None:
+    # Six consecutive safe tools at max_concurrency=3 split into two concurrent
+    # batches of three; each batch boundary is an interrupt checkpoint.
+    pattern = make_react(parallel=True, max_concurrency=3)
+    assert _segments(pattern, ["s1", "s2", "s3", "s1", "s2", "s3"]) == [
+        ("concurrent", ["s1", "s2", "s3"]),
+        ("concurrent", ["s1", "s2", "s3"]),
+    ]
+
+
 def test_unsafe_tool_breaks_the_concurrent_batch() -> None:
     pattern = make_react(parallel=True)
     assert _segments(pattern, ["s1", "u1", "s2", "s3"]) == [
