@@ -141,6 +141,35 @@ class TestHandleRegisterDocument:
                 )
             )
 
+    def test_register_persists_into_context_collection_not_request(
+        self, tmp_path: Path
+    ) -> None:
+        src = tmp_path / "a.txt"
+        src.write_text("hello")
+        handle = make_handle("coll_a")
+
+        # The request names a different collection; the collection-scoped handle
+        # must ignore it and persist into its bound context collection.
+        handle.register_document(
+            RegisterDocumentRequest(
+                collection="coll_b", source_path=str(src), doc_id="doc-x"
+            )
+        )
+
+        store = get_vector_index_store()
+        assert (
+            store.count_rows(
+                "documents", {"collection": "coll_a", "doc_id": "doc-x"}, is_admin=True
+            )
+            == 1
+        )
+        assert (
+            store.count_rows(
+                "documents", {"collection": "coll_b", "doc_id": "doc-x"}, is_admin=True
+            )
+            == 0
+        )
+
 
 def _register(handle: LanceDBCollectionHandle, src: Path, doc_id: str, **kwargs):
     src.write_text(kwargs.pop("content", f"content of {doc_id}"))
@@ -379,3 +408,21 @@ class TestHandleRollback:
         )
         assert again.doc_id == first.doc_id
         assert again.created is True
+
+    def test_restore_rejects_snapshot_from_other_collection(
+        self, tmp_path: Path
+    ) -> None:
+        from xagent.core.tools.core.RAG_tools.core.exceptions import (
+            DocumentValidationError,
+        )
+
+        source = make_handle("coll_a")
+        _register(source, tmp_path / "a.txt", "doc-1", user_id=7)
+        snapshot = source.snapshot_document("doc-1", is_admin=True)
+        assert snapshot is not None
+
+        # A handle bound to a different collection must refuse the snapshot so
+        # restore cannot write outside its resolved collection.
+        other = make_handle("coll_b")
+        with pytest.raises(DocumentValidationError, match="cannot restore a snapshot"):
+            other.restore_document(snapshot)

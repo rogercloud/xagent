@@ -161,7 +161,12 @@ class LanceDBCollectionHandle(KBCollectionHandle):
         fallback), SHA256 content hash, an admin-scoped existence check for the
         ``created`` flag, and an idempotent upsert of the full row.
         """
-        collection = request.collection
+        # The handle is collection-scoped: persist into the bound context
+        # collection rather than trusting request.collection, so a reused handle
+        # can never write outside its resolved collection. Through the
+        # coordinator the two already match (context.collection is the
+        # normalized form of request.collection).
+        collection = self.context.collection
         file_id = request.file_id
         source_path = request.source_path
         metadata_source_path = request.metadata_source_path or source_path
@@ -333,8 +338,14 @@ class LanceDBCollectionHandle(KBCollectionHandle):
 
         Re-upserts the full row (keyed by collection + doc_id), so ``file_id``,
         ``user_id``, collection, metadata, content hash, and file type are all
-        restored exactly.
+        restored exactly. Refuses snapshots from another collection so the
+        collection-scoped boundary holds even on direct handle reuse.
         """
+        if snapshot.collection != self.context.collection:
+            raise DocumentValidationError(
+                f"Handle bound to collection {self.context.collection!r} "
+                f"cannot restore a snapshot from {snapshot.collection!r}"
+            )
         self.vector_index_store.upsert_documents([snapshot.to_legacy_dict()])
 
     def delete_created_document(
