@@ -1,11 +1,36 @@
-"""Collection-scoped KB backend handle skeletons."""
+"""Collection-scoped KB backend handle.
+
+``KBCollectionHandle`` is the collection-scoped backend boundary that owns
+backend-specific data-plane mechanics (starting with the document-row
+lifecycle in #508). ``LanceDBCollectionHandle`` is the first implementation and
+delegates to the current LanceDB documents-table mechanics via the bound
+vector index store.
+"""
 
 from __future__ import annotations
 
+import logging
+import uuid
+from abc import ABC, abstractmethod
 from dataclasses import dataclass
+from datetime import timezone
+from pathlib import Path
 
+import pandas as pd
+
+from ..core.exceptions import (
+    ConfigurationError,
+    DatabaseOperationError,
+    DocumentValidationError,
+    HashComputationError,
+)
+from ..core.schemas import RegisterDocumentRequest, RegisterDocumentResponse
 from ..storage.contracts import MetadataStore, VectorIndexStore
+from ..utils import check_file_type, compute_file_hash
+from ..utils.string_utils import generate_deterministic_doc_id
 from .models import KBBackendCapabilities, KBCollectionContext, KBStorageBackend
+
+logger = logging.getLogger(__name__)
 
 
 class KBHandleProvider:
@@ -28,9 +53,33 @@ class KBHandleProvider:
         """
 
 
+class KBCollectionHandle(ABC):
+    """Collection-scoped backend handle for KB data-plane operations.
+
+    Phase 2 moves backend-specific, collection-local data-plane mechanics here.
+    The first family (#508) is the document-row lifecycle. The coordinator owns
+    context resolution, access policy, and orchestration; the handle owns the
+    backend mechanics for a single collection.
+    """
+
+    @abstractmethod
+    def register_document(
+        self, request: RegisterDocumentRequest
+    ) -> RegisterDocumentResponse:
+        """Idempotently register (upsert) a document row for this collection.
+
+        Preserves deterministic doc_id generation, content-hash calculation,
+        file-type detection, and the exact persisted field set.
+        """
+
+
 @dataclass(frozen=True)
-class LanceDBCollectionHandle:
-    """Thin LanceDB-backed collection handle for #495 compatibility wiring."""
+class LanceDBCollectionHandle(KBCollectionHandle):
+    """LanceDB-backed collection handle.
+
+    The initial delegate is the current LanceDB documents-table implementation,
+    reached through the bound vector index store.
+    """
 
     context: KBCollectionContext
 
@@ -53,3 +102,99 @@ class LanceDBCollectionHandle:
     def capabilities(self) -> KBBackendCapabilities:
         """Return backend capabilities for this collection."""
         return self.context.capabilities
+
+    def register_document(
+        self, request: RegisterDocumentRequest
+    ) -> RegisterDocumentResponse:
+        """Register a document row in this collection's documents table.
+
+        Behavior mirrors the legacy ``_register_document`` helper: input
+        validation, file-type detection, deterministic doc_id (with UUID
+        fallback), SHA256 content hash, an admin-scoped existence check for the
+        ``created`` flag, and an idempotent upsert of the full row.
+        """
+        collection = request.collection
+        file_id = request.file_id
+        source_path = request.source_path
+        metadata_source_path = request.metadata_source_path or source_path
+        file_type = request.file_type
+        doc_id = request.doc_id
+        uploaded_at = request.uploaded_at
+
+        if not collection:
+            raise DocumentValidationError("Collection name cannot be empty")
+
+        if not source_path or not Path(source_path).exists():
+            raise DocumentValidationError(f"Source path does not exist: {source_path}")
+
+        # Auto-detect file type if not provided.
+        if not file_type:
+            try:
+                file_type = check_file_type(source_path)
+            except DocumentValidationError as e:
+                raise DocumentValidationError(f"File type detection failed: {e}") from e
+
+        # Deterministic doc_id from (collection, file_id/source_path) for
+        # idempotent registration; fall back to a UUID if generation fails.
+        if not doc_id:
+            try:
+                stable_key = file_id or metadata_source_path
+                doc_id = generate_deterministic_doc_id(collection, stable_key)
+            except Exception as e:  # noqa: BLE001 - fallback keeps registration working
+                logger.debug(
+                    "Deterministic doc_id generation failed (%s), falling back to UUID",
+                    e,
+                )
+                doc_id = str(uuid.uuid4())
+
+        if not uploaded_at:
+            uploaded_at = pd.Timestamp.now(tz="UTC")
+        elif uploaded_at.tzinfo is None:
+            uploaded_at = uploaded_at.replace(tzinfo=timezone.utc)
+
+        try:
+            content_hash = compute_file_hash(source_path)
+        except Exception as e:
+            raise HashComputationError(f"Failed to compute content hash: {e}") from e
+
+        try:
+            vector_store = self.vector_index_store
+
+            # Existence check uses admin mode to see all records (incl. legacy).
+            exists = (
+                vector_store.count_rows_or_zero(
+                    "documents",
+                    filters={"collection": collection, "doc_id": doc_id},
+                    user_id=request.user_id,
+                    is_admin=True,
+                )
+                > 0
+            )
+
+            doc_record = {
+                "collection": collection,
+                "doc_id": doc_id,
+                "file_id": file_id,
+                "source_path": metadata_source_path,
+                "file_type": file_type,
+                "content_hash": content_hash,
+                "uploaded_at": uploaded_at,
+                "title": None,
+                "language": None,
+                "user_id": request.user_id,
+            }
+
+            vector_store.upsert_documents([doc_record])
+            created = not exists
+        except ConfigurationError:
+            raise
+        except Exception as e:
+            raise DatabaseOperationError(
+                f"Failed to register document in database: {e}"
+            ) from e
+
+        return RegisterDocumentResponse(
+            doc_id=doc_id,
+            created=created,
+            content_hash=content_hash,
+        )
