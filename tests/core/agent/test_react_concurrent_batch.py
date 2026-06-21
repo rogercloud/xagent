@@ -150,10 +150,13 @@ async def test_infra_callback_failure_marks_ledger_terminal() -> None:
     assert pattern.tool_ledger[call["id"]].status == "failed"
 
 
-async def test_concurrent_batch_isolates_infra_callback_failure() -> None:
-    # An infra callback failure for one call becomes that call's error result
-    # (gather swallows it) and a terminal ledger record, while its siblings
-    # complete normally.
+async def test_concurrent_batch_propagates_infra_callback_failure() -> None:
+    # An infra callback failure (on_tool_start) is a real exception, not a tool
+    # failure. The serial path lets it propagate and halt the turn; the
+    # concurrent path must do the same instead of mis-reporting infrastructure
+    # breakage to the model as a tool-failure result. The exception is re-raised
+    # before backfill, so nothing is committed to the context and the whole
+    # (idempotent) segment stays pending for a clean re-run on resume.
     class _BoomOnFirst(FakeRuntime):
         async def on_tool_start(self, *, tool_call: dict) -> None:
             if tool_call["name"] == "boom":
@@ -169,12 +172,13 @@ async def test_concurrent_batch_isolates_infra_callback_failure() -> None:
     context = RecordingContext()
     batch = [make_tool_call(name) for name in ["s1", "boom", "s3"]]
 
-    results = await pattern._run_concurrent_batch(batch, tools, _BoomOnFirst(), context)
+    with pytest.raises(RuntimeError, match="trace down"):
+        await pattern._run_concurrent_batch(batch, tools, _BoomOnFirst(), context)
 
-    assert results[1]["success"] is False
+    # Nothing was back-filled (the turn halts; the segment re-runs on resume)...
+    assert context.tool_results == []
+    # ...but the failing call still reaches a terminal ledger state (I3 walk).
     assert pattern.tool_ledger[batch[1]["id"]].status == "failed"
-    assert pattern.tool_ledger[batch[0]["id"]].status == "completed"
-    assert pattern.tool_ledger[batch[2]["id"]].status == "completed"
 
 
 # --- Inc.4: tool_ledger ordering after a concurrent batch (I3) -------------

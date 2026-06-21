@@ -1282,8 +1282,9 @@ class ReActPattern(AgentPattern):
         back-filled serially in the main coroutine after all tools finish, so
         message-history order is deterministic (I1) and every call gets exactly
         one result (I2). ``_execute_tool_safely`` already turns tool exceptions
-        into error dicts; ``return_exceptions=True`` is a belt-and-suspenders
-        guard against unexpected failures in the execution unit itself.
+        into error dicts, so any real exception captured by
+        ``return_exceptions=True`` is an infra-callback/unexpected failure and is
+        re-raised to halt the turn exactly like the serial path (I5).
         """
         semaphore = asyncio.Semaphore(self.tool_max_concurrency)
 
@@ -1296,20 +1297,22 @@ class ReActPattern(AgentPattern):
             return_exceptions=True,
         )
 
-        results: list[Any] = []
-        for tool_call, result in zip(batch, raw_results):
+        # Tool-level failures are already converted to error dicts inside
+        # _execute_tool_safely, so anything coming back as a real exception is an
+        # infra-callback failure (on_tool_start/on_tool_end) or an unexpected
+        # bug. The serial path lets those propagate and halt the turn; re-raise
+        # here so the concurrent path behaves identically instead of
+        # mis-reporting infrastructure breakage to the model as a tool failure.
+        # Re-raising before backfill leaves the whole (idempotent) segment
+        # pending, so resume re-runs it cleanly (I5).
+        for result in raw_results:
             if isinstance(result, BaseException):
-                result = {
-                    "success": False,
-                    "error": str(result),
-                    "tool_name": tool_call["name"],
-                }
-            results.append(result)
+                raise result
 
-        for tool_call, result in zip(batch, results):
+        for tool_call, result in zip(batch, raw_results):
             self._backfill_result(tool_call, result, context)
         self._reorder_ledger_for_batch(batch)
-        return results
+        return list(raw_results)
 
     def _reorder_ledger_for_batch(self, batch: list[dict[str, Any]]) -> None:
         """Reassert input order for this batch's ledger records (I3).
