@@ -276,9 +276,11 @@ class LanceDBCollectionHandle(KBCollectionHandle):
                 user_id=user_id,
                 is_admin=is_admin,
             ):
-                batch_df = batch.to_pandas()
-                for _, row in batch_df.iterrows():
-                    return DocumentRecordDetail.from_row(row.to_dict())
+                # to_pylist() converts the Arrow batch directly to native Python
+                # objects in C++, avoiding Pandas' int->float upcasting on null
+                # columns (the reason from_row still normalizes defensively).
+                for row_dict in batch.to_pylist():
+                    return DocumentRecordDetail.from_row(row_dict)
             return None
         except Exception as e:
             raise DatabaseOperationError(f"Failed to retrieve document: {e}") from e
@@ -301,9 +303,10 @@ class LanceDBCollectionHandle(KBCollectionHandle):
                 user_id=user_id,
                 is_admin=is_admin,
             ):
-                batch_df = batch.to_pandas()
-                for _, row in batch_df.iterrows():
-                    records.append(DocumentRecordDetail.from_row(row.to_dict()))
+                # to_pylist() bypasses Pandas (see load_document) when materializing
+                # rows; from_row still normalizes any residual null sentinels.
+                for row_dict in batch.to_pylist():
+                    records.append(DocumentRecordDetail.from_row(row_dict))
                     if len(records) >= limit:
                         break
                 if len(records) >= limit:
