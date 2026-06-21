@@ -29,12 +29,6 @@ from typing import Any, Callable
 
 import pytest
 
-from xagent.core.tools.adapters.vibe.exa_web_search import ExaWebSearchTool
-from xagent.core.tools.adapters.vibe.fetch_web_content import FetchWebContentTool
-from xagent.core.tools.adapters.vibe.tavily_web_search import TavilyWebSearchTool
-from xagent.core.tools.adapters.vibe.web_search import WebSearchTool
-from xagent.core.tools.adapters.vibe.zhipu_web_search import ZhipuWebSearchTool
-
 from tests.core.agent.concurrency_harness import (
     ConcurrencyTracker,
     FakeRuntime,
@@ -42,6 +36,11 @@ from tests.core.agent.concurrency_harness import (
     make_react,
     make_tool_call,
 )
+from xagent.core.tools.adapters.vibe.exa_web_search import ExaWebSearchTool
+from xagent.core.tools.adapters.vibe.fetch_web_content import FetchWebContentTool
+from xagent.core.tools.adapters.vibe.tavily_web_search import TavilyWebSearchTool
+from xagent.core.tools.adapters.vibe.web_search import WebSearchTool
+from xagent.core.tools.adapters.vibe.zhipu_web_search import ZhipuWebSearchTool
 
 # How long a batched I/O seam waits to rendezvous with its sibling before giving
 # up. A serialized batch never rendezvouses, so it trips this instead of hanging.

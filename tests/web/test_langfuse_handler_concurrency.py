@@ -22,8 +22,8 @@ from xagent.core.agent.trace import (
     TraceAction,
     TraceCategory,
     TraceEventType,
-    TraceScope,
     Tracer,
+    TraceScope,
     trace_action_end,
     trace_action_start,
 )
