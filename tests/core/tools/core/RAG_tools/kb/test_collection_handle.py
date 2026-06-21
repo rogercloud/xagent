@@ -275,3 +275,107 @@ class TestHandleDeleteDocumentRecord:
         )
         # Idempotent: deleting again returns 0.
         assert handle.delete_document_record("del", is_admin=True) == 0
+
+
+class TestHandleRollback:
+    def test_new_document_rollback_is_idempotent_and_row_only(
+        self, tmp_path: Path
+    ) -> None:
+        handle = make_handle("coll")
+        response = _register(handle, tmp_path / "a.txt", "new-doc", user_id=7)
+        assert response.created is True
+
+        store = get_vector_index_store()
+        store.upsert_parses(
+            [
+                {
+                    "collection": "coll",
+                    "doc_id": "new-doc",
+                    "parse_hash": "h1",
+                    "parser": "p",
+                    "created_at": datetime.now(timezone.utc),
+                    "params_json": "{}",
+                    "parsed_content": "x",
+                    "user_id": None,
+                }
+            ]
+        )
+
+        # Rollback of a newly created document removes only the document row.
+        assert handle.delete_created_document("new-doc", user_id=7, is_admin=True) == 1
+        assert handle.load_document("new-doc", is_admin=True) is None
+        assert (
+            store.count_rows(
+                "parses", {"collection": "coll", "doc_id": "new-doc"}, is_admin=True
+            )
+            == 1
+        )
+        # Idempotent.
+        assert handle.delete_created_document("new-doc", user_id=7, is_admin=True) == 0
+
+    def test_existing_document_replacement_rollback_preserves_fields(
+        self, tmp_path: Path
+    ) -> None:
+        handle = make_handle("coll")
+        _register(
+            handle,
+            tmp_path / "orig.txt",
+            "doc-1",
+            user_id=7,
+            file_id="f1",
+            content="original content",
+        )
+
+        snapshot = handle.snapshot_document("doc-1", is_admin=True)
+        assert snapshot is not None
+
+        # Overwrite the existing row with a different file/owner.
+        _register(
+            handle,
+            tmp_path / "changed.md",
+            "doc-1",
+            user_id=9,
+            file_id="f2",
+            content="changed content",
+        )
+        overwritten = handle.load_document("doc-1", is_admin=True)
+        assert overwritten is not None
+        assert overwritten.file_type == "md"
+        assert overwritten.file_id == "f2"
+        assert overwritten.user_id == 9
+
+        # Restoring the snapshot brings every field back.
+        handle.restore_document(snapshot)
+        restored = handle.load_document("doc-1", is_admin=True)
+        assert restored is not None
+        assert restored.collection == "coll"
+        assert restored.doc_id == "doc-1"
+        assert restored.file_id == "f1"
+        assert restored.user_id == 7
+        assert restored.file_type == "txt"
+        assert restored.source_path == snapshot.source_path
+        assert restored.content_hash == snapshot.content_hash
+        assert restored.title == snapshot.title
+        assert restored.language == snapshot.language
+        assert restored.uploaded_at is not None
+
+    def test_duplicate_registration_idempotent_after_rollback(
+        self, tmp_path: Path
+    ) -> None:
+        handle = make_handle("my_kb")
+        src = tmp_path / "report.docx"
+        src.write_text("content")
+
+        first = handle.register_document(
+            RegisterDocumentRequest(collection="my_kb", source_path=str(src))
+        )
+        assert first.created is True
+
+        assert handle.delete_created_document(first.doc_id, is_admin=True) == 1
+
+        # Re-registering after rollback yields the same deterministic doc_id.
+        again = handle.register_document(
+            RegisterDocumentRequest(collection="my_kb", source_path=str(src))
+        )
+        assert again.doc_id == first.doc_id
+        assert again.created is True

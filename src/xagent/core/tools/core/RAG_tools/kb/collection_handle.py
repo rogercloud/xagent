@@ -102,6 +102,24 @@ class KBCollectionHandle(ABC):
         cleanup is intentionally out of scope here.
         """
 
+    # --- Rollback compensation (document plane only) ---
+
+    @abstractmethod
+    def snapshot_document(
+        self, doc_id: str, *, user_id: int | None = None, is_admin: bool = False
+    ) -> DocumentRecordDetail | None:
+        """Capture the current document row for later restore (None if absent)."""
+
+    @abstractmethod
+    def restore_document(self, snapshot: DocumentRecordDetail) -> None:
+        """Restore a previously snapshotted document row, preserving all fields."""
+
+    @abstractmethod
+    def delete_created_document(
+        self, doc_id: str, *, user_id: int | None = None, is_admin: bool = False
+    ) -> int:
+        """Idempotently delete a newly created document row (compensation)."""
+
 
 @dataclass(frozen=True)
 class LanceDBCollectionHandle(KBCollectionHandle):
@@ -304,3 +322,29 @@ class LanceDBCollectionHandle(KBCollectionHandle):
             user_id=user_id,
             is_admin=is_admin,
         )
+
+    def snapshot_document(
+        self, doc_id: str, *, user_id: int | None = None, is_admin: bool = False
+    ) -> DocumentRecordDetail | None:
+        """Capture the current document row before a destructive operation.
+
+        Returns ``None`` when there is no existing row to snapshot. Note that
+        these compensation methods are added for #514 to wire into the live
+        rollback path; #508 only provides the mechanics.
+        """
+        return self.load_document(doc_id, user_id=user_id, is_admin=is_admin)
+
+    def restore_document(self, snapshot: DocumentRecordDetail) -> None:
+        """Restore a snapshotted document row, preserving every field.
+
+        Re-upserts the full row (keyed by collection + doc_id), so ``file_id``,
+        ``user_id``, collection, metadata, content hash, and file type are all
+        restored exactly.
+        """
+        self.vector_index_store.upsert_documents([snapshot.to_legacy_dict()])
+
+    def delete_created_document(
+        self, doc_id: str, *, user_id: int | None = None, is_admin: bool = False
+    ) -> int:
+        """Idempotently delete a newly created document row (row-only)."""
+        return self.delete_document_record(doc_id, user_id=user_id, is_admin=is_admin)
