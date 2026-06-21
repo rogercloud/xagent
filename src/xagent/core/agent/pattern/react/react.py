@@ -1911,6 +1911,15 @@ class ReActPattern(AgentPattern):
         tools: list[Any],
         runtime: PatternRuntime,
     ) -> Any:
+        # Stamp a stable id on the *original* dict before the _with_* transforms
+        # (which may return a copy). _record_tool_call only computes a fallback
+        # key locally; without writing it back, the key drifts between the
+        # running/completed writes as the ledger grows, and the still-id-less
+        # dict that _backfill_result / _reorder_ledger_for_batch read desyncs
+        # from the ledger (I2/I3). No await runs before the first record below,
+        # so concurrent batch members get distinct fallback ids.
+        if not tool_call.get("id"):
+            tool_call["id"] = f"tool_call_{len(self.tool_ledger)}"
         tool_call = self._with_tool_call_content(tool_call)
         tool_call = self._with_runtime_step(tool_call, runtime)
         self._record_tool_call(tool_call, status="running")

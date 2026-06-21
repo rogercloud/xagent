@@ -150,6 +150,39 @@ async def test_infra_callback_failure_marks_ledger_terminal() -> None:
     assert pattern.tool_ledger[call["id"]].status == "failed"
 
 
+async def test_concurrent_batch_assigns_ids_to_id_less_calls() -> None:
+    # A tool call without an id must get a stable one stamped on the *original*
+    # dict before _execute_tool_safely's _with_* transforms run. _record_tool_call
+    # only generates a fallback key internally; if it is not written back, the
+    # key drifts between the running/completed writes (len(tool_ledger) grows in
+    # between) and never matches the still-id-less dict that _backfill_result and
+    # _reorder_ledger_for_batch read, desyncing the ledger from the context
+    # (I2/I3).
+    tools = [
+        FakeTool("s1", concurrency_safe=True),
+        FakeTool("s2", concurrency_safe=True),
+    ]
+    pattern = make_react(parallel=True, max_concurrency=2)
+    runtime = FakeRuntime()
+    # An active ReAct step makes _with_runtime_step return a *copy*, so stamping
+    # the id after the transform (rather than before) would miss the original
+    # batch dict that backfill/reorder iterate over.
+    runtime.active_react_step_id = "step-x"
+    context = RecordingContext()
+    batch = [make_tool_call("s1", id=""), make_tool_call("s2", id="")]
+
+    await pattern._run_concurrent_batch(batch, tools, runtime, context)
+
+    # Exactly one terminal record per call (no orphan stuck at "running").
+    assert len(pattern.tool_ledger) == 2
+    assert all(record.status == "completed" for record in pattern.tool_ledger.values())
+    # Context tool_call_ids are non-empty and match the ledger keys in input
+    # order (I2 + I3).
+    ctx_ids = [r["tool_call_id"] for r in context.tool_results]
+    assert all(ctx_ids)
+    assert ctx_ids == list(pattern.tool_ledger.keys())
+
+
 async def test_concurrent_batch_propagates_infra_callback_failure() -> None:
     # An infra callback failure (on_tool_start) is a real exception, not a tool
     # failure. The serial path lets it propagate and halt the turn; the
