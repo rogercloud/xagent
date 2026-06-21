@@ -861,6 +861,46 @@ class LanceDBVectorIndexStore(VectorIndexStore):
         self.invalidate_table_cache()
         return counts
 
+    def delete_document_record(
+        self,
+        collection_name: str,
+        doc_id: str,
+        user_id: Optional[int],
+        is_admin: bool,
+    ) -> int:
+        """Delete only the ``documents`` table row(s) for a single document.
+
+        Row-only counterpart to :meth:`delete_document_data`; it does not
+        cascade into parses/chunks/embeddings. Reuses the cascade document
+        filter so tenant scoping stays identical. Idempotent: returns 0 when
+        the row or the ``documents`` table is absent.
+        """
+        from ..LanceDB.schema_manager import _safe_close_table
+        from ..version_management.cascade_cleaner import (
+            _build_document_filter,
+            _delete_rows_by_filters,
+        )
+
+        if "documents" not in self.list_table_names():
+            return 0
+
+        conn = self._get_connection()
+        filter_expr = _build_document_filter(
+            conn=conn,
+            table_name="documents",
+            collection=collection_name,
+            doc_id=doc_id,
+            user_id=user_id,
+            is_admin=is_admin,
+        )
+        table = conn.open_table("documents")
+        try:
+            deleted = _delete_rows_by_filters(table, [filter_expr])
+        finally:
+            _safe_close_table(table)
+        self.invalidate_table_cache("documents")
+        return deleted
+
     def delete_documents_data(
         self,
         collection_name: str,

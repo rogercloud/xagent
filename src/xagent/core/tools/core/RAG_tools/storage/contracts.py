@@ -541,6 +541,26 @@ class VectorIndexStore(ABC):
         """
 
     @abstractmethod
+    def delete_document_record(
+        self,
+        collection_name: str,
+        doc_id: str,
+        user_id: Optional[int],
+        is_admin: bool,
+    ) -> int:
+        """Delete only the ``documents`` table row(s) for a single document.
+
+        Row-only counterpart to :meth:`delete_document_data`: it must NOT
+        cascade into parse/chunk/embedding/version data. Implementations must
+        preserve document-scoped tenant safety (collection + doc_id, plus
+        user_id where the table supports it) and must be idempotent, returning
+        0 when the row or table is absent.
+
+        Returns:
+            Number of document rows deleted (0 if none matched).
+        """
+
+    @abstractmethod
     def aggregate_collection_stats(
         self,
         user_id: Optional[int],
