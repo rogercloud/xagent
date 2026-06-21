@@ -53,6 +53,9 @@ class KBLegacyStepCompatibilityFacade:
         self._coordinator = coordinator
         self._storage_shim = storage_shim
         self._operation_compatibility = operation_compatibility
+        # Lazily-built coordinator bound to an injected shim (see
+        # _active_coordinator); cached so repeated calls reuse one instance.
+        self._shim_coordinator: KBCoordinator | None = None
 
     def _active_storage_shim(self) -> KBStorageShimCompatibilityFacade | None:
         if self._storage_shim is not None:
@@ -71,7 +74,17 @@ class KBLegacyStepCompatibilityFacade:
     def _active_coordinator(self) -> KBCoordinator:
         if self._coordinator is not None:
             return self._coordinator
-        from .coordinator import get_kb_coordinator
+
+        from .coordinator import KBCoordinator, get_kb_coordinator
+
+        # An injected shim without a coordinator must keep document lifecycle
+        # calls bound to that shim instead of leaking onto the process-global
+        # coordinator's independent stores. Back a dedicated coordinator with
+        # the injected shim so the facade's injection boundary is preserved.
+        if self._storage_shim is not None:
+            if self._shim_coordinator is None:
+                self._shim_coordinator = KBCoordinator(storage_shim=self._storage_shim)
+            return self._shim_coordinator
 
         return get_kb_coordinator()
 
