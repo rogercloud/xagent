@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Iterator
 from contextlib import contextmanager
+from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 from ..core.config import (
@@ -11,12 +12,14 @@ from ..core.config import (
     DEFAULT_TABLE_CONTEXT_SIZE,
     DEFAULT_TIKTOKEN_ENCODING,
 )
+from ..core.exceptions import DocumentValidationError
 from ..core.schemas import (
     ChunkStrategy,
     DenseSearchResponse,
     FusionConfig,
     HybridSearchResponse,
     ParseMethod,
+    RegisterDocumentRequest,
     SparseSearchResponse,
 )
 from .operation_compatibility import (
@@ -65,6 +68,56 @@ class KBLegacyStepCompatibilityFacade:
             return self._coordinator.operation_compatibility
         return None
 
+    def _active_coordinator(self) -> KBCoordinator:
+        if self._coordinator is not None:
+            return self._coordinator
+        from .coordinator import get_kb_coordinator
+
+        return get_kb_coordinator()
+
+    @staticmethod
+    def _build_register_request(
+        *,
+        collection: str,
+        source_path: str,
+        file_type: Optional[str],
+        doc_id: Optional[str],
+        uploaded_at: Optional[str],
+        user_id: Optional[int],
+        file_id: Optional[str],
+        metadata_source_path: Optional[str],
+    ) -> RegisterDocumentRequest:
+        """Convert legacy register args into a semantic request.
+
+        Parses the optional ISO8601 ``uploaded_at`` string (supporting a
+        trailing ``Z``); a missing or unparsable value becomes ``None`` so the
+        handle applies its default timestamp.
+        """
+        uploaded_at_dt: Optional[datetime] = None
+        if uploaded_at:
+            try:
+                if uploaded_at.endswith("Z"):
+                    uploaded_at_dt = datetime.fromisoformat(
+                        uploaded_at.replace("Z", "+00:00")
+                    )
+                else:
+                    uploaded_at_dt = datetime.fromisoformat(uploaded_at)
+                if uploaded_at_dt.tzinfo is None:
+                    uploaded_at_dt = uploaded_at_dt.replace(tzinfo=timezone.utc)
+            except ValueError:
+                uploaded_at_dt = None
+
+        return RegisterDocumentRequest(
+            collection=collection,
+            file_id=file_id,
+            source_path=source_path,
+            metadata_source_path=metadata_source_path,
+            file_type=file_type,
+            doc_id=doc_id,
+            uploaded_at=uploaded_at_dt,
+            user_id=user_id,
+        )
+
     @contextmanager
     def _operation_context(
         self, *, operation_type: str, collection: str
@@ -109,22 +162,34 @@ class KBLegacyStepCompatibilityFacade:
         file_id: Optional[str] = None,
         metadata_source_path: Optional[str] = None,
     ) -> Dict[str, Any]:
-        from ..file.register_document import _register_document_public_impl
+        """Register a document row via the coordinator + collection handle.
+
+        Converts the legacy inputs into a semantic ``RegisterDocumentRequest``,
+        delegates to the coordinator (which opens the handle), and converts the
+        semantic response back into the legacy dict shape. The operation context
+        and document side-effect recording are preserved for rollback support.
+        """
+        # Preserve the legacy empty-collection contract before the coordinator
+        # normalizes the collection (which would raise a bare ValueError).
+        if not collection:
+            raise DocumentValidationError("Collection name cannot be empty")
+
+        request = self._build_register_request(
+            collection=collection,
+            source_path=source_path,
+            file_type=file_type,
+            doc_id=doc_id,
+            uploaded_at=uploaded_at,
+            user_id=user_id,
+            file_id=file_id,
+            metadata_source_path=metadata_source_path,
+        )
 
         with self._operation_context(
             operation_type="legacy_register_document", collection=collection
         ) as (operation, owns_operation):
-            with self._storage_context():
-                result = _register_document_public_impl(
-                    collection=collection,
-                    source_path=source_path,
-                    file_type=file_type,
-                    doc_id=doc_id,
-                    uploaded_at=uploaded_at,
-                    user_id=user_id,
-                    file_id=file_id,
-                    metadata_source_path=metadata_source_path,
-                )
+            response = self._active_coordinator().register_document_sync(request)
+            result: Dict[str, Any] = response.model_dump()
             self._record_document_side_effect(
                 operation,
                 collection=collection,
@@ -137,18 +202,26 @@ class KBLegacyStepCompatibilityFacade:
             return result
 
     def get_document(self, db_dir: str, collection: str, doc_id: str) -> Optional[Any]:
-        from ..file.register_document import _get_document_impl
+        """Load a document row via the handle (legacy raw-dict shape or None).
 
-        with self._storage_context():
-            return _get_document_impl(db_dir, collection, doc_id)
+        ``db_dir`` is accepted for backward compatibility and ignored. The
+        anonymous default scope reproduces the legacy ``get_document`` behavior.
+        """
+        detail = self._active_coordinator().load_document_sync(collection, doc_id)
+        return detail.to_legacy_dict() if detail is not None else None
 
     def list_documents(
         self, db_dir: str, collection: str, limit: int = 100
     ) -> list[Dict[str, Any]]:
-        from ..file.register_document import _list_documents_impl
+        """List document rows via the handle (legacy raw-dict list).
 
-        with self._storage_context():
-            return _list_documents_impl(db_dir, collection, limit)
+        ``db_dir`` is accepted for backward compatibility and ignored. Listing
+        uses admin scope to mirror the legacy file-level helper.
+        """
+        result = self._active_coordinator().list_document_records_sync(
+            collection, user_id=None, is_admin=True, limit=limit
+        )
+        return result.to_legacy_dicts()
 
     def parse_document(
         self,
