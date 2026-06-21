@@ -222,6 +222,9 @@ class FakeRuntime:
     async def should_interrupt(self) -> bool:
         return bool(self._interrupt)
 
+    async def send_message(self, **kwargs: Any) -> None:
+        self.events.append(("send_message", dict(kwargs)))
+
     def request_interrupt(self, reason: str | None = None) -> None:
         self._interrupt = True
         self.interrupt_reason = reason

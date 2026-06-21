@@ -1306,55 +1306,88 @@ class ReActPattern(AgentPattern):
             if interrupted is not None:
                 return interrupted
 
-            tool_call = self.pending_tool_calls[0]
-            control_result = await self._handle_control_tool(
-                tool_call,
-                context,
-                llm,
-                runtime,
-            )
-            if control_result is not None:
+            segment, kind = self._next_segment(self.pending_tool_calls, tools)
+
+            if kind == "control":
+                tool_call = segment[0]
+                control_result = await self._handle_control_tool(
+                    tool_call,
+                    context,
+                    llm,
+                    runtime,
+                )
                 self.pending_tool_calls = self.pending_tool_calls[1:]
                 self._forget_tool_call_content(tool_call)
                 await runtime.checkpoint(
-                    str(control_result.get("status", "control_tool")),
+                    str(control_result.get("status", "control_tool"))
+                    if control_result is not None
+                    else "control_tool",
                     context=context,
                     pattern=self,
                     metadata={"tool_call": tool_call},
                 )
-                if control_result.get("status") == "completed":
-                    self.pending_tool_calls = []
-                    return control_result
-                if control_result.get("status") == "waiting_for_user":
-                    return control_result
+                if control_result is not None:
+                    if control_result.get("status") == "completed":
+                        self.pending_tool_calls = []
+                        return control_result
+                    if control_result.get("status") == "waiting_for_user":
+                        return control_result
                 continue
 
-            await runtime.checkpoint(
-                "before_tool",
-                context=context,
-                pattern=self,
-                metadata={"tool_call": tool_call},
-            )
-            result = await self._execute_tool_safely(tool_call, tools, runtime)
-            context.add_tool_result(
-                tool_name=tool_call["name"],
-                result=result,
-                tool_call_id=tool_call.get("id"),
-            )
-            self.pending_tool_calls = self.pending_tool_calls[1:]
-            self._forget_tool_call_content(tool_call)
-            await runtime.checkpoint(
-                "after_tool",
-                context=context,
-                pattern=self,
-                metadata={"tool_call": tool_call},
-            )
+            if kind == "serial":
+                tool_call = segment[0]
+                await runtime.checkpoint(
+                    "before_tool",
+                    context=context,
+                    pattern=self,
+                    metadata={"tool_call": tool_call},
+                )
+                result = await self._execute_tool_safely(tool_call, tools, runtime)
+                self._backfill_result(tool_call, result, context)
+                self.pending_tool_calls = self.pending_tool_calls[1:]
+                await runtime.checkpoint(
+                    "after_tool",
+                    context=context,
+                    pattern=self,
+                    metadata={"tool_call": tool_call},
+                )
+                results = [result]
+            else:  # kind == "concurrent"
+                await runtime.checkpoint(
+                    "before_tool_batch",
+                    context=context,
+                    pattern=self,
+                    metadata={"tool_calls": segment},
+                )
+                results = await self._run_concurrent_batch(
+                    segment, tools, runtime, context
+                )
+                self.pending_tool_calls = self.pending_tool_calls[len(segment) :]
+                await runtime.checkpoint(
+                    "after_tool_batch",
+                    context=context,
+                    pattern=self,
+                    metadata={"tool_calls": segment},
+                )
+                # In-flight tools are not cancellable, so an interrupt that
+                # arrives during the batch is honored here, at the segment
+                # boundary. The completed (read-only, concurrency-safe) results
+                # are already recorded, which is correct for resume.
+                interrupted = await self._interrupt_if_requested(
+                    runtime=runtime,
+                    context=context,
+                    label="after_tool_batch",
+                )
+                if interrupted is not None:
+                    return interrupted
+
+            # Evaluate repeated-tool-decision once per segment, on its last call.
             requested_decision = await self._request_repeated_tool_decision_if_needed(
-                tool_call=tool_call,
+                tool_call=segment[-1],
                 context=context,
                 runtime=runtime,
             )
-            if self._tool_result_success(result):
+            if any(self._tool_result_success(result) for result in results):
                 successful_tool_result = True
             if requested_decision:
                 successful_tool_result = False
