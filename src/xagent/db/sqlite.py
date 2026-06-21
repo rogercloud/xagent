@@ -40,7 +40,29 @@ def apply_sqlite_concurrency_pragmas(
     def _set_sqlite_pragmas(dbapi_connection, _connection_record):  # type: ignore[no-untyped-def]
         cursor = dbapi_connection.cursor()
         try:
-            cursor.execute("PRAGMA journal_mode=WAL")
-            cursor.execute(f"PRAGMA busy_timeout={timeout_ms}")
+            _apply_concurrency_pragmas(cursor, timeout_ms)
         finally:
             cursor.close()
+
+
+def _apply_concurrency_pragmas(cursor, timeout_ms: int) -> None:  # type: ignore[no-untyped-def]
+    """Set the WAL + busy_timeout pragmas, best-effort.
+
+    A connect hook that raises breaks every connection, so a pragma failure must
+    never propagate. On a read-only database (or a directory where the -wal/-shm
+    sidecars cannot be created) ``PRAGMA journal_mode=WAL`` raises; we log and
+    continue. ``busy_timeout`` is connection-local (no disk write) and is set
+    independently so it still applies when WAL is unavailable.
+    """
+    try:
+        cursor.execute("PRAGMA journal_mode=WAL")
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "Could not enable SQLite WAL journal_mode (the database or its "
+            "directory may be read-only); continuing without it: %s",
+            exc,
+        )
+    try:
+        cursor.execute(f"PRAGMA busy_timeout={timeout_ms}")
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Could not set SQLite busy_timeout: %s", exc)

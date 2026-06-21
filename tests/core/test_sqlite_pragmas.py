@@ -9,6 +9,8 @@ the engine tolerate that contention. Postgres is unaffected.
 
 from __future__ import annotations
 
+import logging
+
 from sqlalchemy import create_engine
 
 
@@ -38,6 +40,31 @@ def test_apply_pragmas_default_busy_timeout(tmp_path) -> None:
 
     assert busy_timeout and busy_timeout > 0
     engine.dispose()
+
+
+def test_apply_pragmas_swallows_pragma_failures(caplog) -> None:
+    # A read-only database/directory makes ``PRAGMA journal_mode=WAL`` raise (the
+    # -wal/-shm sidecars cannot be created). The connect hook must degrade with a
+    # warning instead of crashing every connection, and still attempt the
+    # connection-local busy_timeout.
+    from xagent.db.sqlite import _apply_concurrency_pragmas
+
+    class _FailWALCursor:
+        def __init__(self) -> None:
+            self.executed: list[str] = []
+
+        def execute(self, sql: str) -> None:
+            self.executed.append(sql)
+            if "journal_mode" in sql:
+                raise RuntimeError("attempt to write a readonly database")
+
+    cursor = _FailWALCursor()
+    with caplog.at_level(logging.WARNING):
+        _apply_concurrency_pragmas(cursor, 5000)  # must not raise
+
+    assert any("journal_mode" in sql for sql in cursor.executed)
+    assert any("busy_timeout=5000" in sql for sql in cursor.executed)
+    assert any("WAL" in record.message for record in caplog.records)
 
 
 def test_apply_pragmas_noop_for_non_sqlite() -> None:
