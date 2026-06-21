@@ -600,6 +600,8 @@ class ReActPattern(AgentPattern):
             "current_iteration": self.current_iteration,
             "max_iterations": self.max_iterations,
             "finalize_after_tool_result": self.finalize_after_tool_result,
+            "tool_parallel_enabled": self.tool_parallel_enabled,
+            "tool_max_concurrency": self.tool_max_concurrency,
             "repeated_tool_decision_after_consecutive_tool_calls": (
                 self.repeated_tool_decision_after_consecutive_tool_calls
             ),
@@ -629,6 +631,10 @@ class ReActPattern(AgentPattern):
         self.finalize_after_tool_result = bool(
             state.get("finalize_after_tool_result", self.finalize_after_tool_result)
         )
+        if "tool_parallel_enabled" in state:
+            self.tool_parallel_enabled = bool(state["tool_parallel_enabled"])
+        if "tool_max_concurrency" in state:
+            self.tool_max_concurrency = max(1, int(state["tool_max_concurrency"]))
         if "repeated_tool_decision_after_consecutive_tool_calls" in state:
             raw_threshold = state["repeated_tool_decision_after_consecutive_tool_calls"]
             self.repeated_tool_decision_after_consecutive_tool_calls = (

@@ -16,6 +16,8 @@ behavior:
 
 from __future__ import annotations
 
+import pytest
+
 from tests.core.agent.concurrency_harness import (
     FakeRuntime,
     FakeTool,
@@ -165,3 +167,39 @@ async def test_flag_off_runs_everything_serially() -> None:
     assert statuses.count("before_tool") == 2
     assert statuses.count("after_tool") == 2
     assert [r["tool_name"] for r in context.tool_results] == ["s1", "s2"]
+
+
+# --- Inc.6: checkpoint / resume of the concurrency knobs --------------------
+
+
+def test_get_state_load_state_round_trips_concurrency_fields() -> None:
+    pattern = make_react(parallel=True, max_concurrency=5)
+    state = pattern.get_state()
+    assert state["tool_parallel_enabled"] is True
+    assert state["tool_max_concurrency"] == 5
+
+    restored = make_react(parallel=False, max_concurrency=1)
+    restored.load_state(state)
+    assert restored.tool_parallel_enabled is True
+    assert restored.tool_max_concurrency == 5
+
+
+async def test_crash_during_batch_keeps_segment_pending_for_resume() -> None:
+    # If the process dies mid-batch (before backfill/dequeue), the whole segment
+    # must remain pending so resume re-executes it (concurrency-safe tools are
+    # idempotent). Backfill is where the crash is simulated.
+    class ExplodingContext(RecordingContext):
+        def add_tool_result(self, *args, **kwargs):
+            raise RuntimeError("crash during backfill")
+
+    tools = [FakeTool("s1", read_only=True), FakeTool("s2", read_only=True)]
+    pattern = _make_pattern()
+    pattern.pending_tool_calls = [make_tool_call("s1"), make_tool_call("s2")]
+
+    with pytest.raises(RuntimeError, match="crash during backfill"):
+        await pattern._execute_pending_tool_calls(
+            context=ExplodingContext(), tools=tools, llm=None, runtime=FakeRuntime()
+        )
+
+    # Segment was not dequeued -> available for re-execution on resume.
+    assert [tc["name"] for tc in pattern.pending_tool_calls] == ["s1", "s2"]
