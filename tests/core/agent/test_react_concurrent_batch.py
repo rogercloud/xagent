@@ -127,3 +127,92 @@ async def test_exception_isolation_within_batch() -> None:
     assert results[1]["success"] is False
     assert "kaboom" in results[1]["error"]
     assert results[2]["success"] is True
+
+
+# --- Inc.4: tool_ledger ordering after a concurrent batch (I3) -------------
+
+
+def test_reorder_ledger_for_batch_restores_input_order() -> None:
+    # Simulate interleaved completion writing batch records out of order, with
+    # a pre-existing record before the batch that must keep its position.
+    pattern = make_react(parallel=True)
+    pattern._record_tool_call(
+        make_tool_call("earlier", id="e0"), status="completed", result={"success": True}
+    )
+    batch = [
+        make_tool_call("s1", id="b1"),
+        make_tool_call("s2", id="b2"),
+        make_tool_call("s3", id="b3"),
+    ]
+    for tool_call in (batch[2], batch[0], batch[1]):  # scrambled order
+        pattern._record_tool_call(
+            tool_call, status="completed", result={"success": True}
+        )
+    assert list(pattern.tool_ledger.keys()) == ["e0", "b3", "b1", "b2"]
+
+    pattern._reorder_ledger_for_batch(batch)
+
+    assert list(pattern.tool_ledger.keys()) == ["e0", "b1", "b2", "b3"]
+
+
+async def test_concurrent_batch_keeps_ledger_in_input_order() -> None:
+    names = ["s1", "s2", "s3"]
+    tracker = ConcurrencyTracker()
+    gates = {name: asyncio.Event() for name in names}
+    tools = [
+        FakeTool(name, concurrency_safe=True, gate=gates[name], tracker=tracker)
+        for name in names
+    ]
+    pattern = make_react(parallel=True, max_concurrency=3)
+    context = RecordingContext()
+    batch = [make_tool_call(name) for name in names]
+
+    task = asyncio.create_task(
+        pattern._run_concurrent_batch(batch, tools, FakeRuntime(), context)
+    )
+    while tracker.active < 3:
+        await asyncio.sleep(0)
+    for index, name in enumerate(["s3", "s2", "s1"], start=1):  # reverse completion
+        gates[name].set()
+        while len(tracker.leave_order) < index:
+            await asyncio.sleep(0)
+    await task
+
+    assert [tc["id"] for tc in batch] == list(pattern.tool_ledger.keys())
+
+
+async def test_concurrent_batch_updates_consecutive_group_count() -> None:
+    group = "search"
+    names = ["s1", "s2", "s3"]
+    tools = [
+        FakeTool(name, concurrency_safe=True, decision_group=group) for name in names
+    ]
+    pattern = make_react(parallel=True, max_concurrency=3)
+    pattern._tool_decision_groups_by_name = pattern._tool_decision_groups_for_tools(
+        tools
+    )
+    context = RecordingContext()
+    batch = [make_tool_call(name) for name in names]
+
+    await pattern._run_concurrent_batch(batch, tools, FakeRuntime(), context)
+
+    assert pattern._consecutive_successful_tool_group_count(group) == 3
+
+
+async def test_concurrent_batch_with_failure_counts_work_calls() -> None:
+    tools = [
+        FakeTool("s1", concurrency_safe=True),
+        FakeTool("boom", concurrency_safe=True, raises=RuntimeError("x")),
+        FakeTool("s3", concurrency_safe=True),
+    ]
+    pattern = make_react(parallel=True, max_concurrency=3)
+    pattern._tool_decision_groups_by_name = pattern._tool_decision_groups_for_tools(
+        tools
+    )
+    context = RecordingContext()
+    batch = [make_tool_call(name) for name in ["s1", "boom", "s3"]]
+
+    await pattern._run_concurrent_batch(batch, tools, FakeRuntime(), context)
+
+    # completed + failed both count as work calls.
+    assert pattern._consecutive_work_tool_call_count() == 3

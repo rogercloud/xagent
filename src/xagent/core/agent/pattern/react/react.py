@@ -1264,7 +1264,29 @@ class ReActPattern(AgentPattern):
 
         for tool_call, result in zip(batch, results):
             self._backfill_result(tool_call, result, context)
+        self._reorder_ledger_for_batch(batch)
         return results
+
+    def _reorder_ledger_for_batch(self, batch: list[dict[str, Any]]) -> None:
+        """Reassert input order for this batch's ledger records (I3).
+
+        Concurrent execution can interleave ``_record_tool_call`` writes, so the
+        batch's records may land out of order in the insertion-ordered ledger.
+        ``_consecutive_*_count`` walk the ledger in reverse insertion order, so
+        we pop this batch's records and re-insert them at the tail in the
+        original tool-call order. Records keep their latest (final) state; only
+        their relative position is restored.
+        """
+        ids = [str(tool_call.get("id") or "") for tool_call in batch]
+        records = {
+            tool_id: self.tool_ledger.pop(tool_id)
+            for tool_id in ids
+            if tool_id in self.tool_ledger
+        }
+        for tool_id in ids:
+            record = records.get(tool_id)
+            if record is not None:
+                self.tool_ledger[tool_id] = record
 
     async def _execute_pending_tool_calls(
         self,
