@@ -24,7 +24,12 @@ from ..core.exceptions import (
     DocumentValidationError,
     HashComputationError,
 )
-from ..core.schemas import RegisterDocumentRequest, RegisterDocumentResponse
+from ..core.schemas import (
+    DocumentRecordDetail,
+    DocumentRecordListResult,
+    RegisterDocumentRequest,
+    RegisterDocumentResponse,
+)
 from ..storage.contracts import MetadataStore, VectorIndexStore
 from ..utils import check_file_type, compute_file_hash
 from ..utils.string_utils import generate_deterministic_doc_id
@@ -71,6 +76,21 @@ class KBCollectionHandle(ABC):
         Preserves deterministic doc_id generation, content-hash calculation,
         file-type detection, and the exact persisted field set.
         """
+
+    @abstractmethod
+    def load_document(
+        self, doc_id: str, *, user_id: int | None = None, is_admin: bool = False
+    ) -> DocumentRecordDetail | None:
+        """Load a single document row by id within the given scope.
+
+        Returns ``None`` when the row is absent or not visible to the scope.
+        """
+
+    @abstractmethod
+    def list_documents(
+        self, *, user_id: int | None = None, is_admin: bool = False, limit: int = 100
+    ) -> DocumentRecordListResult:
+        """List document rows for this collection as a semantic result."""
 
 
 @dataclass(frozen=True)
@@ -198,3 +218,68 @@ class LanceDBCollectionHandle(KBCollectionHandle):
             created=created,
             content_hash=content_hash,
         )
+
+    def load_document(
+        self, doc_id: str, *, user_id: int | None = None, is_admin: bool = False
+    ) -> DocumentRecordDetail | None:
+        """Load a document row by id within this collection's scope.
+
+        Mirrors the legacy ``_get_document_impl``: an existence check followed
+        by a single-row read. Returns ``None`` when the row is absent or not
+        visible to the given scope.
+        """
+        vector_store = self.vector_index_store
+        query_filters = {"collection": self.context.collection, "doc_id": doc_id}
+        try:
+            if (
+                vector_store.count_rows_or_zero(
+                    "documents",
+                    filters=query_filters,
+                    user_id=user_id,
+                    is_admin=is_admin,
+                )
+                == 0
+            ):
+                return None
+
+            for batch in vector_store.iter_batches(
+                table_name="documents",
+                filters=query_filters,
+                user_id=user_id,
+                is_admin=is_admin,
+            ):
+                batch_df = batch.to_pandas()
+                for _, row in batch_df.iterrows():
+                    return DocumentRecordDetail.from_row(row.to_dict())
+            return None
+        except Exception as e:
+            raise DatabaseOperationError(f"Failed to retrieve document: {e}") from e
+
+    def list_documents(
+        self, *, user_id: int | None = None, is_admin: bool = False, limit: int = 100
+    ) -> DocumentRecordListResult:
+        """List document rows for this collection.
+
+        Mirrors the legacy file-level ``_list_documents_impl``: a batch scan of
+        the documents table filtered by collection, honoring ``limit``.
+        """
+        vector_store = self.vector_index_store
+        query_filters = {"collection": self.context.collection}
+        records: list[DocumentRecordDetail] = []
+        try:
+            for batch in vector_store.iter_batches(
+                table_name="documents",
+                filters=query_filters,
+                user_id=user_id,
+                is_admin=is_admin,
+            ):
+                batch_df = batch.to_pandas()
+                for _, row in batch_df.iterrows():
+                    records.append(DocumentRecordDetail.from_row(row.to_dict()))
+                    if len(records) >= limit:
+                        break
+                if len(records) >= limit:
+                    break
+        except Exception as e:
+            raise DatabaseOperationError(f"Failed to list documents: {e}") from e
+        return DocumentRecordListResult(documents=records, total_count=len(records))

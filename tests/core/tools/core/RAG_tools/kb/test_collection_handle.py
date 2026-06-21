@@ -139,3 +139,103 @@ class TestHandleRegisterDocument:
                     collection="coll", source_path="/no/such/file.txt"
                 )
             )
+
+
+def _register(handle: LanceDBCollectionHandle, src: Path, doc_id: str, **kwargs):
+    src.write_text(kwargs.pop("content", f"content of {doc_id}"))
+    return handle.register_document(
+        RegisterDocumentRequest(
+            collection=handle.context.collection,
+            source_path=str(src),
+            doc_id=doc_id,
+            **kwargs,
+        )
+    )
+
+
+class TestHandleLoadDocument:
+    def test_admin_scope_returns_detail(self, tmp_path: Path) -> None:
+        handle = make_handle("coll")
+        _register(handle, tmp_path / "a.txt", "doc-1", user_id=7, file_id="f9")
+
+        detail = handle.load_document("doc-1", user_id=None, is_admin=True)
+
+        assert detail is not None
+        assert detail.collection == "coll"
+        assert detail.doc_id == "doc-1"
+        assert detail.file_type == "txt"
+        assert detail.user_id == 7
+        assert detail.content_hash is not None
+        assert len(detail.content_hash) == 64
+        # Lossless legacy shape: full 10-column row dict.
+        assert set(detail.to_legacy_dict().keys()) == {
+            "collection",
+            "doc_id",
+            "file_id",
+            "source_path",
+            "file_type",
+            "content_hash",
+            "uploaded_at",
+            "title",
+            "language",
+            "user_id",
+        }
+
+    def test_anonymous_scope_returns_none(self, tmp_path: Path) -> None:
+        handle = make_handle("coll")
+        _register(handle, tmp_path / "a.txt", "doc-1")  # user_id=None
+
+        # Default (anonymous) scope sees no rows -> None (matches legacy
+        # get_document behavior locked by the characterization oracle).
+        assert handle.load_document("doc-1") is None
+
+    def test_missing_returns_none(self, tmp_path: Path) -> None:
+        handle = make_handle("coll")
+        _register(handle, tmp_path / "a.txt", "exists")
+        assert handle.load_document("nope", is_admin=True) is None
+
+
+class TestHandleListDocuments:
+    def test_returns_result_and_maps_to_legacy(self, tmp_path: Path) -> None:
+        handle = make_handle("coll_a")
+        _register(handle, tmp_path / "a1.txt", "a1")
+        _register(handle, tmp_path / "a2.txt", "a2")
+        # A doc in a different collection must not leak in.
+        other = make_handle("coll_b")
+        _register(other, tmp_path / "b1.txt", "b1")
+
+        result = handle.list_documents(is_admin=True, limit=100)
+
+        assert result.total_count == 2
+        legacy = result.to_legacy_dicts()
+        assert {row["doc_id"] for row in legacy} == {"a1", "a2"}
+        for row in legacy:
+            assert row["collection"] == "coll_a"
+            assert set(row.keys()) == {
+                "collection",
+                "doc_id",
+                "file_id",
+                "source_path",
+                "file_type",
+                "content_hash",
+                "uploaded_at",
+                "title",
+                "language",
+                "user_id",
+            }
+
+    def test_limit_is_honored(self, tmp_path: Path) -> None:
+        handle = make_handle("coll")
+        _register(handle, tmp_path / "a1.txt", "a1")
+        _register(handle, tmp_path / "a2.txt", "a2")
+
+        result = handle.list_documents(is_admin=True, limit=1)
+        assert result.total_count == 1
+        assert len(result.documents) == 1
+
+    def test_empty_collection_returns_empty_result(self, tmp_path: Path) -> None:
+        handle = make_handle("coll")
+        result = handle.list_documents(is_admin=True, limit=10)
+        assert result.total_count == 0
+        assert result.documents == []
+        assert result.to_legacy_dicts() == []
