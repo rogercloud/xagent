@@ -8,6 +8,12 @@ from collections.abc import Coroutine
 from contextvars import copy_context
 from typing import Any, Optional, TypeVar
 
+from ..core.schemas import (
+    DocumentRecordDetail,
+    DocumentRecordListResult,
+    RegisterDocumentRequest,
+    RegisterDocumentResponse,
+)
 from ..storage.factory import StorageFactory
 from ..utils.user_scope import resolve_user_scope
 from .api_compatibility import KBApiCompatibilityFacade
@@ -275,6 +281,128 @@ class KBCoordinator:
     ) -> LanceDBCollectionHandle:
         """Synchronous wrapper for opening a collection handle."""
         return _run_in_separate_loop(self.open_collection(request))
+
+    # --- Document-row lifecycle (delegated to the collection handle) ---
+
+    async def register_document(
+        self, request: RegisterDocumentRequest
+    ) -> RegisterDocumentResponse:
+        """Open the collection handle and register a document row."""
+        handle = await self.open_collection(
+            KBContextRequest(
+                collection=request.collection,
+                user_id=request.user_id,
+                access_mode=KBAccessMode.WRITE,
+                hide_missing=True,
+            )
+        )
+        return handle.register_document(request)
+
+    def register_document_sync(
+        self, request: RegisterDocumentRequest
+    ) -> RegisterDocumentResponse:
+        """Synchronous wrapper for :meth:`register_document`."""
+        return _run_in_separate_loop(self.register_document(request))
+
+    async def load_document(
+        self,
+        collection: str,
+        doc_id: str,
+        *,
+        user_id: Optional[int] = None,
+        is_admin: bool = False,
+    ) -> DocumentRecordDetail | None:
+        """Open the collection handle and load a document row by id."""
+        handle = await self.open_collection(
+            KBContextRequest(
+                collection=collection,
+                user_id=user_id,
+                is_admin=is_admin,
+                hide_missing=True,
+            )
+        )
+        return handle.load_document(doc_id, user_id=user_id, is_admin=is_admin)
+
+    def load_document_sync(
+        self,
+        collection: str,
+        doc_id: str,
+        *,
+        user_id: Optional[int] = None,
+        is_admin: bool = False,
+    ) -> DocumentRecordDetail | None:
+        """Synchronous wrapper for :meth:`load_document`."""
+        return _run_in_separate_loop(
+            self.load_document(collection, doc_id, user_id=user_id, is_admin=is_admin)
+        )
+
+    async def list_document_records(
+        self,
+        collection: str,
+        *,
+        user_id: Optional[int] = None,
+        is_admin: bool = False,
+        limit: int = 100,
+    ) -> DocumentRecordListResult:
+        """Open the collection handle and list document rows."""
+        handle = await self.open_collection(
+            KBContextRequest(
+                collection=collection,
+                user_id=user_id,
+                is_admin=is_admin,
+                hide_missing=True,
+            )
+        )
+        return handle.list_documents(user_id=user_id, is_admin=is_admin, limit=limit)
+
+    def list_document_records_sync(
+        self,
+        collection: str,
+        *,
+        user_id: Optional[int] = None,
+        is_admin: bool = False,
+        limit: int = 100,
+    ) -> DocumentRecordListResult:
+        """Synchronous wrapper for :meth:`list_document_records`."""
+        return _run_in_separate_loop(
+            self.list_document_records(
+                collection, user_id=user_id, is_admin=is_admin, limit=limit
+            )
+        )
+
+    async def delete_document_record(
+        self,
+        collection: str,
+        doc_id: str,
+        *,
+        user_id: Optional[int] = None,
+        is_admin: bool = False,
+    ) -> int:
+        """Open the collection handle and delete a document row (no cascade)."""
+        handle = await self.open_collection(
+            KBContextRequest(
+                collection=collection,
+                user_id=user_id,
+                is_admin=is_admin,
+                hide_missing=True,
+            )
+        )
+        return handle.delete_document_record(doc_id, user_id=user_id, is_admin=is_admin)
+
+    def delete_document_record_sync(
+        self,
+        collection: str,
+        doc_id: str,
+        *,
+        user_id: Optional[int] = None,
+        is_admin: bool = False,
+    ) -> int:
+        """Synchronous wrapper for :meth:`delete_document_record`."""
+        return _run_in_separate_loop(
+            self.delete_document_record(
+                collection, doc_id, user_id=user_id, is_admin=is_admin
+            )
+        )
 
     @staticmethod
     def _normalize_collection(collection: str) -> str:
