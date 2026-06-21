@@ -1623,6 +1623,105 @@ class DocumentListResult(BaseModel):
     )
 
 
+class DocumentRecordDetail(BaseModel):
+    """Semantic record for a single ``documents`` table row.
+
+    This is the handle-owned, lean document-row type introduced in #508. It
+    mirrors the full ``documents`` table schema (see LanceDB schema_manager) so
+    it can be mapped losslessly back to the legacy ``list[dict]`` shape used by
+    the file-level ``get_document`` / ``list_documents`` helpers.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    collection: str = Field(..., description="Collection name for data isolation")
+    doc_id: str = Field(..., description="Document identifier inside the collection")
+    file_id: Optional[str] = Field(
+        None, description="UploadedFile file_id for stable file association"
+    )
+    source_path: Optional[str] = Field(
+        None, description="Stored (metadata) source path for the document"
+    )
+    file_type: Optional[str] = Field(None, description="Detected document file type")
+    content_hash: Optional[str] = Field(
+        None, description="SHA256 hash of the document content"
+    )
+    uploaded_at: Optional[datetime] = Field(None, description="Upload timestamp")
+    title: Optional[str] = Field(None, description="Optional document title")
+    language: Optional[str] = Field(None, description="Optional document language")
+    user_id: Optional[int] = Field(
+        None, description="Owner user id for multi-tenancy (None for legacy data)"
+    )
+
+    @classmethod
+    def from_row(cls, row: Dict[str, Any]) -> "DocumentRecordDetail":
+        """Build a record from a raw ``documents`` table row dict.
+
+        Pandas null sentinels (``None``, ``NaN``, ``NaT``) are normalized to
+        ``None``; ``user_id`` is coerced to a plain Python ``int``.
+        """
+
+        def clean(value: Any) -> Any:
+            if value is None:
+                return None
+            try:
+                # NaN / NaT are never equal to themselves.
+                if value != value:  # noqa: PLR0124
+                    return None
+            except Exception:  # noqa: BLE001 - non-comparable values are kept
+                pass
+            return value
+
+        user_id = clean(row.get("user_id"))
+        return cls(
+            collection=clean(row.get("collection")),
+            doc_id=clean(row.get("doc_id")),
+            file_id=clean(row.get("file_id")),
+            source_path=clean(row.get("source_path")),
+            file_type=clean(row.get("file_type")),
+            content_hash=clean(row.get("content_hash")),
+            uploaded_at=clean(row.get("uploaded_at")),
+            title=clean(row.get("title")),
+            language=clean(row.get("language")),
+            user_id=int(user_id) if user_id is not None else None,
+        )
+
+    def to_legacy_dict(self) -> Dict[str, Any]:
+        """Return the legacy raw-row dict shape (all ``documents`` columns)."""
+        return {
+            "collection": self.collection,
+            "doc_id": self.doc_id,
+            "file_id": self.file_id,
+            "source_path": self.source_path,
+            "file_type": self.file_type,
+            "content_hash": self.content_hash,
+            "uploaded_at": self.uploaded_at,
+            "title": self.title,
+            "language": self.language,
+            "user_id": self.user_id,
+        }
+
+
+class DocumentRecordListResult(BaseModel):
+    """Lean result for handle-level document-row listings (#508).
+
+    Distinct from :class:`DocumentListResult` (which aggregates parse/chunk/
+    embedding/status counts); this carries only ``documents`` rows and maps
+    back to the legacy ``list[dict]`` shape.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    documents: List[DocumentRecordDetail] = Field(
+        default_factory=list, description="Document rows for the collection"
+    )
+    total_count: int = Field(..., ge=0, description="Number of document rows returned")
+
+    def to_legacy_dicts(self) -> List[Dict[str, Any]]:
+        """Return the legacy ``list[dict]`` shape for all rows."""
+        return [record.to_legacy_dict() for record in self.documents]
+
+
 class DocumentOperationResult(BaseModel):
     """Standard response for document management operations."""
 
