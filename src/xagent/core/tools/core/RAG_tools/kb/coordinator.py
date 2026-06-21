@@ -296,7 +296,9 @@ class KBCoordinator:
                 hide_missing=True,
             )
         )
-        return handle.register_document(request)
+        # The handle call is synchronous and blocking (file hashing + LanceDB
+        # I/O); offload it so awaiting this method never stalls the event loop.
+        return await asyncio.to_thread(handle.register_document, request)
 
     def register_document_sync(
         self, request: RegisterDocumentRequest
@@ -321,7 +323,10 @@ class KBCoordinator:
                 hide_missing=True,
             )
         )
-        return handle.load_document(doc_id, user_id=user_id, is_admin=is_admin)
+        # Blocking LanceDB read; offload so awaiting this never stalls the loop.
+        return await asyncio.to_thread(
+            handle.load_document, doc_id, user_id=user_id, is_admin=is_admin
+        )
 
     def load_document_sync(
         self,
@@ -353,7 +358,10 @@ class KBCoordinator:
                 hide_missing=True,
             )
         )
-        return handle.list_documents(user_id=user_id, is_admin=is_admin, limit=limit)
+        # Blocking LanceDB scan; offload so awaiting this never stalls the loop.
+        return await asyncio.to_thread(
+            handle.list_documents, user_id=user_id, is_admin=is_admin, limit=limit
+        )
 
     def list_document_records_sync(
         self,
@@ -387,7 +395,10 @@ class KBCoordinator:
                 hide_missing=True,
             )
         )
-        return handle.delete_document_record(doc_id, user_id=user_id, is_admin=is_admin)
+        # Blocking LanceDB delete; offload so awaiting this never stalls the loop.
+        return await asyncio.to_thread(
+            handle.delete_document_record, doc_id, user_id=user_id, is_admin=is_admin
+        )
 
     def delete_document_record_sync(
         self,

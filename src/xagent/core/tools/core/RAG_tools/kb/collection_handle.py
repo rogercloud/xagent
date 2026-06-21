@@ -252,24 +252,15 @@ class LanceDBCollectionHandle(KBCollectionHandle):
     ) -> DocumentRecordDetail | None:
         """Load a document row by id within this collection's scope.
 
-        Mirrors the legacy ``_get_document_impl``: an existence check followed
-        by a single-row read. Returns ``None`` when the row is absent or not
-        visible to the given scope.
+        Streams the single matching row via ``iter_batches``. Returns ``None``
+        when the row is absent or not visible to the given scope.
         """
         vector_store = self.vector_index_store
         query_filters = {"collection": self.context.collection, "doc_id": doc_id}
         try:
-            if (
-                vector_store.count_rows_or_zero(
-                    "documents",
-                    filters=query_filters,
-                    user_id=user_id,
-                    is_admin=is_admin,
-                )
-                == 0
-            ):
-                return None
-
+            # iter_batches yields only non-empty batches under the same scope
+            # filter, so an absent or out-of-scope row yields nothing and we fall
+            # through to None -- a separate existence count would be redundant.
             for batch in vector_store.iter_batches(
                 table_name="documents",
                 filters=query_filters,
