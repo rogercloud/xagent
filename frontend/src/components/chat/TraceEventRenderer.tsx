@@ -109,6 +109,7 @@ interface StepAction {
     assistant_content?: string;
     error?: any;
     tool_calls?: any;
+    tool_call_id?: string;
     sandboxed?: boolean;
     inline?: boolean;
   };
@@ -190,9 +191,13 @@ const isAgentProgressEvent = (event: TraceEvent): boolean => (
 );
 
 // Process trace events into steps
-function useProcessedSteps(events: TraceEvent[], taskStatus?: string): ProcessedStep[] {
-  const { t } = useI18n();
-  return useMemo(() => {
+// Pure reducer over trace events -> ordered steps. Exported for unit testing
+// (e.g. tool_call_id attribution under in-turn tool concurrency).
+export function processTraceEvents(
+  events: TraceEvent[],
+  t: (key: string, vars?: Record<string, string | number>) => string,
+  taskStatus?: string,
+): ProcessedStep[] {
     const stepsMap = new Map<string, ProcessedStep>();
     let currentReactStepId: string | null = null;
     const orderedEvents = events
@@ -211,6 +216,26 @@ function useProcessedSteps(events: TraceEvent[], taskStatus?: string): Processed
       for (let i = step.actions.length - 1; i >= 0; i--) {
         if (step.actions[i].type === type && step.actions[i].status === 'running') {
           return step.actions[i];
+        }
+      }
+      return null;
+    };
+
+    // Match a running tool action by its tool_call_id. With concurrent tool
+    // execution several same-named tools can be in flight at once, so pairing
+    // by "last running tool" mis-attributes results; the id makes it exact.
+    // Returns null when the id is absent so callers can fall back to
+    // findLastRunningAction (legacy / single-tool events).
+    const findRunningToolByCallId = (step: ProcessedStep, toolCallId?: string) => {
+      if (!toolCallId) return null;
+      for (let i = step.actions.length - 1; i >= 0; i--) {
+        const action = step.actions[i];
+        if (
+          action.type === 'tool' &&
+          action.status === 'running' &&
+          action.data?.tool_call_id === toolCallId
+        ) {
+          return action;
         }
       }
       return null;
@@ -428,6 +453,7 @@ function useProcessedSteps(events: TraceEvent[], taskStatus?: string): Processed
         }
         // Support both data.response.tool_name and data.tool_name
         const toolName = event.data?.response?.tool_name || event.data?.tool_name || t('traceEventRenderer.unknownTool');
+        const toolCallId = event.data?.tool_call_id as string | undefined;
         const assistantContent = event.data?.response?.assistant_content || event.data?.assistant_content;
 
         if (typeof assistantContent === 'string' && assistantContent.trim()) {
@@ -461,6 +487,7 @@ function useProcessedSteps(events: TraceEvent[], taskStatus?: string): Processed
             tool: toolName,
             args: toolArgs,
             code: step.code,
+            tool_call_id: toolCallId,
             sandboxed: !!event.data?.sandboxed
           }
         });
@@ -493,7 +520,12 @@ function useProcessedSteps(events: TraceEvent[], taskStatus?: string): Processed
           // except if there's an 'error' field handled elsewhere.
         }
 
-        step.output = output;
+        // Don't clobber the step-level output scalar when multiple tools are in
+        // flight (the per-action output below is the authoritative value).
+        const toolActionCount = step.actions.filter(a => a.type === 'tool').length;
+        if (toolActionCount <= 1) {
+          step.output = output;
+        }
         const artifacts =
           typeof result === 'object' &&
             result !== null &&
@@ -501,7 +533,10 @@ function useProcessedSteps(events: TraceEvent[], taskStatus?: string): Processed
             ? result.artifacts
             : undefined;
 
-        const action = findLastRunningAction(step, 'tool');
+        const endToolCallId = event.data?.tool_call_id as string | undefined;
+        const action =
+          findRunningToolByCallId(step, endToolCallId) ||
+          findLastRunningAction(step, 'tool');
         if (action) {
           action.status = 'completed';
           action.data.output = output;
@@ -582,7 +617,9 @@ function useProcessedSteps(events: TraceEvent[], taskStatus?: string): Processed
 
         // If no running action found, or type mismatch, try to find the last action of corresponding type
         if (event.event_type === 'tool_execution_failed') {
-          const lastTool = findLastRunningAction(step, 'tool');
+          const lastTool =
+            findRunningToolByCallId(step, errorData.tool_call_id as string | undefined) ||
+            findLastRunningAction(step, 'tool');
           if (lastTool) runningAction = lastTool;
         } else if (event.event_type === 'llm_call_failed') {
           const lastLlm = findLastRunningAction(step, 'llm');
@@ -640,7 +677,14 @@ function useProcessedSteps(events: TraceEvent[], taskStatus?: string): Processed
     }
 
     return steps;
-  }, [events, taskStatus, t]);
+}
+
+function useProcessedSteps(events: TraceEvent[], taskStatus?: string): ProcessedStep[] {
+  const { t } = useI18n();
+  return useMemo(
+    () => processTraceEvents(events, t, taskStatus),
+    [events, taskStatus, t],
+  );
 }
 
 
