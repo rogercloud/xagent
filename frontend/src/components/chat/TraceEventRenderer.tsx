@@ -199,6 +199,11 @@ export function processTraceEvents(
   taskStatus?: string,
 ): ProcessedStep[] {
     const stepsMap = new Map<string, ProcessedStep>();
+    // Steps that ever had more than one tool in flight at once. Their step-level
+    // output scalar is meaningless (whichever tool finishes last would clobber
+    // it), so once a step is flagged concurrent we stop writing step.output and
+    // rely on the per-action outputs instead.
+    const concurrentSteps = new Set<string>();
     let currentReactStepId: string | null = null;
     const orderedEvents = events
       .map((event, index) => {
@@ -520,10 +525,20 @@ export function processTraceEvents(
           // except if there's an 'error' field handled elsewhere.
         }
 
-        // Don't clobber the step-level output scalar when multiple tools are in
-        // flight (the per-action output below is the authoritative value).
-        const toolActionCount = step.actions.filter(a => a.type === 'tool').length;
-        if (toolActionCount <= 1) {
+        // Detect *actual* concurrency, not just multiple tools in the step: at
+        // the moment a tool ends it is still marked 'running' (its status is set
+        // below), so >1 running tool here means siblings overlapped it. Counting
+        // total tool actions instead would wrongly suppress step.output for
+        // tools that merely ran sequentially within the same step. Once a step
+        // is concurrent the scalar is unreliable, so keep the per-action outputs
+        // authoritative and stop writing step.output for it.
+        const runningTools = step.actions.filter(
+          a => a.type === 'tool' && a.status === 'running'
+        );
+        if (runningTools.length > 1) {
+          concurrentSteps.add(stepId);
+        }
+        if (!concurrentSteps.has(stepId)) {
           step.output = output;
         }
         const artifacts =

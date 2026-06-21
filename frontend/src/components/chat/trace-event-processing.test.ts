@@ -116,6 +116,79 @@ describe("processTraceEvents tool_call_id attribution", () => {
     expect(b?.data.output).toBe("RESULT_B")
   })
 
+  it("updates step.output for sequential tools within one step", () => {
+    // Two tools run one-after-another (never overlapping). step.output must
+    // track the latest tool's output, exactly as it did before concurrency was
+    // introduced — counting total tool actions would wrongly freeze it.
+    const events = [
+      stepStart,
+      ev("tool_execution_start", {
+        tool_name: "calculator",
+        tool_call_id: "A",
+        tool_args: { expression: "1+1" },
+      }),
+      ev("tool_execution_end", {
+        tool_name: "calculator",
+        tool_call_id: "A",
+        result: { output: "RESULT_A" },
+      }),
+      ev("tool_execution_start", {
+        tool_name: "calculator",
+        tool_call_id: "B",
+        tool_args: { expression: "2+2" },
+      }),
+      ev("tool_execution_end", {
+        tool_name: "calculator",
+        tool_call_id: "B",
+        result: { output: "RESULT_B" },
+      }),
+    ]
+
+    const steps = processTraceEvents(events as never, t)
+    expect(steps[0].output).toBe("RESULT_B")
+  })
+
+  it("does not clobber step.output when tools run concurrently", () => {
+    // Both tools are in flight at once, so the step-level scalar is ambiguous;
+    // the processor leaves it unset and the per-action outputs carry the data.
+    const events = [
+      stepStart,
+      ev("tool_execution_start", {
+        tool_name: "web_search",
+        tool_call_id: "A",
+        tool_args: { query: "a" },
+      }),
+      ev("tool_execution_start", {
+        tool_name: "web_search",
+        tool_call_id: "B",
+        tool_args: { query: "b" },
+      }),
+      ev("tool_execution_end", {
+        tool_name: "web_search",
+        tool_call_id: "A",
+        result: { output: "RESULT_A" },
+      }),
+      ev("tool_execution_end", {
+        tool_name: "web_search",
+        tool_call_id: "B",
+        result: { output: "RESULT_B" },
+      }),
+    ]
+
+    const steps = processTraceEvents(events as never, t)
+    // step.output is left at its initial value, not clobbered by whichever
+    // concurrent tool happened to finish last.
+    expect(steps[0].output).not.toBe("RESULT_A")
+    expect(steps[0].output).not.toBe("RESULT_B")
+    const toolActions = steps[0].actions.filter((a) => a.type === "tool")
+    expect(toolActions.find((x) => x.data.tool_call_id === "A")?.data.output).toBe(
+      "RESULT_A"
+    )
+    expect(toolActions.find((x) => x.data.tool_call_id === "B")?.data.output).toBe(
+      "RESULT_B"
+    )
+  })
+
   it("falls back to last running tool when tool_call_id is absent (legacy)", () => {
     const events = [
       stepStart,
