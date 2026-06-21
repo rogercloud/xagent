@@ -148,12 +148,19 @@ class ReActPattern(AgentPattern):
         repeated_tool_decision_after_consecutive_work_tool_calls: int | None = (
             DEFAULT_REPEATED_TOOL_DECISION_CONSECUTIVE_WORK_TOOL_CALLS
         ),
+        tool_parallel_enabled: bool = False,
+        tool_max_concurrency: int = 3,
     ) -> None:
         self.llm = llm
         self.max_iterations = max_iterations
         self.tool_choice = tool_choice
         self.reasoning_mode = ReActReasoningMode(reasoning_mode)
         self.finalize_after_tool_result = finalize_after_tool_result
+        # In-turn tool concurrency (default off). When enabled, consecutive
+        # concurrency-safe tool calls in a single turn run as a concurrent
+        # batch bounded by ``tool_max_concurrency``.
+        self.tool_parallel_enabled = tool_parallel_enabled
+        self.tool_max_concurrency = max(1, int(tool_max_concurrency))
         self.repeated_tool_decision_after_consecutive_tool_calls = (
             repeated_tool_decision_after_consecutive_tool_calls
         )
@@ -1153,6 +1160,54 @@ class ReActPattern(AgentPattern):
             }
 
         return None
+
+    def _tool_is_concurrency_safe(self, name: str, tools: list[Any]) -> bool:
+        """Whether ``name`` may run concurrently with other safe tools.
+
+        Conservative: unknown tools and tools without the metadata flag are
+        treated as not safe.
+        """
+        try:
+            tool = self._find_tool(name, tools)
+        except ValueError:
+            return False
+        metadata = getattr(tool, "metadata", None)
+        return bool(getattr(metadata, "concurrency_safe", False))
+
+    def _next_segment(
+        self, pending: list[dict[str, Any]], tools: list[Any]
+    ) -> tuple[list[dict[str, Any]], str]:
+        """Slice the next consecutive segment off the front of ``pending``.
+
+        Returns ``(segment, kind)`` where ``kind`` is one of:
+        - ``"control"``: a single control tool (final_answer / send_message /
+          ask_user_question), which always owns its segment;
+        - ``"serial"``: a single tool executed on its own (a non-safe tool, any
+          tool when the parallel flag is off, or a lone safe tool);
+        - ``"concurrent"``: two or more consecutive concurrency-safe tools.
+        """
+        control_tool_names = self._control_tool_names()
+        first = pending[0]
+        if first["name"] in control_tool_names:
+            return [first], "control"
+        if not self.tool_parallel_enabled:
+            return [first], "serial"
+        if not self._tool_is_concurrency_safe(first["name"], tools):
+            return [first], "serial"
+
+        segment: list[dict[str, Any]] = []
+        for tool_call in pending:
+            name = tool_call["name"]
+            if name in control_tool_names:
+                break
+            if not self._tool_is_concurrency_safe(name, tools):
+                break
+            segment.append(tool_call)
+        # A lone safe tool degrades to serial: no gather/Semaphore overhead and
+        # byte-for-byte identical behavior to the current serial path.
+        if len(segment) == 1:
+            return segment, "serial"
+        return segment, "concurrent"
 
     async def _execute_pending_tool_calls(
         self,
