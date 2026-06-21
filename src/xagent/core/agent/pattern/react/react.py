@@ -1209,6 +1209,63 @@ class ReActPattern(AgentPattern):
             return segment, "serial"
         return segment, "concurrent"
 
+    def _backfill_result(
+        self, tool_call: dict[str, Any], result: Any, context: Any
+    ) -> None:
+        """Record one tool result into the context and drop its cached content.
+
+        Shared by the serial and concurrent paths so message-history ordering
+        is produced the same way regardless of execution mode.
+        """
+        context.add_tool_result(
+            tool_name=tool_call["name"],
+            result=result,
+            tool_call_id=tool_call.get("id"),
+        )
+        self._forget_tool_call_content(tool_call)
+
+    async def _run_concurrent_batch(
+        self,
+        batch: list[dict[str, Any]],
+        tools: list[Any],
+        runtime: PatternRuntime,
+        context: Any,
+    ) -> list[Any]:
+        """Run a segment of concurrency-safe tool calls and back-fill in order.
+
+        Tools run under a Semaphore via ``asyncio.gather`` (results stay aligned
+        to ``batch`` regardless of completion order, satisfying I1). Results are
+        back-filled serially in the main coroutine after all tools finish, so
+        message-history order is deterministic (I1) and every call gets exactly
+        one result (I2). ``_execute_tool_safely`` already turns tool exceptions
+        into error dicts; ``return_exceptions=True`` is a belt-and-suspenders
+        guard against unexpected failures in the execution unit itself.
+        """
+        semaphore = asyncio.Semaphore(self.tool_max_concurrency)
+
+        async def _guarded(tool_call: dict[str, Any]) -> Any:
+            async with semaphore:
+                return await self._execute_tool_safely(tool_call, tools, runtime)
+
+        raw_results = await asyncio.gather(
+            *(_guarded(tool_call) for tool_call in batch),
+            return_exceptions=True,
+        )
+
+        results: list[Any] = []
+        for tool_call, result in zip(batch, raw_results):
+            if isinstance(result, BaseException):
+                result = {
+                    "success": False,
+                    "error": str(result),
+                    "tool_name": tool_call["name"],
+                }
+            results.append(result)
+
+        for tool_call, result in zip(batch, results):
+            self._backfill_result(tool_call, result, context)
+        return results
+
     async def _execute_pending_tool_calls(
         self,
         *,
