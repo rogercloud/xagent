@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from unittest.mock import MagicMock, call
+from unittest.mock import AsyncMock, MagicMock, call
 
 import pytest
 
@@ -85,10 +85,16 @@ def test_public_vector_storage_functions_route_through_facade(monkeypatch):
 
 
 def test_vector_storage_facade_binds_storage_shim_for_read_chunks():
+    # An injected shim (no coordinator) must keep embedding reads bound to that
+    # shim's stores: the facade opens a handle through a shim-backed coordinator
+    # and the handle reads from the shim's vector store (#510 re-route).
     vector_store = MagicMock()
     vector_store.count_rows_or_zero.return_value = 0
+    metadata_store = MagicMock()
+    metadata_store.get_collection = AsyncMock(return_value=None)
     storage_shim = MagicMock()
     storage_shim.get_vector_index_store.return_value = vector_store
+    storage_shim.get_metadata_store.return_value = metadata_store
     facade = KBVectorStorageCompatibilityFacade(storage_shim=storage_shim)
 
     result = facade.read_chunks_for_embedding(
@@ -101,7 +107,6 @@ def test_vector_storage_facade_binds_storage_shim_for_read_chunks():
     )
 
     assert result == EmbeddingReadResponse(chunks=[], total_count=0, pending_count=0)
-    storage_shim.get_vector_index_store.assert_called_once_with()
     vector_store.count_rows_or_zero.assert_called_once_with(
         table_name="chunks",
         filters={"collection": "c", "doc_id": "d", "parse_hash": "p"},

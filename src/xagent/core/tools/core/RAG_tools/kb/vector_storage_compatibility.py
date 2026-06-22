@@ -15,6 +15,7 @@ from .cleanup_filters import (
     build_embedding_cleanup_filters,
     resolve_cleanup_scope,
 )
+from .models import KBAccessMode, KBContextRequest
 
 if TYPE_CHECKING:
     from ..core.schemas import (
@@ -22,6 +23,7 @@ if TYPE_CHECKING:
         EmbeddingReadResponse,
         EmbeddingWriteResponse,
     )
+    from .collection_handle import LanceDBCollectionHandle
     from .coordinator import KBCoordinator
     from .storage_shim import KBStorageShimCompatibilityFacade
 
@@ -58,6 +60,9 @@ class KBVectorStorageCompatibilityFacade:
     ) -> None:
         self._coordinator = coordinator
         self._storage_shim = storage_shim
+        # Lazily-built coordinator bound to an injected shim (see
+        # _active_coordinator); cached so repeated calls reuse one instance.
+        self._shim_coordinator: "KBCoordinator | None" = None
 
     def _active_storage_shim(self) -> "KBStorageShimCompatibilityFacade | None":
         if self._storage_shim is not None:
@@ -65,6 +70,41 @@ class KBVectorStorageCompatibilityFacade:
         if self._coordinator is not None:
             return self._coordinator.storage_shim
         return None
+
+    def _active_coordinator(self) -> "KBCoordinator":
+        if self._coordinator is not None:
+            return self._coordinator
+
+        from .coordinator import KBCoordinator, get_kb_coordinator
+
+        # An injected shim without a coordinator must keep embedding storage
+        # bound to that shim instead of leaking onto the process-global
+        # coordinator's independent stores (mirrors the parse/chunk facade).
+        if self._storage_shim is not None:
+            if self._shim_coordinator is None:
+                self._shim_coordinator = KBCoordinator(storage_shim=self._storage_shim)
+            return self._shim_coordinator
+
+        return get_kb_coordinator()
+
+    def _open_collection_handle(
+        self, collection: str, *, user_id: Optional[int], is_admin: bool
+    ) -> "LanceDBCollectionHandle":
+        """Open the collection handle that owns embedding storage (#510).
+
+        Routed through the active coordinator so an injected shim keeps
+        embedding storage bound to that shim (preserves the facade's injection
+        boundary).
+        """
+        return self._active_coordinator().open_collection_sync(
+            KBContextRequest(
+                collection=collection,
+                user_id=user_id,
+                is_admin=is_admin,
+                access_mode=KBAccessMode.WRITE,
+                hide_missing=True,
+            )
+        )
 
     @contextmanager
     def _storage_context(self) -> Iterator[None]:
@@ -86,16 +126,13 @@ class KBVectorStorageCompatibilityFacade:
         user_id: Optional[int] = None,
         is_admin: bool = False,
     ) -> None:
-        from ..vector_storage.vector_manager import _validate_query_vector_impl
+        # Query-vector validation is a pure, collection-independent check, so it
+        # delegates to the handle-owned format validator without opening a
+        # (collection-scoped) handle. ``model_tag``/``conn``/``user_id``/
+        # ``is_admin`` are retained for signature parity only.
+        from .collection_handle import validate_query_vector_format
 
-        with self._storage_context():
-            _validate_query_vector_impl(
-                query_vector,
-                model_tag=model_tag,
-                conn=conn,
-                user_id=user_id,
-                is_admin=is_admin,
-            )
+        validate_query_vector_format(query_vector)
 
     def read_chunks_for_embedding(
         self,
@@ -107,14 +144,14 @@ class KBVectorStorageCompatibilityFacade:
         user_id: Optional[int] = None,
         is_admin: bool = False,
     ) -> "EmbeddingReadResponse":
-        from ..vector_storage.vector_manager import _read_chunks_for_embedding_impl
-
         with self._storage_context():
-            return _read_chunks_for_embedding_impl(
-                collection=collection,
-                doc_id=doc_id,
-                parse_hash=parse_hash,
-                model=model,
+            handle = self._open_collection_handle(
+                collection, user_id=user_id, is_admin=is_admin
+            )
+            return handle.read_chunks_needing_embedding(
+                doc_id,
+                parse_hash,
+                model,
                 filters=filters,
                 user_id=user_id,
                 is_admin=is_admin,
@@ -127,12 +164,14 @@ class KBVectorStorageCompatibilityFacade:
         create_index: bool = True,
         user_id: Optional[int] = None,
     ) -> "EmbeddingWriteResponse":
-        from ..vector_storage.vector_manager import _write_vectors_to_db_impl
-
         with self._storage_context():
-            return _write_vectors_to_db_impl(
-                collection=collection,
-                embeddings=embeddings,
+            # Writes carry no is_admin (mirrors register_document, which opens a
+            # WRITE handle with the caller's user_id and default non-admin scope).
+            handle = self._open_collection_handle(
+                collection, user_id=user_id, is_admin=False
+            )
+            return handle.write_embeddings(
+                embeddings,
                 create_index=create_index,
                 user_id=user_id,
             )

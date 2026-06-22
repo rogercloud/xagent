@@ -605,6 +605,32 @@ class VectorIndexStore(ABC):
         """
 
     @abstractmethod
+    def delete_embedding_records(
+        self,
+        collection_name: str,
+        doc_id: str,
+        *,
+        parse_hash: Optional[str] = None,
+        chunk_ids: Optional[Sequence[str]] = None,
+        model_tag: Optional[str] = None,
+        user_id: Optional[int] = None,
+        is_admin: bool = False,
+    ) -> int:
+        """Delete only ``embeddings_{model_tag}`` row(s) for a document.
+
+        Row-only cleanup primitive (no cascade into documents/parses/chunks).
+        Embeddings live in per-model tables, so implementations enumerate the
+        matching embeddings tables: ``model_tag`` narrows to a single model's
+        table; ``None`` spans every embeddings table. ``parse_hash`` and
+        ``chunk_ids`` optionally narrow the deletion. Implementations must
+        preserve document-scoped tenant safety and be idempotent, returning 0
+        when nothing matched or no embeddings table exists.
+
+        Returns:
+            Total embedding rows deleted across matching tables (0 if none).
+        """
+
+    @abstractmethod
     def aggregate_collection_stats(
         self,
         user_id: Optional[int],

@@ -990,6 +990,58 @@ class LanceDBVectorIndexStore(VectorIndexStore):
             is_admin=is_admin,
         )
 
+    def delete_embedding_records(
+        self,
+        collection_name: str,
+        doc_id: str,
+        *,
+        parse_hash: Optional[str] = None,
+        chunk_ids: Optional[Sequence[str]] = None,
+        model_tag: Optional[str] = None,
+        user_id: Optional[int] = None,
+        is_admin: bool = False,
+    ) -> int:
+        """Delete only ``embeddings_{model_tag}`` rows for a document.
+
+        Enumerates the matching per-model embedding tables (all of them when
+        ``model_tag`` is ``None``) and deletes the rows for the resolved scope
+        without cascading into documents/parses/chunks. Idempotent: returns 0
+        when no embeddings table matches.
+        """
+        from ..kb.cleanup_filters import (
+            build_embedding_cleanup_filters,
+            resolve_cleanup_scope,
+        )
+        from ..LanceDB.schema_manager import _safe_close_table
+        from ..version_management.cascade_cleaner import _delete_rows_by_filters
+
+        scope = resolve_cleanup_scope(
+            collection=collection_name,
+            doc_id=doc_id,
+            parse_hash=parse_hash,
+            chunk_ids=chunk_ids,
+            model_tag=model_tag,
+            user_id=user_id,
+            is_admin=is_admin,
+            require_target=False,
+        )
+
+        conn = self._get_connection()
+        table_filters = build_embedding_cleanup_filters(conn, scope)
+        if not table_filters:
+            return 0
+
+        deleted = 0
+        for table_name, filter_exprs in table_filters.items():
+            table = None
+            try:
+                table = conn.open_table(table_name)
+                deleted += _delete_rows_by_filters(table, filter_exprs)
+            finally:
+                _safe_close_table(table)
+            self.invalidate_table_cache(table_name)
+        return deleted
+
     def delete_documents_data(
         self,
         collection_name: str,
@@ -1774,7 +1826,7 @@ class LanceDBVectorIndexStore(VectorIndexStore):
         """
         from ..LanceDB.model_tag_utils import to_model_tag
         from ..LanceDB.schema_manager import ensure_embeddings_table
-        from ..vector_storage.vector_manager import _is_non_recoverable_merge_error
+        from .merge_errors import is_non_recoverable_merge_error
 
         if not records:
             return
@@ -1800,7 +1852,7 @@ class LanceDBVectorIndexStore(VectorIndexStore):
                 ["collection", "doc_id", "chunk_id"]
             ).when_matched_update_all().when_not_matched_insert_all().execute(records)
         except Exception as merge_error:
-            if _is_non_recoverable_merge_error(merge_error):
+            if is_non_recoverable_merge_error(merge_error):
                 # Log critical error and re-raise without fallback
                 logger.error(
                     "merge_insert failed with non-recoverable error (error_type=%s): %s. "

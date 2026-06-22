@@ -11,6 +11,8 @@ from __future__ import annotations
 
 import json
 import logging
+import numbers
+import os
 import uuid
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
@@ -20,21 +22,30 @@ from typing import Any
 
 import pandas as pd
 
+from ..core.config import DEFAULT_LANCEDB_BATCH_SIZE
 from ..core.exceptions import (
     ConfigurationError,
     DatabaseOperationError,
     DocumentValidationError,
     HashComputationError,
+    VectorValidationError,
 )
 from ..core.schemas import (
+    ChunkEmbeddingData,
+    ChunkForEmbedding,
     ChunkRecordSnapshot,
     DocumentRecordDetail,
     DocumentRecordListResult,
+    EmbeddingReadResponse,
+    EmbeddingRecordSnapshot,
+    EmbeddingWriteResponse,
+    IndexOperation,
     ParsedParagraph,
     ParseRecordDetail,
     RegisterDocumentRequest,
     RegisterDocumentResponse,
 )
+from ..LanceDB.model_tag_utils import to_model_tag
 from ..storage.contracts import MetadataStore, VectorIndexStore
 from ..utils import check_file_type, compute_file_hash
 from ..utils.hash_utils import compute_chunk_hash
@@ -43,6 +54,60 @@ from ..utils.string_utils import generate_deterministic_doc_id
 from .models import KBBackendCapabilities, KBCollectionContext, KBStorageBackend
 
 logger = logging.getLogger(__name__)
+
+
+def _safe_int_value(value: Any, default: int = 0) -> int:
+    """Coerce a row value to ``int``, mapping ``None``/NaN to ``default``."""
+    if value is None:
+        return default
+    try:
+        if value != value:  # NaN is never equal to itself.  # noqa: PLR0124
+            return default
+    except Exception:  # noqa: BLE001 - non-comparable values fall through
+        pass
+    try:
+        return int(value)
+    except (ValueError, TypeError):
+        return default
+
+
+def _safe_optional_str(value: Any) -> str | None:
+    """Return the string value or ``None`` for ``None``/NaN sentinels."""
+    if value is None:
+        return None
+    try:
+        if value != value:  # NaN  # noqa: PLR0124
+            return None
+    except Exception:  # noqa: BLE001
+        pass
+    return str(value)
+
+
+def validate_query_vector_format(query_vector: list[float]) -> None:
+    """Validate a query vector's format and content (collection-independent).
+
+    Pure check shared by the collection handle and the vector-storage facade
+    (the facade's validate path has no collection to bind a handle). Raises
+    ``VectorValidationError`` for non-list, empty, non-numeric, or NaN/inf
+    vectors; numpy scalar types are admitted via ``numbers.Number``.
+    """
+    if not isinstance(query_vector, list):
+        raise VectorValidationError("query_vector must be a list")
+
+    if len(query_vector) == 0:
+        raise VectorValidationError("query_vector cannot be empty")
+
+    if not all(isinstance(x, numbers.Number) for x in query_vector):
+        raise VectorValidationError("query_vector must contain only numbers")
+
+    for x in query_vector:
+        if not isinstance(x, numbers.Real):
+            continue  # Skip non-real numbers (e.g. complex).
+        float_val = float(x)
+        if float_val != float_val or abs(float_val) == float("inf"):
+            raise VectorValidationError(
+                "query_vector contains invalid values (NaN or infinity)"
+            )
 
 
 class KBHandleProvider:
@@ -238,6 +303,109 @@ class KBCollectionHandle(ABC):
 
         Returns ``False`` when there are no chunks to write.
         """
+
+    # --- Embedding data-plane (#510) ---
+
+    @abstractmethod
+    def validate_query_vector(
+        self,
+        query_vector: list[float],
+        *,
+        model_tag: str | None = None,
+        user_id: int | None = None,
+        is_admin: bool = False,
+    ) -> None:
+        """Validate a query vector's format/content (no store access).
+
+        Raises ``VectorValidationError`` for non-list, empty, non-numeric, or
+        NaN/inf vectors. ``model_tag``/``user_id``/``is_admin`` are accepted for
+        signature parity and logging only.
+        """
+
+    @abstractmethod
+    def read_chunks_needing_embedding(
+        self,
+        doc_id: str,
+        parse_hash: str,
+        model: str,
+        *,
+        filters: dict[str, Any] | None = None,
+        user_id: int | None = None,
+        is_admin: bool = False,
+    ) -> EmbeddingReadResponse:
+        """Return chunks that still need an embedding for ``model``.
+
+        Reads the chunks table for ``(doc_id, parse_hash)`` and excludes
+        ``chunk_id``s already present in the ``embeddings_{model_tag}`` table.
+        """
+
+    @abstractmethod
+    def write_embeddings(
+        self,
+        embeddings: list[ChunkEmbeddingData],
+        *,
+        create_index: bool = True,
+        user_id: int | None = None,
+    ) -> EmbeddingWriteResponse:
+        """Write embedding vectors for this collection (idempotent upsert).
+
+        Groups by model, validates per-model dimension consistency, routes each
+        model to its ``embeddings_{model_tag}`` table, upserts in batches (with
+        spill-retry), and optionally creates the index. Stale deletion is a
+        no-op (``deleted_stale_count`` is always 0; merge handles overwrites).
+        """
+
+    @abstractmethod
+    def delete_embedding_records(
+        self,
+        doc_id: str,
+        *,
+        parse_hash: str | None = None,
+        chunk_ids: list[str] | None = None,
+        model_tag: str | None = None,
+        user_id: int | None = None,
+        is_admin: bool = False,
+    ) -> int:
+        """Delete embedding rows for a document across per-model tables.
+
+        Row-only (no cascade); ``model_tag`` narrows to one model's table,
+        ``None`` spans all. Idempotent; returns the total rows deleted.
+        """
+
+    # --- Embedding rollback compensation (methods only; wiring in #514) ---
+
+    @abstractmethod
+    def snapshot_embeddings(
+        self,
+        doc_id: str,
+        parse_hash: str,
+        *,
+        chunk_ids: list[str] | None = None,
+        model_tag: str | None = None,
+        user_id: int | None = None,
+        is_admin: bool = False,
+    ) -> EmbeddingRecordSnapshot | None:
+        """Capture embedding rows across matching model tables (None if absent)."""
+
+    @abstractmethod
+    def restore_embeddings(self, snapshot: EmbeddingRecordSnapshot) -> None:
+        """Restore snapshotted embedding rows, grouped per model tag.
+
+        Refuses rows from another collection (collection-guard); idempotent.
+        """
+
+    @abstractmethod
+    def delete_created_embeddings(
+        self,
+        doc_id: str,
+        parse_hash: str,
+        *,
+        chunk_ids: list[str] | None = None,
+        model_tag: str | None = None,
+        user_id: int | None = None,
+        is_admin: bool = False,
+    ) -> int:
+        """Idempotently delete newly created embedding rows (compensation)."""
 
     # --- Parse/chunk cleanup (row only, collection scoped) (#509) ---
 
@@ -886,6 +1054,438 @@ class LanceDBCollectionHandle(KBCollectionHandle):
         except Exception as e:
             logger.error("Failed to write chunk records: %s", e)
             raise DatabaseOperationError(f"Database write failed: {e}") from e
+
+    # --- Embedding data-plane (#510) ---
+
+    def validate_query_vector(
+        self,
+        query_vector: list[float],
+        *,
+        model_tag: str | None = None,
+        user_id: int | None = None,
+        is_admin: bool = False,
+    ) -> None:
+        """Validate a query vector's format and content (no store access)."""
+        validate_query_vector_format(query_vector)
+
+    def read_chunks_needing_embedding(
+        self,
+        doc_id: str,
+        parse_hash: str,
+        model: str,
+        *,
+        filters: dict[str, Any] | None = None,
+        user_id: int | None = None,
+        is_admin: bool = False,
+    ) -> EmbeddingReadResponse:
+        """Return chunks that still need an embedding for ``model``."""
+        collection = self.context.collection
+        try:
+            if not collection or not doc_id or not parse_hash or not model:
+                raise DocumentValidationError(
+                    "Collection, doc_id, parse_hash, and model are required"
+                )
+
+            vector_store = self.vector_index_store
+            query_filters: dict[str, Any] = {
+                "collection": collection,
+                "doc_id": doc_id,
+                "parse_hash": parse_hash,
+            }
+            if filters:
+                query_filters.update(filters)
+
+            total_count = vector_store.count_rows_or_zero(
+                table_name="chunks",
+                filters=query_filters,
+                user_id=user_id,
+                is_admin=is_admin,
+            )
+            if total_count == 0:
+                return EmbeddingReadResponse(chunks=[], total_count=0, pending_count=0)
+
+            chunks_data: list[dict[str, Any]] = []
+            for batch in vector_store.iter_batches(
+                table_name="chunks",
+                columns=None,
+                batch_size=1000,
+                filters=query_filters,
+                user_id=user_id,
+                is_admin=is_admin,
+            ):
+                chunks_data.extend(batch.to_pylist())
+                if len(chunks_data) >= total_count:
+                    break
+
+            # Chunks already embedded for this model tag are excluded by
+            # chunk_id presence in the per-model embeddings table.
+            embedded_chunk_ids: set[str] = set()
+            model_tag = to_model_tag(model)
+            embeddings_table_name = f"embeddings_{model_tag}"
+            try:
+                embedding_filters: dict[str, Any] = {
+                    "collection": collection,
+                    "doc_id": doc_id,
+                    "parse_hash": parse_hash,
+                }
+                embedding_count = vector_store.count_rows_or_zero(
+                    table_name=embeddings_table_name,
+                    filters=embedding_filters,
+                    user_id=user_id,
+                    is_admin=is_admin,
+                )
+                if embedding_count > 0:
+                    for batch in vector_store.iter_batches(
+                        table_name=embeddings_table_name,
+                        columns=["chunk_id"],
+                        filters=embedding_filters,
+                        user_id=user_id,
+                        is_admin=is_admin,
+                    ):
+                        for row in batch.to_pylist():
+                            chunk_id = row.get("chunk_id")
+                            if chunk_id is not None:
+                                embedded_chunk_ids.add(chunk_id)
+            except Exception as e:  # noqa: BLE001 - missing/absent table = none embedded
+                logger.warning(
+                    "Failed to query existing embeddings for model %s "
+                    "(assuming none exist): %s",
+                    model,
+                    e,
+                )
+                embedded_chunk_ids = set()
+
+            pending_chunks: list[ChunkForEmbedding] = []
+            for chunk_dict in chunks_data:
+                chunk_id = chunk_dict["chunk_id"]
+                if chunk_id in embedded_chunk_ids:
+                    continue
+                metadata = deserialize_metadata(chunk_dict.get("metadata"))
+                index = _safe_int_value(chunk_dict.get("index"), default=0)
+
+                page_number_value = chunk_dict.get("page_number")
+                if page_number_value is not None:
+                    page_num = _safe_int_value(page_number_value, default=1)
+                    page_number = page_num if page_num > 0 else None
+                else:
+                    page_number = None
+
+                pending_chunks.append(
+                    ChunkForEmbedding(
+                        doc_id=chunk_dict["doc_id"],
+                        chunk_id=chunk_id,
+                        parse_hash=chunk_dict["parse_hash"],
+                        index=index,
+                        text=chunk_dict["text"],
+                        chunk_hash=chunk_dict["chunk_hash"],
+                        page_number=page_number,
+                        section=_safe_optional_str(chunk_dict.get("section")),
+                        anchor=_safe_optional_str(chunk_dict.get("anchor")),
+                        json_path=_safe_optional_str(chunk_dict.get("json_path")),
+                        metadata=metadata,
+                    )
+                )
+
+            return EmbeddingReadResponse(
+                chunks=pending_chunks,
+                total_count=total_count,
+                pending_count=len(pending_chunks),
+            )
+        except Exception as e:
+            if isinstance(
+                e,
+                (
+                    DocumentValidationError,
+                    DatabaseOperationError,
+                    ConfigurationError,
+                    VectorValidationError,
+                ),
+            ):
+                raise
+            logger.error("Failed to read chunks for embedding: %s", e)
+            raise DatabaseOperationError(
+                f"Failed to read chunks for embedding: {e}"
+            ) from e
+
+    def write_embeddings(
+        self,
+        embeddings: list[ChunkEmbeddingData],
+        *,
+        create_index: bool = True,
+        user_id: int | None = None,
+    ) -> EmbeddingWriteResponse:
+        """Write embedding vectors for this collection (idempotent upsert)."""
+        if not embeddings:
+            return EmbeddingWriteResponse(
+                upsert_count=0,
+                deleted_stale_count=0,
+                index_status=IndexOperation.SKIPPED.value,
+            )
+
+        collection = self.context.collection
+        try:
+            if not collection:
+                raise DocumentValidationError("Collection name is required")
+
+            embeddings_by_model: dict[str, list[ChunkEmbeddingData]] = {}
+            for embedding in embeddings:
+                embeddings_by_model.setdefault(embedding.model, []).append(embedding)
+
+            total_upserted = 0
+            index_statuses: list[str] = []
+            for model, model_embeddings in embeddings_by_model.items():
+                upserted, idx_status = self._process_model_embeddings(
+                    model, model_embeddings, create_index, user_id
+                )
+                total_upserted += upserted
+                index_statuses.append(idx_status)
+
+            # Map create_index result strings onto IndexOperation.
+            if "index_building" in index_statuses:
+                overall = IndexOperation.CREATED
+            elif "index_ready" in index_statuses:
+                overall = IndexOperation.READY
+            elif "failed" in index_statuses or "index_corrupted" in index_statuses:
+                overall = IndexOperation.FAILED
+            elif "below_threshold" in index_statuses:
+                overall = IndexOperation.SKIPPED_THRESHOLD
+            else:
+                overall = IndexOperation.SKIPPED
+
+            return EmbeddingWriteResponse(
+                upsert_count=total_upserted,
+                deleted_stale_count=0,  # merge_insert handles updates automatically
+                index_status=overall.value,
+            )
+        except Exception as e:
+            if isinstance(
+                e,
+                (
+                    DocumentValidationError,
+                    DatabaseOperationError,
+                    ConfigurationError,
+                    VectorValidationError,
+                ),
+            ):
+                raise
+            logger.error("Failed to write embeddings to database: %s", e)
+            raise DatabaseOperationError(
+                f"Failed to write embeddings to database: {e}"
+            ) from e
+
+    def _process_model_embeddings(
+        self,
+        model: str,
+        model_embeddings: list[ChunkEmbeddingData],
+        create_index: bool,
+        user_id: int | None,
+    ) -> tuple[int, str]:
+        """Upsert one model's embeddings via the bound store (batched)."""
+        model_tag = to_model_tag(model)
+        vector_store = self.vector_index_store
+
+        first_dim = len(model_embeddings[0].vector)
+        unique_dims = {len(item.vector) for item in model_embeddings}
+        if len(unique_dims) > 1:
+            raise VectorValidationError(
+                f"Multiple vector dimensions found for model {model}: {unique_dims}"
+            )
+
+        original_batch_size = int(
+            os.getenv("LANCEDB_BATCH_SIZE", str(DEFAULT_LANCEDB_BATCH_SIZE))
+        )
+        batch_size = original_batch_size
+        batch_timestamp = pd.Timestamp.now(tz="UTC")
+        max_spill_retries = int(os.getenv("LANCEDB_MAX_SPILL_RETRIES", "3"))
+        spill_retry_count = 0
+
+        upserted_count = 0
+        current_idx = 0
+        total_embeddings = len(model_embeddings)
+
+        while current_idx < total_embeddings:
+            end_idx = min(current_idx + batch_size, total_embeddings)
+            batch_embeddings = model_embeddings[current_idx:end_idx]
+
+            records_to_merge = [
+                {
+                    "collection": self.context.collection,
+                    "doc_id": embedding.doc_id,
+                    "chunk_id": embedding.chunk_id,
+                    "parse_hash": embedding.parse_hash,
+                    "model": model,
+                    "vector": embedding.vector,
+                    "text": embedding.text,
+                    "chunk_hash": embedding.chunk_hash,
+                    "created_at": batch_timestamp,
+                    "vector_dimension": first_dim,
+                    "metadata": serialize_metadata(embedding.metadata),
+                    "user_id": user_id,
+                }
+                for embedding in batch_embeddings
+            ]
+
+            try:
+                vector_store.upsert_embeddings(model_tag, records_to_merge)
+                upserted_count += len(records_to_merge)
+                current_idx = end_idx
+                spill_retry_count = 0
+            except Exception as batch_error:  # noqa: BLE001 - spill-retry then re-raise
+                if "Spill has sent an error" in str(batch_error):
+                    spill_retry_count += 1
+                    if spill_retry_count <= max_spill_retries:
+                        if batch_size > 50:
+                            batch_size = max(50, batch_size // 2)
+                            logger.info(
+                                "Reducing batch size to %d and retrying "
+                                "(spill retry %d/%d)",
+                                batch_size,
+                                spill_retry_count,
+                                max_spill_retries,
+                            )
+                        continue
+                raise
+
+        index_status: str = IndexOperation.SKIPPED.value
+        if create_index:
+            try:
+                index_status = vector_store.create_index(
+                    model_tag, readonly=False
+                ).status
+            except Exception as index_error:  # noqa: BLE001 - index failure is non-fatal
+                logger.warning(
+                    "Failed to create index for embeddings_%s: %s",
+                    model_tag,
+                    index_error,
+                )
+                index_status = IndexOperation.FAILED.value
+
+        return upserted_count, index_status
+
+    def delete_embedding_records(
+        self,
+        doc_id: str,
+        *,
+        parse_hash: str | None = None,
+        chunk_ids: list[str] | None = None,
+        model_tag: str | None = None,
+        user_id: int | None = None,
+        is_admin: bool = False,
+    ) -> int:
+        """Delete embedding rows for a document via the bound store (no cascade)."""
+        return self.vector_index_store.delete_embedding_records(
+            self.context.collection,
+            doc_id,
+            parse_hash=parse_hash,
+            chunk_ids=chunk_ids,
+            model_tag=model_tag,
+            user_id=user_id,
+            is_admin=is_admin,
+        )
+
+    # --- Embedding rollback compensation (methods only; wiring in #514) ---
+
+    def _embedding_table_names(self, model_tag: str | None) -> list[str]:
+        """List bound embedding tables, optionally scoped to one model tag."""
+        tables = [
+            name
+            for name in self.vector_index_store.list_table_names()
+            if name.startswith("embeddings_")
+        ]
+        if model_tag is None:
+            return tables
+        candidates = {
+            f"embeddings_{model_tag}",
+            f"embeddings_{to_model_tag(model_tag)}",
+        }
+        return [name for name in tables if name in candidates]
+
+    def snapshot_embeddings(
+        self,
+        doc_id: str,
+        parse_hash: str,
+        *,
+        chunk_ids: list[str] | None = None,
+        model_tag: str | None = None,
+        user_id: int | None = None,
+        is_admin: bool = False,
+    ) -> EmbeddingRecordSnapshot | None:
+        """Capture embedding rows across matching model tables (None if absent)."""
+        vector_store = self.vector_index_store
+        query_filters = {
+            "collection": self.context.collection,
+            "doc_id": doc_id,
+            "parse_hash": parse_hash,
+        }
+        chunk_id_set = set(chunk_ids) if chunk_ids else None
+        rows: list[dict[str, Any]] = []
+        try:
+            for table_name in self._embedding_table_names(model_tag):
+                if (
+                    vector_store.count_rows_or_zero(
+                        table_name,
+                        filters=query_filters,
+                        user_id=user_id,
+                        is_admin=is_admin,
+                    )
+                    == 0
+                ):
+                    continue
+                for batch in vector_store.iter_batches(
+                    table_name=table_name,
+                    filters=query_filters,
+                    user_id=user_id,
+                    is_admin=is_admin,
+                ):
+                    for row in batch.to_pylist():
+                        if chunk_id_set is not None and row.get("chunk_id") not in (
+                            chunk_id_set
+                        ):
+                            continue
+                        rows.append(row)
+        except Exception as e:
+            logger.error("Failed to snapshot embeddings: %s", e)
+            raise DatabaseOperationError(f"Failed to snapshot embeddings: {e}") from e
+
+        if not rows:
+            return None
+        # Deterministic order across tables for a faithful restore/round trip.
+        rows.sort(key=lambda row: (row.get("model") or "", row.get("chunk_id") or ""))
+        return EmbeddingRecordSnapshot.from_rows(rows)
+
+    def restore_embeddings(self, snapshot: EmbeddingRecordSnapshot) -> None:
+        """Restore snapshotted embedding rows, grouped per model tag."""
+        if not snapshot.records:
+            return
+        for record in snapshot.records:
+            if record.collection != self.context.collection:
+                raise DocumentValidationError(
+                    f"Handle bound to collection {self.context.collection!r} "
+                    f"cannot restore an embedding snapshot from "
+                    f"{record.collection!r}"
+                )
+        for model_tag, rows in snapshot.group_by_model_tag().items():
+            self.vector_index_store.upsert_embeddings(model_tag, rows)
+
+    def delete_created_embeddings(
+        self,
+        doc_id: str,
+        parse_hash: str,
+        *,
+        chunk_ids: list[str] | None = None,
+        model_tag: str | None = None,
+        user_id: int | None = None,
+        is_admin: bool = False,
+    ) -> int:
+        """Idempotently delete newly created embedding rows (compensation)."""
+        return self.delete_embedding_records(
+            doc_id,
+            parse_hash=parse_hash,
+            chunk_ids=chunk_ids,
+            model_tag=model_tag,
+            user_id=user_id,
+            is_admin=is_admin,
+        )
 
     # --- Parse/chunk cleanup (row only, collection scoped) (#509) ---
 
