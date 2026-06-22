@@ -1554,7 +1554,7 @@ class TestListAgentsTool:
     @pytest.mark.asyncio
     async def test_list_all_agents(self) -> None:
         """Test listing all agents."""
-        db, db_path, _ = _create_session()
+        db, db_path, SessionLocal = _create_session()
         try:
             user = User(username="testuser_list", password_hash="x", is_admin=False)
             db.add(user)
@@ -1584,8 +1584,10 @@ class TestListAgentsTool:
             )
             db.add_all([draft_agent, published_agent, archived_agent])
             db.commit()
+            user_id = user.id
+            db.close()
 
-            tool = ListAgentsTool(db=db, user_id=user.id)
+            tool = ListAgentsTool(session_factory=SessionLocal, user_id=user_id)
 
             result = await tool.run_json_async({})
 
@@ -1600,7 +1602,6 @@ class TestListAgentsTool:
             assert "archived_agent" in agent_names
 
         finally:
-            db.close()
             try:
                 import os
 
@@ -1610,7 +1611,7 @@ class TestListAgentsTool:
 
     @pytest.mark.asyncio
     async def test_list_agents_hides_generated_workforce_managers(self) -> None:
-        db, db_path, _ = _create_session()
+        db, db_path, SessionLocal = _create_session()
         try:
             user = User(
                 username="testuser_list_generated_manager",
@@ -1636,8 +1637,10 @@ class TestListAgentsTool:
             )
             db.add_all([regular_agent, generated_manager])
             db.commit()
+            user_id = user.id
+            db.close()
 
-            tool = ListAgentsTool(db=db, user_id=user.id)
+            tool = ListAgentsTool(session_factory=SessionLocal, user_id=user_id)
 
             result = await tool.run_json_async({})
 
@@ -1647,7 +1650,6 @@ class TestListAgentsTool:
             assert agent_names == {"reusable_agent"}
 
         finally:
-            db.close()
             try:
                 import os
 
@@ -1658,7 +1660,7 @@ class TestListAgentsTool:
     @pytest.mark.asyncio
     async def test_list_agents_with_status_filter(self) -> None:
         """Test listing agents with status filter."""
-        db, db_path, _ = _create_session()
+        db, db_path, SessionLocal = _create_session()
         try:
             user = User(username="testuser_filter", password_hash="x", is_admin=False)
             db.add(user)
@@ -1677,8 +1679,10 @@ class TestListAgentsTool:
             )
             db.add_all([draft_agent, published_agent])
             db.commit()
+            user_id = user.id
+            db.close()
 
-            tool = ListAgentsTool(db=db, user_id=user.id)
+            tool = ListAgentsTool(session_factory=SessionLocal, user_id=user_id)
 
             # List only draft agents
             result = await tool.run_json_async({"status_filter": "draft"})
@@ -1689,7 +1693,6 @@ class TestListAgentsTool:
             assert result["agents"][0]["status"] == "draft"
 
         finally:
-            db.close()
             try:
                 import os
 
@@ -1700,7 +1703,7 @@ class TestListAgentsTool:
     @pytest.mark.asyncio
     async def test_list_agents_user_isolation(self) -> None:
         """Test that users can only see their own agents."""
-        db, db_path, _ = _create_session()
+        db, db_path, SessionLocal = _create_session()
         try:
             user1 = User(username="listuser1", password_hash="x", is_admin=False)
             user2 = User(username="listuser2", password_hash="x", is_admin=False)
@@ -1723,9 +1726,11 @@ class TestListAgentsTool:
             )
             db.add_all([user1_agent, user2_agent])
             db.commit()
+            user1_id = user1.id
+            db.close()
 
             # User1 should only see their own agents
-            tool = ListAgentsTool(db=db, user_id=user1.id)
+            tool = ListAgentsTool(session_factory=SessionLocal, user_id=user1_id)
             result = await tool.run_json_async({})
 
             assert result["status"] == "success"
@@ -1733,7 +1738,6 @@ class TestListAgentsTool:
             assert result["agents"][0]["name"] == "user1_agent"
 
         finally:
-            db.close()
             try:
                 import os
 
@@ -1744,14 +1748,16 @@ class TestListAgentsTool:
     @pytest.mark.asyncio
     async def test_list_agents_invalid_status_filter(self) -> None:
         """Test that invalid status filter returns error."""
-        db, db_path, _ = _create_session()
+        db, db_path, SessionLocal = _create_session()
         try:
             user = User(username="testuser_invalid", password_hash="x", is_admin=False)
             db.add(user)
             db.commit()
             db.refresh(user)
+            user_id = user.id
+            db.close()
 
-            tool = ListAgentsTool(db=db, user_id=user.id)
+            tool = ListAgentsTool(session_factory=SessionLocal, user_id=user_id)
 
             result = await tool.run_json_async({"status_filter": "invalid_status"})
 
@@ -1759,7 +1765,67 @@ class TestListAgentsTool:
             assert "invalid" in result["message"].lower()
 
         finally:
+            try:
+                import os
+
+                os.remove(db_path)
+            except OSError:
+                pass
+
+    def test_list_agents_tool_opens_and_closes_session_per_call(self) -> None:
+        """ListAgentsTool must open exactly one session per call and close it."""
+        import asyncio
+
+        db, db_path, SessionLocal = _create_session()
+        try:
+            user = User(
+                username="testuser_list_session_lifecycle",
+                password_hash="x",
+                is_admin=False,
+            )
+            db.add(user)
+            db.commit()
+            db.refresh(user)
+
+            agent = Agent(
+                user_id=user.id,
+                name="session_lifecycle_list_agent",
+                description="Agent for list session lifecycle test",
+                instructions="Some instructions",
+                status=AgentStatus.DRAFT,
+            )
+            db.add(agent)
+            db.commit()
+            seeded_user_id = user.id
             db.close()
+
+            opened: list = []
+            closed: list = []
+
+            def tracking_factory():
+                s = SessionLocal()
+                orig_close = s.close
+
+                # Session has no __slots__; instance attr shadows the method
+                def tracked_close():
+                    closed.append(s)
+                    orig_close()
+
+                s.close = tracked_close
+                opened.append(s)
+                return s
+
+            tool = ListAgentsTool(
+                session_factory=tracking_factory, user_id=seeded_user_id
+            )
+            result = asyncio.run(tool.run_json_async({}))
+
+            assert result["status"] == "success"
+            assert result["total_count"] == 1
+            assert len(opened) == 1, f"expected 1 session opened, got {len(opened)}"
+            assert closed == opened, "session was not closed after the call"
+
+        finally:
             try:
                 import os
 

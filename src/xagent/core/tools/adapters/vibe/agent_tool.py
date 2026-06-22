@@ -1145,7 +1145,7 @@ class ListAgentsTool(AbstractBaseTool):
 
     def __init__(
         self,
-        db: Any,
+        session_factory: Any,
         user_id: int,
         task_id: Optional[str] = None,
         workspace_base_dir: Optional[str] = None,
@@ -1154,12 +1154,12 @@ class ListAgentsTool(AbstractBaseTool):
         Initialize the list agents tool.
 
         Args:
-            db: Database session for querying agents
+            session_factory: Callable that returns a new database session per call
             user_id: User ID for filtering user's agents
             task_id: Task ID for context
             workspace_base_dir: Base directory for workspace files
         """
-        self._db = db
+        self._session_factory = session_factory
         self._user_id = user_id
         self._task_id = task_id
         if workspace_base_dir is None:
@@ -1216,6 +1216,7 @@ class ListAgentsTool(AbstractBaseTool):
 
     async def run_json_async(self, args: Mapping[str, Any]) -> Any:
         """List all agents for the current user."""
+        from .db_session import tool_session_scope
         from .....web.models.agent import Agent
 
         try:
@@ -1232,39 +1233,40 @@ class ListAgentsTool(AbstractBaseTool):
                     message=f"Error: Invalid status_filter '{status_filter}'. Must be 'draft', 'published', or 'archived'",
                 ).model_dump()
 
-            # Build query
-            query = _apply_owned_agent_tool_filters(
-                self._db.query(Agent),
-                Agent,
-                user_id=self._user_id,
-            )
-
-            # Apply status filter if provided
-            if status_filter:
-                query = query.filter(Agent.status == status_filter)
-
-            # Order by status (draft first) then by name
-            agents = query.order_by(Agent.status, Agent.name).all()
-
-            # Build agent info list
-            agent_infos = []
-            for agent in agents:
-                tool_name = gen_agent_tool_name(agent.id)
-                markdown_link = f"[{agent.name}](agent://{agent.id})"
-
-                agent_info = AgentInfo(
-                    agent_id=agent.id,
-                    name=agent.name,
-                    description=agent.description or "No description",
-                    status=agent.status.value,
-                    tool_name=tool_name,
-                    markdown_link=markdown_link,
-                    execution_mode=agent.execution_mode or "react",
-                    knowledge_bases=agent.knowledge_bases,
-                    tool_categories=agent.tool_categories,
-                    skills=agent.skills if agent.skills else None,
+            with tool_session_scope(self._session_factory) as db:
+                # Build query
+                query = _apply_owned_agent_tool_filters(
+                    db.query(Agent),
+                    Agent,
+                    user_id=self._user_id,
                 )
-                agent_infos.append(agent_info.model_dump())
+
+                # Apply status filter if provided
+                if status_filter:
+                    query = query.filter(Agent.status == status_filter)
+
+                # Order by status (draft first) then by name
+                agents = query.order_by(Agent.status, Agent.name).all()
+
+                # Build agent info list
+                agent_infos = []
+                for agent in agents:
+                    tool_name = gen_agent_tool_name(agent.id)
+                    markdown_link = f"[{agent.name}](agent://{agent.id})"
+
+                    agent_info = AgentInfo(
+                        agent_id=agent.id,
+                        name=agent.name,
+                        description=agent.description or "No description",
+                        status=agent.status.value,
+                        tool_name=tool_name,
+                        markdown_link=markdown_link,
+                        execution_mode=agent.execution_mode or "react",
+                        knowledge_bases=agent.knowledge_bases,
+                        tool_categories=agent.tool_categories,
+                        skills=agent.skills if agent.skills else None,
+                    )
+                    agent_infos.append(agent_info.model_dump())
 
             total_count = len(agent_infos)
             filter_msg = (
@@ -2217,13 +2219,13 @@ async def create_list_agents_tool(config: "WebToolConfig") -> list[AbstractBaseT
         return []
 
     try:
-        db = config.get_db()
+        factory = config.get_session_factory()
         user_id = config.get_user_id()
         if not user_id:
             return []
 
         tool = ListAgentsTool(
-            db=db,
+            session_factory=factory,
             user_id=user_id,
             task_id=config.get_task_id(),
             workspace_base_dir=None,  # Will use get_uploads_dir() default
