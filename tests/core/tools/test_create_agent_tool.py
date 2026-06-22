@@ -155,7 +155,9 @@ class TestCreateAgentTool:
                     )
                     assert agent is not None
                     assert agent.status == AgentStatus.DRAFT
-                    assert agent.instructions == "You are a test agent for unit testing."
+                    assert (
+                        agent.instructions == "You are a test agent for unit testing."
+                    )
                 finally:
                     verify_db.close()
 
@@ -1043,7 +1045,7 @@ class TestUpdateAgentTool:
     @pytest.mark.asyncio
     async def test_update_agent_success(self) -> None:
         """Test successful agent update."""
-        db, db_path, _ = _create_session()
+        db, db_path, SessionLocal = _create_session()
         try:
             user = User(username="testuser_update", password_hash="x", is_admin=False)
             db.add(user)
@@ -1065,7 +1067,9 @@ class TestUpdateAgentTool:
             with patch(
                 "xagent.web.services.agent_store.invalidate_agent_cache"
             ) as mock_invalidate_agent_cache:
-                tool = UpdateAgentTool(db=db, user_id=user.id, task_id="test_task")
+                tool = UpdateAgentTool(
+                    session_factory=SessionLocal, user_id=user.id, task_id="test_task"
+                )
 
                 result = await tool.run_json_async(
                     {
@@ -1102,7 +1106,7 @@ class TestUpdateAgentTool:
     @pytest.mark.asyncio
     async def test_update_agent_partial_update(self) -> None:
         """Test partial agent update (only some fields)."""
-        db, db_path, _ = _create_session()
+        db, db_path, SessionLocal = _create_session()
         try:
             user = User(username="testuser_partial", password_hash="x", is_admin=False)
             db.add(user)
@@ -1120,7 +1124,7 @@ class TestUpdateAgentTool:
             db.commit()
             db.refresh(existing_agent)
 
-            tool = UpdateAgentTool(db=db, user_id=user.id)
+            tool = UpdateAgentTool(session_factory=SessionLocal, user_id=user.id)
 
             # Update only description, keep name and instructions
             result = await tool.run_json_async(
@@ -1150,14 +1154,14 @@ class TestUpdateAgentTool:
     @pytest.mark.asyncio
     async def test_update_agent_not_found(self) -> None:
         """Test updating non-existent agent."""
-        db, db_path, _ = _create_session()
+        db, db_path, SessionLocal = _create_session()
         try:
             user = User(username="testuser_notfound", password_hash="x", is_admin=False)
             db.add(user)
             db.commit()
             db.refresh(user)
 
-            tool = UpdateAgentTool(db=db, user_id=user.id)
+            tool = UpdateAgentTool(session_factory=SessionLocal, user_id=user.id)
 
             result = await tool.run_json_async(
                 {
@@ -1180,7 +1184,7 @@ class TestUpdateAgentTool:
 
     @pytest.mark.asyncio
     async def test_update_agent_rejects_generated_workforce_manager(self) -> None:
-        db, db_path, _ = _create_session()
+        db, db_path, SessionLocal = _create_session()
         try:
             user = User(
                 username="testuser_update_generated_manager",
@@ -1203,7 +1207,7 @@ class TestUpdateAgentTool:
             db.commit()
             db.refresh(generated_manager)
 
-            tool = UpdateAgentTool(db=db, user_id=user.id)
+            tool = UpdateAgentTool(session_factory=SessionLocal, user_id=user.id)
 
             result = await tool.run_json_async(
                 {
@@ -1230,7 +1234,7 @@ class TestUpdateAgentTool:
     async def test_update_agent_name_conflict_ignores_generated_workforce_manager(
         self,
     ) -> None:
-        db, db_path, _ = _create_session()
+        db, db_path, SessionLocal = _create_session()
         try:
             user = User(
                 username="testuser_update_generated_manager_name",
@@ -1256,7 +1260,7 @@ class TestUpdateAgentTool:
             db.commit()
             db.refresh(visible_agent)
 
-            tool = UpdateAgentTool(db=db, user_id=user.id)
+            tool = UpdateAgentTool(session_factory=SessionLocal, user_id=user.id)
 
             result = await tool.run_json_async(
                 {
@@ -1281,7 +1285,7 @@ class TestUpdateAgentTool:
     @pytest.mark.asyncio
     async def test_update_agent_rejects_missing_knowledge_base(self) -> None:
         """Test that update_agent rejects knowledge bases that do not exist."""
-        db, db_path, _ = _create_session()
+        db, db_path, SessionLocal = _create_session()
         try:
             user = User(username="testuser_update_missing_kb", password_hash="x")
             db.add(user)
@@ -1300,7 +1304,7 @@ class TestUpdateAgentTool:
             db.commit()
             db.refresh(existing_agent)
 
-            tool = UpdateAgentTool(db=db, user_id=user.id)
+            tool = UpdateAgentTool(session_factory=SessionLocal, user_id=user.id)
 
             with patch(
                 "xagent.core.tools.adapters.vibe.agent_tool.find_missing_knowledge_bases",
@@ -1330,7 +1334,7 @@ class TestUpdateAgentTool:
     @pytest.mark.asyncio
     async def test_update_published_agent_success_preserves_status(self) -> None:
         """Test that published agents can be updated and remain published."""
-        db, db_path, _ = _create_session()
+        db, db_path, SessionLocal = _create_session()
         try:
             user = User(
                 username="testuser_published", password_hash="x", is_admin=False
@@ -1350,7 +1354,7 @@ class TestUpdateAgentTool:
             db.commit()
             db.refresh(published_agent)
 
-            tool = UpdateAgentTool(db=db, user_id=user.id)
+            tool = UpdateAgentTool(session_factory=SessionLocal, user_id=user.id)
 
             result = await tool.run_json_async(
                 {
@@ -1382,7 +1386,7 @@ class TestUpdateAgentTool:
     @pytest.mark.asyncio
     async def test_update_archived_agent_rejected(self) -> None:
         """Test that archived agents cannot be updated."""
-        db, db_path, _ = _create_session()
+        db, db_path, SessionLocal = _create_session()
         try:
             user = User(username="testuser_archived", password_hash="x", is_admin=False)
             db.add(user)
@@ -1400,7 +1404,7 @@ class TestUpdateAgentTool:
             db.commit()
             db.refresh(archived_agent)
 
-            tool = UpdateAgentTool(db=db, user_id=user.id)
+            tool = UpdateAgentTool(session_factory=SessionLocal, user_id=user.id)
 
             result = await tool.run_json_async(
                 {
@@ -1430,7 +1434,7 @@ class TestUpdateAgentTool:
     @pytest.mark.asyncio
     async def test_update_agent_duplicate_name(self) -> None:
         """Test that duplicate names are rejected when updating."""
-        db, db_path, _ = _create_session()
+        db, db_path, SessionLocal = _create_session()
         try:
             user = User(username="testuser_dup", password_hash="x", is_admin=False)
             db.add(user)
@@ -1453,7 +1457,7 @@ class TestUpdateAgentTool:
             db.refresh(agent1)
             db.refresh(agent2)
 
-            tool = UpdateAgentTool(db=db, user_id=user.id)
+            tool = UpdateAgentTool(session_factory=SessionLocal, user_id=user.id)
 
             # Try to rename agent2 to agent_one (duplicate)
             result = await tool.run_json_async(
@@ -1468,6 +1472,74 @@ class TestUpdateAgentTool:
 
         finally:
             db.close()
+            try:
+                import os
+
+                os.remove(db_path)
+            except OSError:
+                pass
+
+    def test_update_agent_tool_opens_and_closes_session_per_call(self) -> None:
+        """UpdateAgentTool must open exactly one session per call and close it."""
+        import asyncio
+
+        db, db_path, SessionLocal = _create_session()
+        try:
+            # Seed one agent to update
+            user = User(
+                username="testuser_update_session_lifecycle",
+                password_hash="x",
+                is_admin=False,
+            )
+            db.add(user)
+            db.commit()
+            db.refresh(user)
+
+            existing_agent = Agent(
+                user_id=user.id,
+                name="session_lifecycle_agent",
+                description="Agent for session lifecycle test",
+                instructions="Original instructions",
+                status=AgentStatus.DRAFT,
+            )
+            db.add(existing_agent)
+            db.commit()
+            db.refresh(existing_agent)
+            seeded_id = existing_agent.id
+            seeded_user_id = user.id
+            db.close()
+
+            opened: list = []
+            closed: list = []
+
+            def tracking_factory():
+                s = SessionLocal()
+                orig_close = s.close
+
+                # Session has no __slots__; instance attr shadows the method
+                def tracked_close():
+                    closed.append(s)
+                    orig_close()
+
+                s.close = tracked_close
+                opened.append(s)
+                return s
+
+            with patch("xagent.web.services.agent_store.invalidate_agent_cache"):
+                tool = UpdateAgentTool(
+                    session_factory=tracking_factory, user_id=seeded_user_id
+                )
+                result = asyncio.run(
+                    tool.run_json_async(
+                        {"agent_id": seeded_id, "name": "Renamed Agent"}
+                    )
+                )
+
+            assert result["status"] == "success"
+            assert len(opened) == 1, f"expected 1 session opened, got {len(opened)}"
+            assert closed == opened, "session was not closed after the call"
+
+        finally:
             try:
                 import os
 

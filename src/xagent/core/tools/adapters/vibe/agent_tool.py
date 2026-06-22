@@ -635,9 +635,9 @@ class CreateAgentTool(AbstractBaseTool):
 
     async def run_json_async(self, args: Mapping[str, Any]) -> Any:
         """Create a new agent with the given configuration."""
-        from .db_session import tool_session_scope
         from .....web.models.agent import AgentStatus
         from .....web.models.user import UserDefaultModel, UserModel
+        from .db_session import tool_session_scope
 
         with tool_session_scope(self._session_factory) as db:
             try:
@@ -722,7 +722,9 @@ class CreateAgentTool(AbstractBaseTool):
                     visible_ids = _get_visible_user_ids(db, self._user_id)
                     admin_defaults = (
                         db.query(UserDefaultModel)
-                        .join(UserModel, UserDefaultModel.model_id == UserModel.model_id)
+                        .join(
+                            UserModel, UserDefaultModel.model_id == UserModel.model_id
+                        )
                         .filter(
                             UserDefaultModel.config_type.in_(missing_types),
                             UserModel.is_shared.is_(True),
@@ -833,7 +835,7 @@ class UpdateAgentTool(AbstractBaseTool):
 
     def __init__(
         self,
-        db: Any,
+        session_factory: Any,
         user_id: int,
         task_id: Optional[str] = None,
         workspace_base_dir: Optional[str] = None,
@@ -842,12 +844,13 @@ class UpdateAgentTool(AbstractBaseTool):
         Initialize the update agent tool.
 
         Args:
-            db: Database session for updating the agent
+            session_factory: Callable that returns a new SQLAlchemy session; a
+                fresh session is opened per call and closed in ``finally``.
             user_id: User ID for ownership and access control
             task_id: Task ID for context
             workspace_base_dir: Base directory for workspace files
         """
-        self._db = db
+        self._session_factory = session_factory
         self._user_id = user_id
         self._task_id = task_id
         if workspace_base_dir is None:
@@ -932,199 +935,201 @@ class UpdateAgentTool(AbstractBaseTool):
     async def run_json_async(self, args: Mapping[str, Any]) -> Any:
         """Update an existing agent with the given configuration."""
         from .....web.models.agent import Agent, AgentStatus
+        from .db_session import tool_session_scope
 
-        try:
-            agent_id = args.get("agent_id")
+        with tool_session_scope(self._session_factory) as db:
+            try:
+                agent_id = args.get("agent_id")
 
-            if not agent_id:
-                return UpdateAgentToolResult(
-                    agent_id=0,
-                    agent_name="",
-                    tool_name="",
-                    markdown_link="",
-                    status="error",
-                    message="Error: Agent ID is required",
-                ).model_dump()
+                if not agent_id:
+                    return UpdateAgentToolResult(
+                        agent_id=0,
+                        agent_name="",
+                        tool_name="",
+                        markdown_link="",
+                        status="error",
+                        message="Error: Agent ID is required",
+                    ).model_dump()
 
-            # Find the agent
-            query = self._db.query(Agent).filter(Agent.id == agent_id)
-            query = _apply_owned_agent_tool_filters(
-                query,
-                Agent,
-                user_id=self._user_id,
-            )
-            agent = query.first()
-
-            if not agent:
-                return UpdateAgentToolResult(
-                    agent_id=0,
-                    agent_name="",
-                    tool_name="",
-                    markdown_link="",
-                    status="error",
-                    message=f"Error: Agent with ID {agent_id} not found",
-                ).model_dump()
-
-            if agent.status == AgentStatus.ARCHIVED:
-                return UpdateAgentToolResult(
-                    agent_id=agent_id,
-                    agent_name=agent.name,
-                    tool_name=gen_agent_tool_name(agent.id),
-                    markdown_link=f"[{agent.name}](agent://{agent.id})",
-                    status="error",
-                    message=(
-                        "Error: Archived agents cannot be updated. "
-                        f"This agent is {agent.status.value.upper()}."
-                    ),
-                ).model_dump()
-
-            # Track changes
-            changes = []
-            updates: dict[str, Any] = {}
-
-            # Update name if provided
-            new_name = args.get("name", "").strip() if args.get("name") else None
-            if new_name:
-                # Check for duplicate name (exclude current agent)
-                existing = _apply_owned_agent_tool_filters(
-                    self._db.query(Agent).filter(
-                        Agent.name == new_name,
-                        Agent.id != agent_id,
-                    ),
+                # Find the agent
+                query = db.query(Agent).filter(Agent.id == agent_id)
+                query = _apply_owned_agent_tool_filters(
+                    query,
                     Agent,
                     user_id=self._user_id,
-                ).first()
-                if existing:
+                )
+                agent = query.first()
+
+                if not agent:
                     return UpdateAgentToolResult(
                         agent_id=0,
                         agent_name="",
                         tool_name="",
                         markdown_link="",
                         status="error",
-                        message=f"Error: Agent with name '{new_name}' already exists",
+                        message=f"Error: Agent with ID {agent_id} not found",
                     ).model_dump()
-                updates["name"] = new_name
-                changes.append(f"name → '{new_name}'")
 
-            # Update description if provided
-            new_description = (
-                args.get("description", "").strip() if args.get("description") else None
-            )
-            if new_description:
-                updates["description"] = new_description
-                changes.append("description updated")
-
-            # Update instructions if provided
-            new_instructions = (
-                args.get("instructions", "").strip()
-                if args.get("instructions")
-                else None
-            )
-            if new_instructions:
-                updates["instructions"] = new_instructions
-                changes.append("instructions updated")
-
-            # Update tool_categories if provided
-            new_tool_categories = ensure_list(args.get("tool_categories"))
-            if new_tool_categories is not None:
-                updates["tool_categories"] = new_tool_categories
-                changes.append(f"tool_categories → {new_tool_categories}")
-
-            # Update knowledge_bases if provided
-            new_knowledge_bases = ensure_list(args.get("knowledge_bases"))
-            if new_knowledge_bases is not None:
-                missing_kbs = await _missing_knowledge_bases_for_user(
-                    new_knowledge_bases, self._db, self._user_id
-                )
-                if missing_kbs:
+                if agent.status == AgentStatus.ARCHIVED:
                     return UpdateAgentToolResult(
-                        agent_id=0,
-                        agent_name="",
-                        tool_name="",
-                        markdown_link="",
+                        agent_id=agent_id,
+                        agent_name=agent.name,
+                        tool_name=gen_agent_tool_name(agent.id),
+                        markdown_link=f"[{agent.name}](agent://{agent.id})",
                         status="error",
                         message=(
-                            "Error: Knowledge base(s) not found or not visible to this user: "
-                            + ", ".join(missing_kbs)
+                            "Error: Archived agents cannot be updated. "
+                            f"This agent is {agent.status.value.upper()}."
                         ),
                     ).model_dump()
-                updates["knowledge_bases"] = new_knowledge_bases
-                changes.append(f"knowledge_bases → {new_knowledge_bases}")
 
-            # Update skills if provided
-            new_skills = ensure_list(args.get("skills"))
-            if new_skills is not None:
-                updates["skills"] = new_skills
-                changes.append(f"skills → {new_skills}")
+                # Track changes
+                changes = []
+                updates: dict[str, Any] = {}
 
-            # Update execution_mode if provided
-            new_execution_mode = args.get("execution_mode")
-            if new_execution_mode in ["flash", "balanced", "think", "auto"]:
-                updates["execution_mode"] = new_execution_mode
-                changes.append(f"execution_mode → {new_execution_mode}")
+                # Update name if provided
+                new_name = args.get("name", "").strip() if args.get("name") else None
+                if new_name:
+                    # Check for duplicate name (exclude current agent)
+                    existing = _apply_owned_agent_tool_filters(
+                        db.query(Agent).filter(
+                            Agent.name == new_name,
+                            Agent.id != agent_id,
+                        ),
+                        Agent,
+                        user_id=self._user_id,
+                    ).first()
+                    if existing:
+                        return UpdateAgentToolResult(
+                            agent_id=0,
+                            agent_name="",
+                            tool_name="",
+                            markdown_link="",
+                            status="error",
+                            message=f"Error: Agent with name '{new_name}' already exists",
+                        ).model_dump()
+                    updates["name"] = new_name
+                    changes.append(f"name → '{new_name}'")
 
-            # Check if there were any changes
-            if not changes:
+                # Update description if provided
+                new_description = (
+                    args.get("description", "").strip()
+                    if args.get("description")
+                    else None
+                )
+                if new_description:
+                    updates["description"] = new_description
+                    changes.append("description updated")
+
+                # Update instructions if provided
+                new_instructions = (
+                    args.get("instructions", "").strip()
+                    if args.get("instructions")
+                    else None
+                )
+                if new_instructions:
+                    updates["instructions"] = new_instructions
+                    changes.append("instructions updated")
+
+                # Update tool_categories if provided
+                new_tool_categories = ensure_list(args.get("tool_categories"))
+                if new_tool_categories is not None:
+                    updates["tool_categories"] = new_tool_categories
+                    changes.append(f"tool_categories → {new_tool_categories}")
+
+                # Update knowledge_bases if provided
+                new_knowledge_bases = ensure_list(args.get("knowledge_bases"))
+                if new_knowledge_bases is not None:
+                    missing_kbs = await _missing_knowledge_bases_for_user(
+                        new_knowledge_bases, db, self._user_id
+                    )
+                    if missing_kbs:
+                        return UpdateAgentToolResult(
+                            agent_id=0,
+                            agent_name="",
+                            tool_name="",
+                            markdown_link="",
+                            status="error",
+                            message=(
+                                "Error: Knowledge base(s) not found or not visible to this user: "
+                                + ", ".join(missing_kbs)
+                            ),
+                        ).model_dump()
+                    updates["knowledge_bases"] = new_knowledge_bases
+                    changes.append(f"knowledge_bases → {new_knowledge_bases}")
+
+                # Update skills if provided
+                new_skills = ensure_list(args.get("skills"))
+                if new_skills is not None:
+                    updates["skills"] = new_skills
+                    changes.append(f"skills → {new_skills}")
+
+                # Update execution_mode if provided
+                new_execution_mode = args.get("execution_mode")
+                if new_execution_mode in ["flash", "balanced", "think", "auto"]:
+                    updates["execution_mode"] = new_execution_mode
+                    changes.append(f"execution_mode → {new_execution_mode}")
+
+                # Check if there were any changes
+                if not changes:
+                    return UpdateAgentToolResult(
+                        agent_id=agent_id,
+                        agent_name=agent.name,
+                        tool_name=gen_agent_tool_name(agent.id),
+                        markdown_link=f"[{agent.name}](agent://{agent.id})",
+                        status="success",
+                        message=f"ℹ️ No updates were made to agent '{agent.name}' (ID: {agent_id}). "
+                        f"Status: {agent.status.value.upper()}. "
+                        f"All fields were the same or no values were provided.",
+                    ).model_dump()
+
+                agent = (
+                    AgentStore(db).update_agent_fields(self._user_id, agent_id, updates)
+                    or agent
+                )
+
+                # Generate the tool name and markdown link
+                agent_name = str(agent.name)
+                tool_name = gen_agent_tool_name(agent.id)
+                markdown_link = f"[{agent_name}](agent://{agent.id})"
+
+                logger.info(
+                    f"Updated {agent.status.value.upper()} agent '{agent_name}' (ID: {agent.id}) for user {self._user_id}: {', '.join(changes)}"
+                )
+
                 return UpdateAgentToolResult(
-                    agent_id=agent_id,
-                    agent_name=agent.name,
-                    tool_name=gen_agent_tool_name(agent.id),
-                    markdown_link=f"[{agent.name}](agent://{agent.id})",
+                    agent_id=agent.id,
+                    agent_name=agent_name,
+                    tool_name=tool_name,
+                    markdown_link=markdown_link,
                     status="success",
-                    message=f"ℹ️ No updates were made to agent '{agent.name}' (ID: {agent_id}). "
-                    f"Status: {agent.status.value.upper()}. "
-                    f"All fields were the same or no values were provided.",
+                    message=(
+                        f"✅ Agent updated successfully\n\n"
+                        f"**Agent Details:**\n"
+                        f"- Agent ID: {agent.id}\n"
+                        f"- Agent Name: {agent.name}\n"
+                        f"- Tool Name: {tool_name}\n"
+                        f"- Status: {agent.status.value.upper()}\n\n"
+                        f"**Changes Applied:**\n"
+                        + "\n".join(f"- {change}" for change in changes)
+                        + f"\n\n**How to use this agent:**\n"
+                        f"Include this link in your response: {markdown_link}\n"
+                        f"Or use the tool: {tool_name}\n\n"
+                        f"*The agent keeps its current publication status and will reflect the updated changes on next execution.*"
+                    ),
                 ).model_dump()
 
-            agent = (
-                AgentStore(self._db).update_agent_fields(
-                    self._user_id, agent_id, updates
-                )
-                or agent
-            )
-
-            # Generate the tool name and markdown link
-            agent_name = str(agent.name)
-            tool_name = gen_agent_tool_name(agent.id)
-            markdown_link = f"[{agent_name}](agent://{agent.id})"
-
-            logger.info(
-                f"Updated {agent.status.value.upper()} agent '{agent_name}' (ID: {agent.id}) for user {self._user_id}: {', '.join(changes)}"
-            )
-
-            return UpdateAgentToolResult(
-                agent_id=agent.id,
-                agent_name=agent_name,
-                tool_name=tool_name,
-                markdown_link=markdown_link,
-                status="success",
-                message=(
-                    f"✅ Agent updated successfully\n\n"
-                    f"**Agent Details:**\n"
-                    f"- Agent ID: {agent.id}\n"
-                    f"- Agent Name: {agent.name}\n"
-                    f"- Tool Name: {tool_name}\n"
-                    f"- Status: {agent.status.value.upper()}\n\n"
-                    f"**Changes Applied:**\n"
-                    + "\n".join(f"- {change}" for change in changes)
-                    + f"\n\n**How to use this agent:**\n"
-                    f"Include this link in your response: {markdown_link}\n"
-                    f"Or use the tool: {tool_name}\n\n"
-                    f"*The agent keeps its current publication status and will reflect the updated changes on next execution.*"
-                ),
-            ).model_dump()
-
-        except Exception as e:
-            error_msg = f"Error updating agent: {str(e)}"
-            logger.error(error_msg, exc_info=True)
-            return UpdateAgentToolResult(
-                agent_id=0,
-                agent_name="",
-                tool_name="",
-                markdown_link="",
-                status="error",
-                message=error_msg,
-            ).model_dump()
+            except Exception as e:
+                error_msg = f"Error updating agent: {str(e)}"
+                logger.error(error_msg, exc_info=True)
+                return UpdateAgentToolResult(
+                    agent_id=0,
+                    agent_name="",
+                    tool_name="",
+                    markdown_link="",
+                    status="error",
+                    message=error_msg,
+                ).model_dump()
 
 
 class ListAgentsTool(AbstractBaseTool):
@@ -2187,13 +2192,13 @@ async def create_update_agent_tool(config: "WebToolConfig") -> list[AbstractBase
         return []
 
     try:
-        db = config.get_db()
+        factory = config.get_session_factory()
         user_id = config.get_user_id()
         if not user_id:
             return []
 
         tool = UpdateAgentTool(
-            db=db,
+            session_factory=factory,
             user_id=user_id,
             task_id=config.get_task_id(),
             workspace_base_dir=None,  # Will use get_uploads_dir() default
