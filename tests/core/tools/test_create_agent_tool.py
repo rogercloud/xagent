@@ -171,7 +171,7 @@ class TestCreateAgentTool:
 
     @pytest.mark.asyncio
     async def test_agent_tool_rejects_generated_workforce_manager(self) -> None:
-        db, db_path, _ = _create_session()
+        db, db_path, SessionLocal = _create_session()
         try:
             user = User(
                 username="testuser_generated_manager_run",
@@ -198,7 +198,7 @@ class TestCreateAgentTool:
                 agent_id=generated_manager.id,
                 agent_name=generated_manager.name,
                 agent_description=generated_manager.description or "",
-                db=db,
+                session_factory=SessionLocal,
                 user_id=user.id,
             )
 
@@ -222,7 +222,7 @@ class TestCreateAgentTool:
 
     @pytest.mark.asyncio
     async def test_agent_tool_applies_workforce_runtime_overrides(self) -> None:
-        db, db_path, _ = _create_session()
+        db, db_path, SessionLocal = _create_session()
         try:
             user = User(username="testuser11", password_hash="x", is_admin=False)
             db.add(user)
@@ -280,7 +280,7 @@ class TestCreateAgentTool:
                 agent_id=agent.id,
                 agent_name=agent.name,
                 agent_description=agent.description or "",
-                db=db,
+                session_factory=SessionLocal,
                 user_id=user.id,
                 task_id="tool-session",
                 tool_name="call_workforce_worker_7_writer",
@@ -373,7 +373,7 @@ class TestCreateAgentTool:
     async def test_agent_tool_returns_parent_owned_file_refs_for_worker_outputs(
         self,
     ) -> None:
-        db, db_path, _ = _create_session()
+        db, db_path, SessionLocal = _create_session()
         try:
             user = User(
                 username="worker-output-user", password_hash="x", is_admin=False
@@ -444,7 +444,7 @@ class TestCreateAgentTool:
                     agent_id=agent.id,
                     agent_name=agent.name,
                     agent_description=agent.description or "",
-                    db=db,
+                    session_factory=SessionLocal,
                     user_id=user.id,
                     task_id="77",
                     parent_task_id="77",
@@ -541,7 +541,7 @@ class TestCreateAgentTool:
                 pass
 
     def test_agent_tool_rebinds_worker_owned_file_ids_to_parent_task(self) -> None:
-        db, db_path, _ = _create_session()
+        db, db_path, SessionLocal = _create_session()
         try:
             user = User(
                 username="worker-owned-output-user",
@@ -585,7 +585,7 @@ class TestCreateAgentTool:
                     agent_id=1,
                     agent_name="File Worker",
                     agent_description="Writes files",
-                    db=db,
+                    session_factory=SessionLocal,
                     user_id=user.id,
                     task_id="77",
                     parent_task_id="77",
@@ -601,6 +601,7 @@ class TestCreateAgentTool:
                         }
                     ],
                     worker_workspace,
+                    db,
                 )
 
                 assert file_outputs is not None
@@ -635,13 +636,13 @@ class TestCreateAgentTool:
     def test_agent_tool_omits_workforce_file_outputs_without_parent_db_task_id(
         self,
     ) -> None:
-        db, db_path, _ = _create_session()
+        db, db_path, SessionLocal = _create_session()
         try:
             tool = AgentTool(
                 agent_id=1,
                 agent_name="File Worker",
                 agent_description="Writes files",
-                db=db,
+                session_factory=SessionLocal,
                 user_id=1,
                 task_id="agent_1_abcd1234",
                 parent_task_id="agent_1_abcd1234",
@@ -650,7 +651,10 @@ class TestCreateAgentTool:
 
             file_outputs = [{"file_path": "/tmp/worker-output.txt"}]
 
-            assert tool._parent_owned_file_outputs(file_outputs, workspace=None) == []
+            assert (
+                tool._parent_owned_file_outputs(file_outputs, workspace=None, db=db)
+                == []
+            )
         finally:
             db.close()
             try:
@@ -663,13 +667,13 @@ class TestCreateAgentTool:
     def test_agent_tool_preserves_non_workforce_file_outputs_without_parent_db_task_id(
         self,
     ) -> None:
-        db, db_path, _ = _create_session()
+        db, db_path, SessionLocal = _create_session()
         try:
             tool = AgentTool(
                 agent_id=1,
                 agent_name="File Worker",
                 agent_description="Writes files",
-                db=db,
+                session_factory=SessionLocal,
                 user_id=1,
                 task_id="agent_1_abcd1234",
                 parent_task_id="agent_1_abcd1234",
@@ -677,7 +681,7 @@ class TestCreateAgentTool:
             file_outputs = [{"file_path": "/tmp/legacy-output.txt"}]
 
             assert (
-                tool._parent_owned_file_outputs(file_outputs, workspace=None)
+                tool._parent_owned_file_outputs(file_outputs, workspace=None, db=db)
                 is file_outputs
             )
         finally:
@@ -693,7 +697,7 @@ class TestCreateAgentTool:
         self,
         tmp_path,
     ) -> None:
-        db, db_path, _ = _create_session()
+        db, db_path, SessionLocal = _create_session()
         try:
             output_path = tmp_path / "report.txt"
             output_path.write_text("worker report", encoding="utf-8")
@@ -705,7 +709,7 @@ class TestCreateAgentTool:
                 agent_id=1,
                 agent_name="File Worker",
                 agent_description="Writes files",
-                db=db,
+                session_factory=SessionLocal,
                 user_id=1,
                 task_id="77",
                 parent_task_id="77",
@@ -715,6 +719,7 @@ class TestCreateAgentTool:
                 tool._parent_owned_file_outputs(
                     [{"file_path": str(output_path), "filename": "report.txt"}],
                     workspace,
+                    db,
                 )
         finally:
             db.close()
@@ -1858,7 +1863,7 @@ class TestDraftAgentsInTools:
 
     def test_get_tools_with_draft_disabled(self) -> None:
         """Test that draft agents are excluded when include_draft=False."""
-        db, db_path, _ = _create_session()
+        db, db_path, SessionLocal = _create_session()
         try:
             user = User(username="testuser6", password_hash="x", is_admin=False)
             db.add(user)
@@ -1879,7 +1884,7 @@ class TestDraftAgentsInTools:
             db.commit()
 
             tools = get_published_agents_tools(
-                db=db, user_id=user.id, include_draft=False
+                session_factory=SessionLocal, user_id=user.id, include_draft=False
             )
             tool_names = {tool.name for tool in tools}
 
@@ -1897,7 +1902,7 @@ class TestDraftAgentsInTools:
 
     def test_get_tools_with_draft_enabled(self) -> None:
         """Test that draft agents are included when include_draft=True."""
-        db, db_path, _ = _create_session()
+        db, db_path, SessionLocal = _create_session()
         try:
             user = User(username="testuser7", password_hash="x", is_admin=False)
             db.add(user)
@@ -1918,7 +1923,7 @@ class TestDraftAgentsInTools:
             db.commit()
 
             tools = get_published_agents_tools(
-                db=db, user_id=user.id, include_draft=True
+                session_factory=SessionLocal, user_id=user.id, include_draft=True
             )
             tool_names = {tool.name for tool in tools}
 
@@ -1935,7 +1940,7 @@ class TestDraftAgentsInTools:
                 pass
 
     def test_generated_workforce_managers_are_hidden_from_agent_tools(self) -> None:
-        db, db_path, _ = _create_session()
+        db, db_path, SessionLocal = _create_session()
         try:
             user = User(
                 username="testuser_generated_manager_tools",
@@ -1962,14 +1967,16 @@ class TestDraftAgentsInTools:
             db.refresh(reusable_agent)
             db.refresh(generated_manager)
 
-            tools = get_published_agents_tools(db=db, user_id=user.id)
+            tools = get_published_agents_tools(
+                session_factory=SessionLocal, user_id=user.id
+            )
             tool_names = {tool.name for tool in tools}
 
             assert f"agent_{reusable_agent.id}" in tool_names
             assert f"agent_{generated_manager.id}" not in tool_names
 
             explicitly_allowed_tools = get_published_agents_tools(
-                db=db,
+                session_factory=SessionLocal,
                 user_id=user.id,
                 allowed_agent_ids=[generated_manager.id],
             )
@@ -1986,7 +1993,7 @@ class TestDraftAgentsInTools:
 
     def test_user_isolation_for_draft_agents(self) -> None:
         """Test that users cannot see other users' draft agents."""
-        db, db_path, _ = _create_session()
+        db, db_path, SessionLocal = _create_session()
         try:
             user1 = User(username="user1", password_hash="x", is_admin=False)
             user2 = User(username="user2", password_hash="x", is_admin=False)
@@ -2006,7 +2013,7 @@ class TestDraftAgentsInTools:
 
             # User2 should not see User1's draft agent
             tools_for_user2 = get_published_agents_tools(
-                db=db, user_id=user2.id, include_draft=True
+                session_factory=SessionLocal, user_id=user2.id, include_draft=True
             )
             tool_names = {tool.name for tool in tools_for_user2}
 
@@ -2075,7 +2082,9 @@ class TestCreateAndCallAgent:
                 verify_db = SessionLocal()
                 try:
                     tools = get_published_agents_tools(
-                        db=verify_db, user_id=user_id, include_draft=True
+                        session_factory=SessionLocal,
+                        user_id=user_id,
+                        include_draft=True,
                     )
                     tool_names = {tool.name for tool in tools}
                     assert f"agent_{agent_id}" in tool_names
@@ -2099,7 +2108,7 @@ class TestCreateAndCallAgent:
     async def test_agent_tool_injects_langfuse_tracer(
         self, mocker, monkeypatch, langfuse_client_reset
     ) -> None:
-        db, db_path, _ = _create_session()
+        db, db_path, SessionLocal = _create_session()
         try:
             monkeypatch.setenv("LANGFUSE_PUBLIC_KEY", "test-public")
             monkeypatch.setenv("LANGFUSE_SECRET_KEY", "test-secret")
@@ -2140,7 +2149,7 @@ class TestCreateAndCallAgent:
                 agent_id=agent.id,
                 agent_name=agent.name,
                 agent_description=agent.description or "",
-                db=db,
+                session_factory=SessionLocal,
                 user_id=user.id,
                 task_id="parent-task-1",
             )
@@ -2182,7 +2191,7 @@ class TestCreateAndCallAgent:
 
     @pytest.mark.asyncio
     async def test_agent_tool_keeps_mcp_tools_when_filtering_by_category(self) -> None:
-        db, db_path, _ = _create_session()
+        db, db_path, SessionLocal = _create_session()
         try:
             user = User(username="testuser10", password_hash="x", is_admin=False)
             db.add(user)
@@ -2220,7 +2229,7 @@ class TestCreateAndCallAgent:
                 agent_id=agent.id,
                 agent_name=agent.name,
                 agent_description=agent.description or "",
-                db=db,
+                session_factory=SessionLocal,
                 user_id=user.id,
                 task_id="parent-task-mcp",
             )
@@ -2297,7 +2306,7 @@ class TestCreateAndCallAgent:
         ``include_mcp_tools=False`` -- so it does not pay MCP server init.
         Empty and NULL categories still build an ALL-mode selection spec
         for final filtering, but should not opt into MCP config loading."""
-        db, db_path, _ = _create_session()
+        db, db_path, SessionLocal = _create_session()
         try:
             user = User(username="basicdeleg", password_hash="x", is_admin=False)
             db.add(user)
@@ -2335,7 +2344,7 @@ class TestCreateAndCallAgent:
                 agent_id=agent.id,
                 agent_name=agent.name,
                 agent_description=agent.description or "",
-                db=db,
+                session_factory=SessionLocal,
                 user_id=user.id,
                 task_id="parent-task-basic",
             )
