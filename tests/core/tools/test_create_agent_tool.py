@@ -2,6 +2,7 @@
 
 import tempfile
 from pathlib import Path
+from typing import Any
 from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
@@ -28,15 +29,21 @@ from xagent.web.models.uploaded_file import UploadedFile
 from xagent.web.models.user import User
 
 
-def _create_session() -> tuple[Session, str]:
-    """Create a temporary database session for testing."""
+def _create_session() -> tuple[Session, str, Any]:
+    """Create a temporary database session for testing.
+
+    Returns:
+        (session, db_path, SessionLocal) — the open session, path to the
+        SQLite file (for cleanup), and the sessionmaker so callers can open
+        fresh sessions after the per-call session is closed.
+    """
     temp_db = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
     temp_db.close()
     db_url = f"sqlite:///{temp_db.name}"
     engine = create_engine(db_url)
     Base.metadata.create_all(bind=engine)
     SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
-    return SessionLocal(), temp_db.name
+    return SessionLocal(), temp_db.name, SessionLocal
 
 
 @pytest.fixture
@@ -48,7 +55,7 @@ class TestCreateAgentTool:
     """Test suite for CreateAgentTool."""
 
     def test_create_agent_tool_schema_anchors_persisted_text_language(self) -> None:
-        tool = CreateAgentTool(db=None, user_id=1)
+        tool = CreateAgentTool(session_factory=None, user_id=1)
 
         assert (
             "same natural language as the current output language policy"
@@ -82,13 +89,15 @@ class TestCreateAgentTool:
     @pytest.mark.asyncio
     async def test_create_agent_success(self) -> None:
         """Test successful agent creation."""
-        db, db_path = _create_session()
+        db, db_path, SessionLocal = _create_session()
         try:
             # Create test user
             user = User(username="testuser", password_hash="x", is_admin=False)
             db.add(user)
             db.commit()
             db.refresh(user)
+            user_id = user.id
+            db.close()
 
             # Mock model storage to return default LLM
             mock_llm = Mock()
@@ -112,7 +121,9 @@ class TestCreateAgentTool:
                 mock_storage_class.return_value = mock_storage
 
                 # Create tool
-                tool = CreateAgentTool(db=db, user_id=user.id, task_id="test_task")
+                tool = CreateAgentTool(
+                    session_factory=SessionLocal, user_id=user_id, task_id="test_task"
+                )
 
                 # Execute tool
                 result = await tool.run_json_async(
@@ -131,21 +142,24 @@ class TestCreateAgentTool:
                 assert "test_agent" in result["markdown_link"]
                 assert "agent://" in result["markdown_link"]
                 mock_invalidate_agent_cache.assert_called_once_with(
-                    user.id, result["agent_id"]
+                    user_id, result["agent_id"]
                 )
 
-                # Verify agent was created in database
-                agent = (
-                    db.query(Agent)
-                    .filter(Agent.name == "test_agent", Agent.user_id == user.id)
-                    .first()
-                )
-                assert agent is not None
-                assert agent.status == AgentStatus.DRAFT
-                assert agent.instructions == "You are a test agent for unit testing."
+                # Verify agent was created in database (use a fresh session)
+                verify_db = SessionLocal()
+                try:
+                    agent = (
+                        verify_db.query(Agent)
+                        .filter(Agent.name == "test_agent", Agent.user_id == user_id)
+                        .first()
+                    )
+                    assert agent is not None
+                    assert agent.status == AgentStatus.DRAFT
+                    assert agent.instructions == "You are a test agent for unit testing."
+                finally:
+                    verify_db.close()
 
         finally:
-            db.close()
             try:
                 import os
 
@@ -155,7 +169,7 @@ class TestCreateAgentTool:
 
     @pytest.mark.asyncio
     async def test_agent_tool_rejects_generated_workforce_manager(self) -> None:
-        db, db_path = _create_session()
+        db, db_path, _ = _create_session()
         try:
             user = User(
                 username="testuser_generated_manager_run",
@@ -206,7 +220,7 @@ class TestCreateAgentTool:
 
     @pytest.mark.asyncio
     async def test_agent_tool_applies_workforce_runtime_overrides(self) -> None:
-        db, db_path = _create_session()
+        db, db_path, _ = _create_session()
         try:
             user = User(username="testuser11", password_hash="x", is_admin=False)
             db.add(user)
@@ -357,7 +371,7 @@ class TestCreateAgentTool:
     async def test_agent_tool_returns_parent_owned_file_refs_for_worker_outputs(
         self,
     ) -> None:
-        db, db_path = _create_session()
+        db, db_path, _ = _create_session()
         try:
             user = User(
                 username="worker-output-user", password_hash="x", is_admin=False
@@ -525,7 +539,7 @@ class TestCreateAgentTool:
                 pass
 
     def test_agent_tool_rebinds_worker_owned_file_ids_to_parent_task(self) -> None:
-        db, db_path = _create_session()
+        db, db_path, _ = _create_session()
         try:
             user = User(
                 username="worker-owned-output-user",
@@ -619,7 +633,7 @@ class TestCreateAgentTool:
     def test_agent_tool_omits_workforce_file_outputs_without_parent_db_task_id(
         self,
     ) -> None:
-        db, db_path = _create_session()
+        db, db_path, _ = _create_session()
         try:
             tool = AgentTool(
                 agent_id=1,
@@ -647,7 +661,7 @@ class TestCreateAgentTool:
     def test_agent_tool_preserves_non_workforce_file_outputs_without_parent_db_task_id(
         self,
     ) -> None:
-        db, db_path = _create_session()
+        db, db_path, _ = _create_session()
         try:
             tool = AgentTool(
                 agent_id=1,
@@ -677,7 +691,7 @@ class TestCreateAgentTool:
         self,
         tmp_path,
     ) -> None:
-        db, db_path = _create_session()
+        db, db_path, _ = _create_session()
         try:
             output_path = tmp_path / "report.txt"
             output_path.write_text("worker report", encoding="utf-8")
@@ -712,12 +726,14 @@ class TestCreateAgentTool:
     @pytest.mark.asyncio
     async def test_create_agent_with_tool_filters(self) -> None:
         """Test agent creation with tool categories and skills filters."""
-        db, db_path = _create_session()
+        db, db_path, SessionLocal = _create_session()
         try:
             user = User(username="testuser2", password_hash="x", is_admin=False)
             db.add(user)
             db.commit()
             db.refresh(user)
+            user_id = user.id
+            db.close()
 
             mock_llm = Mock()
             mock_llm.model_id = "gpt-4"
@@ -734,7 +750,7 @@ class TestCreateAgentTool:
                 )
                 mock_storage_class.return_value = mock_storage
 
-                tool = CreateAgentTool(db=db, user_id=user.id)
+                tool = CreateAgentTool(session_factory=SessionLocal, user_id=user_id)
 
                 result = await tool.run_json_async(
                     {
@@ -748,14 +764,21 @@ class TestCreateAgentTool:
 
                 assert result["status"] == "success"
 
-                # Verify filters were saved
-                agent = db.query(Agent).filter(Agent.name == "filtered_agent").first()
-                assert agent is not None
-                assert agent.tool_categories == ["file", "knowledge"]
-                assert agent.skills == ["web_search"]
+                # Verify filters were saved (use a fresh session)
+                verify_db = SessionLocal()
+                try:
+                    agent = (
+                        verify_db.query(Agent)
+                        .filter(Agent.name == "filtered_agent")
+                        .first()
+                    )
+                    assert agent is not None
+                    assert agent.tool_categories == ["file", "knowledge"]
+                    assert agent.skills == ["web_search"]
+                finally:
+                    verify_db.close()
 
         finally:
-            db.close()
             try:
                 import os
 
@@ -766,7 +789,7 @@ class TestCreateAgentTool:
     @pytest.mark.asyncio
     async def test_create_agent_duplicate_name_auto_renames(self) -> None:
         """Test that duplicate agent names are auto-renamed and created."""
-        db, db_path = _create_session()
+        db, db_path, SessionLocal = _create_session()
         try:
             user = User(username="testuser3", password_hash="x", is_admin=False)
             db.add(user)
@@ -781,6 +804,8 @@ class TestCreateAgentTool:
             )
             db.add(existing_agent)
             db.commit()
+            user_id = user.id
+            db.close()
 
             mock_llm = Mock()
             mock_llm.model_id = "gpt-4"
@@ -797,7 +822,7 @@ class TestCreateAgentTool:
                 )
                 mock_storage_class.return_value = mock_storage
 
-                tool = CreateAgentTool(db=db, user_id=user.id)
+                tool = CreateAgentTool(session_factory=SessionLocal, user_id=user_id)
 
                 result = await tool.run_json_async(
                     {
@@ -811,18 +836,21 @@ class TestCreateAgentTool:
                 assert result["agent_name"] == "duplicate_name Assistant"
                 assert "auto-renamed" in result["message"].lower()
 
-                created_agent = (
-                    db.query(Agent)
-                    .filter(
-                        Agent.user_id == user.id,
-                        Agent.name == "duplicate_name Assistant",
+                verify_db = SessionLocal()
+                try:
+                    created_agent = (
+                        verify_db.query(Agent)
+                        .filter(
+                            Agent.user_id == user_id,
+                            Agent.name == "duplicate_name Assistant",
+                        )
+                        .first()
                     )
-                    .first()
-                )
-                assert created_agent is not None
+                    assert created_agent is not None
+                finally:
+                    verify_db.close()
 
         finally:
-            db.close()
             try:
                 import os
 
@@ -833,14 +861,16 @@ class TestCreateAgentTool:
     @pytest.mark.asyncio
     async def test_create_agent_rejects_missing_knowledge_base(self) -> None:
         """Test that create_agent rejects knowledge bases that do not exist."""
-        db, db_path = _create_session()
+        db, db_path, SessionLocal = _create_session()
         try:
             user = User(username="testuser_missing_kb", password_hash="x")
             db.add(user)
             db.commit()
             db.refresh(user)
+            user_id = user.id
+            db.close()
 
-            tool = CreateAgentTool(db=db, user_id=user.id)
+            tool = CreateAgentTool(session_factory=SessionLocal, user_id=user_id)
 
             with patch(
                 "xagent.core.tools.adapters.vibe.agent_tool.find_missing_knowledge_bases",
@@ -857,10 +887,16 @@ class TestCreateAgentTool:
 
             assert result["status"] == "error"
             assert "missing_kb" in result["message"]
-            assert db.query(Agent).filter(Agent.name == "kb_agent").first() is None
+            verify_db = SessionLocal()
+            try:
+                assert (
+                    verify_db.query(Agent).filter(Agent.name == "kb_agent").first()
+                    is None
+                )
+            finally:
+                verify_db.close()
 
         finally:
-            db.close()
             try:
                 import os
 
@@ -873,7 +909,7 @@ class TestCreateAgentTool:
         self,
     ) -> None:
         """Test that auto-rename skips occupied fallback names."""
-        db, db_path = _create_session()
+        db, db_path, SessionLocal = _create_session()
         try:
             user = User(username="testuser3b", password_hash="x", is_admin=False)
             db.add(user)
@@ -895,6 +931,8 @@ class TestCreateAgentTool:
                 ]
             )
             db.commit()
+            user_id = user.id
+            db.close()
 
             mock_llm = Mock()
             mock_llm.model_id = "gpt-4"
@@ -911,7 +949,7 @@ class TestCreateAgentTool:
                 )
                 mock_storage_class.return_value = mock_storage
 
-                tool = CreateAgentTool(db=db, user_id=user.id)
+                tool = CreateAgentTool(session_factory=SessionLocal, user_id=user_id)
 
                 result = await tool.run_json_async(
                     {
@@ -925,7 +963,6 @@ class TestCreateAgentTool:
                 assert result["agent_name"] == "duplicate_name V2"
 
         finally:
-            db.close()
             try:
                 import os
 
@@ -936,14 +973,16 @@ class TestCreateAgentTool:
     @pytest.mark.asyncio
     async def test_create_agent_missing_name(self) -> None:
         """Test that missing name returns error."""
-        db, db_path = _create_session()
+        db, db_path, SessionLocal = _create_session()
         try:
             user = User(username="testuser4", password_hash="x", is_admin=False)
             db.add(user)
             db.commit()
             db.refresh(user)
+            user_id = user.id
+            db.close()
 
-            tool = CreateAgentTool(db=db, user_id=user.id)
+            tool = CreateAgentTool(session_factory=SessionLocal, user_id=user_id)
 
             result = await tool.run_json_async(
                 {
@@ -957,7 +996,6 @@ class TestCreateAgentTool:
             assert "required" in result["message"].lower()
 
         finally:
-            db.close()
             try:
                 import os
 
@@ -968,14 +1006,16 @@ class TestCreateAgentTool:
     @pytest.mark.asyncio
     async def test_create_agent_missing_instructions(self) -> None:
         """Test that missing instructions returns error."""
-        db, db_path = _create_session()
+        db, db_path, SessionLocal = _create_session()
         try:
             user = User(username="testuser5", password_hash="x", is_admin=False)
             db.add(user)
             db.commit()
             db.refresh(user)
+            user_id = user.id
+            db.close()
 
-            tool = CreateAgentTool(db=db, user_id=user.id)
+            tool = CreateAgentTool(session_factory=SessionLocal, user_id=user_id)
 
             result = await tool.run_json_async(
                 {
@@ -989,7 +1029,6 @@ class TestCreateAgentTool:
             assert "required" in result["message"].lower()
 
         finally:
-            db.close()
             try:
                 import os
 
@@ -1004,7 +1043,7 @@ class TestUpdateAgentTool:
     @pytest.mark.asyncio
     async def test_update_agent_success(self) -> None:
         """Test successful agent update."""
-        db, db_path = _create_session()
+        db, db_path, _ = _create_session()
         try:
             user = User(username="testuser_update", password_hash="x", is_admin=False)
             db.add(user)
@@ -1063,7 +1102,7 @@ class TestUpdateAgentTool:
     @pytest.mark.asyncio
     async def test_update_agent_partial_update(self) -> None:
         """Test partial agent update (only some fields)."""
-        db, db_path = _create_session()
+        db, db_path, _ = _create_session()
         try:
             user = User(username="testuser_partial", password_hash="x", is_admin=False)
             db.add(user)
@@ -1111,7 +1150,7 @@ class TestUpdateAgentTool:
     @pytest.mark.asyncio
     async def test_update_agent_not_found(self) -> None:
         """Test updating non-existent agent."""
-        db, db_path = _create_session()
+        db, db_path, _ = _create_session()
         try:
             user = User(username="testuser_notfound", password_hash="x", is_admin=False)
             db.add(user)
@@ -1141,7 +1180,7 @@ class TestUpdateAgentTool:
 
     @pytest.mark.asyncio
     async def test_update_agent_rejects_generated_workforce_manager(self) -> None:
-        db, db_path = _create_session()
+        db, db_path, _ = _create_session()
         try:
             user = User(
                 username="testuser_update_generated_manager",
@@ -1191,7 +1230,7 @@ class TestUpdateAgentTool:
     async def test_update_agent_name_conflict_ignores_generated_workforce_manager(
         self,
     ) -> None:
-        db, db_path = _create_session()
+        db, db_path, _ = _create_session()
         try:
             user = User(
                 username="testuser_update_generated_manager_name",
@@ -1242,7 +1281,7 @@ class TestUpdateAgentTool:
     @pytest.mark.asyncio
     async def test_update_agent_rejects_missing_knowledge_base(self) -> None:
         """Test that update_agent rejects knowledge bases that do not exist."""
-        db, db_path = _create_session()
+        db, db_path, _ = _create_session()
         try:
             user = User(username="testuser_update_missing_kb", password_hash="x")
             db.add(user)
@@ -1291,7 +1330,7 @@ class TestUpdateAgentTool:
     @pytest.mark.asyncio
     async def test_update_published_agent_success_preserves_status(self) -> None:
         """Test that published agents can be updated and remain published."""
-        db, db_path = _create_session()
+        db, db_path, _ = _create_session()
         try:
             user = User(
                 username="testuser_published", password_hash="x", is_admin=False
@@ -1343,7 +1382,7 @@ class TestUpdateAgentTool:
     @pytest.mark.asyncio
     async def test_update_archived_agent_rejected(self) -> None:
         """Test that archived agents cannot be updated."""
-        db, db_path = _create_session()
+        db, db_path, _ = _create_session()
         try:
             user = User(username="testuser_archived", password_hash="x", is_admin=False)
             db.add(user)
@@ -1391,7 +1430,7 @@ class TestUpdateAgentTool:
     @pytest.mark.asyncio
     async def test_update_agent_duplicate_name(self) -> None:
         """Test that duplicate names are rejected when updating."""
-        db, db_path = _create_session()
+        db, db_path, _ = _create_session()
         try:
             user = User(username="testuser_dup", password_hash="x", is_admin=False)
             db.add(user)
@@ -1443,7 +1482,7 @@ class TestListAgentsTool:
     @pytest.mark.asyncio
     async def test_list_all_agents(self) -> None:
         """Test listing all agents."""
-        db, db_path = _create_session()
+        db, db_path, _ = _create_session()
         try:
             user = User(username="testuser_list", password_hash="x", is_admin=False)
             db.add(user)
@@ -1499,7 +1538,7 @@ class TestListAgentsTool:
 
     @pytest.mark.asyncio
     async def test_list_agents_hides_generated_workforce_managers(self) -> None:
-        db, db_path = _create_session()
+        db, db_path, _ = _create_session()
         try:
             user = User(
                 username="testuser_list_generated_manager",
@@ -1547,7 +1586,7 @@ class TestListAgentsTool:
     @pytest.mark.asyncio
     async def test_list_agents_with_status_filter(self) -> None:
         """Test listing agents with status filter."""
-        db, db_path = _create_session()
+        db, db_path, _ = _create_session()
         try:
             user = User(username="testuser_filter", password_hash="x", is_admin=False)
             db.add(user)
@@ -1589,7 +1628,7 @@ class TestListAgentsTool:
     @pytest.mark.asyncio
     async def test_list_agents_user_isolation(self) -> None:
         """Test that users can only see their own agents."""
-        db, db_path = _create_session()
+        db, db_path, _ = _create_session()
         try:
             user1 = User(username="listuser1", password_hash="x", is_admin=False)
             user2 = User(username="listuser2", password_hash="x", is_admin=False)
@@ -1633,7 +1672,7 @@ class TestListAgentsTool:
     @pytest.mark.asyncio
     async def test_list_agents_invalid_status_filter(self) -> None:
         """Test that invalid status filter returns error."""
-        db, db_path = _create_session()
+        db, db_path, _ = _create_session()
         try:
             user = User(username="testuser_invalid", password_hash="x", is_admin=False)
             db.add(user)
@@ -1681,7 +1720,7 @@ class TestDraftAgentsInTools:
 
     def test_get_tools_with_draft_disabled(self) -> None:
         """Test that draft agents are excluded when include_draft=False."""
-        db, db_path = _create_session()
+        db, db_path, _ = _create_session()
         try:
             user = User(username="testuser6", password_hash="x", is_admin=False)
             db.add(user)
@@ -1720,7 +1759,7 @@ class TestDraftAgentsInTools:
 
     def test_get_tools_with_draft_enabled(self) -> None:
         """Test that draft agents are included when include_draft=True."""
-        db, db_path = _create_session()
+        db, db_path, _ = _create_session()
         try:
             user = User(username="testuser7", password_hash="x", is_admin=False)
             db.add(user)
@@ -1758,7 +1797,7 @@ class TestDraftAgentsInTools:
                 pass
 
     def test_generated_workforce_managers_are_hidden_from_agent_tools(self) -> None:
-        db, db_path = _create_session()
+        db, db_path, _ = _create_session()
         try:
             user = User(
                 username="testuser_generated_manager_tools",
@@ -1809,7 +1848,7 @@ class TestDraftAgentsInTools:
 
     def test_user_isolation_for_draft_agents(self) -> None:
         """Test that users cannot see other users' draft agents."""
-        db, db_path = _create_session()
+        db, db_path, _ = _create_session()
         try:
             user1 = User(username="user1", password_hash="x", is_admin=False)
             user2 = User(username="user2", password_hash="x", is_admin=False)
@@ -1851,12 +1890,14 @@ class TestCreateAndCallAgent:
     @pytest.mark.asyncio
     async def test_create_then_call_draft_agent(self) -> None:
         """Test creating a draft agent and then calling it."""
-        db, db_path = _create_session()
+        db, db_path, SessionLocal = _create_session()
         try:
             user = User(username="testuser8", password_hash="x", is_admin=False)
             db.add(user)
             db.commit()
             db.refresh(user)
+            user_id = user.id
+            db.close()
 
             # Mock LLM
             mock_llm = Mock()
@@ -1878,7 +1919,7 @@ class TestCreateAndCallAgent:
 
                 # Step 1: Create agent
                 create_tool = CreateAgentTool(
-                    db=db, user_id=user.id, task_id="test_task"
+                    session_factory=SessionLocal, user_id=user_id, task_id="test_task"
                 )
 
                 create_result = await create_tool.run_json_async(
@@ -1892,21 +1933,23 @@ class TestCreateAndCallAgent:
                 assert create_result["status"] == "success"
                 agent_id = create_result["agent_id"]
 
-                # Step 2: Verify agent is in tools list
-                tools = get_published_agents_tools(
-                    db=db, user_id=user.id, include_draft=True
-                )
-                tool_names = {tool.name for tool in tools}
+                # Step 2: Verify agent is in tools list (use a fresh session)
+                verify_db = SessionLocal()
+                try:
+                    tools = get_published_agents_tools(
+                        db=verify_db, user_id=user_id, include_draft=True
+                    )
+                    tool_names = {tool.name for tool in tools}
+                    assert f"agent_{agent_id}" in tool_names
 
-                assert f"agent_{agent_id}" in tool_names
-
-                # Step 3: Verify agent can be loaded
-                agent = db.query(Agent).filter(Agent.id == agent_id).first()
-                assert agent is not None
-                assert agent.status == AgentStatus.DRAFT
+                    # Step 3: Verify agent can be loaded
+                    agent = verify_db.query(Agent).filter(Agent.id == agent_id).first()
+                    assert agent is not None
+                    assert agent.status == AgentStatus.DRAFT
+                finally:
+                    verify_db.close()
 
         finally:
-            db.close()
             try:
                 import os
 
@@ -1918,7 +1961,7 @@ class TestCreateAndCallAgent:
     async def test_agent_tool_injects_langfuse_tracer(
         self, mocker, monkeypatch, langfuse_client_reset
     ) -> None:
-        db, db_path = _create_session()
+        db, db_path, _ = _create_session()
         try:
             monkeypatch.setenv("LANGFUSE_PUBLIC_KEY", "test-public")
             monkeypatch.setenv("LANGFUSE_SECRET_KEY", "test-secret")
@@ -2001,7 +2044,7 @@ class TestCreateAndCallAgent:
 
     @pytest.mark.asyncio
     async def test_agent_tool_keeps_mcp_tools_when_filtering_by_category(self) -> None:
-        db, db_path = _create_session()
+        db, db_path, _ = _create_session()
         try:
             user = User(username="testuser10", password_hash="x", is_admin=False)
             db.add(user)
@@ -2116,7 +2159,7 @@ class TestCreateAndCallAgent:
         ``include_mcp_tools=False`` -- so it does not pay MCP server init.
         Empty and NULL categories still build an ALL-mode selection spec
         for final filtering, but should not opt into MCP config loading."""
-        db, db_path = _create_session()
+        db, db_path, _ = _create_session()
         try:
             user = User(username="basicdeleg", password_hash="x", is_admin=False)
             db.add(user)
