@@ -248,10 +248,14 @@ class AgentExecutionAdapter:
         if self.config.pattern == "auto":
             return (
                 AutoPattern(
+                    react_pattern=ReActPattern(
+                        tool_parallel_enabled=self.config.tool_parallel_enabled,
+                        tool_max_concurrency=self.config.tool_max_concurrency,
+                    ),
                     dag_pattern=DAGPattern(
                         LLMPlanGenerator(),
                         max_concurrency=self.config.dag_max_concurrency,
-                    )
+                    ),
                 ),
                 "agent_auto",
             )
