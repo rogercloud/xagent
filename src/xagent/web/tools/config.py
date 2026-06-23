@@ -153,7 +153,7 @@ class WebToolConfig(BaseToolConfig):
         # reads ``config.get_tool_selection_spec()``. ``None`` defaults
         # to the ``_SpecAll`` ALL-mode (build every default tool).
         self._tool_selection_spec = tool_selection_spec
-        self.db = db
+        self._live_db = db
         self._db_factory = db_factory
         self._lazy_db = None
         self.request = request
@@ -440,20 +440,30 @@ class WebToolConfig(BaseToolConfig):
 
         return get_session_local()
 
-    def get_db(self) -> Any:
-        """Get database session.
+    @property
+    def db(self) -> Any:
+        """Construction-time DB session.
 
-        Request path: returns the caller-owned request session verbatim.
-        Factory path (nested): lazily opens and caches one construction-time
-        session, closed by ``close()``.
+        Request path: the caller-owned live session, returned verbatim.
+        Factory path (nested child config): a lazily-opened, cached session
+        minted from the factory and closed by ``close()``.
+
+        Exposing this as a property keeps every DB-backed config loader that
+        reads ``self.db.query(...)`` working whether the config was built with
+        a live session or with only a factory — without each loader having to
+        route through ``get_db()`` explicitly.
         """
-        if self.db is not None:
-            return self.db
+        if self._live_db is not None:
+            return self._live_db
         if self._db_factory is not None:
             if self._lazy_db is None:
                 self._lazy_db = self._db_factory()
             return self._lazy_db
         return None
+
+    def get_db(self) -> Any:
+        """Get database session (see the :attr:`db` property)."""
+        return self.db
 
     def close(self) -> None:
         """Close the lazily-opened factory session, if any."""
