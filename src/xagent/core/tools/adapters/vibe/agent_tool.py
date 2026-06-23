@@ -2038,19 +2038,22 @@ def get_published_agents_tools(
                     for agent_id in (normalized_draft_agent_ids or [])
                     if agent_id not in excluded_agent_ids
                 ]
-                draft_agents = _apply_owned_agent_tool_filters(
-                    db.query(Agent).filter(
-                        Agent.id.in_(normalized_draft_agent_ids),
-                        Agent.status == "draft",
-                    ),
-                    Agent,
-                    user_id=user_id,
-                ).all()
-                # Merge without duplicates
-                existing_ids = {agent.id for agent in agents}
-                for draft_agent in draft_agents:
-                    if draft_agent.id not in existing_ids:
-                        agents.append(draft_agent)
+                # Skip the query entirely when nothing survives the exclusion
+                # filter, so we never issue an empty ``IN ()`` predicate.
+                if normalized_draft_agent_ids:
+                    draft_agents = _apply_owned_agent_tool_filters(
+                        db.query(Agent).filter(
+                            Agent.id.in_(normalized_draft_agent_ids),
+                            Agent.status == "draft",
+                        ),
+                        Agent,
+                        user_id=user_id,
+                    ).all()
+                    # Merge without duplicates
+                    existing_ids = {agent.id for agent in agents}
+                    for draft_agent in draft_agents:
+                        if draft_agent.id not in existing_ids:
+                            agents.append(draft_agent)
 
             if normalized_injected_agent_ids is not None:
                 agent_types = "selected PUBLISHED"
