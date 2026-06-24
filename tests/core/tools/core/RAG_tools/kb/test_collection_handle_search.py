@@ -14,6 +14,7 @@ import pytest
 from xagent.core.tools.core.RAG_tools.core.schemas import (
     DenseSearchResponse,
     IndexStatus,
+    SparseSearchResponse,
 )
 from xagent.core.tools.core.RAG_tools.kb.collection_handle import (
     LanceDBCollectionHandle,
@@ -130,3 +131,47 @@ async def test_search_dense_async_success():
     kwargs = store.search_vectors_by_model_async.call_args.kwargs
     assert kwargs["model_tag"] == "model-x"
     assert kwargs["user_id"] == 7 and kwargs["is_admin"] is False
+
+
+# ---------------------------------------------------------------------------
+# Sparse search tests
+# ---------------------------------------------------------------------------
+
+
+def test_search_sparse_capability_unsupported():
+    handle, _, store, _ = _make_handle(supports_search=False)
+    resp = handle.search_sparse("model-x", "hello", top_k=3)
+    assert isinstance(resp, SparseSearchResponse)
+    assert resp.status == "failed"
+    assert any(w.code == "SEARCH_NOT_SUPPORTED" for w in resp.warnings)
+    store.open_embeddings_table.assert_not_called()
+
+
+def test_search_sparse_fts_hit_scores_normalized():
+    handle, _, store, _ = _make_handle()
+    store.open_embeddings_table.return_value = (MagicMock(), "embeddings_model-x")
+    store.create_index.return_value = _index_result()
+    # Return None from build_filter_expression so the .where() branch is skipped
+    # and the FTS result chain is: search().limit().to_pandas()
+    store.build_filter_expression.return_value = None
+    fts_table = store.open_embeddings_table.return_value[0]
+    import pandas as pd
+
+    rows = pd.DataFrame(
+        [
+            {
+                "doc_id": "d1",
+                "chunk_id": "c1",
+                "text": "hello",
+                "parse_hash": "h",
+                "created_at": "2026",
+                "metadata": None,
+                "_score": 3.0,
+            }
+        ]
+    )
+    fts_table.search.return_value.limit.return_value.to_pandas.return_value = rows
+    resp = handle.search_sparse("model-x", "hello", top_k=3)
+    assert resp.status == "success"
+    assert resp.fts_enabled is True
+    assert resp.results[0].score == pytest.approx(0.75)  # 3/(1+3)
