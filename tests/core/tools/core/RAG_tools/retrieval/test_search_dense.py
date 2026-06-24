@@ -1,10 +1,9 @@
 """Tests for search_dense functionality.
 
-This module tests the dense vector search implementation:
-- search_dense main function
-- search_engine core logic
-- _build_safe_filter utility
-- Integration with LanceDB and index management
+This module tests the dense vector search public surface:
+- search_dense / search_dense_async public functions
+- input validation at the public boundary
+- routing through the collection handle
 """
 
 import os
@@ -156,7 +155,7 @@ class TestSearchDense:
 
         assert response.status == "success"
         assert response.total_count == 0
-        # Query vector still validated at the public boundary.
+        # An empty store result yields a clean success response with no rows.
         store.search_vectors_by_model.assert_called_once()
         assert (
             store.search_vectors_by_model.call_args.kwargs["model_tag"] == "test_model"

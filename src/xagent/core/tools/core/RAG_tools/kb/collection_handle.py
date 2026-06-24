@@ -1986,7 +1986,7 @@ class LanceDBCollectionHandle(KBCollectionHandle):
         query_text: str,
         status: str = "success",
     ) -> SparseSearchResponse:
-        """Helper to assemble ``SparseSearchResponse``. Allows fallback reuse."""
+        """Helper to assemble `SparseSearchResponse`. Allows fallback reuse."""
         return SparseSearchResponse(
             results=results,
             total_count=len(results),

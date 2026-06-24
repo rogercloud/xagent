@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from unittest.mock import AsyncMock, MagicMock
 
+import pandas as pd
 import pytest
 
 from xagent.core.tools.core.RAG_tools.core.schemas import (
@@ -155,8 +156,6 @@ def test_search_sparse_fts_hit_scores_normalized():
     # and the FTS result chain is: search().limit().to_pandas()
     store.build_filter_expression.return_value = None
     fts_table = store.open_embeddings_table.return_value[0]
-    import pandas as pd
-
     rows = pd.DataFrame(
         [
             {
