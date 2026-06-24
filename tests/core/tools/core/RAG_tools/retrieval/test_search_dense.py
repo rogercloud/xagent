@@ -18,7 +18,10 @@ from xagent.core.tools.core.RAG_tools.core.schemas import (
     IndexResult,
     IndexStatus,
 )
-from xagent.core.tools.core.RAG_tools.retrieval.search_dense import search_dense
+from xagent.core.tools.core.RAG_tools.retrieval.search_dense import (
+    search_dense,
+    search_dense_async,
+)
 
 
 class TestSearchDense:
@@ -76,6 +79,35 @@ class TestSearchDense:
 
         with pytest.raises(DocumentValidationError):
             search_dense(
+                "collection",
+                "model",
+                [1.0, 2.0, 3.0],
+                top_k=2000,
+                user_id=None,
+                is_admin=True,
+            )
+
+    async def test_search_dense_async_input_validation(self):
+        """Async path validates the same inputs as the sync path (#670)."""
+        with pytest.raises(DocumentValidationError):
+            await search_dense_async(
+                "", "model", [1.0, 2.0, 3.0], user_id=None, is_admin=True
+            )
+        with pytest.raises(DocumentValidationError):
+            await search_dense_async(
+                "collection", "", [1.0, 2.0, 3.0], user_id=None, is_admin=True
+            )
+        with pytest.raises(DocumentValidationError):
+            await search_dense_async(
+                "collection",
+                "model",
+                [1.0, 2.0, 3.0],
+                top_k=0,
+                user_id=None,
+                is_admin=True,
+            )
+        with pytest.raises(DocumentValidationError):
+            await search_dense_async(
                 "collection",
                 "model",
                 [1.0, 2.0, 3.0],

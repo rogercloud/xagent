@@ -27,6 +27,24 @@ def _get_legacy_step_compatibility_facade() -> "KBLegacyStepCompatibilityFacade"
     return get_kb_coordinator().legacy_step_compatibility
 
 
+def _validate_dense_inputs(
+    collection: str, model_tag: str, top_k: int, query_vector: List[float]
+) -> None:
+    """Validate dense-search inputs at the public boundary.
+
+    Raises:
+        DocumentValidationError: If collection/model_tag/top_k are invalid.
+        VectorValidationError: If query-vector validation fails.
+    """
+    if not collection or not isinstance(collection, str):
+        raise DocumentValidationError("Collection must be a non-empty string")
+    if not model_tag or not isinstance(model_tag, str):
+        raise DocumentValidationError("model_tag must be a non-empty string")
+    if top_k <= 0 or top_k > 1000:
+        raise DocumentValidationError("top_k must be between 1 and 1000")
+    validate_query_vector(query_vector)
+
+
 def search_dense(
     collection: str,
     model_tag: str,
@@ -46,15 +64,8 @@ def search_dense(
         DocumentValidationError: If input validation fails.
         VectorValidationError: If query-vector validation fails.
     """
-    # Input validation at the public boundary (the routed handle path no longer
-    # passes through ``_search_dense_impl`` where this previously lived).
-    if not collection or not isinstance(collection, str):
-        raise DocumentValidationError("Collection must be a non-empty string")
-    if not model_tag or not isinstance(model_tag, str):
-        raise DocumentValidationError("model_tag must be a non-empty string")
-    if top_k <= 0 or top_k > 1000:
-        raise DocumentValidationError("top_k must be between 1 and 1000")
-    validate_query_vector(query_vector)
+    # Input validation at the public boundary.
+    _validate_dense_inputs(collection, model_tag, top_k, query_vector)
 
     return _get_legacy_step_compatibility_facade().search_dense(
         collection=collection,
@@ -86,7 +97,14 @@ async def search_dense_async(
     user_id: Optional[int] = None,
     is_admin: bool = False,
 ) -> DenseSearchResponse:
-    """Execute dense vector search using async vector store abstraction."""
+    """Execute dense vector search using async vector store abstraction.
+
+    Raises:
+        DocumentValidationError: If input validation fails.
+        VectorValidationError: If query-vector validation fails.
+    """
+    # Input validation at the public boundary (shared with the sync path).
+    _validate_dense_inputs(collection, model_tag, top_k, query_vector)
     return await _get_legacy_step_compatibility_facade().search_dense_async(
         collection=collection,
         model_tag=model_tag,
