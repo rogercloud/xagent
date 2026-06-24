@@ -46,7 +46,22 @@ def search_dense(
     user_id: Optional[int] = None,
     is_admin: bool = False,
 ) -> DenseSearchResponse:
-    """Execute dense vector search for RAG retrieval."""
+    """Execute dense vector search for RAG retrieval.
+
+    Raises:
+        DocumentValidationError: If input validation fails.
+        VectorValidationError: If query-vector validation fails.
+    """
+    # Input validation at the public boundary (the routed handle path no longer
+    # passes through ``_search_dense_impl`` where this previously lived).
+    if not collection or not isinstance(collection, str):
+        raise DocumentValidationError("Collection must be a non-empty string")
+    if not model_tag or not isinstance(model_tag, str):
+        raise DocumentValidationError("model_tag must be a non-empty string")
+    if top_k <= 0 or top_k > 1000:
+        raise DocumentValidationError("top_k must be between 1 and 1000")
+    validate_query_vector(query_vector)
+
     return _get_legacy_step_compatibility_facade().search_dense(
         collection=collection,
         model_tag=model_tag,

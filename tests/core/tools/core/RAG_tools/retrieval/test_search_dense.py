@@ -405,32 +405,32 @@ class TestSearchDense:
                 is_admin=True,
             )
 
-    def test_search_dense_success_path(self):
-        """Test successful search_dense execution."""
+    def test_search_dense_success_path(self, make_handle, routed_facade):
+        """Test successful search_dense execution through the routed handle.
+
+        Re-pointed (#511): the public ``search_dense`` now runs the real handle
+        logic against a mock ``vector_index_store`` instead of patching the
+        ``search_dense_engine`` free function. The handle reads raw rows from
+        ``store.search_vectors_by_model`` and converts ``_distance`` to a score.
+        """
         search_dense_module = self._patch_search_dense_module()
+        handle, store, _ = make_handle()
+        store.create_index.return_value = IndexResult(
+            status="index_ready", advice="Index is ready", fts_enabled=True
+        )
+        store.search_vectors_by_model.return_value = [
+            {
+                "doc_id": "doc1",
+                "chunk_id": "chunk1",
+                "text": "content",
+                "parse_hash": "hash1",
+                "created_at": "2026-01-01",
+                "metadata": None,
+                "_distance": 0.0,  # score = 1/(1+0) = 1.0
+            }
+        ]
 
-        with (
-            patch.object(search_dense_module, "search_dense_engine") as mock_engine,
-            patch.object(search_dense_module, "validate_query_vector") as mock_validate,
-        ):
-            mock_validate.return_value = None
-
-            from datetime import datetime
-
-            mock_results = [
-                SearchResult(
-                    doc_id="doc1",
-                    chunk_id="chunk1",
-                    text="content",
-                    score=0.8,
-                    parse_hash="hash1",
-                    model_tag="test_model",
-                    created_at=datetime.now(),
-                )
-            ]
-            mock_engine.return_value = (mock_results, "index_ready", "Index is ready")
-
-            # Execute search
+        with routed_facade(search_dense_module, handle):
             response = search_dense(
                 collection="test_collection",
                 model_tag="test_model",
@@ -440,32 +440,32 @@ class TestSearchDense:
                 is_admin=True,
             )
 
-            # Verify response
-            assert isinstance(response, DenseSearchResponse)
-            assert response.status == "success"
-            assert len(response.results) == 1
-            assert response.total_count == 1
-            assert response.index_status == IndexStatus.INDEX_READY
+        # Verify response
+        assert isinstance(response, DenseSearchResponse)
+        assert response.status == "success"
+        assert len(response.results) == 1
+        assert response.total_count == 1
+        assert response.index_status == IndexStatus.INDEX_READY
+        assert response.results[0].doc_id == "doc1"
 
-            # Verify function calls - validate_query_vector is called without conn parameter
-            mock_validate.assert_called_once_with([0.1, 0.2, 0.3])
-            mock_engine.assert_called_once()
+        # The store search reached with the right model_tag/top_k/scope.
+        store.search_vectors_by_model.assert_called_once()
+        kwargs = store.search_vectors_by_model.call_args.kwargs
+        assert kwargs["model_tag"] == "test_model"
+        assert kwargs["top_k"] == 5
+        assert kwargs["is_admin"] is True
 
-    def test_search_dense_validation_fallback(self):
-        """Test search_dense with validation fallback."""
+    def test_search_dense_validation_fallback(self, make_handle, routed_facade):
+        """Test search_dense returns cleanly when the store yields no rows."""
         search_dense_module = self._patch_search_dense_module()
+        handle, store, _ = make_handle()
+        store.create_index.return_value = IndexResult(
+            status="index_ready", advice="Index is ready", fts_enabled=True
+        )
+        store.search_vectors_by_model.return_value = []
 
-        with (
-            patch.object(search_dense_module, "search_dense_engine") as mock_engine,
-            patch.object(search_dense_module, "validate_query_vector") as mock_validate,
-        ):
-            mock_validate.return_value = None
-
-            mock_results = []
-            mock_engine.return_value = (mock_results, "index_ready", "Index is ready")
-
-            # Execute search (should not fail)
-            search_dense(
+        with routed_facade(search_dense_module, handle):
+            response = search_dense(
                 collection="test_collection",
                 model_tag="test_model",
                 query_vector=[0.1, 0.2, 0.3],
@@ -474,11 +474,16 @@ class TestSearchDense:
                 is_admin=True,
             )
 
-            # Verify validate_query_vector was called without conn parameter
-            mock_validate.assert_called_once_with([0.1, 0.2, 0.3])
+        assert response.status == "success"
+        assert response.total_count == 0
+        # Query vector still validated at the public boundary.
+        store.search_vectors_by_model.assert_called_once()
+        assert (
+            store.search_vectors_by_model.call_args.kwargs["model_tag"] == "test_model"
+        )
 
-    def test_search_dense_index_status_mapping(self):
-        """Test index status mapping in search_dense."""
+    def test_search_dense_index_status_mapping(self, make_handle, routed_facade):
+        """Test index status mapping in search_dense via the routed handle."""
         search_dense_module = self._patch_search_dense_module()
 
         test_cases = [
@@ -491,16 +496,17 @@ class TestSearchDense:
         ]
 
         for engine_status, expected_enum in test_cases:
-            with (
-                patch.object(search_dense_module, "search_dense_engine") as mock_engine,
-                patch.object(search_dense_module, "validate_query_vector"),
-            ):
-                mock_engine.return_value = ([], engine_status, "test advice")
+            handle, store, _ = make_handle()
+            store.create_index.return_value = IndexResult(
+                status=engine_status, advice="test advice", fts_enabled=True
+            )
+            store.search_vectors_by_model.return_value = []
 
+            with routed_facade(search_dense_module, handle):
                 response = search_dense(
                     "col", "model", [1.0], top_k=1, user_id=None, is_admin=True
                 )
-                assert response.index_status == expected_enum
+            assert response.index_status == expected_enum
 
 
 class TestSearchDenseIntegration:
