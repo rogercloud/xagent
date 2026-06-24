@@ -22,8 +22,13 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Set, cast
 
 import pandas as pd
-import pyarrow as pa  # type: ignore
-from pyarrow import Table as PyArrowTable
+
+try:
+    import pyarrow as pa  # type: ignore
+    from pyarrow import Table as PyArrowTable
+except ImportError:  # pragma: no cover - pyarrow is an optional runtime dep
+    pa = None
+    PyArrowTable = Any
 
 from ..core.config import DEFAULT_LANCEDB_BATCH_SIZE
 from ..core.exceptions import (
@@ -1724,7 +1729,7 @@ class LanceDBCollectionHandle(KBCollectionHandle):
             for row in raw_results:
                 distance_value = row.get("_distance")
                 distance = float(distance_value) if distance_value is not None else 0.0
-                score = 1.0 / (1.0 + distance)
+                score = 1.0 / (1.0 + max(0.0, distance))
                 metadata = deserialize_metadata(row.get("metadata"))
                 search_results.append(
                     SearchResult(
@@ -1803,7 +1808,7 @@ class LanceDBCollectionHandle(KBCollectionHandle):
             for row in raw_results:
                 distance_value = row.get("_distance")
                 distance = float(distance_value) if distance_value is not None else 0.0
-                score = 1.0 / (1.0 + distance)
+                score = 1.0 / (1.0 + max(0.0, distance))
                 metadata = deserialize_metadata(row.get("metadata"))
                 search_results.append(
                     SearchResult(
