@@ -175,3 +175,148 @@ def test_search_sparse_fts_hit_scores_normalized():
     assert resp.status == "success"
     assert resp.fts_enabled is True
     assert resp.results[0].score == pytest.approx(0.75)  # 3/(1+3)
+
+
+# ---------------------------------------------------------------------------
+# Hybrid search tests
+# ---------------------------------------------------------------------------
+
+
+def test_search_hybrid_capability_unsupported():
+    from xagent.core.tools.core.RAG_tools.core.schemas import HybridSearchResponse
+
+    handle, _, _, _ = _make_handle(supports_search=False)
+    resp = handle.search_hybrid("model-x", "q", [0.1], top_k=5)
+    assert isinstance(resp, HybridSearchResponse)
+    assert resp.status == "failed"
+    assert any(w.code == "SEARCH_NOT_SUPPORTED" for w in resp.warnings)
+    assert resp.dense_count == 0 and resp.sparse_count == 0
+
+
+def test_search_hybrid_fetches_double_top_k_and_fuses(monkeypatch):
+    from xagent.core.tools.core.RAG_tools.core.schemas import (
+        DenseSearchResponse,
+        IndexStatus,
+        SearchResult,
+        SparseSearchResponse,
+    )
+
+    handle, _, _, _ = _make_handle()
+    dense = DenseSearchResponse(
+        results=[
+            SearchResult(
+                doc_id="d",
+                chunk_id="c",
+                text="t",
+                score=0.9,
+                parse_hash="h",
+                model_tag="model-x",
+                created_at="2026",
+                metadata=None,
+            )
+        ],
+        total_count=1,
+        status="success",
+        warnings=[],
+        index_status=IndexStatus.INDEX_READY,
+        index_advice=None,
+        idempotency_key=None,
+        fallback_info=None,
+        nprobes=None,
+        refine_factor=None,
+    )
+    sparse = SparseSearchResponse(
+        results=[],
+        total_count=0,
+        status="success",
+        warnings=[],
+        fts_enabled=True,
+        query_text="q",
+    )
+    captured = {}
+
+    def fake_dense(self, model_tag, query_vector, *, top_k, **kw):
+        captured["dense_top_k"] = top_k
+        return dense
+
+    def fake_sparse(self, model_tag, query_text, *, top_k, **kw):
+        captured["sparse_top_k"] = top_k
+        return sparse
+
+    monkeypatch.setattr(type(handle), "search_dense", fake_dense)
+    monkeypatch.setattr(type(handle), "search_sparse", fake_sparse)
+    resp = handle.search_hybrid("model-x", "q", [0.1], top_k=5)
+    assert captured["dense_top_k"] == 10 and captured["sparse_top_k"] == 10  # top_k*2
+    assert resp.status in ("success", "partial_success")
+    assert resp.dense_count == 1 and resp.sparse_count == 0
+
+
+@pytest.mark.asyncio
+async def test_search_hybrid_async_capability_unsupported():
+    from xagent.core.tools.core.RAG_tools.core.schemas import HybridSearchResponse
+
+    handle, _, _, _ = _make_handle(supports_search=False)
+    resp = await handle.search_hybrid_async("model-x", "q", [0.1], top_k=5)
+    assert isinstance(resp, HybridSearchResponse)
+    assert resp.status == "failed"
+    assert any(w.code == "SEARCH_NOT_SUPPORTED" for w in resp.warnings)
+    assert resp.dense_count == 0 and resp.sparse_count == 0
+
+
+@pytest.mark.asyncio
+async def test_search_hybrid_async_fetches_double_top_k_and_fuses(monkeypatch):
+    from xagent.core.tools.core.RAG_tools.core.schemas import (
+        DenseSearchResponse,
+        IndexStatus,
+        SearchResult,
+        SparseSearchResponse,
+    )
+
+    handle, _, _, _ = _make_handle()
+    dense = DenseSearchResponse(
+        results=[
+            SearchResult(
+                doc_id="d",
+                chunk_id="c",
+                text="t",
+                score=0.9,
+                parse_hash="h",
+                model_tag="model-x",
+                created_at="2026",
+                metadata=None,
+            )
+        ],
+        total_count=1,
+        status="success",
+        warnings=[],
+        index_status=IndexStatus.INDEX_READY,
+        index_advice=None,
+        idempotency_key=None,
+        fallback_info=None,
+        nprobes=None,
+        refine_factor=None,
+    )
+    sparse = SparseSearchResponse(
+        results=[],
+        total_count=0,
+        status="success",
+        warnings=[],
+        fts_enabled=True,
+        query_text="q",
+    )
+    captured = {}
+
+    async def fake_dense_async(self, model_tag, query_vector, *, top_k, **kw):
+        captured["dense_top_k"] = top_k
+        return dense
+
+    async def fake_sparse_async(self, model_tag, query_text, *, top_k, **kw):
+        captured["sparse_top_k"] = top_k
+        return sparse
+
+    monkeypatch.setattr(type(handle), "search_dense_async", fake_dense_async)
+    monkeypatch.setattr(type(handle), "search_sparse_async", fake_sparse_async)
+    resp = await handle.search_hybrid_async("model-x", "q", [0.1], top_k=5)
+    assert captured["dense_top_k"] == 10 and captured["sparse_top_k"] == 10  # top_k*2
+    assert resp.status in ("success", "partial_success")
+    assert resp.dense_count == 1 and resp.sparse_count == 0
