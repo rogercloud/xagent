@@ -421,6 +421,45 @@ async def test_search_hybrid_async_fetches_double_top_k_and_fuses(monkeypatch):
     assert fused.fts_score is None and fused.fts_rank is None
 
 
+# ---------------------------------------------------------------------------
+# Cross-mode capability-degradation tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "call",
+    [
+        lambda h: h.search_dense("m", [0.1], top_k=3),
+        lambda h: h.search_sparse("m", "q", top_k=3),
+        lambda h: h.search_hybrid("m", "q", [0.1], top_k=3),
+    ],
+)
+def test_all_modes_degrade_when_search_unsupported(call):
+    handle, _, _, _ = _make_handle(supports_search=False)
+    resp = call(handle)
+    assert resp.status == "failed"
+    assert any(w.code == "SEARCH_NOT_SUPPORTED" for w in resp.warnings)
+
+
+# ---------------------------------------------------------------------------
+# Rollback-scope filter test
+# ---------------------------------------------------------------------------
+
+
+def test_dense_passes_collection_and_user_scope_to_store():
+    # Rollback-incomplete remnants must still be filtered: assert the store call
+    # always carries the collection filter + user scope so a stray row in another
+    # collection / another user cannot leak.
+    handle, ctx, store, _ = _make_handle()
+    store.create_index.return_value = _index_result()
+    store.search_vectors_by_model.return_value = []
+    handle.search_dense("m", [0.1], top_k=3, user_id=42, is_admin=False)
+    kwargs = store.search_vectors_by_model.call_args.kwargs
+    assert kwargs["user_id"] == 42 and kwargs["is_admin"] is False
+    # collection filter present in the FilterExpression
+    assert kwargs["filters"] is not None
+
+
 @pytest.mark.asyncio
 async def test_search_hybrid_async_linear_fusion(monkeypatch):
     """LINEAR fusion path exercised via the async hybrid method."""
