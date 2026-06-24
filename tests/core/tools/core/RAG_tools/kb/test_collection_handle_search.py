@@ -249,6 +249,99 @@ def test_search_hybrid_fetches_double_top_k_and_fuses(monkeypatch):
     assert captured["dense_top_k"] == 10 and captured["sparse_top_k"] == 10  # top_k*2
     assert resp.status in ("success", "partial_success")
     assert resp.dense_count == 1 and resp.sparse_count == 0
+    # The fused output contains the dense result with the original score/rank
+    # attached: vector_* from dense, fts_* unset because sparse missed.
+    assert len(resp.results) == 1
+    fused = resp.results[0]
+    assert fused.doc_id == "d" and fused.chunk_id == "c"
+    assert fused.vector_score == pytest.approx(0.9)  # dense original score
+    assert fused.vector_rank == 1
+    assert fused.fts_score is None and fused.fts_rank is None
+
+
+def test_search_hybrid_linear_fusion_attaches_scores(monkeypatch):
+    from xagent.core.tools.core.RAG_tools.core.schemas import (
+        DenseSearchResponse,
+        FusionConfig,
+        FusionStrategy,
+        IndexStatus,
+        SearchResult,
+        SparseSearchResponse,
+    )
+
+    handle, _, _, _ = _make_handle()
+    dense = DenseSearchResponse(
+        results=[
+            SearchResult(
+                doc_id="d",
+                chunk_id="c",
+                text="t",
+                score=0.9,
+                parse_hash="h",
+                model_tag="model-x",
+                created_at="2026",
+                metadata=None,
+            )
+        ],
+        total_count=1,
+        status="success",
+        warnings=[],
+        index_status=IndexStatus.INDEX_READY,
+        index_advice=None,
+        idempotency_key=None,
+        fallback_info=None,
+        nprobes=None,
+        refine_factor=None,
+    )
+    sparse = SparseSearchResponse(
+        results=[
+            SearchResult(
+                doc_id="d2",
+                chunk_id="c2",
+                text="t2",
+                score=0.7,
+                parse_hash="h",
+                model_tag="model-x",
+                created_at="2026",
+                metadata=None,
+            )
+        ],
+        total_count=1,
+        status="success",
+        warnings=[],
+        fts_enabled=True,
+        query_text="q",
+    )
+
+    def fake_dense(self, model_tag, query_vector, *, top_k, **kw):
+        return dense
+
+    def fake_sparse(self, model_tag, query_text, *, top_k, **kw):
+        return sparse
+
+    monkeypatch.setattr(type(handle), "search_dense", fake_dense)
+    monkeypatch.setattr(type(handle), "search_sparse", fake_sparse)
+    cfg = FusionConfig(
+        strategy=FusionStrategy.LINEAR,
+        dense_weight=0.6,
+        sparse_weight=0.4,
+        normalize_scores=True,
+    )
+    resp = handle.search_hybrid("model-x", "q", [0.1], top_k=5, fusion_config=cfg)
+    assert resp.status in ("success", "partial_success")
+    assert resp.dense_count == 1 and resp.sparse_count == 1
+    assert resp.fusion_config.strategy == FusionStrategy.LINEAR
+    # Linear fusion combines both lists; both unique results survive.
+    assert len(resp.results) == 2
+    by_doc = {r.doc_id: r for r in resp.results}
+    # Dense-only doc carries its dense score/rank, no fts attachment.
+    assert by_doc["d"].vector_score == pytest.approx(0.9)
+    assert by_doc["d"].vector_rank == 1
+    assert by_doc["d"].fts_score is None and by_doc["d"].fts_rank is None
+    # Sparse-only doc carries its fts score/rank, no vector attachment.
+    assert by_doc["d2"].fts_score == pytest.approx(0.7)
+    assert by_doc["d2"].fts_rank == 1
+    assert by_doc["d2"].vector_score is None and by_doc["d2"].vector_rank is None
 
 
 @pytest.mark.asyncio
@@ -320,3 +413,91 @@ async def test_search_hybrid_async_fetches_double_top_k_and_fuses(monkeypatch):
     assert captured["dense_top_k"] == 10 and captured["sparse_top_k"] == 10  # top_k*2
     assert resp.status in ("success", "partial_success")
     assert resp.dense_count == 1 and resp.sparse_count == 0
+    # _fuse_hybrid is shared; verify it attaches vector_score/rank via the async path too.
+    assert len(resp.results) == 1
+    fused = resp.results[0]
+    assert fused.doc_id == "d" and fused.vector_score == pytest.approx(0.9)
+    assert fused.vector_rank == 1
+    assert fused.fts_score is None and fused.fts_rank is None
+
+
+@pytest.mark.asyncio
+async def test_search_hybrid_async_linear_fusion(monkeypatch):
+    """LINEAR fusion path exercised via the async hybrid method."""
+    from xagent.core.tools.core.RAG_tools.core.schemas import (
+        DenseSearchResponse,
+        FusionConfig,
+        FusionStrategy,
+        IndexStatus,
+        SearchResult,
+        SparseSearchResponse,
+    )
+
+    handle, _, _, _ = _make_handle()
+    dense = DenseSearchResponse(
+        results=[
+            SearchResult(
+                doc_id="da",
+                chunk_id="ca",
+                text="ta",
+                score=0.8,
+                parse_hash="ha",
+                model_tag="model-x",
+                created_at="2026",
+                metadata=None,
+            )
+        ],
+        total_count=1,
+        status="success",
+        warnings=[],
+        index_status=IndexStatus.INDEX_READY,
+        index_advice=None,
+        idempotency_key=None,
+        fallback_info=None,
+        nprobes=None,
+        refine_factor=None,
+    )
+    sparse = SparseSearchResponse(
+        results=[
+            SearchResult(
+                doc_id="db",
+                chunk_id="cb",
+                text="tb",
+                score=0.6,
+                parse_hash="hb",
+                model_tag="model-x",
+                created_at="2026",
+                metadata=None,
+            )
+        ],
+        total_count=1,
+        status="success",
+        warnings=[],
+        fts_enabled=True,
+        query_text="q",
+    )
+
+    async def fake_dense_async(self, model_tag, query_vector, *, top_k, **kw):
+        return dense
+
+    async def fake_sparse_async(self, model_tag, query_text, *, top_k, **kw):
+        return sparse
+
+    monkeypatch.setattr(type(handle), "search_dense_async", fake_dense_async)
+    monkeypatch.setattr(type(handle), "search_sparse_async", fake_sparse_async)
+    cfg = FusionConfig(
+        strategy=FusionStrategy.LINEAR,
+        dense_weight=0.5,
+        sparse_weight=0.5,
+        normalize_scores=True,
+    )
+    resp = await handle.search_hybrid_async(
+        "model-x", "q", [0.1], top_k=5, fusion_config=cfg
+    )
+    assert resp.status in ("success", "partial_success")
+    assert resp.fusion_config.strategy == FusionStrategy.LINEAR
+    assert resp.dense_count == 1 and resp.sparse_count == 1
+    assert len(resp.results) == 2
+    by_doc = {r.doc_id: r for r in resp.results}
+    assert by_doc["da"].vector_rank == 1 and by_doc["da"].fts_score is None
+    assert by_doc["db"].fts_rank == 1 and by_doc["db"].vector_score is None

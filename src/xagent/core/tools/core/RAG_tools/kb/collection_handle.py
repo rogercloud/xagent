@@ -2623,8 +2623,6 @@ class LanceDBCollectionHandle(KBCollectionHandle):
         if fusion_config is None:
             fusion_config = FusionConfig()
 
-        all_warnings: List[SearchWarning] = []
-
         # 1. Execute Dense Search
         logger.info("Executing dense search for model %s...", model_tag)
         dense_response = self.search_dense(
@@ -2638,8 +2636,6 @@ class LanceDBCollectionHandle(KBCollectionHandle):
             user_id=user_id,
             is_admin=is_admin,
         )
-        dense_results = dense_response.results
-        all_warnings.extend(dense_response.warnings)
 
         # 2. Execute Sparse Search
         logger.info("Executing sparse search for model %s...", model_tag)
@@ -2652,6 +2648,39 @@ class LanceDBCollectionHandle(KBCollectionHandle):
             user_id=user_id,
             is_admin=is_admin,
         )
+
+        # 3-6. Fuse and build the response (shared sync logic).
+        return self._fuse_hybrid(
+            model_tag,
+            query_text,
+            dense_response,
+            sparse_response,
+            top_k=top_k,
+            fusion_config=fusion_config,
+        )
+
+    def _fuse_hybrid(
+        self,
+        model_tag: str,
+        query_text: str,
+        dense_response: DenseSearchResponse,
+        sparse_response: SparseSearchResponse,
+        *,
+        top_k: int,
+        fusion_config: FusionConfig,
+    ) -> HybridSearchResponse:
+        """Fuse already-fetched dense/sparse responses into a hybrid response.
+
+        Holds every step that runs after the dense/sparse calls in both the sync
+        and async hybrid paths. It consumes already-fetched response objects, so
+        it is purely synchronous and shared by ``search_hybrid`` and
+        ``search_hybrid_async``.
+        """
+        all_warnings: List[SearchWarning] = []
+
+        dense_results = dense_response.results
+        all_warnings.extend(dense_response.warnings)
+
         sparse_results = sparse_response.results
         all_warnings.extend(sparse_response.warnings)
 
@@ -2751,8 +2780,6 @@ class LanceDBCollectionHandle(KBCollectionHandle):
         if fusion_config is None:
             fusion_config = FusionConfig()
 
-        all_warnings: List[SearchWarning] = []
-
         # 1. Execute Dense Search (async)
         logger.info("Executing async dense search for model %s...", model_tag)
         dense_response = await self.search_dense_async(
@@ -2766,8 +2793,6 @@ class LanceDBCollectionHandle(KBCollectionHandle):
             user_id=user_id,
             is_admin=is_admin,
         )
-        dense_results = dense_response.results
-        all_warnings.extend(dense_response.warnings)
 
         # 2. Execute Sparse Search (async)
         logger.info("Executing async sparse search for model %s...", model_tag)
@@ -2780,81 +2805,15 @@ class LanceDBCollectionHandle(KBCollectionHandle):
             user_id=user_id,
             is_admin=is_admin,
         )
-        sparse_results = sparse_response.results
-        all_warnings.extend(sparse_response.warnings)
 
-        # Get index status and advice from dense search (primary source for index info)
-        index_status = dense_response.index_status
-        index_advice = dense_response.index_advice
-
-        # 3. Preserve original scores and ranks before fusion
-        dense_rank_map: Dict[str, int] = {}
-        sparse_rank_map: Dict[str, int] = {}
-        dense_score_map: Dict[str, float] = {}
-        sparse_score_map: Dict[str, float] = {}
-
-        for rank, result in enumerate(dense_results, start=1):
-            unique_id = f"{result.doc_id}-{result.chunk_id}-{result.parse_hash}-{result.model_tag}"
-            dense_rank_map[unique_id] = rank
-            dense_score_map[unique_id] = result.score
-
-        for rank, result in enumerate(sparse_results, start=1):
-            unique_id = f"{result.doc_id}-{result.chunk_id}-{result.parse_hash}-{result.model_tag}"
-            sparse_rank_map[unique_id] = rank
-            sparse_score_map[unique_id] = result.score
-
-        # 4. Fuse Results
-        logger.info("Fusing results using strategy: %s", fusion_config.strategy.value)
-        fused_results: List[SearchResult] = []
-        if fusion_config.strategy == FusionStrategy.RRF:
-            fused_results = _rrf_fusion(
-                [dense_results, sparse_results], k=fusion_config.rrf_k
-            )
-        elif fusion_config.strategy == FusionStrategy.LINEAR:
-            fused_results = _linear_fusion(
-                dense_results=dense_results,
-                sparse_results=sparse_results,
-                dense_weight=fusion_config.dense_weight,
-                sparse_weight=fusion_config.sparse_weight,
-                normalize_scores=fusion_config.normalize_scores,
-            )
-        else:
-            logger.warning(
-                "Unknown fusion strategy: %s. Defaulting to dense results.",
-                fusion_config.strategy,
-            )
-            fused_results = dense_results
-
-        # 5. Attach original scores and ranks to fused results
-        updated_fused_results: List[SearchResult] = []
-        for result in fused_results:
-            unique_id = f"{result.doc_id}-{result.chunk_id}-{result.parse_hash}-{result.model_tag}"
-            updated_fused_results.append(
-                result.model_copy(
-                    update={
-                        "vector_score": dense_score_map.get(unique_id),
-                        "fts_score": sparse_score_map.get(unique_id),
-                        "vector_rank": dense_rank_map.get(unique_id),
-                        "fts_rank": sparse_rank_map.get(unique_id),
-                    }
-                )
-            )
-        fused_results = updated_fused_results
-
-        # Limit to top_k after fusion
-        final_results = fused_results[:top_k]
-
-        # 6. Build Response
-        return HybridSearchResponse(
-            results=final_results,
-            total_count=len(final_results),
-            status="success" if not all_warnings else "partial_success",
-            warnings=all_warnings,
+        # 3-6. Fuse and build the response (shared sync logic).
+        return self._fuse_hybrid(
+            model_tag,
+            query_text,
+            dense_response,
+            sparse_response,
+            top_k=top_k,
             fusion_config=fusion_config,
-            dense_count=len(dense_results),
-            sparse_count=len(sparse_results),
-            index_status=index_status,
-            index_advice=index_advice,
         )
 
     # --- Parse/chunk cleanup (row only, collection scoped) (#509) ---
