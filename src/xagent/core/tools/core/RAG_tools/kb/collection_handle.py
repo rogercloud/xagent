@@ -1732,9 +1732,9 @@ class LanceDBCollectionHandle(KBCollectionHandle):
                         chunk_id=row["chunk_id"],
                         text=row["text"],
                         score=score,
-                        parse_hash=row["parse_hash"],
+                        parse_hash=row.get("parse_hash"),
                         model_tag=model_tag,
-                        created_at=row["created_at"],
+                        created_at=row.get("created_at"),
                         metadata=metadata,
                     )
                 )
@@ -2019,7 +2019,7 @@ class LanceDBCollectionHandle(KBCollectionHandle):
             "created_at",
             "metadata",
         }
-        if filters:
+        if filters and isinstance(filters, dict):
             desired_columns.update(filters.keys())
 
         results: List[SearchResult] = []
@@ -2045,7 +2045,7 @@ class LanceDBCollectionHandle(KBCollectionHandle):
             batch_df = batch.to_pandas()
 
             mask = batch_df["collection"] == collection
-            if filters:
+            if filters and isinstance(filters, dict):
                 for key, value in filters.items():
                     if key not in batch_df.columns:
                         continue
@@ -2123,7 +2123,7 @@ class LanceDBCollectionHandle(KBCollectionHandle):
 
         # Build query filters
         query_filters: Dict[str, Any] = {"collection": collection}
-        if filters:
+        if filters and isinstance(filters, dict):
             query_filters.update(filters)
 
         _table = None
@@ -2183,6 +2183,9 @@ class LanceDBCollectionHandle(KBCollectionHandle):
                     # Early exit: stop as soon as we have enough results
                     if len(results) >= top_k:
                         break
+
+                if len(results) >= top_k:
+                    break
 
             if results:
                 current_warnings.append(
