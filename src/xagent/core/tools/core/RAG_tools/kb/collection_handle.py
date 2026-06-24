@@ -34,20 +34,32 @@ from ..core.schemas import (
     ChunkEmbeddingData,
     ChunkForEmbedding,
     ChunkRecordSnapshot,
+    DenseSearchResponse,
     DocumentRecordDetail,
     DocumentRecordListResult,
     EmbeddingReadResponse,
     EmbeddingRecordSnapshot,
     EmbeddingWriteResponse,
     IndexOperation,
+    IndexStatus,
     ParsedParagraph,
     ParseRecordDetail,
     RegisterDocumentRequest,
     RegisterDocumentResponse,
+    SearchFallbackAction,
+    SearchResult,
+    SearchWarning,
 )
 from ..LanceDB.model_tag_utils import to_model_tag
-from ..storage.contracts import MetadataStore, VectorIndexStore
+from ..storage.contracts import (
+    FilterCondition,
+    FilterExpression,
+    FilterOperator,
+    MetadataStore,
+    VectorIndexStore,
+)
 from ..utils import check_file_type, compute_file_hash
+from ..utils.filter_utils import parse_legacy_filters, validate_filter_depth
 from ..utils.hash_utils import compute_chunk_hash
 from ..utils.metadata_utils import deserialize_metadata, serialize_metadata
 from ..utils.string_utils import generate_deterministic_doc_id
@@ -422,6 +434,40 @@ class KBCollectionHandle(ABC):
         is_admin: bool = False,
     ) -> int:
         """Idempotently delete newly created embedding rows (compensation)."""
+
+    # --- Search data-plane (#511) ---
+
+    @abstractmethod
+    def search_dense(
+        self,
+        model_tag: str,
+        query_vector: list[float],
+        *,
+        top_k: int = 10,
+        filters: dict[str, Any] | None = None,
+        readonly: bool = False,
+        nprobes: int | None = None,
+        refine_factor: int | None = None,
+        user_id: int | None = None,
+        is_admin: bool = False,
+    ) -> "DenseSearchResponse":
+        """Execute dense vector search for this collection."""
+
+    @abstractmethod
+    async def search_dense_async(
+        self,
+        model_tag: str,
+        query_vector: list[float],
+        *,
+        top_k: int = 10,
+        filters: dict[str, Any] | None = None,
+        readonly: bool = False,
+        nprobes: int | None = None,
+        refine_factor: int | None = None,
+        user_id: int | None = None,
+        is_admin: bool = False,
+    ) -> "DenseSearchResponse":
+        """Async dense vector search for this collection."""
 
     # --- Parse/chunk cleanup (row only, collection scoped) (#509) ---
 
@@ -1507,6 +1553,317 @@ class LanceDBCollectionHandle(KBCollectionHandle):
             user_id=user_id,
             is_admin=is_admin,
         )
+
+    # --- Search data-plane (#511) ---
+
+    def _dense_unsupported(self, model_tag: str) -> DenseSearchResponse:
+        return DenseSearchResponse(
+            results=[],
+            total_count=0,
+            status="failed",
+            warnings=[
+                SearchWarning(
+                    code="SEARCH_NOT_SUPPORTED",
+                    message="This backend does not support search.",
+                    fallback_action=SearchFallbackAction.PARTIAL_RESULTS,
+                    affected_models=[model_tag],
+                )
+            ],
+            index_status=IndexStatus.NO_INDEX,
+            index_advice=None,
+            idempotency_key=None,
+            fallback_info=None,
+            nprobes=None,
+            refine_factor=None,
+        )
+
+    @staticmethod
+    def _map_index_status(index_status: str) -> IndexStatus:
+        return {
+            "index_building": IndexStatus.INDEX_BUILDING,
+            "no_index": IndexStatus.NO_INDEX,
+            "index_corrupted": IndexStatus.INDEX_CORRUPTED,
+            "readonly": IndexStatus.READONLY,
+            "below_threshold": IndexStatus.BELOW_THRESHOLD,
+        }.get(index_status, IndexStatus.INDEX_READY)
+
+    def _dense_engine(
+        self,
+        collection: str,
+        model_tag: str,
+        query_vector: list[float],
+        *,
+        top_k: int,
+        filters: dict | None,
+        readonly: bool,
+        nprobes: int | None,
+        refine_factor: int | None,
+        user_id: int | None,
+        is_admin: bool,
+    ) -> tuple[list, str, str | None]:
+        vector_store = self.vector_index_store
+        index_result_obj = vector_store.create_index(model_tag, readonly)
+        index_status = index_result_obj.status
+        index_advice = index_result_obj.advice
+        filter_expr: FilterExpression | None = None
+        if collection or filters:
+            conditions: list[FilterExpression] = []
+            if collection:
+                conditions.append(
+                    FilterCondition(
+                        field="collection", operator=FilterOperator.EQ, value=collection
+                    )
+                )
+            if filters:
+                parsed = (
+                    parse_legacy_filters(filters) if isinstance(filters, dict) else None
+                )
+                if parsed is not None:
+                    if isinstance(parsed, tuple):
+                        conditions.extend(parsed)
+                    else:
+                        conditions.append(parsed)
+            if len(conditions) == 1:
+                filter_expr = conditions[0]
+            elif len(conditions) > 1:
+                filter_expr = tuple(conditions)
+        if filter_expr is not None:
+            validate_filter_depth(filter_expr)
+        raw_results = vector_store.search_vectors_by_model(
+            model_tag=model_tag,
+            query_vector=query_vector,
+            top_k=top_k,
+            filters=filter_expr,
+            vector_column_name="vector",
+            user_id=user_id,
+            is_admin=is_admin,
+        )
+        search_results = []
+        for row in raw_results:
+            distance_value = row.get("_distance")
+            distance = float(distance_value) if distance_value is not None else 0.0
+            score = 1.0 / (1.0 + distance)
+            metadata = deserialize_metadata(row.get("metadata"))
+            search_results.append(
+                SearchResult(
+                    doc_id=row["doc_id"],
+                    chunk_id=row["chunk_id"],
+                    text=row["text"],
+                    score=score,
+                    parse_hash=row["parse_hash"],
+                    model_tag=model_tag,
+                    created_at=row["created_at"],
+                    metadata=metadata,
+                )
+            )
+        return search_results, index_status, index_advice
+
+    async def _dense_engine_async(
+        self,
+        collection: str,
+        model_tag: str,
+        query_vector: list[float],
+        *,
+        top_k: int,
+        filters: dict | None,
+        readonly: bool,
+        nprobes: int | None,
+        refine_factor: int | None,
+        user_id: int | None,
+        is_admin: bool,
+    ) -> tuple[list, str, str | None]:
+        vector_store = self.vector_index_store
+        index_result_obj = vector_store.create_index(model_tag, readonly)
+        index_status = index_result_obj.status
+        index_advice = index_result_obj.advice
+        filter_expr: FilterExpression | None = None
+        if collection or filters:
+            conditions: list[FilterExpression] = []
+            if collection:
+                conditions.append(
+                    FilterCondition(
+                        field="collection", operator=FilterOperator.EQ, value=collection
+                    )
+                )
+            if filters:
+                parsed = (
+                    parse_legacy_filters(filters) if isinstance(filters, dict) else None
+                )
+                if parsed is not None:
+                    if isinstance(parsed, tuple):
+                        conditions.extend(parsed)
+                    else:
+                        conditions.append(parsed)
+            if len(conditions) == 1:
+                filter_expr = conditions[0]
+            elif len(conditions) > 1:
+                filter_expr = tuple(conditions)
+        if filter_expr is not None:
+            validate_filter_depth(filter_expr)
+        raw_results = await vector_store.search_vectors_by_model_async(
+            model_tag=model_tag,
+            query_vector=query_vector,
+            top_k=top_k,
+            filters=filter_expr,
+            vector_column_name="vector",
+            user_id=user_id,
+            is_admin=is_admin,
+        )
+        search_results = []
+        for row in raw_results:
+            distance_value = row.get("_distance")
+            distance = float(distance_value) if distance_value is not None else 0.0
+            score = 1.0 / (1.0 + distance)
+            metadata = deserialize_metadata(row.get("metadata"))
+            search_results.append(
+                SearchResult(
+                    doc_id=row["doc_id"],
+                    chunk_id=row["chunk_id"],
+                    text=row["text"],
+                    score=score,
+                    parse_hash=row.get("parse_hash"),
+                    model_tag=model_tag,
+                    created_at=row.get("created_at"),
+                    metadata=metadata,
+                )
+            )
+        return search_results, index_status, index_advice
+
+    def search_dense(
+        self,
+        model_tag: str,
+        query_vector: list[float],
+        *,
+        top_k: int = 10,
+        filters: dict | None = None,
+        readonly: bool = False,
+        nprobes: int | None = None,
+        refine_factor: int | None = None,
+        user_id: int | None = None,
+        is_admin: bool = False,
+    ) -> DenseSearchResponse:
+        if not self.capabilities.supports_search:
+            return self._dense_unsupported(model_tag)
+        collection = self.context.collection
+        try:
+            results, index_status, index_advice = self._dense_engine(
+                collection,
+                model_tag,
+                query_vector,
+                top_k=top_k,
+                filters=filters,
+                readonly=readonly,
+                nprobes=nprobes,
+                refine_factor=refine_factor,
+                user_id=user_id,
+                is_admin=is_admin,
+            )
+            return DenseSearchResponse(
+                results=results,
+                total_count=len(results),
+                status="success",
+                warnings=[],
+                index_status=self._map_index_status(index_status),
+                index_advice=index_advice,
+                idempotency_key=None,
+                fallback_info=None,
+                nprobes=nprobes,
+                refine_factor=refine_factor,
+            )
+        except Exception as e:  # noqa: BLE001 - search returns failed response, never raises
+            logger.error(
+                "Dense search failed for %s in collection '%s': %s",
+                model_tag,
+                collection,
+                e,
+            )
+            return DenseSearchResponse(
+                results=[],
+                total_count=0,
+                status="failed",
+                warnings=[
+                    SearchWarning(
+                        code="DENSE_SEARCH_FAILED",
+                        message=f"An unexpected error occurred during dense search: {e}",
+                        fallback_action=SearchFallbackAction.PARTIAL_RESULTS,
+                        affected_models=[model_tag],
+                    )
+                ],
+                index_status=IndexStatus.NO_INDEX,
+                index_advice=None,
+                idempotency_key=None,
+                fallback_info=None,
+                nprobes=nprobes,
+                refine_factor=refine_factor,
+            )
+
+    async def search_dense_async(
+        self,
+        model_tag: str,
+        query_vector: list[float],
+        *,
+        top_k: int = 10,
+        filters: dict | None = None,
+        readonly: bool = False,
+        nprobes: int | None = None,
+        refine_factor: int | None = None,
+        user_id: int | None = None,
+        is_admin: bool = False,
+    ) -> DenseSearchResponse:
+        if not self.capabilities.supports_search:
+            return self._dense_unsupported(model_tag)
+        collection = self.context.collection
+        try:
+            results, index_status, index_advice = await self._dense_engine_async(
+                collection,
+                model_tag,
+                query_vector,
+                top_k=top_k,
+                filters=filters,
+                readonly=readonly,
+                nprobes=nprobes,
+                refine_factor=refine_factor,
+                user_id=user_id,
+                is_admin=is_admin,
+            )
+            return DenseSearchResponse(
+                results=results,
+                total_count=len(results),
+                status="success",
+                warnings=[],
+                index_status=self._map_index_status(index_status),
+                index_advice=index_advice,
+                idempotency_key=None,
+                fallback_info=None,
+                nprobes=nprobes,
+                refine_factor=refine_factor,
+            )
+        except Exception as e:  # noqa: BLE001 - search returns failed response, never raises
+            logger.error(
+                "Dense search failed (async) for %s in collection '%s': %s",
+                model_tag,
+                collection,
+                e,
+            )
+            return DenseSearchResponse(
+                results=[],
+                total_count=0,
+                status="failed",
+                warnings=[
+                    SearchWarning(
+                        code="DENSE_SEARCH_FAILED",
+                        message=f"An unexpected error occurred during dense search: {e}",
+                        fallback_action=SearchFallbackAction.PARTIAL_RESULTS,
+                        affected_models=[model_tag],
+                    )
+                ],
+                index_status=IndexStatus.NO_INDEX,
+                index_advice=None,
+                idempotency_key=None,
+                fallback_info=None,
+                nprobes=nprobes,
+                refine_factor=refine_factor,
+            )
 
     # --- Parse/chunk cleanup (row only, collection scoped) (#509) ---
 
