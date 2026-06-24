@@ -564,10 +564,14 @@ class TestSearchSparse:
         assert abs(response.results[0].score - expected_score) < 0.0001
 
     def test_search_sparse_fts_fallback_warning_content(self) -> None:
-        """Test that FTS_FALLBACK warning has correct content and fallback_action."""
-        # Test the warning creation directly by calling _substring_fallback
-        from xagent.core.tools.core.RAG_tools.retrieval.search_sparse import (
-            _substring_fallback,
+        """Test that FTS_FALLBACK warning has correct content and fallback_action.
+
+        The _substring_fallback logic now lives on LanceDBCollectionHandle.
+        Call it via the handle instance to verify warning message content.
+        """
+        from xagent.core.tools.core.RAG_tools.core.schemas import SearchWarning
+        from xagent.core.tools.core.RAG_tools.kb.collection_handle import (
+            LanceDBCollectionHandle,
         )
 
         warnings: List[SearchWarning] = []
@@ -588,7 +592,9 @@ class TestSearchSparse:
         )
         mock_table.to_batches.return_value = [mock_batch]
 
-        results = _substring_fallback(
+        # Create a handle instance to call the method
+        handle = LanceDBCollectionHandle.__new__(LanceDBCollectionHandle)
+        results = handle._substring_fallback(
             table=mock_table,
             collection="test_col",
             query_text="test query",

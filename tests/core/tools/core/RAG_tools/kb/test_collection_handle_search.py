@@ -540,3 +540,90 @@ async def test_search_hybrid_async_linear_fusion(monkeypatch):
     by_doc = {r.doc_id: r for r in resp.results}
     assert by_doc["da"].vector_rank == 1 and by_doc["da"].fts_score is None
     assert by_doc["db"].fts_rank == 1 and by_doc["db"].vector_score is None
+
+
+# ---------------------------------------------------------------------------
+# Issue #72: Ported from test_retrieval_helper_compatibility.py
+# Exact collection-filter equality assertions moved from facade engine tests.
+# ---------------------------------------------------------------------------
+
+
+def _filter_conditions(expr):
+    """Extract (field, operator, value) triples from a FilterExpression tree."""
+    if expr is None:
+        return []
+    if isinstance(expr, (tuple, list)):
+        conditions = []
+        for item in expr:
+            conditions.extend(_filter_conditions(item))
+        return conditions
+    operator = getattr(expr, "operator", None)
+    return [
+        (
+            getattr(expr, "field"),
+            getattr(operator, "value", operator),
+            getattr(expr, "value"),
+        )
+    ]
+
+
+def test_dense_collection_filter_equality_issue_72():
+    """search_dense always applies an exact-match collection filter (Issue #72).
+
+    Ported from test_retrieval_facade_preserves_sync_tuple_filter_scope_and_conversion.
+    The handle must build FilterCondition(field="collection", operator=EQ, value=collection)
+    and pass it to store.search_vectors_by_model — not just any non-None filter.
+    """
+    handle, ctx, store, _ = _make_handle()
+    ctx.collection = "docs"
+    store.create_index.return_value = _index_result()
+    store.search_vectors_by_model.return_value = []
+    handle.search_dense("model-a", [0.5, 0.25], top_k=5, user_id=7, is_admin=False)
+    kwargs = store.search_vectors_by_model.call_args.kwargs
+    conditions = _filter_conditions(kwargs["filters"])
+    # The first condition MUST be the collection equality filter for Issue #72.
+    assert ("collection", "eq", "docs") in conditions, (
+        "Issue #72: collection equality filter missing from store call"
+    )
+
+
+@pytest.mark.asyncio
+async def test_dense_async_collection_filter_equality_issue_72():
+    """search_dense_async always applies an exact-match collection filter (Issue #72)."""
+    from unittest.mock import AsyncMock
+
+    handle, ctx, store, _ = _make_handle()
+    ctx.collection = "docs"
+    store.create_index.return_value = _index_result()
+    store.search_vectors_by_model_async = AsyncMock(return_value=[])
+    await handle.search_dense_async(
+        "model-a", [0.5], top_k=3, user_id=None, is_admin=True
+    )
+    kwargs = store.search_vectors_by_model_async.call_args.kwargs
+    conditions = _filter_conditions(kwargs["filters"])
+    assert ("collection", "eq", "docs") in conditions, (
+        "Issue #72: collection equality filter missing from async store call"
+    )
+
+
+def test_dense_invalid_filter_returns_failed_response():
+    """search_dense returns a failed response for unknown filter operators.
+
+    Ported from test_retrieval_facade_preserves_invalid_legacy_filter_errors.
+    The handle catches parse errors and returns a structured failed response.
+    """
+    handle, ctx, store, _ = _make_handle()
+    ctx.collection = "docs"
+    store.create_index.return_value = _index_result()
+    # Unknown operator causes parse failure; handle returns failed response
+    resp = handle.search_dense(
+        "model-a",
+        [0.5],
+        top_k=5,
+        filters={"page_number": {"operator": "between", "value": [1, 3]}},
+        user_id=7,
+        is_admin=False,
+    )
+    assert resp.status == "failed"
+    assert any(w.code == "DENSE_SEARCH_FAILED" for w in resp.warnings)
+    assert any("between" in w.message for w in resp.warnings)
