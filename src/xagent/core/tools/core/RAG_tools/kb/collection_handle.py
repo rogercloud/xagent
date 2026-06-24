@@ -450,7 +450,7 @@ class KBCollectionHandle(ABC):
         refine_factor: int | None = None,
         user_id: int | None = None,
         is_admin: bool = False,
-    ) -> "DenseSearchResponse":
+    ) -> DenseSearchResponse:
         """Execute dense vector search for this collection."""
 
     @abstractmethod
@@ -466,7 +466,7 @@ class KBCollectionHandle(ABC):
         refine_factor: int | None = None,
         user_id: int | None = None,
         is_admin: bool = False,
-    ) -> "DenseSearchResponse":
+    ) -> DenseSearchResponse:
         """Async dense vector search for this collection."""
 
     # --- Parse/chunk cleanup (row only, collection scoped) (#509) ---
@@ -1600,63 +1600,71 @@ class LanceDBCollectionHandle(KBCollectionHandle):
         refine_factor: int | None,
         user_id: int | None,
         is_admin: bool,
-    ) -> tuple[list, str, str | None]:
-        vector_store = self.vector_index_store
-        index_result_obj = vector_store.create_index(model_tag, readonly)
-        index_status = index_result_obj.status
-        index_advice = index_result_obj.advice
-        filter_expr: FilterExpression | None = None
-        if collection or filters:
-            conditions: list[FilterExpression] = []
-            if collection:
-                conditions.append(
-                    FilterCondition(
-                        field="collection", operator=FilterOperator.EQ, value=collection
+    ) -> tuple[list[SearchResult], str, str | None]:
+        try:
+            vector_store = self.vector_index_store
+            index_result_obj = vector_store.create_index(model_tag, readonly)
+            index_status = index_result_obj.status
+            index_advice = index_result_obj.advice
+            filter_expr: FilterExpression | None = None
+            if collection or filters:
+                conditions: list[FilterExpression] = []
+                if collection:
+                    conditions.append(
+                        FilterCondition(
+                            field="collection",
+                            operator=FilterOperator.EQ,
+                            value=collection,
+                        )
+                    )
+                if filters:
+                    parsed = (
+                        parse_legacy_filters(filters)
+                        if isinstance(filters, dict)
+                        else None
+                    )
+                    if parsed is not None:
+                        if isinstance(parsed, tuple):
+                            conditions.extend(parsed)
+                        else:
+                            conditions.append(parsed)
+                if len(conditions) == 1:
+                    filter_expr = conditions[0]
+                elif len(conditions) > 1:
+                    filter_expr = tuple(conditions)
+            if filter_expr is not None:
+                validate_filter_depth(filter_expr)
+            raw_results = vector_store.search_vectors_by_model(
+                model_tag=model_tag,
+                query_vector=query_vector,
+                top_k=top_k,
+                filters=filter_expr,
+                vector_column_name="vector",
+                user_id=user_id,
+                is_admin=is_admin,
+            )
+            search_results = []
+            for row in raw_results:
+                distance_value = row.get("_distance")
+                distance = float(distance_value) if distance_value is not None else 0.0
+                score = 1.0 / (1.0 + distance)
+                metadata = deserialize_metadata(row.get("metadata"))
+                search_results.append(
+                    SearchResult(
+                        doc_id=row["doc_id"],
+                        chunk_id=row["chunk_id"],
+                        text=row["text"],
+                        score=score,
+                        parse_hash=row["parse_hash"],
+                        model_tag=model_tag,
+                        created_at=row["created_at"],
+                        metadata=metadata,
                     )
                 )
-            if filters:
-                parsed = (
-                    parse_legacy_filters(filters) if isinstance(filters, dict) else None
-                )
-                if parsed is not None:
-                    if isinstance(parsed, tuple):
-                        conditions.extend(parsed)
-                    else:
-                        conditions.append(parsed)
-            if len(conditions) == 1:
-                filter_expr = conditions[0]
-            elif len(conditions) > 1:
-                filter_expr = tuple(conditions)
-        if filter_expr is not None:
-            validate_filter_depth(filter_expr)
-        raw_results = vector_store.search_vectors_by_model(
-            model_tag=model_tag,
-            query_vector=query_vector,
-            top_k=top_k,
-            filters=filter_expr,
-            vector_column_name="vector",
-            user_id=user_id,
-            is_admin=is_admin,
-        )
-        search_results = []
-        for row in raw_results:
-            distance_value = row.get("_distance")
-            distance = float(distance_value) if distance_value is not None else 0.0
-            score = 1.0 / (1.0 + distance)
-            metadata = deserialize_metadata(row.get("metadata"))
-            search_results.append(
-                SearchResult(
-                    doc_id=row["doc_id"],
-                    chunk_id=row["chunk_id"],
-                    text=row["text"],
-                    score=score,
-                    parse_hash=row["parse_hash"],
-                    model_tag=model_tag,
-                    created_at=row["created_at"],
-                    metadata=metadata,
-                )
-            )
-        return search_results, index_status, index_advice
+            return search_results, index_status, index_advice
+        except Exception as e:
+            logger.error("Failed to execute dense search: %s", str(e))
+            raise
 
     async def _dense_engine_async(
         self,
@@ -1671,63 +1679,71 @@ class LanceDBCollectionHandle(KBCollectionHandle):
         refine_factor: int | None,
         user_id: int | None,
         is_admin: bool,
-    ) -> tuple[list, str, str | None]:
-        vector_store = self.vector_index_store
-        index_result_obj = vector_store.create_index(model_tag, readonly)
-        index_status = index_result_obj.status
-        index_advice = index_result_obj.advice
-        filter_expr: FilterExpression | None = None
-        if collection or filters:
-            conditions: list[FilterExpression] = []
-            if collection:
-                conditions.append(
-                    FilterCondition(
-                        field="collection", operator=FilterOperator.EQ, value=collection
+    ) -> tuple[list[SearchResult], str, str | None]:
+        try:
+            vector_store = self.vector_index_store
+            index_result_obj = vector_store.create_index(model_tag, readonly)
+            index_status = index_result_obj.status
+            index_advice = index_result_obj.advice
+            filter_expr: FilterExpression | None = None
+            if collection or filters:
+                conditions: list[FilterExpression] = []
+                if collection:
+                    conditions.append(
+                        FilterCondition(
+                            field="collection",
+                            operator=FilterOperator.EQ,
+                            value=collection,
+                        )
+                    )
+                if filters:
+                    parsed = (
+                        parse_legacy_filters(filters)
+                        if isinstance(filters, dict)
+                        else None
+                    )
+                    if parsed is not None:
+                        if isinstance(parsed, tuple):
+                            conditions.extend(parsed)
+                        else:
+                            conditions.append(parsed)
+                if len(conditions) == 1:
+                    filter_expr = conditions[0]
+                elif len(conditions) > 1:
+                    filter_expr = tuple(conditions)
+            if filter_expr is not None:
+                validate_filter_depth(filter_expr)
+            raw_results = await vector_store.search_vectors_by_model_async(
+                model_tag=model_tag,
+                query_vector=query_vector,
+                top_k=top_k,
+                filters=filter_expr,
+                vector_column_name="vector",
+                user_id=user_id,
+                is_admin=is_admin,
+            )
+            search_results = []
+            for row in raw_results:
+                distance_value = row.get("_distance")
+                distance = float(distance_value) if distance_value is not None else 0.0
+                score = 1.0 / (1.0 + distance)
+                metadata = deserialize_metadata(row.get("metadata"))
+                search_results.append(
+                    SearchResult(
+                        doc_id=row["doc_id"],
+                        chunk_id=row["chunk_id"],
+                        text=row["text"],
+                        score=score,
+                        parse_hash=row.get("parse_hash"),
+                        model_tag=model_tag,
+                        created_at=row.get("created_at"),
+                        metadata=metadata,
                     )
                 )
-            if filters:
-                parsed = (
-                    parse_legacy_filters(filters) if isinstance(filters, dict) else None
-                )
-                if parsed is not None:
-                    if isinstance(parsed, tuple):
-                        conditions.extend(parsed)
-                    else:
-                        conditions.append(parsed)
-            if len(conditions) == 1:
-                filter_expr = conditions[0]
-            elif len(conditions) > 1:
-                filter_expr = tuple(conditions)
-        if filter_expr is not None:
-            validate_filter_depth(filter_expr)
-        raw_results = await vector_store.search_vectors_by_model_async(
-            model_tag=model_tag,
-            query_vector=query_vector,
-            top_k=top_k,
-            filters=filter_expr,
-            vector_column_name="vector",
-            user_id=user_id,
-            is_admin=is_admin,
-        )
-        search_results = []
-        for row in raw_results:
-            distance_value = row.get("_distance")
-            distance = float(distance_value) if distance_value is not None else 0.0
-            score = 1.0 / (1.0 + distance)
-            metadata = deserialize_metadata(row.get("metadata"))
-            search_results.append(
-                SearchResult(
-                    doc_id=row["doc_id"],
-                    chunk_id=row["chunk_id"],
-                    text=row["text"],
-                    score=score,
-                    parse_hash=row.get("parse_hash"),
-                    model_tag=model_tag,
-                    created_at=row.get("created_at"),
-                    metadata=metadata,
-                )
-            )
-        return search_results, index_status, index_advice
+            return search_results, index_status, index_advice
+        except Exception as e:
+            logger.error("Failed to execute async dense search: %s", str(e))
+            raise
 
     def search_dense(
         self,

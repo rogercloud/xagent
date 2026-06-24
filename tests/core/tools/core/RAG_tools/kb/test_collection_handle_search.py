@@ -7,7 +7,7 @@ Search provider calls (vector store) are mocked.
 
 from __future__ import annotations
 
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -101,3 +101,32 @@ async def test_search_dense_async_capability_unsupported():
     resp = await handle.search_dense_async("model-x", [0.1])
     assert resp.status == "failed"
     assert any(w.code == "SEARCH_NOT_SUPPORTED" for w in resp.warnings)
+
+
+@pytest.mark.asyncio
+async def test_search_dense_async_success():
+    handle, ctx, store, _ = _make_handle()
+    store.create_index.return_value = _index_result()
+    store.search_vectors_by_model_async = AsyncMock(
+        return_value=[
+            {
+                "doc_id": "d1",
+                "chunk_id": "c1",
+                "text": "t",
+                "parse_hash": "h",
+                "created_at": "2026-01-01",
+                "metadata": None,
+                "_distance": 1.0,
+            },
+        ]
+    )
+    resp = await handle.search_dense_async(
+        "model-x", [0.1, 0.2], top_k=5, user_id=7, is_admin=False
+    )
+    assert isinstance(resp, DenseSearchResponse)
+    assert resp.status == "success"
+    assert resp.total_count == 1
+    assert resp.results[0].score == pytest.approx(0.5)  # 1/(1+1.0)
+    kwargs = store.search_vectors_by_model_async.call_args.kwargs
+    assert kwargs["model_tag"] == "model-x"
+    assert kwargs["user_id"] == 7 and kwargs["is_admin"] is False
