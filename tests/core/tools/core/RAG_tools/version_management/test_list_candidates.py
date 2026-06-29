@@ -168,9 +168,7 @@ class TestListCandidates:
             candidate1 = result["candidates"][0]
             assert candidate1["technical_id"] == "hash1"
             assert candidate1["state"] == "candidate"
-            # parse_method lives in params_json in real schema; with mock data it
-            # is a direct column — _vis_get_parse_candidates reads both
-            assert "parse_" in candidate1["semantic_id"]
+            assert "parse_unstructured" in candidate1["semantic_id"]
 
     def test_chunk_candidates_with_data(self):
         """Test list_candidates returns chunk candidates when data exists."""

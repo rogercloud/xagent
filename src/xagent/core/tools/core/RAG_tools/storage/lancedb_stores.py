@@ -2409,11 +2409,7 @@ class LanceDBVectorIndexStore(VectorIndexStore):
             return []
         parse_candidates: List[Dict[str, Any]] = []
         for row in result:
-            # parse_method lives inside params_json for real schema rows
-            params_json = self._vis_parse_params_json(row)
-            parse_method = row.get("parse_method") or params_json.get(
-                "parse_method", "unknown"
-            )
+            parse_method = row.get("parse_method", "unknown")
             parser = row.get("parser", "unknown")
             merged_params: Dict[str, Any] = {
                 "parse_method": parse_method,
@@ -2523,11 +2519,8 @@ class LanceDBVectorIndexStore(VectorIndexStore):
                     }
                 embed_configs[key]["vector_count"] += 1
                 vector = row.get("vector", [])
-                if vector is not None and embed_configs[key]["vector_dim"] == 0:
-                    try:
-                        embed_configs[key]["vector_dim"] = len(vector)
-                    except Exception:
-                        pass
+                if vector and embed_configs[key]["vector_dim"] == 0:
+                    embed_configs[key]["vector_dim"] = len(vector)
 
             for (model, parse_hash), cfg in embed_configs.items():
                 semantic_id = self._vis_generate_semantic_id(
