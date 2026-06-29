@@ -69,6 +69,8 @@ from ..storage.contracts import (
     FilterCondition,
     FilterExpression,
     FilterOperator,
+    IngestionStatusStore,
+    MainPointerStore,
     MetadataStore,
     VectorIndexStore,
 )
@@ -658,6 +660,16 @@ class LanceDBCollectionHandle(KBCollectionHandle):
     def vector_index_store(self) -> VectorIndexStore:
         """Return the vector index store bound to this collection context."""
         return self.context.vector_index_store
+
+    @property
+    def ingestion_status_store(self) -> IngestionStatusStore:
+        """Return the ingestion status store bound to this collection context."""
+        return self.context.ingestion_status_store
+
+    @property
+    def main_pointer_store(self) -> MainPointerStore:
+        """Return the main pointer store bound to this collection context."""
+        return self.context.main_pointer_store
 
     @property
     def backend(self) -> KBStorageBackend:
@@ -2976,6 +2988,134 @@ class LanceDBCollectionHandle(KBCollectionHandle):
             doc_id,
             parse_hash=parse_hash,
             config_hash=config_hash,
+            user_id=user_id,
+            is_admin=is_admin,
+        )
+
+    # --- Ingestion-status data-plane (#513) ---
+
+    def write_ingestion_status(
+        self,
+        doc_id: str,
+        *,
+        status: str,
+        message: str | None = None,
+        parse_hash: str | None = None,
+        user_id: int | None = None,
+    ) -> None:
+        """Write ingestion status for a document in this collection (sync)."""
+        self.ingestion_status_store.write_ingestion_status(
+            collection=self.context.collection,
+            doc_id=doc_id,
+            status=status,
+            message=message,
+            parse_hash=parse_hash,
+            user_id=user_id,
+        )
+
+    def load_ingestion_status(
+        self,
+        *,
+        doc_id: str | None = None,
+        user_id: int | None = None,
+        is_admin: bool = False,
+    ) -> List[Dict[str, Any]]:
+        """Load ingestion status rows for this collection (sync)."""
+        return self.ingestion_status_store.load_ingestion_status(
+            collection=self.context.collection,
+            doc_id=doc_id,
+            user_id=user_id,
+            is_admin=is_admin,
+        )
+
+    def clear_ingestion_status(
+        self,
+        doc_id: str,
+        *,
+        user_id: int | None = None,
+        is_admin: bool = False,
+    ) -> None:
+        """Remove ingestion status row for a document in this collection (sync)."""
+        self.ingestion_status_store.clear_ingestion_status(
+            collection=self.context.collection,
+            doc_id=doc_id,
+            user_id=user_id,
+            is_admin=is_admin,
+        )
+
+    def rename_collection_status(
+        self,
+        new_name: str,
+        *,
+        user_id: int | None = None,
+        is_admin: bool = False,
+    ) -> List[str]:
+        """Rename ingestion status rows from this collection to ``new_name``.
+
+        Best-effort: never raises; returns a list of warning strings on
+        partial failures.
+        """
+        try:
+            return self.ingestion_status_store.rename_collection_status(
+                old_name=self.context.collection,
+                new_name=new_name,
+                user_id=user_id,
+                is_admin=is_admin,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "rename_collection_status(%r -> %r) failed: %s",
+                self.context.collection,
+                new_name,
+                exc,
+            )
+            return [str(exc)]
+
+    async def write_ingestion_status_async(
+        self,
+        doc_id: str,
+        *,
+        status: str,
+        message: str | None = None,
+        parse_hash: str | None = None,
+        user_id: int | None = None,
+    ) -> None:
+        """Write ingestion status for a document in this collection (async)."""
+        await self.ingestion_status_store.write_ingestion_status_async(
+            collection=self.context.collection,
+            doc_id=doc_id,
+            status=status,
+            message=message,
+            parse_hash=parse_hash,
+            user_id=user_id,
+        )
+
+    async def load_ingestion_status_async(
+        self,
+        *,
+        doc_id: str | None = None,
+        user_id: int | None = None,
+        is_admin: bool = False,
+    ) -> List[Dict[str, Any]]:
+        """Load ingestion status rows for this collection (async)."""
+        return await self.ingestion_status_store.load_ingestion_status_async(
+            collection=self.context.collection,
+            doc_id=doc_id,
+            user_id=user_id,
+            is_admin=is_admin,
+        )
+
+    async def clear_ingestion_status_async(
+        self,
+        doc_id: str,
+        *,
+        user_id: int | None = None,
+        is_admin: bool = False,
+    ) -> None:
+        """Remove ingestion status row for a document in this collection (async)."""
+        await self.ingestion_status_store.clear_ingestion_status_async(
+            collection=self.context.collection,
+            doc_id=doc_id,
             user_id=user_id,
             is_admin=is_admin,
         )

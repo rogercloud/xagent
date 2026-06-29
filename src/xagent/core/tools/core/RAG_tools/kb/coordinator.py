@@ -419,6 +419,258 @@ class KBCoordinator:
             )
         )
 
+    # --- Ingestion-status lifecycle (delegated to the collection handle) ---
+
+    async def write_ingestion_status(
+        self,
+        collection: str,
+        doc_id: str,
+        *,
+        status: str,
+        message: Optional[str] = None,
+        parse_hash: Optional[str] = None,
+        user_id: Optional[int] = None,
+    ) -> None:
+        """Open the collection handle and write ingestion status (async)."""
+        handle = await self.open_collection(
+            KBContextRequest(
+                collection=collection,
+                user_id=user_id,
+                hide_missing=True,
+            )
+        )
+        await asyncio.to_thread(
+            handle.write_ingestion_status,
+            doc_id,
+            status=status,
+            message=message,
+            parse_hash=parse_hash,
+            user_id=user_id,
+        )
+
+    def write_ingestion_status_sync(
+        self,
+        collection: str,
+        doc_id: str,
+        *,
+        status: str,
+        message: Optional[str] = None,
+        parse_hash: Optional[str] = None,
+        user_id: Optional[int] = None,
+    ) -> None:
+        """Synchronous wrapper for :meth:`write_ingestion_status`."""
+        _run_in_separate_loop(
+            self.write_ingestion_status(
+                collection,
+                doc_id,
+                status=status,
+                message=message,
+                parse_hash=parse_hash,
+                user_id=user_id,
+            )
+        )
+
+    async def write_ingestion_status_async(
+        self,
+        collection: str,
+        doc_id: str,
+        *,
+        status: str,
+        message: Optional[str] = None,
+        parse_hash: Optional[str] = None,
+        user_id: Optional[int] = None,
+    ) -> None:
+        """Open the collection handle and write ingestion status (direct async)."""
+        handle = await self.open_collection(
+            KBContextRequest(
+                collection=collection,
+                user_id=user_id,
+                hide_missing=True,
+            )
+        )
+        await handle.write_ingestion_status_async(
+            doc_id,
+            status=status,
+            message=message,
+            parse_hash=parse_hash,
+            user_id=user_id,
+        )
+
+    async def load_ingestion_status(
+        self,
+        collection: str,
+        *,
+        doc_id: Optional[str] = None,
+        user_id: Optional[int] = None,
+        is_admin: bool = False,
+    ) -> list:
+        """Delegate to the ingestion status store (async, collection-scoped)."""
+        store = self._storage_shim.get_ingestion_status_store()
+        return await asyncio.to_thread(
+            store.load_ingestion_status,
+            collection=collection,
+            doc_id=doc_id,
+            user_id=user_id,
+            is_admin=is_admin,
+        )
+
+    def load_ingestion_status_sync(
+        self,
+        collection: str,
+        *,
+        doc_id: Optional[str] = None,
+        user_id: Optional[int] = None,
+        is_admin: bool = False,
+    ) -> list:
+        """Synchronous wrapper for :meth:`load_ingestion_status`."""
+        return _run_in_separate_loop(
+            self.load_ingestion_status(
+                collection, doc_id=doc_id, user_id=user_id, is_admin=is_admin
+            )
+        )
+
+    async def load_ingestion_status_async(
+        self,
+        collection: str,
+        *,
+        doc_id: Optional[str] = None,
+        user_id: Optional[int] = None,
+        is_admin: bool = False,
+    ) -> list:
+        """Delegate to the ingestion status store (direct async, collection-scoped)."""
+        store = self._storage_shim.get_ingestion_status_store()
+        return await store.load_ingestion_status_async(
+            collection=collection,
+            doc_id=doc_id,
+            user_id=user_id,
+            is_admin=is_admin,
+        )
+
+    async def clear_ingestion_status(
+        self,
+        collection: str,
+        doc_id: str,
+        *,
+        user_id: Optional[int] = None,
+        is_admin: bool = False,
+    ) -> None:
+        """Open the collection handle and clear ingestion status (async)."""
+        handle = await self.open_collection(
+            KBContextRequest(
+                collection=collection,
+                user_id=user_id,
+                is_admin=is_admin,
+                hide_missing=True,
+            )
+        )
+        await asyncio.to_thread(
+            handle.clear_ingestion_status,
+            doc_id,
+            user_id=user_id,
+            is_admin=is_admin,
+        )
+
+    def clear_ingestion_status_sync(
+        self,
+        collection: str,
+        doc_id: str,
+        *,
+        user_id: Optional[int] = None,
+        is_admin: bool = False,
+    ) -> None:
+        """Synchronous wrapper for :meth:`clear_ingestion_status`."""
+        _run_in_separate_loop(
+            self.clear_ingestion_status(
+                collection, doc_id, user_id=user_id, is_admin=is_admin
+            )
+        )
+
+    async def clear_ingestion_status_async(
+        self,
+        collection: str,
+        doc_id: str,
+        *,
+        user_id: Optional[int] = None,
+        is_admin: bool = False,
+    ) -> None:
+        """Open the collection handle and clear ingestion status (direct async)."""
+        handle = await self.open_collection(
+            KBContextRequest(
+                collection=collection,
+                user_id=user_id,
+                is_admin=is_admin,
+                hide_missing=True,
+            )
+        )
+        await handle.clear_ingestion_status_async(
+            doc_id,
+            user_id=user_id,
+            is_admin=is_admin,
+        )
+
+    async def rename_collection_status(
+        self,
+        old_name: str,
+        new_name: str,
+        *,
+        user_id: Optional[int] = None,
+        is_admin: bool = False,
+    ) -> list:
+        """Open the old collection handle and rename status rows to ``new_name``."""
+        handle = await self.open_collection(
+            KBContextRequest(
+                collection=old_name,
+                user_id=user_id,
+                is_admin=is_admin,
+                hide_missing=True,
+            )
+        )
+        return await asyncio.to_thread(
+            handle.rename_collection_status,
+            new_name,
+            user_id=user_id,
+            is_admin=is_admin,
+        )
+
+    def rename_collection_status_sync(
+        self,
+        old_name: str,
+        new_name: str,
+        *,
+        user_id: Optional[int] = None,
+        is_admin: bool = False,
+    ) -> list:
+        """Synchronous wrapper for :meth:`rename_collection_status`."""
+        return _run_in_separate_loop(
+            self.rename_collection_status(
+                old_name, new_name, user_id=user_id, is_admin=is_admin
+            )
+        )
+
+    async def rename_collection_status_async(
+        self,
+        old_name: str,
+        new_name: str,
+        *,
+        user_id: Optional[int] = None,
+        is_admin: bool = False,
+    ) -> list:
+        """Open the old collection handle and rename status rows (direct async)."""
+        handle = await self.open_collection(
+            KBContextRequest(
+                collection=old_name,
+                user_id=user_id,
+                is_admin=is_admin,
+                hide_missing=True,
+            )
+        )
+        return await handle.ingestion_status_store.rename_collection_status_async(
+            old_name=old_name,
+            new_name=new_name,
+            user_id=user_id,
+            is_admin=is_admin,
+        )
+
     @staticmethod
     def _normalize_collection(collection: str) -> str:
         normalized = collection.strip() if isinstance(collection, str) else ""
