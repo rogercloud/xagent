@@ -504,7 +504,12 @@ class KBCoordinator:
         user_id: Optional[int] = None,
         is_admin: bool = False,
     ) -> list:
-        """Delegate to the ingestion status store (async, collection-scoped)."""
+        """Delegate to the ingestion status store (async, collection-scoped).
+
+        # Status reads need no metadata/collection resolution; going direct keeps
+        # the nested-storage rebind test working and avoids an unnecessary collection
+        # lookup.
+        """
         store = self._storage_shim.get_ingestion_status_store()
         return await asyncio.to_thread(
             store.load_ingestion_status,
@@ -537,7 +542,12 @@ class KBCoordinator:
         user_id: Optional[int] = None,
         is_admin: bool = False,
     ) -> list:
-        """Delegate to the ingestion status store (direct async, collection-scoped)."""
+        """Delegate to the ingestion status store (direct async, collection-scoped).
+
+        # Status reads need no metadata/collection resolution; going direct keeps
+        # the nested-storage rebind test working and avoids an unnecessary collection
+        # lookup.
+        """
         store = self._storage_shim.get_ingestion_status_store()
         return await store.load_ingestion_status_async(
             collection=collection,
@@ -664,9 +674,8 @@ class KBCoordinator:
                 hide_missing=True,
             )
         )
-        return await handle.ingestion_status_store.rename_collection_status_async(
-            old_name=old_name,
-            new_name=new_name,
+        return await handle.rename_collection_status_async(
+            new_name,
             user_id=user_id,
             is_admin=is_admin,
         )

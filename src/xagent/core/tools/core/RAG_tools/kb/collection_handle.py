@@ -3071,6 +3071,34 @@ class LanceDBCollectionHandle(KBCollectionHandle):
             )
             return [str(exc)]
 
+    async def rename_collection_status_async(
+        self,
+        new_name: str,
+        *,
+        user_id: int | None = None,
+        is_admin: bool = False,
+    ) -> List[str]:
+        """Rename ingestion status rows from this collection to ``new_name`` (async).
+
+        Best-effort: never raises; returns a list of warning strings on
+        partial failures.
+        """
+        try:
+            return await self.ingestion_status_store.rename_collection_status_async(
+                old_name=self.context.collection,
+                new_name=new_name,
+                user_id=user_id,
+                is_admin=is_admin,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "rename_collection_status_async(%r -> %r) failed: %s",
+                self.context.collection,
+                new_name,
+                exc,
+            )
+            return [str(exc)]
+
     async def write_ingestion_status_async(
         self,
         doc_id: str,

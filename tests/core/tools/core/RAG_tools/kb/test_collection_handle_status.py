@@ -103,3 +103,44 @@ async def test_write_load_clear_async() -> None:
         doc_id="async-doc", is_admin=True
     )
     assert len(rows_after) == 0
+
+
+def test_rename_collection_status_never_raises() -> None:
+    """handle.rename_collection_status is best-effort: returns List[str] and never raises
+    even when the underlying store raises.
+    """
+    from unittest.mock import patch
+
+    handle = make_handle("rename_sync_coll")
+
+    with patch.object(
+        handle.ingestion_status_store,
+        "rename_collection_status",
+        side_effect=RuntimeError("store exploded"),
+    ):
+        result = handle.rename_collection_status("new_name", is_admin=True)
+
+    assert isinstance(result, list)
+    assert len(result) == 1
+    assert "store exploded" in result[0]
+
+
+@pytest.mark.asyncio
+async def test_rename_collection_status_async_never_raises() -> None:
+    """handle.rename_collection_status_async is best-effort: returns List[str] and never
+    raises even when the underlying async store call raises.
+    """
+    from unittest.mock import AsyncMock, patch
+
+    handle = make_handle("rename_async_coll")
+
+    with patch.object(
+        handle.ingestion_status_store,
+        "rename_collection_status_async",
+        new=AsyncMock(side_effect=RuntimeError("async store exploded")),
+    ):
+        result = await handle.rename_collection_status_async("new_name", is_admin=True)
+
+    assert isinstance(result, list)
+    assert len(result) == 1
+    assert "async store exploded" in result[0]
