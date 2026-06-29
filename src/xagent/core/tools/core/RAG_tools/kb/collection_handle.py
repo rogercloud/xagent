@@ -36,6 +36,7 @@ from ..core.exceptions import (
     DatabaseOperationError,
     DocumentValidationError,
     HashComputationError,
+    MainPointerError,
     VectorValidationError,
 )
 from ..core.schemas import (
@@ -3147,3 +3148,157 @@ class LanceDBCollectionHandle(KBCollectionHandle):
             user_id=user_id,
             is_admin=is_admin,
         )
+
+    # --- Main-pointer data-plane (#513) ---
+
+    def get_main_pointer(
+        self,
+        doc_id: str,
+        step_type: str,
+        model_tag: str | None = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Get the main pointer for a document stage in this collection (sync)."""
+        try:
+            return self.main_pointer_store.get_main_pointer(
+                collection=self.context.collection,
+                doc_id=doc_id,
+                step_type=step_type,
+                model_tag=model_tag,
+                user_id=None,
+            )
+        except Exception as e:
+            raise MainPointerError(f"Failed to get main pointer: {e}") from e
+
+    def set_main_pointer(
+        self,
+        doc_id: str,
+        step_type: str,
+        semantic_id: str,
+        technical_id: str,
+        model_tag: str | None = None,
+        operator: str | None = None,
+    ) -> None:
+        """Set or update the main pointer for a document stage in this collection (sync)."""
+        try:
+            self.main_pointer_store.set_main_pointer(
+                collection=self.context.collection,
+                doc_id=doc_id,
+                step_type=step_type,
+                semantic_id=semantic_id,
+                technical_id=technical_id,
+                model_tag=model_tag,
+                operator=operator,
+                user_id=None,
+            )
+        except Exception as e:
+            raise MainPointerError(f"Failed to set main pointer: {e}") from e
+
+    def list_main_pointers(
+        self,
+        doc_id: str | None = None,
+        limit: int = 100,
+    ) -> List[Dict[str, Any]]:
+        """List main pointers for this collection (sync)."""
+        try:
+            return self.main_pointer_store.list_main_pointers(
+                collection=self.context.collection,
+                doc_id=doc_id,
+                user_id=None,
+                limit=limit,
+            )
+        except Exception as e:
+            raise MainPointerError(f"Failed to list main pointers: {e}") from e
+
+    def delete_main_pointer(
+        self,
+        doc_id: str,
+        step_type: str,
+        model_tag: str | None = None,
+    ) -> bool:
+        """Delete the main pointer for a document stage in this collection (sync)."""
+        try:
+            return self.main_pointer_store.delete_main_pointer(
+                collection=self.context.collection,
+                doc_id=doc_id,
+                step_type=step_type,
+                model_tag=model_tag,
+                user_id=None,
+            )
+        except Exception as e:
+            raise MainPointerError(f"Failed to delete main pointer: {e}") from e
+
+    async def get_main_pointer_async(
+        self,
+        doc_id: str,
+        step_type: str,
+        model_tag: str | None = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Get the main pointer for a document stage in this collection (async)."""
+        try:
+            return await self.main_pointer_store.get_main_pointer_async(
+                collection=self.context.collection,
+                doc_id=doc_id,
+                step_type=step_type,
+                model_tag=model_tag,
+                user_id=None,
+            )
+        except Exception as e:
+            raise MainPointerError(f"Failed to get main pointer: {e}") from e
+
+    async def set_main_pointer_async(
+        self,
+        doc_id: str,
+        step_type: str,
+        semantic_id: str,
+        technical_id: str,
+        model_tag: str | None = None,
+        operator: str | None = None,
+    ) -> None:
+        """Set or update the main pointer for a document stage in this collection (async)."""
+        try:
+            await self.main_pointer_store.set_main_pointer_async(
+                collection=self.context.collection,
+                doc_id=doc_id,
+                step_type=step_type,
+                semantic_id=semantic_id,
+                technical_id=technical_id,
+                model_tag=model_tag,
+                operator=operator,
+                user_id=None,
+            )
+        except Exception as e:
+            raise MainPointerError(f"Failed to set main pointer: {e}") from e
+
+    async def list_main_pointers_async(
+        self,
+        doc_id: str | None = None,
+        limit: int = 100,
+    ) -> List[Dict[str, Any]]:
+        """List main pointers for this collection (async)."""
+        try:
+            return await self.main_pointer_store.list_main_pointers_async(
+                collection=self.context.collection,
+                doc_id=doc_id,
+                user_id=None,
+                limit=limit,
+            )
+        except Exception as e:
+            raise MainPointerError(f"Failed to list main pointers: {e}") from e
+
+    async def delete_main_pointer_async(
+        self,
+        doc_id: str,
+        step_type: str,
+        model_tag: str | None = None,
+    ) -> bool:
+        """Delete the main pointer for a document stage in this collection (async)."""
+        try:
+            return await self.main_pointer_store.delete_main_pointer_async(
+                collection=self.context.collection,
+                doc_id=doc_id,
+                step_type=step_type,
+                model_tag=model_tag,
+                user_id=None,
+            )
+        except Exception as e:
+            raise MainPointerError(f"Failed to delete main pointer: {e}") from e

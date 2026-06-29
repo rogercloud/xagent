@@ -680,6 +680,154 @@ class KBCoordinator:
             is_admin=is_admin,
         )
 
+    # --- Main-pointer lifecycle (delegated to the collection handle) ---
+
+    async def get_main_pointer(
+        self,
+        collection: str,
+        doc_id: str,
+        step_type: str,
+        *,
+        model_tag: Optional[str] = None,
+    ) -> Optional[dict]:
+        """Open the collection handle and get a main pointer (async)."""
+        handle = await self.open_collection(
+            KBContextRequest(
+                collection=collection,
+                hide_missing=True,
+            )
+        )
+        return await asyncio.to_thread(
+            handle.get_main_pointer, doc_id, step_type, model_tag
+        )
+
+    def get_main_pointer_sync(
+        self,
+        collection: str,
+        doc_id: str,
+        step_type: str,
+        *,
+        model_tag: Optional[str] = None,
+    ) -> Optional[dict]:
+        """Synchronous wrapper for :meth:`get_main_pointer`."""
+        return _run_in_separate_loop(
+            self.get_main_pointer(collection, doc_id, step_type, model_tag=model_tag)
+        )
+
+    async def set_main_pointer(
+        self,
+        collection: str,
+        doc_id: str,
+        step_type: str,
+        semantic_id: str,
+        technical_id: str,
+        *,
+        model_tag: Optional[str] = None,
+        operator: Optional[str] = None,
+    ) -> None:
+        """Open the collection handle and set a main pointer (async)."""
+        handle = await self.open_collection(
+            KBContextRequest(
+                collection=collection,
+                access_mode=KBAccessMode.WRITE,
+                hide_missing=True,
+            )
+        )
+        return await asyncio.to_thread(
+            handle.set_main_pointer,
+            doc_id,
+            step_type,
+            semantic_id,
+            technical_id,
+            model_tag,
+            operator,
+        )
+
+    def set_main_pointer_sync(
+        self,
+        collection: str,
+        doc_id: str,
+        step_type: str,
+        semantic_id: str,
+        technical_id: str,
+        *,
+        model_tag: Optional[str] = None,
+        operator: Optional[str] = None,
+    ) -> None:
+        """Synchronous wrapper for :meth:`set_main_pointer`."""
+        _run_in_separate_loop(
+            self.set_main_pointer(
+                collection,
+                doc_id,
+                step_type,
+                semantic_id,
+                technical_id,
+                model_tag=model_tag,
+                operator=operator,
+            )
+        )
+
+    async def list_main_pointers(
+        self,
+        collection: str,
+        *,
+        doc_id: Optional[str] = None,
+        limit: int = 100,
+    ) -> list:
+        """Open the collection handle and list main pointers (async)."""
+        handle = await self.open_collection(
+            KBContextRequest(
+                collection=collection,
+                hide_missing=True,
+            )
+        )
+        return await asyncio.to_thread(handle.list_main_pointers, doc_id, limit)
+
+    def list_main_pointers_sync(
+        self,
+        collection: str,
+        *,
+        doc_id: Optional[str] = None,
+        limit: int = 100,
+    ) -> list:
+        """Synchronous wrapper for :meth:`list_main_pointers`."""
+        return _run_in_separate_loop(
+            self.list_main_pointers(collection, doc_id=doc_id, limit=limit)
+        )
+
+    async def delete_main_pointer(
+        self,
+        collection: str,
+        doc_id: str,
+        step_type: str,
+        *,
+        model_tag: Optional[str] = None,
+    ) -> bool:
+        """Open the collection handle and delete a main pointer (async)."""
+        handle = await self.open_collection(
+            KBContextRequest(
+                collection=collection,
+                access_mode=KBAccessMode.WRITE,
+                hide_missing=True,
+            )
+        )
+        return await asyncio.to_thread(
+            handle.delete_main_pointer, doc_id, step_type, model_tag
+        )
+
+    def delete_main_pointer_sync(
+        self,
+        collection: str,
+        doc_id: str,
+        step_type: str,
+        *,
+        model_tag: Optional[str] = None,
+    ) -> bool:
+        """Synchronous wrapper for :meth:`delete_main_pointer`."""
+        return _run_in_separate_loop(
+            self.delete_main_pointer(collection, doc_id, step_type, model_tag=model_tag)
+        )
+
     @staticmethod
     def _normalize_collection(collection: str) -> str:
         normalized = collection.strip() if isinstance(collection, str) else ""

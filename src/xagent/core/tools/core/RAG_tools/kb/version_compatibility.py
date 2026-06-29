@@ -150,6 +150,10 @@ class KBVersionCompatibilityFacade:
         step_type: str,
         model_tag: Optional[str] = None,
     ) -> Optional[Dict[str, Any]]:
+        if self._coordinator is not None:
+            return self._coordinator.get_main_pointer_sync(
+                collection, doc_id, step_type, model_tag=model_tag
+            )
         from ..version_management.main_pointer_manager import _get_main_pointer_impl
 
         with self._storage_context():
@@ -171,6 +175,18 @@ class KBVersionCompatibilityFacade:
         model_tag: Optional[str] = None,
         operator: Optional[str] = None,
     ) -> None:
+        if self._coordinator is not None:
+            # lancedb_dir is vestigial: drop it before delegating to the coordinator.
+            self._coordinator.set_main_pointer_sync(
+                collection,
+                doc_id,
+                step_type,
+                semantic_id,
+                technical_id,
+                model_tag=model_tag,
+                operator=operator,
+            )
+            return
         from ..version_management.main_pointer_manager import _set_main_pointer_impl
 
         with self._storage_context():
@@ -188,6 +204,8 @@ class KBVersionCompatibilityFacade:
     def list_main_pointers(
         self, collection: str, doc_id: Optional[str] = None
     ) -> List[Dict[str, Any]]:
+        if self._coordinator is not None:
+            return self._coordinator.list_main_pointers_sync(collection, doc_id=doc_id)
         from ..version_management.main_pointer_manager import _list_main_pointers_impl
 
         with self._storage_context():
@@ -200,6 +218,10 @@ class KBVersionCompatibilityFacade:
         step_type: str,
         model_tag: Optional[str] = None,
     ) -> bool:
+        if self._coordinator is not None:
+            return self._coordinator.delete_main_pointer_sync(
+                collection, doc_id, step_type, model_tag=model_tag
+            )
         from ..version_management.main_pointer_manager import _delete_main_pointer_impl
 
         with self._storage_context():
