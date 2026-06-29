@@ -105,6 +105,19 @@ class KBVersionCompatibilityFacade:
         limit: int = 50,
         order_by: str = "created_at desc",
     ) -> Dict[str, Any]:
+        if self._coordinator is not None:
+            step_type_str = (
+                step_type.value if isinstance(step_type, StepType) else step_type
+            )
+            return self._coordinator.list_candidates_sync(
+                collection,
+                doc_id,
+                step_type_str,
+                model_tag=model_tag,
+                state=state,
+                limit=limit,
+                order_by=order_by,
+            )
         from ..version_management.list_candidates import _list_candidates_impl
 
         with self._storage_context():

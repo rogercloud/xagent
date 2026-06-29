@@ -11,7 +11,7 @@ by test_version_compatibility.py).
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
 from xagent.core.tools.core.RAG_tools.kb.collection_handle import (
@@ -328,3 +328,230 @@ def test_list_main_pointers_filtered_by_doc_id() -> None:
     pointers = handle.list_main_pointers(doc_id="doc-1")
     assert len(pointers) == 1
     assert pointers[0]["doc_id"] == "doc-1"
+
+
+# ── Task 4: list_candidates handle tests ─────────────────────────────────────
+
+
+class _FakeVectorIndexStore:
+    """Minimal in-memory VectorIndexStore stub for list_candidates handle tests."""
+
+    def __init__(self, candidates: list) -> None:
+        self._candidates = candidates
+
+    def list_version_candidate_rows(
+        self,
+        collection: str,
+        doc_id: str,
+        step_type: str,
+        model_tag=None,
+    ):
+        return list(self._candidates)
+
+    async def list_version_candidate_rows_async(
+        self,
+        collection: str,
+        doc_id: str,
+        step_type: str,
+        model_tag=None,
+    ):
+        return self.list_version_candidate_rows(
+            collection, doc_id, step_type, model_tag
+        )
+
+
+def make_handle_with_vector_store(
+    collection: str, candidates: list
+) -> "LanceDBCollectionHandle":
+    """Make a handle with a fake VectorIndexStore for list_candidates testing."""
+    from xagent.core.tools.core.RAG_tools.kb.models import (
+        KBAccessMode,
+        KBBackendCapabilities,
+        KBCollectionContext,
+        KBStorageBackend,
+        KBUserScope,
+    )
+    from xagent.core.tools.core.RAG_tools.storage.factory import (
+        get_ingestion_status_store,
+        get_metadata_store,
+    )
+
+    fake_vis = _FakeVectorIndexStore(candidates)
+    context = KBCollectionContext(
+        collection=collection,
+        user_scope=KBUserScope(user_id=None, is_admin=True),
+        access_mode=KBAccessMode.WRITE,
+        allow_create=True,
+        hide_missing=True,
+        metadata_store=get_metadata_store(),
+        vector_index_store=fake_vis,  # type: ignore[arg-type]
+        ingestion_status_store=get_ingestion_status_store(),
+        main_pointer_store=_FakeMainPointerStore(),
+        backend=KBStorageBackend.LANCEDB,
+        capabilities=KBBackendCapabilities.lancedb(),
+        collection_info=None,
+    )
+    return LanceDBCollectionHandle(context)
+
+
+def test_list_candidates_sort_before_limit() -> None:
+    """Sorting must happen before limit (get correct top-N). Mirrors test_list_candidates.py:408."""
+
+    base_time = datetime(2024, 1, 1)
+    candidates = [
+        {
+            "semantic_id": "s1",
+            "technical_id": "hash_oldest",
+            "params_brief": {},
+            "stats": {},
+            "state": "candidate",
+            "created_at": base_time,
+            "operator": "unknown",
+        },
+        {
+            "semantic_id": "s2",
+            "technical_id": "hash_middle",
+            "params_brief": {},
+            "stats": {},
+            "state": "candidate",
+            "created_at": base_time + timedelta(days=5),
+            "operator": "unknown",
+        },
+        {
+            "semantic_id": "s3",
+            "technical_id": "hash_newer",
+            "params_brief": {},
+            "stats": {},
+            "state": "candidate",
+            "created_at": base_time + timedelta(days=7),
+            "operator": "unknown",
+        },
+        {
+            "semantic_id": "s4",
+            "technical_id": "hash_newest",
+            "params_brief": {},
+            "stats": {},
+            "state": "candidate",
+            "created_at": base_time + timedelta(days=10),
+            "operator": "unknown",
+        },
+        {
+            "semantic_id": "s5",
+            "technical_id": "hash_second_newest",
+            "params_brief": {},
+            "stats": {},
+            "state": "candidate",
+            "created_at": base_time + timedelta(days=8),
+            "operator": "unknown",
+        },
+    ]
+
+    handle = make_handle_with_vector_store("sort_coll", candidates)
+    result = handle.list_candidates(
+        "doc-1", "parse", limit=3, order_by="created_at desc"
+    )
+
+    assert len(result["candidates"]) == 3
+    assert result["total_count"] == 5
+    assert result["returned_count"] == 3
+
+    technical_ids = [c["technical_id"] for c in result["candidates"]]
+    assert technical_ids[0] == "hash_newest"
+    assert technical_ids[1] == "hash_second_newest"
+    assert technical_ids[2] == "hash_newer"
+    assert "hash_oldest" not in technical_ids
+    assert "hash_middle" not in technical_ids
+
+
+def test_list_candidates_state_filter() -> None:
+    """State filter narrows candidates. Mirrors test_list_candidates.py:296."""
+    candidates = [
+        {
+            "semantic_id": "s1",
+            "technical_id": "hash1",
+            "params_brief": {},
+            "stats": {},
+            "state": "candidate",
+            "created_at": datetime(2024, 1, 1),
+            "operator": "unknown",
+        },
+        {
+            "semantic_id": "s2",
+            "technical_id": "hash2",
+            "params_brief": {},
+            "stats": {},
+            "state": "main",
+            "created_at": datetime(2024, 1, 2),
+            "operator": "unknown",
+        },
+    ]
+    handle = make_handle_with_vector_store("state_coll", candidates)
+
+    result = handle.list_candidates("doc-1", "parse", state="candidate")
+    assert (
+        result["total_count"] == 1
+    )  # total AFTER state filter (matches _list_candidates_impl behavior)
+    assert result["returned_count"] == 1
+    assert len(result["candidates"]) == 1
+    assert result["candidates"][0]["state"] == "candidate"
+    assert result["filters"]["state"] == "candidate"
+
+
+def test_list_candidates_model_tag_filter() -> None:
+    """model_tag is passed through to the store. Mirrors test_list_candidates.py:369."""
+    candidates_bge = [
+        {
+            "semantic_id": "embed_BAAI/bge-large-zh-v1.5_parse_ha",
+            "technical_id": "parse_hash1",
+            "params_brief": {
+                "model": "BAAI/bge-large-zh-v1.5",
+                "model_tag": "bge_large",
+            },
+            "stats": {"upsert_count": 1, "vector_dim": 3},
+            "state": "candidate",
+            "created_at": datetime(2024, 1, 1),
+            "operator": "unknown",
+        },
+    ]
+
+    handle = make_handle_with_vector_store("mtag_coll", candidates_bge)
+    result = handle.list_candidates("doc-1", "embed", model_tag="bge_large")
+
+    assert len(result["candidates"]) == 1
+    assert result["total_count"] == 1
+    assert result["model_tag"] == "bge_large"
+
+
+def test_list_candidates_result_dict_shape() -> None:
+    """Result dict has all required keys. Mirrors test_list_candidates.py:296."""
+    candidates = [
+        {
+            "semantic_id": "s1",
+            "technical_id": "h1",
+            "params_brief": {},
+            "stats": {},
+            "state": "candidate",
+            "created_at": datetime(2024, 1, 1),
+            "operator": "unknown",
+        },
+    ]
+    handle = make_handle_with_vector_store("shape_coll", candidates)
+    result = handle.list_candidates(
+        "doc-1",
+        "parse",
+        model_tag=None,
+        state=None,
+        limit=50,
+        order_by="created_at desc",
+    )
+
+    assert "candidates" in result
+    assert "total_count" in result
+    assert "returned_count" in result
+    assert "step_type" in result
+    assert "model_tag" in result
+    assert "filters" in result
+    assert result["step_type"] == "parse"
+    assert result["filters"]["state"] is None
+    assert result["filters"]["limit"] == 50
+    assert result["filters"]["order_by"] == "created_at desc"

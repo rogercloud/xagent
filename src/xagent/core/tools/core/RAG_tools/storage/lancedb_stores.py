@@ -2340,6 +2340,253 @@ class LanceDBVectorIndexStore(VectorIndexStore):
         finally:
             _safe_close_table(table)
 
+    # --- Version candidate listing (#513 Task 4) ---
+
+    @staticmethod
+    def _vis_query_table(
+        connection: Any,
+        table_name: str,
+        filters: Dict[str, Any],
+    ) -> List[Dict[str, Any]]:
+        """Query a table with given filters; return List[Dict]. Returns [] if table missing.
+
+        Uses ``skip_user_filter=True`` because this is an internal store-level
+        query with no user authentication context (admin-level candidate scan).
+        """
+        from ..LanceDB.schema_manager import _safe_close_table as _sct
+
+        if table_name not in list_table_names(connection):
+            return []
+        tbl = None
+        try:
+            tbl = connection.open_table(table_name)
+            filter_expr = build_lancedb_filter_expression(
+                filters, skip_user_filter=True
+            )
+            return query_to_list(tbl.search().where(filter_expr))
+        finally:
+            _sct(tbl)
+
+    @staticmethod
+    def _vis_parse_params_json(row: Dict[str, Any]) -> Dict[str, Any]:
+        """Parse ``params_json`` field from a row; return empty dict on failure."""
+        import json as _json
+
+        raw = row.get("params_json", "")
+        if not raw:
+            return {}
+        try:
+            parsed = _json.loads(raw)
+            return parsed if isinstance(parsed, dict) else {}
+        except Exception:
+            return {}
+
+    @staticmethod
+    def _vis_generate_semantic_id(
+        step_type_str: str, technical_id: str, params: Optional[Dict[str, Any]] = None
+    ) -> str:
+        """Generate a semantic ID from technical ID and parameters."""
+        hash_prefix = technical_id[:8] if technical_id else "unknown"
+        if step_type_str == "parse":
+            method = params.get("parse_method", "unknown") if params else "unknown"
+            return f"parse_{method}_{hash_prefix}"
+        elif step_type_str == "chunk":
+            strategy = params.get("chunk_strategy", "unknown") if params else "unknown"
+            size = params.get("chunk_size", "unknown") if params else "unknown"
+            return f"chunk_{strategy}_{size}_{hash_prefix}"
+        elif step_type_str == "embed":
+            model = params.get("model", "unknown") if params else "unknown"
+            return f"embed_{model}_{hash_prefix}"
+        else:
+            return f"{step_type_str}_{hash_prefix}"
+
+    def _vis_get_parse_candidates(
+        self, connection: Any, filters: Dict[str, Any]
+    ) -> List[Dict[str, Any]]:
+        """Get parse candidates from the database."""
+        result = self._vis_query_table(connection, "parses", filters)
+        if not result:
+            return []
+        parse_candidates: List[Dict[str, Any]] = []
+        for row in result:
+            # parse_method lives inside params_json for real schema rows
+            params_json = self._vis_parse_params_json(row)
+            parse_method = row.get("parse_method") or params_json.get(
+                "parse_method", "unknown"
+            )
+            parser = row.get("parser", "unknown")
+            merged_params: Dict[str, Any] = {
+                "parse_method": parse_method,
+                "parser": parser,
+            }
+            semantic_id = self._vis_generate_semantic_id(
+                "parse", row["parse_hash"], merged_params
+            )
+            stats: Dict[str, Any] = {
+                "paragraphs_count": 0,
+                "elapsed_ms": 0,
+                "parse_method": parse_method,
+                "parser": parser,
+            }
+            parse_candidates.append(
+                {
+                    "semantic_id": semantic_id,
+                    "technical_id": row["parse_hash"],
+                    "params_brief": merged_params,
+                    "stats": stats,
+                    "state": "candidate",
+                    "created_at": row.get(
+                        "created_at", datetime.now(timezone.utc).replace(tzinfo=None)
+                    ),
+                    "operator": "unknown",
+                }
+            )
+        return parse_candidates
+
+    def _vis_get_chunk_candidates(
+        self, connection: Any, filters: Dict[str, Any]
+    ) -> List[Dict[str, Any]]:
+        """Get chunk candidates from the database."""
+        result = self._vis_query_table(connection, "chunks", filters)
+        if not result:
+            return []
+        chunk_configs: Dict[str, Dict[str, Any]] = {}
+        for row in result:
+            parse_hash = row["parse_hash"]
+            if parse_hash not in chunk_configs:
+                chunk_configs[parse_hash] = {
+                    "chunk_count": 0,
+                    "avg_length": 0,
+                    "created_at": row.get(
+                        "created_at", datetime.now(timezone.utc).replace(tzinfo=None)
+                    ),
+                }
+            chunk_configs[parse_hash]["chunk_count"] += 1
+            text_len = len(row.get("text", ""))
+            cfg = chunk_configs[parse_hash]
+            cfg["avg_length"] = (
+                cfg["avg_length"] * (cfg["chunk_count"] - 1) + text_len
+            ) / cfg["chunk_count"]
+
+        chunk_candidates: List[Dict[str, Any]] = []
+        for parse_hash, cfg in chunk_configs.items():
+            semantic_id = self._vis_generate_semantic_id(
+                "chunk", parse_hash, {"chunk_count": cfg["chunk_count"]}
+            )
+            stats = {
+                "chunks_count": cfg["chunk_count"],
+                "avg_length": int(cfg["avg_length"]),
+                "parse_hash": parse_hash,
+            }
+            chunk_candidates.append(
+                {
+                    "semantic_id": semantic_id,
+                    "technical_id": parse_hash,
+                    "params_brief": {"chunk_count": cfg["chunk_count"]},
+                    "stats": stats,
+                    "state": "candidate",
+                    "created_at": cfg["created_at"],
+                    "operator": "unknown",
+                }
+            )
+        return chunk_candidates
+
+    def _vis_get_embed_candidates(
+        self, connection: Any, filters: Dict[str, Any], model_tag: str
+    ) -> List[Dict[str, Any]]:
+        """Get embedding candidates from the database."""
+        table_names = list_table_names(connection)
+        embed_tables = [name for name in table_names if name.startswith("embeddings_")]
+        if not embed_tables:
+            return []
+        embed_candidates: List[Dict[str, Any]] = []
+        for table_name in embed_tables:
+            table_model_tag = table_name.replace("embeddings_", "")
+            if model_tag != table_model_tag:
+                continue
+            result = self._vis_query_table(connection, table_name, filters)
+            if not result:
+                continue
+            embed_configs: Dict[tuple, Dict[str, Any]] = {}
+            for row in result:
+                model = row.get("model", "unknown")
+                parse_hash = row.get("parse_hash", "unknown")
+                key = (model, parse_hash)
+                if key not in embed_configs:
+                    embed_configs[key] = {
+                        "vector_count": 0,
+                        "vector_dim": 0,
+                        "created_at": row.get(
+                            "created_at",
+                            datetime.now(timezone.utc).replace(tzinfo=None),
+                        ),
+                    }
+                embed_configs[key]["vector_count"] += 1
+                vector = row.get("vector", [])
+                if vector is not None and embed_configs[key]["vector_dim"] == 0:
+                    try:
+                        embed_configs[key]["vector_dim"] = len(vector)
+                    except Exception:
+                        pass
+
+            for (model, parse_hash), cfg in embed_configs.items():
+                semantic_id = self._vis_generate_semantic_id(
+                    "embed", parse_hash, {"model": model, "model_tag": model_tag}
+                )
+                stats = {
+                    "upsert_count": cfg["vector_count"],
+                    "vector_dim": cfg["vector_dim"],
+                    "model": model,
+                    "model_tag": model_tag,
+                    "parse_hash": parse_hash,
+                }
+                embed_candidates.append(
+                    {
+                        "semantic_id": semantic_id,
+                        "technical_id": parse_hash,
+                        "params_brief": {"model": model, "model_tag": model_tag},
+                        "stats": stats,
+                        "state": "candidate",
+                        "created_at": cfg["created_at"],
+                        "operator": "unknown",
+                    }
+                )
+        return embed_candidates
+
+    def list_version_candidate_rows(
+        self,
+        collection: str,
+        doc_id: str,
+        step_type: str,
+        model_tag: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        """List raw candidate rows for a document/stage (unsorted, unlimited, unfiltered by state).
+
+        Raises:
+            DatabaseOperationError: If a database operation fails.
+            VersionManagementError: If step_type is unknown or model_tag missing for embed.
+        """
+        from ..core.exceptions import DatabaseOperationError, VersionManagementError
+
+        try:
+            connection = self._get_connection()
+            filters: Dict[str, Any] = {"collection": collection, "doc_id": doc_id}
+
+            if step_type == "parse":
+                return self._vis_get_parse_candidates(connection, filters)
+            elif step_type == "chunk":
+                return self._vis_get_chunk_candidates(connection, filters)
+            elif step_type == "embed":
+                if not model_tag:
+                    raise VersionManagementError("model_tag is required for embed step")
+                return self._vis_get_embed_candidates(connection, filters, model_tag)
+            else:
+                raise VersionManagementError(f"Unknown step_type: {step_type}")
+        except (DatabaseOperationError, VersionManagementError):
+            raise
+        except Exception as e:
+            raise DatabaseOperationError(f"Failed to get candidates: {e}") from e
+
 
 # ============================================================================
 # Phase 1A Part 2: Additional LanceDB Store Implementations

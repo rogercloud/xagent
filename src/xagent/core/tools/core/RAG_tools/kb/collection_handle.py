@@ -19,7 +19,7 @@ from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from datetime import timezone
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Set, cast
+from typing import Any, Dict, Iterable, List, Optional, Set, Union, cast
 
 import pandas as pd
 
@@ -3302,3 +3302,92 @@ class LanceDBCollectionHandle(KBCollectionHandle):
             )
         except Exception as e:
             raise MainPointerError(f"Failed to delete main pointer: {e}") from e
+
+    # --- Version candidate listing (#513 Task 4) ---
+
+    def list_candidates(
+        self,
+        doc_id: str,
+        step_type: "Union[Any, str]",
+        model_tag: Optional[str] = None,
+        state: Optional[str] = None,
+        limit: int = 50,
+        order_by: str = "created_at desc",
+    ) -> Dict[str, Any]:
+        """List version candidates for a document/stage within this collection.
+
+        Resolves ``step_type``, calls the vector index store's semantic method,
+        then applies state-filter / total-count capture / sort / limit /
+        result-dict assembly (the orchestration from ``_list_candidates_impl``).
+
+        Args:
+            doc_id: Document ID.
+            step_type: Processing stage as :class:`StepType` enum or string.
+            model_tag: Required for ``embed`` step.
+            state: Optional state filter (``"candidate"``, ``"main"``, etc.).
+            limit: Maximum candidates to return (default 50).
+            order_by: Sort order (``"created_at desc"`` or ``"created_at asc"``).
+
+        Returns:
+            Result dict with keys ``candidates``, ``total_count``,
+            ``returned_count``, ``step_type``, ``model_tag``, ``filters``.
+        """
+        from ..core.exceptions import DatabaseOperationError, VersionManagementError
+        from ..core.schemas import StepType as _StepType
+
+        def _resolve(st: Union[Any, str]) -> "_StepType":
+            if isinstance(st, _StepType):
+                return st
+            elif isinstance(st, str):
+                try:
+                    return _StepType(st)
+                except ValueError:
+                    raise VersionManagementError(
+                        f"Invalid step_type string: '{st}'. Expected one of: "
+                        + ", ".join(["'" + s.value + "'" for s in _StepType])
+                    )
+            else:
+                raise VersionManagementError(
+                    f"Unsupported step_type type: {type(st)}. Expected StepType or str."
+                )
+
+        try:
+            resolved = _resolve(step_type)
+
+            candidates = self.vector_index_store.list_version_candidate_rows(
+                self.context.collection,
+                doc_id,
+                resolved.value,
+                model_tag,
+            )
+
+            # Apply state filter if specified
+            if state is not None:
+                candidates = [c for c in candidates if c["state"] == state]
+
+            # Record total count before limit (after state filter, matching _list_candidates_impl)
+            total_count = len(candidates)
+
+            # Sort by order_by (must happen before limit)
+            if order_by == "created_at desc":
+                candidates.sort(key=lambda x: x["created_at"], reverse=True)
+            elif order_by == "created_at asc":
+                candidates.sort(key=lambda x: x["created_at"], reverse=False)
+
+            # Apply limit after sorting
+            if limit > 0:
+                candidates = candidates[:limit]
+
+            return {
+                "candidates": candidates,
+                "total_count": total_count,
+                "returned_count": len(candidates),
+                "step_type": resolved.value,
+                "model_tag": model_tag,
+                "filters": {"state": state, "limit": limit, "order_by": order_by},
+            }
+
+        except (DatabaseOperationError, VersionManagementError):
+            raise
+        except Exception as e:
+            raise VersionManagementError(f"Failed to list candidates: {e}") from e

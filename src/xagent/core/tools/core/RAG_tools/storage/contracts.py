@@ -878,6 +878,47 @@ class VectorIndexStore(ABC):
         """
 
     @abstractmethod
+    def list_version_candidate_rows(
+        self,
+        collection: str,
+        doc_id: str,
+        step_type: str,
+        model_tag: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        """List raw candidate rows for a document/stage (semantic, unsorted/unlimited).
+
+        Returns per-candidate dicts with keys:
+          ``semantic_id``, ``technical_id``, ``params_brief``, ``stats``,
+          ``state``, ``created_at``, ``operator``.
+
+        Args:
+            collection: Collection name.
+            doc_id: Document ID.
+            step_type: Processing stage as string (``"parse"``, ``"chunk"``, ``"embed"``).
+            model_tag: Required when ``step_type == "embed"``.
+
+        Returns:
+            List of candidate dicts, **unsorted, unlimited, unfiltered by state**.
+
+        Raises:
+            DatabaseOperationError: If a database operation fails.
+            VersionManagementError: If a version-management logic error occurs (e.g.
+                missing ``model_tag`` for embed).
+        """
+
+    async def list_version_candidate_rows_async(
+        self,
+        collection: str,
+        doc_id: str,
+        step_type: str,
+        model_tag: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        """Async variant — delegates to sync by default (Phase 1A pattern)."""
+        return self.list_version_candidate_rows(
+            collection, doc_id, step_type, model_tag
+        )
+
+    @abstractmethod
     def search_vectors(
         self,
         table_name: str,

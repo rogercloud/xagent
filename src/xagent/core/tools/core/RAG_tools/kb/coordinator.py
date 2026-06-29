@@ -828,6 +828,58 @@ class KBCoordinator:
             self.delete_main_pointer(collection, doc_id, step_type, model_tag=model_tag)
         )
 
+    async def list_candidates(
+        self,
+        collection: str,
+        doc_id: str,
+        step_type: str,
+        *,
+        model_tag: Optional[str] = None,
+        state: Optional[str] = None,
+        limit: int = 50,
+        order_by: str = "created_at desc",
+    ) -> dict:
+        """Open the collection handle and list version candidates (async)."""
+        handle = await self.open_collection(
+            KBContextRequest(
+                collection=collection,
+                hide_missing=True,
+            )
+        )
+        return await asyncio.to_thread(
+            handle.list_candidates,
+            doc_id,
+            step_type,
+            model_tag,
+            state,
+            limit,
+            order_by,
+        )
+
+    def list_candidates_sync(
+        self,
+        collection: str,
+        doc_id: str,
+        step_type: str,
+        *,
+        model_tag: Optional[str] = None,
+        state: Optional[str] = None,
+        limit: int = 50,
+        order_by: str = "created_at desc",
+    ) -> dict:
+        """Synchronous wrapper for :meth:`list_candidates`."""
+        return _run_in_separate_loop(
+            self.list_candidates(
+                collection,
+                doc_id,
+                step_type,
+                model_tag=model_tag,
+                state=state,
+                limit=limit,
+                order_by=order_by,
+            )
+        )
+
     @staticmethod
     def _normalize_collection(collection: str) -> str:
         normalized = collection.strip() if isinstance(collection, str) else ""
