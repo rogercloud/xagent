@@ -239,6 +239,8 @@ class KBCoordinator:
         user_scope = self._resolve_user_scope(request)
         metadata_store = self._storage_shim.get_metadata_store()
         vector_index_store = self._storage_shim.get_vector_index_store()
+        ingestion_status_store = self._storage_shim.get_ingestion_status_store()
+        main_pointer_store = self._storage_shim.get_main_pointer_store()
 
         collection_info = None
         try:
@@ -260,6 +262,8 @@ class KBCoordinator:
             hide_missing=bool(request.hide_missing),
             metadata_store=metadata_store,
             vector_index_store=vector_index_store,
+            ingestion_status_store=ingestion_status_store,
+            main_pointer_store=main_pointer_store,
             backend=backend,
             capabilities=capabilities,
             collection_info=collection_info,
