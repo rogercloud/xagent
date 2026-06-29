@@ -39,6 +39,12 @@ class _FakeStorageFactory:
     def get_vector_index_store(self) -> object:
         return object()
 
+    def get_ingestion_status_store(self) -> object:
+        return object()
+
+    def get_main_pointer_store(self) -> object:
+        return object()
+
 
 class _StorageAccessSentinel:
     def get_metadata_store(self) -> object:
