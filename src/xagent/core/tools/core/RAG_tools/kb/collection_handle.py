@@ -641,6 +641,76 @@ class KBCollectionHandle(ABC):
     ) -> int:
         """Idempotently delete newly created chunk rows (compensation)."""
 
+    @abstractmethod
+    def cleanup_cascade(
+        self,
+        doc_id: str,
+        scope: str,
+        *,
+        new_parse_hash: Optional[str] = None,
+        old_parse_hash: Optional[str] = None,
+        model_tag: Optional[str] = None,
+        user_id: Optional[int] = None,
+        is_admin: Optional[bool] = None,
+        preview_only: bool = True,
+        confirm: bool = False,
+    ) -> Dict[str, int]:
+        """Version cascade cleanup for a document by scope (policy layer)."""
+
+    @abstractmethod
+    def cleanup_document_cascade(
+        self,
+        doc_id: str,
+        *,
+        model_tag: Optional[str] = None,
+        user_id: Optional[int] = None,
+        is_admin: bool = True,
+        preview_only: bool = True,
+        confirm: bool = False,
+    ) -> Dict[str, int]:
+        """Cascade cleanup for all data of a document."""
+
+    @abstractmethod
+    def cleanup_parse_cascade(
+        self,
+        doc_id: str,
+        *,
+        old_parse_hash: Optional[str] = None,
+        new_parse_hash: Optional[str] = None,
+        user_id: Optional[int] = None,
+        is_admin: bool = True,
+        preview_only: bool = True,
+        confirm: bool = False,
+    ) -> Dict[str, int]:
+        """Cascade cleanup when promoting a parse version."""
+
+    @abstractmethod
+    def cleanup_chunk_cascade(
+        self,
+        doc_id: str,
+        *,
+        old_parse_hash: Optional[str] = None,
+        new_parse_hash: Optional[str] = None,
+        user_id: Optional[int] = None,
+        is_admin: bool = True,
+        preview_only: bool = True,
+        confirm: bool = False,
+    ) -> Dict[str, int]:
+        """Cascade cleanup when promoting a chunk version."""
+
+    @abstractmethod
+    def cleanup_embed_cascade(
+        self,
+        doc_id: str,
+        *,
+        model_tag: Optional[str] = None,
+        user_id: Optional[int] = None,
+        is_admin: bool = True,
+        preview_only: bool = True,
+        confirm: bool = False,
+    ) -> Dict[str, int]:
+        """Cascade cleanup when promoting an embeddings version."""
+
 
 @dataclass(frozen=True)
 class LanceDBCollectionHandle(KBCollectionHandle):
@@ -2992,6 +3062,144 @@ class LanceDBCollectionHandle(KBCollectionHandle):
             user_id=user_id,
             is_admin=is_admin,
         )
+
+    # --- Version cascade cleanup (Task 5) ---
+
+    def cleanup_cascade(
+        self,
+        doc_id: str,
+        scope: str,
+        *,
+        new_parse_hash: Optional[str] = None,
+        old_parse_hash: Optional[str] = None,
+        model_tag: Optional[str] = None,
+        user_id: Optional[int] = None,
+        is_admin: Optional[bool] = None,
+        preview_only: bool = True,
+        confirm: bool = False,
+    ) -> Dict[str, int]:
+        """Policy layer: is_admin=None → True, then delegate to store."""
+        from ..utils.user_scope import resolve_user_scope
+
+        if is_admin is None:
+            is_admin = True
+        user_scope = resolve_user_scope(user_id=user_id, is_admin=is_admin)
+        return self.vector_index_store.cleanup_cascade_by_scope(
+            collection=self.context.collection,
+            doc_id=doc_id,
+            scope=scope,
+            new_parse_hash=new_parse_hash,
+            old_parse_hash=old_parse_hash,
+            model_tag=model_tag,
+            user_id=user_scope.user_id,
+            is_admin=user_scope.is_admin,
+            preview_only=preview_only,
+            confirm=confirm,
+        )
+
+    def cleanup_document_cascade(
+        self,
+        doc_id: str,
+        *,
+        model_tag: Optional[str] = None,
+        user_id: Optional[int] = None,
+        is_admin: bool = True,
+        preview_only: bool = True,
+        confirm: bool = False,
+    ) -> Dict[str, int]:
+        from ..core.exceptions import CascadeCleanupError
+
+        try:
+            return self.cleanup_cascade(
+                doc_id,
+                "document",
+                model_tag=model_tag,
+                user_id=user_id,
+                is_admin=is_admin,
+                preview_only=preview_only,
+                confirm=confirm,
+            )
+        except Exception as e:
+            raise CascadeCleanupError(f"Failed to cleanup document cascade: {e}") from e
+
+    def cleanup_parse_cascade(
+        self,
+        doc_id: str,
+        *,
+        old_parse_hash: Optional[str] = None,
+        new_parse_hash: Optional[str] = None,
+        user_id: Optional[int] = None,
+        is_admin: bool = True,
+        preview_only: bool = True,
+        confirm: bool = False,
+    ) -> Dict[str, int]:
+        from ..core.exceptions import CascadeCleanupError
+
+        try:
+            return self.cleanup_cascade(
+                doc_id,
+                "parse",
+                old_parse_hash=old_parse_hash,
+                new_parse_hash=new_parse_hash,
+                user_id=user_id,
+                is_admin=is_admin,
+                preview_only=preview_only,
+                confirm=confirm,
+            )
+        except Exception as e:
+            raise CascadeCleanupError(f"Failed to cleanup parse cascade: {e}") from e
+
+    def cleanup_chunk_cascade(
+        self,
+        doc_id: str,
+        *,
+        old_parse_hash: Optional[str] = None,
+        new_parse_hash: Optional[str] = None,
+        user_id: Optional[int] = None,
+        is_admin: bool = True,
+        preview_only: bool = True,
+        confirm: bool = False,
+    ) -> Dict[str, int]:
+        from ..core.exceptions import CascadeCleanupError
+
+        try:
+            return self.cleanup_cascade(
+                doc_id,
+                "chunk",
+                old_parse_hash=old_parse_hash,
+                new_parse_hash=new_parse_hash,
+                user_id=user_id,
+                is_admin=is_admin,
+                preview_only=preview_only,
+                confirm=confirm,
+            )
+        except Exception as e:
+            raise CascadeCleanupError(f"Failed to cleanup chunk cascade: {e}") from e
+
+    def cleanup_embed_cascade(
+        self,
+        doc_id: str,
+        *,
+        model_tag: Optional[str] = None,
+        user_id: Optional[int] = None,
+        is_admin: bool = True,
+        preview_only: bool = True,
+        confirm: bool = False,
+    ) -> Dict[str, int]:
+        from ..core.exceptions import CascadeCleanupError
+
+        try:
+            return self.cleanup_cascade(
+                doc_id,
+                "embeddings",
+                model_tag=model_tag,
+                user_id=user_id,
+                is_admin=is_admin,
+                preview_only=preview_only,
+                confirm=confirm,
+            )
+        except Exception as e:
+            raise CascadeCleanupError(f"Failed to cleanup embed cascade: {e}") from e
 
     # --- Ingestion-status data-plane (#513) ---
 

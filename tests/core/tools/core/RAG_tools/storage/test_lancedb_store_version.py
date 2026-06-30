@@ -219,3 +219,92 @@ class TestListVersionCandidateRowsStore:
         )
         rows_sync = store.list_version_candidate_rows(collection, doc_id, "parse")
         assert rows_async == rows_sync
+
+
+class TestCleanupCascadeByScope:
+    """Tests for VectorIndexStore.cleanup_cascade_by_scope – store-level (real LanceDB)."""
+
+    def test_parse_scope_preview_counts_collapsed(self, isolated_store):
+        """cleanup_cascade_by_scope scope=parse returns collapsed embeddings key."""
+        store = isolated_store
+        collection = "cc_coll1"
+        doc_id = "cc_doc1"
+        parse_hash = "parsehash11223344"
+
+        # Seed a parse row
+        store.upsert_parses([_make_parse_row(collection, doc_id, parse_hash)])
+        # Seed a chunk
+        store.upsert_chunks([_make_chunk_row(collection, doc_id, parse_hash, "ck1")])
+
+        result = store.cleanup_cascade_by_scope(
+            collection,
+            doc_id,
+            "parse",
+            new_parse_hash="newhash1234567890",
+            preview_only=True,
+            confirm=False,
+        )
+
+        assert isinstance(result, dict)
+        assert "embeddings" in result
+        assert "chunks" in result
+        assert "parses" in result
+
+    def test_document_scope_returns_6_keys(self, isolated_store):
+        """cleanup_cascade_by_scope scope=document returns 6-key dict."""
+        store = isolated_store
+        collection = "cc_coll2"
+        doc_id = "cc_doc2"
+
+        result = store.cleanup_cascade_by_scope(
+            collection,
+            doc_id,
+            "document",
+            preview_only=True,
+            confirm=False,
+        )
+
+        assert isinstance(result, dict)
+        assert set(result.keys()) == {
+            "embeddings",
+            "chunks",
+            "parses",
+            "main_pointers",
+            "documents",
+            "ingestion_runs",
+        }
+
+    def test_embeddings_scope_collapse(self, isolated_store):
+        """cleanup_cascade_by_scope scope=embeddings returns embeddings key."""
+        store = isolated_store
+        collection = "cc_coll3"
+        doc_id = "cc_doc3"
+
+        result = store.cleanup_cascade_by_scope(
+            collection,
+            doc_id,
+            "embeddings",
+            preview_only=True,
+            confirm=False,
+        )
+
+        assert isinstance(result, dict)
+        assert "embeddings" in result
+
+    def test_async_variant_delegates_to_sync(self, isolated_store):
+        """cleanup_cascade_by_scope_async returns same result as sync."""
+        import asyncio
+
+        store = isolated_store
+        collection = "cc_coll4"
+        doc_id = "cc_doc4"
+
+        sync_result = store.cleanup_cascade_by_scope(
+            collection, doc_id, "parse", preview_only=True, confirm=False
+        )
+        async_result = asyncio.run(
+            store.cleanup_cascade_by_scope_async(
+                collection, doc_id, "parse", preview_only=True, confirm=False
+            )
+        )
+        assert sync_result == async_result

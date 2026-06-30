@@ -6,7 +6,7 @@ import asyncio
 import threading
 from collections.abc import Coroutine
 from contextvars import copy_context
-from typing import Any, Optional, TypeVar
+from typing import Any, Dict, Optional, TypeVar
 
 from ..core.schemas import (
     DocumentRecordDetail,
@@ -877,6 +877,301 @@ class KBCoordinator:
                 state=state,
                 limit=limit,
                 order_by=order_by,
+            )
+        )
+
+    async def cleanup_cascade(
+        self,
+        collection: str,
+        doc_id: str,
+        scope: str,
+        *,
+        new_parse_hash: Optional[str] = None,
+        old_parse_hash: Optional[str] = None,
+        model_tag: Optional[str] = None,
+        user_id: Optional[int] = None,
+        is_admin: Optional[bool] = None,
+        preview_only: bool = True,
+        confirm: bool = False,
+    ) -> Dict[str, Any]:
+        """Open the collection handle and run cascade cleanup (async)."""
+        handle = await self.open_collection(
+            KBContextRequest(
+                collection=collection,
+                user_id=user_id,
+                is_admin=is_admin or False,
+                access_mode=KBAccessMode.WRITE,
+                hide_missing=True,
+            )
+        )
+        return await asyncio.to_thread(
+            handle.cleanup_cascade,
+            doc_id,
+            scope,
+            new_parse_hash=new_parse_hash,
+            old_parse_hash=old_parse_hash,
+            model_tag=model_tag,
+            user_id=user_id,
+            is_admin=is_admin,
+            preview_only=preview_only,
+            confirm=confirm,
+        )
+
+    def cleanup_cascade_sync(
+        self,
+        collection: str,
+        doc_id: str,
+        scope: str,
+        *,
+        new_parse_hash: Optional[str] = None,
+        old_parse_hash: Optional[str] = None,
+        model_tag: Optional[str] = None,
+        user_id: Optional[int] = None,
+        is_admin: Optional[bool] = None,
+        preview_only: bool = True,
+        confirm: bool = False,
+    ) -> Dict[str, Any]:
+        """Synchronous wrapper for :meth:`cleanup_cascade`."""
+        return _run_in_separate_loop(
+            self.cleanup_cascade(
+                collection,
+                doc_id,
+                scope,
+                new_parse_hash=new_parse_hash,
+                old_parse_hash=old_parse_hash,
+                model_tag=model_tag,
+                user_id=user_id,
+                is_admin=is_admin,
+                preview_only=preview_only,
+                confirm=confirm,
+            )
+        )
+
+    async def cleanup_document_cascade(
+        self,
+        collection: str,
+        doc_id: str,
+        *,
+        model_tag: Optional[str] = None,
+        user_id: Optional[int] = None,
+        is_admin: bool = True,
+        preview_only: bool = True,
+        confirm: bool = False,
+    ) -> Dict[str, Any]:
+        """Open collection handle and run document cascade cleanup (async)."""
+        handle = await self.open_collection(
+            KBContextRequest(
+                collection=collection,
+                user_id=user_id,
+                is_admin=is_admin,
+                access_mode=KBAccessMode.WRITE,
+                hide_missing=True,
+            )
+        )
+        return await asyncio.to_thread(
+            handle.cleanup_document_cascade,
+            doc_id,
+            model_tag=model_tag,
+            user_id=user_id,
+            is_admin=is_admin,
+            preview_only=preview_only,
+            confirm=confirm,
+        )
+
+    def cleanup_document_cascade_sync(
+        self,
+        collection: str,
+        doc_id: str,
+        *,
+        model_tag: Optional[str] = None,
+        user_id: Optional[int] = None,
+        is_admin: bool = True,
+        preview_only: bool = True,
+        confirm: bool = False,
+    ) -> Dict[str, Any]:
+        """Synchronous wrapper for :meth:`cleanup_document_cascade`."""
+        return _run_in_separate_loop(
+            self.cleanup_document_cascade(
+                collection,
+                doc_id,
+                model_tag=model_tag,
+                user_id=user_id,
+                is_admin=is_admin,
+                preview_only=preview_only,
+                confirm=confirm,
+            )
+        )
+
+    async def cleanup_parse_cascade(
+        self,
+        collection: str,
+        doc_id: str,
+        *,
+        old_parse_hash: Optional[str] = None,
+        new_parse_hash: Optional[str] = None,
+        user_id: Optional[int] = None,
+        is_admin: bool = True,
+        preview_only: bool = True,
+        confirm: bool = False,
+    ) -> Dict[str, Any]:
+        """Open collection handle and run parse cascade cleanup (async)."""
+        handle = await self.open_collection(
+            KBContextRequest(
+                collection=collection,
+                user_id=user_id,
+                is_admin=is_admin,
+                access_mode=KBAccessMode.WRITE,
+                hide_missing=True,
+            )
+        )
+        return await asyncio.to_thread(
+            handle.cleanup_parse_cascade,
+            doc_id,
+            old_parse_hash=old_parse_hash,
+            new_parse_hash=new_parse_hash,
+            user_id=user_id,
+            is_admin=is_admin,
+            preview_only=preview_only,
+            confirm=confirm,
+        )
+
+    def cleanup_parse_cascade_sync(
+        self,
+        collection: str,
+        doc_id: str,
+        *,
+        old_parse_hash: Optional[str] = None,
+        new_parse_hash: Optional[str] = None,
+        user_id: Optional[int] = None,
+        is_admin: bool = True,
+        preview_only: bool = True,
+        confirm: bool = False,
+    ) -> Dict[str, Any]:
+        """Synchronous wrapper for :meth:`cleanup_parse_cascade`."""
+        return _run_in_separate_loop(
+            self.cleanup_parse_cascade(
+                collection,
+                doc_id,
+                old_parse_hash=old_parse_hash,
+                new_parse_hash=new_parse_hash,
+                user_id=user_id,
+                is_admin=is_admin,
+                preview_only=preview_only,
+                confirm=confirm,
+            )
+        )
+
+    async def cleanup_chunk_cascade(
+        self,
+        collection: str,
+        doc_id: str,
+        *,
+        old_parse_hash: Optional[str] = None,
+        new_parse_hash: Optional[str] = None,
+        user_id: Optional[int] = None,
+        is_admin: bool = True,
+        preview_only: bool = True,
+        confirm: bool = False,
+    ) -> Dict[str, Any]:
+        """Open collection handle and run chunk cascade cleanup (async)."""
+        handle = await self.open_collection(
+            KBContextRequest(
+                collection=collection,
+                user_id=user_id,
+                is_admin=is_admin,
+                access_mode=KBAccessMode.WRITE,
+                hide_missing=True,
+            )
+        )
+        return await asyncio.to_thread(
+            handle.cleanup_chunk_cascade,
+            doc_id,
+            old_parse_hash=old_parse_hash,
+            new_parse_hash=new_parse_hash,
+            user_id=user_id,
+            is_admin=is_admin,
+            preview_only=preview_only,
+            confirm=confirm,
+        )
+
+    def cleanup_chunk_cascade_sync(
+        self,
+        collection: str,
+        doc_id: str,
+        *,
+        old_parse_hash: Optional[str] = None,
+        new_parse_hash: Optional[str] = None,
+        user_id: Optional[int] = None,
+        is_admin: bool = True,
+        preview_only: bool = True,
+        confirm: bool = False,
+    ) -> Dict[str, Any]:
+        """Synchronous wrapper for :meth:`cleanup_chunk_cascade`."""
+        return _run_in_separate_loop(
+            self.cleanup_chunk_cascade(
+                collection,
+                doc_id,
+                old_parse_hash=old_parse_hash,
+                new_parse_hash=new_parse_hash,
+                user_id=user_id,
+                is_admin=is_admin,
+                preview_only=preview_only,
+                confirm=confirm,
+            )
+        )
+
+    async def cleanup_embed_cascade(
+        self,
+        collection: str,
+        doc_id: str,
+        *,
+        model_tag: Optional[str] = None,
+        user_id: Optional[int] = None,
+        is_admin: bool = True,
+        preview_only: bool = True,
+        confirm: bool = False,
+    ) -> Dict[str, Any]:
+        """Open collection handle and run embed cascade cleanup (async)."""
+        handle = await self.open_collection(
+            KBContextRequest(
+                collection=collection,
+                user_id=user_id,
+                is_admin=is_admin,
+                access_mode=KBAccessMode.WRITE,
+                hide_missing=True,
+            )
+        )
+        return await asyncio.to_thread(
+            handle.cleanup_embed_cascade,
+            doc_id,
+            model_tag=model_tag,
+            user_id=user_id,
+            is_admin=is_admin,
+            preview_only=preview_only,
+            confirm=confirm,
+        )
+
+    def cleanup_embed_cascade_sync(
+        self,
+        collection: str,
+        doc_id: str,
+        *,
+        model_tag: Optional[str] = None,
+        user_id: Optional[int] = None,
+        is_admin: bool = True,
+        preview_only: bool = True,
+        confirm: bool = False,
+    ) -> Dict[str, Any]:
+        """Synchronous wrapper for :meth:`cleanup_embed_cascade`."""
+        return _run_in_separate_loop(
+            self.cleanup_embed_cascade(
+                collection,
+                doc_id,
+                model_tag=model_tag,
+                user_id=user_id,
+                is_admin=is_admin,
+                preview_only=preview_only,
+                confirm=confirm,
             )
         )
 

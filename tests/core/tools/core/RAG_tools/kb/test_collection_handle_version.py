@@ -11,6 +11,8 @@ by test_version_compatibility.py).
 
 from __future__ import annotations
 
+import pytest
+
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
@@ -555,3 +557,139 @@ def test_list_candidates_result_dict_shape() -> None:
     assert result["filters"]["state"] is None
     assert result["filters"]["limit"] == 50
     assert result["filters"]["order_by"] == "created_at desc"
+
+
+class _FakeVectorIndexStoreWithCleanup(_FakeVectorIndexStore):
+    """Extended fake that records cleanup_cascade_by_scope calls."""
+
+    def __init__(self, candidates: list) -> None:
+        super().__init__(candidates)
+        self.last_cleanup_args: Optional[Dict[str, Any]] = None
+        self.cleanup_return: Dict[str, int] = {"embeddings": 0, "chunks": 0, "parses": 0}
+        self.cleanup_side_effect: Optional[Exception] = None
+
+    def cleanup_cascade_by_scope(
+        self,
+        collection: str,
+        doc_id: str,
+        scope: str,
+        *,
+        new_parse_hash=None,
+        old_parse_hash=None,
+        model_tag=None,
+        user_id=None,
+        is_admin: bool = True,
+        preview_only: bool = True,
+        confirm: bool = False,
+    ) -> Dict[str, int]:
+        if self.cleanup_side_effect is not None:
+            raise self.cleanup_side_effect
+        self.last_cleanup_args = {
+            "collection": collection,
+            "doc_id": doc_id,
+            "scope": scope,
+            "is_admin": is_admin,
+            "user_id": user_id,
+        }
+        return dict(self.cleanup_return)
+
+
+def make_handle_with_cleanup_store(
+    collection: str,
+    *,
+    cleanup_return: Optional[Dict[str, int]] = None,
+    cleanup_side_effect: Optional[Exception] = None,
+) -> tuple:
+    """Make a handle with a fake cleanup store. Returns (handle, fake_store)."""
+    from xagent.core.tools.core.RAG_tools.kb.models import (
+        KBAccessMode,
+        KBBackendCapabilities,
+        KBCollectionContext,
+        KBStorageBackend,
+        KBUserScope,
+    )
+    from xagent.core.tools.core.RAG_tools.storage.factory import (
+        get_ingestion_status_store,
+        get_metadata_store,
+    )
+
+    fake_vis = _FakeVectorIndexStoreWithCleanup([])
+    if cleanup_return is not None:
+        fake_vis.cleanup_return = cleanup_return
+    if cleanup_side_effect is not None:
+        fake_vis.cleanup_side_effect = cleanup_side_effect
+
+    context = KBCollectionContext(
+        collection=collection,
+        user_scope=KBUserScope(user_id=None, is_admin=True),
+        access_mode=KBAccessMode.WRITE,
+        allow_create=True,
+        hide_missing=True,
+        metadata_store=get_metadata_store(),
+        vector_index_store=fake_vis,  # type: ignore[arg-type]
+        ingestion_status_store=get_ingestion_status_store(),
+        main_pointer_store=_FakeMainPointerStore(),
+        backend=KBStorageBackend.LANCEDB,
+        capabilities=KBBackendCapabilities.lancedb(),
+        collection_info=None,
+    )
+    return LanceDBCollectionHandle(context), fake_vis
+
+
+class TestCleanupCascadeHandle:
+    """Tests for cleanup_cascade and per-plane wrappers on LanceDBCollectionHandle."""
+
+    def test_cleanup_cascade_is_admin_none_defaults_to_true(self) -> None:
+        """is_admin=None should be promoted to True before calling the store."""
+        handle, fake_vis = make_handle_with_cleanup_store(
+            "cascade_coll",
+            cleanup_return={"embeddings": 0, "chunks": 0, "parses": 0},
+        )
+        handle.cleanup_cascade("doc1", "parse", is_admin=None, preview_only=True)
+        assert fake_vis.last_cleanup_args is not None
+        assert fake_vis.last_cleanup_args["is_admin"] is True
+
+    def test_cleanup_document_cascade_wraps_cascade_error(self) -> None:
+        """Exceptions from the store should be wrapped in CascadeCleanupError."""
+        from xagent.core.tools.core.RAG_tools.core.exceptions import CascadeCleanupError
+
+        handle, fake_vis = make_handle_with_cleanup_store(
+            "cascade_err_coll",
+            cleanup_side_effect=RuntimeError("store boom"),
+        )
+        with pytest.raises(CascadeCleanupError):
+            handle.cleanup_document_cascade("doc1")
+
+    def test_cleanup_parse_cascade_passes_correct_scope(self) -> None:
+        """cleanup_parse_cascade must pass scope='parse' to the store."""
+        handle, fake_vis = make_handle_with_cleanup_store(
+            "parse_scope_coll",
+            cleanup_return={"embeddings": 0, "chunks": 0, "parses": 0},
+        )
+        handle.cleanup_parse_cascade(
+            "doc1", old_parse_hash="oldhash", new_parse_hash="newhash", preview_only=True
+        )
+        assert fake_vis.last_cleanup_args is not None
+        assert fake_vis.last_cleanup_args["scope"] == "parse"
+
+    def test_cleanup_embed_cascade_uses_embeddings_scope(self) -> None:
+        """cleanup_embed_cascade must pass scope='embeddings' to the store."""
+        handle, fake_vis = make_handle_with_cleanup_store(
+            "embed_scope_coll",
+            cleanup_return={"embeddings": 5},
+        )
+        handle.cleanup_embed_cascade("doc1", preview_only=True)
+        assert fake_vis.last_cleanup_args is not None
+        assert fake_vis.last_cleanup_args["scope"] == "embeddings"
+
+    def test_cleanup_chunk_cascade_passes_correct_scope(self) -> None:
+        """cleanup_chunk_cascade must pass scope='chunk' to the store."""
+        handle, fake_vis = make_handle_with_cleanup_store(
+            "chunk_scope_coll",
+            cleanup_return={"embeddings": 0, "chunks": 2},
+        )
+        handle.cleanup_chunk_cascade(
+            "doc1", new_parse_hash="newhash", preview_only=True
+        )
+        assert fake_vis.last_cleanup_args is not None
+        assert fake_vis.last_cleanup_args["scope"] == "chunk"

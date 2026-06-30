@@ -410,6 +410,19 @@ class KBVersionCompatibilityFacade:
         preview_only: bool = True,
         confirm: bool = False,
     ) -> Dict[str, int]:
+        if self._coordinator is not None:
+            return self._coordinator.cleanup_cascade_sync(
+                collection,
+                doc_id,
+                scope,
+                new_parse_hash=new_parse_hash,
+                old_parse_hash=old_parse_hash,
+                model_tag=model_tag,
+                user_id=user_id,
+                is_admin=is_admin,
+                preview_only=preview_only,
+                confirm=confirm,
+            )
         from ..version_management.cascade_cleaner import _cleanup_cascade_impl
 
         with self._storage_context():
@@ -436,6 +449,16 @@ class KBVersionCompatibilityFacade:
         preview_only: bool = True,
         confirm: bool = False,
     ) -> Dict[str, int]:
+        if self._coordinator is not None:
+            return self._coordinator.cleanup_document_cascade_sync(
+                collection,
+                doc_id,
+                model_tag=model_tag,
+                user_id=user_id,
+                is_admin=is_admin,
+                preview_only=preview_only,
+                confirm=confirm,
+            )
         from ..version_management.cascade_cleaner import _cleanup_document_cascade_impl
 
         with self._storage_context():
@@ -460,6 +483,17 @@ class KBVersionCompatibilityFacade:
         preview_only: bool = True,
         confirm: bool = False,
     ) -> Dict[str, int]:
+        if self._coordinator is not None:
+            return self._coordinator.cleanup_parse_cascade_sync(
+                collection,
+                doc_id,
+                old_parse_hash=old_parse_hash,
+                new_parse_hash=new_parse_hash,
+                user_id=user_id,
+                is_admin=is_admin,
+                preview_only=preview_only,
+                confirm=confirm,
+            )
         from ..version_management.cascade_cleaner import _cleanup_parse_cascade_impl
 
         with self._storage_context():
@@ -485,6 +519,17 @@ class KBVersionCompatibilityFacade:
         preview_only: bool = True,
         confirm: bool = False,
     ) -> Dict[str, int]:
+        if self._coordinator is not None:
+            return self._coordinator.cleanup_chunk_cascade_sync(
+                collection,
+                doc_id,
+                old_parse_hash=old_parse_hash,
+                new_parse_hash=new_parse_hash,
+                user_id=user_id,
+                is_admin=is_admin,
+                preview_only=preview_only,
+                confirm=confirm,
+            )
         from ..version_management.cascade_cleaner import _cleanup_chunk_cascade_impl
 
         with self._storage_context():
@@ -511,6 +556,16 @@ class KBVersionCompatibilityFacade:
         preview_only: bool = True,
         confirm: bool = False,
     ) -> Dict[str, int]:
+        if self._coordinator is not None:
+            return self._coordinator.cleanup_embed_cascade_sync(
+                collection,
+                doc_id,
+                model_tag=model_tag,
+                user_id=user_id,
+                is_admin=is_admin,
+                preview_only=preview_only,
+                confirm=confirm,
+            )
         from ..version_management.cascade_cleaner import _cleanup_embed_cascade_impl
 
         with self._storage_context():
