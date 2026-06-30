@@ -2447,7 +2447,7 @@ class LanceDBVectorIndexStore(VectorIndexStore):
                     ),
                 }
             chunk_configs[parse_hash]["chunk_count"] += 1
-            text_len = len(row.get("text", ""))
+            text_len = len(row.get("text") or "")
             cfg = chunk_configs[parse_hash]
             cfg["avg_length"] = (
                 cfg["avg_length"] * (cfg["chunk_count"] - 1) + text_len
@@ -2508,7 +2508,7 @@ class LanceDBVectorIndexStore(VectorIndexStore):
                     }
                 embed_configs[key]["vector_count"] += 1
                 vector = row.get("vector", [])
-                if vector and embed_configs[key]["vector_dim"] == 0:
+                if vector is not None and embed_configs[key]["vector_dim"] == 0:
                     embed_configs[key]["vector_dim"] = len(vector)
 
             for (model, parse_hash), cfg in embed_configs.items():
