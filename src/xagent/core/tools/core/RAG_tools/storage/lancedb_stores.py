@@ -2368,20 +2368,6 @@ class LanceDBVectorIndexStore(VectorIndexStore):
             _sct(tbl)
 
     @staticmethod
-    def _vis_parse_params_json(row: Dict[str, Any]) -> Dict[str, Any]:
-        """Parse ``params_json`` field from a row; return empty dict on failure."""
-        import json as _json
-
-        raw = row.get("params_json", "")
-        if not raw:
-            return {}
-        try:
-            parsed = _json.loads(raw)
-            return parsed if isinstance(parsed, dict) else {}
-        except Exception:
-            return {}
-
-    @staticmethod
     def _vis_generate_semantic_id(
         step_type_str: str, technical_id: str, params: Optional[Dict[str, Any]] = None
     ) -> str:
@@ -2594,9 +2580,9 @@ class LanceDBVectorIndexStore(VectorIndexStore):
         preview_only: bool = True,
         confirm: bool = False,
     ) -> Dict[str, int]:
-        # NOTE: The predicate pipeline below (_vis_replace_predicate, _vis_plan_by_predicates,
-        # etc.) is a TEMPORARY DUPLICATION of cascade_cleaner.py helpers, intentionally
-        # accepted until the #494 follow-up migrates the collection-delete path.
+        # NOTE: The predicate pipeline below (_vis_plan_by_predicates, etc.) is a TEMPORARY
+        # DUPLICATION of cascade_cleaner.py helpers, intentionally accepted until the #494
+        # follow-up migrates the collection-delete path.
         # Do NOT refactor the two into one yet.
         from ..core.exceptions import CascadeCleanupError
         from ..kb.cleanup_filters import (
@@ -2821,18 +2807,6 @@ class LanceDBVectorIndexStore(VectorIndexStore):
 # _vis_* helpers: temporary duplication of cascade_cleaner.py predicate utils
 # (accepted until #494 follow-up; do NOT merge into one yet)
 # ---------------------------------------------------------------------------
-
-
-def _vis_replace_predicate(
-    predicates: Dict[str, list], table_name: str, filter_expr: str
-) -> None:
-    predicates[table_name] = [filter_expr]
-
-
-def _vis_append_predicates(
-    predicates: Dict[str, list], table_name: str, filter_exprs: list
-) -> None:
-    predicates.setdefault(table_name, []).extend(filter_exprs)
 
 
 def _vis_count_rows_by_filters(table: Any, filter_exprs: list) -> int:
