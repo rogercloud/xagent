@@ -449,7 +449,7 @@ class KBCoreManagementCompatibilityFacade:
     ) -> List[str]:
         """Async version of :meth:`rename_collection_status`."""
         if self._coordinator is not None:
-            return await self._coordinator.rename_collection_status_async(
+            return await self._coordinator.rename_collection_status(
                 old_name,
                 new_name,
                 user_id=user_id,

@@ -11,10 +11,10 @@ by test_version_compatibility.py).
 
 from __future__ import annotations
 
-import pytest
-
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
+
+import pytest
 
 from xagent.core.tools.core.RAG_tools.kb.collection_handle import (
     LanceDBCollectionHandle,
