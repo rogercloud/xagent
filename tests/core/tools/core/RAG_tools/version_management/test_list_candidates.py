@@ -332,8 +332,7 @@ class TestListCandidates:
                     "collection": "test_collection",
                     "doc_id": "test_doc",
                     "parse_hash": "hash1",
-                    "parse_method": "unstructured",
-                    "parser": "local:UnstructuredParser@v1",
+                    "parser": "local:unstructured@v1.0.0",
                     "created_at": datetime.now(),
                 }
             ]
@@ -368,8 +367,7 @@ class TestListCandidates:
                     "collection": "test_collection",
                     "doc_id": "test_doc",
                     "parse_hash": f"hash{i}",
-                    "parse_method": "unstructured",
-                    "parser": "local:UnstructuredParser@v1",
+                    "parser": "local:unstructured@v1.0.0",
                     "created_at": datetime.now(),
                 }
                 for i in range(5)
