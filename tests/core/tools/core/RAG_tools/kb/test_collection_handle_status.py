@@ -118,7 +118,7 @@ def test_rename_collection_status_never_raises() -> None:
         "rename_collection_status",
         side_effect=RuntimeError("store exploded"),
     ):
-        result = handle.rename_collection_status("new_name", is_admin=True)
+        result = handle.rename_collection_status("new_name", None, True)
 
     assert isinstance(result, list)
     assert len(result) == 1
@@ -139,7 +139,7 @@ async def test_rename_collection_status_async_never_raises() -> None:
         "rename_collection_status_async",
         new=AsyncMock(side_effect=RuntimeError("async store exploded")),
     ):
-        result = await handle.rename_collection_status_async("new_name", is_admin=True)
+        result = await handle.rename_collection_status_async("new_name", None, True)
 
     assert isinstance(result, list)
     assert len(result) == 1
