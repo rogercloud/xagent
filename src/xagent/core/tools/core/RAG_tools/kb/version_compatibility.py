@@ -142,6 +142,20 @@ class KBVersionCompatibilityFacade:
         confirm: bool = False,
         model_tag: Optional[str] = None,
     ) -> Dict[str, Any]:
+        if self._coordinator is not None:
+            step_type_str = (
+                step_type.value if isinstance(step_type, StepType) else step_type
+            )
+            return self._coordinator.promote_version_main_sync(
+                collection,
+                doc_id,
+                step_type_str,
+                selected_id,
+                operator=operator,
+                preview_only=preview_only,
+                confirm=confirm,
+                model_tag=model_tag,
+            )
         from ..version_management.promote_version_main import _promote_version_main_impl
 
         with self._storage_context():
