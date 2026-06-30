@@ -1045,7 +1045,6 @@ class LanceDBVectorIndexStore(VectorIndexStore):
             return {}
 
         conn = self._get_connection()
-        from ..version_management.cascade_cleaner import cascade_delete_documents
 
         batch_size = DEFAULT_VECTOR_STORE_DELETE_BATCH_SIZE
         merged: Dict[str, int] = {}
@@ -1054,14 +1053,14 @@ class LanceDBVectorIndexStore(VectorIndexStore):
             for start in range(0, len(normalized_doc_ids), batch_size):
                 batch = normalized_doc_ids[start : start + batch_size]
                 try:
-                    counts = cascade_delete_documents(
+                    counts = _vis_cascade_delete_documents(
+                        conn,
                         collection=collection_name,
                         doc_ids=batch,
                         user_id=user_id,
                         is_admin=is_admin,
                         preview_only=False,
                         confirm=True,
-                        conn=conn,
                     )
                 except Exception as exc:
                     if warnings_out is not None:

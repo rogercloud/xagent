@@ -620,61 +620,53 @@ def test_delete_document_data_delegates_to_store_cascade_delete(
 
 
 @patch(
-    "xagent.core.tools.core.RAG_tools.version_management.cascade_cleaner.cascade_delete_documents"
+    "xagent.core.tools.core.RAG_tools.storage.lancedb_stores._vis_cascade_delete_documents"
 )
 @patch(
     "xagent.core.tools.core.RAG_tools.storage.lancedb_stores.get_connection_from_env"
 )
-def test_delete_documents_data_delegates_to_batched_cascade_delete(
-    mock_get_connection: Mock,
-    mock_cascade_delete_documents: Mock,
+def test_delete_documents_data_uses_vis_batch_driver(
+    mock_get_conn: Mock,
+    mock_batch: Mock,
 ) -> None:
-    """delete_documents_data should batch document-scoped cascade deletes."""
-
+    """delete_documents_data should route batches through _vis_cascade_delete_documents."""
     mock_conn = Mock()
-    mock_get_connection.return_value = mock_conn
-    mock_cascade_delete_documents.return_value = {"documents": 2, "chunks": 4}
+    mock_get_conn.return_value = mock_conn
+    mock_batch.return_value = {"documents": 2, "chunks": 4}
 
     store = LanceDBVectorIndexStore()
     warnings: List[str] = []
 
-    deleted_counts = store.delete_documents_data(
-        "demo",
-        ["doc-2", "doc-1", "doc-1"],
-        user_id=7,
-        is_admin=False,
-        warnings_out=warnings,
+    result = store.delete_documents_data(
+        "demo", ["doc-2", "doc-1", "doc-1"], user_id=7, is_admin=False, warnings_out=warnings
     )
 
-    mock_cascade_delete_documents.assert_called_once()
-    called = mock_cascade_delete_documents.call_args.kwargs
-    assert called["collection"] == "demo"
-    assert called["doc_ids"] == ["doc-1", "doc-2"]
-    assert called["user_id"] == 7
-    assert called["is_admin"] is False
-    assert called["preview_only"] is False
-    assert called["confirm"] is True
-    assert called["conn"] is mock_conn
-
-    assert deleted_counts == {"documents": 2, "chunks": 4}
+    mock_batch.assert_called_once()
+    args, kw = mock_batch.call_args
+    assert args[0] is mock_conn            # conn is first positional arg
+    assert kw["collection"] == "demo"
+    assert kw["doc_ids"] == ["doc-1", "doc-2"]  # normalized + deduped + sorted
+    assert kw["user_id"] == 7
+    assert kw["is_admin"] is False
+    assert kw["preview_only"] is False
+    assert kw["confirm"] is True
+    assert result == {"documents": 2, "chunks": 4}
     assert warnings == []
 
 
 @patch(
-    "xagent.core.tools.core.RAG_tools.version_management.cascade_cleaner.cascade_delete_documents"
+    "xagent.core.tools.core.RAG_tools.storage.lancedb_stores._vis_cascade_delete_documents"
 )
 @patch(
     "xagent.core.tools.core.RAG_tools.storage.lancedb_stores.get_connection_from_env"
 )
-def test_delete_documents_data_invalidates_cache_and_reports_partial_counts_on_failure(
-    mock_get_connection: Mock,
-    mock_cascade_delete_documents: Mock,
+def test_delete_documents_data_partial_failure_raises_with_details(
+    mock_get_conn: Mock,
+    mock_batch: Mock,
 ) -> None:
-    """A later batch failure should not hide prior batch progress."""
-
-    mock_conn = Mock()
-    mock_get_connection.return_value = mock_conn
-    mock_cascade_delete_documents.side_effect = [
+    """A later batch failure should preserve prior batch progress in the error details."""
+    mock_get_conn.return_value = Mock()
+    mock_batch.side_effect = [
         {"documents": 100, "chunks": 200},
         RuntimeError("batch failed"),
     ]
@@ -686,20 +678,13 @@ def test_delete_documents_data_invalidates_cache_and_reports_partial_counts_on_f
 
     with pytest.raises(DatabaseOperationError) as exc_info:
         store.delete_documents_data(
-            "demo",
-            doc_ids,
-            user_id=7,
-            is_admin=False,
-            warnings_out=warnings,
+            "demo", doc_ids, user_id=7, is_admin=False, warnings_out=warnings,
         )
 
-    assert mock_cascade_delete_documents.call_count == 2
+    assert mock_batch.call_count == 2
     store.invalidate_table_cache.assert_called_once()
     assert warnings == ["Failed to delete document batch 2: batch failed"]
-    assert exc_info.value.details["deleted_counts"] == {
-        "documents": 100,
-        "chunks": 200,
-    }
+    assert exc_info.value.details["deleted_counts"] == {"documents": 100, "chunks": 200}
     assert exc_info.value.details["deleted_doc_ids"] == doc_ids[:100]
     assert exc_info.value.details["failed_batch_index"] == 2
 
