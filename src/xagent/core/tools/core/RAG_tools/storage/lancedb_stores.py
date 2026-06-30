@@ -2559,10 +2559,6 @@ class LanceDBVectorIndexStore(VectorIndexStore):
         preview_only: bool = True,
         confirm: bool = False,
     ) -> Dict[str, int]:
-        # NOTE: The predicate pipeline below (_vis_plan_by_predicates, etc.) is a TEMPORARY
-        # DUPLICATION of cascade_cleaner.py helpers, intentionally accepted until the #494
-        # follow-up migrates the collection-delete path.
-        # Do NOT refactor the two into one yet.
         from ..core.exceptions import CascadeCleanupError
         from ..kb.cleanup_filters import (
             KBCleanupScope,
@@ -2854,8 +2850,7 @@ class LanceDBVectorIndexStore(VectorIndexStore):
 # ============================================================================
 
 # ---------------------------------------------------------------------------
-# _vis_* helpers: temporary duplication of cascade_cleaner.py predicate utils
-# (accepted until #494 follow-up; do NOT merge into one yet)
+# _vis_* helpers: predicate pipeline for collection/document cascade delete
 # ---------------------------------------------------------------------------
 
 
