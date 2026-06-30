@@ -565,7 +565,11 @@ class _FakeVectorIndexStoreWithCleanup(_FakeVectorIndexStore):
     def __init__(self, candidates: list) -> None:
         super().__init__(candidates)
         self.last_cleanup_args: Optional[Dict[str, Any]] = None
-        self.cleanup_return: Dict[str, int] = {"embeddings": 0, "chunks": 0, "parses": 0}
+        self.cleanup_return: Dict[str, int] = {
+            "embeddings": 0,
+            "chunks": 0,
+            "parses": 0,
+        }
         self.cleanup_side_effect: Optional[Exception] = None
 
     def cleanup_cascade_by_scope(
@@ -667,7 +671,10 @@ class TestCleanupCascadeHandle:
             cleanup_return={"embeddings": 0, "chunks": 0, "parses": 0},
         )
         handle.cleanup_parse_cascade(
-            "doc1", old_parse_hash="oldhash", new_parse_hash="newhash", preview_only=True
+            "doc1",
+            old_parse_hash="oldhash",
+            new_parse_hash="newhash",
+            preview_only=True,
         )
         assert fake_vis.last_cleanup_args is not None
         assert fake_vis.last_cleanup_args["scope"] == "parse"
@@ -693,3 +700,247 @@ class TestCleanupCascadeHandle:
         )
         assert fake_vis.last_cleanup_args is not None
         assert fake_vis.last_cleanup_args["scope"] == "chunk"
+
+
+# ── Task 6: promote_version_main handle tests ─────────────────────────────────
+
+
+class _FakeVectorIndexStoreForPromotion(_FakeVectorIndexStoreWithCleanup):
+    """Fake store that supports both candidates and cleanup_cascade for promotion tests."""
+
+    def __init__(
+        self,
+        candidates: list,
+        cleanup_return: Optional[Dict[str, int]] = None,
+        cleanup_side_effect: Optional[Exception] = None,
+    ) -> None:
+        super().__init__(candidates)
+        if cleanup_return is not None:
+            self.cleanup_return = cleanup_return
+        if cleanup_side_effect is not None:
+            self.cleanup_side_effect = cleanup_side_effect
+
+
+def make_handle_for_promotion(
+    collection: str = "promo_coll",
+    *,
+    candidates: Optional[list] = None,
+    cleanup_return: Optional[Dict[str, int]] = None,
+    cleanup_side_effect: Optional[Exception] = None,
+    main_pointer_store: Optional[Any] = None,
+) -> tuple:
+    """Make a handle suitable for promote_version_main tests.
+
+    Returns (handle, fake_vis, fake_mp_store).
+    """
+    from xagent.core.tools.core.RAG_tools.kb.models import (
+        KBAccessMode,
+        KBBackendCapabilities,
+        KBCollectionContext,
+        KBStorageBackend,
+        KBUserScope,
+    )
+    from xagent.core.tools.core.RAG_tools.storage.factory import (
+        get_ingestion_status_store,
+        get_metadata_store,
+    )
+
+    fake_vis = _FakeVectorIndexStoreForPromotion(
+        candidates or [],
+        cleanup_return=cleanup_return,
+        cleanup_side_effect=cleanup_side_effect,
+    )
+    fake_mp = (
+        main_pointer_store
+        if main_pointer_store is not None
+        else _FakeMainPointerStore()
+    )
+
+    context = KBCollectionContext(
+        collection=collection,
+        user_scope=KBUserScope(user_id=None, is_admin=True),
+        access_mode=KBAccessMode.WRITE,
+        allow_create=True,
+        hide_missing=True,
+        metadata_store=get_metadata_store(),
+        vector_index_store=fake_vis,  # type: ignore[arg-type]
+        ingestion_status_store=get_ingestion_status_store(),
+        main_pointer_store=fake_mp,
+        backend=KBStorageBackend.LANCEDB,
+        capabilities=KBBackendCapabilities.lancedb(),
+        collection_info=None,
+    )
+    return LanceDBCollectionHandle(context), fake_vis, fake_mp
+
+
+class TestPromoteVersionMainHandle:
+    """Tests for promote_version_main inlined in LanceDBCollectionHandle (Task 6).
+
+    Mirrors test_promote_version_main.py:241,296,346 and test_version_compatibility.py:655.
+    """
+
+    def _make_candidates(self) -> list:
+        from datetime import datetime
+
+        return [
+            {
+                "semantic_id": "parse_test_v1",
+                "technical_id": "abc123",
+                "params_brief": {"method": "unstructured"},
+                "stats": {"paragraphs_count": 10},
+                "state": "candidate",
+                "created_at": datetime.now(),
+                "operator": "test_user",
+            }
+        ]
+
+    def test_preview_only(self) -> None:
+        """preview_only=True returns promoted=False, preview=True with counts.
+
+        Mirrors test_promote_version_main.py:241.
+        """
+        handle, fake_vis, _ = make_handle_for_promotion(
+            "preview_coll",
+            candidates=self._make_candidates(),
+            cleanup_return={"parses": 2, "chunks": 10, "embeddings": 50},
+        )
+
+        result = handle.promote_version_main(
+            "doc-1",
+            "parse",
+            "abc123",
+            preview_only=True,
+        )
+
+        assert result["promoted"] is False
+        assert result["preview"] is True
+        assert result["deleted_counts"]["parses"] == 2
+        assert result["deleted_counts"]["chunks"] == 10
+        assert result["deleted_counts"]["embeddings"] == 50
+        assert "message" in result
+
+    def test_not_confirmed(self) -> None:
+        """confirm=False returns preview=True with a message. Mirrors test_promote_version_main.py:296."""
+        handle, fake_vis, _ = make_handle_for_promotion(
+            "not_confirmed_coll",
+            candidates=self._make_candidates(),
+            cleanup_return={"parses": 0, "chunks": 0, "embeddings": 0},
+        )
+
+        result = handle.promote_version_main(
+            "doc-1",
+            "parse",
+            "abc123",
+            preview_only=False,
+            confirm=False,
+        )
+
+        assert result["promoted"] is False
+        assert result["preview"] is True
+        assert "Set confirm=True to execute the promotion" in result["message"]
+
+    def test_execute_promotion(self) -> None:
+        """confirm=True executes promotion and sets the main pointer.
+
+        Mirrors test_promote_version_main.py:346.
+        """
+        handle, fake_vis, fake_mp = make_handle_for_promotion(
+            "execute_coll",
+            candidates=self._make_candidates(),
+            cleanup_return={"parses": 2, "chunks": 10, "embeddings": 50},
+        )
+
+        result = handle.promote_version_main(
+            "doc-1",
+            "parse",
+            "abc123",
+            preview_only=False,
+            confirm=True,
+            operator="test_user",
+        )
+
+        assert result["promoted"] is True
+        assert result["preview"] is False
+        assert result["deleted_counts"]["parses"] == 2
+        assert result["deleted_counts"]["chunks"] == 10
+        assert result["deleted_counts"]["embeddings"] == 50
+        assert result["operator"] == "test_user"
+
+        # Main pointer must have been advanced
+        pointer = fake_mp.get_main_pointer("execute_coll", "doc-1", "parse")
+        assert pointer is not None
+        assert pointer["technical_id"] == "abc123"
+        assert pointer["semantic_id"] == "parse_test_v1"
+
+    def test_no_records_deleted_guard(self) -> None:
+        """Raises VersionManagementError when deleted_counts is empty on confirm.
+
+        Mirrors the "No records deleted" guard in promote_version_main.py.
+        """
+        from xagent.core.tools.core.RAG_tools.core.exceptions import (
+            VersionManagementError,
+        )
+
+        handle, fake_vis, _ = make_handle_for_promotion(
+            "no_delete_coll",
+            candidates=self._make_candidates(),
+            cleanup_return={},  # empty → falsy
+        )
+
+        with pytest.raises(VersionManagementError, match="No records deleted"):
+            handle.promote_version_main(
+                "doc-1",
+                "parse",
+                "abc123",
+                preview_only=False,
+                confirm=True,
+                operator="tester",
+            )
+
+    def test_operator_too_long(self) -> None:
+        """Operator longer than 32 characters raises VersionManagementError."""
+        from xagent.core.tools.core.RAG_tools.core.exceptions import (
+            VersionManagementError,
+        )
+
+        handle, fake_vis, _ = make_handle_for_promotion(
+            "op_len_coll",
+            candidates=self._make_candidates(),
+            cleanup_return={"parses": 1},
+        )
+
+        with pytest.raises(VersionManagementError, match="Operator name too long"):
+            handle.promote_version_main(
+                "doc-1",
+                "parse",
+                "abc123",
+                operator="a" * 33,
+            )
+
+    def test_failed_promotion_does_not_advance_pointer(self) -> None:
+        """Cleanup failure does not advance the main pointer.
+
+        Mirrors test_version_compatibility.py:655.
+        """
+        from xagent.core.tools.core.RAG_tools.core.exceptions import (
+            VersionManagementError,
+        )
+
+        handle, fake_vis, fake_mp = make_handle_for_promotion(
+            "fail_promo_coll",
+            candidates=self._make_candidates(),
+            cleanup_side_effect=RuntimeError("cleanup failed"),
+        )
+
+        with pytest.raises(VersionManagementError, match="cleanup failed"):
+            handle.promote_version_main(
+                "doc-1",
+                "parse",
+                "abc123",
+                operator="tester",
+                confirm=True,
+            )
+
+        # Main pointer must NOT have been advanced
+        pointer = fake_mp.get_main_pointer("fail_promo_coll", "doc-1", "parse")
+        assert pointer is None

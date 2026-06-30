@@ -3599,3 +3599,300 @@ class LanceDBCollectionHandle(KBCollectionHandle):
             raise
         except Exception as e:
             raise VersionManagementError(f"Failed to list candidates: {e}") from e
+
+    # --- Version promotion orchestration (#513 Task 6) ---
+
+    def _call_cleanup_cascade_for_step(
+        self,
+        doc_id: str,
+        step_type: Any,
+        technical_id: str,
+        old_technical_id: Optional[str] = None,
+        model_tag: Optional[str] = None,
+        preview_only: bool = True,
+        confirm: bool = False,
+    ) -> Dict[str, int]:
+        """Scope-mapping helper: route step_type → cleanup_cascade scope."""
+        from ..core.exceptions import VersionManagementError
+        from ..core.schemas import StepType as _StepType
+
+        if step_type == _StepType.PARSE:
+            return self.cleanup_cascade(
+                doc_id,
+                "parse",
+                new_parse_hash=technical_id,
+                old_parse_hash=old_technical_id,
+                preview_only=preview_only,
+                confirm=confirm,
+            )
+        elif step_type == _StepType.CHUNK:
+            return self.cleanup_cascade(
+                doc_id,
+                "chunk",
+                new_parse_hash=technical_id,
+                old_parse_hash=old_technical_id,
+                preview_only=preview_only,
+                confirm=confirm,
+            )
+        elif step_type == _StepType.EMBED:
+            if not model_tag:
+                raise VersionManagementError("model_tag is required for embed step")
+            return self.cleanup_cascade(
+                doc_id,
+                "embeddings",
+                model_tag=model_tag,
+                preview_only=preview_only,
+                confirm=confirm,
+            )
+        else:
+            step_type_str = (
+                step_type.value if isinstance(step_type, _StepType) else str(step_type)
+            )
+            raise VersionManagementError(f"Invalid step_type: {step_type_str}")
+
+    def _resolve_selected_id_from_candidates(
+        self,
+        doc_id: str,
+        step_type: Any,
+        selected_id: str,
+        model_tag: Optional[str] = None,
+    ) -> tuple:
+        """Resolve selected_id → (technical_id, semantic_id) via list_candidates."""
+        from ..core.exceptions import VersionManagementError
+
+        try:
+            candidates_result = self.list_candidates(
+                doc_id,
+                step_type,
+                model_tag=model_tag,
+            )
+            candidates = candidates_result.get("candidates", [])
+
+            if not candidates:
+                raise VersionManagementError(f"No candidates found for {step_type}")
+
+            for candidate in candidates:
+                if candidate["technical_id"] == selected_id:
+                    return candidate["technical_id"], candidate["semantic_id"]
+
+            for candidate in candidates:
+                if candidate["semantic_id"] == selected_id:
+                    return candidate["technical_id"], candidate["semantic_id"]
+
+            available_ids = [c["semantic_id"] for c in candidates]
+            raise VersionManagementError(
+                f"Selected ID '{selected_id}' not found. Available IDs: {available_ids}"
+            )
+
+        except Exception as e:
+            if isinstance(e, VersionManagementError):
+                raise
+            raise VersionManagementError(f"Failed to resolve selected_id: {e}")
+
+    def _calculate_cleanup_plan_for_step(
+        self,
+        doc_id: str,
+        step_type: Any,
+        technical_id: str,
+        model_tag: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Calculate cleanup plan for a version promotion (preview_only=True)."""
+        from ..core.exceptions import VersionManagementError
+        from ..core.schemas import StepType as _StepType
+
+        try:
+            current_pointer = self.get_main_pointer(doc_id, step_type.value, model_tag)
+            old_technical_id = None
+            if current_pointer:
+                old_technical_id = current_pointer["technical_id"]
+
+            deleted_counts = self._call_cleanup_cascade_for_step(
+                doc_id,
+                step_type,
+                technical_id,
+                old_technical_id=old_technical_id,
+                model_tag=model_tag,
+                preview_only=True,
+                confirm=False,
+            )
+
+            notes = []
+            if step_type == _StepType.PARSE and deleted_counts.get("chunks", 0) > 0:
+                notes.append("Requires re-chunk/embed")
+            elif (
+                step_type == _StepType.CHUNK and deleted_counts.get("embeddings", 0) > 0
+            ):
+                notes.append("Requires re-embed")
+
+            return {
+                "deleted_counts": deleted_counts,
+                "notes": notes,
+                "current_pointer": current_pointer,
+                "new_technical_id": technical_id,
+            }
+
+        except Exception as e:
+            raise VersionManagementError(f"Failed to calculate cleanup plan: {e}")
+
+    def promote_version_main(
+        self,
+        doc_id: str,
+        step_type: "Union[Any, str]",
+        selected_id: str,
+        operator: Optional[str] = None,
+        preview_only: bool = False,
+        confirm: bool = False,
+        model_tag: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Promote a candidate version to main for a document stage (pure orchestration).
+
+        Relocates ``_promote_version_main_impl`` body to the handle, calling
+        handle primitives (``list_candidates``, ``get_main_pointer``,
+        ``cleanup_cascade``, ``set_main_pointer``) instead of module-level fns.
+        The ``lancedb_dir`` resolution is dropped (no longer needed by the handle).
+
+        Args:
+            doc_id: Document ID.
+            step_type: Processing step type (:class:`StepType` or string).
+            selected_id: Technical or semantic ID of the candidate to promote.
+            operator: Operator name (default: ``$USER`` env var or ``"unknown"``).
+            preview_only: If True, only return preview without executing.
+            confirm: If True, execute the promotion.
+            model_tag: Required for embed step.
+
+        Returns:
+            Result dict with keys ``promoted``, ``preview``, ``main_pointer``,
+            ``deleted_counts``, ``notes``, and optionally ``message``/``operator``.
+
+        Raises:
+            VersionManagementError: Any error during the promotion flow.
+        """
+        from ..core.exceptions import VersionManagementError
+        from ..core.schemas import StepType as _StepType
+
+        def _resolve(st: "Union[Any, str]") -> "_StepType":
+            if isinstance(st, _StepType):
+                return st
+            elif isinstance(st, str):
+                try:
+                    return _StepType(st)
+                except ValueError:
+                    raise VersionManagementError(
+                        f"Invalid step_type string: '{st}'. Expected one of: "
+                        + ", ".join(["'" + s.value + "'" for s in _StepType])
+                    )
+            else:
+                raise VersionManagementError(
+                    f"Unsupported step_type type: {type(st)}. Expected StepType or str."
+                )
+
+        resolved_step_type = _resolve(step_type)
+
+        # Validate and set operator
+        if not operator:
+            operator = os.environ.get("USER", "unknown")
+        if len(operator) > 32:
+            raise VersionManagementError("Operator name too long (max 32 characters)")
+
+        try:
+            # Resolve selected_id to technical_id and semantic_id
+            technical_id, semantic_id = self._resolve_selected_id_from_candidates(
+                doc_id, resolved_step_type, selected_id, model_tag
+            )
+
+            # Calculate cleanup plan
+            cleanup_plan = self._calculate_cleanup_plan_for_step(
+                doc_id, resolved_step_type, technical_id, model_tag
+            )
+
+            if preview_only or not confirm:
+                message = (
+                    "Preview of promotion to be applied."
+                    if preview_only
+                    else "Set confirm=True to execute the promotion."
+                )
+                return {
+                    "promoted": False,
+                    "preview": True,
+                    "message": message,
+                    "main_pointer": {
+                        "step_type": resolved_step_type.value,
+                        "semantic_id": semantic_id,
+                        "technical_id": technical_id,
+                        "model_tag": model_tag,
+                    },
+                    "deleted_counts": cleanup_plan["deleted_counts"],
+                    "notes": cleanup_plan["notes"],
+                }
+
+            # Perform cascade cleanup
+            old_technical_id = None
+            if cleanup_plan["current_pointer"]:
+                old_technical_id = cleanup_plan["current_pointer"]["technical_id"]
+
+            deleted_counts = self._call_cleanup_cascade_for_step(
+                doc_id,
+                resolved_step_type,
+                technical_id,
+                old_technical_id=old_technical_id,
+                model_tag=model_tag,
+                preview_only=False,
+                confirm=True,
+            )
+
+            if not deleted_counts:
+                raise VersionManagementError(
+                    f"[Promotion] No records deleted for "
+                    f"{self.context.collection}/{doc_id}/{resolved_step_type.value}"
+                )
+
+            # Update main pointer
+            self.set_main_pointer(
+                doc_id,
+                resolved_step_type.value,
+                semantic_id,
+                technical_id,
+                model_tag,
+                operator,
+            )
+
+            # Generate notes
+            notes = []
+            if (
+                resolved_step_type == _StepType.PARSE
+                and deleted_counts.get("chunks", 0) > 0
+            ):
+                notes.append("Requires re-chunk/embed")
+            elif (
+                resolved_step_type == _StepType.CHUNK
+                and deleted_counts.get("embeddings", 0) > 0
+            ):
+                notes.append("Requires re-embed")
+
+            logger.info(
+                "Promoted version for %s/%s/%s to %s (operator: %s)",
+                self.context.collection,
+                doc_id,
+                resolved_step_type.value,
+                technical_id,
+                operator,
+            )
+
+            return {
+                "promoted": True,
+                "preview": False,
+                "main_pointer": {
+                    "step_type": resolved_step_type.value,
+                    "semantic_id": semantic_id,
+                    "technical_id": technical_id,
+                    "model_tag": model_tag,
+                },
+                "deleted_counts": deleted_counts,
+                "notes": notes,
+                "operator": operator,
+            }
+
+        except Exception as e:
+            if isinstance(e, VersionManagementError):
+                raise
+            raise VersionManagementError(f"Failed to promote version main: {e}") from e

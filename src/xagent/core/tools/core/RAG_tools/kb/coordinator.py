@@ -880,6 +880,65 @@ class KBCoordinator:
             )
         )
 
+    async def promote_version_main(
+        self,
+        collection: str,
+        doc_id: str,
+        step_type: str,
+        selected_id: str,
+        *,
+        operator: Optional[str] = None,
+        preview_only: bool = False,
+        confirm: bool = False,
+        model_tag: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Open the collection handle and promote a version candidate to main (async)."""
+        handle = await self.open_collection(
+            KBContextRequest(
+                collection=collection,
+                user_id=None,
+                is_admin=True,
+                access_mode=KBAccessMode.WRITE,
+                hide_missing=True,
+            )
+        )
+        return await asyncio.to_thread(
+            handle.promote_version_main,
+            doc_id,
+            step_type,
+            selected_id,
+            operator=operator,
+            preview_only=preview_only,
+            confirm=confirm,
+            model_tag=model_tag,
+        )
+
+    def promote_version_main_sync(
+        self,
+        collection: str,
+        doc_id: str,
+        step_type: str,
+        selected_id: str,
+        *,
+        operator: Optional[str] = None,
+        preview_only: bool = False,
+        confirm: bool = False,
+        model_tag: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Synchronous wrapper for :meth:`promote_version_main`."""
+        return _run_in_separate_loop(
+            self.promote_version_main(
+                collection,
+                doc_id,
+                step_type,
+                selected_id,
+                operator=operator,
+                preview_only=preview_only,
+                confirm=confirm,
+                model_tag=model_tag,
+            )
+        )
+
     async def cleanup_cascade(
         self,
         collection: str,
