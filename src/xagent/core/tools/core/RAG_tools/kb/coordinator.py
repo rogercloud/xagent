@@ -6,7 +6,7 @@ import asyncio
 import threading
 from collections.abc import Coroutine
 from contextvars import copy_context
-from typing import Any, Dict, Optional, TypeVar
+from typing import Any, Dict, List, Optional, TypeVar
 
 from ..core.exceptions import (
     CascadeCleanupError,
@@ -29,6 +29,7 @@ from .collection_handle import (
     KBHandleProvider,
     KBMainPointerSnapshot,
     KBVersionCandidateCleanupSnapshot,
+    KBVersionCandidateRollbackResult,
     LanceDBCollectionHandle,
 )
 from .file_compatibility import KBFileCompatibilityFacade
@@ -1726,6 +1727,161 @@ class KBCoordinator:
                 model_tag=model_tag,
                 user_id=user_id,
                 is_admin=is_admin,
+            )
+        )
+
+    async def capture_status_snapshot(
+        self,
+        collection: str,
+        doc_id: str,
+        *,
+        user_id: Optional[int] = None,
+        is_admin: bool = True,
+    ) -> List[Dict[str, Any]]:
+        """Open collection handle and capture an ingestion-status snapshot (async)."""
+        handle = await self.open_collection(
+            KBContextRequest(
+                collection=collection,
+                user_id=user_id,
+                is_admin=is_admin,
+                access_mode=KBAccessMode.READ,
+                hide_missing=True,
+            )
+        )
+        return await asyncio.to_thread(
+            handle.capture_status_snapshot,
+            doc_id,
+            user_id=user_id,
+            is_admin=is_admin,
+        )
+
+    def capture_status_snapshot_sync(
+        self,
+        collection: str,
+        doc_id: str,
+        *,
+        user_id: Optional[int] = None,
+        is_admin: bool = True,
+    ) -> List[Dict[str, Any]]:
+        """Synchronous wrapper for :meth:`capture_status_snapshot`."""
+        return _run_in_separate_loop(
+            self.capture_status_snapshot(
+                collection, doc_id, user_id=user_id, is_admin=is_admin
+            )
+        )
+
+    async def restore_status_snapshot(
+        self,
+        collection: str,
+        doc_id: str,
+        snapshot: List[Dict[str, Any]],
+        *,
+        user_id: Optional[int] = None,
+    ) -> None:
+        """Open collection handle and restore an ingestion-status snapshot (async)."""
+        handle = await self.open_collection(
+            KBContextRequest(
+                collection=collection,
+                user_id=user_id,
+                is_admin=True,
+                access_mode=KBAccessMode.WRITE,
+                hide_missing=True,
+            )
+        )
+        await asyncio.to_thread(
+            handle.restore_status_snapshot,
+            doc_id,
+            snapshot,
+            user_id=user_id,
+        )
+
+    def restore_status_snapshot_sync(
+        self,
+        collection: str,
+        doc_id: str,
+        snapshot: List[Dict[str, Any]],
+        *,
+        user_id: Optional[int] = None,
+    ) -> None:
+        """Synchronous wrapper for :meth:`restore_status_snapshot`."""
+        _run_in_separate_loop(
+            self.restore_status_snapshot(collection, doc_id, snapshot, user_id=user_id)
+        )
+
+    async def clear_status_snapshot(
+        self,
+        collection: str,
+        doc_id: str,
+        *,
+        user_id: Optional[int] = None,
+        is_admin: bool = True,
+    ) -> None:
+        """Open collection handle and clear the ingestion-status row (async)."""
+        handle = await self.open_collection(
+            KBContextRequest(
+                collection=collection,
+                user_id=user_id,
+                is_admin=is_admin,
+                access_mode=KBAccessMode.WRITE,
+                hide_missing=True,
+            )
+        )
+        await asyncio.to_thread(
+            handle.clear_status_snapshot,
+            doc_id,
+            user_id=user_id,
+            is_admin=is_admin,
+        )
+
+    def clear_status_snapshot_sync(
+        self,
+        collection: str,
+        doc_id: str,
+        *,
+        user_id: Optional[int] = None,
+        is_admin: bool = True,
+    ) -> None:
+        """Synchronous wrapper for :meth:`clear_status_snapshot`."""
+        _run_in_separate_loop(
+            self.clear_status_snapshot(
+                collection, doc_id, user_id=user_id, is_admin=is_admin
+            )
+        )
+
+    async def restore_candidate_cleanup_snapshot(
+        self,
+        snapshot: "KBVersionCandidateCleanupSnapshot",
+        *,
+        cleanup_executed: bool = False,
+    ) -> "KBVersionCandidateRollbackResult":
+        """Open collection handle and assess rollback feasibility (async)."""
+        handle = await self.open_collection(
+            KBContextRequest(
+                collection=snapshot.collection,
+                user_id=snapshot.user_id,
+                is_admin=bool(snapshot.is_admin)
+                if snapshot.is_admin is not None
+                else True,
+                access_mode=KBAccessMode.READ,
+                hide_missing=True,
+            )
+        )
+        return await asyncio.to_thread(
+            handle.restore_candidate_cleanup_snapshot,
+            snapshot,
+            cleanup_executed=cleanup_executed,
+        )
+
+    def restore_candidate_cleanup_snapshot_sync(
+        self,
+        snapshot: "KBVersionCandidateCleanupSnapshot",
+        *,
+        cleanup_executed: bool = False,
+    ) -> "KBVersionCandidateRollbackResult":
+        """Synchronous wrapper for :meth:`restore_candidate_cleanup_snapshot`."""
+        return _run_in_separate_loop(
+            self.restore_candidate_cleanup_snapshot(
+                snapshot, cleanup_executed=cleanup_executed
             )
         )
 

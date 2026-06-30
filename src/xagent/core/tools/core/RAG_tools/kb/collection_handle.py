@@ -19,7 +19,7 @@ from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from datetime import timezone
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Optional, Set, Union, cast
+from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Optional, Set, cast
 
 if TYPE_CHECKING:
     from .maintenance_compatibility import CollectionConfigSnapshot
@@ -4260,7 +4260,7 @@ class LanceDBCollectionHandle(KBCollectionHandle):
         from ..core.exceptions import DatabaseOperationError, VersionManagementError
         from ..core.schemas import StepType as _StepType
 
-        def _resolve(st: Union[Any, str]) -> "_StepType":
+        def _resolve(st: Any) -> "_StepType":
             if isinstance(st, _StepType):
                 return st
             elif isinstance(st, str):
@@ -4454,7 +4454,7 @@ class LanceDBCollectionHandle(KBCollectionHandle):
     def promote_version_main(
         self,
         doc_id: str,
-        step_type: "Union[Any, str]",
+        step_type: "Any",
         selected_id: str,
         operator: Optional[str] = None,
         preview_only: bool = False,
@@ -4487,7 +4487,7 @@ class LanceDBCollectionHandle(KBCollectionHandle):
         from ..core.exceptions import VersionManagementError
         from ..core.schemas import StepType as _StepType
 
-        def _resolve(st: "Union[Any, str]") -> "_StepType":
+        def _resolve(st: "Any") -> "_StepType":
             if isinstance(st, _StepType):
                 return st
             elif isinstance(st, str):

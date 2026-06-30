@@ -374,6 +374,11 @@ class KBVersionCompatibilityFacade:
         *,
         cleanup_executed: bool = False,
     ) -> KBVersionCandidateRollbackResult:
+        if self._coordinator is not None:
+            return self._coordinator.restore_candidate_cleanup_snapshot_sync(
+                snapshot,
+                cleanup_executed=cleanup_executed,
+            )
         cleanup_counts = dict(snapshot.cleanup_counts)
         has_candidate_side_effects = any(
             int(count) > 0 for count in cleanup_counts.values()
