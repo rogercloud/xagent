@@ -11,10 +11,6 @@ from xagent.core.tools.core.RAG_tools.storage.factory import get_vector_index_st
 from xagent.core.tools.core.RAG_tools.storage.lancedb_stores import (
     LanceDBVectorIndexStore,
 )
-from xagent.core.tools.core.RAG_tools.utils.user_scope import user_scope_context
-from xagent.core.tools.core.RAG_tools.version_management.cascade_cleaner import (
-    cascade_delete,
-)
 
 _STORE = "xagent.core.tools.core.RAG_tools.storage.lancedb_stores"
 
@@ -814,5 +810,3 @@ def test_cleanup_cascade_plans_unless_confirmed_outside_preview(
     assert result == {"embeddings": 1}
     mock_plan.assert_called_once()
     mock_delete.assert_not_called()
-
-

@@ -725,8 +725,12 @@ def test_facade_cascade_delete_routes_to_store(mocker) -> None:
     )
 
     out = facade.cascade_delete(
-        target="collection", collection="c1", user_id=1,
-        is_admin=True, preview_only=False, confirm=True,
+        target="collection",
+        collection="c1",
+        user_id=1,
+        is_admin=True,
+        preview_only=False,
+        confirm=True,
     )
 
     assert out == {"documents": 3}

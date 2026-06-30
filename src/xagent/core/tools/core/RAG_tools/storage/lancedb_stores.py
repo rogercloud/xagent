@@ -23,7 +23,11 @@ from ..core.config import (
 from ..core.schemas import CollectionInfo, IndexResult
 from ..LanceDB.schema_manager import ensure_documents_table
 from ..utils.lancedb_query_utils import list_table_names, query_to_list
-from ..utils.string_utils import build_lancedb_filter_expression, build_user_id_filter_for_table, escape_lancedb_string
+from ..utils.string_utils import (
+    build_lancedb_filter_expression,
+    build_user_id_filter_for_table,
+    escape_lancedb_string,
+)
 from ..utils.user_permissions import UserPermissions
 from .contracts import (
     DocumentRecord,
@@ -2808,37 +2812,61 @@ class LanceDBVectorIndexStore(VectorIndexStore):
         table_names = _vis_get_table_names(conn)
         predicates: Dict[str, list] = {}
 
-        core_tables = ["documents", "parses", "chunks", "main_pointers", "ingestion_runs"]
+        core_tables = [
+            "documents",
+            "parses",
+            "chunks",
+            "main_pointers",
+            "ingestion_runs",
+        ]
         for table_name in core_tables:
             if table_name not in table_names:
                 continue
             if target == "collection":
                 filter_expr = _vis_build_collection_filter(
-                    conn=conn, table_name=table_name, collection=collection,
-                    user_id=user_id, is_admin=is_admin,
+                    conn=conn,
+                    table_name=table_name,
+                    collection=collection,
+                    user_id=user_id,
+                    is_admin=is_admin,
                 )
             else:
                 filter_expr = _vis_build_document_filter(
-                    conn=conn, table_name=table_name, collection=collection,
-                    doc_id=str(doc_id), user_id=user_id, is_admin=is_admin,
+                    conn=conn,
+                    table_name=table_name,
+                    collection=collection,
+                    doc_id=str(doc_id),
+                    user_id=user_id,
+                    is_admin=is_admin,
                 )
             predicates[table_name] = [filter_expr]
 
         for table_name in select_embedding_tables(conn, model_tag=model_tag):
             if target == "collection":
                 filter_expr = _vis_build_collection_filter(
-                    conn=conn, table_name=table_name, collection=collection,
-                    user_id=user_id, is_admin=is_admin,
+                    conn=conn,
+                    table_name=table_name,
+                    collection=collection,
+                    user_id=user_id,
+                    is_admin=is_admin,
                 )
             else:
                 filter_expr = _vis_build_document_filter(
-                    conn=conn, table_name=table_name, collection=collection,
-                    doc_id=str(doc_id), user_id=user_id, is_admin=is_admin,
+                    conn=conn,
+                    table_name=table_name,
+                    collection=collection,
+                    doc_id=str(doc_id),
+                    user_id=user_id,
+                    is_admin=is_admin,
                 )
             predicates[table_name] = [filter_expr]
 
         result = _vis_execute_or_plan_by_predicates(
-            conn, predicates, preview_only=preview_only, confirm=confirm, model_tag=None,
+            conn,
+            predicates,
+            preview_only=preview_only,
+            confirm=confirm,
+            model_tag=None,
         )
         if confirm:
             self.invalidate_table_cache()
@@ -3228,8 +3256,11 @@ def _vis_cascade_delete_documents(
     """Cascade delete multiple documents using one predicate set per table."""
     from ..kb.cleanup_filters import select_embedding_tables
     from ..LanceDB.schema_manager import (
-        ensure_chunks_table, ensure_documents_table, ensure_ingestion_runs_table,
-        ensure_main_pointers_table, ensure_parses_table,
+        ensure_chunks_table,
+        ensure_documents_table,
+        ensure_ingestion_runs_table,
+        ensure_main_pointers_table,
+        ensure_parses_table,
     )
     from ..utils.user_scope import resolve_user_scope
 
@@ -3256,19 +3287,35 @@ def _vis_cascade_delete_documents(
     for table_name in core_tables:
         if table_name not in table_names:
             continue
-        predicates[table_name] = [_vis_build_documents_filter(
-            conn=conn, table_name=table_name, collection=collection,
-            doc_ids=normalized_doc_ids, user_id=user_id, is_admin=is_admin,
-        )]
+        predicates[table_name] = [
+            _vis_build_documents_filter(
+                conn=conn,
+                table_name=table_name,
+                collection=collection,
+                doc_ids=normalized_doc_ids,
+                user_id=user_id,
+                is_admin=is_admin,
+            )
+        ]
 
     for table_name in select_embedding_tables(conn):
-        predicates[table_name] = [_vis_build_documents_filter(
-            conn=conn, table_name=table_name, collection=collection,
-            doc_ids=normalized_doc_ids, user_id=user_id, is_admin=is_admin,
-        )]
+        predicates[table_name] = [
+            _vis_build_documents_filter(
+                conn=conn,
+                table_name=table_name,
+                collection=collection,
+                doc_ids=normalized_doc_ids,
+                user_id=user_id,
+                is_admin=is_admin,
+            )
+        ]
 
     return _vis_execute_or_plan_by_predicates(
-        conn, predicates, preview_only=preview_only, confirm=confirm, model_tag=None,
+        conn,
+        predicates,
+        preview_only=preview_only,
+        confirm=confirm,
+        model_tag=None,
     )
 
 
