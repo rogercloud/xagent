@@ -2594,9 +2594,7 @@ class LanceDBVectorIndexStore(VectorIndexStore):
         ensure_main_pointers_table(conn)
 
         if scope == "document":
-            from ..version_management.cascade_cleaner import _cascade_delete_impl
-
-            raw = _cascade_delete_impl(
+            raw = self.cascade_delete(
                 target="document",
                 collection=collection,
                 doc_id=doc_id,
@@ -2605,7 +2603,6 @@ class LanceDBVectorIndexStore(VectorIndexStore):
                 model_tag=model_tag,
                 preview_only=preview_only,
                 confirm=confirm,
-                conn=conn,
             )
             embeddings_total = sum(
                 int(v) for k, v in raw.items() if str(k).startswith("embeddings_")
@@ -2761,9 +2758,7 @@ class LanceDBVectorIndexStore(VectorIndexStore):
                 if filter_exprs:
                     predicates.setdefault(table_name, []).extend(filter_exprs)
         elif scope == "pointers":
-            from ..version_management.cascade_cleaner import _build_document_filter
-
-            filt = _build_document_filter(
+            filt = _vis_build_document_filter(
                 conn=conn,
                 table_name="main_pointers",
                 collection=collection,
