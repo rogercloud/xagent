@@ -2798,3 +2798,88 @@ def test_vis_build_documents_filter_unauthenticated_non_admin_fails_closed():
     assert "doc_id IN ('d1', 'd2')" in filt
     # no_access_filter is appended (no tenant rows visible)
     assert "AND (" in filt
+
+
+# ---------------------------------------------------------------------------
+# cascade_delete tests
+# ---------------------------------------------------------------------------
+
+
+@patch("xagent.core.tools.core.RAG_tools.storage.lancedb_stores.get_connection_from_env")
+def test_store_cascade_delete_collection_applies_user_filter(mock_get_conn, mocker):
+    for n in ("ensure_documents_table", "ensure_parses_table", "ensure_chunks_table",
+              "ensure_main_pointers_table", "ensure_ingestion_runs_table"):
+        mocker.patch(f"xagent.core.tools.core.RAG_tools.LanceDB.schema_manager.{n}", return_value=None)
+    conn = Mock()
+    conn.table_names.return_value = ["documents"]
+    conn.list_tables.return_value = ["documents"]
+    table = _mk_table_with_columns(["collection", "doc_id", "user_id"])
+    conn.open_table.return_value = table
+    mock_get_conn.return_value = conn
+
+    store = LanceDBVectorIndexStore()
+    store.cascade_delete(
+        target="collection", collection="c1", user_id=7, is_admin=False,
+        preview_only=False, confirm=True,
+    )
+
+    assert table.delete.call_count >= 1
+    # Check the filter used contained collection and user_id scope
+    filt = table.delete.call_args_list[0][0][0]
+    assert "collection == 'c1'" in filt
+    assert "user_id" in filt
+
+
+@patch("xagent.core.tools.core.RAG_tools.storage.lancedb_stores.get_connection_from_env")
+def test_store_cascade_delete_document_scopes_doc_id(mock_get_conn, mocker):
+    for n in ("ensure_documents_table", "ensure_parses_table", "ensure_chunks_table",
+              "ensure_main_pointers_table", "ensure_ingestion_runs_table"):
+        mocker.patch(f"xagent.core.tools.core.RAG_tools.LanceDB.schema_manager.{n}", return_value=None)
+    conn = Mock()
+    conn.table_names.return_value = ["documents"]
+    conn.list_tables.return_value = ["documents"]
+    table = _mk_table_with_columns(["collection", "doc_id", "user_id"])
+    conn.open_table.return_value = table
+    mock_get_conn.return_value = conn
+
+    store = LanceDBVectorIndexStore()
+    store.cascade_delete(
+        target="document", collection="c1", doc_id="d1", user_id=9, is_admin=False,
+        preview_only=False, confirm=True,
+    )
+
+    filt = table.delete.call_args_list[0][0][0]
+    assert "collection == 'c1'" in filt
+    assert "doc_id == 'd1'" in filt
+
+
+@patch("xagent.core.tools.core.RAG_tools.storage.lancedb_stores.get_connection_from_env")
+def test_store_cascade_delete_preview_does_not_delete(mock_get_conn, mocker):
+    for n in ("ensure_documents_table", "ensure_parses_table", "ensure_chunks_table",
+              "ensure_main_pointers_table", "ensure_ingestion_runs_table"):
+        mocker.patch(f"xagent.core.tools.core.RAG_tools.LanceDB.schema_manager.{n}", return_value=None)
+    conn = Mock()
+    conn.table_names.return_value = ["documents"]
+    conn.list_tables.return_value = ["documents"]
+    table = _mk_table_with_columns(["collection", "doc_id"])
+    conn.open_table.return_value = table
+    mock_get_conn.return_value = conn
+
+    store = LanceDBVectorIndexStore()
+    spy = mocker.spy(store, "invalidate_table_cache")
+    store.cascade_delete(
+        target="collection", collection="c1", user_id=None, is_admin=True,
+        preview_only=True, confirm=False,
+    )
+    assert table.delete.call_count == 0      # preview: plan only, no delete
+    assert spy.call_count == 0               # preview: no cache invalidation
+
+
+def test_store_cascade_delete_document_requires_doc_id():
+    from xagent.core.tools.core.RAG_tools.core.exceptions import CascadeCleanupError
+    store = LanceDBVectorIndexStore()
+    with pytest.raises(CascadeCleanupError):
+        store.cascade_delete(
+            target="document", collection="c1", user_id=None, is_admin=True,
+            preview_only=True, confirm=False,
+        )

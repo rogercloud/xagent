@@ -2801,6 +2801,82 @@ class LanceDBVectorIndexStore(VectorIndexStore):
             return _vis_collapse_embedding_table_counts(result)
         return result
 
+    def cascade_delete(
+        self,
+        *,
+        target,
+        collection: str,
+        doc_id=None,
+        user_id=None,
+        is_admin: bool = False,
+        model_tag=None,
+        preview_only: bool = True,
+        confirm: bool = False,
+    ) -> Dict[str, int]:
+        from ..core.exceptions import CascadeCleanupError
+        from ..kb.cleanup_filters import select_embedding_tables
+        from ..LanceDB.schema_manager import (
+            ensure_chunks_table,
+            ensure_documents_table,
+            ensure_ingestion_runs_table,
+            ensure_main_pointers_table,
+            ensure_parses_table,
+        )
+        from ..utils.user_scope import resolve_user_scope
+
+        user_scope = resolve_user_scope(user_id=user_id, is_admin=is_admin)
+        user_id = user_scope.user_id
+        is_admin = user_scope.is_admin
+
+        if target == "document" and not doc_id:
+            raise CascadeCleanupError("doc_id is required for document cascade delete")
+
+        conn = self._get_connection()
+        ensure_documents_table(conn)
+        ensure_parses_table(conn)
+        ensure_chunks_table(conn)
+        ensure_main_pointers_table(conn)
+        ensure_ingestion_runs_table(conn)
+
+        table_names = _vis_get_table_names(conn)
+        predicates: Dict[str, list] = {}
+
+        core_tables = ["documents", "parses", "chunks", "main_pointers", "ingestion_runs"]
+        for table_name in core_tables:
+            if table_name not in table_names:
+                continue
+            if target == "collection":
+                filter_expr = _vis_build_collection_filter(
+                    conn=conn, table_name=table_name, collection=collection,
+                    user_id=user_id, is_admin=is_admin,
+                )
+            else:
+                filter_expr = _vis_build_document_filter(
+                    conn=conn, table_name=table_name, collection=collection,
+                    doc_id=str(doc_id), user_id=user_id, is_admin=is_admin,
+                )
+            predicates[table_name] = [filter_expr]
+
+        for table_name in select_embedding_tables(conn, model_tag=model_tag):
+            if target == "collection":
+                filter_expr = _vis_build_collection_filter(
+                    conn=conn, table_name=table_name, collection=collection,
+                    user_id=user_id, is_admin=is_admin,
+                )
+            else:
+                filter_expr = _vis_build_document_filter(
+                    conn=conn, table_name=table_name, collection=collection,
+                    doc_id=str(doc_id), user_id=user_id, is_admin=is_admin,
+                )
+            predicates[table_name] = [filter_expr]
+
+        result = _vis_execute_or_plan_by_predicates(
+            conn, predicates, preview_only=preview_only, confirm=confirm, model_tag=None,
+        )
+        if confirm:
+            self.invalidate_table_cache()
+        return result
+
 
 # ============================================================================
 # Phase 1A Part 2: Additional LanceDB Store Implementations
