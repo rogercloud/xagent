@@ -3249,6 +3249,63 @@ def _vis_build_documents_filter(
         _safe_close_table(table)
 
 
+def _vis_cascade_delete_documents(
+    conn,
+    *,
+    collection: str,
+    doc_ids: list,
+    user_id,
+    is_admin: bool,
+    preview_only: bool = True,
+    confirm: bool = False,
+) -> Dict[str, int]:
+    """Cascade delete multiple documents using one predicate set per table."""
+    from ..kb.cleanup_filters import select_embedding_tables
+    from ..LanceDB.schema_manager import (
+        ensure_chunks_table, ensure_documents_table, ensure_ingestion_runs_table,
+        ensure_main_pointers_table, ensure_parses_table,
+    )
+    from ..utils.user_scope import resolve_user_scope
+
+    normalized_doc_ids = sorted({str(d) for d in doc_ids if str(d)})
+    if not normalized_doc_ids:
+        return {}
+
+    user_scope = resolve_user_scope(user_id=user_id, is_admin=is_admin)
+    user_id = user_scope.user_id
+    is_admin = user_scope.is_admin
+    if not is_admin and user_id is None:
+        return {}
+
+    ensure_documents_table(conn)
+    ensure_parses_table(conn)
+    ensure_chunks_table(conn)
+    ensure_main_pointers_table(conn)
+    ensure_ingestion_runs_table(conn)
+
+    table_names = _vis_get_table_names(conn)
+    predicates: Dict[str, list] = {}
+
+    core_tables = ["documents", "parses", "chunks", "main_pointers", "ingestion_runs"]
+    for table_name in core_tables:
+        if table_name not in table_names:
+            continue
+        predicates[table_name] = [_vis_build_documents_filter(
+            conn=conn, table_name=table_name, collection=collection,
+            doc_ids=normalized_doc_ids, user_id=user_id, is_admin=is_admin,
+        )]
+
+    for table_name in select_embedding_tables(conn):
+        predicates[table_name] = [_vis_build_documents_filter(
+            conn=conn, table_name=table_name, collection=collection,
+            doc_ids=normalized_doc_ids, user_id=user_id, is_admin=is_admin,
+        )]
+
+    return _vis_execute_or_plan_by_predicates(
+        conn, predicates, preview_only=preview_only, confirm=confirm, model_tag=None,
+    )
+
+
 class LanceDBIngestionStatusStore(IngestionStatusStore):
     """LanceDB implementation for ingestion status tracking.
 

@@ -2883,3 +2883,38 @@ def test_store_cascade_delete_document_requires_doc_id():
             target="document", collection="c1", user_id=None, is_admin=True,
             preview_only=True, confirm=False,
         )
+
+
+def test_vis_cascade_delete_documents_batched_predicates(mocker):
+    from xagent.core.tools.core.RAG_tools.storage.lancedb_stores import _vis_cascade_delete_documents
+
+    for n in ("ensure_documents_table", "ensure_parses_table", "ensure_chunks_table",
+              "ensure_main_pointers_table", "ensure_ingestion_runs_table"):
+        mocker.patch(f"xagent.core.tools.core.RAG_tools.LanceDB.schema_manager.{n}", return_value=None)
+    conn = Mock()
+    conn.table_names.return_value = ["documents"]
+    conn.list_tables.return_value = ["documents"]   # _vis_get_table_names uses list_tables
+    table = _mk_table_with_columns(["collection", "doc_id", "user_id"])
+    conn.open_table.return_value = table
+
+    _vis_cascade_delete_documents(
+        conn, collection="c1", doc_ids=["d2", "d1", "d1"],  # out of order, dupe
+        user_id=7, is_admin=False, preview_only=False, confirm=True,
+    )
+    assert table.delete.call_count >= 1
+    filt = table.delete.call_args_list[0][0][0]
+    assert "collection == 'c1'" in filt
+    # doc_ids normalized to sorted deduped list: ["d1", "d2"]
+    assert "doc_id IN ('d1', 'd2')" in filt
+
+
+def test_vis_cascade_delete_documents_unauthenticated_non_admin_returns_empty():
+    from xagent.core.tools.core.RAG_tools.storage.lancedb_stores import _vis_cascade_delete_documents
+
+    conn = Mock()
+    result = _vis_cascade_delete_documents(
+        conn, collection="c1", doc_ids=["d1"], user_id=None, is_admin=False,
+        preview_only=False, confirm=True,
+    )
+    assert result == {}
+    conn.open_table.assert_not_called()
