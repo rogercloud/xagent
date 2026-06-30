@@ -864,16 +864,12 @@ class LanceDBVectorIndexStore(VectorIndexStore):
         the row or the ``documents`` table is absent.
         """
         from ..LanceDB.schema_manager import _safe_close_table
-        from ..version_management.cascade_cleaner import (
-            _build_document_filter,
-            _delete_rows_by_filters,
-        )
 
         if "documents" not in self.list_table_names():
             return 0
 
         conn = self._get_connection()
-        filter_expr = _build_document_filter(
+        filter_expr = _vis_build_document_filter(
             conn=conn,
             table_name="documents",
             collection=collection_name,
@@ -883,7 +879,7 @@ class LanceDBVectorIndexStore(VectorIndexStore):
         )
         table = conn.open_table("documents")
         try:
-            deleted = _delete_rows_by_filters(table, [filter_expr])
+            deleted = _vis_delete_rows_by_filters(table, [filter_expr])
         finally:
             _safe_close_table(table)
         self.invalidate_table_cache("documents")
@@ -908,16 +904,12 @@ class LanceDBVectorIndexStore(VectorIndexStore):
         """
         from ..LanceDB.schema_manager import _safe_close_table
         from ..utils.string_utils import escape_lancedb_string
-        from ..version_management.cascade_cleaner import (
-            _build_document_filter,
-            _delete_rows_by_filters,
-        )
 
         if table_name not in self.list_table_names():
             return 0
 
         conn = self._get_connection()
-        filter_expr = _build_document_filter(
+        filter_expr = _vis_build_document_filter(
             conn=conn,
             table_name=table_name,
             collection=collection_name,
@@ -932,7 +924,7 @@ class LanceDBVectorIndexStore(VectorIndexStore):
                 )
         table = conn.open_table(table_name)
         try:
-            deleted = _delete_rows_by_filters(table, [filter_expr])
+            deleted = _vis_delete_rows_by_filters(table, [filter_expr])
         finally:
             _safe_close_table(table)
         self.invalidate_table_cache(table_name)
@@ -1001,7 +993,6 @@ class LanceDBVectorIndexStore(VectorIndexStore):
             resolve_cleanup_scope,
         )
         from ..LanceDB.schema_manager import _safe_close_table
-        from ..version_management.cascade_cleaner import _delete_rows_by_filters
 
         scope = resolve_cleanup_scope(
             collection=collection_name,
@@ -1024,7 +1015,7 @@ class LanceDBVectorIndexStore(VectorIndexStore):
             table = None
             try:
                 table = conn.open_table(table_name)
-                deleted += _delete_rows_by_filters(table, filter_exprs)
+                deleted += _vis_delete_rows_by_filters(table, filter_exprs)
             finally:
                 _safe_close_table(table)
             self.invalidate_table_cache(table_name)
