@@ -562,41 +562,61 @@ def test_vector_store_rename_collection_data_tenant_scoped(
         assert "42" in where_expr
 
 
-@patch(
-    "xagent.core.tools.core.RAG_tools.version_management.cascade_cleaner.cascade_delete"
-)
+@patch.object(LanceDBVectorIndexStore, "cascade_delete")
 @patch(
     "xagent.core.tools.core.RAG_tools.storage.lancedb_stores.get_connection_from_env"
 )
-def test_delete_collection_data_delegates_to_cascade_delete(
-    mock_get_connection: Mock,
-    mock_cascade_delete: Mock,
+def test_delete_collection_data_delegates_to_store_cascade_delete(
+    mock_get_conn: Mock,
+    mock_cascade: Mock,
 ) -> None:
-    """delete_collection_data should route collection deletes through cascade_delete."""
-
-    mock_conn = Mock()
-    mock_get_connection.return_value = mock_conn
-    mock_cascade_delete.return_value = {"documents": 1, "parses": 1}
-
+    """delete_collection_data should route through self.cascade_delete."""
+    mock_get_conn.return_value = Mock()
+    mock_cascade.return_value = {"documents": 1, "parses": 1}
     store = LanceDBVectorIndexStore()
     warnings: List[str] = []
 
-    deleted_counts = store.delete_collection_data(
-        "demo", user_id=1, is_admin=False, warnings_out=warnings
-    )
+    result = store.delete_collection_data("demo", user_id=1, is_admin=False, warnings_out=warnings)
 
-    mock_cascade_delete.assert_called_once()
-    called = mock_cascade_delete.call_args.kwargs
-    assert called["target"] == "collection"
-    assert called["collection"] == "demo"
-    assert called["user_id"] == 1
-    assert called["is_admin"] is False
-    assert called["preview_only"] is False
-    assert called["confirm"] is True
-    assert called["conn"] is mock_conn
-
-    assert deleted_counts == {"documents": 1, "parses": 1}
+    mock_cascade.assert_called_once()
+    kw = mock_cascade.call_args.kwargs
+    assert kw["target"] == "collection"
+    assert kw["collection"] == "demo"
+    assert kw["user_id"] == 1
+    assert kw["is_admin"] is False
+    assert kw["preview_only"] is False
+    assert kw["confirm"] is True
+    assert "conn" not in kw   # contract method owns its connection
+    assert result == {"documents": 1, "parses": 1}
     assert warnings == []
+
+
+@patch.object(LanceDBVectorIndexStore, "cascade_delete")
+@patch(
+    "xagent.core.tools.core.RAG_tools.storage.lancedb_stores.get_connection_from_env"
+)
+def test_delete_document_data_delegates_to_store_cascade_delete(
+    mock_get_conn: Mock,
+    mock_cascade: Mock,
+) -> None:
+    """delete_document_data should route through self.cascade_delete."""
+    mock_get_conn.return_value = Mock()
+    mock_cascade.return_value = {"documents": 1}
+    store = LanceDBVectorIndexStore()
+
+    result = store.delete_document_data("demo", "d1", user_id=2, is_admin=True)
+
+    mock_cascade.assert_called_once()
+    kw = mock_cascade.call_args.kwargs
+    assert kw["target"] == "document"
+    assert kw["collection"] == "demo"
+    assert kw["doc_id"] == "d1"
+    assert kw["user_id"] == 2
+    assert kw["is_admin"] is True
+    assert kw["preview_only"] is False
+    assert kw["confirm"] is True
+    assert "conn" not in kw
+    assert result == {"documents": 1}
 
 
 @patch(

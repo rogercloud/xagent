@@ -822,21 +822,14 @@ class LanceDBVectorIndexStore(VectorIndexStore):
         warnings_out: Optional[List[str]] = None,
     ) -> Dict[str, int]:
         """Delete all data for a collection from vector-side tables."""
-        conn = self._get_connection()
-        from ..version_management.cascade_cleaner import cascade_delete
-
-        counts = cascade_delete(
+        return self.cascade_delete(
             target="collection",
             collection=collection_name,
             user_id=user_id,
             is_admin=is_admin,
             preview_only=False,
             confirm=True,
-            conn=conn,
         )
-        # Ensure subsequent reads don't observe stale cached table handles.
-        self.invalidate_table_cache()
-        return counts
 
     def delete_document_data(
         self,
@@ -846,10 +839,7 @@ class LanceDBVectorIndexStore(VectorIndexStore):
         is_admin: bool,
     ) -> Dict[str, int]:
         """Delete all vector-side data for a document."""
-        conn = self._get_connection()
-        from ..version_management.cascade_cleaner import cascade_delete
-
-        counts = cascade_delete(
+        return self.cascade_delete(
             target="document",
             collection=collection_name,
             doc_id=doc_id,
@@ -857,11 +847,7 @@ class LanceDBVectorIndexStore(VectorIndexStore):
             is_admin=is_admin,
             preview_only=False,
             confirm=True,
-            conn=conn,
         )
-        # Ensure subsequent reads don't observe stale cached table handles.
-        self.invalidate_table_cache()
-        return counts
 
     def delete_document_record(
         self,
