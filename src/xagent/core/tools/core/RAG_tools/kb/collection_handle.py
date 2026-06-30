@@ -3716,7 +3716,7 @@ class LanceDBCollectionHandle(KBCollectionHandle):
     def list_candidates(
         self,
         doc_id: str,
-        step_type: "Union[Any, str]",
+        step_type: "Any",
         model_tag: Optional[str] = None,
         state: Optional[str] = None,
         limit: int = 50,

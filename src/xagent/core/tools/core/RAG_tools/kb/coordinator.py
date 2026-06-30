@@ -963,7 +963,7 @@ class KBCoordinator:
             KBContextRequest(
                 collection=collection,
                 user_id=user_id,
-                is_admin=is_admin or False,
+                is_admin=is_admin if is_admin is not None else True,
                 access_mode=KBAccessMode.WRITE,
                 hide_missing=True,
             )
