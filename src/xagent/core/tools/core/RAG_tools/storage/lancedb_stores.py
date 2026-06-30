@@ -23,7 +23,7 @@ from ..core.config import (
 from ..core.schemas import CollectionInfo, IndexResult
 from ..LanceDB.schema_manager import ensure_documents_table
 from ..utils.lancedb_query_utils import list_table_names, query_to_list
-from ..utils.string_utils import build_lancedb_filter_expression, escape_lancedb_string
+from ..utils.string_utils import build_lancedb_filter_expression, build_user_id_filter_for_table, escape_lancedb_string
 from ..utils.user_permissions import UserPermissions
 from .contracts import (
     DocumentRecord,
@@ -3053,6 +3053,124 @@ def _vis_collapse_embedding_table_counts(counts: Dict[str, int]) -> Dict[str, in
             embeddings_total += int(collapsed.pop(table_name, 0))
     collapsed["embeddings"] = embeddings_total
     return collapsed
+
+
+def _vis_build_collection_filter(
+    *,
+    conn: Any,
+    table_name: str,
+    collection: str,
+    user_id: Optional[int],
+    is_admin: bool,
+) -> str:
+    """Build a safe filter for collection-scoped deletion.
+
+    Adds user_id filtering only when the target table contains a user_id column.
+    """
+    from ..kb.cleanup_filters import table_has_column as _table_has_column
+    from ..LanceDB.schema_manager import _safe_close_table
+
+    base: Dict[str, str] = {"collection": collection}
+    table = None
+    try:
+        table = conn.open_table(table_name)
+        if not is_admin and user_id is not None:
+            if _table_has_column(table, "user_id"):
+                base_expr = build_lancedb_filter_expression(
+                    base, user_id=user_id, is_admin=is_admin, skip_user_filter=True
+                )
+                user_expr = build_user_id_filter_for_table(table, int(user_id))
+                return f"{base_expr} AND {user_expr}"
+            # Legacy schemas without user_id must remain compatible.
+            return build_lancedb_filter_expression(base, skip_user_filter=True)
+        return build_lancedb_filter_expression(base, user_id=user_id, is_admin=is_admin)
+    except Exception:
+        # If table introspection fails, keep tenant-safe fallback.
+        return build_lancedb_filter_expression(base, user_id=user_id, is_admin=is_admin)
+    finally:
+        _safe_close_table(table)
+
+
+def _vis_build_document_filter(
+    *,
+    conn: Any,
+    table_name: str,
+    collection: str,
+    doc_id: str,
+    user_id: Optional[int],
+    is_admin: bool,
+) -> str:
+    """Build a safe filter for document-scoped deletion."""
+    from ..kb.cleanup_filters import table_has_column as _table_has_column
+    from ..LanceDB.schema_manager import _safe_close_table
+
+    base: Dict[str, str] = {"collection": collection, "doc_id": doc_id}
+    table = None
+    try:
+        table = conn.open_table(table_name)
+        if not is_admin and user_id is not None:
+            if _table_has_column(table, "user_id"):
+                base_expr = build_lancedb_filter_expression(
+                    base, user_id=user_id, is_admin=is_admin, skip_user_filter=True
+                )
+                user_expr = build_user_id_filter_for_table(table, int(user_id))
+                return f"{base_expr} AND {user_expr}"
+            # Legacy schemas without user_id must remain compatible.
+            return build_lancedb_filter_expression(base, skip_user_filter=True)
+        return build_lancedb_filter_expression(base, user_id=user_id, is_admin=is_admin)
+    except Exception:
+        # If table introspection fails, keep tenant-safe fallback.
+        return build_lancedb_filter_expression(base, user_id=user_id, is_admin=is_admin)
+    finally:
+        _safe_close_table(table)
+
+
+def _vis_doc_ids_filter(doc_ids: list) -> str:
+    if len(doc_ids) == 1:
+        return f"doc_id == '{escape_lancedb_string(doc_ids[0])}'"
+    values = ", ".join(f"'{escape_lancedb_string(doc_id)}'" for doc_id in doc_ids)
+    return f"doc_id IN ({values})"
+
+
+def _vis_build_documents_filter(
+    *,
+    conn: Any,
+    table_name: str,
+    collection: str,
+    doc_ids: list,
+    user_id: Optional[int],
+    is_admin: bool,
+) -> str:
+    """Build a safe filter for deleting multiple document-scoped rows."""
+    from ..kb.cleanup_filters import table_has_column as _table_has_column
+    from ..LanceDB.schema_manager import _safe_close_table
+
+    base_expr = build_lancedb_filter_expression(
+        {"collection": collection}, skip_user_filter=True
+    )
+    doc_expr = _vis_doc_ids_filter(doc_ids)
+    scoped_expr = f"{base_expr} AND {doc_expr}"
+
+    if is_admin:
+        return scoped_expr
+    if user_id is None:
+        return f"{scoped_expr} AND ({UserPermissions.get_no_access_filter()})"
+
+    table = None
+    try:
+        table = conn.open_table(table_name)
+        if _table_has_column(table, "user_id"):
+            return (
+                f"{scoped_expr} AND "
+                f"{build_user_id_filter_for_table(table, int(user_id))}"
+            )
+        # Legacy schemas without user_id stay document-scoped by doc_id.
+        return scoped_expr
+    except Exception:
+        # If introspection fails, fail closed with an explicit user_id predicate.
+        return f"{scoped_expr} AND user_id == {int(user_id)}"
+    finally:
+        _safe_close_table(table)
 
 
 class LanceDBIngestionStatusStore(IngestionStatusStore):

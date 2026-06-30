@@ -2726,3 +2726,75 @@ def test_count_collections_fast_error_graceful(mock_get_connection: Mock) -> Non
         "documents", "documents", stats, user_id=None, is_admin=True
     )
     assert stats == {}
+
+
+# ---------------------------------------------------------------------------
+# _vis_build_* predicate-builder tests
+# ---------------------------------------------------------------------------
+
+
+def _mk_table_with_columns(columns: list):
+    """Mock LanceDB table whose schema.names == columns."""
+    table = Mock()
+    schema = Mock()
+    schema.names = columns
+    table.schema = schema
+    table.count_rows.return_value = 1
+    table.delete = Mock()
+    return table
+
+
+from xagent.core.tools.core.RAG_tools.storage.lancedb_stores import (  # noqa: E402
+    _vis_build_collection_filter,
+    _vis_build_document_filter,
+    _vis_build_documents_filter,
+    _vis_doc_ids_filter,
+)
+
+
+def test_vis_build_collection_filter_non_admin_with_user_id_column():
+    conn = Mock()
+    conn.open_table.return_value = _mk_table_with_columns(["collection", "doc_id", "user_id"])
+    filt = _vis_build_collection_filter(
+        conn=conn, table_name="documents", collection="c1", user_id=7, is_admin=False
+    )
+    assert "collection == 'c1'" in filt
+    assert "user_id == 7" in filt
+
+
+def test_vis_build_collection_filter_legacy_schema_omits_user_id():
+    conn = Mock()
+    conn.open_table.return_value = _mk_table_with_columns(["collection", "doc_id"])
+    filt = _vis_build_collection_filter(
+        conn=conn, table_name="documents", collection="c_legacy", user_id=11, is_admin=False
+    )
+    assert "collection == 'c_legacy'" in filt
+    assert "user_id" not in filt
+
+
+def test_vis_build_document_filter_scopes_collection_and_doc():
+    conn = Mock()
+    conn.open_table.return_value = _mk_table_with_columns(["collection", "doc_id", "user_id"])
+    filt = _vis_build_document_filter(
+        conn=conn, table_name="documents", collection="c1", doc_id="d1", user_id=9, is_admin=False
+    )
+    assert "collection == 'c1'" in filt
+    assert "doc_id == 'd1'" in filt
+    assert "user_id == 9" in filt
+
+
+def test_vis_doc_ids_filter_single_and_multi():
+    assert _vis_doc_ids_filter(["d1"]) == "doc_id == 'd1'"
+    assert _vis_doc_ids_filter(["d1", "d2"]) == "doc_id IN ('d1', 'd2')"
+
+
+def test_vis_build_documents_filter_unauthenticated_non_admin_fails_closed():
+    conn = Mock()
+    filt = _vis_build_documents_filter(
+        conn=conn, table_name="documents", collection="c1",
+        doc_ids=["d1", "d2"], user_id=None, is_admin=False,
+    )
+    assert "collection == 'c1'" in filt
+    assert "doc_id IN ('d1', 'd2')" in filt
+    # no_access_filter is appended (no tenant rows visible)
+    assert "AND (" in filt
