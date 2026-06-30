@@ -127,7 +127,8 @@ class TestListCandidates:
         mock_conn.table_names.return_value = ["parses"]
         mock_table = MagicMock()
 
-        # Mock pandas result
+        # Real `parses` schema has NO top-level parse_method column; the method
+        # is carried only by the `parser` column as local:{method}@v1.0.0.
         now = datetime.now()
         mock_data = pd.DataFrame(
             [
@@ -135,16 +136,16 @@ class TestListCandidates:
                     "collection": "test_collection",
                     "doc_id": "test_doc",
                     "parse_hash": "hash1",
-                    "parse_method": "unstructured",
-                    "parser": "local:UnstructuredParser@v1",
+                    "parser": "local:unstructured@v1.0.0",
+                    "params_json": "{}",
                     "created_at": now + timedelta(milliseconds=1),
                 },
                 {
                     "collection": "test_collection",
                     "doc_id": "test_doc",
                     "parse_hash": "hash2",
-                    "parse_method": "pypdf",
-                    "parser": "local:PyPDFParser@v1",
+                    "parser": "local:pypdf@v1.0.0",
+                    "params_json": "{}",
                     "created_at": now,
                 },
             ]
@@ -164,11 +165,46 @@ class TestListCandidates:
             assert result["returned_count"] == 2
             assert result["step_type"] == "parse"
 
-            # Check first candidate (should be hash1 as it's newer)
+            # hash1 is newer -> first; method recovered from the parser column.
             candidate1 = result["candidates"][0]
             assert candidate1["technical_id"] == "hash1"
             assert candidate1["state"] == "candidate"
-            assert "parse_unstructured" in candidate1["semantic_id"]
+            assert candidate1["semantic_id"] == "parse_unstructured_hash1"
+            assert candidate1["stats"]["parse_method"] == "unstructured"
+
+    def test_parse_candidates_method_from_parser_column(self):
+        """Characterization: with no top-level parse_method column and an empty
+        params_json, the method must still be recovered from the parser column,
+        so semantic_id reflects the real method instead of parse_unknown_*.
+        """
+        mock_conn = MagicMock(spec=["table_names", "open_table"])
+        mock_conn.table_names.return_value = ["parses"]
+        mock_table = MagicMock()
+
+        mock_data = pd.DataFrame(
+            [
+                {
+                    "collection": "test_collection",
+                    "doc_id": "test_doc",
+                    "parse_hash": "abcd1234ef",
+                    "parser": "local:pypdf@v1.0.0",
+                    "params_json": "{}",  # method is NOT in params_json
+                    "created_at": datetime.now(),
+                }
+            ]
+        )
+        mock_where = mock_table.search.return_value.where.return_value
+        mock_where.to_arrow.side_effect = AttributeError("to_arrow not available")
+        mock_where.to_list.side_effect = AttributeError("to_list not available")
+        mock_where.to_pandas.return_value = mock_data
+        mock_conn.open_table.return_value = mock_table
+
+        with self._patch_get_connection_from_env(mock_conn):
+            result = list_candidates("test_collection", "test_doc", StepType.PARSE)
+
+            candidate = result["candidates"][0]
+            assert candidate["semantic_id"] == "parse_pypdf_abcd1234"
+            assert candidate["stats"]["parse_method"] == "pypdf"
 
     def test_chunk_candidates_with_data(self):
         """Test list_candidates returns chunk candidates when data exists."""

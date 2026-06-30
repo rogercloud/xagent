@@ -2415,8 +2415,8 @@ class LanceDBVectorIndexStore(VectorIndexStore):
             return []
         parse_candidates: List[Dict[str, Any]] = []
         for row in result:
-            parse_method = row.get("parse_method", "unknown")
             parser = row.get("parser", "unknown")
+            parse_method = self._vis_method_from_parser(parser)
             merged_params: Dict[str, Any] = {
                 "parse_method": parse_method,
                 "parser": parser,
