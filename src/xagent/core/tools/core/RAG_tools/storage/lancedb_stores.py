@@ -7,7 +7,7 @@ import logging
 import os
 from collections import OrderedDict, defaultdict
 from datetime import datetime, timezone
-from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple, cast
+from typing import Any, Dict, Iterator, List, Literal, Optional, Sequence, Tuple, cast
 
 import lancedb
 import pyarrow as pa  # type: ignore
@@ -2771,12 +2771,12 @@ class LanceDBVectorIndexStore(VectorIndexStore):
     def cascade_delete(
         self,
         *,
-        target,
+        target: Literal["collection", "document"],
         collection: str,
-        doc_id=None,
-        user_id=None,
+        doc_id: Optional[str] = None,
+        user_id: Optional[int] = None,
         is_admin: bool = False,
-        model_tag=None,
+        model_tag: Optional[str] = None,
         preview_only: bool = True,
         confirm: bool = False,
     ) -> Dict[str, int]:
@@ -3216,11 +3216,11 @@ def _vis_build_documents_filter(
 
 
 def _vis_cascade_delete_documents(
-    conn,
+    conn: Any,
     *,
     collection: str,
     doc_ids: list,
-    user_id,
+    user_id: Optional[int],
     is_admin: bool,
     preview_only: bool = True,
     confirm: bool = False,
