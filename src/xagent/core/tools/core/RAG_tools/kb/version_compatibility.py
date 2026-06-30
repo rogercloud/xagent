@@ -418,21 +418,20 @@ class KBVersionCompatibilityFacade:
         model_tag: Optional[str] = None,
         preview_only: bool = True,
         confirm: bool = False,
-        conn: Any | None = None,
+        conn: Any | None = None,  # vestigial — accepted for back-compat, ignored
     ) -> Dict[str, int]:
-        from ..version_management.cascade_cleaner import _cascade_delete_impl
+        from ..storage.factory import get_vector_index_store
 
         with self._storage_context():
-            return _cascade_delete_impl(
+            return get_vector_index_store().cascade_delete(
                 target=target,
                 collection=collection,
                 doc_id=doc_id,
                 user_id=user_id,
-                is_admin=is_admin,
+                is_admin=bool(is_admin) if is_admin is not None else False,
                 model_tag=model_tag,
                 preview_only=preview_only,
                 confirm=confirm,
-                conn=conn,
             )
 
     def cleanup_cascade(
