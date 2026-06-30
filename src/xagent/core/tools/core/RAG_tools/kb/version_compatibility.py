@@ -266,6 +266,10 @@ class KBVersionCompatibilityFacade:
         step_type: str,
         model_tag: Optional[str] = None,
     ) -> KBMainPointerSnapshot:
+        if self._coordinator is not None:
+            return self._coordinator.capture_main_pointer_snapshot_sync(
+                collection, doc_id, step_type, model_tag
+            )
         return KBMainPointerSnapshot(
             collection=collection,
             doc_id=doc_id,
@@ -281,6 +285,10 @@ class KBVersionCompatibilityFacade:
         lancedb_dir: str = "",
         operator: Optional[str] = None,
     ) -> bool:
+        if self._coordinator is not None:
+            return self._coordinator.restore_main_pointer_snapshot_sync(
+                snapshot, operator=operator
+            )
         if snapshot.pointer is None:
             self.delete_main_pointer(
                 snapshot.collection,
@@ -325,6 +333,17 @@ class KBVersionCompatibilityFacade:
         user_id: Optional[int] = None,
         is_admin: Optional[bool] = None,
     ) -> KBVersionCandidateCleanupSnapshot:
+        if self._coordinator is not None:
+            return self._coordinator.capture_candidate_cleanup_snapshot_sync(
+                collection,
+                doc_id,
+                scope,
+                new_parse_hash=new_parse_hash,
+                old_parse_hash=old_parse_hash,
+                model_tag=model_tag,
+                user_id=user_id,
+                is_admin=is_admin,
+            )
         cleanup_counts = self.cleanup_cascade(
             collection=collection,
             doc_id=doc_id,

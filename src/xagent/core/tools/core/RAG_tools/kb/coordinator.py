@@ -17,7 +17,12 @@ from ..core.schemas import (
 from ..storage.factory import StorageFactory
 from ..utils.user_scope import resolve_user_scope
 from .api_compatibility import KBApiCompatibilityFacade
-from .collection_handle import KBHandleProvider, LanceDBCollectionHandle
+from .collection_handle import (
+    KBHandleProvider,
+    KBMainPointerSnapshot,
+    KBVersionCandidateCleanupSnapshot,
+    LanceDBCollectionHandle,
+)
 from .file_compatibility import KBFileCompatibilityFacade
 from .legacy_step_compatibility import KBLegacyStepCompatibilityFacade
 from .maintenance_compatibility import KBMaintenanceCompatibilityFacade
@@ -1304,6 +1309,132 @@ class KBCoordinator:
         if backend is KBStorageBackend.LANCEDB:
             return KBBackendCapabilities.lancedb()
         return KBBackendCapabilities.unsupported()
+
+    # --- Rollback snapshot/restore primitives (#513 Task 7) ---
+
+    async def capture_main_pointer_snapshot(
+        self,
+        collection: str,
+        doc_id: str,
+        step_type: str,
+        model_tag: Optional[str] = None,
+    ) -> "KBMainPointerSnapshot":
+        """Open collection handle and capture a main-pointer snapshot (async)."""
+        handle = await self.open_collection(
+            KBContextRequest(
+                collection=collection,
+                access_mode=KBAccessMode.READ,
+                hide_missing=True,
+            )
+        )
+        return await asyncio.to_thread(
+            handle.capture_main_pointer_snapshot,
+            doc_id,
+            step_type,
+            model_tag,
+        )
+
+    def capture_main_pointer_snapshot_sync(
+        self,
+        collection: str,
+        doc_id: str,
+        step_type: str,
+        model_tag: Optional[str] = None,
+    ) -> "KBMainPointerSnapshot":
+        """Synchronous wrapper for :meth:`capture_main_pointer_snapshot`."""
+        return _run_in_separate_loop(
+            self.capture_main_pointer_snapshot(collection, doc_id, step_type, model_tag)
+        )
+
+    async def restore_main_pointer_snapshot(
+        self,
+        snapshot: "KBMainPointerSnapshot",
+        *,
+        operator: Optional[str] = None,
+    ) -> bool:
+        """Open collection handle and restore a main-pointer snapshot (async)."""
+        handle = await self.open_collection(
+            KBContextRequest(
+                collection=snapshot.collection,
+                access_mode=KBAccessMode.WRITE,
+                hide_missing=True,
+            )
+        )
+        return await asyncio.to_thread(
+            handle.restore_main_pointer_snapshot,
+            snapshot,
+            operator=operator,
+        )
+
+    def restore_main_pointer_snapshot_sync(
+        self,
+        snapshot: "KBMainPointerSnapshot",
+        *,
+        operator: Optional[str] = None,
+    ) -> bool:
+        """Synchronous wrapper for :meth:`restore_main_pointer_snapshot`."""
+        return _run_in_separate_loop(
+            self.restore_main_pointer_snapshot(snapshot, operator=operator)
+        )
+
+    async def capture_candidate_cleanup_snapshot(
+        self,
+        collection: str,
+        doc_id: str,
+        scope: str,
+        *,
+        new_parse_hash: Optional[str] = None,
+        old_parse_hash: Optional[str] = None,
+        model_tag: Optional[str] = None,
+        user_id: Optional[int] = None,
+        is_admin: Optional[bool] = None,
+    ) -> "KBVersionCandidateCleanupSnapshot":
+        """Open collection handle and capture a candidate-cleanup snapshot (async)."""
+        handle = await self.open_collection(
+            KBContextRequest(
+                collection=collection,
+                user_id=user_id,
+                is_admin=bool(is_admin) if is_admin is not None else True,
+                access_mode=KBAccessMode.WRITE,
+                hide_missing=True,
+            )
+        )
+        return await asyncio.to_thread(
+            handle.capture_candidate_cleanup_snapshot,
+            doc_id,
+            scope,
+            new_parse_hash=new_parse_hash,
+            old_parse_hash=old_parse_hash,
+            model_tag=model_tag,
+            user_id=user_id,
+            is_admin=is_admin,
+        )
+
+    def capture_candidate_cleanup_snapshot_sync(
+        self,
+        collection: str,
+        doc_id: str,
+        scope: str,
+        *,
+        new_parse_hash: Optional[str] = None,
+        old_parse_hash: Optional[str] = None,
+        model_tag: Optional[str] = None,
+        user_id: Optional[int] = None,
+        is_admin: Optional[bool] = None,
+    ) -> "KBVersionCandidateCleanupSnapshot":
+        """Synchronous wrapper for :meth:`capture_candidate_cleanup_snapshot`."""
+        return _run_in_separate_loop(
+            self.capture_candidate_cleanup_snapshot(
+                collection,
+                doc_id,
+                scope,
+                new_parse_hash=new_parse_hash,
+                old_parse_hash=old_parse_hash,
+                model_tag=model_tag,
+                user_id=user_id,
+                is_admin=is_admin,
+            )
+        )
 
     def reset_compatibility_caches(self) -> None:
         """Clear coordinator-owned compatibility facade caches."""

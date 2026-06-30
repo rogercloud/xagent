@@ -944,3 +944,297 @@ class TestPromoteVersionMainHandle:
         # Main pointer must NOT have been advanced
         pointer = fake_mp.get_main_pointer("fail_promo_coll", "doc-1", "parse")
         assert pointer is None
+
+
+# ── Task 7: rollback snapshot/restore/clear handle tests ─────────────────────
+
+
+class _FakeIngestionStatusStore:
+    """In-memory IngestionStatusStore for handle-level snapshot tests."""
+
+    def __init__(self) -> None:
+        self.rows: Dict[tuple, Dict[str, Any]] = {}
+
+    def _key(self, collection: str, doc_id: str) -> tuple:
+        return (collection, doc_id)
+
+    def write_ingestion_status(
+        self,
+        collection: str,
+        doc_id: str,
+        *,
+        status: str,
+        message: Optional[str] = None,
+        parse_hash: Optional[str] = None,
+        user_id: Optional[int] = None,
+    ) -> None:
+        self.rows[self._key(collection, doc_id)] = {
+            "collection": collection,
+            "doc_id": doc_id,
+            "status": status,
+            "message": message,
+            "parse_hash": parse_hash,
+            "user_id": user_id,
+        }
+
+    def load_ingestion_status(
+        self,
+        collection: Optional[str] = None,
+        doc_id: Optional[str] = None,
+        user_id: Optional[int] = None,
+        is_admin: bool = False,
+    ) -> List[Dict[str, Any]]:
+        result = []
+        for (row_coll, row_doc), row in self.rows.items():
+            if collection is not None and row_coll != collection:
+                continue
+            if doc_id is not None and row_doc != doc_id:
+                continue
+            result.append(dict(row))
+        return result
+
+    def clear_ingestion_status(
+        self,
+        collection: str,
+        doc_id: str,
+        user_id: Optional[int] = None,
+        is_admin: bool = False,
+    ) -> None:
+        self.rows.pop(self._key(collection, doc_id), None)
+
+    def rename_collection_status(self, old_name, new_name, user_id, is_admin=False):
+        return []
+
+    async def write_ingestion_status_async(
+        self, collection, doc_id, *, status, message=None, parse_hash=None, user_id=None
+    ):
+        self.write_ingestion_status(
+            collection,
+            doc_id,
+            status=status,
+            message=message,
+            parse_hash=parse_hash,
+            user_id=user_id,
+        )
+
+    async def load_ingestion_status_async(
+        self, collection=None, doc_id=None, user_id=None, is_admin=False
+    ):
+        return self.load_ingestion_status(
+            collection=collection, doc_id=doc_id, user_id=user_id, is_admin=is_admin
+        )
+
+    async def clear_ingestion_status_async(
+        self, collection, doc_id, user_id=None, is_admin=False
+    ):
+        self.clear_ingestion_status(
+            collection, doc_id, user_id=user_id, is_admin=is_admin
+        )
+
+
+def make_handle_with_status_store(
+    collection: str = "snap_coll",
+) -> tuple:
+    """Return (handle, fake_status_store, fake_mp_store) for snapshot tests."""
+    fake_status = _FakeIngestionStatusStore()
+    fake_mp = _FakeMainPointerStore()
+    context = KBCollectionContext(
+        collection=collection,
+        user_scope=KBUserScope(user_id=None, is_admin=True),
+        access_mode=KBAccessMode.WRITE,
+        allow_create=True,
+        hide_missing=True,
+        metadata_store=get_metadata_store(),
+        vector_index_store=get_vector_index_store(),
+        ingestion_status_store=fake_status,  # type: ignore[arg-type]
+        main_pointer_store=fake_mp,
+        backend=KBStorageBackend.LANCEDB,
+        capabilities=KBBackendCapabilities.lancedb(),
+        collection_info=None,
+    )
+    return LanceDBCollectionHandle(context), fake_status, fake_mp
+
+
+def test_status_snapshot_restore_then_clear() -> None:
+    """Failed-ingest path: snapshot → simulate failure → restore → clear.
+
+    Asserts the handle's status snapshot primitives produce inspectable state:
+    the status row is restorable from the snapshot, and clear removes it.
+
+    Mirrors the failed-ingest rollback invariant (restores-then-clears status;
+    main pointer NOT advanced by failed ops).
+    """
+    handle, fake_status, _ = make_handle_with_status_store("status_snap_coll")
+
+    # Write a pre-existing "processing" status
+    handle.write_ingestion_status(
+        "doc-snap", status="processing", message="in progress"
+    )
+
+    # Capture snapshot (before potential failure)
+    snapshot = handle.capture_status_snapshot("doc-snap")
+    assert snapshot is not None
+    assert len(snapshot) == 1
+    assert snapshot[0]["status"] == "processing"
+
+    # Simulate a failure: overwrite status with "failed"
+    handle.write_ingestion_status("doc-snap", status="failed", message="boom")
+
+    # Verify mutation happened
+    rows = handle.load_ingestion_status(doc_id="doc-snap", is_admin=True)
+    assert rows[0]["status"] == "failed"
+
+    # Restore from snapshot
+    handle.restore_status_snapshot("doc-snap", snapshot)
+
+    restored = handle.load_ingestion_status(doc_id="doc-snap", is_admin=True)
+    assert len(restored) == 1
+    assert restored[0]["status"] == "processing"
+    assert restored[0]["message"] == "in progress"
+
+    # Clear
+    handle.clear_status_snapshot("doc-snap")
+    cleared = handle.load_ingestion_status(doc_id="doc-snap", is_admin=True)
+    assert cleared == []
+
+
+def test_main_pointer_snapshot_restore_reverts() -> None:
+    """capture_main_pointer_snapshot + restore reverts a mutated pointer.
+
+    Mirrors test_version_compatibility.py:374.
+    """
+    handle = make_handle("mp_snap_coll")
+    handle.set_main_pointer(
+        "doc-1", "parse", semantic_id="parse_old", technical_id="old-hash"
+    )
+
+    snapshot = handle.capture_main_pointer_snapshot("doc-1", "parse")
+    handle.set_main_pointer(
+        "doc-1",
+        "parse",
+        semantic_id="parse_new",
+        technical_id="new-hash",
+        operator="mutator",
+    )
+
+    assert handle.get_main_pointer("doc-1", "parse")["technical_id"] == "new-hash"
+
+    result = handle.restore_main_pointer_snapshot(snapshot, operator="rollback")
+    assert result is True
+
+    restored = handle.get_main_pointer("doc-1", "parse")
+    assert restored is not None
+    assert restored["semantic_id"] == "parse_old"
+    assert restored["technical_id"] == "old-hash"
+
+
+def test_main_pointer_restore_returns_false_for_incomplete() -> None:
+    """Incomplete snapshots (missing semantic_id or technical_id) return False.
+
+    Mirrors test_version_compatibility.py:433.
+    """
+    from xagent.core.tools.core.RAG_tools.kb.collection_handle import (
+        KBMainPointerSnapshot,
+    )
+
+    handle = make_handle("mp_incomplete_coll")
+
+    missing_semantic = KBMainPointerSnapshot(
+        collection="mp_incomplete_coll",
+        doc_id="doc-1",
+        step_type="parse",
+        model_tag=None,
+        pointer={"technical_id": "parse-hash"},
+    )
+    missing_technical = KBMainPointerSnapshot(
+        collection="mp_incomplete_coll",
+        doc_id="doc-1",
+        step_type="parse",
+        model_tag=None,
+        pointer={"semantic_id": "parse_manual_hash"},
+    )
+
+    assert not handle.restore_main_pointer_snapshot(missing_semantic)
+    assert not handle.restore_main_pointer_snapshot(missing_technical)
+    assert handle.list_main_pointers() == []
+
+
+def test_candidate_cleanup_snapshot_records_preview_counts() -> None:
+    """capture_candidate_cleanup_snapshot records preview counts (preview_only=True).
+
+    Mirrors test_version_compatibility.py:463.
+    """
+    handle, fake_vis = make_handle_with_cleanup_store(
+        "candidate_snap_coll",
+        cleanup_return={"chunks": 2, "embeddings": 5},
+    )
+
+    snapshot = handle.capture_candidate_cleanup_snapshot(
+        "doc-1",
+        "parse",
+        new_parse_hash="new-hash",
+        old_parse_hash="old-hash",
+    )
+
+    assert snapshot.cleanup_counts == {"chunks": 2, "embeddings": 5}
+    assert snapshot.collection == "candidate_snap_coll"
+    assert snapshot.doc_id == "doc-1"
+    assert snapshot.scope == "parse"
+    # preview_only must have been passed: no real deletion
+    assert fake_vis.last_cleanup_args is not None
+
+
+def test_candidate_cleanup_restore_marks_remaining_side_effects() -> None:
+    """Executed candidate cleanup is reported as incomplete, not fake-restored.
+
+    Mirrors test_version_compatibility.py:513.
+    """
+    from xagent.core.tools.core.RAG_tools.kb.collection_handle import (
+        KBVersionCandidateCleanupSnapshot,
+    )
+
+    handle = make_handle("candidate_restore_coll")
+
+    snapshot = KBVersionCandidateCleanupSnapshot(
+        collection="candidate_restore_coll",
+        doc_id="doc-1",
+        scope="parse",
+        cleanup_counts={"chunks": 2, "embeddings": 5},
+        new_parse_hash="new-hash",
+        old_parse_hash="old-hash",
+    )
+
+    result = handle.restore_candidate_cleanup_snapshot(snapshot, cleanup_executed=True)
+
+    assert result.status == "incomplete"
+    assert result.skipped
+    assert result.reason == "candidate_cleanup_not_restorable"
+    assert not result.restorable
+    assert result.side_effects_may_remain
+    assert result.cleanup_counts == {"chunks": 2, "embeddings": 5}
+    assert result.warnings
+
+
+def test_candidate_cleanup_restore_does_not_delete_active_artifacts() -> None:
+    """Rollback-incomplete restore reports state without issuing more cleanup.
+
+    Mirrors test_version_compatibility.py:542.
+    """
+    from xagent.core.tools.core.RAG_tools.kb.collection_handle import (
+        KBVersionCandidateCleanupSnapshot,
+    )
+
+    handle, fake_vis = make_handle_with_cleanup_store("no_delete_coll")
+
+    snapshot = KBVersionCandidateCleanupSnapshot(
+        collection="no_delete_coll",
+        doc_id="doc-1",
+        scope="parse",
+        cleanup_counts={"parses": 1, "chunks": 2},
+    )
+    result = handle.restore_candidate_cleanup_snapshot(snapshot, cleanup_executed=True)
+
+    assert result.status == "incomplete"
+    assert result.side_effects_may_remain
+    # The fake store should NOT have been called for cleanup on restore
+    assert fake_vis.last_cleanup_args is None

@@ -81,6 +81,11 @@ from ..utils.hash_utils import compute_chunk_hash
 from ..utils.metadata_utils import deserialize_metadata, serialize_metadata
 from ..utils.string_utils import generate_deterministic_doc_id
 from .models import KBBackendCapabilities, KBCollectionContext, KBStorageBackend
+from .version_compatibility import (
+    KBMainPointerSnapshot,
+    KBVersionCandidateCleanupSnapshot,
+    KBVersionCandidateRollbackResult,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -3307,6 +3312,201 @@ class LanceDBCollectionHandle(KBCollectionHandle):
                 exc,
             )
             return [str(exc)]
+
+    # --- Rollback snapshot/restore/clear primitives (#513 Task 7) ---
+
+    def capture_status_snapshot(
+        self,
+        doc_id: str,
+        *,
+        user_id: int | None = None,
+        is_admin: bool = True,
+    ) -> List[Dict[str, Any]]:
+        """Capture the current ingestion-status rows for ``doc_id`` (snapshot).
+
+        Returns the list of status rows as returned by ``load_ingestion_status``.
+        An empty list means no status row exists (snapshot of absence).
+        """
+        return self.load_ingestion_status(
+            doc_id=doc_id, user_id=user_id, is_admin=is_admin
+        )
+
+    def restore_status_snapshot(
+        self,
+        doc_id: str,
+        snapshot: List[Dict[str, Any]],
+        *,
+        user_id: int | None = None,
+    ) -> None:
+        """Restore an ingestion-status snapshot captured by ``capture_status_snapshot``.
+
+        If ``snapshot`` is empty the status row is cleared (restoring absence).
+        If ``snapshot`` contains a row it is re-written (restoring the prior state).
+        """
+        if not snapshot:
+            self.clear_ingestion_status(doc_id, user_id=user_id, is_admin=True)
+            return
+        for row in snapshot:
+            self.write_ingestion_status(
+                doc_id,
+                status=row.get("status", ""),
+                message=row.get("message"),
+                parse_hash=row.get("parse_hash"),
+                user_id=row.get("user_id"),
+            )
+
+    def clear_status_snapshot(
+        self,
+        doc_id: str,
+        *,
+        user_id: int | None = None,
+        is_admin: bool = True,
+    ) -> None:
+        """Clear the ingestion-status row for ``doc_id`` (post-rollback cleanup).
+
+        Thin wrapper over ``clear_ingestion_status`` for the rollback path.
+        """
+        self.clear_ingestion_status(doc_id, user_id=user_id, is_admin=is_admin)
+
+    def capture_main_pointer_snapshot(
+        self,
+        doc_id: str,
+        step_type: str,
+        model_tag: str | None = None,
+    ) -> "KBMainPointerSnapshot":
+        """Capture the current main-pointer row as a snapshot before mutation.
+
+        Returns a :class:`KBMainPointerSnapshot`; ``pointer`` is ``None`` when
+        no pointer exists (snapshot of absence).
+        """
+        return KBMainPointerSnapshot(
+            collection=self.context.collection,
+            doc_id=doc_id,
+            step_type=step_type,
+            model_tag=model_tag,
+            pointer=self.get_main_pointer(doc_id, step_type, model_tag),
+        )
+
+    def restore_main_pointer_snapshot(
+        self,
+        snapshot: "KBMainPointerSnapshot",
+        *,
+        operator: str | None = None,
+    ) -> bool:
+        """Restore the main pointer to the state recorded in ``snapshot``.
+
+        If ``snapshot.pointer`` is ``None`` the pointer is deleted (restoring
+        absence).  Returns ``True`` on success, ``False`` when the snapshot
+        pointer is incomplete (missing ``semantic_id`` or ``technical_id``).
+        """
+        if snapshot.pointer is None:
+            self.delete_main_pointer(
+                snapshot.doc_id, snapshot.step_type, snapshot.model_tag
+            )
+            return True
+
+        semantic_id = snapshot.pointer.get("semantic_id")
+        technical_id = snapshot.pointer.get("technical_id")
+        if not semantic_id or not technical_id:
+            logger.warning(
+                "Failed to restore main pointer snapshot for %s/%s/%s: "
+                "missing semantic_id or technical_id",
+                snapshot.collection,
+                snapshot.doc_id,
+                snapshot.step_type,
+            )
+            return False
+
+        self.set_main_pointer(
+            snapshot.doc_id,
+            snapshot.step_type,
+            semantic_id,
+            technical_id,
+            model_tag=snapshot.model_tag,
+            operator=operator,
+        )
+        return True
+
+    def capture_candidate_cleanup_snapshot(
+        self,
+        doc_id: str,
+        scope: str,
+        *,
+        new_parse_hash: str | None = None,
+        old_parse_hash: str | None = None,
+        model_tag: str | None = None,
+        user_id: int | None = None,
+        is_admin: bool | None = None,
+    ) -> "KBVersionCandidateCleanupSnapshot":
+        """Capture a preview of what candidate cleanup would delete (preview_only=True).
+
+        The preview counts are stored in the snapshot; no rows are actually
+        deleted.  The snapshot can later be passed to
+        ``restore_candidate_cleanup_snapshot`` to determine rollback feasibility.
+        """
+        cleanup_counts = self.cleanup_cascade(
+            doc_id,
+            scope,
+            new_parse_hash=new_parse_hash,
+            old_parse_hash=old_parse_hash,
+            model_tag=model_tag,
+            user_id=user_id,
+            is_admin=is_admin,
+            preview_only=True,
+            confirm=False,
+        )
+        return KBVersionCandidateCleanupSnapshot(
+            collection=self.context.collection,
+            doc_id=doc_id,
+            scope=scope,
+            cleanup_counts=cleanup_counts,
+            new_parse_hash=new_parse_hash,
+            old_parse_hash=old_parse_hash,
+            model_tag=model_tag,
+            user_id=user_id,
+            is_admin=is_admin,
+        )
+
+    def restore_candidate_cleanup_snapshot(
+        self,
+        snapshot: "KBVersionCandidateCleanupSnapshot",
+        *,
+        cleanup_executed: bool = False,
+    ) -> "KBVersionCandidateRollbackResult":
+        """Assess rollback feasibility for a candidate-cleanup snapshot.
+
+        When ``cleanup_executed=True`` and the snapshot recorded side effects,
+        returns a result with ``status="incomplete"``, ``restorable=False``,
+        and ``side_effects_may_remain=True`` — the inspectable-incomplete
+        invariant.  Never issues further deletes; the state is left inspectable.
+        """
+        cleanup_counts = dict(snapshot.cleanup_counts)
+        has_candidate_side_effects = any(
+            int(count) > 0 for count in cleanup_counts.values()
+        )
+        if not cleanup_executed or not has_candidate_side_effects:
+            return KBVersionCandidateRollbackResult(
+                collection=snapshot.collection,
+                doc_id=snapshot.doc_id,
+                status="not_needed",
+                restorable=True,
+                cleanup_counts=cleanup_counts,
+            )
+
+        return KBVersionCandidateRollbackResult(
+            collection=snapshot.collection,
+            doc_id=snapshot.doc_id,
+            status="incomplete",
+            skipped=True,
+            restorable=False,
+            reason="candidate_cleanup_not_restorable",
+            cleanup_counts=cleanup_counts,
+            warnings=(
+                "Version candidate cleanup cannot be restored from the handle; "
+                "preserve visible rollback state and report remaining side effects.",
+            ),
+            side_effects_may_remain=True,
+        )
 
     async def write_ingestion_status_async(
         self,
