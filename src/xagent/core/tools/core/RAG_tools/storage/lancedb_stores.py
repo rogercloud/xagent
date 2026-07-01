@@ -2779,7 +2779,7 @@ class LanceDBVectorIndexStore(VectorIndexStore):
         collection: str,
         doc_id: Optional[str] = None,
         user_id: Optional[int] = None,
-        is_admin: bool = False,
+        is_admin: Optional[bool] = None,
         model_tag: Optional[str] = None,
         preview_only: bool = True,
         confirm: bool = False,

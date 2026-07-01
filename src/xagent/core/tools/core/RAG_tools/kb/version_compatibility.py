@@ -428,7 +428,7 @@ class KBVersionCompatibilityFacade:
                 collection=collection,
                 doc_id=doc_id,
                 user_id=user_id,
-                is_admin=bool(is_admin) if is_admin is not None else False,
+                is_admin=is_admin,
                 model_tag=model_tag,
                 preview_only=preview_only,
                 confirm=confirm,
