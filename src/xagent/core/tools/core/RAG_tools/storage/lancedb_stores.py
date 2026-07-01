@@ -2403,7 +2403,7 @@ class LanceDBVectorIndexStore(VectorIndexStore):
         """
         if not isinstance(parser, str) or not parser.startswith("local:"):
             return "unknown"
-        method = parser[len("local:"):].split("@", 1)[0]
+        method = parser[len("local:") :].split("@", 1)[0]
         return method or "unknown"
 
     def _vis_get_parse_candidates(

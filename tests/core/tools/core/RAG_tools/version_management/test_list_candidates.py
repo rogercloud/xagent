@@ -560,13 +560,13 @@ class TestListCandidates:
         ("local:pypdf@v1.0.0", "pypdf"),
         ("local:unstructured@v1.0.0", "unstructured"),
         ("local:default@v1.0.0", "default"),
-        ("local:pypdf", "pypdf"),            # missing version segment, still recovers
-        ("local:@v1.0.0", "unknown"),        # empty method
-        ("unknown", "unknown"),              # current row.get("parser", "unknown") default
+        ("local:pypdf", "pypdf"),  # missing version segment, still recovers
+        ("local:@v1.0.0", "unknown"),  # empty method
+        ("unknown", "unknown"),  # current row.get("parser", "unknown") default
         ("remote:something@v1", "unknown"),  # non-local prefix
         ("", "unknown"),
         (None, "unknown"),
-        (123, "unknown"),                    # non-str
+        (123, "unknown"),  # non-str
     ],
 )
 def test_vis_method_from_parser(parser, expected):
