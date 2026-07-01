@@ -1035,7 +1035,7 @@ class LanceDBVectorIndexStore(VectorIndexStore):
         warnings_out: Optional[List[str]] = None,
     ) -> Dict[str, int]:
         """Delete vector-side data for multiple documents in batches."""
-        normalized_doc_ids = sorted({str(doc_id) for doc_id in doc_ids if str(doc_id)})
+        normalized_doc_ids = sorted({str(doc_id) for doc_id in doc_ids if doc_id})
         if not normalized_doc_ids:
             return {}
 
@@ -3264,7 +3264,7 @@ def _vis_cascade_delete_documents(
     )
     from ..utils.user_scope import resolve_user_scope
 
-    normalized_doc_ids = sorted({str(d) for d in doc_ids if str(d)})
+    normalized_doc_ids = sorted({str(d) for d in doc_ids if d})
     if not normalized_doc_ids:
         return {}
 
