@@ -418,7 +418,6 @@ class KBVersionCompatibilityFacade:
         model_tag: Optional[str] = None,
         preview_only: bool = True,
         confirm: bool = False,
-        conn: Any | None = None,  # vestigial — accepted for back-compat, ignored
     ) -> Dict[str, int]:
         from ..storage.factory import get_vector_index_store
 

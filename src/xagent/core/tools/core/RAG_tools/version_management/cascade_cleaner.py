@@ -7,7 +7,7 @@ ensuring data consistency across processing stages.
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Any, Dict, Optional
+from typing import TYPE_CHECKING, Dict, Optional
 
 from typing_extensions import Literal
 
@@ -35,7 +35,6 @@ def cascade_delete(
     model_tag: Optional[str] = None,
     preview_only: bool = True,
     confirm: bool = False,
-    conn: Any | None = None,
 ) -> Dict[str, int]:
     return _get_version_compatibility_facade().cascade_delete(
         target=target,
@@ -46,7 +45,6 @@ def cascade_delete(
         model_tag=model_tag,
         preview_only=preview_only,
         confirm=confirm,
-        conn=conn,
     )
 
 

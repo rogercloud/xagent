@@ -326,7 +326,6 @@ def test_public_version_helpers_remain_sync_and_route_through_facade(
                 "model_tag": None,
                 "preview_only": True,
                 "confirm": False,
-                "conn": None,
             },
         ),
     ]
