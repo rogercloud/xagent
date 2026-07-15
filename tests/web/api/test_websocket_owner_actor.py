@@ -668,7 +668,21 @@ async def test_resume_rejection_embeds_known_control_state(db_session) -> None:
     ):
         await handle_resume_task(MagicMock(), int(task.id), {"user": owner})
 
-    payload = ws_manager.send_personal_message.await_args.args[0]
+        # The rejection is sent from a dispatched command that
+        # ``dispatch_task_command_promptly`` may detach after its 50ms
+        # deadline, so the "task" payload can land after this call returns.
+        for _ in range(100):
+            for call in ws_manager.send_personal_message.await_args_list:
+                if "task" in call.args[0]:
+                    payload = call.args[0]
+                    break
+            else:
+                await asyncio.sleep(0.01)
+                continue
+            break
+        else:
+            raise AssertionError("resume rejection payload did not arrive in time")
+
     assert payload["task"] == {
         "id": int(task.id),
         "run_id": "run-current",
