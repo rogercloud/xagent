@@ -671,15 +671,15 @@ async def test_resume_rejection_embeds_known_control_state(db_session) -> None:
         # The rejection is sent from a dispatched command that
         # ``dispatch_task_command_promptly`` may detach after its 50ms
         # deadline, so the "task" payload can land after this call returns.
+        payload = None
         for _ in range(100):
             for call in ws_manager.send_personal_message.await_args_list:
-                if "task" in call.args[0]:
+                if call.args and "task" in call.args[0]:
                     payload = call.args[0]
                     break
-            else:
-                await asyncio.sleep(0.01)
-                continue
-            break
+            if payload is not None:
+                break
+            await asyncio.sleep(0.01)
         else:
             raise AssertionError("resume rejection payload did not arrive in time")
 
