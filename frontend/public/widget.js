@@ -504,6 +504,12 @@
         // its own flush is held back (see handleResult) so this call wins.
         var wait = state.inflight.exchange || Promise.resolve();
         return wait.then(function () {
+          // Re-check: the exchange we waited on may have just latched a
+          // terminal state (or left us without a token at all). Firing a
+          // network call after that would violate "zero network calls once
+          // latched", so bail out to the terminal flush instead.
+          if (state.terminalCode) { flush(); return; }
+          if (!state.reconnectToken) return;
           var body = { reconnect_token: state.reconnectToken };
           if (state.grant) body.encrypted_context = state.grant;
           return withRetry(function () {

@@ -449,6 +449,39 @@ describe("widget session mode", () => {
     expect(post.mock.calls[0][0]).toMatchObject({ session_token: "st_second" })
   })
 
+  it("never fires a deferred reconnect once the exchange it waited on goes terminal", async () => {
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => undefined)
+    fetchMock.mockResolvedValueOnce(errorResponse(409, "widget_disabled"))
+    runWidget({ "data-encrypted-context": GRANT })
+    const post = spyOnIframePostMessage()
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1))
+
+    // reconnect_request arrives while the exchange is still in flight (its
+    // response hasn't been parsed yet), so it coalesces via singleFlight and
+    // defers its own network call until the exchange settles.
+    fromIframe("reconnect_request", { reason: "ws_closed" })
+
+    // The exchange settles into a terminal error.
+    await vi.waitFor(() => expect(errorSpy).toHaveBeenCalledWith(
+      expect.stringContaining("[widget_disabled]"),
+    ))
+    fromIframe("ready")
+    await vi.waitFor(() => expect(post).toHaveBeenCalled())
+    // Give the deferred reconnect's `wait.then` callback a turn to run: it
+    // only wakes up after singleFlight clears state.inflight.exchange, which
+    // happens one more microtask turn after handleResult/goTerminal return.
+    await Promise.resolve()
+    await Promise.resolve()
+
+    // The deferred reconnect must re-check the terminal latch before firing
+    // its network call and bail out instead — no second (reconnect) fetch,
+    // ever, and every broadcast the frame receives is the terminal one.
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+    for (const call of post.mock.calls) {
+      expect(call[0]).toMatchObject({ type: "session_terminal", code: "widget_disabled" })
+    }
+  })
+
   it("answers reconnect_request from a latched terminal state without any network call", async () => {
     const errorSpy = vi.spyOn(console, "error").mockImplementation(() => undefined)
     fetchMock.mockResolvedValueOnce(errorResponse(409, "widget_disabled"))
@@ -490,6 +523,21 @@ describe("widget session mode", () => {
     expect(post.mock.calls[0][0]).toMatchObject({ session_token: "st_fresh" })
   })
 
+  // NOTE on coverage: this test proves a stale/abandoned first attempt can't
+  // cause a duplicate or incorrect flush once a retry has already won the
+  // race (real, useful, and exercised below). It does NOT exercise the
+  // `state.settled` guard in handleResult (widget.js "first response wins")
+  // that specifically blocks a SECOND *successful* exchange() response from
+  // being applied: withRetry only ever surfaces its final settled result to
+  // handleResult('exchange', ...) once per exchange() call (retries are
+  // strictly sequential — attempt N+1 is never dispatched until attempt N's
+  // promise has settled), and exchange() itself has exactly one call site in
+  // production (runLoadFlow(), guarded by singleFlight). So handleResult can
+  // never actually observe a second successful 'exchange' response through
+  // any sequence of public events, and `state.settled` being true when that
+  // happens is not reachable via this test file's public surface (DOM
+  // attributes, fetch responses, postMessage). Confirmed by tracing every
+  // call site; see the Stage 4 report for the full trace.
   it("ignores a late duplicate exchange response after the session moved on", async () => {
     // Fake timers must be installed before runWidget() schedules postJson's
     // SESSION_TIMEOUT_MS abort timer, or advanceTimersByTimeAsync below has
