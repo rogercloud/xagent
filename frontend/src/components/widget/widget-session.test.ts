@@ -56,6 +56,16 @@ function errorResponse(status: number, code: string) {
   return jsonResponse(status, { error: { code, message: "nope" } })
 }
 
+// vi.waitFor's condition here (fetchMock call count) goes true the instant
+// fetch() is invoked, which happens synchronously during runWidget(). That
+// resolves the waitFor promise before the mocked Response's real .json()
+// body-read (an inherently async, multi-microtask-tick operation) has settled.
+// A macrotask flush lets every already-scheduled microtask (the fetch/json/
+// applySession chain) drain before we simulate the iframe's "ready" signal.
+function flushAsync() {
+  return new Promise<void>((resolve) => setTimeout(resolve, 0))
+}
+
 function exchangeBody(overrides: Record<string, unknown> = {}) {
   return {
     session_token: "st_first",
@@ -184,5 +194,90 @@ describe("widget session mode", () => {
     runWidget({ "data-encrypted-context": `${GRANT}-other` })
 
     expect(document.querySelectorAll(".xagent-widget-container")).toHaveLength(2)
+  })
+
+  it("pushes session_update to the iframe once it announces ready", async () => {
+    fetchMock.mockResolvedValueOnce(jsonResponse(200, exchangeBody()))
+    runWidget({ "data-encrypted-context": GRANT })
+    const post = spyOnIframePostMessage()
+
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1))
+    await flushAsync()
+    fromIframe("ready")
+
+    expect(post).toHaveBeenCalledTimes(1)
+    const [message, targetOrigin] = post.mock.calls[0]
+    expect(targetOrigin).toBe(HOST)
+    expect(message).toMatchObject({
+      xagent: true,
+      v: 1,
+      type: "session_update",
+      session_token: "st_first",
+      agent: { id: 42, name: "Care Assistant" },
+    })
+    expect(message).not.toHaveProperty("reconnect_token")
+  })
+
+  it("holds only the latest state until ready arrives", async () => {
+    fetchMock
+      .mockResolvedValueOnce(jsonResponse(200, exchangeBody()))
+      .mockResolvedValueOnce(jsonResponse(200, exchangeBody({
+        session_token: "st_second",
+        reconnect_token: "rt_second",
+      })))
+    runWidget({ "data-encrypted-context": GRANT })
+    const post = spyOnIframePostMessage()
+
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1))
+    await flushAsync()
+    fromIframe("reconnect_request", { reason: "ws_closed" })
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2))
+    await flushAsync()
+
+    expect(post).not.toHaveBeenCalled()
+    fromIframe("ready")
+
+    expect(post).toHaveBeenCalledTimes(1)
+    expect(post.mock.calls[0][0]).toMatchObject({ session_token: "st_second" })
+  })
+
+  it("re-sends the current state on every ready", async () => {
+    fetchMock.mockResolvedValueOnce(jsonResponse(200, exchangeBody()))
+    runWidget({ "data-encrypted-context": GRANT })
+    const post = spyOnIframePostMessage()
+
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1))
+    await flushAsync()
+    fromIframe("ready")
+    fromIframe("ready")
+
+    expect(post).toHaveBeenCalledTimes(2)
+    expect(post.mock.calls[1][0]).toMatchObject({ type: "session_update", session_token: "st_first" })
+  })
+
+  it("ignores messages from a foreign origin, a foreign source, or a foreign shape", async () => {
+    fetchMock.mockResolvedValueOnce(jsonResponse(200, exchangeBody()))
+    runWidget({ "data-encrypted-context": GRANT })
+    const post = spyOnIframePostMessage()
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1))
+
+    window.dispatchEvent(new MessageEvent("message", {
+      data: { xagent: true, v: 1, type: "ready" },
+      origin: "https://evil.example",
+      source: iframeEl()?.contentWindow as Window,
+    }))
+    window.dispatchEvent(new MessageEvent("message", {
+      data: { xagent: true, v: 1, type: "ready" },
+      origin: HOST,
+      source: window,
+    }))
+    fromIframe("ready", { v: 2 })
+    window.dispatchEvent(new MessageEvent("message", {
+      data: { type: "ready" },
+      origin: HOST,
+      source: iframeEl()?.contentWindow as Window,
+    }))
+
+    expect(post).not.toHaveBeenCalled()
   })
 })

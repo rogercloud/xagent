@@ -280,6 +280,7 @@
     function attach(iframe) {
       state.iframe = iframe;
       iframe.src = host + '/widget/chat/session';
+      window.addEventListener('message', onMessage);
       runLoadFlow();
     }
 
@@ -287,12 +288,92 @@
       return exchange();
     }
 
+    function onMessage(event) {
+      if (!state.iframe || event.source !== state.iframe.contentWindow) return;
+      if (event.origin !== host) return;
+      var data = event.data;
+      if (!data || data.xagent !== true || data.v !== 1) return;
+
+      if (data.type === 'ready') {
+        state.ready = true;
+        flush();
+      } else if (data.type === 'reconnect_request') {
+        onReconnectRequest();
+      }
+    }
+
+    function send(message) {
+      message.xagent = true;
+      message.v = 1;
+      state.iframe.contentWindow.postMessage(message, host);
+    }
+
+    // Level-triggered: every ready re-sends whatever the current state is, and
+    // only the latest state is ever sent. Replaying an older session_update
+    // would hand the iframe an already-rotated token.
+    function flush() {
+      if (!state.ready) return;
+      if (state.terminalCode) {
+        send({ type: 'session_terminal', code: state.terminalCode });
+        return;
+      }
+      if (!state.session) return;
+      send({
+        type: 'session_update',
+        session_token: state.session.session_token,
+        session_token_expires_at: state.session.session_token_expires_at,
+        absolute_expires_at: state.session.absolute_expires_at,
+        agent: state.session.agent
+      });
+    }
+
+    function applySession(data) {
+      state.session = {
+        session_token: data.session_token,
+        session_token_expires_at: data.session_token_expires_at,
+        absolute_expires_at: data.session && data.session.absolute_expires_at,
+        agent: data.session && data.session.agent
+      };
+      state.reconnectToken = data.reconnect_token;
+    }
+
     function exchange() {
-      return fetch(host + '/v1/external/chat/sessions', {
+      return postJson(host + '/v1/external/chat/sessions', { encrypted_context: state.grant })
+        .then(function (r) {
+          if (r.ok && r.data && r.data.session_token) {
+            applySession(r.data);
+            flush();
+          }
+          return r;
+        });
+    }
+
+    function postJson(url, body) {
+      return fetch(url, {
         method: 'POST',
         credentials: 'omit',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ encrypted_context: state.grant })
+        body: JSON.stringify(body)
+      }).then(function (res) {
+        return res.json().catch(function () { return null; }).then(function (data) {
+          return { ok: res.ok, status: res.status, data: data };
+        });
+      });
+    }
+
+    function onReconnectRequest() {
+      reconnect();
+    }
+
+    function reconnect() {
+      var body = { reconnect_token: state.reconnectToken };
+      if (state.grant) body.encrypted_context = state.grant;
+      return postJson(host + '/v1/external/chat/sessions/reconnect', body).then(function (r) {
+        if (r.ok && r.data && r.data.session_token) {
+          applySession(r.data);
+          flush();
+        }
+        return r;
       });
     }
 
