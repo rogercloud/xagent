@@ -216,6 +216,20 @@
     return window.__xagentWidgetGrants;
   }
 
+  // 32-bit FNV-1a: a fast, dependency-free, synchronous string digest. This is
+  // NOT a security boundary (no crypto guarantees) -- it only exists so the
+  // dedupe registry never stores the grant plaintext itself, so that a
+  // third-party script scraping window.__xagentWidgetGrants can't recover the
+  // grant the way it could if the raw string were used as the key.
+  function hashGrant(text) {
+    var hash = 0x811c9dc5;
+    for (var i = 0; i < text.length; i++) {
+      hash ^= text.charCodeAt(i);
+      hash = (hash * 0x01000193) >>> 0;
+    }
+    return 'g' + hash.toString(16);
+  }
+
   function logSession(level, text, code, status) {
     var suffix = status ? ' (HTTP ' + status + ')' : '';
     console[level]('Xagent Widget: ' + text + ' [' + code + ']' + suffix + '.');
@@ -237,11 +251,12 @@
     }
 
     var registry = xagentSessionRegistry();
-    if (registry[grant]) {
+    var registryKey = hashGrant(grant);
+    if (registry[registryKey]) {
       logSession('warn', 'this grant is already running on the page, ignoring the duplicate embed', 'duplicate_init');
       return null;
     }
-    registry[grant] = true;
+    registry[registryKey] = true;
 
     // The grant lives in the closure from here on; keeping it in the DOM would
     // let any third-party script on the page scrape it off the script tag.
