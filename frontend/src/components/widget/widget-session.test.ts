@@ -534,16 +534,20 @@ describe("widget session mode", () => {
   // race (real, useful, and exercised below). It does NOT exercise the
   // `state.settled` guard in handleResult (widget.js "first response wins")
   // that specifically blocks a SECOND *successful* exchange() response from
-  // being applied: withRetry only ever surfaces its final settled result to
-  // handleResult('exchange', ...) once per exchange() call (retries are
-  // strictly sequential — attempt N+1 is never dispatched until attempt N's
-  // promise has settled), and exchange() itself has exactly one call site in
-  // production (runLoadFlow(), guarded by singleFlight). So handleResult can
-  // never actually observe a second successful 'exchange' response through
-  // any sequence of public events, and `state.settled` being true when that
-  // happens is not reachable via this test file's public surface (DOM
-  // attributes, fetch responses, postMessage). Confirmed by tracing every
-  // call site; see the Stage 4 report for the full trace.
+  // being applied: within a single exchange() call, withRetry only ever
+  // surfaces its final settled result to handleResult('exchange', ...) once
+  // (retries are strictly sequential — attempt N+1 is never dispatched until
+  // attempt N's promise has settled). BUT exchange() no longer has exactly
+  // one call site in production as of Stage 5's bfcache handling: onPageShow
+  // deliberately clears state.inflight.exchange and calls runLoadFlow() again
+  // on an unhealthy-state page restore, which defeats the singleFlight guard
+  // on purpose so a first exchange that was merely frozen (not actually dead)
+  // can still resolve later and reach handleResult('exchange', ...) after a
+  // second one already has. That is exactly the double-apply race
+  // `state.settled` exists to prevent, and it is reachable in principle
+  // again. No test in this file (including this one) drives that concurrent
+  // scenario end-to-end, so the guard remains uncovered here — but it is NOT
+  // dead code and must not be removed. See the Stage 5 report for the trace.
   it("ignores a late duplicate exchange response after the session moved on", async () => {
     // Fake timers must be installed before runWidget() schedules postJson's
     // SESSION_TIMEOUT_MS abort timer, or advanceTimersByTimeAsync below has
