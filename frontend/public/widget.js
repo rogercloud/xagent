@@ -3,6 +3,54 @@
   var scriptTag = document.currentScript;
   var host = new URL(scriptTag.src).origin;
 
+  var SESSION_TIMEOUT_MS = 5000;          // constants appendix #16
+  var SESSION_RETRY_DELAYS = [1000, 2000, 4000];  // four attempts, three waits
+  var SESSION_MAX_RATE_LIMIT_RETRIES = 2;
+  var SESSION_REFRESH_THRESHOLD_MS = 60000;
+
+  function sessionDelay(ms) {
+    return new Promise(function (resolve) { setTimeout(resolve, ms); });
+  }
+
+  function retryAfterMs(result, fallback) {
+    var header = result && result.retryAfter;
+    var seconds = header ? parseInt(header, 10) : NaN;
+    return isNaN(seconds) ? fallback : seconds * 1000;
+  }
+
+  // Retries only the transport classes: rejected fetches (network, CORS, CSP,
+  // abort) and any 5xx, coded or not. 429 has its own small budget.
+  function withRetry(makeRequest) {
+    var attempt = 0;
+    var rateLimited = 0;
+
+    function retryOrGiveUp(result, error) {
+      if (attempt >= SESSION_RETRY_DELAYS.length) {
+        if (error) throw error;
+        return result;
+      }
+      var wait = SESSION_RETRY_DELAYS[attempt];
+      attempt += 1;
+      return sessionDelay(wait).then(run);
+    }
+
+    function run() {
+      return makeRequest().then(function (result) {
+        if (result.status === 429) {
+          if (rateLimited >= SESSION_MAX_RATE_LIMIT_RETRIES) return result;
+          rateLimited += 1;
+          return sessionDelay(retryAfterMs(result, 1000)).then(run);
+        }
+        if (result.status >= 500) return retryOrGiveUp(result, null);
+        return result;
+      }, function (error) {
+        return retryOrGiveUp(null, error);
+      });
+    }
+
+    return run();
+  }
+
   // Single mode branch point: a delegated context grant switches the whole
   // identity channel. Either factory returns null after reporting a
   // fail-closed integration error, in which case nothing is rendered at all.
@@ -337,27 +385,73 @@
       state.reconnectToken = data.reconnect_token;
     }
 
-    function exchange() {
-      return postJson(host + '/v1/external/chat/sessions', { encrypted_context: state.grant })
-        .then(function (r) {
-          if (r.ok && r.data && r.data.session_token) {
-            applySession(r.data);
-            flush();
-          }
-          return r;
-        });
+    function goTerminal(code, status) {
+      if (state.terminalCode) return;
+      state.terminalCode = code;
+      logSession('error', 'chat unavailable', code, status);
+      flush();
+    }
+
+    var STALE_GRANT_CODES = { grant_expired: true, grant_already_used: true };
+
+    function handleResult(result, phase) {
+      if (result.ok && result.data && result.data.session_token) {
+        if (phase === 'exchange') {
+          if (state.settled) return;   // first response wins
+          state.settled = true;
+        }
+        applySession(result.data);
+        flush();
+        return;
+      }
+
+      var code = result.data && result.data.error && result.data.error.code;
+      if (!code) {
+        goTerminal(result.status >= 500 ? 'network_unavailable' : 'unexpected_error', result.status);
+        return;
+      }
+      if (phase === 'exchange' && STALE_GRANT_CODES[code] && state.reconnectToken) {
+        reconnect();
+        return;
+      }
+      goTerminal(code, result.status);
     }
 
     function postJson(url, body) {
+      var controller = new AbortController();
+      var timer = setTimeout(function () { controller.abort(); }, SESSION_TIMEOUT_MS);
       return fetch(url, {
         method: 'POST',
         credentials: 'omit',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(body)
+        body: JSON.stringify(body),
+        signal: controller.signal
       }).then(function (res) {
-        return res.json().catch(function () { return null; }).then(function (data) {
-          return { ok: res.ok, status: res.status, data: data };
+        clearTimeout(timer);
+        // .clone() before reading: mocks (and retried real fetches) can hand back
+        // the same Response instance across attempts, and a body can only be
+        // read once from any given instance.
+        return res.clone().json().catch(function () { return null; }).then(function (data) {
+          return {
+            ok: res.ok,
+            status: res.status,
+            data: data,
+            retryAfter: res.headers.get('Retry-After')
+          };
         });
+      }, function (err) {
+        clearTimeout(timer);
+        throw err;
+      });
+    }
+
+    function exchange() {
+      return withRetry(function () {
+        return postJson(host + '/v1/external/chat/sessions', { encrypted_context: state.grant });
+      }).then(function (result) {
+        handleResult(result, 'exchange');
+      }, function () {
+        goTerminal('network_unavailable');
       });
     }
 
@@ -368,12 +462,12 @@
     function reconnect() {
       var body = { reconnect_token: state.reconnectToken };
       if (state.grant) body.encrypted_context = state.grant;
-      return postJson(host + '/v1/external/chat/sessions/reconnect', body).then(function (r) {
-        if (r.ok && r.data && r.data.session_token) {
-          applySession(r.data);
-          flush();
-        }
-        return r;
+      return withRetry(function () {
+        return postJson(host + '/v1/external/chat/sessions/reconnect', body);
+      }).then(function (result) {
+        handleResult(result, 'reconnect');
+      }, function () {
+        goTerminal('network_unavailable');
       });
     }
 
