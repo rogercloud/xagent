@@ -93,6 +93,16 @@ function exchangeBody(overrides: Record<string, unknown> = {}) {
 
 describe("widget session mode", () => {
   let currentScriptDescriptor: PropertyDescriptor | undefined
+  // runWidget()'s attach() registers 'message' and 'pageshow' listeners
+  // directly on the shared jsdom `window` (vitest reuses one window per test
+  // file). Without tracking and removing them, a controller from an earlier
+  // test stays subscribed and reacts to a later test's fromIframe()/
+  // firePageShow() dispatches, corrupting that later test's fetch-call
+  // counts. We wrap addEventListener for the duration of each test to record
+  // every (type, listener) pair the production code registers on window, and
+  // remove them all in afterEach.
+  let windowListeners: Array<[string, EventListenerOrEventListenerObject]> = []
+  let realAddEventListener: typeof window.addEventListener
 
   beforeEach(() => {
     currentScriptDescriptor = Object.getOwnPropertyDescriptor(document, "currentScript")
@@ -103,9 +113,21 @@ describe("widget session mode", () => {
     Reflect.deleteProperty(window as unknown as Record<string, unknown>, "__xagentWidgetGrants")
     vi.stubGlobal("fetch", fetchMock)
     fetchMock.mockReset()
+
+    windowListeners = []
+    realAddEventListener = window.addEventListener.bind(window)
+    vi.spyOn(window, "addEventListener").mockImplementation((type, listener, options) => {
+      windowListeners.push([type, listener as EventListenerOrEventListenerObject])
+      realAddEventListener(type, listener, options)
+    })
   })
 
   afterEach(() => {
+    for (const [type, listener] of windowListeners) {
+      window.removeEventListener(type, listener)
+    }
+    windowListeners = []
+
     if (currentScriptDescriptor) {
       Object.defineProperty(document, "currentScript", currentScriptDescriptor)
     } else {
@@ -529,25 +551,75 @@ describe("widget session mode", () => {
     expect(post.mock.calls[0][0]).toMatchObject({ session_token: "st_fresh" })
   })
 
+  it.each([
+    ["reconnect_invalid", 401],
+    ["session_expired", 401],
+    ["identity_mismatch", 403],
+  ])("goes terminal on %s from the reconnect endpoint without retrying", async (code, status) => {
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => undefined)
+    fetchMock
+      .mockResolvedValueOnce(jsonResponse(200, exchangeBody()))
+      .mockResolvedValueOnce(errorResponse(status as number, code as string))
+    runWidget({ "data-encrypted-context": GRANT })
+    const post = spyOnIframePostMessage()
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1))
+    await flushAsync()
+    fromIframe("ready")
+    post.mockClear()
+
+    fromIframe("reconnect_request", { reason: "ws_closed" })
+
+    await vi.waitFor(() => expect(errorSpy).toHaveBeenCalledWith(
+      expect.stringContaining(`[${code}] (HTTP ${status})`),
+    ))
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+    expect(fetchMock.mock.calls[1][0]).toBe(RECONNECT_URL)
+
+    fromIframe("ready")
+    expect(post).toHaveBeenCalledWith(
+      expect.objectContaining({ type: "session_terminal", code }),
+      HOST,
+    )
+  })
+
+  it("retries an uncoded 5xx three times on the reconnect endpoint, then reports network_unavailable", async () => {
+    vi.useFakeTimers()
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => undefined)
+    fetchMock.mockResolvedValueOnce(jsonResponse(200, exchangeBody()))
+    runWidget({ "data-encrypted-context": GRANT })
+    await vi.advanceTimersByTimeAsync(0)
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+
+    fetchMock.mockResolvedValue(new Response("<html>bad gateway</html>", { status: 502 }))
+    fromIframe("reconnect_request", { reason: "ws_closed" })
+
+    await vi.advanceTimersByTimeAsync(0)
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+    expect(fetchMock.mock.calls[1][0]).toBe(RECONNECT_URL)
+    await vi.advanceTimersByTimeAsync(1000)
+    expect(fetchMock).toHaveBeenCalledTimes(3)
+    await vi.advanceTimersByTimeAsync(2000)
+    expect(fetchMock).toHaveBeenCalledTimes(4)
+    await vi.advanceTimersByTimeAsync(4000)
+    expect(fetchMock).toHaveBeenCalledTimes(5)
+
+    await vi.advanceTimersByTimeAsync(8000)
+    expect(fetchMock).toHaveBeenCalledTimes(5)  // exchange + four reconnect attempts, never a fifth reconnect
+    expect(errorSpy).toHaveBeenCalledWith(expect.stringContaining("[network_unavailable] (HTTP 502)"))
+  })
+
   // NOTE on coverage: this test proves a stale/abandoned first attempt can't
   // cause a duplicate or incorrect flush once a retry has already won the
-  // race (real, useful, and exercised below). It does NOT exercise the
-  // `state.settled` guard in handleResult (widget.js "first response wins")
-  // that specifically blocks a SECOND *successful* exchange() response from
-  // being applied: within a single exchange() call, withRetry only ever
-  // surfaces its final settled result to handleResult('exchange', ...) once
-  // (retries are strictly sequential — attempt N+1 is never dispatched until
-  // attempt N's promise has settled). BUT exchange() no longer has exactly
-  // one call site in production as of Stage 5's bfcache handling: onPageShow
-  // deliberately clears state.inflight.exchange and calls runLoadFlow() again
-  // on an unhealthy-state page restore, which defeats the singleFlight guard
-  // on purpose so a first exchange that was merely frozen (not actually dead)
-  // can still resolve later and reach handleResult('exchange', ...) after a
-  // second one already has. That is exactly the double-apply race
-  // `state.settled` exists to prevent, and it is reachable in principle
-  // again. No test in this file (including this one) drives that concurrent
-  // scenario end-to-end, so the guard remains uncovered here — but it is NOT
-  // dead code and must not be removed. See the Stage 5 report for the trace.
+  // race, WITHIN a single exchange() call (retries are strictly sequential —
+  // attempt N+1 is never dispatched until attempt N's promise has settled).
+  // It does not exercise `state.settled` itself: that guard blocks a SECOND
+  // *successful* exchange() response from being applied, and this race is
+  // resolved before either attempt reaches handleResult (the late one is
+  // rejected by AbortController, not raced against a winner). The genuine
+  // `state.settled` race — two independent, real exchange() calls, both
+  // resolving successfully, in reversed order — is covered separately below
+  // by "blocks a late first exchange response from overwriting a
+  // bfcache-triggered second exchange that already won".
   it("ignores a late duplicate exchange response after the session moved on", async () => {
     // Fake timers must be installed before runWidget() schedules postJson's
     // SESSION_TIMEOUT_MS abort timer, or advanceTimersByTimeAsync below has
@@ -579,6 +651,45 @@ describe("widget session mode", () => {
     await Promise.resolve()
 
     expect(post).not.toHaveBeenCalled()
+  })
+
+  it("blocks a late first exchange response from overwriting a bfcache-triggered second exchange that already won", async () => {
+    // Both attempts are real, independent exchange() calls that genuinely
+    // resolve (no abort, no rejection) — the first is just frozen, not dead.
+    let resolveFirst: (value: Response) => void = () => undefined
+    fetchMock.mockImplementationOnce(() => new Promise<Response>((resolve) => {
+      resolveFirst = resolve
+    }))
+    runWidget({ "data-encrypted-context": GRANT })
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1))
+
+    // The page freezes with that first exchange still in flight, then
+    // restores from bfcache. state.session is still null, so onPageShow
+    // takes the "unhealthy" branch: it drops the singleFlight handle and
+    // fires a second, independent exchange call while the first is still
+    // pending — this is what defeats the singleFlight guard on purpose.
+    fetchMock.mockResolvedValueOnce(jsonResponse(200, exchangeBody({ session_token: "st_second" })))
+    firePageShow(true)
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2))
+
+    const post = spyOnIframePostMessage()
+    await flushAsync()
+    fromIframe("ready")
+    expect(post).toHaveBeenCalledTimes(1)
+    expect(post.mock.calls[0][0]).toMatchObject({ session_token: "st_second" })
+    post.mockClear()
+
+    // The first attempt was merely frozen, not dead: it now resolves late,
+    // after the second has already been applied and flushed, with a
+    // different, stale session. state.settled must block it from ever
+    // reaching the frame.
+    resolveFirst(jsonResponse(200, exchangeBody({ session_token: "st_stale", reconnect_token: "rt_stale" })))
+    await flushAsync()
+
+    expect(post).not.toHaveBeenCalled()
+    fromIframe("ready")
+    expect(post).toHaveBeenCalledTimes(1)
+    expect(post.mock.calls[0][0]).toMatchObject({ session_token: "st_second" })
   })
 
   it("does not loop when the server hands back an already-stale token", async () => {
