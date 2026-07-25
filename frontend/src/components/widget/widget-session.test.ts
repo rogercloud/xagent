@@ -107,4 +107,82 @@ describe("widget session mode", () => {
       expect(iframeEl()?.src).toContain("/widget/chat/default")
     })
   })
+
+  it("navigates the iframe to the session URL and exchanges the grant immediately", () => {
+    fetchMock.mockResolvedValueOnce(jsonResponse(200, exchangeBody()))
+
+    runWidget({ "data-encrypted-context": GRANT })
+
+    expect(iframeEl()?.src).toBe(`${HOST}/widget/chat/session`)
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+    expect(fetchMock).toHaveBeenCalledWith(EXCHANGE_URL, expect.objectContaining({
+      method: "POST",
+      credentials: "omit",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ encrypted_context: GRANT }),
+    }))
+  })
+
+  it("fails closed on an empty grant attribute with no DOM and no network", () => {
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => undefined)
+
+    runWidget({ "data-encrypted-context": "   " })
+
+    expect(fetchMock).not.toHaveBeenCalled()
+    expect(document.querySelector(".xagent-widget-container")).toBeNull()
+    expect(document.head.querySelector("style")).toBeNull()
+    expect(errorSpy).toHaveBeenCalledWith(expect.stringContaining("[grant_malformed]"))
+  })
+
+  it.each(["data-widget-key", "data-token"])(
+    "fails closed when %s coexists with the grant",
+    (legacyAttribute) => {
+      const errorSpy = vi.spyOn(console, "error").mockImplementation(() => undefined)
+
+      runWidget({ "data-encrypted-context": GRANT, [legacyAttribute]: "legacy" })
+
+      expect(fetchMock).not.toHaveBeenCalled()
+      expect(document.querySelector(".xagent-widget-container")).toBeNull()
+      expect(errorSpy).toHaveBeenCalledWith(expect.stringContaining("[attribute_conflict]"))
+    },
+  )
+
+  it("keeps cosmetic attributes working in session mode", () => {
+    fetchMock.mockResolvedValueOnce(jsonResponse(200, exchangeBody()))
+
+    runWidget({ "data-encrypted-context": GRANT, "data-button-color": "rgb(1, 2, 3)" })
+
+    expect(document.head.querySelector("style")?.innerHTML).toContain("rgb(1, 2, 3)")
+  })
+
+  it("never writes a guest id in session mode", () => {
+    fetchMock.mockResolvedValueOnce(jsonResponse(200, exchangeBody()))
+
+    runWidget({ "data-encrypted-context": GRANT })
+
+    expect(localStorage.getItem("xagent_guest_id")).toBeNull()
+  })
+
+  it("removes the grant attribute from the DOM once it is read", () => {
+    fetchMock.mockResolvedValueOnce(jsonResponse(200, exchangeBody()))
+
+    const script = runWidget({ "data-encrypted-context": GRANT })
+
+    expect(script.hasAttribute("data-encrypted-context")).toBe(false)
+  })
+
+  it("ignores a repeat injection of the same grant but allows a different one", () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => undefined)
+    fetchMock.mockResolvedValue(jsonResponse(200, exchangeBody()))
+
+    runWidget({ "data-encrypted-context": GRANT })
+    runWidget({ "data-encrypted-context": GRANT })
+
+    expect(document.querySelectorAll(".xagent-widget-container")).toHaveLength(1)
+    expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining("[duplicate_init]"))
+
+    runWidget({ "data-encrypted-context": `${GRANT}-other` })
+
+    expect(document.querySelectorAll(".xagent-widget-container")).toHaveLength(2)
+  })
 })
