@@ -66,6 +66,12 @@ function flushAsync() {
   return new Promise<void>((resolve) => setTimeout(resolve, 0))
 }
 
+function firePageShow(persisted: boolean) {
+  const event = new Event("pageshow") as PageTransitionEvent & { persisted: boolean }
+  Object.defineProperty(event, "persisted", { value: persisted })
+  window.dispatchEvent(event)
+}
+
 function exchangeBody(overrides: Record<string, unknown> = {}) {
   return {
     session_token: "st_first",
@@ -583,5 +589,65 @@ describe("widget session mode", () => {
     await vi.waitFor(() => expect(post).toHaveBeenCalled())
 
     expect(fetchMock).toHaveBeenCalledTimes(2)  // one refresh attempt, then hand it over anyway
+  })
+
+  it("re-runs the load flow when a bfcache restore finds no session", async () => {
+    vi.useFakeTimers()
+    // The exchange never settles: the page was frozen mid-flight.
+    fetchMock.mockImplementationOnce(() => new Promise(() => undefined))
+    runWidget({ "data-encrypted-context": GRANT })
+    await vi.advanceTimersByTimeAsync(0)
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+
+    fetchMock.mockResolvedValueOnce(jsonResponse(200, exchangeBody()))
+    firePageShow(true)
+    await vi.advanceTimersByTimeAsync(0)
+
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+    expect(fetchMock.mock.calls[1][0]).toBe(EXCHANGE_URL)
+  })
+
+  it("does nothing on a bfcache restore with a healthy session", async () => {
+    fetchMock.mockResolvedValueOnce(jsonResponse(200, exchangeBody()))
+    runWidget({ "data-encrypted-context": GRANT })
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1))
+    // vi.waitFor's condition above (fetchMock call count) goes true the
+    // instant fetch() is invoked, before the mocked Response's .json() body
+    // read (and the applySession() it feeds) has actually settled — see the
+    // flushAsync() comment near the top of this file for the same race. A
+    // macrotask flush here lets state.session actually be populated before
+    // firePageShow, or this test would spuriously re-trigger the load flow.
+    await flushAsync()
+
+    firePageShow(true)
+    await Promise.resolve()
+
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+  })
+
+  it("does nothing on a bfcache restore after a terminal outcome", async () => {
+    vi.spyOn(console, "error").mockImplementation(() => undefined)
+    fetchMock.mockResolvedValueOnce(errorResponse(403, "agent_not_granted"))
+    runWidget({ "data-encrypted-context": GRANT })
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1))
+    // Same race as above: let goTerminal() actually latch state.terminalCode
+    // before firePageShow, or this test would spuriously re-trigger the load
+    // flow while the terminal outcome is still mid-flight.
+    await flushAsync()
+
+    firePageShow(true)
+    await Promise.resolve()
+
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+  })
+
+  it("does nothing on a normal (non-persisted) pageshow", async () => {
+    fetchMock.mockImplementationOnce(() => new Promise(() => undefined))
+    runWidget({ "data-encrypted-context": GRANT })
+
+    firePageShow(false)
+    await Promise.resolve()
+
+    expect(fetchMock).toHaveBeenCalledTimes(1)
   })
 })

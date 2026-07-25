@@ -330,11 +330,27 @@
       state.iframe = iframe;
       iframe.src = host + '/widget/chat/session';
       window.addEventListener('message', onMessage);
+      window.addEventListener('pageshow', onPageShow);
       runLoadFlow();
     }
 
     function runLoadFlow() {
       return exchange();
+    }
+
+    // Scripts do not re-run on a bfcache restore, so the grant-first load flow
+    // needs an explicit entry point here. Only unhealthy states re-run: a
+    // healthy page would burn a doomed exchange on every back-navigation, and a
+    // latched terminal stays terminal.
+    function onPageShow(event) {
+      if (!event.persisted) return;
+      if (state.terminalCode) return;
+      if (state.session) return;
+      // A request that was in flight while the page was frozen may never
+      // settle; drop the single-flight handle so the load flow can run again.
+      state.inflight.exchange = null;
+      state.inflight.reconnect = null;
+      runLoadFlow();
     }
 
     function onMessage(event) {
