@@ -420,4 +420,120 @@ describe("widget session mode", () => {
     expect(fetchMock).toHaveBeenCalledTimes(3)
     expect(errorSpy).toHaveBeenCalledWith(expect.stringContaining("[rate_limited] (HTTP 429)"))
   })
+
+  it("coalesces concurrent reconnect requests into a single call and one broadcast", async () => {
+    fetchMock
+      .mockResolvedValueOnce(jsonResponse(200, exchangeBody()))
+      .mockResolvedValueOnce(jsonResponse(200, exchangeBody({
+        session_token: "st_second",
+        reconnect_token: "rt_second",
+      })))
+    runWidget({ "data-encrypted-context": GRANT })
+    const post = spyOnIframePostMessage()
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1))
+    fromIframe("ready")
+    post.mockClear()
+
+    fromIframe("reconnect_request", { reason: "ws_closed" })
+    fromIframe("reconnect_request", { reason: "ws_closed" })
+    fromIframe("reconnect_request", { reason: "token_expired" })
+    await vi.waitFor(() => expect(post).toHaveBeenCalled())
+
+    expect(fetchMock).toHaveBeenCalledTimes(2)  // one exchange + one reconnect
+    expect(fetchMock.mock.calls[1][0]).toBe(RECONNECT_URL)
+    expect(JSON.parse(fetchMock.mock.calls[1][1].body)).toEqual({
+      reconnect_token: "rt_first",
+      encrypted_context: GRANT,
+    })
+    expect(post).toHaveBeenCalledTimes(1)
+    expect(post.mock.calls[0][0]).toMatchObject({ session_token: "st_second" })
+  })
+
+  it("answers reconnect_request from a latched terminal state without any network call", async () => {
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => undefined)
+    fetchMock.mockResolvedValueOnce(errorResponse(409, "widget_disabled"))
+    runWidget({ "data-encrypted-context": GRANT })
+    const post = spyOnIframePostMessage()
+    // Wait for the exchange to actually finish failing (terminal latch set),
+    // not just for fetch() to have been called — the response body still
+    // needs to be parsed asynchronously before goTerminal() runs.
+    await vi.waitFor(() => expect(errorSpy).toHaveBeenCalledWith(
+      expect.stringContaining("[widget_disabled]"),
+    ))
+    fromIframe("ready")
+    post.mockClear()
+
+    fromIframe("reconnect_request", { reason: "ws_closed" })
+    fromIframe("reconnect_request", { reason: "ws_closed" })
+
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+    expect(post).toHaveBeenCalledTimes(2)
+    expect(post.mock.calls[0][0]).toMatchObject({ type: "session_terminal", code: "widget_disabled" })
+  })
+
+  it("reconnects before handing the frame a token with under 60s left", async () => {
+    fetchMock
+      .mockResolvedValueOnce(jsonResponse(200, exchangeBody({
+        session_token_expires_at: new Date(Date.now() + 30_000).toISOString(),
+      })))
+      .mockResolvedValueOnce(jsonResponse(200, exchangeBody({ session_token: "st_fresh" })))
+    runWidget({ "data-encrypted-context": GRANT })
+    const post = spyOnIframePostMessage()
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1))
+
+    fromIframe("ready")
+    await vi.waitFor(() => expect(post).toHaveBeenCalled())
+
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+    expect(fetchMock.mock.calls[1][0]).toBe(RECONNECT_URL)
+    expect(post).toHaveBeenCalledTimes(1)
+    expect(post.mock.calls[0][0]).toMatchObject({ session_token: "st_fresh" })
+  })
+
+  it("ignores a late duplicate exchange response after the session moved on", async () => {
+    // Fake timers must be installed before runWidget() schedules postJson's
+    // SESSION_TIMEOUT_MS abort timer, or advanceTimersByTimeAsync below has
+    // nothing to advance and the real timer never fires within the test.
+    vi.useFakeTimers()
+    let resolveLate: (value: Response) => void = () => undefined
+    fetchMock
+      // The first attempt hangs until the client gives up: postJson's own
+      // AbortController fires at SESSION_TIMEOUT_MS, and this mock (like the
+      // "aborts an attempt" test above) must react to that signal the way a
+      // real fetch would, or withRetry never sees this attempt settle and
+      // never starts the retry that's supposed to win the race.
+      .mockImplementationOnce((_url: string, init: RequestInit) => new Promise<Response>((resolve, reject) => {
+        resolveLate = resolve
+        ;(init.signal as AbortSignal).addEventListener("abort", () => reject(new DOMException("aborted", "AbortError")))
+      }))
+      .mockResolvedValueOnce(jsonResponse(200, exchangeBody({ session_token: "st_real" })))
+    runWidget({ "data-encrypted-context": GRANT })
+    const post = spyOnIframePostMessage()
+    fromIframe("ready")
+
+    // The first attempt times out and the retry wins.
+    await vi.advanceTimersByTimeAsync(6000)
+    await vi.waitFor(() => expect(post).toHaveBeenCalled())
+    vi.useRealTimers()
+    post.mockClear()
+
+    resolveLate(jsonResponse(200, exchangeBody({ session_token: "st_stale", reconnect_token: "rt_stale" })))
+    await Promise.resolve()
+
+    expect(post).not.toHaveBeenCalled()
+  })
+
+  it("does not loop when the server hands back an already-stale token", async () => {
+    fetchMock.mockResolvedValue(jsonResponse(200, exchangeBody({
+      session_token_expires_at: new Date(Date.now() + 10_000).toISOString(),
+    })))
+    runWidget({ "data-encrypted-context": GRANT })
+    const post = spyOnIframePostMessage()
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1))
+
+    fromIframe("ready")
+    await vi.waitFor(() => expect(post).toHaveBeenCalled())
+
+    expect(fetchMock).toHaveBeenCalledTimes(2)  // one refresh attempt, then hand it over anyway
+  })
 })

@@ -322,7 +322,8 @@
       reconnectToken: null,
       terminalCode: null,
       settled: false,
-      inflight: { exchange: null, reconnect: null }
+      inflight: { exchange: null, reconnect: null },
+      refreshedOnce: false
     };
 
     function attach(iframe) {
@@ -356,6 +357,12 @@
       state.iframe.contentWindow.postMessage(message, host);
     }
 
+    function isStale(expiresAt) {
+      var at = Date.parse(expiresAt);
+      if (isNaN(at)) return true;
+      return at - Date.now() < SESSION_REFRESH_THRESHOLD_MS;
+    }
+
     // Level-triggered: every ready re-sends whatever the current state is, and
     // only the latest state is ever sent. Replaying an older session_update
     // would hand the iframe an already-rotated token.
@@ -366,6 +373,12 @@
         return;
       }
       if (!state.session) return;
+      // Rule 3: refresh before any use of the token, including handing it over.
+      if (isStale(state.session.session_token_expires_at) && !state.refreshedOnce) {
+        state.refreshedOnce = true;
+        reconnect();
+        return;
+      }
       send({
         type: 'session_update',
         session_token: state.session.session_token,
@@ -383,6 +396,9 @@
         agent: data.session && data.session.agent
       };
       state.reconnectToken = data.reconnect_token;
+      state.refreshedOnce = isStale(state.session.session_token_expires_at)
+        ? state.refreshedOnce
+        : false;
     }
 
     function goTerminal(code, status) {
@@ -401,6 +417,10 @@
           state.settled = true;
         }
         applySession(result.data);
+        // A reconnect already in flight supersedes this response: it was
+        // queued while this exchange was still pending and will carry the
+        // freshest reconnect_token, so let it be the one that flushes.
+        if (phase === 'exchange' && state.inflight.reconnect) return;
         flush();
         return;
       }
@@ -445,29 +465,55 @@
       });
     }
 
-    function exchange() {
-      return withRetry(function () {
-        return postJson(host + '/v1/external/chat/sessions', { encrypted_context: state.grant });
-      }).then(function (result) {
-        handleResult(result, 'exchange');
+    function singleFlight(key, makePromise) {
+      if (state.inflight[key]) return state.inflight[key];
+      var promise = makePromise().then(function () {
+        state.inflight[key] = null;
       }, function () {
-        goTerminal('network_unavailable');
+        state.inflight[key] = null;
+      });
+      state.inflight[key] = promise;
+      return promise;
+    }
+
+    function exchange() {
+      return singleFlight('exchange', function () {
+        return withRetry(function () {
+          return postJson(host + '/v1/external/chat/sessions', { encrypted_context: state.grant });
+        }).then(function (result) {
+          handleResult(result, 'exchange');
+        }, function () {
+          goTerminal('network_unavailable');
+        });
       });
     }
 
     function onReconnectRequest() {
+      if (state.terminalCode) {
+        flush();
+        return;
+      }
       reconnect();
     }
 
     function reconnect() {
-      var body = { reconnect_token: state.reconnectToken };
-      if (state.grant) body.encrypted_context = state.grant;
-      return withRetry(function () {
-        return postJson(host + '/v1/external/chat/sessions/reconnect', body);
-      }).then(function (result) {
-        handleResult(result, 'reconnect');
-      }, function () {
-        goTerminal('network_unavailable');
+      if (state.terminalCode) { flush(); return Promise.resolve(); }
+      return singleFlight('reconnect', function () {
+        // If an exchange is still in flight, wait for it: it will land the
+        // authoritative reconnect_token this reconnect needs to send, and
+        // its own flush is held back (see handleResult) so this call wins.
+        var wait = state.inflight.exchange || Promise.resolve();
+        return wait.then(function () {
+          var body = { reconnect_token: state.reconnectToken };
+          if (state.grant) body.encrypted_context = state.grant;
+          return withRetry(function () {
+            return postJson(host + '/v1/external/chat/sessions/reconnect', body);
+          }).then(function (result) {
+            handleResult(result, 'reconnect');
+          }, function () {
+            goTerminal('network_unavailable');
+          });
+        });
       });
     }
 
