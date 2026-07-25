@@ -32,6 +32,7 @@ export default defineConfig({
     // merging to keep this command strictly targeted.
     include: [
       "src/components/widget/widget-bootstrap.test.ts",
+      "src/components/widget/widget-session.test.ts",
       "src/components/widget/public-agent-chat-page.test.tsx",
     ],
   },
