@@ -145,11 +145,15 @@ applied.
 reason; `RemovedFromMergeQueueEvent.reason` does:
 
 ```bash
-gh api graphql -f query='
-query { repository(owner:"xorbitsai",name:"xagent"){ pullRequest(number:PR){
+gh api graphql -F number=PR_NUMBER -f query='
+query($number: Int!) { repository(owner:"xorbitsai",name:"xagent"){ pullRequest(number:$number){
   timelineItems(last:5, itemTypes:[REMOVED_FROM_MERGE_QUEUE_EVENT]){ nodes{
     ... on RemovedFromMergeQueueEvent { createdAt reason } } } } } }'
 ```
+
+Note that a *successful* merge also emits a removal event, with
+`reason: merged`. "Removed from merge queue" on its own says nothing about
+whether anything went wrong — read the reason.
 
 **Merge queue is organization-only.** It cannot be configured on a
 personal-account repository -- a `merge_queue` ruleset there is rejected with
