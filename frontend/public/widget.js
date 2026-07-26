@@ -273,7 +273,7 @@
     var hash = 0x811c9dc5;
     for (var i = 0; i < text.length; i++) {
       hash ^= text.charCodeAt(i);
-      hash = (hash * 0x01000193) >>> 0;
+      hash = Math.imul(hash, 0x01000193) >>> 0;
     }
     return 'g' + hash.toString(16);
   }
@@ -321,7 +321,8 @@
       session: null,
       reconnectToken: null,
       terminalCode: null,
-      settled: false,
+      exchangeAccepted: false,
+      exchangeSeq: 0,
       inflight: { exchange: null, reconnect: null },
       refreshedOnce: false
     };
@@ -426,11 +427,17 @@
 
     var STALE_GRANT_CODES = { grant_expired: true, grant_already_used: true };
 
-    function handleResult(result, phase) {
-      if (result.ok && result.data && result.data.session_token) {
+    function handleResult(result, phase, seq) {
+      var isSuccess = result.ok && result.data && result.data.session_token;
+      if (phase === 'exchange') {
+        // Preserve first-success-wins while discarding failures from an older
+        // request that bfcache recovery deliberately superseded.
+        if (state.exchangeAccepted) return;
+        if (!isSuccess && seq !== state.exchangeSeq) return;
+      }
+      if (isSuccess) {
         if (phase === 'exchange') {
-          if (state.settled) return;   // first response wins
-          state.settled = true;
+          state.exchangeAccepted = true;
         }
         applySession(result.data);
         // A reconnect already in flight supersedes this response: it was
@@ -494,12 +501,16 @@
 
     function exchange() {
       return singleFlight('exchange', function () {
+        state.exchangeSeq += 1;
+        var seq = state.exchangeSeq;
         return withRetry(function () {
           return postJson(host + '/v1/external/chat/sessions', { encrypted_context: state.grant });
         }).then(function (result) {
-          handleResult(result, 'exchange');
+          handleResult(result, 'exchange', seq);
         }, function () {
-          goTerminal('network_unavailable');
+          if (!state.exchangeAccepted && seq === state.exchangeSeq) {
+            goTerminal('network_unavailable');
+          }
         });
       });
     }

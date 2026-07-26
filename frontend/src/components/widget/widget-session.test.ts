@@ -224,6 +224,17 @@ describe("widget session mode", () => {
     expect(document.querySelectorAll(".xagent-widget-container")).toHaveLength(2)
   })
 
+  it("uses the exact 32-bit FNV-1a digest for grant dedupe keys", () => {
+    fetchMock.mockResolvedValueOnce(jsonResponse(200, exchangeBody()))
+
+    runWidget({ "data-encrypted-context": "hello" })
+
+    expect(
+      (window as unknown as { __xagentWidgetGrants: Record<string, boolean> })
+        .__xagentWidgetGrants,
+    ).toEqual({ g4f9f2cab: true })
+  })
+
   it("pushes session_update to the iframe once it announces ready", async () => {
     fetchMock.mockResolvedValueOnce(jsonResponse(200, exchangeBody()))
     runWidget({ "data-encrypted-context": GRANT })
@@ -612,11 +623,11 @@ describe("widget session mode", () => {
   // cause a duplicate or incorrect flush once a retry has already won the
   // race, WITHIN a single exchange() call (retries are strictly sequential —
   // attempt N+1 is never dispatched until attempt N's promise has settled).
-  // It does not exercise `state.settled` itself: that guard blocks a SECOND
+  // It does not exercise `state.exchangeAccepted` itself: that guard blocks a SECOND
   // *successful* exchange() response from being applied, and this race is
   // resolved before either attempt reaches handleResult (the late one is
   // rejected by AbortController, not raced against a winner). The genuine
-  // `state.settled` race — two independent, real exchange() calls, both
+  // `state.exchangeAccepted` race — two independent, real exchange() calls, both
   // resolving successfully, in reversed order — is covered separately below
   // by "blocks a late first exchange response from overwriting a
   // bfcache-triggered second exchange that already won".
@@ -681,7 +692,7 @@ describe("widget session mode", () => {
 
     // The first attempt was merely frozen, not dead: it now resolves late,
     // after the second has already been applied and flushed, with a
-    // different, stale session. state.settled must block it from ever
+    // different, stale session. state.exchangeAccepted must block it from ever
     // reaching the frame.
     resolveFirst(jsonResponse(200, exchangeBody({ session_token: "st_stale", reconnect_token: "rt_stale" })))
     await flushAsync()
@@ -690,6 +701,152 @@ describe("widget session mode", () => {
     fromIframe("ready")
     expect(post).toHaveBeenCalledTimes(1)
     expect(post.mock.calls[0][0]).toMatchObject({ session_token: "st_second" })
+  })
+
+  it("ignores a superseded exchange failure after the replacement exchange succeeds", async () => {
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => undefined)
+    let resolveFirst: (value: Response) => void = () => undefined
+    fetchMock.mockImplementationOnce(() => new Promise<Response>((resolve) => {
+      resolveFirst = resolve
+    }))
+    runWidget({ "data-encrypted-context": GRANT })
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1))
+
+    fetchMock.mockResolvedValueOnce(jsonResponse(200, exchangeBody({ session_token: "st_second" })))
+    firePageShow(true)
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2))
+
+    const post = spyOnIframePostMessage()
+    await flushAsync()
+    fromIframe("ready")
+    expect(post).toHaveBeenCalledWith(
+      expect.objectContaining({ type: "session_update", session_token: "st_second" }),
+      HOST,
+    )
+    post.mockClear()
+
+    resolveFirst(errorResponse(409, "agent_not_available"))
+    await flushAsync()
+
+    expect(errorSpy).not.toHaveBeenCalledWith(
+      expect.stringContaining("[agent_not_available]"),
+    )
+    expect(post).not.toHaveBeenCalled()
+    fromIframe("ready")
+    expect(post).toHaveBeenCalledWith(
+      expect.objectContaining({ type: "session_update", session_token: "st_second" }),
+      HOST,
+    )
+  })
+
+  it("ignores a superseded exchange failure before the replacement exchange succeeds", async () => {
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => undefined)
+    let resolveFirst: (value: Response) => void = () => undefined
+    let resolveSecond: (value: Response) => void = () => undefined
+    fetchMock.mockImplementationOnce(() => new Promise<Response>((resolve) => {
+      resolveFirst = resolve
+    }))
+    runWidget({ "data-encrypted-context": GRANT })
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1))
+
+    fetchMock.mockImplementationOnce(() => new Promise<Response>((resolve) => {
+      resolveSecond = resolve
+    }))
+    firePageShow(true)
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2))
+
+    const post = spyOnIframePostMessage()
+    fromIframe("ready")
+    resolveFirst(errorResponse(409, "agent_not_available"))
+    await flushAsync()
+
+    expect(errorSpy).not.toHaveBeenCalledWith(
+      expect.stringContaining("[agent_not_available]"),
+    )
+    expect(post).not.toHaveBeenCalled()
+
+    resolveSecond(jsonResponse(200, exchangeBody({ session_token: "st_second" })))
+    await flushAsync()
+    expect(post).toHaveBeenCalledWith(
+      expect.objectContaining({ type: "session_update", session_token: "st_second" }),
+      HOST,
+    )
+  })
+
+  it("ignores an exhausted network failure from a superseded exchange", async () => {
+    vi.useFakeTimers()
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => undefined)
+    let rejectFirst: (reason: unknown) => void = () => undefined
+    fetchMock.mockImplementationOnce(() => new Promise<Response>((_resolve, reject) => {
+      rejectFirst = reject
+    }))
+    runWidget({ "data-encrypted-context": GRANT })
+    await vi.advanceTimersByTimeAsync(0)
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+
+    fetchMock.mockResolvedValueOnce(jsonResponse(200, exchangeBody({ session_token: "st_second" })))
+    firePageShow(true)
+    await vi.advanceTimersByTimeAsync(0)
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+
+    const post = spyOnIframePostMessage()
+    fromIframe("ready")
+    expect(post).toHaveBeenCalledWith(
+      expect.objectContaining({ type: "session_update", session_token: "st_second" }),
+      HOST,
+    )
+    post.mockClear()
+
+    fetchMock.mockRejectedValue(new TypeError("Failed to fetch"))
+    rejectFirst(new TypeError("Failed to fetch"))
+    await vi.advanceTimersByTimeAsync(7000)
+
+    expect(fetchMock).toHaveBeenCalledTimes(5)
+    expect(errorSpy).not.toHaveBeenCalledWith(
+      expect.stringContaining("[network_unavailable]"),
+    )
+    expect(post).not.toHaveBeenCalled()
+    fromIframe("ready")
+    expect(post).toHaveBeenCalledWith(
+      expect.objectContaining({ type: "session_update", session_token: "st_second" }),
+      HOST,
+    )
+  })
+
+  it("keeps the first successful exchange even when a replacement request has started", async () => {
+    let resolveFirst: (value: Response) => void = () => undefined
+    let resolveSecond: (value: Response) => void = () => undefined
+    fetchMock.mockImplementationOnce(() => new Promise<Response>((resolve) => {
+      resolveFirst = resolve
+    }))
+    runWidget({ "data-encrypted-context": GRANT })
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1))
+
+    fetchMock.mockImplementationOnce(() => new Promise<Response>((resolve) => {
+      resolveSecond = resolve
+    }))
+    firePageShow(true)
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2))
+
+    const post = spyOnIframePostMessage()
+    resolveFirst(jsonResponse(200, exchangeBody({ session_token: "st_first_winner" })))
+    await flushAsync()
+    fromIframe("ready")
+    expect(post).toHaveBeenCalledWith(
+      expect.objectContaining({ type: "session_update", session_token: "st_first_winner" }),
+      HOST,
+    )
+    post.mockClear()
+
+    resolveSecond(jsonResponse(200, exchangeBody({ session_token: "st_second_late" })))
+    await flushAsync()
+
+    expect(post).not.toHaveBeenCalled()
+    fromIframe("ready")
+    expect(post).toHaveBeenCalledWith(
+      expect.objectContaining({ type: "session_update", session_token: "st_first_winner" }),
+      HOST,
+    )
   })
 
   it("does not loop when the server hands back an already-stale token", async () => {
