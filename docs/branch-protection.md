@@ -52,7 +52,8 @@ merge `main` into open migration PRs while `strict` was on, and along the way it
 hand-parsed `down_revision` out of the source with `ast` and re-derived the head
 graph without going through Alembic. A second implementation that can disagree
 with the authoritative one, while posting a status that looks just as official,
-is worse than not checking twice.
+is not extra protection -- it is a second answer that can quietly contradict the
+real one.
 
 Its regression coverage lives in
 `tests/migrations/test_check_alembic_heads.py`, which injects each defect into a
@@ -193,9 +194,10 @@ The required contexts are therefore the two summary jobs:
 | `CI Summary` | `ci.yml` | `pre-commit`, `pytest-fast`, `pytest-fast-deepdoc`, `pytest-slow`, `e2e`, `frontend-build`, `prepare-deepdoc-cache` |
 
 Both declare `if: always()` and fail unless every job they gather reports
-`success` -- `skipped`, `failure` and `cancelled` all fail. **`always()` is
-load-bearing.** Removing it looks harmless and silently restores the hole, which
-is why it carries a comment in the workflow saying so.
+`success` -- a gathered job that is `skipped`, `failure` or `cancelled` fails
+the summary. **`always()` is load-bearing.** Removing it looks harmless and
+silently restores the hole, which is why it carries a comment in the workflow
+saying so.
 
 Adding a job to either workflow does not automatically gate on it. It has to be
 added to that summary's `needs` and to its `check_job` list, or it is advisory
