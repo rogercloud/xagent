@@ -199,6 +199,21 @@ the summary. **`always()` is load-bearing.** Removing it looks harmless and
 silently restores the hole, which is why it carries a comment in the workflow
 saying so.
 
+### Gate at the step, not at the job
+
+Failing on `skipped` only works because **no gathered job is ever skipped**.
+`Test SQLite Migrations` and `Test PostgreSQL Migrations` carry no job-level
+`if:` at all. When `detect-migration-changes` reports `should-test=false`, the
+jobs still run; it is their *steps* that are gated, and the job reports
+`success` in a few seconds. A PR that touches no migration still gets a green
+`Migrations Summary` -- this page's own PR is an example.
+
+That is a deliberate property and an easy one to destroy. Moving the condition
+up to the job level looks like an optimisation -- same outcome, one less job
+started -- but it turns every non-migration PR into a skipped required job,
+which reports success, which is the exact hole the summary exists to close.
+**If a job must be conditional, gate its steps.**
+
 Adding a job to either workflow does not automatically gate on it. It has to be
 added to that summary's `needs` and to its `check_job` list, or it is advisory
 only.
