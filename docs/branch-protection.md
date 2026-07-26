@@ -8,9 +8,10 @@ blocks something urgent.
 > which enqueues the PR; the queue validates it against the latest `main` and
 > merges it for you.
 >
-> **The push restriction on `main` was removed to make this possible**, and
-> `block_creations` went with it. See "The cost: no push restriction" below --
-> that trade-off is the most important thing on this page.
+> **The push restriction on `main` was removed to make this possible**, so
+> merging is no longer limited to administrators, and `block_creations` went
+> with it. See "The cost: merging is no longer admin-only" below -- that
+> trade-off is the most important thing on this page.
 >
 > Still pending: `CI Summary` as a required status check, and `enforce_admins`.
 
@@ -91,7 +92,7 @@ earlier ones are still being checked.
 `ALLGREEN` so that raising the batch size later cannot silently downgrade to the
 weaker "only the group head must pass" semantics.
 
-## The cost: no push restriction
+## The cost: merging is no longer admin-only
 
 **A merge queue and "Restrict who can push to matching branches" cannot both be
 enabled.** The queue merges by pushing to `main`, and it does so as
@@ -103,8 +104,7 @@ makes it look like a mystery.
 The bot cannot be added to the allowlist: `github-merge-queue` is an internal
 GitHub service, not an installable GitHub App, so it cannot be selected as a
 user, team, or app. GitHub's own answer to this is that using a merge queue
-requires granting push access, and that the protection you keep is the ban on
-force pushes.
+means granting push access to the branch.
 
 Removing the restriction also silently disabled `block_creations`, which depends
 on it. That one is close to harmless here -- it only blocked *creating* a branch
@@ -112,20 +112,50 @@ named `main`, which cannot happen while `main` exists and `allow_deletions` is
 false -- but it is gone, and the API reports it as `false` even if a request
 tries to set it `true`.
 
+### What actually changed, precisely
+
+The removed `restrictions` was an **empty allowlist** (`users: []`, `teams: []`,
+`apps: []`). Combined with `enforce_admins: false`, that meant only
+administrators could merge anything into `main` -- which is why, before the
+rollout, every merge on the branch was performed by an admin.
+
+| | before | after |
+| --- | --- | --- |
+| direct push by a write collaborator | rejected | rejected |
+| direct push by an administrator | allowed (`enforce_admins: false`) | allowed (unchanged) |
+| merging an approved PR, write collaborator | rejected -- not on the allowlist | allowed |
+| merging an approved PR, administrator | allowed | allowed |
+
+**Direct pushes by ordinary collaborators were not what `restrictions` was
+holding back, and they are still blocked.** That gate is
+`required_pull_request_reviews`: with it enabled, a write collaborator can only
+change `main` through a pull request carrying the required approval.
+`restrictions` was a second, narrower gate layered on top, and what it gated was
+*who may perform the merge*.
+
+So the change is that merging widened from administrators to all write
+collaborators -- still by way of an approved PR, resolved conversations, and the
+required checks. That is the intended effect, not a side effect: self-service
+merging is the point of the queue.
+
 What still holds `main`:
 
 | | |
 | --- | --- |
+| `required_pull_request_reviews` | no change to `main` outside a PR; 1 approval, conversations resolved |
+| required status checks | `Test SQLite/PostgreSQL Migrations` |
+| merge queue | validates the combined tree before it lands |
 | `allow_force_pushes: false` | history cannot be rewritten |
 | `allow_deletions: false` | `main` cannot be deleted |
-| required status checks | `Test SQLite/PostgreSQL Migrations` |
-| required reviews | 1 approval, conversations resolved |
-| merge queue | validates the combined tree before it lands |
 
-So the exposure is that a collaborator with write access can push an ordinary
-commit straight to `main`, bypassing review. Nothing can rewrite or delete
-history. If that trade-off ever stops being acceptable, the queue has to go and
-`strict` comes back.
+The one bypass left is an administrator, because `enforce_admins` is `false` --
+and that was equally true before the rollout. Closing it is a matter of enabling
+`enforce_admins`; it does not require giving up the queue.
+
+If narrowing merge permission back to a named set ever becomes necessary, the
+lever is `restrictions`, and restoring it means giving up the queue. `strict` is
+not that lever -- it governs whether a PR must be up to date, not who may merge
+or whether a PR is required at all.
 
 ## Gotchas worth knowing
 
@@ -153,7 +183,7 @@ query($number: Int!) { repository(owner:"xorbitsai",name:"xagent"){ pullRequest(
 
 Note that a *successful* merge also emits a removal event, with
 `reason: merged`. "Removed from merge queue" on its own says nothing about
-whether anything went wrong — read the reason.
+whether anything went wrong -- read the reason.
 
 **Merge queue is organization-only.** It cannot be configured on a
 personal-account repository -- a `merge_queue` ruleset there is rejected with
