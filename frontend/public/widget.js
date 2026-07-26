@@ -7,6 +7,22 @@
   var SESSION_RETRY_DELAYS = [1000, 2000, 4000];  // four attempts, three waits
   var SESSION_MAX_RATE_LIMIT_RETRIES = 2;
   var SESSION_REFRESH_THRESHOLD_MS = 60000;
+  var SESSION_ERROR_CODES = {
+    grant_malformed: true,
+    signature_invalid: true,
+    grant_expired: true,
+    grant_already_used: true,
+    agent_not_granted: true,
+    agent_not_available: true,
+    widget_disabled: true,
+    invalid_input: true,
+    invalid_runtime_context: true,
+    encryption_required: true,
+    reconnect_invalid: true,
+    session_expired: true,
+    identity_mismatch: true,
+    rate_limited: true
+  };
 
   function sessionDelay(ms) {
     return new Promise(function (resolve) { setTimeout(resolve, ms); });
@@ -284,12 +300,12 @@
   }
 
   function createSessionMode(scriptTag, host) {
-    var grant = (scriptTag.getAttribute('data-encrypted-context') || '').trim();
+    var grant = scriptTag.getAttribute('data-encrypted-context') || '';
 
     // Fail closed before any network call, and render nothing at all: these are
     // integration mistakes on the embedding page, mirroring the missing
     // data-widget-key precedent. Never fall back to guest mode.
-    if (!grant) {
+    if (!grant.trim()) {
       logSession('error', 'chat unavailable, the grant attribute is empty', 'grant_malformed');
       return null;
     }
@@ -323,8 +339,7 @@
       terminalCode: null,
       exchangeAccepted: false,
       exchangeSeq: 0,
-      inflight: { exchange: null, reconnect: null },
-      refreshedOnce: false
+      inflight: { exchange: null, reconnect: null }
     };
 
     function attach(iframe) {
@@ -391,8 +406,7 @@
       }
       if (!state.session) return;
       // Rule 3: refresh before any use of the token, including handing it over.
-      if (isStale(state.session.session_token_expires_at) && !state.refreshedOnce) {
-        state.refreshedOnce = true;
+      if (isStale(state.session.session_token_expires_at)) {
         reconnect();
         return;
       }
@@ -405,17 +419,42 @@
       });
     }
 
-    function applySession(data) {
-      state.session = {
-        session_token: data.session_token,
-        session_token_expires_at: data.session_token_expires_at,
-        absolute_expires_at: data.session && data.session.absolute_expires_at,
-        agent: data.session && data.session.agent
+    function isRecord(value) {
+      return value !== null && typeof value === 'object' && !Array.isArray(value);
+    }
+
+    function isNonBlankString(value) {
+      return typeof value === 'string' && value.trim().length > 0;
+    }
+
+    function isTimestamp(value) {
+      return isNonBlankString(value) && !isNaN(Date.parse(value));
+    }
+
+    function parseSessionPayload(data) {
+      if (!isRecord(data) ||
+          !isNonBlankString(data.session_token) ||
+          !isTimestamp(data.session_token_expires_at) ||
+          !isNonBlankString(data.reconnect_token) ||
+          !isRecord(data.session) ||
+          !isTimestamp(data.session.absolute_expires_at) ||
+          !isRecord(data.session.agent)) {
+        return null;
+      }
+      return {
+        session: {
+          session_token: data.session_token,
+          session_token_expires_at: data.session_token_expires_at,
+          absolute_expires_at: data.session.absolute_expires_at,
+          agent: data.session.agent
+        },
+        reconnectToken: data.reconnect_token
       };
-      state.reconnectToken = data.reconnect_token;
-      state.refreshedOnce = isStale(state.session.session_token_expires_at)
-        ? state.refreshedOnce
-        : false;
+    }
+
+    function applySession(payload) {
+      state.session = payload.session;
+      state.reconnectToken = payload.reconnectToken;
     }
 
     function goTerminal(code, status) {
@@ -427,8 +466,18 @@
 
     var STALE_GRANT_CODES = { grant_expired: true, grant_already_used: true };
 
+    function classifySessionFailure(result) {
+      if (result.status >= 500) return 'network_unavailable';
+      var code = result.data && result.data.error && result.data.error.code;
+      return typeof code === 'string' &&
+        Object.prototype.hasOwnProperty.call(SESSION_ERROR_CODES, code)
+        ? code
+        : 'unexpected_error';
+    }
+
     function handleResult(result, phase, seq) {
-      var isSuccess = result.ok && result.data && result.data.session_token;
+      var payload = result.ok ? parseSessionPayload(result.data) : null;
+      var isSuccess = payload !== null;
       if (phase === 'exchange') {
         // Preserve first-success-wins while discarding failures from an older
         // request that bfcache recovery deliberately superseded.
@@ -436,10 +485,14 @@
         if (!isSuccess && seq !== state.exchangeSeq) return;
       }
       if (isSuccess) {
+        if (phase === 'reconnect' && isStale(payload.session.session_token_expires_at)) {
+          goTerminal('unexpected_error', result.status);
+          return;
+        }
         if (phase === 'exchange') {
           state.exchangeAccepted = true;
         }
-        applySession(result.data);
+        applySession(payload);
         // A reconnect already in flight supersedes this response: it was
         // queued while this exchange was still pending and will carry the
         // freshest reconnect_token, so let it be the one that flushes.
@@ -448,11 +501,7 @@
         return;
       }
 
-      var code = result.data && result.data.error && result.data.error.code;
-      if (!code) {
-        goTerminal(result.status >= 500 ? 'network_unavailable' : 'unexpected_error', result.status);
-        return;
-      }
+      var code = classifySessionFailure(result);
       if (phase === 'exchange' && STALE_GRANT_CODES[code] && state.reconnectToken) {
         reconnect();
         return;
@@ -470,11 +519,16 @@
         body: JSON.stringify(body),
         signal: controller.signal
       }).then(function (res) {
-        clearTimeout(timer);
         // .clone() before reading: mocks (and retried real fetches) can hand back
         // the same Response instance across attempts, and a body can only be
         // read once from any given instance.
-        return res.clone().json().catch(function () { return null; }).then(function (data) {
+        return res.clone().json().catch(function (error) {
+          // A complete non-JSON response is a protocol error handled from its
+          // HTTP status. Body-stream failures and aborts remain transport
+          // failures so withRetry can apply the bounded retry policy.
+          if (error && error.name === 'SyntaxError') return null;
+          throw error;
+        }).then(function (data) {
           return {
             ok: res.ok,
             status: res.status,
@@ -482,6 +536,9 @@
             retryAfter: res.headers.get('Retry-After')
           };
         });
+      }).then(function (result) {
+        clearTimeout(timer);
+        return result;
       }, function (err) {
         clearTimeout(timer);
         throw err;

@@ -161,6 +161,17 @@ describe("widget session mode", () => {
     }))
   })
 
+  it("sends the opaque grant value verbatim after checking that it is not blank", () => {
+    const rawGrant = `  ${GRANT}\n`
+    fetchMock.mockResolvedValueOnce(jsonResponse(200, exchangeBody()))
+
+    runWidget({ "data-encrypted-context": rawGrant })
+
+    expect(fetchMock).toHaveBeenCalledWith(EXCHANGE_URL, expect.objectContaining({
+      body: JSON.stringify({ encrypted_context: rawGrant }),
+    }))
+  })
+
   it("fails closed on an empty grant attribute with no DOM and no network", () => {
     const errorSpy = vi.spyOn(console, "error").mockImplementation(() => undefined)
 
@@ -378,17 +389,41 @@ describe("widget session mode", () => {
     expect(post.mock.calls[0][0]).toMatchObject({ type: "session_terminal", code })
   })
 
-  it("fails closed on an error code it does not recognize", async () => {
+  it.each(["future_code_v2", "toString"])(
+    "fails closed on the unrecognized error code %s",
+    async (unknownCode) => {
+      const errorSpy = vi.spyOn(console, "error").mockImplementation(() => undefined)
+      fetchMock.mockResolvedValueOnce(errorResponse(403, unknownCode))
+      runWidget({ "data-encrypted-context": GRANT })
+      const post = spyOnIframePostMessage()
+
+      await vi.waitFor(() => expect(errorSpy).toHaveBeenCalledWith(
+        expect.stringContaining("[unexpected_error] (HTTP 403)"),
+      ))
+      expect(errorSpy).not.toHaveBeenCalledWith(expect.stringContaining(`[${unknownCode}]`))
+      fromIframe("ready")
+      expect(post.mock.calls[0][0]).toMatchObject({ type: "session_terminal", code: "unexpected_error" })
+    },
+  )
+
+  it("fails closed when a successful response is missing required session fields", async () => {
     const errorSpy = vi.spyOn(console, "error").mockImplementation(() => undefined)
-    fetchMock.mockResolvedValueOnce(errorResponse(403, "future_code_v2"))
+    fetchMock.mockResolvedValueOnce(jsonResponse(200, { session_token: "st_only" }))
     runWidget({ "data-encrypted-context": GRANT })
     const post = spyOnIframePostMessage()
 
-    await vi.waitFor(() => expect(errorSpy).toHaveBeenCalledWith(
-      expect.stringContaining("[future_code_v2]"),
-    ))
+    await flushAsync()
     fromIframe("ready")
-    expect(post.mock.calls[0][0]).toMatchObject({ type: "session_terminal", code: "future_code_v2" })
+
+    expect(errorSpy).toHaveBeenCalledWith(expect.stringContaining("[unexpected_error] (HTTP 200)"))
+    expect(post).toHaveBeenCalledWith(
+      expect.objectContaining({ type: "session_terminal", code: "unexpected_error" }),
+      HOST,
+    )
+    expect(post).not.toHaveBeenCalledWith(
+      expect.objectContaining({ type: "session_update" }),
+      HOST,
+    )
   })
 
   it("retries an uncoded 5xx three times with 1s/2s/4s backoff, then reports network_unavailable", async () => {
@@ -440,6 +475,36 @@ describe("widget session mode", () => {
     // attempt 2 at 6s, attempt 3 at 13s, attempt 4 at 22s, all done by 27s
     await vi.advanceTimersByTimeAsync(22_000)
     expect(fetchMock).toHaveBeenCalledTimes(4)
+    expect(vi.getTimerCount()).toBe(0)
+  })
+
+  it("keeps the 5s deadline active while the response body is being read", async () => {
+    vi.useFakeTimers()
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => undefined)
+    const signals: AbortSignal[] = []
+    fetchMock.mockImplementation((_url: string, init: RequestInit) => {
+      const signal = init.signal as AbortSignal
+      signals.push(signal)
+      const body = new ReadableStream<Uint8Array>({
+        start(controller) {
+          signal.addEventListener("abort", () => {
+            controller.error(new DOMException("aborted", "AbortError"))
+          }, { once: true })
+        },
+      })
+      return Promise.resolve(new Response(body, {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      }))
+    })
+    runWidget({ "data-encrypted-context": GRANT })
+
+    await vi.advanceTimersByTimeAsync(27_000)
+
+    expect(fetchMock).toHaveBeenCalledTimes(4)
+    expect(signals).toHaveLength(4)
+    expect(signals.every((signal) => signal.aborted)).toBe(true)
+    expect(errorSpy).toHaveBeenCalledWith(expect.stringContaining("[network_unavailable]"))
     expect(vi.getTimerCount()).toBe(0)
   })
 
@@ -849,18 +914,28 @@ describe("widget session mode", () => {
     )
   })
 
-  it("does not loop when the server hands back an already-stale token", async () => {
-    fetchMock.mockResolvedValue(jsonResponse(200, exchangeBody({
+  it("fails closed when reconnect still returns an already-stale token", async () => {
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => undefined)
+    fetchMock.mockImplementation(() => Promise.resolve(jsonResponse(200, exchangeBody({
       session_token_expires_at: new Date(Date.now() + 10_000).toISOString(),
-    })))
+    }))))
     runWidget({ "data-encrypted-context": GRANT })
     const post = spyOnIframePostMessage()
     await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1))
 
     fromIframe("ready")
-    await vi.waitFor(() => expect(post).toHaveBeenCalled())
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2))
+    await flushAsync()
 
-    expect(fetchMock).toHaveBeenCalledTimes(2)  // one refresh attempt, then hand it over anyway
+    expect(errorSpy).toHaveBeenCalledWith(expect.stringContaining("[unexpected_error] (HTTP 200)"))
+    expect(post).toHaveBeenCalledWith(
+      expect.objectContaining({ type: "session_terminal", code: "unexpected_error" }),
+      HOST,
+    )
+    expect(post).not.toHaveBeenCalledWith(
+      expect.objectContaining({ type: "session_update" }),
+      HOST,
+    )
   })
 
   it("re-runs the load flow when a bfcache restore finds no session", async () => {
