@@ -4,8 +4,18 @@
   var host = new URL(scriptTag.src).origin;
 
   var SESSION_TIMEOUT_MS = 5000;          // constants appendix #16
-  var SESSION_RETRY_DELAYS = [1000, 2000, 4000];  // four attempts, three waits
-  var SESSION_MAX_RATE_LIMIT_RETRIES = 2;
+  var SESSION_EXCHANGE_RETRY_POLICY = {
+    maxAttempts: 4,
+    maxRateLimitRetries: 2,
+    retryDelays: [1000, 2000, 4000],
+    deadlineMs: 30000
+  };
+  var SESSION_RECONNECT_RETRY_POLICY = {
+    maxAttempts: 2,
+    maxRateLimitRetries: 1,
+    retryDelays: [1000],
+    deadlineMs: 9000
+  };
   var SESSION_REFRESH_THRESHOLD_MS = 60000;
   var SESSION_ERROR_CODES = {
     grant_malformed: true,
@@ -34,33 +44,56 @@
     return isNaN(seconds) ? fallback : seconds * 1000;
   }
 
-  // Retries only the transport classes: rejected fetches (network, CORS, CSP,
-  // abort) and any 5xx, coded or not. 429 has its own small budget.
-  function withRetry(makeRequest) {
-    var attempt = 0;
+  // Every request counts against the selected phase's total attempts and
+  // absolute deadline. Transport failures and 429s also have narrower
+  // per-class retry caps inside that shared budget.
+  function withRetry(makeRequest, policy) {
+    var attempts = 0;
+    var transportRetries = 0;
     var rateLimited = 0;
+    var startedAt = Date.now();
 
-    function retryOrGiveUp(result, error) {
-      if (attempt >= SESSION_RETRY_DELAYS.length) {
-        if (error) throw error;
-        return result;
+    function remainingMs() {
+      return Math.max(0, policy.deadlineMs - (Date.now() - startedAt));
+    }
+
+    function giveUp(result, error) {
+      if (error) throw error;
+      return result;
+    }
+
+    function retryAfter(wait, result, error) {
+      if (attempts >= policy.maxAttempts || wait >= remainingMs()) {
+        return giveUp(result, error);
       }
-      var wait = SESSION_RETRY_DELAYS[attempt];
-      attempt += 1;
       return sessionDelay(wait).then(run);
     }
 
+    function retryTransportOrGiveUp(result, error) {
+      if (transportRetries >= policy.retryDelays.length) {
+        return giveUp(result, error);
+      }
+      var wait = policy.retryDelays[transportRetries];
+      transportRetries += 1;
+      return retryAfter(wait, result, error);
+    }
+
     function run() {
-      return makeRequest().then(function (result) {
+      var requestTimeoutMs = Math.min(SESSION_TIMEOUT_MS, remainingMs());
+      if (requestTimeoutMs <= 0) {
+        return Promise.reject(new DOMException('session request deadline exceeded', 'AbortError'));
+      }
+      attempts += 1;
+      return makeRequest(requestTimeoutMs).then(function (result) {
         if (result.status === 429) {
-          if (rateLimited >= SESSION_MAX_RATE_LIMIT_RETRIES) return result;
+          if (rateLimited >= policy.maxRateLimitRetries) return result;
           rateLimited += 1;
-          return sessionDelay(retryAfterMs(result, 1000)).then(run);
+          return retryAfter(retryAfterMs(result, 1000), result, null);
         }
-        if (result.status >= 500) return retryOrGiveUp(result, null);
+        if (result.status >= 500) return retryTransportOrGiveUp(result, null);
         return result;
       }, function (error) {
-        return retryOrGiveUp(null, error);
+        return retryTransportOrGiveUp(null, error);
       });
     }
 
@@ -301,6 +334,9 @@
 
   function createSessionMode(scriptTag, host) {
     var grant = scriptTag.getAttribute('data-encrypted-context') || '';
+    // Remove the credential before every possible exit. Conflict and duplicate
+    // embeds are fail-closed too, but must not leave the raw grant in the DOM.
+    scriptTag.removeAttribute('data-encrypted-context');
 
     // Fail closed before any network call, and render nothing at all: these are
     // integration mistakes on the embedding page, mirroring the missing
@@ -321,10 +357,6 @@
       return null;
     }
     registry[registryKey] = true;
-
-    // The grant lives in the closure from here on; keeping it in the DOM would
-    // let any third-party script on the page scrape it off the script tag.
-    scriptTag.removeAttribute('data-encrypted-context');
 
     return createSessionController(grant, host);
   }
@@ -509,16 +541,29 @@
       goTerminal(code, result.status);
     }
 
-    function postJson(url, body) {
+    function postJson(url, body, timeoutMs) {
       var controller = new AbortController();
-      var timer = setTimeout(function () { controller.abort(); }, SESSION_TIMEOUT_MS);
-      return fetch(url, {
-        method: 'POST',
-        credentials: 'omit',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(body),
-        signal: controller.signal
-      }).then(function (res) {
+      var timer;
+      var timeout = new Promise(function (_resolve, reject) {
+        timer = setTimeout(function () {
+          controller.abort();
+          reject(new DOMException('session request deadline exceeded', 'AbortError'));
+        }, timeoutMs);
+      });
+      var request;
+      try {
+        request = fetch(url, {
+          method: 'POST',
+          credentials: 'omit',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(body),
+          signal: controller.signal
+        });
+      } catch (error) {
+        clearTimeout(timer);
+        return Promise.reject(error);
+      }
+      request = request.then(function (res) {
         // .clone() before reading: mocks (and retried real fetches) can hand back
         // the same Response instance across attempts, and a body can only be
         // read once from any given instance.
@@ -536,7 +581,8 @@
             retryAfter: res.headers.get('Retry-After')
           };
         });
-      }).then(function (result) {
+      });
+      return Promise.race([request, timeout]).then(function (result) {
         clearTimeout(timer);
         return result;
       }, function (err) {
@@ -547,10 +593,11 @@
 
     function singleFlight(key, makePromise) {
       if (state.inflight[key]) return state.inflight[key];
-      var promise = makePromise().then(function () {
-        state.inflight[key] = null;
+      var promise;
+      promise = makePromise().then(function () {
+        if (state.inflight[key] === promise) state.inflight[key] = null;
       }, function () {
-        state.inflight[key] = null;
+        if (state.inflight[key] === promise) state.inflight[key] = null;
       });
       state.inflight[key] = promise;
       return promise;
@@ -560,9 +607,13 @@
       return singleFlight('exchange', function () {
         state.exchangeSeq += 1;
         var seq = state.exchangeSeq;
-        return withRetry(function () {
-          return postJson(host + '/v1/external/chat/sessions', { encrypted_context: state.grant });
-        }).then(function (result) {
+        return withRetry(function (timeoutMs) {
+          return postJson(
+            host + '/v1/external/chat/sessions',
+            { encrypted_context: state.grant },
+            timeoutMs
+          );
+        }, SESSION_EXCHANGE_RETRY_POLICY).then(function (result) {
           handleResult(result, 'exchange', seq);
         }, function () {
           if (!state.exchangeAccepted && seq === state.exchangeSeq) {
@@ -596,9 +647,13 @@
           if (!state.reconnectToken) return;
           var body = { reconnect_token: state.reconnectToken };
           if (state.grant) body.encrypted_context = state.grant;
-          return withRetry(function () {
-            return postJson(host + '/v1/external/chat/sessions/reconnect', body);
-          }).then(function (result) {
+          return withRetry(function (timeoutMs) {
+            return postJson(
+              host + '/v1/external/chat/sessions/reconnect',
+              body,
+              timeoutMs
+            );
+          }, SESSION_RECONNECT_RETRY_POLICY).then(function (result) {
             handleResult(result, 'reconnect');
           }, function () {
             goTerminal('network_unavailable');
