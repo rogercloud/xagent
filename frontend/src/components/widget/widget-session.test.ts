@@ -162,10 +162,12 @@ describe("widget session mode", () => {
 
   it("navigates the iframe to the session URL and exchanges the grant immediately", () => {
     fetchMock.mockResolvedValueOnce(jsonResponse(200, exchangeBody()))
+    const observeSpy = vi.spyOn(MutationObserver.prototype, "observe")
 
     runWidget({ "data-encrypted-context": GRANT })
 
     expect(iframeEl()?.src).toBe(`${HOST}/widget/chat/session`)
+    expect(observeSpy).toHaveBeenCalledWith(document.body, { childList: true })
     expect(fetchMock).toHaveBeenCalledTimes(1)
     expect(fetchMock).toHaveBeenCalledWith(EXCHANGE_URL, expect.objectContaining({
       method: "POST",
@@ -250,7 +252,9 @@ describe("widget session mode", () => {
     const duplicateScript = runWidget({ "data-encrypted-context": GRANT })
 
     expect(document.querySelectorAll(".xagent-widget-container")).toHaveLength(1)
-    expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining("[duplicate_init]"))
+    expect(warnSpy).toHaveBeenCalledWith(expect.stringMatching(
+      /single-use.*fresh grant.*\[duplicate_init\]/,
+    ))
     expect(duplicateScript.hasAttribute("data-encrypted-context")).toBe(false)
 
     runWidget({ "data-encrypted-context": `${GRANT}-other` })
@@ -287,7 +291,9 @@ describe("widget session mode", () => {
   })
 
   it("pushes session_update to the iframe once it announces ready", async () => {
-    fetchMock.mockResolvedValueOnce(jsonResponse(200, exchangeBody()))
+    const body = exchangeBody()
+    const absoluteExpiresAt = body.session.absolute_expires_at
+    fetchMock.mockResolvedValueOnce(jsonResponse(200, body))
     runWidget({ "data-encrypted-context": GRANT })
     const post = spyOnIframePostMessage()
 
@@ -303,7 +309,7 @@ describe("widget session mode", () => {
       v: 1,
       type: "session_update",
       session_token: "st_first",
-      absolute_expires_at: expect.any(String),
+      absolute_expires_at: absoluteExpiresAt,
       agent: { id: 42, name: "Care Assistant" },
     })
     expect(message).not.toHaveProperty("reconnect_token")
@@ -715,7 +721,7 @@ describe("widget session mode", () => {
     expect(post.mock.calls[0][0]).toMatchObject({ session_token: "st_second" })
   })
 
-  it("restarts a frozen reconnect through grant-first exchange and stale fallback", async () => {
+  it("restarts a frozen reconnect directly with the held reconnect token", async () => {
     let frozenReconnectSignal: AbortSignal | undefined
     fetchMock
       .mockResolvedValueOnce(jsonResponse(200, exchangeBody()))
@@ -723,7 +729,6 @@ describe("widget session mode", () => {
         frozenReconnectSignal = init.signal as AbortSignal
         return new Promise(() => undefined)
       })
-      .mockResolvedValueOnce(errorResponse(401, "grant_already_used"))
       .mockResolvedValueOnce(jsonResponse(200, exchangeBody({
         session_token: "st_recovered",
         reconnect_token: "rt_recovered",
@@ -739,16 +744,15 @@ describe("widget session mode", () => {
     fromIframe("reconnect_request", { reason: "ws_closed" })
     await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2))
     firePageShow(true)
-    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(4))
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(3))
 
     expect(frozenReconnectSignal?.aborted).toBe(true)
     expect(fetchMock.mock.calls.map((call) => call[0])).toEqual([
       EXCHANGE_URL,
       RECONNECT_URL,
-      EXCHANGE_URL,
       RECONNECT_URL,
     ])
-    expect(JSON.parse(fetchMock.mock.calls[3][1].body)).toEqual({
+    expect(JSON.parse(fetchMock.mock.calls[2][1].body)).toEqual({
       reconnect_token: "rt_first",
       encrypted_context: GRANT,
     })
@@ -768,9 +772,6 @@ describe("widget session mode", () => {
       .mockImplementationOnce((_url: string, init: RequestInit) => new Promise<Response>((resolve) => {
         resolveFirstExchange = resolve
         firstExchangeSignal = init.signal as AbortSignal
-        // The production operation owner must abort this signal on restore even
-        // when the transport ignores abort and resolves later.
-        expect(firstExchangeSignal.aborted).toBe(false)
       }))
       .mockImplementationOnce(() => new Promise<Response>((resolve) => {
         resolveSecondExchange = resolve
@@ -814,6 +815,61 @@ describe("widget session mode", () => {
     await flushAsync()
   })
 
+  it("keeps the last healthy session while bfcache reconnect recovery is transiently unavailable", async () => {
+    vi.useFakeTimers()
+    vi.spyOn(console, "error").mockImplementation(() => undefined)
+    let frozenReconnectSignal: AbortSignal | undefined
+    fetchMock
+      .mockResolvedValueOnce(jsonResponse(200, exchangeBody()))
+      .mockImplementationOnce((_url: string, init: RequestInit) => {
+        frozenReconnectSignal = init.signal as AbortSignal
+        return new Promise(() => undefined)
+      })
+      .mockRejectedValue(new TypeError("Failed to fetch"))
+
+    runWidget({ "data-encrypted-context": GRANT })
+    await vi.advanceTimersByTimeAsync(0)
+    const post = spyOnIframePostMessage()
+    fromIframe("ready")
+    post.mockClear()
+
+    fromIframe("reconnect_request", { reason: "ws_closed" })
+    await vi.advanceTimersByTimeAsync(0)
+    firePageShow(true)
+    await vi.advanceTimersByTimeAsync(7_000)
+
+    expect(frozenReconnectSignal?.aborted).toBe(true)
+    expect(fetchMock.mock.calls.map((call) => call[0])).toEqual([
+      EXCHANGE_URL,
+      RECONNECT_URL,
+      RECONNECT_URL,
+      RECONNECT_URL,
+      RECONNECT_URL,
+      RECONNECT_URL,
+    ])
+    expect(post).toHaveBeenCalledWith(
+      expect.objectContaining({ type: "session_update", session_token: "st_first" }),
+      HOST,
+    )
+    expect(post).not.toHaveBeenCalledWith(
+      expect.objectContaining({ type: "session_terminal" }),
+      HOST,
+    )
+
+    fetchMock.mockResolvedValueOnce(jsonResponse(200, exchangeBody({
+      session_token: "st_recovered",
+      reconnect_token: "rt_recovered",
+    })))
+    firePageShow(true)
+    await vi.advanceTimersByTimeAsync(0)
+
+    expect(fetchMock.mock.calls.at(-1)?.[0]).toBe(RECONNECT_URL)
+    expect(post).toHaveBeenCalledWith(
+      expect.objectContaining({ type: "session_update", session_token: "st_recovered" }),
+      HOST,
+    )
+  })
+
   it("never fires a deferred reconnect once the exchange it waited on goes terminal", async () => {
     const errorSpy = vi.spyOn(console, "error").mockImplementation(() => undefined)
     fetchMock.mockResolvedValueOnce(errorResponse(409, "widget_disabled"))
@@ -821,6 +877,9 @@ describe("widget session mode", () => {
     const post = spyOnIframePostMessage()
     await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1))
 
+    // Make the frame ready while the exchange is still pending so both the
+    // terminal transition and a deferred reconnect continuation could flush.
+    fromIframe("ready")
     // reconnect_request arrives while the exchange is still in flight (its
     // response hasn't been parsed yet), so it coalesces via singleFlight and
     // defers its own network call until the exchange settles.
@@ -830,7 +889,6 @@ describe("widget session mode", () => {
     await vi.waitFor(() => expect(errorSpy).toHaveBeenCalledWith(
       expect.stringContaining("[widget_disabled]"),
     ))
-    fromIframe("ready")
     await vi.waitFor(() => expect(post).toHaveBeenCalled())
     // Give the deferred reconnect's `wait.then` callback a turn to run: it
     // only wakes up after singleFlight clears state.inflight.exchange, which
@@ -845,6 +903,7 @@ describe("widget session mode", () => {
     for (const call of post.mock.calls) {
       expect(call[0]).toMatchObject({ type: "session_terminal", code: "widget_disabled" })
     }
+    expect(post).toHaveBeenCalledTimes(1)
   })
 
   it("answers reconnect_request from a latched terminal state without any network call", async () => {
@@ -1288,6 +1347,43 @@ describe("widget session mode", () => {
     await Promise.resolve()
 
     expect(fetchMock).toHaveBeenCalledTimes(1)
+  })
+
+  it("retries a latched rate limit only after a persisted pageshow", async () => {
+    vi.useFakeTimers()
+    vi.spyOn(console, "error").mockImplementation(() => undefined)
+    fetchMock.mockImplementation(() => Promise.resolve(jsonResponse(
+      429,
+      { error: { code: "rate_limited" } },
+      { "Retry-After": "1" },
+    )))
+    runWidget({ "data-encrypted-context": GRANT })
+    const post = spyOnIframePostMessage()
+    fromIframe("ready")
+    await vi.advanceTimersByTimeAsync(3_000)
+
+    expect(fetchMock).toHaveBeenCalledTimes(3)
+    expect(post).toHaveBeenCalledWith(
+      expect.objectContaining({ type: "session_terminal", code: "rate_limited" }),
+      HOST,
+    )
+    post.mockClear()
+
+    fromIframe("reconnect_request", { reason: "ws_closed" })
+    expect(fetchMock).toHaveBeenCalledTimes(3)
+
+    fetchMock.mockResolvedValueOnce(jsonResponse(200, exchangeBody({
+      session_token: "st_recovered",
+    })))
+    firePageShow(true)
+    await vi.advanceTimersByTimeAsync(0)
+
+    expect(fetchMock).toHaveBeenCalledTimes(4)
+    expect(fetchMock.mock.calls[3][0]).toBe(EXCHANGE_URL)
+    expect(post).toHaveBeenCalledWith(
+      expect.objectContaining({ type: "session_update", session_token: "st_recovered" }),
+      HOST,
+    )
   })
 
   it("does nothing on a normal (non-persisted) pageshow", async () => {

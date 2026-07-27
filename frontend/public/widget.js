@@ -28,6 +28,10 @@
     identity_mismatch: true,
     rate_limited: true
   };
+  var TRANSIENT_SESSION_CODES = {
+    network_unavailable: true,
+    rate_limited: true
+  };
 
   function sessionAbortError() {
     return new DOMException('session request superseded', 'AbortError');
@@ -385,7 +389,7 @@
     var registry = xagentSessionRegistry();
     var registryKey = hashGrant(grant);
     if (registry[registryKey]) {
-      logSession('warn', 'this grant is already running on the page, ignoring the duplicate embed', 'duplicate_init');
+      logSession('warn', 'this grant is single-use; mint a fresh grant before remounting the widget', 'duplicate_init');
       return null;
     }
     registry[registryKey] = true;
@@ -401,6 +405,7 @@
       session: null,
       reconnectToken: null,
       terminalCode: null,
+      recoverableCode: null,
       detached: false,
       observer: null,
       inflight: { exchange: null, reconnect: null }
@@ -412,12 +417,16 @@
       window.addEventListener('message', onMessage);
       window.addEventListener('pageshow', onPageShow);
       state.observer = new MutationObserver(onDomMutation);
-      state.observer.observe(document.documentElement, { childList: true, subtree: true });
+      state.observer.observe(document.body, { childList: true });
       runLoadFlow();
     }
 
     function runLoadFlow() {
       return exchange();
+    }
+
+    function runRecoveryFlow() {
+      return state.reconnectToken ? reconnect() : exchange();
     }
 
     function onDomMutation() {
@@ -437,23 +446,25 @@
       state.ready = false;
     }
 
-    // Scripts do not re-run on a bfcache restore, so the grant-first load flow
-    // needs an explicit entry point here. Only unhealthy states re-run: a
-    // healthy page would burn a doomed exchange on every back-navigation, and a
-    // latched terminal stays terminal.
+    // Scripts do not re-run on a bfcache restore, so lifecycle recovery needs
+    // an explicit entry point. Initial load remains grant-first; a restored
+    // controller with a rotated reconnect credential resumes through reconnect
+    // instead of deliberately replaying its already-consumed bootstrap grant.
     function onPageShow(event) {
       if (!event.persisted) return;
       if (state.detached) return;
       if (state.terminalCode) return;
       var requestInterrupted = state.inflight.exchange || state.inflight.reconnect;
-      if (state.session && !requestInterrupted) return;
-      // Recovery owns the whole request lifecycle: cancel work that may have
-      // been frozen, retain only the in-memory reconnect credential, and
-      // re-enter the contract's grant-first load flow.
+      if (!state.recoverableCode && state.session && !requestInterrupted) return;
+      // Recovery owns the whole request lifecycle. Cancel work that may have
+      // been frozen, retain the last confirmed session until a replacement is
+      // accepted, and reopen only the transient failure class for this trusted
+      // browser-lifecycle trigger.
       cancelInflight('exchange');
       cancelInflight('reconnect');
-      state.session = null;
-      runLoadFlow();
+      state.recoverableCode = null;
+      runRecoveryFlow();
+      flush();
     }
 
     function onMessage(event) {
@@ -494,6 +505,11 @@
       if (!state.ready) return;
       if (state.terminalCode) {
         send({ type: 'session_terminal', code: state.terminalCode });
+        return;
+      }
+      if (state.recoverableCode &&
+          (!state.session || isStale(state.session.session_token_expires_at))) {
+        send({ type: 'session_terminal', code: state.recoverableCode });
         return;
       }
       if (!state.session) return;
@@ -547,11 +563,17 @@
     function applySession(payload) {
       state.session = payload.session;
       state.reconnectToken = payload.reconnectToken;
+      state.recoverableCode = null;
     }
 
-    function goTerminal(code, status) {
+    function recordFailure(code, status) {
       if (state.terminalCode) return;
-      state.terminalCode = code;
+      if (Object.prototype.hasOwnProperty.call(TRANSIENT_SESSION_CODES, code)) {
+        state.recoverableCode = code;
+      } else {
+        state.terminalCode = code;
+        state.recoverableCode = null;
+      }
       logSession('error', 'chat unavailable', code, status);
       flush();
     }
@@ -570,7 +592,7 @@
       var isSuccess = payload !== null;
       if (isSuccess) {
         if (phase === 'reconnect' && isStale(payload.session.session_token_expires_at)) {
-          goTerminal('unexpected_error', result.status);
+          recordFailure('unexpected_error', result.status);
           return;
         }
         applySession(payload);
@@ -586,11 +608,13 @@
       // Only an exchange can fall back to the held reconnect credential.
       // Repeating a failed reconnect with the same token and stale grant would
       // resend identical inputs instead of making forward progress.
-      if (phase === 'exchange' && STALE_GRANT_CODES[code] && state.reconnectToken) {
+      if (phase === 'exchange' &&
+          Object.prototype.hasOwnProperty.call(STALE_GRANT_CODES, code) &&
+          state.reconnectToken) {
         reconnect();
         return;
       }
-      goTerminal(code, result.status);
+      recordFailure(code, result.status);
     }
 
     function postJson(url, body, timeoutMs, operationSignal) {
@@ -699,13 +723,13 @@
         }, SESSION_RETRY_POLICY, signal).then(function (result) {
           handleResult(result, 'exchange');
         }, function () {
-          if (!signal.aborted) goTerminal('network_unavailable');
+          if (!signal.aborted) recordFailure('network_unavailable');
         });
       });
     }
 
     function onReconnectRequest() {
-      if (state.terminalCode) {
+      if (state.terminalCode || state.recoverableCode) {
         flush();
         return;
       }
@@ -713,7 +737,10 @@
     }
 
     function reconnect() {
-      if (state.terminalCode) { flush(); return Promise.resolve(); }
+      if (state.terminalCode || state.recoverableCode) {
+        flush();
+        return Promise.resolve();
+      }
       return singleFlight('reconnect', function (signal) {
         // If an exchange is still in flight, wait for it: it will land the
         // authoritative reconnect_token this reconnect needs to send, and
@@ -721,15 +748,11 @@
         var wait = inflightPromise('exchange') || Promise.resolve();
         return wait.then(function () {
           if (signal.aborted) return;
-          // Re-check: the exchange we waited on may have just latched a
-          // terminal state (or left us without a token at all). Firing a
-          // network call after that would violate "zero network calls once
-          // latched", so bail out to the terminal flush instead.
-          if (state.terminalCode) { flush(); return; }
-          if (!state.reconnectToken) {
-            goTerminal('unexpected_error');
-            return;
-          }
+          // Re-check: the exchange we waited on may have just published a
+          // failure. Its transition already flushed the authoritative state;
+          // this parked continuation must neither issue a request nor flush a
+          // duplicate terminal message.
+          if (state.terminalCode || state.recoverableCode) return;
           var body = { reconnect_token: state.reconnectToken };
           body.encrypted_context = state.grant;
           return withRetry(function (timeoutMs) {
@@ -742,7 +765,7 @@
           }, SESSION_RETRY_POLICY, signal).then(function (result) {
             handleResult(result, 'reconnect');
           }, function () {
-            if (!signal.aborted) goTerminal('network_unavailable');
+            if (!signal.aborted) recordFailure('network_unavailable');
           });
         });
       });
