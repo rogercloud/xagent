@@ -578,8 +578,6 @@
       flush();
     }
 
-    var STALE_GRANT_CODES = { grant_expired: true, grant_already_used: true };
-
     function classifySessionFailure(result) {
       var code = sessionErrorCode(result);
       if (code && Object.prototype.hasOwnProperty.call(SESSION_ERROR_CODES, code)) return code;
@@ -605,15 +603,6 @@
       }
 
       var code = classifySessionFailure(result);
-      // Only an exchange can fall back to the held reconnect credential.
-      // Repeating a failed reconnect with the same token and stale grant would
-      // resend identical inputs instead of making forward progress.
-      if (phase === 'exchange' &&
-          Object.prototype.hasOwnProperty.call(STALE_GRANT_CODES, code) &&
-          state.reconnectToken) {
-        reconnect();
-        return;
-      }
       recordFailure(code, result.status);
     }
 
