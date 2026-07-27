@@ -19,6 +19,12 @@ const widgetConfig = mergeConfig(baseConfig, defineConfig({
         branches: 55,
         functions: 45,
         lines: 80,
+        "public/widget.js": {
+          statements: 95,
+          branches: 90,
+          functions: 95,
+          lines: 95,
+        },
       },
     },
   },
