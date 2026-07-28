@@ -483,12 +483,11 @@
       if (state.terminalCode) return;
       cancelInflightIfCurrent('exchange', frozenExchange);
       cancelInflightIfCurrent('reconnect', frozenReconnect);
+      state.recoverableCode = null;
       if (state.session && !isStale(state.session.session_token_expires_at)) {
-        state.recoverableCode = null;
         flush();
         return;
       }
-      state.recoverableCode = null;
       runRecoveryFlow();
       flush();
     }
