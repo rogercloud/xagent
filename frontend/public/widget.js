@@ -61,6 +61,11 @@
     return typeof code === 'string' ? code : null;
   }
 
+  function isKnownSessionErrorCode(code) {
+    return Boolean(code) &&
+      Object.prototype.hasOwnProperty.call(SESSION_ERROR_CODES, code);
+  }
+
   function retryAfterMs(result) {
     var header = result && result.retryAfter;
     var value = header && header.trim();
@@ -125,7 +130,9 @@
           rateLimited += 1;
           return retryAfter(retryAfterMs(result), result, null);
         }
-        if (!code && result.status >= 500) return retryTransportOrGiveUp(result, null);
+        if (!isKnownSessionErrorCode(code) && result.status >= 500) {
+          return retryTransportOrGiveUp(result, null);
+        }
         return result;
       }, function (error) {
         if (signal.aborted) throw error;
@@ -408,7 +415,9 @@
       recoverableCode: null,
       detached: false,
       observer: null,
-      inflight: { exchange: null, reconnect: null }
+      inflight: { exchange: null, reconnect: null },
+      restorePending: false,
+      frozenInflight: { exchange: null, reconnect: null }
     };
 
     function attach(iframe) {
@@ -416,6 +425,7 @@
       iframe.src = host + '/widget/chat/session';
       window.addEventListener('message', onMessage);
       window.addEventListener('pageshow', onPageShow);
+      window.addEventListener('pagehide', onPageHide);
       state.observer = new MutationObserver(onDomMutation);
       state.observer.observe(document.body, { childList: true });
       runLoadFlow();
@@ -440,28 +450,44 @@
       cancelInflight('reconnect');
       window.removeEventListener('message', onMessage);
       window.removeEventListener('pageshow', onPageShow);
+      window.removeEventListener('pagehide', onPageHide);
       if (state.observer) state.observer.disconnect();
       state.observer = null;
       state.iframe = null;
       state.ready = false;
     }
 
-    // Scripts do not re-run on a bfcache restore, so lifecycle recovery needs
-    // an explicit entry point. Initial load remains grant-first; a restored
-    // controller with a rotated reconnect credential resumes through reconnect
-    // instead of deliberately replaying its already-consumed bootstrap grant.
+    // Capture exactly which operations the browser freezes. A later pageshow
+    // may cancel those operations, but must not cancel recovery started by an
+    // earlier pageshow for the same navigation.
+    function onPageHide(event) {
+      if (!event.persisted || state.detached) return;
+      state.restorePending = true;
+      state.frozenInflight.exchange = state.inflight.exchange;
+      state.frozenInflight.reconnect = state.inflight.reconnect;
+    }
+
+    // Scripts do not re-run on a bfcache restore. Consume each persisted
+    // pagehide once, retire only work frozen by that transition, and keep a
+    // still-fresh confirmed session instead of speculatively replaying its
+    // rotate-on-use reconnect credential.
     function onPageShow(event) {
       if (!event.persisted) return;
       if (state.detached) return;
+      if (!state.restorePending) return;
+      state.restorePending = false;
+      var frozenExchange = state.frozenInflight.exchange;
+      var frozenReconnect = state.frozenInflight.reconnect;
+      state.frozenInflight.exchange = null;
+      state.frozenInflight.reconnect = null;
       if (state.terminalCode) return;
-      var requestInterrupted = state.inflight.exchange || state.inflight.reconnect;
-      if (!state.recoverableCode && state.session && !requestInterrupted) return;
-      // Recovery owns the whole request lifecycle. Cancel work that may have
-      // been frozen, retain the last confirmed session until a replacement is
-      // accepted, and reopen only the transient failure class for this trusted
-      // browser-lifecycle trigger.
-      cancelInflight('exchange');
-      cancelInflight('reconnect');
+      cancelInflightIfCurrent('exchange', frozenExchange);
+      cancelInflightIfCurrent('reconnect', frozenReconnect);
+      if (state.session && !isStale(state.session.session_token_expires_at)) {
+        state.recoverableCode = null;
+        flush();
+        return;
+      }
       state.recoverableCode = null;
       runRecoveryFlow();
       flush();
@@ -477,7 +503,7 @@
         state.ready = true;
         flush();
       } else if (data.type === 'reconnect_request') {
-        onReconnectRequest();
+        reconnect();
       }
     }
 
@@ -509,7 +535,7 @@
       }
       if (state.recoverableCode &&
           (!state.session || isStale(state.session.session_token_expires_at))) {
-        send({ type: 'session_terminal', code: state.recoverableCode });
+        send({ type: 'session_degraded', code: state.recoverableCode });
         return;
       }
       if (!state.session) return;
@@ -580,8 +606,8 @@
 
     function classifySessionFailure(result) {
       var code = sessionErrorCode(result);
-      if (code && Object.prototype.hasOwnProperty.call(SESSION_ERROR_CODES, code)) return code;
-      if (!code && result.status >= 500) return 'network_unavailable';
+      if (isKnownSessionErrorCode(code)) return code;
+      if (result.status >= 500) return 'network_unavailable';
       return 'unexpected_error';
     }
 
@@ -700,6 +726,11 @@
       operation.controller.abort();
     }
 
+    function cancelInflightIfCurrent(key, operation) {
+      if (!operation || state.inflight[key] !== operation) return;
+      cancelInflight(key);
+    }
+
     function exchange() {
       return singleFlight('exchange', function (signal) {
         return withRetry(function (timeoutMs) {
@@ -715,14 +746,6 @@
           if (!signal.aborted) recordFailure('network_unavailable');
         });
       });
-    }
-
-    function onReconnectRequest() {
-      if (state.terminalCode || state.recoverableCode) {
-        flush();
-        return;
-      }
-      reconnect();
     }
 
     function reconnect() {

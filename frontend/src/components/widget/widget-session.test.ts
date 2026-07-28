@@ -78,6 +78,17 @@ function firePageShow(persisted: boolean) {
   window.dispatchEvent(event)
 }
 
+function firePageHide(persisted: boolean) {
+  const event = new Event("pagehide") as PageTransitionEvent & { persisted: boolean }
+  Object.defineProperty(event, "persisted", { value: persisted })
+  window.dispatchEvent(event)
+}
+
+function firePageRestore() {
+  firePageHide(true)
+  firePageShow(true)
+}
+
 function exchangeBody(overrides: Record<string, unknown> = {}) {
   return {
     session_token: "st_first",
@@ -99,7 +110,7 @@ function exchangeBody(overrides: Record<string, unknown> = {}) {
 
 describe("widget session mode", () => {
   let currentScriptDescriptor: PropertyDescriptor | undefined
-  // runWidget()'s attach() registers 'message' and 'pageshow' listeners
+  // runWidget()'s attach() registers message and bfcache lifecycle listeners
   // directly on the shared jsdom `window` (vitest reuses one window per test
   // file). Without tracking and removing them, a controller from an earlier
   // test stays subscribed and reacts to a later test's fromIframe()/
@@ -480,6 +491,7 @@ describe("widget session mode", () => {
       new Response("<html>bad gateway</html>", { status: 502 }),
     ))
     runWidget({ "data-encrypted-context": GRANT })
+    const post = spyOnIframePostMessage()
 
     await vi.advanceTimersByTimeAsync(0)
     expect(fetchMock).toHaveBeenCalledTimes(1)
@@ -493,6 +505,24 @@ describe("widget session mode", () => {
     await vi.advanceTimersByTimeAsync(8000)
     expect(fetchMock).toHaveBeenCalledTimes(4)  // four attempts total, never a fifth
     expect(errorSpy).toHaveBeenCalledWith(expect.stringContaining("[network_unavailable] (HTTP 502)"))
+    fromIframe("ready")
+    expect(post).toHaveBeenCalledWith(
+      expect.objectContaining({ type: "session_degraded", code: "network_unavailable" }),
+      HOST,
+    )
+  })
+
+  it("retries an unknown coded 5xx before reporting network_unavailable", async () => {
+    vi.useFakeTimers()
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => undefined)
+    fetchMock.mockImplementation(() => Promise.resolve(errorResponse(503, "future_server_code")))
+
+    runWidget({ "data-encrypted-context": GRANT })
+    await vi.advanceTimersByTimeAsync(7000)
+
+    expect(fetchMock).toHaveBeenCalledTimes(4)
+    expect(errorSpy).toHaveBeenCalledWith(expect.stringContaining("[network_unavailable] (HTTP 503)"))
+    expect(errorSpy).not.toHaveBeenCalledWith(expect.stringContaining("[future_server_code]"))
   })
 
   it("honors a known error code on 5xx without status-based retry", async () => {
@@ -721,10 +751,12 @@ describe("widget session mode", () => {
     expect(post.mock.calls[0][0]).toMatchObject({ session_token: "st_second" })
   })
 
-  it("restarts a frozen reconnect directly with the held reconnect token", async () => {
+  it("restarts a frozen stale-session reconnect with the held reconnect token", async () => {
     let frozenReconnectSignal: AbortSignal | undefined
     fetchMock
-      .mockResolvedValueOnce(jsonResponse(200, exchangeBody()))
+      .mockResolvedValueOnce(jsonResponse(200, exchangeBody({
+        session_token_expires_at: new Date(Date.now() + 30_000).toISOString(),
+      })))
       .mockImplementationOnce((_url: string, init: RequestInit) => {
         frozenReconnectSignal = init.signal as AbortSignal
         return new Promise(() => undefined)
@@ -741,9 +773,8 @@ describe("widget session mode", () => {
     fromIframe("ready")
     post.mockClear()
 
-    fromIframe("reconnect_request", { reason: "ws_closed" })
     await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2))
-    firePageShow(true)
+    firePageRestore()
     await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(3))
 
     expect(frozenReconnectSignal?.aborted).toBe(true)
@@ -786,7 +817,7 @@ describe("widget session mode", () => {
     runWidget({ "data-encrypted-context": GRANT })
     await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1))
     fromIframe("reconnect_request", { reason: "ws_closed" })
-    firePageShow(true)
+    firePageRestore()
     await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2))
     expect(firstExchangeSignal?.aborted).toBe(true)
 
@@ -815,7 +846,7 @@ describe("widget session mode", () => {
     await flushAsync()
   })
 
-  it("keeps the last healthy session while bfcache reconnect recovery is transiently unavailable", async () => {
+  it("keeps the last healthy session without replaying a frozen reconnect", async () => {
     vi.useFakeTimers()
     vi.spyOn(console, "error").mockImplementation(() => undefined)
     let frozenReconnectSignal: AbortSignal | undefined
@@ -825,7 +856,6 @@ describe("widget session mode", () => {
         frozenReconnectSignal = init.signal as AbortSignal
         return new Promise(() => undefined)
       })
-      .mockRejectedValue(new TypeError("Failed to fetch"))
 
     runWidget({ "data-encrypted-context": GRANT })
     await vi.advanceTimersByTimeAsync(0)
@@ -835,16 +865,12 @@ describe("widget session mode", () => {
 
     fromIframe("reconnect_request", { reason: "ws_closed" })
     await vi.advanceTimersByTimeAsync(0)
-    firePageShow(true)
+    firePageRestore()
     await vi.advanceTimersByTimeAsync(7_000)
 
     expect(frozenReconnectSignal?.aborted).toBe(true)
     expect(fetchMock.mock.calls.map((call) => call[0])).toEqual([
       EXCHANGE_URL,
-      RECONNECT_URL,
-      RECONNECT_URL,
-      RECONNECT_URL,
-      RECONNECT_URL,
       RECONNECT_URL,
     ])
     expect(post).toHaveBeenCalledWith(
@@ -852,20 +878,7 @@ describe("widget session mode", () => {
       HOST,
     )
     expect(post).not.toHaveBeenCalledWith(
-      expect.objectContaining({ type: "session_terminal" }),
-      HOST,
-    )
-
-    fetchMock.mockResolvedValueOnce(jsonResponse(200, exchangeBody({
-      session_token: "st_recovered",
-      reconnect_token: "rt_recovered",
-    })))
-    firePageShow(true)
-    await vi.advanceTimersByTimeAsync(0)
-
-    expect(fetchMock.mock.calls.at(-1)?.[0]).toBe(RECONNECT_URL)
-    expect(post).toHaveBeenCalledWith(
-      expect.objectContaining({ type: "session_update", session_token: "st_recovered" }),
+      expect.objectContaining({ type: "session_degraded" }),
       HOST,
     )
   })
@@ -1070,7 +1083,7 @@ describe("widget session mode", () => {
     await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1))
 
     fetchMock.mockResolvedValueOnce(jsonResponse(200, exchangeBody({ session_token: "st_second" })))
-    firePageShow(true)
+    firePageRestore()
     await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2))
     expect(firstSignal?.aborted).toBe(true)
 
@@ -1100,7 +1113,7 @@ describe("widget session mode", () => {
     await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1))
 
     fetchMock.mockResolvedValueOnce(jsonResponse(200, exchangeBody({ session_token: "st_second" })))
-    firePageShow(true)
+    firePageRestore()
     await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2))
 
     const post = spyOnIframePostMessage()
@@ -1139,7 +1152,7 @@ describe("widget session mode", () => {
     fetchMock.mockImplementationOnce(() => new Promise<Response>((resolve) => {
       resolveSecond = resolve
     }))
-    firePageShow(true)
+    firePageRestore()
     await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2))
 
     const post = spyOnIframePostMessage()
@@ -1177,7 +1190,7 @@ describe("widget session mode", () => {
     runWidget({ "data-encrypted-context": GRANT })
     await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1))
 
-    firePageShow(true)
+    firePageRestore()
     await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2))
     const post = spyOnIframePostMessage()
     fromIframe("ready")
@@ -1217,7 +1230,7 @@ describe("widget session mode", () => {
     expect(fetchMock).toHaveBeenCalledTimes(1)
 
     fetchMock.mockResolvedValueOnce(jsonResponse(200, exchangeBody({ session_token: "st_second" })))
-    firePageShow(true)
+    firePageRestore()
     await vi.advanceTimersByTimeAsync(0)
     expect(fetchMock).toHaveBeenCalledTimes(2)
 
@@ -1257,7 +1270,7 @@ describe("widget session mode", () => {
     fetchMock.mockImplementationOnce(() => new Promise<Response>((resolve) => {
       resolveSecond = resolve
     }))
-    firePageShow(true)
+    firePageRestore()
     await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2))
 
     const post = spyOnIframePostMessage()
@@ -1308,11 +1321,34 @@ describe("widget session mode", () => {
     expect(fetchMock).toHaveBeenCalledTimes(1)
 
     fetchMock.mockResolvedValueOnce(jsonResponse(200, exchangeBody()))
-    firePageShow(true)
+    firePageRestore()
     await vi.advanceTimersByTimeAsync(0)
 
     expect(fetchMock).toHaveBeenCalledTimes(2)
     expect(fetchMock.mock.calls[1][0]).toBe(EXCHANGE_URL)
+  })
+
+  it("processes one persisted pagehide only once across repeated pageshow events", async () => {
+    vi.useFakeTimers()
+    let recoverySignal: AbortSignal | undefined
+    fetchMock
+      .mockImplementationOnce(() => new Promise(() => undefined))
+      .mockImplementationOnce((_url: string, init: RequestInit) => {
+        recoverySignal = init.signal as AbortSignal
+        return new Promise(() => undefined)
+      })
+    runWidget({ "data-encrypted-context": GRANT })
+    await vi.advanceTimersByTimeAsync(0)
+
+    firePageRestore()
+    await vi.advanceTimersByTimeAsync(0)
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+
+    firePageShow(true)
+    await vi.advanceTimersByTimeAsync(0)
+
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+    expect(recoverySignal?.aborted).toBe(false)
   })
 
   it("does nothing on a bfcache restore with a healthy session", async () => {
@@ -1327,7 +1363,7 @@ describe("widget session mode", () => {
     // firePageShow, or this test would spuriously re-trigger the load flow.
     await flushAsync()
 
-    firePageShow(true)
+    firePageRestore()
     await Promise.resolve()
 
     expect(fetchMock).toHaveBeenCalledTimes(1)
@@ -1343,7 +1379,7 @@ describe("widget session mode", () => {
     // flow while the terminal outcome is still mid-flight.
     await flushAsync()
 
-    firePageShow(true)
+    firePageRestore()
     await Promise.resolve()
 
     expect(fetchMock).toHaveBeenCalledTimes(1)
@@ -1364,7 +1400,7 @@ describe("widget session mode", () => {
 
     expect(fetchMock).toHaveBeenCalledTimes(3)
     expect(post).toHaveBeenCalledWith(
-      expect.objectContaining({ type: "session_terminal", code: "rate_limited" }),
+      expect.objectContaining({ type: "session_degraded", code: "rate_limited" }),
       HOST,
     )
     post.mockClear()
@@ -1375,7 +1411,7 @@ describe("widget session mode", () => {
     fetchMock.mockResolvedValueOnce(jsonResponse(200, exchangeBody({
       session_token: "st_recovered",
     })))
-    firePageShow(true)
+    firePageRestore()
     await vi.advanceTimersByTimeAsync(0)
 
     expect(fetchMock).toHaveBeenCalledTimes(4)
@@ -1410,8 +1446,9 @@ describe("widget session mode", () => {
     await vi.waitFor(() => expect(requestSignal?.aborted).toBe(true))
     expect(removeListenerSpy).toHaveBeenCalledWith("message", expect.any(Function))
     expect(removeListenerSpy).toHaveBeenCalledWith("pageshow", expect.any(Function))
+    expect(removeListenerSpy).toHaveBeenCalledWith("pagehide", expect.any(Function))
 
-    firePageShow(true)
+    firePageRestore()
     await flushAsync()
     expect(fetchMock).toHaveBeenCalledTimes(1)
   })
