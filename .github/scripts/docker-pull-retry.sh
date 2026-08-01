@@ -20,7 +20,7 @@ fi
 
 for image in "$@"; do
   pulled=false
-  for i in $(seq 1 "$ATTEMPTS"); do
+  for ((i = 1; i <= ATTEMPTS; i++)); do
     if docker pull "$image"; then
       pulled=true
       break
