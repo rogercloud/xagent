@@ -320,6 +320,9 @@ def test_mcp_tool_adapter_name_is_truncated_to_the_provider_length_limit():
     rejected by the same providers, just on length. Nothing upstream
     (MCP server name, MCP tool name) is length-bounded, so this adapter
     must enforce the limit itself instead of assuming it never comes up.
+    A tool name alone at or past the limit squeezes the prefix down to
+    nothing rather than wrapping around from the end (a negative slice
+    on the *tool* name would otherwise do exactly that).
     """
     mcp_tool = SimpleNamespace(
         name="x" * 200,
@@ -333,7 +336,40 @@ def test_mcp_tool_adapter_name_is_truncated_to_the_provider_length_limit():
     )
 
     assert len(adapter.name) == MAX_AGENT_TOOL_NAME_LENGTH
-    assert adapter.name.startswith("mcp_Coding_MCP_")
+    assert adapter.name == "x" * MAX_AGENT_TOOL_NAME_LENGTH
+
+
+def test_mcp_tool_adapter_truncation_keeps_same_server_tools_distinct():
+    """Regression: truncating the *tool name* end of `prefix + tool_name`
+    can make two distinct tools on one long-named server collapse into
+    one identical LLM-visible name once the combined length passes
+    `MAX_AGENT_TOOL_NAME_LENGTH` -- `_find_tool` (react.py) has no
+    duplicate-name detection, so the model asking for one tool would
+    silently get whichever tool happens to register first instead. MCP
+    server names are bounded at 100 (web/api/mcp.py), so 59 characters
+    -- long enough that `mcp_<server>_` alone already reaches the limit
+    -- is a length a real deployment can produce, not a contrived one.
+    The fix keeps the tool name whole and squeezes the prefix instead.
+    """
+    server = "s" * 59
+
+    def _adapter(tool_name: str) -> MCPToolAdapter:
+        return _build_mcp_tool_adapter(
+            server,
+            {"transport": "streamable_http", "url": "http://127.0.0.1:8642/mcp"},
+            SimpleNamespace(
+                name=tool_name,
+                description=tool_name,
+                inputSchema={"type": "object", "properties": {}},
+            ),
+        )
+
+    read_name = _adapter("read_file").name
+    delete_name = _adapter("delete_all_files").name
+
+    assert read_name != delete_name
+    assert read_name.endswith("read_file")
+    assert delete_name.endswith("delete_all_files")
 
 
 def test_mcp_tool_adapter_defaults_to_not_concurrency_safe():

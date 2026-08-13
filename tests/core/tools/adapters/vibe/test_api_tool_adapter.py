@@ -81,6 +81,38 @@ def test_custom_api_tool_name_is_truncated_to_the_provider_length_limit():
     assert tool.name.endswith("_call")
 
 
+def test_custom_api_tool_truncation_keeps_long_shared_prefix_names_distinct():
+    """Regression: unlike the MCP adapter, there is no server prefix to
+    squeeze here -- `name` is one free-form, DB-unique string (`custom_
+    apis.name` is `String(100) unique=True`), so two long, descriptive
+    API names that share everything but a trailing qualifier (a normal
+    naming habit -- e.g. two services named for the same team) truncate
+    to the exact same string once cut to fit `api_<name>_call` within
+    `MAX_AGENT_TOOL_NAME_LENGTH`. Nothing downstream detects that
+    collision, so the model asking for one tool would silently get
+    whichever one happens to register first. The fix mixes a short hash
+    of the original name into a truncated name so it stays distinct.
+    """
+    name_a = "Acme Billing Reconciliation Service For The Payments Team Alpha"
+    name_b = "Acme Billing Reconciliation Service For The Payments Team Beta"
+
+    tool_a = CustomApiTool(name=name_a, description="A test API", env={})
+    tool_b = CustomApiTool(name=name_b, description="A test API", env={})
+
+    assert tool_a.name != tool_b.name
+    assert len(tool_a.name) <= MAX_AGENT_TOOL_NAME_LENGTH
+    assert len(tool_b.name) <= MAX_AGENT_TOOL_NAME_LENGTH
+
+
+def test_custom_api_tool_short_name_truncation_is_unaffected_by_the_hash_suffix():
+    """The hash suffix only kicks in once truncation is actually needed --
+    a short name's `._name` must stay exactly what it was before this
+    fix, byte for byte, not gain a hash suffix it doesn't need."""
+    tool = CustomApiTool(name="my-test api", description="A test API", env={})
+
+    assert tool.name == "api_my_test_api_call"
+
+
 def test_custom_api_tool_replace_secrets():
     # Use unencrypted secrets for simplicity since decrypt_value handles unencrypted fallback or we can mock it
     # We will mock decrypt_value to just return the value for testing replace

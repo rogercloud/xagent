@@ -410,23 +410,40 @@ class MCPToolAdapter(AbstractBaseTool):
     @property
     def name(self) -> str:
         """Get tool name with optional prefix, formatted for LLM requirements."""
-        raw_name = f"{self._name_prefix}{self.mcp_tool.name}"
-        # Replace spaces and dashes with underscores to match LLM tool naming constraints.
-        sanitized = raw_name.replace(" ", "_").replace("-", "_")
-        # Some MCP servers namespace tool names with characters (e.g. the
-        # `.` in `coding.start`) that OpenAI-compatible APIs reject outright
-        # -- `^[a-zA-Z0-9_-]+$` is the pattern OpenAI/DeepSeek enforce on
-        # `tools[].function.name`, and a name that fails it 400s the whole
-        # LLM call, not just this one tool. Catch anything left over from
-        # the two replacements above instead of only handling the specific
-        # characters this method happened to have seen so far.
-        sanitized = re.sub(r"[^A-Za-z0-9_-]", "_", sanitized)
+
+        def _sanitize(value: str) -> str:
+            # Replace spaces and dashes with underscores to match LLM tool
+            # naming constraints, then catch anything else disallowed --
+            # some MCP servers namespace tool names with characters (e.g.
+            # the `.` in `coding.start`) that OpenAI-compatible APIs reject
+            # outright (`^[a-zA-Z0-9_-]+$` is the pattern OpenAI/DeepSeek
+            # enforce on `tools[].function.name`), and a name that fails it
+            # 400s the whole LLM call, not just this one tool.
+            return re.sub(
+                r"[^A-Za-z0-9_-]", "_", value.replace(" ", "_").replace("-", "_")
+            )
+
+        sanitized_prefix = _sanitize(self._name_prefix)
+        sanitized_tool = _sanitize(self.mcp_tool.name)
         # Same failure mode as the character check above -- an over-long
         # name is rejected by the same providers, just on length instead of
         # charset. `MAX_AGENT_TOOL_NAME_LENGTH` is this repo's own record of
         # that provider limit (agent_tool_names.py), shared here rather than
         # redeclared so the two adapters can't drift apart on the number.
-        return sanitized[:MAX_AGENT_TOOL_NAME_LENGTH]
+        #
+        # The tool name -- not the prefix -- is the only part that tells
+        # two tools on the *same* server apart, so truncating from the end
+        # (i.e. cutting the tool name) can make two distinct tools collide
+        # into one identical name once `prefix + tool_name` exceeds the
+        # limit. `_find_tool` has no duplicate-name detection, so a
+        # collision isn't a loud error like an illegal character is -- it's
+        # a silent wrong-tool dispatch. Squeeze the prefix instead and keep
+        # the tool name whole; `max(0, ...)` covers a tool name alone at or
+        # past the limit, where a negative slice would otherwise wrap
+        # around from the end instead of emptying.
+        budget_for_prefix = max(0, MAX_AGENT_TOOL_NAME_LENGTH - len(sanitized_tool))
+        combined = f"{sanitized_prefix[:budget_for_prefix]}{sanitized_tool}"
+        return combined[:MAX_AGENT_TOOL_NAME_LENGTH]
 
     @property
     def description(self) -> str:
