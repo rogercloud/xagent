@@ -412,7 +412,15 @@ class MCPToolAdapter(AbstractBaseTool):
         raw_name = f"{self._name_prefix}{self.mcp_tool.name}"
         # Replace spaces and dashes with underscores to match LLM tool naming constraints
         # This matches the frontend/chat.py filtering logic
-        return raw_name.replace(" ", "_").replace("-", "_")
+        sanitized = raw_name.replace(" ", "_").replace("-", "_")
+        # Some MCP servers namespace tool names with characters (e.g. the
+        # `.` in `coding.start`) that OpenAI-compatible APIs reject outright
+        # -- `^[a-zA-Z0-9_-]+$` is the pattern OpenAI/DeepSeek enforce on
+        # `tools[].function.name`, and a name that fails it 400s the whole
+        # LLM call, not just this one tool. Catch anything left over from
+        # the two replacements above instead of only handling the specific
+        # characters this method happened to have seen so far.
+        return re.sub(r"[^A-Za-z0-9_-]", "_", sanitized)
 
     @property
     def description(self) -> str:

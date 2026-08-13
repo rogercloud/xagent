@@ -1,4 +1,5 @@
 import json
+import re
 from contextlib import asynccontextmanager
 from dataclasses import FrozenInstanceError
 from types import SimpleNamespace
@@ -267,6 +268,29 @@ def test_mcp_tool_adapter_source_server_defaults_none():
     )
     assert adapter.source_server is None
     assert adapter.metadata.source_server is None
+
+
+def test_mcp_tool_adapter_name_strips_dots_for_openai_compatible_apis():
+    """OpenAI-compatible chat-completions APIs (and at least DeepSeek's)
+    validate `tools[].function.name` against `^[a-zA-Z0-9_-]+$` and 400
+    the whole call if any tool name fails it. MCP servers commonly
+    namespace tool names with a `.` (e.g. `coding.start`) to avoid
+    collisions between generically-named tools -- that dot must not
+    survive into the LLM-visible name."""
+    mcp_tool = SimpleNamespace(
+        name="coding.start",
+        description="Start a coding run",
+        inputSchema={"type": "object", "properties": {}},
+    )
+    adapter = _build_mcp_tool_adapter(
+        "Coding MCP",
+        {"transport": "streamable_http", "url": "http://127.0.0.1:8642/mcp"},
+        mcp_tool,
+    )
+
+    assert "." not in adapter.name
+    assert re.fullmatch(r"[A-Za-z0-9_-]+", adapter.name)
+    assert adapter.name == "mcp_Coding_MCP_coding_start"
 
 
 def test_mcp_tool_adapter_defaults_to_not_concurrency_safe():
