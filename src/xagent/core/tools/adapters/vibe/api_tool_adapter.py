@@ -10,6 +10,7 @@ from pydantic import BaseModel, Field, model_validator
 
 from ....utils.encryption import decrypt_value
 from ...core.api_tool import call_api
+from .agent_tool_names import MAX_AGENT_TOOL_NAME_LENGTH
 from .base import AbstractBaseTool, ToolCategory, ToolVisibility
 from .connector_runtime import (
     MISSING_RUNTIME_VALUE,
@@ -134,11 +135,25 @@ class CustomApiTool(AbstractBaseTool):
     ):
         # Format name for LLM (replace spaces/dashes with underscores)
         sanitized_name = name.replace(" ", "_").replace("-", "_")
+        # `name` is free-form user input (CustomApiCreate.name only bounds
+        # length, not charset), so anything the two replacements above
+        # didn't catch -- a `.` in a domain-like name, punctuation, etc. --
+        # would otherwise survive into `function.name` and 400 the whole
+        # LLM call the same way an unsanitized MCP tool name does.
+        sanitized_name = re.sub(r"[^A-Za-z0-9_-]", "_", sanitized_name)
         # Ensure name doesn't start with api_ twice if already prefixed
-        if sanitized_name.startswith("api_"):
-            self._name = f"{sanitized_name}_call"
-        else:
-            self._name = f"api_{sanitized_name}_call"
+        prefix = "" if sanitized_name.startswith("api_") else "api_"
+        suffix = "_call"
+        # Same failure mode as the character check above -- an over-long
+        # name is rejected by the same providers, just on length instead of
+        # charset. Budget the truncation around the fixed prefix/suffix so
+        # `_call` (the part that signals "this is an API call") survives
+        # instead of being cut off by a blind truncation of the whole
+        # string. `MAX_AGENT_TOOL_NAME_LENGTH` is this repo's own record of
+        # that provider limit (agent_tool_names.py), shared here rather than
+        # redeclared so the two adapters can't drift apart on the number.
+        budget = MAX_AGENT_TOOL_NAME_LENGTH - len(prefix) - len(suffix)
+        self._name = f"{prefix}{sanitized_name[:budget]}{suffix}"
 
         # Structured originating-server identity, normalized once through the
         # shared SSOT. A scoped mcp:<server> selector fronts this Custom-API

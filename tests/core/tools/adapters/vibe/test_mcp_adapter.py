@@ -9,6 +9,7 @@ import httpx
 import pytest
 
 from xagent.core.tools.adapters.vibe import mcp_adapter as mcp_adapter_module
+from xagent.core.tools.adapters.vibe.agent_tool_names import MAX_AGENT_TOOL_NAME_LENGTH
 from xagent.core.tools.adapters.vibe.mcp_adapter import (
     MCPFailurePhase,
     MCPServerLoadFailure,
@@ -270,15 +271,37 @@ def test_mcp_tool_adapter_source_server_defaults_none():
     assert adapter.metadata.source_server is None
 
 
-def test_mcp_tool_adapter_name_strips_dots_for_openai_compatible_apis():
+@pytest.mark.parametrize(
+    ("tool_name", "expected"),
+    [
+        # `.` namespacing, the case the fix was written for.
+        ("coding.start", "mcp_Coding_MCP_coding_start"),
+        # Path-like separator.
+        ("list/items", "mcp_Coding_MCP_list_items"),
+        # Parentheses and a space alongside the version marker.
+        ("run (v2)", "mcp_Coding_MCP_run__v2_"),
+        # Non-ASCII names collapse to underscores rather than raising or
+        # being romanized -- `_semantic_slug` (agent_tool_names.py) makes
+        # the opposite, deliberate choice for agent-delegation tool names
+        # (pinyin-transliterate instead of drop) because it can carry a
+        # unique per-agent id in the suffix; MCP tool names have no such
+        # id to fall back on for uniqueness, so this test pins today's
+        # trade-off (two same-length CJK names collide) rather than
+        # leaving it to be discovered later.
+        ("查询", "mcp_Coding_MCP___"),
+    ],
+)
+def test_mcp_tool_adapter_name_strips_disallowed_characters_for_openai_compatible_apis(
+    tool_name, expected
+):
     """OpenAI-compatible chat-completions APIs (and at least DeepSeek's)
     validate `tools[].function.name` against `^[a-zA-Z0-9_-]+$` and 400
-    the whole call if any tool name fails it. MCP servers commonly
-    namespace tool names with a `.` (e.g. `coding.start`) to avoid
-    collisions between generically-named tools -- that dot must not
-    survive into the LLM-visible name."""
+    the whole call if any tool name fails it. MCP servers namespace tool
+    names with all sorts of characters (e.g. the `.` in `coding.start`)
+    to avoid collisions between generically-named tools -- none of that
+    must survive into the LLM-visible name."""
     mcp_tool = SimpleNamespace(
-        name="coding.start",
+        name=tool_name,
         description="Start a coding run",
         inputSchema={"type": "object", "properties": {}},
     )
@@ -288,9 +311,29 @@ def test_mcp_tool_adapter_name_strips_dots_for_openai_compatible_apis():
         mcp_tool,
     )
 
-    assert "." not in adapter.name
     assert re.fullmatch(r"[A-Za-z0-9_-]+", adapter.name)
-    assert adapter.name == "mcp_Coding_MCP_coding_start"
+    assert adapter.name == expected
+
+
+def test_mcp_tool_adapter_name_is_truncated_to_the_provider_length_limit():
+    """Same failure mode as an illegal character -- an over-long name is
+    rejected by the same providers, just on length. Nothing upstream
+    (MCP server name, MCP tool name) is length-bounded, so this adapter
+    must enforce the limit itself instead of assuming it never comes up.
+    """
+    mcp_tool = SimpleNamespace(
+        name="x" * 200,
+        description="A tool with an absurdly long name",
+        inputSchema={"type": "object", "properties": {}},
+    )
+    adapter = _build_mcp_tool_adapter(
+        "Coding MCP",
+        {"transport": "streamable_http", "url": "http://127.0.0.1:8642/mcp"},
+        mcp_tool,
+    )
+
+    assert len(adapter.name) == MAX_AGENT_TOOL_NAME_LENGTH
+    assert adapter.name.startswith("mcp_Coding_MCP_")
 
 
 def test_mcp_tool_adapter_defaults_to_not_concurrency_safe():

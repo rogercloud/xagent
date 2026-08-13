@@ -1,7 +1,9 @@
+import re
 from unittest.mock import patch
 
 import pytest
 
+from xagent.core.tools.adapters.vibe.agent_tool_names import MAX_AGENT_TOOL_NAME_LENGTH
 from xagent.core.tools.adapters.vibe.api_tool_adapter import (
     CustomApiTool,
     create_custom_api_tools,
@@ -28,6 +30,55 @@ def test_custom_api_tool_init():
     assert "Configured method: POST" in tool.description
     assert "- API_KEY" in tool.description
     assert "- API_KEY_BACKUP" in tool.description
+
+
+@pytest.mark.parametrize(
+    ("api_name", "expected"),
+    [
+        # A domain-shaped name is the natural thing for a user to type
+        # when naming a custom API after the service it calls -- the `.`
+        # must not survive into `function.name`.
+        ("weather.com", "api_weather_com_call"),
+        ("Foo (v2)", "api_Foo__v2__call"),
+        ("Slack #alerts", "api_Slack__alerts_call"),
+    ],
+)
+def test_custom_api_tool_name_strips_disallowed_characters_for_openai_compatible_apis(
+    api_name, expected
+):
+    """`CustomApiCreate.name` (web/api/custom_api.py) only bounds length,
+    not charset, so this is free-form user input. OpenAI-compatible
+    chat-completions APIs validate `tools[].function.name` against
+    `^[a-zA-Z0-9_-]+$` and 400 the whole call if any tool name fails it
+    -- the same defect `MCPToolAdapter.name` had, just reached through a
+    different, even less constrained input."""
+    tool = CustomApiTool(
+        name=api_name,
+        description="A test API",
+        env={},
+    )
+
+    assert re.fullmatch(r"[A-Za-z0-9_-]+", tool.name)
+    assert tool.name == expected
+
+
+def test_custom_api_tool_name_is_truncated_to_the_provider_length_limit():
+    """Same failure mode as an illegal character -- an over-long name is
+    rejected by the same providers, just on length. `CustomApiCreate.
+    name` only bounds length to 100, well past what fits after the
+    `api_`/`_call` wrapper, so this adapter must enforce the real
+    provider limit itself. The `_call` suffix -- the part that signals
+    "this is an API call" -- must survive a name this long, not just get
+    chopped off by a blind truncation of the whole string."""
+    tool = CustomApiTool(
+        name="x" * 200,
+        description="A test API",
+        env={},
+    )
+
+    assert len(tool.name) == MAX_AGENT_TOOL_NAME_LENGTH
+    assert tool.name.startswith("api_")
+    assert tool.name.endswith("_call")
 
 
 def test_custom_api_tool_replace_secrets():

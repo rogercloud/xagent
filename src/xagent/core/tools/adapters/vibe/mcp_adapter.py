@@ -23,6 +23,7 @@ from ..... import config as _root_config
 from .....sandbox.base import Sandbox
 from ...core.mcp.sessions import Connection, create_session
 from ...core.mcp.tools import load_mcp_tools
+from .agent_tool_names import MAX_AGENT_TOOL_NAME_LENGTH
 from .base import AbstractBaseTool, ToolVisibility
 from .connector_runtime import (
     ERROR_DELEGATED_AUTHORIZATION_FAILED,
@@ -410,8 +411,7 @@ class MCPToolAdapter(AbstractBaseTool):
     def name(self) -> str:
         """Get tool name with optional prefix, formatted for LLM requirements."""
         raw_name = f"{self._name_prefix}{self.mcp_tool.name}"
-        # Replace spaces and dashes with underscores to match LLM tool naming constraints
-        # This matches the frontend/chat.py filtering logic
+        # Replace spaces and dashes with underscores to match LLM tool naming constraints.
         sanitized = raw_name.replace(" ", "_").replace("-", "_")
         # Some MCP servers namespace tool names with characters (e.g. the
         # `.` in `coding.start`) that OpenAI-compatible APIs reject outright
@@ -420,7 +420,13 @@ class MCPToolAdapter(AbstractBaseTool):
         # LLM call, not just this one tool. Catch anything left over from
         # the two replacements above instead of only handling the specific
         # characters this method happened to have seen so far.
-        return re.sub(r"[^A-Za-z0-9_-]", "_", sanitized)
+        sanitized = re.sub(r"[^A-Za-z0-9_-]", "_", sanitized)
+        # Same failure mode as the character check above -- an over-long
+        # name is rejected by the same providers, just on length instead of
+        # charset. `MAX_AGENT_TOOL_NAME_LENGTH` is this repo's own record of
+        # that provider limit (agent_tool_names.py), shared here rather than
+        # redeclared so the two adapters can't drift apart on the number.
+        return sanitized[:MAX_AGENT_TOOL_NAME_LENGTH]
 
     @property
     def description(self) -> str:
