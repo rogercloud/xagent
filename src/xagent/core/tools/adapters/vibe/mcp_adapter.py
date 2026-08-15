@@ -327,14 +327,15 @@ def _mcp_return_value_as_string(value: Any) -> str:
                         texts.append(str(item))
             elif content:
                 texts.append(str(content))
-            else:
-                texts.append("No content returned")
 
             structured_content = value.get("structured_content")
             if structured_content is not None:
                 texts.append(
                     "Structured result: " + json.dumps(structured_content, default=str)
                 )
+
+            if not texts:
+                texts.append("No content returned")
 
             return "\n".join(texts)
         return str(value)

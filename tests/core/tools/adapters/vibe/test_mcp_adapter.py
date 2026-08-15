@@ -536,6 +536,19 @@ def test_mcp_return_value_as_string_omits_structured_content_when_absent():
     assert _mcp_return_value_as_string(value) == "ok"
 
 
+def test_mcp_return_value_as_string_omits_no_content_placeholder_when_structured_content_present():
+    value = {
+        "content": [],
+        "structured_content": {"status": "completed"},
+        "is_error": False,
+    }
+
+    rendered = _mcp_return_value_as_string(value)
+
+    assert "No content returned" not in rendered
+    assert "completed" in rendered
+
+
 @pytest.mark.asyncio
 async def test_execute_mcp_call_forwards_structured_content(monkeypatch):
     mcp_tool = _mcp_tool("status")
