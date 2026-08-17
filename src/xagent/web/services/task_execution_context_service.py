@@ -9,6 +9,7 @@ from typing import Any, Dict, List, Optional
 
 from sqlalchemy.orm import Session
 
+from ...config import get_faithful_context_reconstruction_enabled
 from ...core.file_ref import build_file_id_ref
 from ...skills.utils import create_skill_manager
 from ..models.task import TraceEvent
@@ -85,47 +86,67 @@ def load_task_execution_context_messages(
     *,
     max_tool_events: int = 8,
 ) -> List[Dict[str, str]]:
-    """Load reusable prior execution context for a task as planner-visible messages."""
-    trace_events = (
-        db.query(TraceEvent)
-        .filter(
-            TraceEvent.task_id == task_id,
-            TraceEvent.build_id.is_(None),
-            TraceEvent.event_type == "tool_execution_end",
-        )
-        .order_by(TraceEvent.timestamp.desc(), TraceEvent.id.desc())
-        .limit(max_tool_events)
-        .all()
-    )
+    """Load reusable prior execution context for a task as planner-visible messages.
 
-    tool_summaries: List[str] = []
-    seen_summaries: set[str] = set()
+    When faithful context reconstruction is enabled (the default; see
+    :func:`xagent.config.get_faithful_context_reconstruction_enabled`), the
+    real prior tool calls/results already reach the model faithfully through
+    ``task_conversation_context_service.load_task_conversation_context_sync``
+    (wired into ``conversation_history``), so this function only contributes
+    the latest-execution-failure anchor -- re-emitting a lossy per-tool
+    ``"=== Previous Execution Context ==="`` summary here would duplicate
+    (and risk contradicting) the faithfully reconstructed messages.
 
-    for trace_event in trace_events:
-        data: Dict[str, Any] = (
-            trace_event.data if isinstance(trace_event.data, dict) else {}
-        )
-        summary = summarize_tool_event(data)
-        if not summary or summary in seen_summaries:
-            continue
-        seen_summaries.add(summary)
-        tool_summaries.append(summary)
-
+    With the kill switch disabled, this keeps the legacy behavior: up to
+    ``max_tool_events`` most-recent tool summaries plus the failure anchor,
+    collapsed into a single synthetic ``system`` message.
+    """
     failure_summary = load_latest_execution_failure_summary(db, task_id)
-    if not tool_summaries and not failure_summary:
-        return []
 
-    tool_summaries.reverse()
-    context_lines = []
-    if failure_summary:
-        context_lines.append(failure_summary)
-    context_lines.extend(tool_summaries)
-    content = (
-        "=== Previous Execution Context ===\n"
-        "Prior execution context for this task. Reuse when relevant; rerun only if needed.\n"
-        + "\n".join(context_lines)
-    )
-    return [{"role": "system", "content": content}]
+    if not get_faithful_context_reconstruction_enabled():
+        trace_events = (
+            db.query(TraceEvent)
+            .filter(
+                TraceEvent.task_id == task_id,
+                TraceEvent.build_id.is_(None),
+                TraceEvent.event_type == "tool_execution_end",
+            )
+            .order_by(TraceEvent.timestamp.desc(), TraceEvent.id.desc())
+            .limit(max_tool_events)
+            .all()
+        )
+
+        tool_summaries: List[str] = []
+        seen_summaries: set[str] = set()
+
+        for trace_event in trace_events:
+            data: Dict[str, Any] = (
+                trace_event.data if isinstance(trace_event.data, dict) else {}
+            )
+            summary = summarize_tool_event(data)
+            if not summary or summary in seen_summaries:
+                continue
+            seen_summaries.add(summary)
+            tool_summaries.append(summary)
+
+        if not tool_summaries and not failure_summary:
+            return []
+
+        tool_summaries.reverse()
+        context_lines = []
+        if failure_summary:
+            context_lines.append(failure_summary)
+        context_lines.extend(tool_summaries)
+        content = (
+            "=== Previous Execution Context ===\n"
+            "Prior execution context for this task. Reuse when relevant; rerun only if needed.\n"
+            + "\n".join(context_lines)
+        )
+        return [{"role": "system", "content": content}]
+
+    if not failure_summary:
+        return []
+    return [{"role": "system", "content": failure_summary}]
 
 
 async def load_task_recovered_skill_context(db: Session, task_id: int) -> Optional[str]:

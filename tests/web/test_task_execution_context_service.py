@@ -41,7 +41,57 @@ def _create_task(db_session):
     return task
 
 
-def test_load_task_execution_context_messages_summarizes_list_files_results():
+def test_load_task_execution_context_messages_returns_empty_without_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With faithful reconstruction enabled (default), per-tool summaries are
+    no longer synthesized here -- the real tool calls/results reach the model
+    faithfully via ``task_conversation_context_service`` (wired into
+    ``conversation_history``). Only the latest-failure anchor remains, and
+    with no failure trace event there is nothing left to return.
+    """
+    monkeypatch.delenv("XAGENT_FAITHFUL_CONTEXT_RECONSTRUCTION", raising=False)
+    db_session = _create_db_session()
+    try:
+        task = _create_task(db_session)
+        db_session.add(
+            TraceEvent(
+                task_id=int(task.id),
+                build_id=None,
+                event_id="tool-event-1",
+                event_type="tool_execution_end",
+                timestamp=datetime.now(timezone.utc),
+                step_id="step_1",
+                parent_event_id=None,
+                data={
+                    "tool_name": "list_files",
+                    "success": True,
+                    "result": {
+                        "input": [
+                            {"filename": "foo.docx"},
+                            {"filename": "bar.pdf"},
+                        ],
+                        "output": [],
+                        "temp": [],
+                        "workspace": [],
+                    },
+                },
+            )
+        )
+        db_session.commit()
+
+        messages = load_task_execution_context_messages(db_session, int(task.id))
+
+        assert messages == []
+    finally:
+        db_session.close()
+
+
+def test_load_task_execution_context_messages_summarizes_list_files_results_when_disabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Kill switch OFF restores the legacy lossy per-tool summary behavior."""
+    monkeypatch.setenv("XAGENT_FAITHFUL_CONTEXT_RECONSTRUCTION", "false")
     db_session = _create_db_session()
     try:
         task = _create_task(db_session)
@@ -223,6 +273,9 @@ def test_load_task_execution_context_messages_includes_latest_failure_anchor():
         assert len(messages) == 1
         assert "Previous execution failed" in messages[0]["content"]
         assert "step=render_poster" in messages[0]["content"]
+        # Faithful reconstruction (default) drops the legacy per-tool summary
+        # header -- only the bare failure anchor line remains.
+        assert "=== Previous Execution Context ===" not in messages[0]["content"]
     finally:
         db_session.close()
 
@@ -292,6 +345,28 @@ def test_recovery_snapshot_separates_database_read_from_skill_loading() -> None:
                         "result": {"title": "Snapshot evidence"},
                     },
                 ),
+                # A non-failing tool result alone no longer produces a message
+                # here (faithful reconstruction, the default, carries it via
+                # ``conversation_history`` instead) -- add a failure event so
+                # this test still exercises a non-empty ``messages`` tuple.
+                TraceEvent(
+                    task_id=int(task.id),
+                    build_id=None,
+                    event_id="failure-event-snapshot",
+                    event_type="dag_execute_end",
+                    timestamp=now,
+                    step_id=None,
+                    parent_event_id=None,
+                    data={
+                        "status": "failed",
+                        "result": {
+                            "success": False,
+                            "error": "connection reset",
+                            "failure_reason": "step_failed",
+                            "failed_step_id": "snapshot_step",
+                        },
+                    },
+                ),
                 TraceEvent(
                     task_id=int(task.id),
                     build_id=None,
@@ -313,7 +388,7 @@ def test_recovery_snapshot_separates_database_read_from_skill_loading() -> None:
 
         assert snapshot.selected_skill_name == "translator"
         assert len(snapshot.messages) == 1
-        assert "Snapshot evidence" in snapshot.messages[0]["content"]
+        assert "step=snapshot_step" in snapshot.messages[0]["content"]
         assert isinstance(snapshot.messages, tuple)
     finally:
         db_session.close()

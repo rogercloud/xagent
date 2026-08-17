@@ -15,6 +15,7 @@ from sqlalchemy.orm import Session
 from ...config import (
     get_default_task_execution_mode,
     get_external_upload_dirs,
+    get_faithful_context_reconstruction_enabled,
     get_uploads_dir,
 )
 from ...core.agent.service import AgentService
@@ -1653,13 +1654,37 @@ class AgentServiceManager:
                 f"Cannot set memory similarity threshold for non-existent task {task_id}"
             )
 
-    def _load_persisted_conversation_history(self, task_id: int, db: Session) -> None:
-        """Hydrate an agent's chat transcript from persisted task chat messages."""
+    def _load_persisted_conversation_history(
+        self,
+        task_id: int,
+        db: Session,
+        *,
+        task_pattern: Optional[str] = None,
+    ) -> None:
+        """Hydrate an agent's chat transcript from persisted task chat messages.
+
+        Uses the faithful reconstruction path (real ``assistant(tool_calls)``
+        + ``tool`` message pairs) when the kill switch is enabled and
+        ``task_pattern`` is one of the verified patterns (``react``/``auto``);
+        otherwise falls back to the legacy ``load_task_transcript`` behavior.
+        See ``task_setup_snapshot.py`` for the same eligibility rule applied
+        to the primary snapshot-based path.
+        """
         agent = self._agents.get(task_id)
         if agent is None:
             return
 
-        conversation_history = load_task_transcript(db, task_id)
+        if get_faithful_context_reconstruction_enabled() and task_pattern in (
+            "react",
+            "auto",
+        ):
+            from ..services.task_conversation_context_service import (
+                load_task_conversation_context_sync,
+            )
+
+            conversation_history = load_task_conversation_context_sync(db, task_id)
+        else:
+            conversation_history = load_task_transcript(db, task_id)
         if not conversation_history:
             return
 
@@ -2858,7 +2883,9 @@ class AgentServiceManager:
                         recovery_state.get("skill_context")
                     )
                 elif task_exists and db is not None:
-                    self._load_persisted_conversation_history(task_id, db)
+                    self._load_persisted_conversation_history(
+                        task_id, db, task_pattern=task_pattern
+                    )
                     await self._load_persisted_execution_context(task_id, db)
 
             except Exception as e:

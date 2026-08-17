@@ -712,6 +712,119 @@ async def test_runner_does_not_add_empty_user_message_for_missing_task(
 
 
 @pytest.mark.asyncio
+async def test_initial_messages_replay_tool_pairs(tmp_path: Path) -> None:
+    agent = Agent(name="writer", patterns=[FakePattern({"success": True})])
+    runner = AgentRunner(
+        agent=agent,
+        workspace_manager=FakeWorkspaceManager(tmp_path),
+    )
+
+    initial_messages = [
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "call-1",
+                    "type": "function",
+                    "function": {"name": "read_file", "arguments": "{}"},
+                }
+            ],
+        },
+        {
+            "role": "tool",
+            "tool_name": "read_file",
+            "tool_call_id": "call-1",
+            "raw_result": {"output": "file contents"},
+        },
+    ]
+
+    result = await runner.run(
+        task=None,
+        execution_id="exec-replay",
+        initial_messages=initial_messages,
+    )
+
+    assert result["success"] is True
+    messages = result["context"].messages
+    assert [message.role for message in messages] == ["assistant", "tool"]
+
+    assistant_message = messages[0]
+    assert assistant_message.content == ""
+    assert assistant_message.tool_calls == initial_messages[0]["tool_calls"]
+
+    tool_message = messages[1]
+    assert tool_message.content == "Tool read_file returned: file contents"
+    assert tool_message.tool_call_id == "call-1"
+    assert tool_message.metadata["raw_result"] == {"output": "file contents"}
+    assert tool_message.metadata["tool_name"] == "read_file"
+
+
+@pytest.mark.asyncio
+async def test_initial_assistant_with_empty_content_and_tool_calls_survives(
+    tmp_path: Path,
+) -> None:
+    agent = Agent(name="writer", patterns=[FakePattern({"success": True})])
+    runner = AgentRunner(
+        agent=agent,
+        workspace_manager=FakeWorkspaceManager(tmp_path),
+    )
+
+    initial_messages = [
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "call-2",
+                    "type": "function",
+                    "function": {"name": "list_files", "arguments": "{}"},
+                }
+            ],
+        },
+    ]
+
+    result = await runner.run(
+        task=None,
+        execution_id="exec-empty-content-tool-calls",
+        initial_messages=initial_messages,
+    )
+
+    assert result["success"] is True
+    messages = result["context"].messages
+    assert [message.role for message in messages] == ["assistant"]
+    assert messages[0].tool_calls == initial_messages[0]["tool_calls"]
+
+
+@pytest.mark.asyncio
+async def test_initial_messages_plain_roles_unchanged(tmp_path: Path) -> None:
+    agent = Agent(name="writer", patterns=[FakePattern({"success": True})])
+    runner = AgentRunner(
+        agent=agent,
+        workspace_manager=FakeWorkspaceManager(tmp_path),
+    )
+
+    initial_messages = [
+        {"role": "system", "content": "You are helpful."},
+        {"role": "user", "content": "Hello there"},
+        {"role": "user", "content": ""},  # dropped: no content/context_refs
+    ]
+
+    result = await runner.run(
+        task=None,
+        execution_id="exec-plain-initial",
+        initial_messages=initial_messages,
+    )
+
+    assert result["success"] is True
+    messages = result["context"].messages
+    assert [(message.role, message.content) for message in messages] == [
+        ("system", "You are helpful."),
+        ("user", "Hello there"),
+    ]
+
+
+@pytest.mark.asyncio
 async def test_runner_stops_on_llm_call_interrupt(tmp_path: Path) -> None:
     fallback = FakePattern({"success": True, "output": "should not run"})
     agent = Agent(name="writer", patterns=[LLMInterruptedPattern(), fallback])

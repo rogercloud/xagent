@@ -36,6 +36,12 @@ from typing import TYPE_CHECKING, Any, Optional, cast
 
 from sqlalchemy.orm import Session
 
+from ...config import (
+    get_compact_threshold_default,
+    get_compact_threshold_ratio,
+    get_context_reconstruction_max_chars,
+    get_faithful_context_reconstruction_enabled,
+)
 from ...core.model.chat.basic.base import BaseLLM
 from ..models.database import get_session_local
 from ..models.task import DAGExecution, Task, TraceEvent
@@ -45,6 +51,13 @@ from .task_execution_context_service import (
     TaskExecutionRecoverySnapshot,
     load_task_execution_recovery_snapshot_sync,
 )
+
+# Patterns whose persisted trace-event shapes are verified to match the
+# reconstruction logic in ``task_conversation_context_service``. DAG's tool
+# events (``dag.py`` ~267-274, ``_step_id_from_payload``/``dag_step_id``) have
+# NOT been verified against that reconstruction, so DAG-pattern tasks keep the
+# original ``load_task_transcript`` behavior regardless of the kill switch.
+_RECONSTRUCTION_ELIGIBLE_PATTERNS = {"react", "auto"}
 
 if TYPE_CHECKING:
     from .workforce_runtime import WorkforceTaskRuntime
@@ -118,7 +131,7 @@ class TaskSetupSnapshot:
     agent: Optional[AgentRuntimeFields]
     agent_config: Optional[dict]
     excluded_agent_id: Optional[int]
-    conversation_history: tuple[dict[str, str], ...] = ()
+    conversation_history: tuple[dict[str, Any], ...] = ()
     execution_recovery: TaskExecutionRecoverySnapshot = TaskExecutionRecoverySnapshot()
     reconstruction: TaskReconstructionSnapshot = TaskReconstructionSnapshot()
     # Resolved by ``resolve_task_runtime_config_core`` using this same Session.
@@ -333,13 +346,56 @@ def load_task_setup_snapshot_sync(
 
         from .chat_history_service import load_task_transcript
 
-        conversation_history = tuple(
-            load_task_transcript(
-                session,
-                task_id,
-                before_message_id=before_message_id,
-            )
+        use_reconstruction = (
+            get_faithful_context_reconstruction_enabled()
+            and core.task_pattern in _RECONSTRUCTION_ELIGIBLE_PATTERNS
         )
+        if use_reconstruction:
+            from .task_conversation_context_service import (
+                load_task_conversation_context_sync,
+            )
+
+            llm = task_compact_llm or task_llm
+            window = getattr(llm, "context_window", None)
+            if isinstance(window, int) and window > 0:
+                # tokens -> chars: ~4 chars/token is the project's standing
+                # estimate (see get_compact_threshold_default's docstring and
+                # callers). The extra *2 is deliberate headroom: exceeding the
+                # compaction threshold is exactly what triggers the LLM-summary
+                # compaction path, which is what we want for a faithfully
+                # reconstructed but oversized history. We don't want to exceed
+                # it by much, though, because ExecutionContext._compact_transcript
+                # (core/agent/context/execution.py ~1346-1363) puts no cap of
+                # its own on the summarization prompt -- it serializes the
+                # entire transcript verbatim into the compact LLM call. If that
+                # overflows the compact model's own context window, the call
+                # raises and runtime.py's fallback (~1159-1170) drops to a bare
+                # `truncate` strategy that keeps only the last ~20 messages,
+                # silently losing history anyway. *2 is the empirically chosen
+                # headroom that keeps reconstruction large enough to be useful
+                # while still landing inside the compact LLM's own window often
+                # enough for the LLM-summary path to actually run.
+                budget = int(window * get_compact_threshold_ratio() * 4 * 2)
+            else:
+                budget = get_compact_threshold_default() * 4 * 2
+            max_chars = min(budget, get_context_reconstruction_max_chars())
+
+            conversation_history = tuple(
+                load_task_conversation_context_sync(
+                    session,
+                    task_id,
+                    before_message_id=before_message_id,
+                    max_chars=max_chars,
+                )
+            )
+        else:
+            conversation_history = tuple(
+                load_task_transcript(
+                    session,
+                    task_id,
+                    before_message_id=before_message_id,
+                )
+            )
         execution_recovery = load_task_execution_recovery_snapshot_sync(
             session,
             task_id,

@@ -125,6 +125,14 @@ CHECKPOINT_ENCODING_V2 = "XAGENT_CHECKPOINT_ENCODING_V2"
 CHECKPOINT_HISTORY_LIMIT = "XAGENT_CHECKPOINT_HISTORY_LIMIT"
 COMPACT_THRESHOLD_RATIO = "XAGENT_COMPACT_THRESHOLD_RATIO"
 COMPACT_THRESHOLD_DEFAULT = "XAGENT_COMPACT_THRESHOLD_DEFAULT"
+CONTEXT_RECONSTRUCTION_MAX_SINGLE_RESULT_CHARS = (
+    "XAGENT_CONTEXT_RECONSTRUCTION_MAX_SINGLE_RESULT_CHARS"
+)
+CONTEXT_RECONSTRUCTION_MAX_TOOL_EXCHANGES = (
+    "XAGENT_CONTEXT_RECONSTRUCTION_MAX_TOOL_EXCHANGES"
+)
+CONTEXT_RECONSTRUCTION_MAX_CHARS = "XAGENT_CONTEXT_RECONSTRUCTION_MAX_CHARS"
+FAITHFUL_CONTEXT_RECONSTRUCTION = "XAGENT_FAITHFUL_CONTEXT_RECONSTRUCTION"
 REDIS_URL = "XAGENT_REDIS_URL"
 HOT_PATH_CACHE_ENABLED = "XAGENT_HOT_PATH_CACHE_ENABLED"
 HOT_PATH_CACHE_TTL_SECONDS = "XAGENT_HOT_PATH_CACHE_TTL_SECONDS"
@@ -898,6 +906,64 @@ def get_compact_threshold_default() -> int:
         2. Default ``32000``
     """
     return _get_positive_int_env(COMPACT_THRESHOLD_DEFAULT, 32000)
+
+
+def get_context_reconstruction_max_single_result_chars() -> int:
+    """Per-tool-result size budget (chars) for faithful context reconstruction.
+
+    A result whose serialized JSON exceeds this is replaced wholesale by an
+    ``__omitted__`` marker rather than being character-sliced, so the model
+    never sees a truncated fragment that looks like malformed JSON.
+
+    Priority:
+        1. XAGENT_CONTEXT_RECONSTRUCTION_MAX_SINGLE_RESULT_CHARS environment variable
+        2. Default ``262144``
+    """
+    return _get_positive_int_env(
+        CONTEXT_RECONSTRUCTION_MAX_SINGLE_RESULT_CHARS, 262_144
+    )
+
+
+def get_context_reconstruction_max_tool_exchanges() -> int:
+    """Maximum number of assistant/tool exchange pairs kept during reconstruction.
+
+    Priority:
+        1. XAGENT_CONTEXT_RECONSTRUCTION_MAX_TOOL_EXCHANGES environment variable
+        2. Default ``400``
+    """
+    return _get_positive_int_env(CONTEXT_RECONSTRUCTION_MAX_TOOL_EXCHANGES, 400)
+
+
+def get_context_reconstruction_max_chars() -> int:
+    """Absolute upper bound (chars) on faithfully reconstructed conversation history.
+
+    This is a hard ceiling applied on top of the per-task budget derived from
+    the resolved model's context window (see ``task_setup_snapshot.py``), so a
+    misconfigured or unusually large context window can't make reconstruction
+    unbounded.
+
+    Priority:
+        1. XAGENT_CONTEXT_RECONSTRUCTION_MAX_CHARS environment variable
+        2. Default ``4_000_000``
+    """
+    return _get_positive_int_env(CONTEXT_RECONSTRUCTION_MAX_CHARS, 4_000_000)
+
+
+def get_faithful_context_reconstruction_enabled() -> bool:
+    """Kill switch for faithful context reconstruction (default ON).
+
+    When disabled, callers fall back to the legacy lossy behavior:
+    ``task_setup_snapshot`` uses ``load_task_transcript`` for
+    ``conversation_history`` instead of
+    ``load_task_conversation_context_sync``, and
+    ``load_task_execution_context_messages`` keeps its old per-tool
+    ``"=== Previous Execution Context ==="`` summary block.
+
+    Priority:
+        1. XAGENT_FAITHFUL_CONTEXT_RECONSTRUCTION environment variable
+        2. Default ``True``
+    """
+    return _get_bool_env(FAITHFUL_CONTEXT_RECONSTRUCTION, True)
 
 
 def get_celery_broker_url() -> str | None:

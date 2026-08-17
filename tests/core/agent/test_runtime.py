@@ -1138,3 +1138,78 @@ async def test_runtime_surfaces_cached_tokens_in_usage_and_trace() -> None:
     await runtime.on_llm_end(context=context, response=result)
     assert events[-1]["data"]["cached_input_tokens"] == 4
     assert events[-1]["data"]["input_tokens"] == 7
+
+
+class RaisingCompactLLM:
+    """Stub whose ``chat`` always fails, driving the llm_summary -> truncate
+    fallback in ``PatternRuntime.compact_context_if_needed``."""
+
+    model_name = "raising-compact-llm"
+
+    async def chat(self, **_: Any) -> Any:
+        raise RuntimeError("compact llm exploded")
+
+
+@pytest.mark.asyncio
+async def test_compact_context_if_needed_falls_back_to_truncate_without_orphans() -> (
+    None
+):
+    """When the LLM-summary compaction path raises, the runtime must fall back
+    to ``truncate`` -- and the fallback must never leave a native ``tool``
+    message without the assistant message that declared its ``tool_calls``
+    immediately before it, since providers reject that shape outright.
+    """
+    runtime = PatternRuntime(execution_id="task-compact-fallback")
+    ctx = ExecutionContext()
+    ctx.compact_config.threshold = 1
+    ctx.compact_config.max_messages = 4
+    ctx.add_user_message("u0")
+    ctx.add_assistant_message(
+        "",
+        tool_calls=[
+            {"id": "call-1", "type": "function", "function": {"name": "read_file"}},
+            {"id": "call-2", "type": "function", "function": {"name": "write_file"}},
+        ],
+    )
+    ctx.add_tool_result("read_file", {"output": "read"}, tool_call_id="call-1")
+    ctx.add_tool_result("write_file", {"output": "written"}, tool_call_id="call-2")
+    for i in range(5):
+        ctx.add_user_message(f"tail-{i}")
+
+    result = await runtime.compact_context_if_needed(
+        context=ctx, llm=RaisingCompactLLM()
+    )
+
+    assert result is not None
+    assert result.compacted is True
+    assert result.strategy == "truncate"
+    assert result.metadata["fallback_strategy"] == "truncate"
+    assert "llm_compact_error" in result.metadata
+
+    def assert_no_orphan_tool_messages(messages: list[dict[str, Any]]) -> None:
+        for index, message in enumerate(messages):
+            if message.get("role") != "tool":
+                continue
+            assert index > 0, "tool message with no preceding message"
+            previous = messages[index - 1]
+            assert previous.get("role") == "assistant" and previous.get("tool_calls"), (
+                "tool message not immediately preceded by its assistant tool_calls"
+            )
+            declared_ids = {
+                str(tool_call.get("id"))
+                for tool_call in previous["tool_calls"]
+                if isinstance(tool_call, dict) and tool_call.get("id")
+            }
+            assert message.get("tool_call_id") in declared_ids
+
+    assert_no_orphan_tool_messages(ctx.get_messages_for_llm())
+    assert_no_orphan_tool_messages(
+        [
+            {
+                "role": message.role,
+                "tool_calls": message.tool_calls,
+                "tool_call_id": message.tool_call_id,
+            }
+            for message in ctx.messages
+        ]
+    )

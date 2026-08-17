@@ -376,8 +376,13 @@ def test_snapshot_captures_turn_transcript_recovery_and_decoded_reconstruction(
     assert snapshot is not None
     assert snapshot.conversation_history == ({"role": "user", "content": "prior turn"},)
     assert snapshot.execution_recovery.selected_skill_name == "translator"
-    assert len(snapshot.execution_recovery.messages) == 1
-    assert "prior evidence" in snapshot.execution_recovery.messages[0]["content"]
+    # Faithful reconstruction (default) no longer synthesizes a per-tool
+    # summary here for a non-failing tool result -- the real tool call/result
+    # reaches the model faithfully through ``conversation_history`` instead
+    # (this task's pattern is "single_call", so ``conversation_history`` still
+    # uses the legacy transcript here, but ``execution_recovery.messages`` is
+    # governed purely by the kill switch, not by pattern).
+    assert snapshot.execution_recovery.messages == ()
     assert snapshot.reconstruction.plan_state == {"steps": [{"id": "step-1"}]}
     checkpoint_event = next(
         event
@@ -653,6 +658,142 @@ def test_task_pattern_derived_from_execution_mode(db_session) -> None:
             f"execution_mode={mode!r} expected pattern={expected_pattern!r}, "
             f"got {snapshot.task_pattern!r}"
         )
+
+
+def test_react_task_reconstructs_tool_exchanges_in_conversation_history(
+    db_session,
+) -> None:
+    """A ``react``-pattern task's ``conversation_history`` faithfully
+    reconstructs prior tool calls/results as real ``assistant(tool_calls)`` +
+    ``tool`` message pairs, instead of the legacy lossy transcript-only view.
+    """
+    user = _create_user(db_session)
+    task = _create_task(
+        db_session,
+        user_id=int(user.id),
+        execution_mode="balanced",  # -> "react" pattern
+    )
+    now = datetime.now(timezone.utc)
+    db_session.add(
+        TraceEvent(
+            task_id=int(task.id),
+            build_id=None,
+            event_id="tool-end-1",
+            event_type="tool_execution_end",
+            timestamp=now,
+            data={
+                "tool_call_id": "call-1",
+                "tool_name": "web_search",
+                "tool_params": {"query": "xagent"},
+                "success": True,
+                "result": {"title": "prior evidence"},
+            },
+        )
+    )
+    db_session.commit()
+
+    snapshot = load_task_setup_snapshot_sync(
+        task_id=int(task.id), task_owner_user_id=int(user.id)
+    )
+
+    assert snapshot is not None
+    assert snapshot.task_pattern == "react"
+    roles = [message["role"] for message in snapshot.conversation_history]
+    assert "tool" in roles
+    tool_message = next(
+        message
+        for message in snapshot.conversation_history
+        if message["role"] == "tool"
+    )
+    assert tool_message["tool_name"] == "web_search"
+    assert tool_message["raw_result"] == {"title": "prior evidence"}
+    assistant_message = next(
+        message
+        for message in snapshot.conversation_history
+        if message["role"] == "assistant" and message.get("tool_calls")
+    )
+    assert assistant_message["tool_calls"][0]["function"]["name"] == "web_search"
+
+
+def test_react_task_reconstruction_disabled_by_kill_switch(
+    db_session, monkeypatch
+) -> None:
+    """Setting ``XAGENT_FAITHFUL_CONTEXT_RECONSTRUCTION=false`` restores the
+    legacy transcript-only behavior even for an otherwise-eligible pattern."""
+    monkeypatch.setenv("XAGENT_FAITHFUL_CONTEXT_RECONSTRUCTION", "false")
+
+    user = _create_user(db_session)
+    task = _create_task(
+        db_session,
+        user_id=int(user.id),
+        execution_mode="balanced",  # -> "react" pattern
+    )
+    now = datetime.now(timezone.utc)
+    db_session.add(
+        TraceEvent(
+            task_id=int(task.id),
+            build_id=None,
+            event_id="tool-end-1",
+            event_type="tool_execution_end",
+            timestamp=now,
+            data={
+                "tool_call_id": "call-1",
+                "tool_name": "web_search",
+                "tool_params": {"query": "xagent"},
+                "success": True,
+                "result": {"title": "prior evidence"},
+            },
+        )
+    )
+    db_session.commit()
+
+    snapshot = load_task_setup_snapshot_sync(
+        task_id=int(task.id), task_owner_user_id=int(user.id)
+    )
+
+    assert snapshot is not None
+    assert snapshot.task_pattern == "react"
+    roles = [message["role"] for message in snapshot.conversation_history]
+    assert "tool" not in roles
+
+
+def test_dag_pattern_task_does_not_get_reconstruction(db_session) -> None:
+    """DAG's tool-event shapes were not verified against the reconstruction
+    logic, so a ``dag_plan_execute``-pattern task must keep the legacy
+    ``load_task_transcript`` behavior even with the kill switch enabled."""
+    user = _create_user(db_session)
+    task = _create_task(
+        db_session,
+        user_id=int(user.id),
+        execution_mode="think",  # -> "dag_plan_execute" pattern
+    )
+    now = datetime.now(timezone.utc)
+    db_session.add(
+        TraceEvent(
+            task_id=int(task.id),
+            build_id=None,
+            event_id="tool-end-1",
+            event_type="tool_execution_end",
+            timestamp=now,
+            data={
+                "tool_call_id": "call-1",
+                "tool_name": "web_search",
+                "tool_params": {"query": "xagent"},
+                "success": True,
+                "result": {"title": "prior evidence"},
+            },
+        )
+    )
+    db_session.commit()
+
+    snapshot = load_task_setup_snapshot_sync(
+        task_id=int(task.id), task_owner_user_id=int(user.id)
+    )
+
+    assert snapshot is not None
+    assert snapshot.task_pattern == "dag_plan_execute"
+    roles = [message["role"] for message in snapshot.conversation_history]
+    assert "tool" not in roles
 
 
 def test_no_orm_leak_in_returned_fields(db_session) -> None:
