@@ -29,8 +29,15 @@ config = context.config
 
 # Interpret the config file for Python logging.
 # This line sets up loggers basically.
+#
+# ``disable_existing_loggers`` defaults to True, which would disable every
+# already-registered logger not explicitly listed in alembic.ini's
+# [loggers] section (root/sqlalchemy/alembic). Migrations run in-process
+# during normal app startup (see xagent.web.models.database), so that
+# default would silently and permanently disable application loggers
+# (e.g. everything under "xagent.*") for the lifetime of the process.
 if config.config_file_name is not None:
-    fileConfig(config.config_file_name)
+    fileConfig(config.config_file_name, disable_existing_loggers=False)
 
 # Use our models' MetaData for autogenerate support
 target_metadata = Base.metadata
