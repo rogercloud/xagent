@@ -1,21 +1,25 @@
 """Regression test for the alembic ``env.py`` logging configuration.
 
-``env.py`` calls ``logging.config.fileConfig(config.config_file_name)`` to
-apply ``alembic.ini``'s ``[loggers]`` section. ``fileConfig`` defaults
-``disable_existing_loggers`` to ``True``, which disables *every* logger
-already registered in ``logging.Logger.manager.loggerDict`` that is not one
-of the names explicitly configured in ``alembic.ini`` (``root``,
-``sqlalchemy``, ``alembic``).
+``env.py`` calls ``logging.config.fileConfig(config.config_file_name)`` when
+Alembic is driven from a config *file* (the standalone ``alembic upgrade
+head`` CLI, and this test suite, which builds its ``Config`` from
+``alembic.ini``). ``fileConfig`` defaults ``disable_existing_loggers`` to
+``True``, which disables *every* logger already registered in
+``logging.Logger.manager.loggerDict`` that is not one of the names
+explicitly configured in ``alembic.ini`` (``root``, ``sqlalchemy``,
+``alembic``).
 
-Because migrations run in-process during normal application startup (see
-``xagent.web.models.database._initialize_database_schema`` ->
-``xagent.db.migration.try_upgrade_db`` -> ``command.upgrade`` -> this
-``env.py``), that default would silently and permanently disable
-application loggers such as everything under ``xagent.*`` for the lifetime
-of the process, contradicting the project's own logging setup
-(``xagent.web.logging_config.setup_logging`` explicitly passes
-``disable_existing_loggers=False``).
+Normal application startup does **not** go through this branch:
+``xagent.db.config.create_alembic_config`` builds an in-memory Alembic
+``Config`` with no filename, so ``config.config_file_name`` is ``None`` and
+``fileConfig`` is never called there. See
+``test_env_logging_config_production.py`` for the test pinning that fact.
 
+What this file's test *is* affected by: when this test suite constructs a
+file-backed ``Config`` and runs a real migration, the old default
+(``disable_existing_loggers=True``) would disable every other already
+registered logger for the rest of the test process, contaminating
+subsequent tests that assert on log output -- 131 of them, historically.
 This test drives a real Alembic upgrade (exercising the actual ``env.py``)
 against a throwaway SQLite database and asserts that a logger which existed
 before the upgrade is not disabled afterward.
@@ -24,8 +28,6 @@ before the upgrade is not disabled afterward.
 from __future__ import annotations
 
 import logging
-import os
-import tempfile
 from collections.abc import Generator
 from pathlib import Path
 
@@ -49,25 +51,15 @@ def preexisting_logger() -> Generator[logging.Logger, None, None]:
 
 
 @pytest.fixture
-def sqlite_alembic_cfg() -> Generator[Config, None, None]:
+def sqlite_alembic_cfg(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Config:
     """An Alembic config pointed at a throwaway SQLite database."""
-    old_database_url = os.environ.get("DATABASE_URL")
-    fd, path = tempfile.mkstemp(suffix=".db")
-    os.close(fd)
-    db_url = f"sqlite:///{path}"
-    os.environ["DATABASE_URL"] = db_url
+    db_path = tmp_path / "env_logging_config.db"
+    db_url = f"sqlite:///{db_path}"
+    monkeypatch.setenv("DATABASE_URL", db_url)
 
     cfg = Config(str(project_root / "alembic.ini"))
     cfg.set_main_option("sqlalchemy.url", db_url)
-
-    try:
-        yield cfg
-    finally:
-        if old_database_url is None:
-            os.environ.pop("DATABASE_URL", None)
-        else:
-            os.environ["DATABASE_URL"] = old_database_url
-        os.unlink(path)
+    return cfg
 
 
 @pytest.mark.integration
@@ -77,9 +69,11 @@ def test_alembic_env_does_not_disable_preexisting_loggers(
 ) -> None:
     """Running the real migration env.py must not disable existing loggers.
 
+    This exercises the file-backed ``Config`` path (the same one the
+    standalone ``alembic upgrade head`` CLI and this test suite use).
     ``preexisting_logger`` stands in for any ``xagent.*`` logger created by
-    normal module imports before migrations run during app startup. Alembic
-    only explicitly configures ``root``, ``sqlalchemy``, and ``alembic`` in
+    normal module imports before this migration runs. Alembic only
+    explicitly configures ``root``, ``sqlalchemy``, and ``alembic`` in
     ``alembic.ini``; every other pre-existing logger must be left alone.
     """
     # Base tables are created by SQLAlchemy in production before migrations
