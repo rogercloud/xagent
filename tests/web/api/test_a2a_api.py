@@ -10,6 +10,12 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import QueuePool
 
+from tests.web.pool_contention_shared import (
+    CONTENTION_POOL_TIMEOUT,
+    GUARD_TIMEOUT,
+    LOOP_LIVENESS_TICKS,
+    wait_for_ticks,
+)
 from xagent.core.agent.checkpoint import (
     CheckpointAccessRefusedError,
     CheckpointCorruptError,
@@ -1960,13 +1966,14 @@ async def test_a2a_task_page_pool_wait_runs_in_worker_without_blocking_loop(
     assert page_loader is not None
     assert sync_loader is not None
 
+    # The page loader must wait for the slot, never give up on it.
     engine = create_engine(
         f"sqlite:///{tmp_path / 'a2a-page-pool.db'}",
         connect_args={"check_same_thread": False},
         poolclass=QueuePool,
         pool_size=1,
         max_overflow=0,
-        pool_timeout=1.0,
+        pool_timeout=CONTENTION_POOL_TIMEOUT,
     )
     Base.metadata.create_all(bind=engine)
     SessionLocal = sessionmaker(bind=engine)
@@ -2018,15 +2025,17 @@ async def test_a2a_task_page_pool_wait_runs_in_worker_without_blocking_loop(
     )
     ticker_task = asyncio.create_task(ticker())
     try:
-        assert await asyncio.to_thread(worker_started.wait, 1.0)
-        await asyncio.sleep(0.08)
-        assert ticks >= 3, "A2A list QueuePool checkout blocked the event loop"
+        assert await asyncio.to_thread(worker_started.wait, GUARD_TIMEOUT)
+        observed = await wait_for_ticks(lambda: ticks)
+        assert observed >= LOOP_LIVENESS_TICKS, (
+            "A2A list QueuePool checkout blocked the event loop"
+        )
         assert not load_task.done()
     finally:
         held_connection.close()
 
     try:
-        page = await asyncio.wait_for(load_task, timeout=1.0)
+        page = await asyncio.wait_for(load_task, timeout=GUARD_TIMEOUT)
         assert [task.id for task in page.tasks] == [101]
         assert page.total_size == 1
         assert worker_thread_ids
@@ -2122,7 +2131,7 @@ async def test_start_a2a_turn_cancellation_drains_atomic_create_into_scheduling(
         preparation = original_prepare(**kwargs)
         prepared_task_ids.append(preparation.task.id)
         preparation_committed.set()
-        assert allow_preparation_return.wait(timeout=2.0)
+        assert allow_preparation_return.wait(timeout=GUARD_TIMEOUT)
         return preparation
 
     begin_turn = AsyncMock()
@@ -2155,7 +2164,7 @@ async def test_start_a2a_turn_cancellation_drains_atomic_create_into_scheduling(
             task_id=None,
         )
     )
-    assert await asyncio.to_thread(preparation_committed.wait, 2.0)
+    assert await asyncio.to_thread(preparation_committed.wait, GUARD_TIMEOUT)
 
     turn.cancel()
     await asyncio.sleep(0)
