@@ -19,7 +19,7 @@ import logging
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack, contextmanager
 from datetime import datetime, timedelta, timezone
-from threading import Barrier, Event, get_ident
+from threading import Barrier, get_ident
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -34,6 +34,7 @@ from tests.web.pool_contention_shared import (
     EXHAUSTION_POOL_TIMEOUT,
     GUARD_TIMEOUT,
     LOOP_LIVENESS_TICKS,
+    gated_pool_checkout,
     wait_for_ticks,
 )
 from xagent.core.agent.checkpoint import CHECKPOINT_TYPE
@@ -1890,9 +1891,6 @@ async def test_schedule_bg_resolves_scope_off_loop_before_execution(
     events: list[str] = []
     resolver_threads: list[int] = []
     loop_thread = get_ident()
-    # Opened before the liveness window so it only measures loop progress made
-    # while the scope lookup is actually contending for the slot.
-    scope_started = Event()
 
     def load_snapshot(*_args, **_kwargs):
         events.append("snapshot")
@@ -1901,7 +1899,6 @@ async def test_schedule_bg_resolves_scope_off_loop_before_execution(
     def resolve_scope(resolved_task_id):
         assert resolved_task_id == task_id
         resolver_threads.append(get_ident())
-        scope_started.set()
         with SessionLocal() as scope_db:
             scope_db.execute(text("SELECT 1")).scalar()
         events.append("scope")
@@ -1923,6 +1920,7 @@ async def test_schedule_bg_resolves_scope_off_loop_before_execution(
             ticks += 1
 
     with (
+        gated_pool_checkout(engine) as gate,
         patch(
             "xagent.web.services.task_orchestrator.acquire_task_lease_isolated",
             return_value=fake_lease,
@@ -1964,9 +1962,7 @@ async def test_schedule_bg_resolves_scope_off_loop_before_execution(
         )
         ticker_task = asyncio.create_task(ticker())
         try:
-            assert await asyncio.to_thread(scope_started.wait, GUARD_TIMEOUT), (
-                "scope lookup never reached the contended checkout"
-            )
+            await gate.wait_until_contending()
             observed = await wait_for_ticks(lambda: ticks)
             assert observed >= LOOP_LIVENESS_TICKS, (
                 "scope QueuePool checkout blocked the event loop"
@@ -1974,6 +1970,7 @@ async def test_schedule_bg_resolves_scope_off_loop_before_execution(
             assert not bg_task.done(), "execution started before scope resolution"
         finally:
             held_connection.close()
+            gate.let_through()
             await asyncio.wait_for(bg_task, timeout=GUARD_TIMEOUT)
             ticker_stop.set()
             await ticker_task
@@ -2354,16 +2351,7 @@ async def test_schedule_bg_releases_lease_without_blocking_pool_checkout(
         task.run_id = "run-a"
         seed_db.commit()
 
-    # The release path is production code, so the only seam the test owns is the
-    # session factory it reaches for immediately before the contended checkout.
-    # Opened before the liveness window for the same reason as the scope test.
-    release_started = Event()
-
-    def session_local_for_release():
-        release_started.set()
-        return SessionLocal
-
-    monkeypatch.setattr(database_module, "get_session_local", session_local_for_release)
+    monkeypatch.setattr(database_module, "get_session_local", lambda: SessionLocal)
     held_connection = engine.connect()
     ticker_stop = asyncio.Event()
     ticks = 0
@@ -2375,6 +2363,7 @@ async def test_schedule_bg_releases_lease_without_blocking_pool_checkout(
             ticks += 1
 
     with (
+        gated_pool_checkout(engine) as gate,
         patch(
             "xagent.web.services.task_orchestrator.acquire_task_lease_isolated",
             return_value=TaskLease(
@@ -2418,9 +2407,7 @@ async def test_schedule_bg_releases_lease_without_blocking_pool_checkout(
         )
         ticker_task = asyncio.create_task(ticker())
         try:
-            assert await asyncio.to_thread(release_started.wait, GUARD_TIMEOUT), (
-                "lease release never reached the contended checkout"
-            )
+            await gate.wait_until_contending()
             observed = await wait_for_ticks(lambda: ticks)
             assert observed >= LOOP_LIVENESS_TICKS, (
                 "lease release QueuePool checkout blocked the loop"
@@ -2428,6 +2415,7 @@ async def test_schedule_bg_releases_lease_without_blocking_pool_checkout(
             assert not bg_task.done(), "lease release skipped the contended checkout"
         finally:
             held_connection.close()
+            gate.let_through()
             await asyncio.wait_for(bg_task, timeout=GUARD_TIMEOUT)
             ticker_stop.set()
             await ticker_task
