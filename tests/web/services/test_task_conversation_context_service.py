@@ -509,8 +509,8 @@ def test_merge_chronologically_orders_naive_and_aware_without_typeerror():
 
     entries = _merge_chronologically([naive_user, aware_reply], [exchange])
     kinds_in_order = [entry.kind for entry in entries]
-    assert kinds_in_order == ["transcript", "exchange", "transcript"]
-    assert entries[1].exchange is exchange
+    assert kinds_in_order == ["transcript", "group", "transcript"]
+    assert entries[1].group == [exchange]
     assert entries[0].transcript is naive_user
     assert entries[2].transcript is aware_reply
 
@@ -1388,5 +1388,490 @@ def test_historical_image_budget_keeps_only_the_newest_n_across_messages():
             if CONTEXT_REFS_KEY in message
         ]
         assert retained_ids == [f"image-{index}" for index in range(2, total_images)]
+    finally:
+        db_session.close()
+
+
+# ---------------------------------------------------------------------------
+# Part D -- per-turn grouping (step_id) and image-only-turn retention (#1601)
+# ---------------------------------------------------------------------------
+
+
+def test_second_turn_clock_skew_relocates_exchange_after_its_own_user_message():
+    """The old guard only protected the conversation's *first* user message:
+    an exchange timestamped before ANY later user message (e.g. turn 2's)
+    sorted wherever raw timestamps put it, landing before that turn's own
+    question. Reproduces the reviewer's scenario: turn 2's
+    ``tool_execution_start``/``tool_execution_end`` are timestamped 1s
+    before turn 2's ``TaskChatMessage`` (DB clock vs app clock skew). The
+    fix groups by ``step_id`` and relocates the whole group after the user
+    message it belongs to, for every turn -- not just the first.
+    """
+    db_session = _create_db_session()
+    try:
+        task = _create_task(db_session)
+        base = datetime(2026, 1, 1, tzinfo=timezone.utc)
+
+        # Turn 1: well-timestamped, no skew.
+        _add_chat_message(
+            db_session, task, role="user", content="turn 1 question", created_at=base
+        )
+        _add_trace_event(
+            db_session,
+            task,
+            event_type="tool_execution_start",
+            timestamp=base + timedelta(seconds=1),
+            step_id="turn1",
+            data={
+                "tool_name": "list_files",
+                "tool_params": {"turn": 1},
+                "tool_call_id": "turn1-call",
+                "assistant_content": "Checking turn 1.",
+            },
+        )
+        _add_trace_event(
+            db_session,
+            task,
+            event_type="tool_execution_end",
+            timestamp=base + timedelta(seconds=2),
+            step_id="turn1",
+            data={
+                "tool_name": "list_files",
+                "tool_call_id": "turn1-call",
+                "success": True,
+                "result": {"turn": 1},
+            },
+        )
+        _add_chat_message(
+            db_session,
+            task,
+            role="assistant",
+            content="turn 1 answer",
+            created_at=base + timedelta(seconds=3),
+        )
+
+        # Turn 2: the TaskChatMessage row (DB clock).
+        turn2_user_created_at = base + timedelta(minutes=5)
+        _add_chat_message(
+            db_session,
+            task,
+            role="user",
+            content="turn 2 question",
+            created_at=turn2_user_created_at,
+        )
+
+        # Turn 2's tool exchange (app clock), timestamped BEFORE its own
+        # user message due to clock skew between the two clocks.
+        _add_trace_event(
+            db_session,
+            task,
+            event_type="tool_execution_start",
+            timestamp=turn2_user_created_at - timedelta(seconds=1),
+            step_id="turn2",
+            data={
+                "tool_name": "list_files",
+                "tool_params": {"turn": 2},
+                "tool_call_id": "turn2-call",
+                "assistant_content": "Checking turn 2.",
+            },
+        )
+        _add_trace_event(
+            db_session,
+            task,
+            event_type="tool_execution_end",
+            timestamp=turn2_user_created_at - timedelta(milliseconds=500),
+            step_id="turn2",
+            data={
+                "tool_name": "list_files",
+                "tool_call_id": "turn2-call",
+                "success": True,
+                "result": {"turn": 2},
+            },
+        )
+        _add_chat_message(
+            db_session,
+            task,
+            role="assistant",
+            content="turn 2 answer",
+            created_at=turn2_user_created_at + timedelta(seconds=3),
+        )
+
+        messages = load_task_conversation_context_sync(db_session, int(task.id))
+        roles = [m["role"] for m in messages]
+
+        assert roles == [
+            "user",
+            "assistant",
+            "tool",
+            "assistant",
+            "user",
+            "assistant",
+            "tool",
+            "assistant",
+        ]
+        assert messages[0]["content"] == "turn 1 question"
+        assert messages[1]["tool_calls"][0]["id"] == "turn1-call"
+        assert messages[2]["tool_call_id"] == "turn1-call"
+        assert messages[3]["content"] == "turn 1 answer"
+        assert messages[4]["content"] == "turn 2 question"
+        # Turn 2's exchange sits AFTER turn 2's own question, not before it.
+        assert messages[5]["tool_calls"][0]["id"] == "turn2-call"
+        assert messages[6]["tool_call_id"] == "turn2-call"
+        assert messages[7]["content"] == "turn 2 answer"
+    finally:
+        db_session.close()
+
+
+def test_exchanges_from_different_turns_never_merge_into_one_group():
+    """Two turns whose tool events share no ``step_id`` must never be
+    coalesced into a single group, and each turn's group must stay
+    contiguous (no interleaving between the two turns' assistant/tool
+    pairs)."""
+    from xagent.web.services.task_conversation_context_service import (
+        _group_exchanges_by_turn,
+        _ToolExchange,
+    )
+
+    turn1_call_a = _ToolExchange(
+        call_id="t1-a",
+        tool_name="list_files",
+        tool_params={},
+        result={"ok": True},
+        assistant_content="",
+        sort_key=(_ts(0), 1),
+        step_id="turn1",
+    )
+    turn1_call_b = _ToolExchange(
+        call_id="t1-b",
+        tool_name="list_files",
+        tool_params={},
+        result={"ok": True},
+        assistant_content="",
+        sort_key=(_ts(1), 2),
+        step_id="turn1",
+    )
+    turn2_call = _ToolExchange(
+        call_id="t2-a",
+        tool_name="list_files",
+        tool_params={},
+        result={"ok": True},
+        assistant_content="",
+        sort_key=(_ts(2), 3),
+        step_id="turn2",
+    )
+
+    groups = _group_exchanges_by_turn([turn1_call_a, turn1_call_b, turn2_call])
+
+    assert len(groups) == 2
+    assert groups[0] == [turn1_call_a, turn1_call_b]
+    assert groups[1] == [turn2_call]
+
+    # And end-to-end: each turn's assistant/tool block stays contiguous in
+    # the rendered output, with no cross-turn interleaving.
+    db_session = _create_db_session()
+    try:
+        task = _create_task(db_session)
+        base = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        _add_chat_message(db_session, task, role="user", content="q1", created_at=base)
+        for index, call_id in enumerate(["t1-a", "t1-b"]):
+            _add_trace_event(
+                db_session,
+                task,
+                event_type="tool_execution_start",
+                timestamp=base + timedelta(seconds=1 + index),
+                step_id="turn1",
+                data={
+                    "tool_name": "list_files",
+                    "tool_params": {"call": call_id},
+                    "tool_call_id": call_id,
+                },
+            )
+            _add_trace_event(
+                db_session,
+                task,
+                event_type="tool_execution_end",
+                timestamp=base + timedelta(seconds=1 + index, milliseconds=500),
+                step_id="turn1",
+                data={
+                    "tool_name": "list_files",
+                    "tool_call_id": call_id,
+                    "success": True,
+                    "result": {"call": call_id},
+                },
+            )
+        _add_chat_message(
+            db_session,
+            task,
+            role="assistant",
+            content="a1",
+            created_at=base + timedelta(seconds=5),
+        )
+        _add_chat_message(
+            db_session,
+            task,
+            role="user",
+            content="q2",
+            created_at=base + timedelta(minutes=1),
+        )
+        _add_trace_event(
+            db_session,
+            task,
+            event_type="tool_execution_start",
+            timestamp=base + timedelta(minutes=1, seconds=1),
+            step_id="turn2",
+            data={
+                "tool_name": "list_files",
+                "tool_params": {"call": "t2-a"},
+                "tool_call_id": "t2-a",
+            },
+        )
+        _add_trace_event(
+            db_session,
+            task,
+            event_type="tool_execution_end",
+            timestamp=base + timedelta(minutes=1, seconds=2),
+            step_id="turn2",
+            data={
+                "tool_name": "list_files",
+                "tool_call_id": "t2-a",
+                "success": True,
+                "result": {"call": "t2-a"},
+            },
+        )
+        _add_chat_message(
+            db_session,
+            task,
+            role="assistant",
+            content="a2",
+            created_at=base + timedelta(minutes=1, seconds=3),
+        )
+
+        messages = load_task_conversation_context_sync(db_session, int(task.id))
+        call_ids_in_order = [m["tool_call_id"] for m in messages if m["role"] == "tool"]
+        assert call_ids_in_order == ["t1-a", "t1-b", "t2-a"]
+        # Turn 1's block (2 assistant+tool pairs) sits fully between q1/a1;
+        # turn 2's block sits fully between q2/a2 -- no interleaving.
+        q1_index = messages.index({"role": "user", "content": "q1"})
+        a1_index = next(i for i, m in enumerate(messages) if m.get("content") == "a1")
+        q2_index = messages.index({"role": "user", "content": "q2"})
+        a2_index = next(i for i, m in enumerate(messages) if m.get("content") == "a2")
+        assert q1_index < a1_index < q2_index < a2_index
+        for index in range(q1_index + 1, a1_index):
+            if messages[index]["role"] == "tool":
+                assert messages[index]["raw_result"]["call"] in ("t1-a", "t1-b")
+        for index in range(q2_index + 1, a2_index):
+            if messages[index]["role"] == "tool":
+                assert messages[index]["raw_result"]["call"] == "t2-a"
+    finally:
+        db_session.close()
+
+
+def test_well_timestamped_multi_turn_history_unchanged_by_grouping():
+    """Regression guard: with proper, non-skewed timestamps and step_id set
+    per turn (exercising the new grouping path), the reconstructed order is
+    identical to the pre-grouping expectation covered by
+    ``test_multi_turn_history_is_chronological`` above."""
+    db_session = _create_db_session()
+    try:
+        task = _create_task(db_session)
+        base = datetime(2026, 1, 1, tzinfo=timezone.utc)
+
+        for turn in range(3):
+            offset_minutes = turn * 10
+            _add_chat_message(
+                db_session,
+                task,
+                role="user",
+                content=f"user turn {turn}",
+                created_at=base + timedelta(minutes=offset_minutes),
+            )
+            for tool_index in range(2):
+                call_id = f"turn{turn}-call{tool_index}"
+                ts_start = base + timedelta(
+                    minutes=offset_minutes, seconds=1 + tool_index * 2
+                )
+                ts_end = base + timedelta(
+                    minutes=offset_minutes, seconds=2 + tool_index * 2
+                )
+                _add_trace_event(
+                    db_session,
+                    task,
+                    event_type="tool_execution_start",
+                    timestamp=ts_start,
+                    step_id=f"step-turn{turn}",
+                    data={
+                        "tool_name": "list_files",
+                        "tool_params": {"turn": turn, "tool_index": tool_index},
+                        "tool_call_id": call_id,
+                    },
+                )
+                _add_trace_event(
+                    db_session,
+                    task,
+                    event_type="tool_execution_end",
+                    timestamp=ts_end,
+                    step_id=f"step-turn{turn}",
+                    data={
+                        "tool_name": "list_files",
+                        "tool_call_id": call_id,
+                        "success": True,
+                        "result": {"turn": turn, "tool_index": tool_index},
+                    },
+                )
+            _add_chat_message(
+                db_session,
+                task,
+                role="assistant",
+                content=f"assistant answer {turn}",
+                created_at=base + timedelta(minutes=offset_minutes, seconds=9),
+            )
+
+        messages = load_task_conversation_context_sync(db_session, int(task.id))
+        roles = [m["role"] for m in messages]
+
+        assert roles.count("user") == 3
+        assert roles.count("assistant") == 3 + 3 * 2
+        assert roles.count("tool") == 6
+
+        for turn in range(3):
+            user_index = messages.index(
+                {"role": "user", "content": f"user turn {turn}"}
+            )
+            answer_index = next(
+                index
+                for index, m in enumerate(messages)
+                if m["role"] == "assistant"
+                and m.get("content") == f"assistant answer {turn}"
+            )
+            assert user_index < answer_index
+            for index in range(user_index + 1, answer_index):
+                message = messages[index]
+                if message["role"] == "tool":
+                    assert message["raw_result"]["turn"] == turn
+    finally:
+        db_session.close()
+
+
+def test_image_only_user_turn_survives_with_blank_content():
+    """A ``TaskChatMessage`` with ``content=""`` and an image attachment is
+    a supported product path (``persist_user_message_no_commit``,
+    chat_history_service.py, documents this explicitly) and must survive
+    reconstruction with its context refs -- not be dropped as if it were
+    truly empty."""
+    db_session = _create_db_session()
+    try:
+        task = _create_task(db_session)
+        base = _ts(0)
+
+        _add_chat_message(
+            db_session,
+            task,
+            role="user",
+            content="",
+            created_at=base,
+            attachments=[
+                {
+                    "file_id": "image-only",
+                    "name": "screenshot.png",
+                    "type": "image/png",
+                }
+            ],
+        )
+        # A truly empty row -- no content, no attachments -- must still be
+        # dropped.
+        _add_chat_message(
+            db_session,
+            task,
+            role="user",
+            content="",
+            created_at=base + timedelta(seconds=1),
+            attachments=None,
+        )
+        _add_chat_message(
+            db_session,
+            task,
+            role="assistant",
+            content="I see the screenshot.",
+            created_at=base + timedelta(seconds=2),
+        )
+
+        messages = load_task_conversation_context_sync(db_session, int(task.id))
+
+        assert len(messages) == 2
+        assert messages[0]["role"] == "user"
+        assert messages[0]["content"] == ""
+        assert len(messages[0][CONTEXT_REFS_KEY]) == 1
+        assert messages[0][CONTEXT_REFS_KEY][0]["file_ref"]["file_id"] == ("image-only")
+        assert messages[1]["role"] == "assistant"
+        assert messages[1]["content"] == "I see the screenshot."
+    finally:
+        db_session.close()
+
+
+def test_image_only_turn_participates_correctly_in_chronological_ordering():
+    """The image-only row is not just retained -- it must land in its
+    correct chronological slot relative to a tool exchange interleaved
+    around it."""
+    db_session = _create_db_session()
+    try:
+        task = _create_task(db_session)
+        base = _ts(0)
+
+        _add_chat_message(
+            db_session,
+            task,
+            role="user",
+            content="",
+            created_at=base,
+            attachments=[
+                {
+                    "file_id": "image-mid",
+                    "name": "diagram.png",
+                    "type": "image/png",
+                }
+            ],
+        )
+        _add_trace_event(
+            db_session,
+            task,
+            event_type="tool_execution_start",
+            timestamp=base + timedelta(seconds=1),
+            step_id="turn1",
+            data={
+                "tool_name": "analyze_image",
+                "tool_params": {},
+                "tool_call_id": "call-analyze",
+            },
+        )
+        _add_trace_event(
+            db_session,
+            task,
+            event_type="tool_execution_end",
+            timestamp=base + timedelta(seconds=2),
+            step_id="turn1",
+            data={
+                "tool_name": "analyze_image",
+                "tool_call_id": "call-analyze",
+                "success": True,
+                "result": {"label": "diagram"},
+            },
+        )
+        _add_chat_message(
+            db_session,
+            task,
+            role="assistant",
+            content="It's a diagram.",
+            created_at=base + timedelta(seconds=3),
+        )
+
+        messages = load_task_conversation_context_sync(db_session, int(task.id))
+        roles = [m["role"] for m in messages]
+
+        assert roles == ["user", "assistant", "tool", "assistant"]
+        assert messages[0]["content"] == ""
+        assert messages[0][CONTEXT_REFS_KEY][0]["file_ref"]["file_id"] == ("image-mid")
+        assert messages[1]["tool_calls"][0]["id"] == "call-analyze"
+        assert messages[2]["tool_call_id"] == "call-analyze"
+        assert messages[3]["content"] == "It's a diagram."
     finally:
         db_session.close()
