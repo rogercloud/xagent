@@ -50,12 +50,6 @@ _TOOL_EVENT_TYPES = (
 # ``normalize_transcript_messages`` (core/agent/transcript.py).
 _TRANSCRIPT_ROLES = {"user", "assistant", "system"}
 
-# Sort tiebreak when a tool exchange and a transcript row share the exact same
-# timestamp: the exchange (0) sorts before the transcript row (1), since tool
-# work logically precedes the turn's final answer.
-_TIEBREAK_EXCHANGE = 0
-_TIEBREAK_TRANSCRIPT = 1
-
 
 @dataclass
 class _TranscriptRow:
@@ -65,6 +59,11 @@ class _TranscriptRow:
     role: str
     content: str
     created_at: datetime
+    # ``TaskChatMessage.turn_id``, empty string when unset (rows written
+    # before this column existed, or a role that never gets one). Used to
+    # place this turn's reconstructed tool exchanges immediately after this
+    # row -- see ``_merge_chronologically``.
+    turn_id: str = ""
     # Raw ``TaskChatMessage.attachments`` payload, kept only long enough for
     # ``_attach_historical_image_context_refs`` to project it into
     # ``context_refs`` below; never read after ``_load_transcript_rows``
@@ -84,6 +83,11 @@ class _PendingToolStart:
     tool_name: str
     tool_params: Any
     sort_key: tuple[datetime, int]
+    # The turn_id stamped on the "tool_execution_start" event's data (see
+    # PatternRuntime.on_tool_start / _with_runtime_turn_id in react.py),
+    # empty string when absent (legacy rows, or a call whose start event
+    # fell outside this query's window).
+    turn_id: str = ""
 
 
 @dataclass
@@ -96,18 +100,21 @@ class _ToolExchange:
     result: Any
     assistant_content: str
     sort_key: tuple[datetime, int]
-    # Raw ``TraceEvent.step_id`` discriminator (see ``_load_tool_exchanges``),
-    # empty string when the column was unset. Used only to group exchanges
-    # produced by the same turn for the R4 merge below -- never for pairing,
-    # which already has its own step-scoped keying.
-    step_id: str = ""
+    # The durable turn_id this exchange belongs to (see ``_PendingToolStart
+    # .turn_id`` and ``_load_tool_exchanges``), empty string when the
+    # producing trace events predate turn_id support. Used by
+    # ``_merge_chronologically`` to place this exchange immediately after
+    # its turn's user transcript row -- a plain join, since
+    # ``TaskChatMessage.turn_id`` and this value come from the same source
+    # (see AgentRunner._ensure_user_message_turn_id). An empty turn_id means
+    # the exchange is omitted rather than placed by guesswork.
+    turn_id: str = ""
 
 
 @dataclass
 class _MergeEntry:
-    """One item queued for the chronological merge (R4)."""
+    """One item queued for the transcript/tool-exchange merge (R4)."""
 
-    sort_key: tuple[datetime, int, int]
     kind: str  # "group" | "transcript"
     group: Optional[list[_ToolExchange]] = None
     transcript: Optional[_TranscriptRow] = None
@@ -174,13 +181,14 @@ def _load_transcript_rows(
         TaskChatMessage.content,
         TaskChatMessage.created_at,
         TaskChatMessage.attachments,
+        TaskChatMessage.turn_id,
     ).filter(TaskChatMessage.task_id == task_id)
     if before_message_id is not None:
         query = query.filter(TaskChatMessage.id < before_message_id)
     query = query.order_by(asc(TaskChatMessage.id))
 
     rows: list[_TranscriptRow] = []
-    for row_id, role, content, created_at, attachments in query.all():
+    for row_id, role, content, created_at, attachments, turn_id in query.all():
         normalized_role = str(role or "").strip().lower()
         if normalized_role not in _TRANSCRIPT_ROLES:
             continue
@@ -191,6 +199,7 @@ def _load_transcript_rows(
                 role=normalized_role,
                 content=normalized_content,
                 created_at=_as_aware_utc(created_at),
+                turn_id=str(turn_id or ""),
                 attachments=attachments,
             )
         )
@@ -286,6 +295,7 @@ def _load_tool_exchanges(db: Session, task_id: int) -> list[_ToolExchange]:
                 tool_name=str(data.get("tool_name") or ""),
                 tool_params=data.get("tool_params"),
                 sort_key=(row_timestamp, row_id),
+                turn_id=str(data.get("turn_id") or ""),
             )
             continue
 
@@ -338,6 +348,15 @@ def _load_tool_exchanges(db: Session, task_id: int) -> list[_ToolExchange]:
 
         sort_key = start.sort_key if start is not None else (row_timestamp, row_id)
 
+        # The end/failure event's own "turn_id" (present since
+        # PatternRuntime.on_tool_end/on_tool_error also stamp it) wins;
+        # fall back to the matching start's value for a pair split across
+        # two events where only one carries it (e.g. a start recorded before
+        # this field shipped, matched to an end recorded after).
+        turn_id = str(data.get("turn_id") or "")
+        if not turn_id and start is not None:
+            turn_id = start.turn_id
+
         exchanges.append(
             _ToolExchange(
                 call_id=call_id,
@@ -346,7 +365,7 @@ def _load_tool_exchanges(db: Session, task_id: int) -> list[_ToolExchange]:
                 result=result,
                 assistant_content=assistant_content,
                 sort_key=sort_key,
-                step_id=step_discriminator,
+                turn_id=turn_id,
             )
         )
 
@@ -417,154 +436,88 @@ def _resolve_tool_result(event_type: str, data: dict[str, Any]) -> Any:
 
 
 # ---------------------------------------------------------------------------
-# R4 -- chronological merge
+# R4 -- turn_id join
 # ---------------------------------------------------------------------------
 
 
 def _group_exchanges_by_turn(
     exchanges: list[_ToolExchange],
-) -> list[list[_ToolExchange]]:
-    """Group tool exchanges by the turn that produced them.
+) -> dict[str, list[_ToolExchange]]:
+    """Group tool exchanges by the durable turn_id that produced them.
 
-    ``TraceEvent.step_id`` is the grouping key. For ReAct tasks it carries
-    ``PatternRuntime.active_react_step_id`` (runtime.py), which is minted
-    fresh (``f"react_{uuid4().hex[:8]}"``) in ``on_pattern_start`` and cleared
-    in ``on_pattern_end``/``on_pattern_error`` -- so every tool event produced
-    while handling one user turn shares one step id, and no two turns ever
-    share one. For DAG-produced events, ``_with_step`` (pattern/dag/dag.py)
-    stamps each concurrently-scheduled DAG step with its own ``step_id``, so
-    a single turn that fans out over several DAG steps yields *several*
-    groups rather than one -- that's fine here: each such group still carries
-    its own real timestamps and gets positioned (and guarded, see
-    ``_relocate_groups_before_their_user_message`` below) independently, so
-    the atomicity and ordering invariants below hold per group regardless of
-    how many groups one turn happens to produce.
+    Unlike the old ``TraceEvent.step_id``-keyed grouping this replaces,
+    ``turn_id`` is guaranteed fresh per turn: it is minted once per user
+    message (``AgentRunner._ensure_user_message_turn_id``) and threaded
+    verbatim into both ``TaskChatMessage.turn_id`` and the tool trace
+    events' ``data["turn_id"]`` (``PatternRuntime.on_tool_start`` /
+    ``on_tool_end`` / ``on_tool_error``, via ``_with_runtime_turn_id`` in
+    react.py and ``_DAGStepRuntime.active_turn_id`` in dag.py). A DAG turn
+    that fans out over several steps still shares that one turn_id across
+    every step, so it collapses back into a single group here -- unlike
+    ``step_id``, which is deliberately per-step and would fragment it.
 
-    Rows written before ``TraceEvent.step_id`` existed (or otherwise missing
-    it) carry ``step_id=None``, which ``_load_tool_exchanges`` normalizes to
-    ``""``. Grouping *all* such exchanges under one empty-string key would
-    silently merge unrelated turns back together -- exactly the bug this
-    function exists to avoid. So each exchange with no step id instead gets
-    its own singleton group, keyed by its position in the (already
-    time-sorted) ``exchanges`` list: this reproduces the pre-grouping,
-    per-exchange behavior exactly for that degraded case, rather than
-    inventing a new failure mode for it.
+    Exchanges with no turn_id (``""``, from rows written before this
+    column/field existed) are dropped entirely rather than grouped under a
+    shared key or placed as singletons: see ``_merge_chronologically`` for
+    why omission, not inference, is the deliberate choice here.
     """
     groups: dict[str, list[_ToolExchange]] = {}
-    order: list[str] = []
-    for index, exchange in enumerate(exchanges):
-        key = exchange.step_id or f"__no_step_id__{index}"
-        if key not in groups:
-            groups[key] = []
-            order.append(key)
-        groups[key].append(exchange)
-    return [groups[key] for key in order]
-
-
-def _relocate_groups_before_their_user_message(
-    entries: list[_MergeEntry],
-) -> list[_MergeEntry]:
-    """Generalize the clock-skew guard from the first user message to every one.
-
-    ``created_at`` (``TaskChatMessage``, DB clock via ``server_default``)
-    and the trace ``timestamp`` (``TraceEvent``, app clock) are different
-    clocks, so a turn's tool-exchange group can sort a hair before the very
-    user message that triggered it purely from sub-second skew. The old
-    guard only relocated exchanges that sorted before the conversation's
-    very first user message -- a case that's easy to make a hard rule for
-    ("nothing can precede the task's opening message"), but it left every
-    later turn unprotected.
-
-    This generalizes that rule to every user message by walking the merged,
-    timestamp-sorted entries and buffering consecutive ``"group"`` entries.
-    When a user-role transcript row is reached, any buffered groups are
-    flushed *after* it instead of before -- exactly what the old guard did
-    for the first user message, just repeated at each one. When a
-    non-user-role transcript row is reached first (typically that group's
-    own turn's assistant answer), the buffered groups are flushed in place,
-    unchanged: a group is only ever adjacent-before a user row (with no
-    other transcript row between them) when either skew misplaced it or it's
-    trailing, unanswered content at the very end of the merge, and in the
-    normal well-timestamped case a turn's own answer row already sits
-    between its group and the next user message, so this never fires there.
-
-    Grouping (see ``_group_exchanges_by_turn``) makes this correct at whole
-    turn granularity: a group is placed as one unit, so it can never
-    straddle a user message, and within a group the members keep their
-    relative (single-clock, timestamp) order from ``_load_tool_exchanges``.
-
-    Residual gap (deliberately not closed here): which group belongs to
-    which user message is still inferred from adjacency in timestamp order,
-    not from a durable link. ``TaskChatMessage.turn_id`` is an indexed,
-    populated column, but ``TraceEvent`` has no ``turn_id`` column, and the
-    only code that projects ``turn_id`` into trace ``data``
-    (``PatternRuntime._with_dag_turn_id``, runtime.py) is called from the
-    DAG hooks only -- never from ``on_tool_start``/``on_tool_end``/
-    ``on_tool_error``. Threading ``turn_id`` through those hooks and onto
-    ``TraceEvent`` would let this function match a group to its user message
-    exactly instead of by adjacency; that plumbing is deferred to a
-    follow-up change.
-    """
-    result: list[_MergeEntry] = []
-    pending_groups: list[_MergeEntry] = []
-    for entry in entries:
-        if entry.kind == "group":
-            pending_groups.append(entry)
+    for exchange in exchanges:
+        if not exchange.turn_id:
             continue
-        is_user_row = (
-            entry.kind == "transcript"
-            and entry.transcript is not None
-            and entry.transcript.role == "user"
-        )
-        if is_user_row:
-            result.append(entry)
-            result.extend(pending_groups)
-            pending_groups = []
-            continue
-        result.extend(pending_groups)
-        pending_groups = []
-        result.append(entry)
-    result.extend(pending_groups)
-    return result
+        groups.setdefault(exchange.turn_id, []).append(exchange)
+    return groups
 
 
 def _merge_chronologically(
     transcript_rows: list[_TranscriptRow],
     exchanges: list[_ToolExchange],
 ) -> list[_MergeEntry]:
+    """Interleave transcript rows with tool exchanges by turn_id, not timestamp.
+
+    Placement is now a join, not an inference: each user transcript row
+    carries the same turn_id its turn's tool exchanges were stamped with
+    (see ``_group_exchanges_by_turn``), so a turn's exchanges belong
+    unambiguously right after that row and before whatever transcript row
+    comes next. This is immune to clock skew between ``TaskChatMessage
+    .created_at`` (DB clock) and ``TraceEvent.timestamp`` (app clock) --
+    the old timestamp-adjacency approach this replaces could misplace a
+    turn either by that skew or, worse, structurally: two DAG re-plans can
+    both emit ``step_id="step_1"``, which silently merged two distinct
+    turns into one group, and a failed/interrupted turn with no assistant
+    row got flushed *after* the next user message by the old relocation
+    pass regardless of timestamps. Joining on turn_id makes both cases
+    correct by construction instead of narrowing the heuristic further.
+
+    Exchanges whose turn_id has no matching row in ``transcript_rows`` --
+    either it predates turn_id support (``""``), or its user row fell
+    outside ``before_message_id`` -- are silently omitted rather than
+    placed by adjacency or clock guesswork. Losing that detail is
+    acceptable (the conversation reconstructs with transcript text only,
+    exactly today's non-reconstructed behavior); fabricating a placement
+    is not, because a misplaced exchange can make the model believe a
+    later turn's tool results informed an earlier answer, or that a failed
+    turn never happened.
+
+    Within a turn's group, members keep the relative order already
+    established in ``_load_tool_exchanges`` (timestamp/id sort) -- safe
+    because it is one turn's own clock, not a cross-turn comparison.
+    """
+    exchanges_by_turn = _group_exchanges_by_turn(exchanges)
+
     entries: list[_MergeEntry] = []
     for row in transcript_rows:
-        entries.append(
-            _MergeEntry(
-                sort_key=(row.created_at, _TIEBREAK_TRANSCRIPT, row.row_id),
-                kind="transcript",
-                transcript=row,
-            )
-        )
+        entries.append(_MergeEntry(kind="transcript", transcript=row))
+        if row.role != "user" or not row.turn_id:
+            continue
+        # TaskChatMessage's (task_id, role, turn_id) uniqueness constraint
+        # guarantees at most one "user" row per turn_id, so this can never
+        # place the same group twice.
+        group = exchanges_by_turn.pop(row.turn_id, None)
+        if group:
+            entries.append(_MergeEntry(kind="group", group=group))
 
-    for group in _group_exchanges_by_turn(exchanges):
-        # Position the group by its earliest member's timestamp -- still a
-        # timestamp comparison, but the unit that can be misplaced by
-        # cross-clock skew is now a whole turn's worth of exchanges, not a
-        # single event, and distinct turns are separated by human thinking
-        # time (seconds to minutes), not the sub-second skew between the two
-        # clocks. Within the group, members keep the timestamp order already
-        # established in ``_load_tool_exchanges`` (one turn, one clock).
-        anchor = min(
-            (timestamp, _TIEBREAK_EXCHANGE, event_id)
-            for timestamp, event_id in (exchange.sort_key for exchange in group)
-        )
-        entries.append(
-            _MergeEntry(
-                sort_key=anchor,
-                kind="group",
-                group=group,
-            )
-        )
-
-    entries.sort(key=lambda entry: entry.sort_key)
-
-    return _relocate_groups_before_their_user_message(entries)
+    return entries
 
 
 # ---------------------------------------------------------------------------

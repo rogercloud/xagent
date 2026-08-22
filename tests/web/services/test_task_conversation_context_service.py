@@ -90,7 +90,14 @@ def _add_trace_event(
     timestamp,
     event_id=None,
     step_id=None,
+    turn_id=None,
 ):
+    # ``turn_id`` mirrors how PatternRuntime.on_tool_start/on_tool_end/
+    # on_tool_error stamp it into the event's JSON ``data`` (never a
+    # dedicated column, unlike ``step_id``) -- see runtime.py.
+    payload = dict(data)
+    if turn_id is not None and "turn_id" not in payload:
+        payload["turn_id"] = turn_id
     event = TraceEvent(
         task_id=int(task.id),
         build_id=None,
@@ -99,7 +106,7 @@ def _add_trace_event(
         timestamp=timestamp,
         step_id=step_id,
         parent_event_id=None,
-        data=data,
+        data=payload,
     )
     db_session.add(event)
     db_session.commit()
@@ -116,11 +123,20 @@ def test_structured_handle_survives_reconstruction_byte_for_byte():
     db_session = _create_db_session()
     try:
         task = _create_task(db_session)
+        _add_chat_message(
+            db_session,
+            task,
+            role="user",
+            content="resume",
+            created_at=_ts(-1),
+            turn_id="turn-1",
+        )
         _add_trace_event(
             db_session,
             task,
             event_type="tool_execution_start",
             timestamp=_ts(0),
+            turn_id="turn-1",
             data={
                 "tool_name": "resume_task",
                 "tool_params": {"workspace": "4b33784773d5"},
@@ -133,6 +149,7 @@ def test_structured_handle_survives_reconstruction_byte_for_byte():
             task,
             event_type="tool_execution_end",
             timestamp=_ts(1),
+            turn_id="turn-1",
             data={
                 "tool_name": "resume_task",
                 "tool_call_id": "call-handle-1",
@@ -170,6 +187,14 @@ def test_tool_call_pairing_never_orphaned():
     db_session = _create_db_session()
     try:
         task = _create_task(db_session)
+        _add_chat_message(
+            db_session,
+            task,
+            role="user",
+            content="run some tools",
+            created_at=_ts(-1),
+            turn_id="turn-1",
+        )
 
         # Normal start + end.
         _add_trace_event(
@@ -177,6 +202,7 @@ def test_tool_call_pairing_never_orphaned():
             task,
             event_type="tool_execution_start",
             timestamp=_ts(0),
+            turn_id="turn-1",
             data={
                 "tool_name": "list_files",
                 "tool_params": {"path": "."},
@@ -188,6 +214,7 @@ def test_tool_call_pairing_never_orphaned():
             task,
             event_type="tool_execution_end",
             timestamp=_ts(1),
+            turn_id="turn-1",
             data={
                 "tool_name": "list_files",
                 "tool_call_id": "call-1",
@@ -202,6 +229,7 @@ def test_tool_call_pairing_never_orphaned():
             task,
             event_type="tool_execution_end",
             timestamp=_ts(2),
+            turn_id="turn-1",
             data={
                 "tool_name": "read_file",
                 "tool_call_id": "call-orphan-end",
@@ -216,6 +244,7 @@ def test_tool_call_pairing_never_orphaned():
             task,
             event_type="tool_execution_start",
             timestamp=_ts(3),
+            turn_id="turn-1",
             data={
                 "tool_name": "write_file",
                 "tool_params": {"path": "b.txt"},
@@ -229,6 +258,7 @@ def test_tool_call_pairing_never_orphaned():
             task,
             event_type="tool_execution_start",
             timestamp=_ts(4),
+            turn_id="turn-1",
             data={
                 "tool_name": "web_search",
                 "tool_params": {"query": "xagent"},
@@ -239,6 +269,7 @@ def test_tool_call_pairing_never_orphaned():
             task,
             event_type="tool_execution_end",
             timestamp=_ts(5),
+            turn_id="turn-1",
             data={
                 "tool_name": "web_search",
                 "success": True,
@@ -252,6 +283,7 @@ def test_tool_call_pairing_never_orphaned():
             task,
             event_type="tool_execution_start",
             timestamp=_ts(6),
+            turn_id="turn-1",
             data={
                 "tool_name": "run_command",
                 "tool_params": {"cmd": "false"},
@@ -263,6 +295,7 @@ def test_tool_call_pairing_never_orphaned():
             task,
             event_type="tool_execution_failed",
             timestamp=_ts(7),
+            turn_id="turn-1",
             data={
                 "tool_name": "run_command",
                 "tool_call_id": "call-fail",
@@ -312,12 +345,14 @@ def test_multi_turn_history_is_chronological():
 
         for turn in range(3):
             offset_minutes = turn * 10
+            turn_id = f"turn-{turn}"
             _add_chat_message(
                 db_session,
                 task,
                 role="user",
                 content=f"user turn {turn}",
                 created_at=base + timedelta(minutes=offset_minutes),
+                turn_id=turn_id,
             )
             for tool_index in range(2):
                 call_id = f"turn{turn}-call{tool_index}"
@@ -332,6 +367,7 @@ def test_multi_turn_history_is_chronological():
                     task,
                     event_type="tool_execution_start",
                     timestamp=ts_start,
+                    turn_id=turn_id,
                     data={
                         "tool_name": "list_files",
                         "tool_params": {"turn": turn, "tool_index": tool_index},
@@ -343,6 +379,7 @@ def test_multi_turn_history_is_chronological():
                     task,
                     event_type="tool_execution_end",
                     timestamp=ts_end,
+                    turn_id=turn_id,
                     data={
                         "tool_name": "list_files",
                         "tool_call_id": call_id,
@@ -400,12 +437,14 @@ def test_naive_and_aware_timestamps_merge_without_error():
             role="user",
             content="naive user message",
             created_at=datetime(2026, 1, 1, 0, 0, 0),  # naive
+            turn_id="turn-1",
         )
         _add_trace_event(
             db_session,
             task,
             event_type="tool_execution_start",
             timestamp=datetime(2026, 1, 1, 0, 0, 1, tzinfo=timezone.utc),
+            turn_id="turn-1",
             data={
                 "tool_name": "list_files",
                 "tool_params": {},
@@ -417,6 +456,7 @@ def test_naive_and_aware_timestamps_merge_without_error():
             task,
             event_type="tool_execution_end",
             timestamp=datetime(2026, 1, 1, 0, 0, 2, tzinfo=timezone.utc),
+            turn_id="turn-1",
             data={
                 "tool_name": "list_files",
                 "tool_call_id": "call-aware",
@@ -459,41 +499,36 @@ def test_as_aware_utc_normalizes_naive_and_preserves_aware():
     assert normalized_aware == aware_non_utc
 
 
-def test_merge_chronologically_orders_naive_and_aware_without_typeerror():
-    """Direct unit test of the merge path (R4) with hand-built naive/aware
-    datetimes, bypassing the DB round trip entirely.
+def test_merge_chronologically_places_group_immediately_after_its_turn_user_row():
+    """Direct unit test of the merge path (R4) with hand-built rows/exchanges,
+    bypassing the DB round trip entirely.
 
-    ``test_naive_and_aware_timestamps_merge_without_error`` above looks like
-    it covers the naive-vs-aware hazard, but it doesn't: SQLite strips
-    tzinfo from *both* ``TaskChatMessage.created_at`` and
-    ``TraceEvent.timestamp`` on read-back, so by the time
-    ``_load_transcript_rows``/``_load_tool_exchanges`` see them, nothing
-    naive is ever compared against anything aware -- that test would pass
-    identically even if ``_as_aware_utc`` were replaced by the identity
-    function. This test builds a ``_TranscriptRow`` whose ``created_at`` is
-    genuinely naive-turned-aware and a ``_ToolExchange`` whose ``sort_key``
-    is genuinely aware, so a broken (identity) ``_as_aware_utc`` would raise
-    ``TypeError`` on the ``entries.sort`` call inside
-    ``_merge_chronologically`` -- proving the normalization is load-bearing.
+    Placement is a ``turn_id`` join, not a timestamp comparison (see
+    ``_merge_chronologically``'s docstring), so this no longer needs to
+    prove anything about naive-vs-aware datetimes -- ``_merge_chronologically``
+    doesn't compare timestamps at all any more. What it must still prove:
+    a group is spliced in immediately after the transcript row carrying its
+    turn_id, and before whatever comes next, regardless of either side's
+    ``created_at``/``sort_key`` values.
     """
     from xagent.web.services.task_conversation_context_service import (
-        _as_aware_utc,
         _merge_chronologically,
         _ToolExchange,
         _TranscriptRow,
     )
 
-    naive_user = _TranscriptRow(
+    user_row = _TranscriptRow(
         row_id=1,
         role="user",
-        content="naive user",
-        created_at=_as_aware_utc(datetime(2026, 1, 1, 0, 0, 0)),  # naive input
+        content="hi",
+        created_at=datetime(2026, 1, 1, 0, 0, 0, tzinfo=timezone.utc),
+        turn_id="turn-1",
     )
-    aware_reply = _TranscriptRow(
+    reply_row = _TranscriptRow(
         row_id=2,
         role="assistant",
-        content="aware assistant",
-        created_at=_as_aware_utc(datetime(2026, 1, 1, 0, 0, 5, tzinfo=timezone.utc)),
+        content="done",
+        created_at=datetime(2026, 1, 1, 0, 0, 5, tzinfo=timezone.utc),
     )
     exchange = _ToolExchange(
         call_id="call-1",
@@ -501,18 +536,16 @@ def test_merge_chronologically_orders_naive_and_aware_without_typeerror():
         tool_params={},
         result={"ok": True},
         assistant_content="",
-        sort_key=(
-            _as_aware_utc(datetime(2026, 1, 1, 0, 0, 2, tzinfo=timezone.utc)),
-            10,
-        ),
+        sort_key=(datetime(2026, 1, 1, 0, 0, 2, tzinfo=timezone.utc), 10),
+        turn_id="turn-1",
     )
 
-    entries = _merge_chronologically([naive_user, aware_reply], [exchange])
+    entries = _merge_chronologically([user_row, reply_row], [exchange])
     kinds_in_order = [entry.kind for entry in entries]
     assert kinds_in_order == ["transcript", "group", "transcript"]
     assert entries[1].group == [exchange]
-    assert entries[0].transcript is naive_user
-    assert entries[2].transcript is aware_reply
+    assert entries[0].transcript is user_row
+    assert entries[2].transcript is reply_row
 
 
 def test_control_tools_are_excluded():
@@ -523,6 +556,14 @@ def test_control_tools_are_excluded():
     db_session = _create_db_session()
     try:
         task = _create_task(db_session)
+        _add_chat_message(
+            db_session,
+            task,
+            role="user",
+            content="go",
+            created_at=_ts(-1),
+            turn_id="turn-1",
+        )
 
         for index, tool_name in enumerate(sorted(CONTROL_TOOL_NAMES)):
             call_id = f"call-control-{index}"
@@ -531,6 +572,7 @@ def test_control_tools_are_excluded():
                 task,
                 event_type="tool_execution_start",
                 timestamp=_ts(index * 10),
+                turn_id="turn-1",
                 data={
                     "tool_name": tool_name,
                     "tool_params": {},
@@ -542,6 +584,7 @@ def test_control_tools_are_excluded():
                 task,
                 event_type="tool_execution_end",
                 timestamp=_ts(index * 10 + 1),
+                turn_id="turn-1",
                 data={
                     "tool_name": tool_name,
                     "tool_call_id": call_id,
@@ -555,6 +598,7 @@ def test_control_tools_are_excluded():
             task,
             event_type="tool_execution_start",
             timestamp=_ts(1000),
+            turn_id="turn-1",
             data={
                 "tool_name": "list_files",
                 "tool_params": {},
@@ -566,6 +610,7 @@ def test_control_tools_are_excluded():
             task,
             event_type="tool_execution_end",
             timestamp=_ts(1001),
+            turn_id="turn-1",
             data={
                 "tool_name": "list_files",
                 "tool_call_id": "call-real",
@@ -587,6 +632,14 @@ def test_parallel_batch_assistant_content_not_duplicated():
     db_session = _create_db_session()
     try:
         task = _create_task(db_session)
+        _add_chat_message(
+            db_session,
+            task,
+            role="user",
+            content="go",
+            created_at=_ts(-1),
+            turn_id="turn-1",
+        )
         shared_prose = "Running two lookups in parallel."
 
         for index in range(2):
@@ -596,6 +649,7 @@ def test_parallel_batch_assistant_content_not_duplicated():
                 task,
                 event_type="tool_execution_start",
                 timestamp=_ts(index),
+                turn_id="turn-1",
                 data={
                     "tool_name": "list_files",
                     "tool_params": {"index": index},
@@ -608,6 +662,7 @@ def test_parallel_batch_assistant_content_not_duplicated():
                 task,
                 event_type="tool_execution_end",
                 timestamp=_ts(index + 10),
+                turn_id="turn-1",
                 data={
                     "tool_name": "list_files",
                     "tool_call_id": call_id,
@@ -650,16 +705,28 @@ def test_concurrent_dag_steps_with_colliding_tool_call_ids_are_not_mispaired():
     db_session = _create_db_session()
     try:
         task = _create_task(db_session)
+        _add_chat_message(
+            db_session,
+            task,
+            role="user",
+            content="go",
+            created_at=_ts(-1),
+            turn_id="turn-1",
+        )
 
         # Branch A start (step "step-a"), then branch B start (step "step-b"),
         # both using the colliding id "tool_call_0" -- interleaved as
         # start A, start B, end A, end B, matching real concurrent arrival.
+        # Both branches belong to the same DAG turn, so they share one
+        # turn_id even though their step_id (the pairing discriminator)
+        # differs.
         _add_trace_event(
             db_session,
             task,
             event_type="tool_execution_start",
             timestamp=_ts(0),
             step_id="step-a",
+            turn_id="turn-1",
             data={
                 "tool_name": "read_file",
                 "tool_params": {"path": "a.txt"},
@@ -673,6 +740,7 @@ def test_concurrent_dag_steps_with_colliding_tool_call_ids_are_not_mispaired():
             event_type="tool_execution_start",
             timestamp=_ts(1),
             step_id="step-b",
+            turn_id="turn-1",
             data={
                 "tool_name": "list_files",
                 "tool_params": {"path": "b/"},
@@ -686,6 +754,7 @@ def test_concurrent_dag_steps_with_colliding_tool_call_ids_are_not_mispaired():
             event_type="tool_execution_end",
             timestamp=_ts(2),
             step_id="step-a",
+            turn_id="turn-1",
             data={
                 "tool_name": "read_file",
                 "tool_call_id": "tool_call_0",
@@ -699,6 +768,7 @@ def test_concurrent_dag_steps_with_colliding_tool_call_ids_are_not_mispaired():
             event_type="tool_execution_end",
             timestamp=_ts(3),
             step_id="step-b",
+            turn_id="turn-1",
             data={
                 "tool_name": "list_files",
                 "tool_call_id": "tool_call_0",
@@ -748,6 +818,14 @@ def test_react_shaped_events_without_step_discriminator_still_pair_correctly():
     db_session = _create_db_session()
     try:
         task = _create_task(db_session)
+        _add_chat_message(
+            db_session,
+            task,
+            role="user",
+            content="go",
+            created_at=_ts(-1),
+            turn_id="turn-1",
+        )
 
         _add_trace_event(
             db_session,
@@ -755,6 +833,7 @@ def test_react_shaped_events_without_step_discriminator_still_pair_correctly():
             event_type="tool_execution_start",
             timestamp=_ts(0),
             step_id=None,
+            turn_id="turn-1",
             data={
                 "tool_name": "search_web",
                 "tool_params": {"query": "xagent"},
@@ -768,6 +847,7 @@ def test_react_shaped_events_without_step_discriminator_still_pair_correctly():
             event_type="tool_execution_end",
             timestamp=_ts(1),
             step_id=None,
+            turn_id="turn-1",
             data={
                 "tool_name": "search_web",
                 "tool_call_id": "call-1",
@@ -800,9 +880,16 @@ def test_react_shaped_events_without_step_discriminator_still_pair_correctly():
 
 def test_clock_skew_guard_relocates_misplaced_exchange_atomically():
     """A tool exchange timestamped BEFORE the first transcript user message
-    (DB clock vs app clock skew) must be repositioned after it in the merged
-    output, and the relocated assistant/tool block must stay atomic (the
-    tool message immediately follows its declaring assistant message)."""
+    (DB clock vs app clock skew) must still be placed after it, and the
+    placed assistant/tool block must stay atomic (the tool message
+    immediately follows its declaring assistant message).
+
+    Placement is a ``turn_id`` join now, not a timestamp-adjacency guard, so
+    the skewed timestamps below are deliberately kept (rather than removed)
+    to prove the join makes them irrelevant: this exchange lands right after
+    its turn's user message regardless of which one has the earlier clock
+    reading.
+    """
     db_session = _create_db_session()
     try:
         task = _create_task(db_session)
@@ -815,16 +902,19 @@ def test_clock_skew_guard_relocates_misplaced_exchange_atomically():
             role="user",
             content="first turn",
             created_at=base,
+            turn_id="turn-1",
         )
 
         # This exchange's trace timestamps predate the first user message --
         # simulating clock skew between the DB clock (created_at) and the
-        # app clock (trace timestamps).
+        # app clock (trace timestamps). Only turn_id, not timestamp order,
+        # decides placement now.
         _add_trace_event(
             db_session,
             task,
             event_type="tool_execution_start",
             timestamp=base - timedelta(seconds=50),
+            turn_id="turn-1",
             data={
                 "tool_name": "list_files",
                 "tool_params": {},
@@ -837,6 +927,7 @@ def test_clock_skew_guard_relocates_misplaced_exchange_atomically():
             task,
             event_type="tool_execution_end",
             timestamp=base - timedelta(seconds=49),
+            turn_id="turn-1",
             data={
                 "tool_name": "list_files",
                 "tool_call_id": "call-skewed",
@@ -856,7 +947,7 @@ def test_clock_skew_guard_relocates_misplaced_exchange_atomically():
         messages = load_task_conversation_context_sync(db_session, int(task.id))
         roles = [m["role"] for m in messages]
 
-        # Repositioned after the first user message, not before it.
+        # Placed after the first user message, not before it.
         assert roles[0] == "user"
         assert messages[0]["content"] == "first turn"
         assert roles[1] == "assistant" and messages[1].get("tool_calls")
@@ -1106,6 +1197,18 @@ def test_dedup_positional_after_sort_keeps_different_turns_distinct_prose():
     db_session = _create_db_session()
     try:
         task = _create_task(db_session)
+        # All three calls are anchored to one turn: this test is about
+        # _dedupe_parallel_batch_prose's positional logic over the flat,
+        # start-time-sorted exchange list, which runs before turn grouping
+        # -- it is unconcerned with turn_id boundaries.
+        _add_chat_message(
+            db_session,
+            task,
+            role="user",
+            content="go",
+            created_at=_ts(-1),
+            turn_id="turn-1",
+        )
         shared_prose = "Investigating the failure."
 
         # Turn A: starts first, but is slow -- its end event arrives LAST.
@@ -1114,6 +1217,7 @@ def test_dedup_positional_after_sort_keeps_different_turns_distinct_prose():
             task,
             event_type="tool_execution_start",
             timestamp=_ts(0),
+            turn_id="turn-1",
             data={
                 "tool_name": "tool_a",
                 "tool_params": {},
@@ -1128,6 +1232,7 @@ def test_dedup_positional_after_sort_keeps_different_turns_distinct_prose():
             task,
             event_type="tool_execution_start",
             timestamp=_ts(1),
+            turn_id="turn-1",
             data={
                 "tool_name": "tool_b",
                 "tool_params": {},
@@ -1140,6 +1245,7 @@ def test_dedup_positional_after_sort_keeps_different_turns_distinct_prose():
             task,
             event_type="tool_execution_end",
             timestamp=_ts(2),  # B's end lands before A's end below.
+            turn_id="turn-1",
             data={
                 "tool_name": "tool_b",
                 "tool_call_id": "call-b",
@@ -1152,6 +1258,7 @@ def test_dedup_positional_after_sort_keeps_different_turns_distinct_prose():
             task,
             event_type="tool_execution_end",
             timestamp=_ts(100),  # A finishes much later.
+            turn_id="turn-1",
             data={
                 "tool_name": "tool_a",
                 "tool_call_id": "call-a",
@@ -1166,6 +1273,7 @@ def test_dedup_positional_after_sort_keeps_different_turns_distinct_prose():
             task,
             event_type="tool_execution_start",
             timestamp=_ts(200),
+            turn_id="turn-1",
             data={
                 "tool_name": "tool_c",
                 "tool_params": {},
@@ -1178,6 +1286,7 @@ def test_dedup_positional_after_sort_keeps_different_turns_distinct_prose():
             task,
             event_type="tool_execution_end",
             timestamp=_ts(201),
+            turn_id="turn-1",
             data={
                 "tool_name": "tool_c",
                 "tool_call_id": "call-c",
@@ -1208,6 +1317,14 @@ def test_dedup_still_blanks_immediately_following_parallel_duplicate():
     db_session = _create_db_session()
     try:
         task = _create_task(db_session)
+        _add_chat_message(
+            db_session,
+            task,
+            role="user",
+            content="go",
+            created_at=_ts(-1),
+            turn_id="turn-1",
+        )
         shared_prose = "Running parallel lookups."
 
         for index in range(3):
@@ -1217,6 +1334,7 @@ def test_dedup_still_blanks_immediately_following_parallel_duplicate():
                 task,
                 event_type="tool_execution_start",
                 timestamp=_ts(index),
+                turn_id="turn-1",
                 data={
                     "tool_name": "list_files",
                     "tool_params": {"index": index},
@@ -1229,6 +1347,7 @@ def test_dedup_still_blanks_immediately_following_parallel_duplicate():
                 task,
                 event_type="tool_execution_end",
                 timestamp=_ts(index + 10),
+                turn_id="turn-1",
                 data={
                     "tool_name": "list_files",
                     "tool_call_id": call_id,
@@ -1257,11 +1376,20 @@ def test_tool_execution_end_missing_result_yields_degraded_dict_not_none():
     db_session = _create_db_session()
     try:
         task = _create_task(db_session)
+        _add_chat_message(
+            db_session,
+            task,
+            role="user",
+            content="go",
+            created_at=_ts(-1),
+            turn_id="turn-1",
+        )
         _add_trace_event(
             db_session,
             task,
             event_type="tool_execution_start",
             timestamp=_ts(0),
+            turn_id="turn-1",
             data={
                 "tool_name": "flaky_tool",
                 "tool_params": {},
@@ -1273,6 +1401,7 @@ def test_tool_execution_end_missing_result_yields_degraded_dict_not_none():
             task,
             event_type="tool_execution_end",
             timestamp=_ts(1),
+            turn_id="turn-1",
             data={
                 "tool_name": "flaky_tool",
                 "tool_call_id": "call-degraded",
@@ -1393,19 +1522,29 @@ def test_historical_image_budget_keeps_only_the_newest_n_across_messages():
 
 
 # ---------------------------------------------------------------------------
-# Part D -- per-turn grouping (step_id) and image-only-turn retention (#1601)
+# Part D -- turn_id-join placement and image-only-turn retention (#1601)
+#
+# fa650272 tried to solve turn placement by grouping tool exchanges on
+# ``TraceEvent.step_id`` and relocating groups by timestamp adjacency. A
+# reviewer found two structural counterexamples (reproduced below as
+# ``test_dag_replan_reusing_step_id_keeps_turns_separate`` and
+# ``test_failed_turn_without_assistant_row_stays_before_next_user_message``),
+# so that approach was replaced with the ``turn_id`` join implemented in
+# ``_merge_chronologically``/``_group_exchanges_by_turn``: every tool trace
+# event now carries the same durable ``turn_id`` as its triggering user
+# message (``PatternRuntime.on_tool_start``/``on_tool_end``/``on_tool_error``
+# in runtime.py), so placement is a lookup, not an inference from clocks or
+# a reused step id.
 # ---------------------------------------------------------------------------
 
 
-def test_second_turn_clock_skew_relocates_exchange_after_its_own_user_message():
-    """The old guard only protected the conversation's *first* user message:
-    an exchange timestamped before ANY later user message (e.g. turn 2's)
-    sorted wherever raw timestamps put it, landing before that turn's own
-    question. Reproduces the reviewer's scenario: turn 2's
+def test_second_turn_clock_skew_placed_correctly_by_turn_id_join():
+    """Reproduces the original clock-skew scenario -- turn 2's
     ``tool_execution_start``/``tool_execution_end`` are timestamped 1s
-    before turn 2's ``TaskChatMessage`` (DB clock vs app clock skew). The
-    fix groups by ``step_id`` and relocates the whole group after the user
-    message it belongs to, for every turn -- not just the first.
+    before turn 2's own ``TaskChatMessage`` (DB clock vs app clock skew) --
+    but placement is now a ``turn_id`` join, so the skew is irrelevant: the
+    exchange still lands right after turn 2's question because that's what
+    its ``turn_id`` says, not because of any timestamp comparison.
     """
     db_session = _create_db_session()
     try:
@@ -1414,14 +1553,19 @@ def test_second_turn_clock_skew_relocates_exchange_after_its_own_user_message():
 
         # Turn 1: well-timestamped, no skew.
         _add_chat_message(
-            db_session, task, role="user", content="turn 1 question", created_at=base
+            db_session,
+            task,
+            role="user",
+            content="turn 1 question",
+            created_at=base,
+            turn_id="turn1",
         )
         _add_trace_event(
             db_session,
             task,
             event_type="tool_execution_start",
             timestamp=base + timedelta(seconds=1),
-            step_id="turn1",
+            turn_id="turn1",
             data={
                 "tool_name": "list_files",
                 "tool_params": {"turn": 1},
@@ -1434,7 +1578,7 @@ def test_second_turn_clock_skew_relocates_exchange_after_its_own_user_message():
             task,
             event_type="tool_execution_end",
             timestamp=base + timedelta(seconds=2),
-            step_id="turn1",
+            turn_id="turn1",
             data={
                 "tool_name": "list_files",
                 "tool_call_id": "turn1-call",
@@ -1458,6 +1602,7 @@ def test_second_turn_clock_skew_relocates_exchange_after_its_own_user_message():
             role="user",
             content="turn 2 question",
             created_at=turn2_user_created_at,
+            turn_id="turn2",
         )
 
         # Turn 2's tool exchange (app clock), timestamped BEFORE its own
@@ -1467,7 +1612,7 @@ def test_second_turn_clock_skew_relocates_exchange_after_its_own_user_message():
             task,
             event_type="tool_execution_start",
             timestamp=turn2_user_created_at - timedelta(seconds=1),
-            step_id="turn2",
+            turn_id="turn2",
             data={
                 "tool_name": "list_files",
                 "tool_params": {"turn": 2},
@@ -1480,7 +1625,7 @@ def test_second_turn_clock_skew_relocates_exchange_after_its_own_user_message():
             task,
             event_type="tool_execution_end",
             timestamp=turn2_user_created_at - timedelta(milliseconds=500),
-            step_id="turn2",
+            turn_id="turn2",
             data={
                 "tool_name": "list_files",
                 "tool_call_id": "turn2-call",
@@ -1522,33 +1667,31 @@ def test_second_turn_clock_skew_relocates_exchange_after_its_own_user_message():
         db_session.close()
 
 
-def test_exchanges_from_different_turns_never_merge_into_one_group():
-    """Two turns whose tool events share no ``step_id`` must never be
-    coalesced into a single group, and each turn's group must stay
-    contiguous (no interleaving between the two turns' assistant/tool
-    pairs)."""
+def test_dag_replan_reusing_step_id_keeps_turns_separate():
+    """Reviewer counterexample #1 (fa650272): ``ExecutionPlan.validate()``
+    only enforces ``step_id`` uniqueness within one plan, so a later re-plan
+    can emit ``step_1`` again -- two DAG turns can legitimately share one
+    ``step_id``. Grouping by ``step_id`` (the fa650272 approach) merged such
+    turns into one group; joining on ``turn_id`` instead keeps them separate
+    regardless of ``step_id`` collisions, because placement never looks at
+    ``step_id`` at all.
+    """
     from xagent.web.services.task_conversation_context_service import (
         _group_exchanges_by_turn,
         _ToolExchange,
     )
 
-    turn1_call_a = _ToolExchange(
+    # Direct unit check: two turns whose exchanges carry the identical
+    # step_id="step_1" (a DAG re-plan reusing the id) must still land in two
+    # distinct groups, keyed by turn_id.
+    turn1_call = _ToolExchange(
         call_id="t1-a",
         tool_name="list_files",
         tool_params={},
         result={"ok": True},
         assistant_content="",
         sort_key=(_ts(0), 1),
-        step_id="turn1",
-    )
-    turn1_call_b = _ToolExchange(
-        call_id="t1-b",
-        tool_name="list_files",
-        tool_params={},
-        result={"ok": True},
-        assistant_content="",
-        sort_key=(_ts(1), 2),
-        step_id="turn1",
+        turn_id="turn1",
     )
     turn2_call = _ToolExchange(
         call_id="t2-a",
@@ -1557,48 +1700,55 @@ def test_exchanges_from_different_turns_never_merge_into_one_group():
         result={"ok": True},
         assistant_content="",
         sort_key=(_ts(2), 3),
-        step_id="turn2",
+        turn_id="turn2",
     )
+    groups = _group_exchanges_by_turn([turn1_call, turn2_call])
+    assert groups == {"turn1": [turn1_call], "turn2": [turn2_call]}
 
-    groups = _group_exchanges_by_turn([turn1_call_a, turn1_call_b, turn2_call])
-
-    assert len(groups) == 2
-    assert groups[0] == [turn1_call_a, turn1_call_b]
-    assert groups[1] == [turn2_call]
-
-    # And end-to-end: each turn's assistant/tool block stays contiguous in
-    # the rendered output, with no cross-turn interleaving.
+    # End-to-end: both turns' trace events are stamped step_id="step_1" (the
+    # DAG re-plan collision), but distinct turn_id -- the reconstruction
+    # must still keep the turns separate and correctly ordered: user1,
+    # tools1, answer1, user2, tools2, answer2 -- never user1, tools1,
+    # tools2, answer1, user2, answer2 (the fa650272 regression).
     db_session = _create_db_session()
     try:
         task = _create_task(db_session)
         base = datetime(2026, 1, 1, tzinfo=timezone.utc)
-        _add_chat_message(db_session, task, role="user", content="q1", created_at=base)
-        for index, call_id in enumerate(["t1-a", "t1-b"]):
-            _add_trace_event(
-                db_session,
-                task,
-                event_type="tool_execution_start",
-                timestamp=base + timedelta(seconds=1 + index),
-                step_id="turn1",
-                data={
-                    "tool_name": "list_files",
-                    "tool_params": {"call": call_id},
-                    "tool_call_id": call_id,
-                },
-            )
-            _add_trace_event(
-                db_session,
-                task,
-                event_type="tool_execution_end",
-                timestamp=base + timedelta(seconds=1 + index, milliseconds=500),
-                step_id="turn1",
-                data={
-                    "tool_name": "list_files",
-                    "tool_call_id": call_id,
-                    "success": True,
-                    "result": {"call": call_id},
-                },
-            )
+        _add_chat_message(
+            db_session,
+            task,
+            role="user",
+            content="q1",
+            created_at=base,
+            turn_id="turn1",
+        )
+        _add_trace_event(
+            db_session,
+            task,
+            event_type="tool_execution_start",
+            timestamp=base + timedelta(seconds=1),
+            step_id="step_1",
+            turn_id="turn1",
+            data={
+                "tool_name": "list_files",
+                "tool_params": {"call": "t1-a"},
+                "tool_call_id": "t1-a",
+            },
+        )
+        _add_trace_event(
+            db_session,
+            task,
+            event_type="tool_execution_end",
+            timestamp=base + timedelta(seconds=1, milliseconds=500),
+            step_id="step_1",
+            turn_id="turn1",
+            data={
+                "tool_name": "list_files",
+                "tool_call_id": "t1-a",
+                "success": True,
+                "result": {"call": "t1-a"},
+            },
+        )
         _add_chat_message(
             db_session,
             task,
@@ -1612,13 +1762,16 @@ def test_exchanges_from_different_turns_never_merge_into_one_group():
             role="user",
             content="q2",
             created_at=base + timedelta(minutes=1),
+            turn_id="turn2",
         )
+        # The re-plan: same step_id="step_1" as turn 1, different turn_id.
         _add_trace_event(
             db_session,
             task,
             event_type="tool_execution_start",
             timestamp=base + timedelta(minutes=1, seconds=1),
-            step_id="turn2",
+            step_id="step_1",
+            turn_id="turn2",
             data={
                 "tool_name": "list_files",
                 "tool_params": {"call": "t2-a"},
@@ -1630,7 +1783,8 @@ def test_exchanges_from_different_turns_never_merge_into_one_group():
             task,
             event_type="tool_execution_end",
             timestamp=base + timedelta(minutes=1, seconds=2),
-            step_id="turn2",
+            step_id="step_1",
+            turn_id="turn2",
             data={
                 "tool_name": "list_files",
                 "tool_call_id": "t2-a",
@@ -1647,107 +1801,257 @@ def test_exchanges_from_different_turns_never_merge_into_one_group():
         )
 
         messages = load_task_conversation_context_sync(db_session, int(task.id))
-        call_ids_in_order = [m["tool_call_id"] for m in messages if m["role"] == "tool"]
-        assert call_ids_in_order == ["t1-a", "t1-b", "t2-a"]
-        # Turn 1's block (2 assistant+tool pairs) sits fully between q1/a1;
-        # turn 2's block sits fully between q2/a2 -- no interleaving.
-        q1_index = messages.index({"role": "user", "content": "q1"})
-        a1_index = next(i for i, m in enumerate(messages) if m.get("content") == "a1")
-        q2_index = messages.index({"role": "user", "content": "q2"})
-        a2_index = next(i for i, m in enumerate(messages) if m.get("content") == "a2")
-        assert q1_index < a1_index < q2_index < a2_index
-        for index in range(q1_index + 1, a1_index):
-            if messages[index]["role"] == "tool":
-                assert messages[index]["raw_result"]["call"] in ("t1-a", "t1-b")
-        for index in range(q2_index + 1, a2_index):
-            if messages[index]["role"] == "tool":
-                assert messages[index]["raw_result"]["call"] == "t2-a"
+        shapes = [
+            (m["role"], m.get("content"), m.get("tool_call_id")) for m in messages
+        ]
+        assert shapes == [
+            ("user", "q1", None),
+            ("assistant", "", None),
+            ("tool", "", "t1-a"),
+            ("assistant", "a1", None),
+            ("user", "q2", None),
+            ("assistant", "", None),
+            ("tool", "", "t2-a"),
+            ("assistant", "a2", None),
+        ]
     finally:
         db_session.close()
 
 
-def test_well_timestamped_multi_turn_history_unchanged_by_grouping():
-    """Regression guard: with proper, non-skewed timestamps and step_id set
-    per turn (exercising the new grouping path), the reconstructed order is
-    identical to the pre-grouping expectation covered by
-    ``test_multi_turn_history_is_chronological`` above."""
+def test_failed_turn_without_assistant_row_stays_before_next_user_message():
+    """Reviewer counterexample #2 (fa650272): a failed/interrupted turn
+    produces no assistant transcript row, so
+    ``_relocate_groups_before_their_user_message`` (the fa650272 relocation
+    pass) flushed its buffered exchange group *after* the next user message
+    regardless of timestamps -- turning ``user1, failed_tools1, user2`` into
+    ``user1, user2, failed_tools1``. Joining on ``turn_id`` places the
+    exchange immediately after its own turn's user row, before the next
+    transcript row, with no relocation pass to misfire.
+    """
     db_session = _create_db_session()
     try:
         task = _create_task(db_session)
         base = datetime(2026, 1, 1, tzinfo=timezone.utc)
 
-        for turn in range(3):
-            offset_minutes = turn * 10
-            _add_chat_message(
-                db_session,
-                task,
-                role="user",
-                content=f"user turn {turn}",
-                created_at=base + timedelta(minutes=offset_minutes),
-            )
-            for tool_index in range(2):
-                call_id = f"turn{turn}-call{tool_index}"
-                ts_start = base + timedelta(
-                    minutes=offset_minutes, seconds=1 + tool_index * 2
-                )
-                ts_end = base + timedelta(
-                    minutes=offset_minutes, seconds=2 + tool_index * 2
-                )
-                _add_trace_event(
-                    db_session,
-                    task,
-                    event_type="tool_execution_start",
-                    timestamp=ts_start,
-                    step_id=f"step-turn{turn}",
-                    data={
-                        "tool_name": "list_files",
-                        "tool_params": {"turn": turn, "tool_index": tool_index},
-                        "tool_call_id": call_id,
-                    },
-                )
-                _add_trace_event(
-                    db_session,
-                    task,
-                    event_type="tool_execution_end",
-                    timestamp=ts_end,
-                    step_id=f"step-turn{turn}",
-                    data={
-                        "tool_name": "list_files",
-                        "tool_call_id": call_id,
-                        "success": True,
-                        "result": {"turn": turn, "tool_index": tool_index},
-                    },
-                )
-            _add_chat_message(
-                db_session,
-                task,
-                role="assistant",
-                content=f"assistant answer {turn}",
-                created_at=base + timedelta(minutes=offset_minutes, seconds=9),
-            )
+        _add_chat_message(
+            db_session,
+            task,
+            role="user",
+            content="q1",
+            created_at=base,
+            turn_id="turn1",
+        )
+        _add_trace_event(
+            db_session,
+            task,
+            event_type="tool_execution_start",
+            timestamp=base + timedelta(seconds=1),
+            turn_id="turn1",
+            data={
+                "tool_name": "run_command",
+                "tool_params": {"cmd": "false"},
+                "tool_call_id": "call-failed",
+            },
+        )
+        _add_trace_event(
+            db_session,
+            task,
+            event_type="tool_execution_failed",
+            timestamp=base + timedelta(seconds=2),
+            turn_id="turn1",
+            data={
+                "tool_name": "run_command",
+                "tool_call_id": "call-failed",
+                "error_type": "agent_tool_error",
+                "error": "boom",
+                "error_message": "boom",
+            },
+        )
+        # Turn 1 never gets an assistant answer row -- the run was
+        # interrupted/failed before producing a final_answer.
+        _add_chat_message(
+            db_session,
+            task,
+            role="user",
+            content="q2",
+            created_at=base + timedelta(minutes=1),
+            turn_id="turn2",
+        )
+        _add_chat_message(
+            db_session,
+            task,
+            role="assistant",
+            content="a2",
+            created_at=base + timedelta(minutes=1, seconds=1),
+        )
 
         messages = load_task_conversation_context_sync(db_session, int(task.id))
         roles = [m["role"] for m in messages]
 
-        assert roles.count("user") == 3
-        assert roles.count("assistant") == 3 + 3 * 2
-        assert roles.count("tool") == 6
+        # user1, failed_tools1, user2, answer2 -- never user1, user2, ...tools1.
+        assert roles == ["user", "assistant", "tool", "user", "assistant"]
+        assert messages[0]["content"] == "q1"
+        assert messages[2]["tool_call_id"] == "call-failed"
+        assert messages[2]["raw_result"]["error"] == "boom"
+        assert messages[3]["content"] == "q2"
+        assert messages[4]["content"] == "a2"
+    finally:
+        db_session.close()
 
-        for turn in range(3):
-            user_index = messages.index(
-                {"role": "user", "content": f"user turn {turn}"}
-            )
-            answer_index = next(
-                index
-                for index, m in enumerate(messages)
-                if m["role"] == "assistant"
-                and m.get("content") == f"assistant answer {turn}"
-            )
-            assert user_index < answer_index
-            for index in range(user_index + 1, answer_index):
-                message = messages[index]
-                if message["role"] == "tool":
-                    assert message["raw_result"]["turn"] == turn
+
+def test_legacy_exchange_without_turn_id_is_omitted_transcript_intact():
+    """A tool exchange whose trace events predate ``turn_id`` support (both
+    events carry no ``turn_id`` in their JSON ``data``) is omitted from the
+    reconstruction entirely -- not placed by guesswork -- while the
+    surrounding transcript rows still reconstruct intact. This is the
+    deliberate legacy behavior: conversations recorded before this shipped
+    resume with transcript text only, exactly what they got before this
+    module existed.
+    """
+    db_session = _create_db_session()
+    try:
+        task = _create_task(db_session)
+        base = datetime(2026, 1, 1, tzinfo=timezone.utc)
+
+        _add_chat_message(db_session, task, role="user", content="q1", created_at=base)
+        _add_trace_event(
+            db_session,
+            task,
+            event_type="tool_execution_start",
+            timestamp=base + timedelta(seconds=1),
+            data={
+                "tool_name": "list_files",
+                "tool_params": {},
+                "tool_call_id": "legacy-call",
+            },
+        )
+        _add_trace_event(
+            db_session,
+            task,
+            event_type="tool_execution_end",
+            timestamp=base + timedelta(seconds=2),
+            data={
+                "tool_name": "list_files",
+                "tool_call_id": "legacy-call",
+                "success": True,
+                "result": {"files": []},
+            },
+        )
+        _add_chat_message(
+            db_session,
+            task,
+            role="assistant",
+            content="a1",
+            created_at=base + timedelta(seconds=3),
+        )
+
+        messages = load_task_conversation_context_sync(db_session, int(task.id))
+        roles = [m["role"] for m in messages]
+
+        # No trace of the legacy tool exchange -- just the transcript text.
+        assert roles == ["user", "assistant"]
+        assert messages[0]["content"] == "q1"
+        assert messages[1]["content"] == "a1"
+    finally:
+        db_session.close()
+
+
+def test_mixed_turn_id_and_legacy_exchanges_in_same_task():
+    """A task spanning the turn_id deploy: turn 1's tool exchange predates
+    turn_id support (omitted, transcript-only), turn 2's postdates it
+    (placed exactly, right after turn 2's question)."""
+    db_session = _create_db_session()
+    try:
+        task = _create_task(db_session)
+        base = datetime(2026, 1, 1, tzinfo=timezone.utc)
+
+        # Turn 1: legacy -- no turn_id anywhere.
+        _add_chat_message(db_session, task, role="user", content="q1", created_at=base)
+        _add_trace_event(
+            db_session,
+            task,
+            event_type="tool_execution_start",
+            timestamp=base + timedelta(seconds=1),
+            data={
+                "tool_name": "list_files",
+                "tool_params": {},
+                "tool_call_id": "legacy-call",
+            },
+        )
+        _add_trace_event(
+            db_session,
+            task,
+            event_type="tool_execution_end",
+            timestamp=base + timedelta(seconds=2),
+            data={
+                "tool_name": "list_files",
+                "tool_call_id": "legacy-call",
+                "success": True,
+                "result": {"files": []},
+            },
+        )
+        _add_chat_message(
+            db_session,
+            task,
+            role="assistant",
+            content="a1",
+            created_at=base + timedelta(seconds=3),
+        )
+
+        # Turn 2: post-deploy -- turn_id everywhere.
+        _add_chat_message(
+            db_session,
+            task,
+            role="user",
+            content="q2",
+            created_at=base + timedelta(minutes=1),
+            turn_id="turn2",
+        )
+        _add_trace_event(
+            db_session,
+            task,
+            event_type="tool_execution_start",
+            timestamp=base + timedelta(minutes=1, seconds=1),
+            turn_id="turn2",
+            data={
+                "tool_name": "list_files",
+                "tool_params": {},
+                "tool_call_id": "post-deploy-call",
+            },
+        )
+        _add_trace_event(
+            db_session,
+            task,
+            event_type="tool_execution_end",
+            timestamp=base + timedelta(minutes=1, seconds=2),
+            turn_id="turn2",
+            data={
+                "tool_name": "list_files",
+                "tool_call_id": "post-deploy-call",
+                "success": True,
+                "result": {"files": ["a.txt"]},
+            },
+        )
+        _add_chat_message(
+            db_session,
+            task,
+            role="assistant",
+            content="a2",
+            created_at=base + timedelta(minutes=1, seconds=3),
+        )
+
+        messages = load_task_conversation_context_sync(db_session, int(task.id))
+        roles = [m["role"] for m in messages]
+
+        # Turn 1: transcript text only, no tool exchange. Turn 2: full
+        # reconstruction, placed right after its own question.
+        assert roles == ["user", "assistant", "user", "assistant", "tool", "assistant"]
+        assert messages[0]["content"] == "q1"
+        assert messages[1]["content"] == "a1"
+        assert messages[2]["content"] == "q2"
+        assert messages[3]["tool_calls"][0]["id"] == "post-deploy-call"
+        assert messages[4]["tool_call_id"] == "post-deploy-call"
+        assert messages[5]["content"] == "a2"
     finally:
         db_session.close()
 
@@ -1823,6 +2127,7 @@ def test_image_only_turn_participates_correctly_in_chronological_ordering():
             role="user",
             content="",
             created_at=base,
+            turn_id="turn1",
             attachments=[
                 {
                     "file_id": "image-mid",
@@ -1837,6 +2142,7 @@ def test_image_only_turn_participates_correctly_in_chronological_ordering():
             event_type="tool_execution_start",
             timestamp=base + timedelta(seconds=1),
             step_id="turn1",
+            turn_id="turn1",
             data={
                 "tool_name": "analyze_image",
                 "tool_params": {},
@@ -1849,6 +2155,7 @@ def test_image_only_turn_participates_correctly_in_chronological_ordering():
             event_type="tool_execution_end",
             timestamp=base + timedelta(seconds=2),
             step_id="turn1",
+            turn_id="turn1",
             data={
                 "tool_name": "analyze_image",
                 "tool_call_id": "call-analyze",
