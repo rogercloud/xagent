@@ -541,14 +541,29 @@ def _final_pairing_sweep(messages: list[dict[str, Any]]) -> list[dict[str, Any]]
         if (
             previous is not None
             and previous.get("role") == "assistant"
-            and any(
-                str(call.get("id")) == str(message.get("tool_call_id"))
-                for call in previous.get("tool_calls") or []
-            )
+            and _ids_match(message.get("tool_call_id"), previous.get("tool_calls"))
         ):
             sanitized.append(message)
         # else: orphaned tool message, drop it.
     return sanitized
+
+
+def _ids_match(tool_call_id: Any, tool_calls: Any) -> bool:
+    """Whether ``tool_calls`` declares ``tool_call_id``.
+
+    Compares only present ids. ``str()`` on two ``None``s would render
+    ``"None" == "None"`` and report a match, which would let this sweep --
+    whose whole job is catching pairs construction should never have
+    produced -- pass an orphan through in exactly the case it exists for.
+    """
+    if tool_call_id is None:
+        return False
+    target = str(tool_call_id)
+    for call in tool_calls or []:
+        call_id = call.get("id") if isinstance(call, dict) else None
+        if call_id is not None and str(call_id) == target:
+            return True
+    return False
 
 
 def _as_aware_utc(value: datetime) -> datetime:

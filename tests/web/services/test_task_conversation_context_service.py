@@ -968,6 +968,127 @@ def test_final_pairing_sweep_drops_orphaned_tool_message():
     assert tool_call_ids == ["call-1"]
 
 
+def test_final_pairing_sweep_drops_orphan_when_both_ids_are_none():
+    """Review regression (PR #1601): the old comparison was
+    ``str(call.get("id")) == str(message.get("tool_call_id"))``, so a
+    ``tool`` message with ``tool_call_id: None`` preceded by an assistant
+    whose declared call also has ``id: None`` rendered as
+    ``"None" == "None"`` and was kept -- an orphan slipping through the
+    exact defense meant to catch it. This must fail against that old
+    ``str(...) == str(...)`` form and pass with ``_ids_match``."""
+    from xagent.web.services.task_conversation_context_service import (
+        _final_pairing_sweep,
+    )
+
+    messages = [
+        {"role": "user", "content": "hi"},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": None,
+                    "type": "function",
+                    "function": {"name": "real_tool", "arguments": "{}"},
+                }
+            ],
+        },
+        {
+            "role": "tool",
+            "tool_call_id": None,
+            "content": "",
+            "tool_name": "real_tool",
+            "raw_result": {},
+        },
+    ]
+
+    sanitized = _final_pairing_sweep(messages)
+    assert sanitized == [messages[0], messages[1]]
+    assert all(m.get("role") != "tool" for m in sanitized)
+
+
+def test_final_pairing_sweep_keeps_tool_message_with_matching_real_id():
+    """Normal path, unchanged: a tool message with a real id preceded by
+    the assistant that declared that same id is kept."""
+    from xagent.web.services.task_conversation_context_service import (
+        _final_pairing_sweep,
+    )
+
+    messages = [
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "call-42",
+                    "type": "function",
+                    "function": {"name": "real_tool", "arguments": "{}"},
+                }
+            ],
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "call-42",
+            "content": "",
+            "tool_name": "real_tool",
+            "raw_result": {},
+        },
+    ]
+
+    sanitized = _final_pairing_sweep(messages)
+    assert sanitized == messages
+
+
+def test_final_pairing_sweep_drops_tool_message_with_mismatched_real_id():
+    """A tool message with a real id whose preceding assistant declares a
+    different id is still dropped as an orphan."""
+    from xagent.web.services.task_conversation_context_service import (
+        _final_pairing_sweep,
+    )
+
+    messages = [
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "call-1",
+                    "type": "function",
+                    "function": {"name": "real_tool", "arguments": "{}"},
+                }
+            ],
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "call-2",
+            "content": "",
+            "tool_name": "real_tool",
+            "raw_result": {},
+        },
+    ]
+
+    sanitized = _final_pairing_sweep(messages)
+    assert sanitized == [messages[0]]
+
+
+def test_ids_match_ignores_malformed_tool_call_entries():
+    """Malformed ``tool_calls`` entries -- a non-dict item, or a dict with
+    no ``id`` key -- must not raise and must not produce a false match."""
+    from xagent.web.services.task_conversation_context_service import (
+        _ids_match,
+    )
+
+    assert _ids_match("call-1", ["not-a-dict", {"type": "function"}]) is False
+    assert _ids_match(None, ["not-a-dict", {"type": "function"}]) is False
+    assert (
+        _ids_match(
+            "call-1",
+            ["not-a-dict", {"type": "function"}, {"id": "call-1"}],
+        )
+        is True
+    )
+
+
 # ---------------------------------------------------------------------------
 # Part D -- regression tests for the fixes just made
 # ---------------------------------------------------------------------------
