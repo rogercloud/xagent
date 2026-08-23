@@ -58,7 +58,6 @@ class _TranscriptRow:
     row_id: int
     role: str
     content: str
-    created_at: datetime
     # ``TaskChatMessage.turn_id``, empty string when unset (rows written
     # before this column existed, or a role that never gets one). Used to
     # place this turn's reconstructed tool exchanges immediately after this
@@ -165,21 +164,24 @@ def _load_transcript_rows(
     *,
     before_message_id: int | None,
 ) -> list[_TranscriptRow]:
-    """Load ``task_chat_messages`` rows, preserving ``created_at`` for merging.
+    """Load ``task_chat_messages`` rows for the turn_id-joined reconstruction.
 
-    ``chat_history_service``'s row-loading helpers normalize away
-    ``created_at``, which this module needs for the chronological merge
-    against trace events, so the rows are queried directly here instead.
+    ``chat_history_service``'s row-loading helpers normalize the row shape
+    for a different caller, so the rows are queried directly here instead.
     ``attachments`` is selected alongside the existing narrow column set
     (rather than loading the whole ORM row) so the historical-image budget
     below can reach uploaded-image metadata without widening this query's
-    result shape beyond what image support actually needs.
+    result shape beyond what image support actually needs. ``created_at`` is
+    deliberately NOT selected: placement of a turn's tool exchanges is a
+    ``turn_id`` join (see ``_merge_chronologically``), not a timestamp
+    comparison, and transcript ordering itself comes from ``TaskChatMessage
+    .id`` (see ``order_by`` below), so nothing in this module ever needs a
+    transcript row's clock time.
     """
     query = db.query(
         TaskChatMessage.id,
         TaskChatMessage.role,
         TaskChatMessage.content,
-        TaskChatMessage.created_at,
         TaskChatMessage.attachments,
         TaskChatMessage.turn_id,
     ).filter(TaskChatMessage.task_id == task_id)
@@ -188,7 +190,7 @@ def _load_transcript_rows(
     query = query.order_by(asc(TaskChatMessage.id))
 
     rows: list[_TranscriptRow] = []
-    for row_id, role, content, created_at, attachments, turn_id in query.all():
+    for row_id, role, content, attachments, turn_id in query.all():
         normalized_role = str(role or "").strip().lower()
         if normalized_role not in _TRANSCRIPT_ROLES:
             continue
@@ -198,7 +200,6 @@ def _load_transcript_rows(
                 row_id=int(row_id),
                 role=normalized_role,
                 content=normalized_content,
-                created_at=_as_aware_utc(created_at),
                 turn_id=str(turn_id or ""),
                 attachments=attachments,
             )
@@ -620,11 +621,17 @@ def _ids_match(tool_call_id: Any, tool_calls: Any) -> bool:
 def _as_aware_utc(value: datetime) -> datetime:
     """Normalize a possibly-naive datetime to aware UTC for safe comparison.
 
-    ``TaskChatMessage.created_at`` and ``TraceEvent.timestamp`` are both
-    declared ``DateTime(timezone=True)``, but SQLite (used by tests) returns
-    naive datetimes while Postgres returns aware ones. Comparing a naive and
-    an aware datetime raises ``TypeError``, so every value is normalized here
-    before it is ever used as a sort key.
+    Applied to every ``TraceEvent.timestamp`` value in ``_load_tool_exchanges``
+    before it feeds a ``sort_key`` (used both to order an exchange's start/end
+    pairing and to order same-turn exchanges relative to each other, and by
+    ``_dedupe_parallel_batch_prose``). ``TraceEvent.timestamp`` is declared
+    ``DateTime(timezone=True)``, but SQLite (used by tests) returns naive
+    datetimes regardless of what was stored, while Postgres returns aware
+    ones; comparing a naive and an aware datetime raises ``TypeError``.
+    Placement of a turn's exchanges relative to the transcript is a
+    ``turn_id`` join now (see ``_merge_chronologically``), not a timestamp
+    comparison, so this function is no longer applied to ``TaskChatMessage
+    .created_at`` -- that column isn't even loaded by this module any more.
     """
     if value.tzinfo is None:
         return value.replace(tzinfo=timezone.utc)

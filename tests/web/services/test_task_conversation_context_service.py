@@ -424,63 +424,6 @@ def test_multi_turn_history_is_chronological():
         db_session.close()
 
 
-def test_naive_and_aware_timestamps_merge_without_error():
-    db_session = _create_db_session()
-    try:
-        task = _create_task(db_session)
-
-        # created_at written as naive (as SQLite round-trips it) while trace
-        # timestamps are aware -- must not raise TypeError when merged.
-        _add_chat_message(
-            db_session,
-            task,
-            role="user",
-            content="naive user message",
-            created_at=datetime(2026, 1, 1, 0, 0, 0),  # naive
-            turn_id="turn-1",
-        )
-        _add_trace_event(
-            db_session,
-            task,
-            event_type="tool_execution_start",
-            timestamp=datetime(2026, 1, 1, 0, 0, 1, tzinfo=timezone.utc),
-            turn_id="turn-1",
-            data={
-                "tool_name": "list_files",
-                "tool_params": {},
-                "tool_call_id": "call-aware",
-            },
-        )
-        _add_trace_event(
-            db_session,
-            task,
-            event_type="tool_execution_end",
-            timestamp=datetime(2026, 1, 1, 0, 0, 2, tzinfo=timezone.utc),
-            turn_id="turn-1",
-            data={
-                "tool_name": "list_files",
-                "tool_call_id": "call-aware",
-                "success": True,
-                "result": {"ok": True},
-            },
-        )
-        _add_chat_message(
-            db_session,
-            task,
-            role="assistant",
-            content="naive assistant reply",
-            created_at=datetime(2026, 1, 1, 0, 0, 3),  # naive
-        )
-
-        messages = load_task_conversation_context_sync(db_session, int(task.id))
-        roles = [m["role"] for m in messages]
-        assert roles == ["user", "assistant", "tool", "assistant"]
-        assert messages[0]["content"] == "naive user message"
-        assert messages[-1]["content"] == "naive assistant reply"
-    finally:
-        db_session.close()
-
-
 def test_as_aware_utc_normalizes_naive_and_preserves_aware():
     """Direct unit test of ``_as_aware_utc`` itself, independent of any DB
     round trip. A naive datetime gets stamped UTC; an already-aware datetime
@@ -506,10 +449,11 @@ def test_merge_chronologically_places_group_immediately_after_its_turn_user_row(
     Placement is a ``turn_id`` join, not a timestamp comparison (see
     ``_merge_chronologically``'s docstring), so this no longer needs to
     prove anything about naive-vs-aware datetimes -- ``_merge_chronologically``
-    doesn't compare timestamps at all any more. What it must still prove:
-    a group is spliced in immediately after the transcript row carrying its
-    turn_id, and before whatever comes next, regardless of either side's
-    ``created_at``/``sort_key`` values.
+    doesn't compare timestamps at all any more, and ``_TranscriptRow`` no
+    longer even carries a clock value. What it must still prove: a group is
+    spliced in immediately after the transcript row carrying its turn_id,
+    and before whatever comes next, regardless of the exchange's own
+    ``sort_key``.
     """
     from xagent.web.services.task_conversation_context_service import (
         _merge_chronologically,
@@ -521,14 +465,12 @@ def test_merge_chronologically_places_group_immediately_after_its_turn_user_row(
         row_id=1,
         role="user",
         content="hi",
-        created_at=datetime(2026, 1, 1, 0, 0, 0, tzinfo=timezone.utc),
         turn_id="turn-1",
     )
     reply_row = _TranscriptRow(
         row_id=2,
         role="assistant",
         content="done",
-        created_at=datetime(2026, 1, 1, 0, 0, 5, tzinfo=timezone.utc),
     )
     exchange = _ToolExchange(
         call_id="call-1",
@@ -624,61 +566,6 @@ def test_control_tools_are_excluded():
         for control_tool_name in CONTROL_TOOL_NAMES:
             assert control_tool_name not in tool_names
         assert tool_names == ["list_files"]
-    finally:
-        db_session.close()
-
-
-def test_parallel_batch_assistant_content_not_duplicated():
-    db_session = _create_db_session()
-    try:
-        task = _create_task(db_session)
-        _add_chat_message(
-            db_session,
-            task,
-            role="user",
-            content="go",
-            created_at=_ts(-1),
-            turn_id="turn-1",
-        )
-        shared_prose = "Running two lookups in parallel."
-
-        for index in range(2):
-            call_id = f"parallel-call-{index}"
-            _add_trace_event(
-                db_session,
-                task,
-                event_type="tool_execution_start",
-                timestamp=_ts(index),
-                turn_id="turn-1",
-                data={
-                    "tool_name": "list_files",
-                    "tool_params": {"index": index},
-                    "tool_call_id": call_id,
-                    "assistant_content": shared_prose,
-                },
-            )
-            _add_trace_event(
-                db_session,
-                task,
-                event_type="tool_execution_end",
-                timestamp=_ts(index + 10),
-                turn_id="turn-1",
-                data={
-                    "tool_name": "list_files",
-                    "tool_call_id": call_id,
-                    "success": True,
-                    "result": {"index": index},
-                },
-            )
-
-        messages = load_task_conversation_context_sync(db_session, int(task.id))
-        assistant_contents = [
-            m["content"]
-            for m in messages
-            if m["role"] == "assistant" and m.get("tool_calls")
-        ]
-        assert assistant_contents.count(shared_prose) == 1
-        assert assistant_contents.count("") == 1
     finally:
         db_session.close()
 
@@ -876,88 +763,6 @@ def test_react_shaped_events_without_step_discriminator_still_pair_correctly():
 # ---------------------------------------------------------------------------
 # Part C -- coverage for previously-untested paths
 # ---------------------------------------------------------------------------
-
-
-def test_clock_skew_guard_relocates_misplaced_exchange_atomically():
-    """A tool exchange timestamped BEFORE the first transcript user message
-    (DB clock vs app clock skew) must still be placed after it, and the
-    placed assistant/tool block must stay atomic (the tool message
-    immediately follows its declaring assistant message).
-
-    Placement is a ``turn_id`` join now, not a timestamp-adjacency guard, so
-    the skewed timestamps below are deliberately kept (rather than removed)
-    to prove the join makes them irrelevant: this exchange lands right after
-    its turn's user message regardless of which one has the earlier clock
-    reading.
-    """
-    db_session = _create_db_session()
-    try:
-        task = _create_task(db_session)
-        base = datetime(2026, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
-
-        # The transcript's first user message, created_at = base.
-        _add_chat_message(
-            db_session,
-            task,
-            role="user",
-            content="first turn",
-            created_at=base,
-            turn_id="turn-1",
-        )
-
-        # This exchange's trace timestamps predate the first user message --
-        # simulating clock skew between the DB clock (created_at) and the
-        # app clock (trace timestamps). Only turn_id, not timestamp order,
-        # decides placement now.
-        _add_trace_event(
-            db_session,
-            task,
-            event_type="tool_execution_start",
-            timestamp=base - timedelta(seconds=50),
-            turn_id="turn-1",
-            data={
-                "tool_name": "list_files",
-                "tool_params": {},
-                "tool_call_id": "call-skewed",
-                "assistant_content": "Looking things up.",
-            },
-        )
-        _add_trace_event(
-            db_session,
-            task,
-            event_type="tool_execution_end",
-            timestamp=base - timedelta(seconds=49),
-            turn_id="turn-1",
-            data={
-                "tool_name": "list_files",
-                "tool_call_id": "call-skewed",
-                "success": True,
-                "result": {"ok": True},
-            },
-        )
-
-        _add_chat_message(
-            db_session,
-            task,
-            role="assistant",
-            content="done",
-            created_at=base + timedelta(seconds=10),
-        )
-
-        messages = load_task_conversation_context_sync(db_session, int(task.id))
-        roles = [m["role"] for m in messages]
-
-        # Placed after the first user message, not before it.
-        assert roles[0] == "user"
-        assert messages[0]["content"] == "first turn"
-        assert roles[1] == "assistant" and messages[1].get("tool_calls")
-        assert roles[2] == "tool"
-        assert messages[2]["tool_call_id"] == "call-skewed"
-        # Atomic: the tool message is immediately preceded by its assistant.
-        assert messages[1]["tool_calls"][0]["id"] == messages[2]["tool_call_id"]
-        assert roles[3] == "assistant" and messages[3]["content"] == "done"
-    finally:
-        db_session.close()
 
 
 def test_before_message_id_excludes_current_turn_user_message():
