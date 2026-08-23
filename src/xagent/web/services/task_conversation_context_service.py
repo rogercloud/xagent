@@ -463,55 +463,13 @@ def _load_tool_exchanges(
         )
 
     # Sort by the *start* time (sort_key), matching the order exchanges will
-    # ultimately appear in once merged with the transcript (R4). Dedup of
-    # parallel-batch prose happens later, per turn group (see
-    # ``_group_exchanges_by_turn``) -- not here over this flat, task-wide
-    # list. Deduping here would compare exchanges across turn boundaries
-    # (blanking a later, unrelated turn's coincidentally identical prose)
-    # and would let an exchange that never survives grouping (no usable
-    # turn_id) still act as the "previous" entry and blank a legitimately
-    # rendered exchange right after it.
+    # ultimately appear in once merged with the transcript (R4).
     exchanges.sort(key=lambda exchange: exchange.sort_key)
     # Any start left in ``pending`` here never found its end/failure event
     # and so never became an exchange at all; it silently disappears along
     # with its prose (behavior unchanged), but is now counted.
     stats.dangling_tool_starts += len(pending)
     return exchanges
-
-
-def _dedupe_parallel_batch_prose(exchanges: list[_ToolExchange]) -> None:
-    """Blank assistant prose that exactly repeats the immediately preceding
-    exchange, within a single turn's group, in that group's internal order.
-
-    Parallel tool-call batches share one ``assistant_content`` value (the
-    runtime's ``active_react_step_id`` can't delimit iterations, so every
-    concurrent call in the batch is stamped with the same prose); this
-    blanks all but the first occurrence in a run of adjacent duplicates so
-    the model doesn't see the same paragraph N times.
-
-    Called once per turn group (see ``_group_exchanges_by_turn``), never
-    over the flat, task-wide exchange list: adjacency in that list is not a
-    reliable signal here for two reasons. First, two *different* turns
-    whose only exchange happens to share byte-identical prose are adjacent
-    in the flat list whenever nothing else falls between them, and blanking
-    the second would drop real content from a later turn, not a duplicate.
-    Second, dedup running before ``_group_exchanges_by_turn`` drops
-    exchanges with no usable ``turn_id`` would let a dropped exchange --
-    one that never reaches the rendered output at all -- still serve as
-    "previous" and blank a legitimately rendered exchange that follows it.
-    Scoping this to one turn's already-grouped list closes both holes: a
-    turn boundary can never be crossed, and every candidate is guaranteed
-    to actually survive into the output.
-    """
-    previous: str | None = None
-    for exchange in exchanges:
-        content = exchange.assistant_content
-        if not content:
-            continue
-        if content == previous:
-            exchange.assistant_content = ""
-            continue
-        previous = content
 
 
 def _resolve_tool_result(event_type: str, data: dict[str, Any]) -> Any:
@@ -572,15 +530,22 @@ def _group_exchanges_by_turn(
     Exchanges with no turn_id (``""``, from rows written before this
     column/field existed) are dropped entirely rather than grouped under a
     shared key or placed as singletons: see ``_merge_chronologically`` for
-    why omission, not inference, is the deliberate choice here. Because that
-    drop happens here, before dedup, a dropped exchange can never stand in
-    as another exchange's "previous" for ``_dedupe_parallel_batch_prose``
-    below.
+    why omission, not inference, is the deliberate choice here.
 
-    Parallel-batch prose dedup is applied per group, in the exchanges'
-    already-established relative order (see ``_load_tool_exchanges``'s
-    sort), immediately after each group is assembled -- never over the
-    flat cross-turn list. See ``_dedupe_parallel_batch_prose`` for why.
+    Assistant prose is carried through verbatim, one exchange at a time.
+    An earlier revision of this module also deduplicated byte-identical
+    prose on adjacent exchanges, on the theory that a parallel tool-call
+    batch stamps every concurrent call with the same ``assistant_content``.
+    That premise is false: the only writer of that field,
+    ``ReActPattern._remember_tool_call_content``, returns after the first
+    non-control call in the batch, so exactly one call in a batch ever
+    carries prose. A parallel batch therefore cannot produce the adjacent
+    duplicate that dedup looked for; the only thing that can is two
+    *serialized* iterations of one turn whose prose happens to match (the
+    ReAct step_id is minted once per pattern run, so serialized iterations
+    share it and the turn_id). Blanking the second of those dropped real
+    content the live history had, which is why dedup is gone rather than
+    made more precise.
     """
     stats = stats if stats is not None else _ReconstructionStats()
     groups: dict[str, list[_ToolExchange]] = {}
@@ -589,8 +554,6 @@ def _group_exchanges_by_turn(
             stats.exchanges_without_turn_id += 1
             continue
         groups.setdefault(exchange.turn_id, []).append(exchange)
-    for group in groups.values():
-        _dedupe_parallel_batch_prose(group)
     return groups
 
 
@@ -773,11 +736,12 @@ def _as_aware_utc(value: datetime) -> datetime:
 
     Applied to every ``TraceEvent.timestamp`` value in ``_load_tool_exchanges``
     before it feeds a ``sort_key`` (used both to order an exchange's start/end
-    pairing and to order same-turn exchanges relative to each other, and by
-    ``_dedupe_parallel_batch_prose``). ``TraceEvent.timestamp`` is declared
-    ``DateTime(timezone=True)``, but SQLite (used by tests) returns naive
-    datetimes regardless of what was stored, while Postgres returns aware
-    ones; comparing a naive and an aware datetime raises ``TypeError``.
+    pairing and to order same-turn exchanges relative to each other).
+    ``TraceEvent.timestamp`` is declared ``DateTime(timezone=True)``, but
+    SQLite (used by tests) returns naive datetimes regardless of what was
+    stored, while Postgres returns aware ones; comparing a naive and an
+    aware datetime raises ``TypeError``.
+
     Placement of a turn's exchanges relative to the transcript is a
     ``turn_id`` join now (see ``_merge_chronologically``), not a timestamp
     comparison, so this function is no longer applied to ``TaskChatMessage

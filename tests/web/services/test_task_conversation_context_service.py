@@ -991,190 +991,6 @@ def test_ids_match_ignores_malformed_tool_call_entries():
 # ---------------------------------------------------------------------------
 
 
-def test_dedup_positional_after_sort_keeps_different_turns_distinct_prose():
-    """Fix 5 regression: two DIFFERENT turns emitting byte-identical
-    assistant prose must BOTH keep their prose. The old code tracked
-    ``last_assistant_content`` across trace rows in *end-event-arrival*
-    order; when an unrelated exchange's END event lands before an earlier
-    exchange's own (slow-running) END event, positional dedup by end-order
-    could blank a later, unrelated turn's coincidentally identical prose.
-    Sorting by *start* time before deduping (the fix) keeps these turns
-    correctly separated by the truly-intervening exchange."""
-    db_session = _create_db_session()
-    try:
-        task = _create_task(db_session)
-        # All three calls are anchored to one turn: this test is about
-        # _dedupe_parallel_batch_prose's positional logic over the flat,
-        # start-time-sorted exchange list, which runs before turn grouping
-        # -- it is unconcerned with turn_id boundaries.
-        _add_chat_message(
-            db_session,
-            task,
-            role="user",
-            content="go",
-            created_at=_ts(-1),
-            turn_id="turn-1",
-        )
-        shared_prose = "Investigating the failure."
-
-        # Turn A: starts first, but is slow -- its end event arrives LAST.
-        _add_trace_event(
-            db_session,
-            task,
-            event_type="tool_execution_start",
-            timestamp=_ts(0),
-            turn_id="turn-1",
-            data={
-                "tool_name": "tool_a",
-                "tool_params": {},
-                "tool_call_id": "call-a",
-                "assistant_content": shared_prose,
-            },
-        )
-        # Turn B: starts after A, but is fast -- its end event arrives
-        # before A's, and carries different prose.
-        _add_trace_event(
-            db_session,
-            task,
-            event_type="tool_execution_start",
-            timestamp=_ts(1),
-            turn_id="turn-1",
-            data={
-                "tool_name": "tool_b",
-                "tool_params": {},
-                "tool_call_id": "call-b",
-                "assistant_content": "Checking a different thing.",
-            },
-        )
-        _add_trace_event(
-            db_session,
-            task,
-            event_type="tool_execution_end",
-            timestamp=_ts(2),  # B's end lands before A's end below.
-            turn_id="turn-1",
-            data={
-                "tool_name": "tool_b",
-                "tool_call_id": "call-b",
-                "success": True,
-                "result": {"ok": True},
-            },
-        )
-        _add_trace_event(
-            db_session,
-            task,
-            event_type="tool_execution_end",
-            timestamp=_ts(100),  # A finishes much later.
-            turn_id="turn-1",
-            data={
-                "tool_name": "tool_a",
-                "tool_call_id": "call-a",
-                "success": True,
-                "result": {"ok": True},
-            },
-        )
-        # Turn C: a much later, unrelated turn that coincidentally repeats
-        # A's exact prose.
-        _add_trace_event(
-            db_session,
-            task,
-            event_type="tool_execution_start",
-            timestamp=_ts(200),
-            turn_id="turn-1",
-            data={
-                "tool_name": "tool_c",
-                "tool_params": {},
-                "tool_call_id": "call-c",
-                "assistant_content": shared_prose,
-            },
-        )
-        _add_trace_event(
-            db_session,
-            task,
-            event_type="tool_execution_end",
-            timestamp=_ts(201),
-            turn_id="turn-1",
-            data={
-                "tool_name": "tool_c",
-                "tool_call_id": "call-c",
-                "success": True,
-                "result": {"ok": True},
-            },
-        )
-
-        messages = load_task_conversation_context_sync(db_session, int(task.id))
-        assistant_by_tool = {}
-        for index, message in enumerate(messages):
-            if message["role"] != "assistant" or not message.get("tool_calls"):
-                continue
-            tool_message = messages[index + 1]
-            assistant_by_tool[tool_message["tool_name"]] = message["content"]
-
-        assert assistant_by_tool["tool_a"] == shared_prose
-        assert assistant_by_tool["tool_c"] == shared_prose
-        assert assistant_by_tool["tool_b"] == "Checking a different thing."
-    finally:
-        db_session.close()
-
-
-def test_dedup_still_blanks_immediately_following_parallel_duplicate():
-    """Fix 5 regression, other half: a genuine parallel batch (same start
-    time, no other exchange between them in start order) must still have
-    its duplicate prose blanked for the immediately-following exchange."""
-    db_session = _create_db_session()
-    try:
-        task = _create_task(db_session)
-        _add_chat_message(
-            db_session,
-            task,
-            role="user",
-            content="go",
-            created_at=_ts(-1),
-            turn_id="turn-1",
-        )
-        shared_prose = "Running parallel lookups."
-
-        for index in range(3):
-            call_id = f"batch-call-{index}"
-            _add_trace_event(
-                db_session,
-                task,
-                event_type="tool_execution_start",
-                timestamp=_ts(index),
-                turn_id="turn-1",
-                data={
-                    "tool_name": "list_files",
-                    "tool_params": {"index": index},
-                    "tool_call_id": call_id,
-                    "assistant_content": shared_prose,
-                },
-            )
-            _add_trace_event(
-                db_session,
-                task,
-                event_type="tool_execution_end",
-                timestamp=_ts(index + 10),
-                turn_id="turn-1",
-                data={
-                    "tool_name": "list_files",
-                    "tool_call_id": call_id,
-                    "success": True,
-                    "result": {"index": index},
-                },
-            )
-
-        messages = load_task_conversation_context_sync(db_session, int(task.id))
-        assistant_contents = [
-            m["content"]
-            for m in messages
-            if m["role"] == "assistant" and m.get("tool_calls")
-        ]
-        assert len(assistant_contents) == 3
-        assert assistant_contents.count(shared_prose) == 1
-        assert assistant_contents.count("") == 2
-    finally:
-        db_session.close()
-
-
 def test_tool_execution_end_missing_result_yields_degraded_dict_not_none():
     """Fix 6 regression: a ``tool_execution_end`` with no ``result`` key and
     not marked ``interrupted`` must produce a degraded placeholder dict,
@@ -1991,202 +1807,9 @@ def test_image_only_turn_participates_correctly_in_chronological_ordering():
 
 
 # ---------------------------------------------------------------------------
-# Part E -- dedup scoped to one turn (item 1), turn_id in the pairing key
-# (item 2), the F1 silent-drop decision (item 4), and the summary log line
-# (item 5).
+# Part E -- turn_id in the pairing key (item 2), the F1 silent-drop decision
+# (item 4), and the summary log line (item 5).
 # ---------------------------------------------------------------------------
-
-
-def test_dedup_does_not_blank_a_different_later_turns_identical_prose():
-    """Item 1a: two DIFFERENT turns whose only exchange happens to share
-    byte-identical ``assistant_content``, with nothing else between them in
-    the task-wide flat exchange order, must both keep their prose.
-
-    Before the fix, ``_dedupe_parallel_batch_prose`` ran over the flat,
-    task-wide exchange list *before* turn grouping, so adjacency in that
-    list (not an actual parallel batch) blanked the second turn's prose.
-    Adjacency across a turn boundary is not the same thing as adjacency
-    within one turn's parallel tool-call batch.
-    """
-    db_session = _create_db_session()
-    try:
-        task = _create_task(db_session)
-        shared_prose = "Looking into it now."
-
-        _add_chat_message(
-            db_session,
-            task,
-            role="user",
-            content="turn 1",
-            created_at=_ts(0),
-            turn_id="turn-1",
-        )
-        _add_trace_event(
-            db_session,
-            task,
-            event_type="tool_execution_start",
-            timestamp=_ts(1),
-            turn_id="turn-1",
-            data={
-                "tool_name": "tool_one",
-                "tool_params": {},
-                "tool_call_id": "call-1",
-                "assistant_content": shared_prose,
-            },
-        )
-        _add_trace_event(
-            db_session,
-            task,
-            event_type="tool_execution_end",
-            timestamp=_ts(2),
-            turn_id="turn-1",
-            data={
-                "tool_name": "tool_one",
-                "tool_call_id": "call-1",
-                "success": True,
-                "result": {"ok": True},
-            },
-        )
-
-        _add_chat_message(
-            db_session,
-            task,
-            role="user",
-            content="turn 2, a genuinely different later turn",
-            created_at=_ts(3),
-            turn_id="turn-2",
-        )
-        _add_trace_event(
-            db_session,
-            task,
-            event_type="tool_execution_start",
-            timestamp=_ts(4),
-            turn_id="turn-2",
-            data={
-                "tool_name": "tool_two",
-                "tool_params": {},
-                "tool_call_id": "call-2",
-                # Coincidentally identical prose -- not a parallel batch,
-                # a different turn.
-                "assistant_content": shared_prose,
-            },
-        )
-        _add_trace_event(
-            db_session,
-            task,
-            event_type="tool_execution_end",
-            timestamp=_ts(5),
-            turn_id="turn-2",
-            data={
-                "tool_name": "tool_two",
-                "tool_call_id": "call-2",
-                "success": True,
-                "result": {"ok": True},
-            },
-        )
-
-        messages = load_task_conversation_context_sync(db_session, int(task.id))
-        assistant_by_tool = {}
-        for index, message in enumerate(messages):
-            if message["role"] != "assistant" or not message.get("tool_calls"):
-                continue
-            assistant_by_tool[message["tool_calls"][0]["function"]["name"]] = message[
-                "content"
-            ]
-
-        assert assistant_by_tool["tool_one"] == shared_prose
-        assert assistant_by_tool["tool_two"] == shared_prose
-    finally:
-        db_session.close()
-
-
-def test_dedup_ignores_a_dropped_legacy_predecessor():
-    """Item 1b: a legacy exchange with no usable ``turn_id`` is dropped by
-    ``_group_exchanges_by_turn`` and never reaches rendering -- it must not
-    still act as "previous" for a real, rendered exchange that happens to
-    share its prose and immediately follows it in the flat, pre-grouping
-    order.
-    """
-    db_session = _create_db_session()
-    try:
-        task = _create_task(db_session)
-        shared_prose = "Same wording, unrelated turns."
-
-        # Legacy exchange: no turn_id on either event, so it is dropped
-        # by _group_exchanges_by_turn and never rendered.
-        _add_trace_event(
-            db_session,
-            task,
-            event_type="tool_execution_start",
-            timestamp=_ts(0),
-            data={
-                "tool_name": "legacy_tool",
-                "tool_params": {},
-                "tool_call_id": "call-legacy",
-                "assistant_content": shared_prose,
-            },
-        )
-        _add_trace_event(
-            db_session,
-            task,
-            event_type="tool_execution_end",
-            timestamp=_ts(1),
-            data={
-                "tool_name": "legacy_tool",
-                "tool_call_id": "call-legacy",
-                "success": True,
-                "result": {"ok": True},
-            },
-        )
-
-        # Real turn, immediately after in the flat order, sharing the same
-        # prose byte-for-byte.
-        _add_chat_message(
-            db_session,
-            task,
-            role="user",
-            content="go",
-            created_at=_ts(2),
-            turn_id="turn-1",
-        )
-        _add_trace_event(
-            db_session,
-            task,
-            event_type="tool_execution_start",
-            timestamp=_ts(3),
-            turn_id="turn-1",
-            data={
-                "tool_name": "real_tool",
-                "tool_params": {},
-                "tool_call_id": "call-real",
-                "assistant_content": shared_prose,
-            },
-        )
-        _add_trace_event(
-            db_session,
-            task,
-            event_type="tool_execution_end",
-            timestamp=_ts(4),
-            turn_id="turn-1",
-            data={
-                "tool_name": "real_tool",
-                "tool_call_id": "call-real",
-                "success": True,
-                "result": {"ok": True},
-            },
-        )
-
-        messages = load_task_conversation_context_sync(db_session, int(task.id))
-        assistant_messages = [
-            m for m in messages if m["role"] == "assistant" and m.get("tool_calls")
-        ]
-        assert len(assistant_messages) == 1
-        assert assistant_messages[0]["content"] == shared_prose
-        assert assistant_messages[0]["tool_calls"][0]["function"]["name"] == (
-            "real_tool"
-        )
-    finally:
-        db_session.close()
 
 
 def test_pairing_key_with_turn_id_does_not_change_well_formed_single_turn_pairing():
@@ -2665,5 +2288,136 @@ def test_summary_log_line_reports_every_drop_reason_with_correct_counts(caplog):
         assert "exchanges_with_unmatched_turn=1" in message
         assert "dangling_tool_starts=1" in message
         assert "tool_ends_without_start=1" in message
+    finally:
+        db_session.close()
+
+
+# ---------------------------------------------------------------------------
+# Part F -- assistant prose is carried through verbatim (no dedup).
+# ---------------------------------------------------------------------------
+
+
+def test_serialized_iterations_with_identical_prose_both_keep_it():
+    """Two *serialized* ReAct iterations inside one turn -- A start, A end,
+    B start, B end -- whose LLM responses happen to carry byte-identical
+    prose must both keep it.
+
+    Serialized iterations share a step_id (minted once per pattern run) and
+    a turn_id, so they are indistinguishable from a parallel batch by key
+    alone; the removed prose dedup blanked B here, dropping content the live
+    message history had. A parallel batch cannot produce this shape in the
+    first place -- ``_remember_tool_call_content`` stamps prose on only the
+    first non-control call of a batch -- so there is nothing to trade off.
+    """
+    db_session = _create_db_session()
+    try:
+        task = _create_task(db_session)
+        _add_chat_message(
+            db_session,
+            task,
+            role="user",
+            content="go",
+            created_at=_ts(-1),
+            turn_id="turn-1",
+        )
+        repeated_prose = "Let me check the file."
+
+        # Fully serialized: A's end precedes B's start.
+        for index, call_id in enumerate(("call-A", "call-B")):
+            _add_trace_event(
+                db_session,
+                task,
+                event_type="tool_execution_start",
+                timestamp=_ts(index * 10),
+                turn_id="turn-1",
+                data={
+                    "tool_name": "read_file",
+                    "tool_params": {"path": f"f{index}.py"},
+                    "tool_call_id": call_id,
+                    "assistant_content": repeated_prose,
+                },
+            )
+            _add_trace_event(
+                db_session,
+                task,
+                event_type="tool_execution_end",
+                timestamp=_ts(index * 10 + 5),
+                turn_id="turn-1",
+                data={
+                    "tool_name": "read_file",
+                    "tool_call_id": call_id,
+                    "success": True,
+                    "result": {"index": index},
+                },
+            )
+
+        messages = load_task_conversation_context_sync(db_session, int(task.id))
+        assistant_contents = [
+            m["content"]
+            for m in messages
+            if m["role"] == "assistant" and m.get("tool_calls")
+        ]
+        assert assistant_contents == [repeated_prose, repeated_prose]
+    finally:
+        db_session.close()
+
+
+def test_same_prose_separated_by_a_prose_less_exchange_is_kept():
+    """The removed dedup skipped prose-less exchanges without resetting its
+    "previous" value, so an intervening exchange with no prose did not break
+    the run of duplicates. All three exchanges here must come through with
+    exactly the prose their own start event carried."""
+    db_session = _create_db_session()
+    try:
+        task = _create_task(db_session)
+        _add_chat_message(
+            db_session,
+            task,
+            role="user",
+            content="go",
+            created_at=_ts(-1),
+            turn_id="turn-1",
+        )
+        repeated_prose = "Let me check the file."
+        proses = [repeated_prose, None, repeated_prose]
+
+        for index, prose in enumerate(proses):
+            call_id = f"call-{index}"
+            data = {
+                "tool_name": "read_file",
+                "tool_params": {"path": f"f{index}.py"},
+                "tool_call_id": call_id,
+            }
+            if prose is not None:
+                data["assistant_content"] = prose
+            _add_trace_event(
+                db_session,
+                task,
+                event_type="tool_execution_start",
+                timestamp=_ts(index * 10),
+                turn_id="turn-1",
+                data=data,
+            )
+            _add_trace_event(
+                db_session,
+                task,
+                event_type="tool_execution_end",
+                timestamp=_ts(index * 10 + 5),
+                turn_id="turn-1",
+                data={
+                    "tool_name": "read_file",
+                    "tool_call_id": call_id,
+                    "success": True,
+                    "result": {"index": index},
+                },
+            )
+
+        messages = load_task_conversation_context_sync(db_session, int(task.id))
+        assistant_contents = [
+            m["content"]
+            for m in messages
+            if m["role"] == "assistant" and m.get("tool_calls")
+        ]
+        assert assistant_contents == [repeated_prose, "", repeated_prose]
     finally:
         db_session.close()
