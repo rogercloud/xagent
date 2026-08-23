@@ -788,6 +788,67 @@ class TestSandboxLeaseProvider:
         )
 
     @pytest.mark.asyncio
+    async def test_provider_reports_workspace_mount_coverage(self, tmp_path):
+        """The provider proves which host-created directories its mounts expose."""
+
+        service = FakeSandboxService(runtime_spec_supported=True)
+        manager = SandboxManager(service)
+        client_root = tmp_path / "user_42" / "clients" / "7"
+        external_root = tmp_path / "external"
+
+        with (
+            patch.dict("os.environ", {}, clear=True),
+            patch(
+                "xagent.web.sandbox_manager.build_code_mount_volumes",
+                return_value=[("/repo/src", "/app/src", "ro")],
+            ),
+        ):
+            provider = await manager.create_lease_provider(
+                "user",
+                "42:client-7",
+                mount_intent=SandboxMountIntent(
+                    mount_root=str(client_root),
+                    extra_mounts=(str(external_root),),
+                ),
+            )
+
+        assert provider.workspace_dirs_are_host_mounted(
+            [
+                str(client_root / "end_users" / "101"),
+                str(client_root / "end_users" / "101" / "output"),
+                str(external_root / "uploads"),
+            ]
+        )
+        assert not provider.workspace_dirs_are_host_mounted(
+            [str(tmp_path / "unmounted")]
+        )
+
+    @pytest.mark.asyncio
+    async def test_legacy_provider_cannot_claim_verified_mount_coverage(self, tmp_path):
+        """An uninspectable reused sandbox keeps the in-sandbox mkdir fallback."""
+
+        service = FakeSandboxService(runtime_spec_supported=False)
+        manager = SandboxManager(service)
+        workspace_root = tmp_path / "user_42"
+
+        with (
+            patch.dict("os.environ", {}, clear=True),
+            patch(
+                "xagent.web.sandbox_manager.build_code_mount_volumes",
+                return_value=[("/repo/src", "/app/src", "ro")],
+            ),
+        ):
+            provider = await manager.create_lease_provider(
+                "user",
+                "42",
+                mount_intent=SandboxMountIntent(mount_root=str(workspace_root)),
+            )
+
+        assert not provider.workspace_dirs_are_host_mounted(
+            [str(workspace_root / "task" / "output")]
+        )
+
+    @pytest.mark.asyncio
     async def test_delete_sandbox_removes_cached_worker_sandboxes(self, tmp_path):
         """Deleting a lifecycle sandbox should delete its worker sandboxes too."""
 

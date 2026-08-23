@@ -763,12 +763,21 @@ class ToolFactory:
             if workspace is None:
                 workspace = ToolFactory.create_workspace(config.get_workspace_config())
             if workspace is not None:
-                from .sandboxed_tool.sandboxed_tool_wrapper import (
-                    create_workspace_in_sandbox,
+                directories = workspace.get_allowed_dirs()
+                host_mount_check = getattr(
+                    type(sandbox), "workspace_dirs_are_host_mounted", None
                 )
+                workspace_is_host_mounted = (
+                    callable(host_mount_check)
+                    and host_mount_check(sandbox, directories) is True
+                )
+                if not workspace_is_host_mounted:
+                    from .sandboxed_tool.sandboxed_tool_wrapper import (
+                        create_workspace_in_sandbox,
+                    )
 
-                setup_sandbox = getattr(sandbox, "primary_sandbox", sandbox)
-                await create_workspace_in_sandbox(setup_sandbox, workspace)
+                    setup_sandbox = getattr(sandbox, "primary_sandbox", sandbox)
+                    await create_workspace_in_sandbox(setup_sandbox, workspace)
             tools = await ToolFactory._wrap_sandbox_tools(tools, sandbox)
 
         # Apply output filtering to all tools

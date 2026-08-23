@@ -8,7 +8,7 @@ import os
 import re
 import threading
 import time
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Callable, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -168,6 +168,47 @@ class SandboxLeaseProvider:
     def lease(self, *, concurrency_safe: bool) -> SandboxLease:
         """Return an async context manager for the requested execution mode."""
         return SandboxLease(self, concurrency_safe=concurrency_safe)
+
+    def workspace_dirs_are_host_mounted(self, directories: Sequence[str]) -> bool:
+        """Whether verified RW mounts cover every backend workspace directory.
+
+        ``SandboxManager`` creates all workspace mounts as read-write volumes
+        from backend/host storage into the sandbox.  ``TaskWorkspace`` creates
+        its task-specific directories on that backend storage before the tool
+        factory runs, so directories covered by these mounts are immediately
+        visible in both primary and worker sandboxes without a serialized
+        ``sandbox.exec("mkdir", ...)`` bootstrap.
+
+        Keep this as a positive capability on the lease provider rather than
+        on ``Sandbox`` itself: a raw sandbox supplied by a standalone embedder
+        may have an independent filesystem and must retain the exec fallback.
+        A legacy backend that cannot inspect/reconcile its runtime spec also
+        retains the fallback because its requested volumes are not proof of
+        the mounts on a reused sandbox.
+        """
+        if not directories:
+            return True
+        if self._manager._backend_probe is not True:
+            return False
+
+        mount_roots = tuple(
+            Path(canonical_sandbox_path(str(absolute_backend_mount_path(backend_path))))
+            for backend_path, _should_create in self._manager._workspace_mount_paths(
+                self._lifecycle_type,
+                self._lifecycle_id,
+                self._mount_intent,
+            )
+        )
+        if not mount_roots:
+            return False
+
+        for directory in directories:
+            candidate = Path(
+                canonical_sandbox_path(str(absolute_backend_mount_path(directory)))
+            )
+            if not any(candidate.is_relative_to(root) for root in mount_roots):
+                return False
+        return True
 
     async def acquire_worker_slot(self) -> int:
         """Reserve one worker slot, waiting when all workers are busy."""
