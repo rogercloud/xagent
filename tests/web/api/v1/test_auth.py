@@ -10,6 +10,7 @@ Test plumbing (client, _test_db fixture, auth helpers) is shared via
 import asyncio
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
@@ -20,8 +21,14 @@ from fastapi.security import HTTPAuthorizationCredentials
 from sqlalchemy import create_engine, text
 from sqlalchemy.pool import QueuePool
 
-from xagent.core.utils.api_key import BCRYPT_COST
+from xagent.core.utils.api_key import (
+    BCRYPT_COST,
+    SHA256_HASH_PREFIX,
+    hash_api_key,
+    verify_api_key,
+)
 from xagent.web.models.agent import Agent, AgentOrigin
+from xagent.web.models.agent_api_key import AgentApiKey
 from xagent.web.models.user_api_key import UserApiKey
 
 from ..conftest import (
@@ -71,6 +78,27 @@ def _create_personal_key() -> tuple[str, str]:
     return body["full_key"], body["key_prefix"]
 
 
+def _replace_key_hash(key_model, prefix: str, key_hash: str) -> None:  # type: ignore[no-untyped-def]
+    db = _direct_db_session()
+    try:
+        db.query(key_model).filter(key_model.key_prefix == prefix).update(
+            {"key_hash": key_hash}
+        )
+        db.commit()
+    finally:
+        db.close()
+
+
+def _load_key_hash(key_model, prefix: str) -> str:  # type: ignore[no-untyped-def]
+    db = _direct_db_session()
+    try:
+        return str(
+            db.query(key_model.key_hash).filter(key_model.key_prefix == prefix).scalar()
+        )
+    finally:
+        db.close()
+
+
 def _mark_generated_manager(agent_id: int) -> None:
     db = _direct_db_session()
     try:
@@ -99,6 +127,113 @@ def test_valid_personal_key_returns_me_response():
     assert body["username"] == "admin"
     assert body["email"] == "admin@example.com"
     assert body["key_prefix"] == prefix
+
+
+def test_new_personal_key_uses_sha256_verifier():
+    full_key, prefix = _create_personal_key()
+    stored_hash = _load_key_hash(UserApiKey, prefix)
+
+    assert stored_hash.startswith(SHA256_HASH_PREFIX)
+    assert verify_api_key(full_key, stored_hash) is True
+
+
+def test_legacy_personal_key_migrates_after_successful_authentication():
+    full_key, prefix = _create_personal_key()
+    legacy_hash = bcrypt.hashpw(full_key.encode(), bcrypt.gensalt(rounds=4)).decode()
+    _replace_key_hash(UserApiKey, prefix, legacy_hash)
+
+    resp = client.get("/v1/me", headers={"Authorization": f"Bearer {full_key}"})
+
+    assert resp.status_code == 200, resp.text
+    migrated_hash = _load_key_hash(UserApiKey, prefix)
+    assert migrated_hash == hash_api_key(full_key)
+
+
+def test_legacy_personal_key_wrong_secret_does_not_migrate():
+    full_key, prefix = _create_personal_key()
+    legacy_hash = bcrypt.hashpw(full_key.encode(), bcrypt.gensalt(rounds=4)).decode()
+    _replace_key_hash(UserApiKey, prefix, legacy_hash)
+    parts = full_key.split("_")
+    parts[-1] = "z" * 32
+
+    resp = client.get(
+        "/v1/me",
+        headers={"Authorization": f"Bearer {'_'.join(parts)}"},
+    )
+
+    _assert_invalid_api_key(resp)
+    assert _load_key_hash(UserApiKey, prefix) == legacy_hash
+
+
+def test_legacy_runtime_key_migrates_after_successful_authentication():
+    from xagent.web.api.v1.deps import (
+        _resolve_principal_from_credentials,
+        _upgrade_api_key_hash_isolated,
+    )
+
+    agent_id, full_key, prefix = _create_agent_and_key()
+    legacy_hash = bcrypt.hashpw(full_key.encode(), bcrypt.gensalt(rounds=4)).decode()
+    _replace_key_hash(AgentApiKey, prefix, legacy_hash)
+
+    principal = _resolve_principal_from_credentials(
+        HTTPAuthorizationCredentials(scheme="Bearer", credentials=full_key)
+    )
+
+    assert principal.agent is not None
+    assert principal.agent.id == agent_id
+    assert _load_key_hash(AgentApiKey, prefix) == hash_api_key(full_key)
+
+    # A concurrent worker holding the old snapshot cannot overwrite the
+    # winner's digest with a stale compare-and-swap.
+    different_key = full_key[:-1] + ("A" if full_key[-1] != "A" else "B")
+    _upgrade_api_key_hash_isolated(
+        AgentApiKey,
+        key_prefix=prefix,
+        raw_key=different_key,
+        observed_hash=legacy_hash,
+    )
+    assert _load_key_hash(AgentApiKey, prefix) == hash_api_key(full_key)
+
+
+def test_concurrent_legacy_runtime_auth_pays_one_bcrypt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A same-key request burst cannot stampede the legacy verifier."""
+    from xagent.web.api.v1 import deps
+
+    agent_id, full_key, prefix = _create_agent_and_key()
+    legacy_hash = bcrypt.hashpw(full_key.encode(), bcrypt.gensalt(rounds=4)).decode()
+    _replace_key_hash(AgentApiKey, prefix, legacy_hash)
+    legacy_checks = 0
+    count_lock = threading.Lock()
+    original_verify = deps.verify_api_key
+
+    def recording_verify(raw: str, stored_hash: str) -> bool:
+        nonlocal legacy_checks
+        if stored_hash.startswith("$2"):
+            with count_lock:
+                legacy_checks += 1
+        return original_verify(raw, stored_hash)
+
+    monkeypatch.setattr(deps, "verify_api_key", recording_verify)
+    credentials = HTTPAuthorizationCredentials(
+        scheme="Bearer",
+        credentials=full_key,
+    )
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        principals = list(
+            pool.map(
+                lambda _index: deps._resolve_principal_from_credentials(credentials),
+                range(8),
+            )
+        )
+
+    assert all(
+        principal.agent is not None and principal.agent.id == agent_id
+        for principal in principals
+    )
+    assert legacy_checks == 1
+    assert _load_key_hash(AgentApiKey, prefix) == hash_api_key(full_key)
 
 
 def test_agent_runtime_key_cannot_authenticate_me():

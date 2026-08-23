@@ -106,7 +106,7 @@ async def _cancel_after_runtime_key_commit(
 async def test_create_and_rotate_hash_without_holding_pool_connection(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """bcrypt is worker-owned and runs before either write transaction opens."""
+    """Key hashing is worker-owned and precedes either write transaction."""
 
     from xagent.core.utils import api_key
 
@@ -115,23 +115,23 @@ async def test_create_and_rotate_hash_without_holding_pool_connection(
     event_loop_thread = threading.get_ident()
     hash_observations: list[tuple[int, int]] = []
     sql_threads: list[int] = []
-    original_hashpw = api_key.bcrypt.hashpw
+    original_hash_api_key = api_key.hash_api_key
 
     @event.listens_for(engine, "before_cursor_execute")
     def record_sql_thread(*_args) -> None:  # type: ignore[no-untyped-def]
         sql_threads.append(threading.get_ident())
 
-    def recording_hashpw(*args, **kwargs):  # type: ignore[no-untyped-def]
+    def recording_hash_api_key(*args, **kwargs):  # type: ignore[no-untyped-def]
         hash_observations.append((threading.get_ident(), engine.pool.checkedout()))
-        return original_hashpw(*args, **kwargs)
+        return original_hash_api_key(*args, **kwargs)
 
-    monkeypatch.setattr(api_key.bcrypt, "hashpw", recording_hashpw)
+    monkeypatch.setattr(api_key, "hash_api_key", recording_hash_api_key)
     runtime = AgentManagementRuntime()
 
     created = await runtime.create_agent(
         user_id=user_id,
         is_admin=is_admin,
-        spec=_create_spec("bcrypt boundary"),
+        spec=_create_spec("hash boundary"),
     )
     rotated = await runtime.rotate_agent_runtime_key(
         user_id=user_id,
