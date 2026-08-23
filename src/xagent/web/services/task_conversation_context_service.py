@@ -17,6 +17,21 @@ deliberately not wired into any caller yet. Bounds (a per-result size cap, a
 total exchange-count cap, and a total character budget) and the observability
 around which of them fired ship in a follow-up change, alongside the wiring
 that puts this service on the hot path.
+
+One known deviation from the live shape, deliberately left for that same
+follow-up: a single LLM response that returns several ``tool_calls`` becomes
+one assistant message declaring all of them followed by a contiguous run of
+tool results in a live run, but is reconstructed here as one
+assistant/``tool`` pair per call. B's assistant message then sits after A's
+result, which reads as a decision taken with A's result in hand when in fact
+both calls were chosen with no results available. This is not gated by
+``tool_parallel_enabled`` -- serial execution of a multi-call response has
+the same shape. The persisted rows cannot currently distinguish the two
+cases: tool trace events carry ``tool_call_id`` and ``turn_id`` but nothing
+identifying which assistant response a call belongs to (``step_id`` is per
+pattern run, ``turn_id`` per user message, ``parent_event_id`` is always
+NULL for tool events), so fixing it means plumbing a per-response
+discriminator through the runtime hooks first.
 """
 
 from __future__ import annotations
