@@ -824,6 +824,41 @@ class TestSandboxLeaseProvider:
         )
 
     @pytest.mark.asyncio
+    async def test_provider_reports_symlinked_workspace_mount_coverage(self, tmp_path):
+        """Coverage compares the physical guest target that Docker mounts."""
+        service = FakeSandboxService(runtime_spec_supported=True)
+        manager = SandboxManager(service)
+        physical_storage = tmp_path / "physical" / ".xagent"
+        physical_workspace = physical_storage / "uploads" / "user_42"
+        physical_workspace.mkdir(parents=True)
+        backend_alias = tmp_path / "backend-alias"
+        backend_alias.symlink_to(physical_storage, target_is_directory=True)
+        aliased_workspace = backend_alias / "uploads" / "user_42"
+
+        with (
+            patch.dict(
+                "os.environ",
+                {
+                    "XAGENT_STORAGE_ROOT": str(backend_alias),
+                    "XAGENT_UPLOADS_DIR": str(backend_alias / "uploads"),
+                },
+                clear=True,
+            ),
+            patch(
+                "xagent.web.sandbox_manager.build_code_mount_volumes",
+                return_value=[],
+            ),
+        ):
+            provider = await manager.create_lease_provider(
+                "user",
+                "42",
+                mount_intent=SandboxMountIntent(mount_root=str(aliased_workspace)),
+            )
+            assert provider.workspace_dirs_are_host_mounted(
+                [str(physical_workspace / "task" / "output")]
+            )
+
+    @pytest.mark.asyncio
     async def test_legacy_provider_cannot_claim_verified_mount_coverage(self, tmp_path):
         """An uninspectable reused sandbox keeps the in-sandbox mkdir fallback."""
 

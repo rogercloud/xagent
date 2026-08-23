@@ -170,7 +170,7 @@ class SandboxLeaseProvider:
         return SandboxLease(self, concurrency_safe=concurrency_safe)
 
     def workspace_dirs_are_host_mounted(self, directories: Sequence[str]) -> bool:
-        """Whether verified RW mounts cover every backend workspace directory.
+        """Whether verified RW mounts cover every workspace guest target.
 
         ``SandboxManager`` creates all workspace mounts as read-write volumes
         from backend/host storage into the sandbox.  ``TaskWorkspace`` creates
@@ -191,8 +191,11 @@ class SandboxLeaseProvider:
         if self._manager._backend_probe is not True:
             return False
 
+        path_mapper = SandboxPathMapper.from_env()
         mount_roots = tuple(
-            Path(canonical_sandbox_path(str(absolute_backend_mount_path(backend_path))))
+            Path(
+                canonical_sandbox_path(str(path_mapper.to_sandbox_target(backend_path)))
+            )
             for backend_path, _should_create in self._manager._workspace_mount_paths(
                 self._lifecycle_type,
                 self._lifecycle_id,
@@ -204,7 +207,7 @@ class SandboxLeaseProvider:
 
         for directory in directories:
             candidate = Path(
-                canonical_sandbox_path(str(absolute_backend_mount_path(directory)))
+                canonical_sandbox_path(str(path_mapper.to_sandbox_target(directory)))
             )
             if not any(candidate.is_relative_to(root) for root in mount_roots):
                 return False
@@ -300,24 +303,24 @@ def absolute_backend_mount_path(path: str | Path) -> Path:
 
 
 def resolve_backend_mount_path(path: str | Path) -> str:
-    """Absolutize a backend-domain path and resolve its symlinks.
+    """Return the physical absolute identity of a backend-domain path.
 
-    ``SandboxMountIntent``'s covered/covering/disjoint split is purely
-    lexical, so it cannot tell a directory that is lexically inside a mount
-    root from a symlink at that same lexical position pointing somewhere
-    else entirely. Only the second one is *not* exposed by the root's bind,
-    so folding decisions must be taken against resolved paths -- this is the
-    resolver that answers that question.
-
-    The paths that end up mounted deliberately keep their unresolved
-    spelling: the guest mount point has to stay the path the rest of the
-    system (file tools, the workspace allowlist) already refers to.
+    Workspace tools resolve their roots before opening files. Mount producers
+    use the same resolution so the host source and guest target expose the
+    directory those tools actually address, including through symlinks.
     """
     return os.path.realpath(absolute_backend_mount_path(path))
 
 
 class SandboxPathMapper:
-    """Translate backend-visible workspace paths into sandbox volume tuples."""
+    """Translate physical backend workspace paths into sandbox volume tuples.
+
+    Backend operands are resolved because ``TaskWorkspace`` uses physical
+    paths. The optional host root is deliberately left untouched: it belongs
+    to the Docker-host namespace, where this backend process cannot resolve
+    symlinks. An explicit sandbox root is likewise already a guest-domain
+    path and receives lexical normalization only.
+    """
 
     def __init__(
         self,
@@ -328,8 +331,10 @@ class SandboxPathMapper:
     ) -> None:
         self.backend_storage_root = self._as_backend_path(backend_storage_root)
         self.host_storage_root = host_storage_root
-        self.sandbox_storage_root = self._as_backend_path(
-            sandbox_storage_root or self.backend_storage_root
+        self.sandbox_storage_root = (
+            self.backend_storage_root
+            if sandbox_storage_root is None
+            else Path(canonical_sandbox_path(str(sandbox_storage_root)))
         )
 
     @classmethod
@@ -345,7 +350,7 @@ class SandboxPathMapper:
 
     @staticmethod
     def _as_backend_path(path: str | Path) -> Path:
-        return absolute_backend_mount_path(path)
+        return Path(resolve_backend_mount_path(path))
 
     def _relative_to_backend_storage(self, backend_path: Path) -> Path | None:
         try:

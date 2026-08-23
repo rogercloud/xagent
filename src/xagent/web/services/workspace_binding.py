@@ -40,10 +40,11 @@ projection removes. That is a hard invariant rather than a best effort: an
 Actor subtree that cannot fold into the CA root fails the build instead of
 becoming an Actor-specific bind.
 
-Because that classification is lexical, every candidate is absolutized,
-canonicalized and symlink-resolved in the backend path domain first, and
-what a disagreement between the two views means depends on where the
-candidate came from -- its :class:`_MountCandidate` provenance, see
+Because that classification is lexical, every candidate is first resolved to
+its physical identity in the backend path domain. The final mount intent,
+workspace tools, and sandbox guest target therefore all name the same path even
+when an operator configured a symlink. What an escape from the physical mount
+root means still depends on provenance -- see :class:`_MountCandidate` and
 :func:`_fold_mount_paths`.
 """
 
@@ -61,7 +62,7 @@ from ...sandbox import (
     SandboxMountIntent,
     canonical_sandbox_path,
 )
-from ..sandbox_manager import absolute_backend_mount_path, resolve_backend_mount_path
+from ..sandbox_manager import resolve_backend_mount_path
 
 logger = logging.getLogger(__name__)
 
@@ -154,40 +155,22 @@ def _build_external_allowlist(
 
 
 def _canonical_mount_path(path: str) -> str:
-    """One raw mount path in the identity domain the fold decides in.
+    """Return one mount path's stable physical backend identity.
 
-    Absolutizes in the backend domain (raw configuration may be relative or
-    ``~``-prefixed) and then canonicalizes, because the spelling that
-    survives folding does not reach the backend as typed:
-    ``SandboxMountIntent`` canonicalizes it. Folding on the pre-canonical
-    spelling would therefore decide coverage, symlink resolution and
-    authorization for a path other than the one actually mounted, and let
-    two spellings of one mount point produce two different intents.
+    Raw configuration may be relative, environment-expanded, ``~``-prefixed,
+    or symlinked. Resolve all of that before creating ``SandboxMountIntent``;
+    its POSIX canonicalizer then only normalizes the already-physical spelling
+    used by the workspace, mount intent, and sandbox target.
     """
-    return canonical_sandbox_path(str(absolute_backend_mount_path(path)))
+    return canonical_sandbox_path(resolve_backend_mount_path(path))
 
 
 def canonical_workspace_base(owner_id: int, segments: Sequence[str] = ()) -> str:
-    """One owner's workspace root at ``segments``, in the mount identity domain.
+    """Return one owner's physical workspace root at ``segments``.
 
-    The same directory has two consumers with two different normalizations:
-    the sandbox binds it (canonicalized by ``SandboxMountIntent``, a lexical
-    domain, because desired-vs-observed config comparison has to be lexical),
-    while the file tools open it through ``TaskWorkspace``, which ``resolve()``s
-    what it is handed (a physical domain, because files have to be found).
-
-    ``config.get_uploads_dir`` rejects an uploads *root* whose two readings
-    land in different directories, so for the root itself the remaining
-    difference is the spelling rather than the destination. That does not
-    extend to the segments composed onto it: a symlink planted inside the
-    uploads tree still resolves elsewhere, and only the fold's resolved-view
-    veto (:func:`_fold_relation`) speaks to that.
-
-    The spelling matters on its own: the desired spec is compared byte-wise
-    against what the backend reports, so a base dir carrying ``..`` or ``//``
-    makes one workspace look like two configurations depending on which
-    producer built it. Every producer of a backend workspace path composes it
-    here so they all emit the reported form.
+    Every producer composes and resolves the path here so file tools and the
+    desired sandbox spec use one byte-identical identity, including when the
+    configured uploads root or a workspace segment is a symlink.
     """
     return _canonical_mount_path(
         str(scoped_user_root(get_uploads_dir(), owner_id, tuple(segments)))
@@ -205,27 +188,13 @@ def _lexical_relation(root: str, path: str) -> str:
 
 
 def _fold_relation(root: str, resolved_root: str, path: str, resolved_path: str) -> str:
-    """Fold verdict for one candidate: lexical, vetoed by the resolved view.
+    """Return a fold verdict, failing safe if physical identity moved.
 
-    ``SandboxMountIntent`` classifies lexically, which is blind to symlinks
-    (its own docstring says so and requires callers to resolve first). Both
-    folding directions are only sound when the two views agree, because
-    each of them keeps the *unresolved* spelling as the surviving mount:
-
-    - dropping a covered candidate assumes the root's bind already exposes
-      it at its own path. A symlink lexically under the root but resolving
-      outside it is exposed by nothing once the root is bind-mounted, so
-      dropping it silently loses the mount;
-    - promoting a covering candidate assumes mounting it still exposes the
-      old root at the old root's path. A symlink that only *resolves* to an
-      ancestor does not contain the old root at all.
-
-    So a disagreement demotes the candidate to disjoint -- the verdict that
-    grants a separate bind. What that means is provenance-dependent, and
-    :func:`_fold_mount_paths` owns the decision: for a mount point the
-    deployment named a separate bind is exactly the unfolded behavior and
-    loses nothing, while for any other scope-derived one it is a rejected
-    build.
+    Callers already canonicalize to currently observable physical identities.
+    Resolving once more protects the classification if a previously missing
+    component materializes as a symlink during construction: a disagreement
+    becomes ``disjoint`` and provenance decides whether a separate deployment
+    mount is allowed or a scope-derived escape is rejected.
     """
     lexical = _lexical_relation(root, path)
     if lexical != _lexical_relation(resolved_root, resolved_path):
@@ -262,26 +231,15 @@ def _fold_mount_paths(
       that set by construction; a scope-derived one is in it exactly when an
       operator entry names the same mount point, under any spelling.
 
-    A scope-derived candidate is always lexically the root, its descendant
-    or its ancestor -- ``scoped_user_root`` composes both from the same user
-    root, and ``ExecutionScope`` enforces that ``sandbox_mount_segments`` is
-    a prefix of ``workspace_segments`` -- so the only way it reaches a
-    disjoint verdict is a symlink inside the workspace tree that moves it
-    out of the root it is required to share. Granting that its own bind
-    would hand the backend a writable mount of whatever the symlink points
-    at and give this Actor an intent no sibling Actor under the same CA
-    produces, so it raises ``SandboxMountEscapeError`` instead. The
-    deployment-named exception is why the identity domain matters: an
-    operator who names a mount point takes responsibility for it whatever a
-    scope also derives, but only for the mount point actually named -- a
-    symlink *alias* of it is a different bind point and does not authorize
-    its target. Canonicalization is lexical and keeps that distinction: it
-    folds redundant spellings of one path together, it does not follow the
-    symlink that makes an alias a path of its own.
+    A scope-derived candidate is normally the root, its descendant, or its
+    ancestor because ``ExecutionScope`` enforces the corresponding segment
+    prefix. A symlink may move its physical identity outside that tree. Such
+    a path is rejected unless the deployment independently named that same
+    physical directory; a symlink alias counts because aliases and their
+    targets intentionally share one mount identity.
 
-    Returns the final root and the surviving candidates in candidate order,
-    each canonical and never symlink-resolved -- the spelling the guest
-    mount point keeps. ``SandboxMountIntent`` still owns their deduplication
+    Returns the final physical root and surviving physical candidates in
+    candidate order. ``SandboxMountIntent`` still owns their deduplication
     and ordering.
     """
     root = _canonical_mount_path(mount_root)

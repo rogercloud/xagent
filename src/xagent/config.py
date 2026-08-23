@@ -1604,6 +1604,11 @@ class UploadsDirConfigurationError(Exception):
 # the configured spelling, so changing the configuration still takes effect.
 _pinned_relative_uploads_roots: dict[str, Path] = {}
 
+# External upload dirs feed both the chat allowlist and sandbox mount building
+# through separate calls. Pin cwd-dependent spellings on first use so a later
+# process-wide chdir cannot make those consumers name different directories.
+_pinned_relative_external_upload_dirs: dict[str, Path] = {}
+
 
 def _require_unambiguous_uploads_dir(uploads_dir: Path) -> Path:
     """Reject an uploads dir whose two normalizations name different places.
@@ -1611,20 +1616,19 @@ def _require_unambiguous_uploads_dir(uploads_dir: Path) -> Path:
     Paths under the uploads root reach consumers that normalize differently,
     and both normalizations are load-bearing:
 
-    - lexical (``canonical_sandbox_path``) is what sandbox mount identity and
-      desired-vs-observed spec comparison must use, because a path that keeps
-      ``..`` can never byte-match what a container backend reports;
+    - lexical (``canonical_sandbox_path``) is still used by generic sandbox
+      configuration identities and must not preserve ``..`` segments that a
+      backend will report differently;
     - physical (``realpath``) is what ``TaskWorkspace``, the upload writers
       and ``files.py``'s containment checks use, because files have to be
       found.
 
     They agree on every spelling but one: a symlink followed by ``..``, where
     the lexical form discards the symlink the physical form follows. That
-    configuration makes one logical directory two real ones, so an uploaded
-    file can land where the sandbox never mounted and agent tools cannot see
-    it. Rejecting the input is what lets each consumer keep its own
-    normalization: none has to defend against this, and a new consumer cannot
-    reintroduce it by picking the "wrong" one.
+    configuration gives one logical directory two readings. Workspace mount
+    producers now deliberately resolve to the physical reading, but rejecting
+    this ambiguous spelling at the shared configuration boundary also keeps
+    older and non-mount consumers from choosing the other one.
 
     An ordinary symlink is untouched -- following one is not a disagreement,
     both spellings still name a single directory.
@@ -1998,7 +2002,10 @@ def get_external_upload_dirs() -> list[Path]:
     """Get external upload directories from environment variable.
 
     The XAGENT_EXTERNAL_UPLOAD_DIRS environment variable should contain
-    a comma-separated list of directory paths.
+    a comma-separated list of directory paths. Environment variables and
+    ``~`` are expanded, relative paths are pinned to their first observed
+    working directory, and symlinks are resolved so callers receive stable
+    physical absolute paths.
 
     Example: /path/to/uploads1,/path/to/uploads2
 
@@ -2015,7 +2022,14 @@ def get_external_upload_dirs() -> list[Path]:
     for dir_path in env_dirs.split(","):
         dir_path = dir_path.strip()
         if dir_path:
-            path = Path(dir_path)
+            expanded = Path(os.path.expandvars(dir_path)).expanduser()
+            if expanded.is_absolute():
+                absolute = expanded
+            else:
+                absolute = _pinned_relative_external_upload_dirs.setdefault(
+                    dir_path, Path.cwd() / expanded
+                )
+            path = Path(os.path.realpath(absolute))
             if path.is_dir():
                 result.append(path)
             else:

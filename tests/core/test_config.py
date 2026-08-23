@@ -1206,8 +1206,40 @@ class TestGetExternalUploadDirs:
             monkeypatch.setenv(EXTERNAL_UPLOAD_DIRS, f"{dir1},{dir2}")
             result = get_external_upload_dirs()
             assert len(result) == 2
-            assert dir1 in result
-            assert dir2 in result
+            assert dir1.resolve() in result
+            assert dir2.resolve() in result
+
+    def test_expands_environment_tilde_and_resolves_symlinks(
+        self, tmp_path, monkeypatch
+    ):
+        physical = tmp_path / "physical" / "uploads"
+        physical.mkdir(parents=True)
+        alias = tmp_path / "alias"
+        alias.symlink_to(physical, target_is_directory=True)
+        monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.setenv("EXTERNAL_NAME", "alias")
+        monkeypatch.setenv(EXTERNAL_UPLOAD_DIRS, "~/$EXTERNAL_NAME")
+
+        assert get_external_upload_dirs() == [physical]
+
+    def test_relative_dir_is_pinned_to_first_working_directory(
+        self, tmp_path, monkeypatch
+    ):
+        first_cwd = tmp_path / "first"
+        second_cwd = tmp_path / "second"
+        external = first_cwd / "relative-external"
+        external.mkdir(parents=True)
+        second_cwd.mkdir()
+        relative_spelling = f"relative-external-{tmp_path.name}"
+        external.rename(first_cwd / relative_spelling)
+        external = first_cwd / relative_spelling
+        monkeypatch.setenv(EXTERNAL_UPLOAD_DIRS, relative_spelling)
+
+        monkeypatch.chdir(first_cwd)
+        assert get_external_upload_dirs() == [external]
+
+        monkeypatch.chdir(second_cwd)
+        assert get_external_upload_dirs() == [external]
 
 
 class TestGetExternalSkillsDirs:

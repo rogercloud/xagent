@@ -23,7 +23,11 @@ from xagent.sandbox.base import (
 # root handlers via dictConfig. Import it at collection so that reset happens
 # before caplog attaches per-test, not inside a caplog context.
 from xagent.web.app import _startup_phase
-from xagent.web.sandbox_manager import _SANDBOX_STOP_TIMEOUT_SECONDS, SandboxManager
+from xagent.web.sandbox_manager import (
+    _SANDBOX_STOP_TIMEOUT_SECONDS,
+    SandboxManager,
+    SandboxPathMapper,
+)
 
 
 def _make_sb_info(
@@ -109,6 +113,80 @@ def test_default_volumes_map_user_workspace_to_host_storage(
             "rw",
         ),
     ]
+
+
+def test_default_volumes_resolve_symlinked_backend_paths_locally(
+    manager: SandboxManager, tmp_path: Path
+):
+    """Local Docker must mount the same physical path workspace tools open."""
+    physical_storage = tmp_path / "physical" / ".xagent"
+    physical_user_dir = physical_storage / "uploads" / "user_42"
+    physical_user_dir.mkdir(parents=True)
+    backend_alias = tmp_path / "backend-alias"
+    backend_alias.symlink_to(physical_storage, target_is_directory=True)
+    aliased_user_dir = backend_alias / "uploads" / "user_42"
+
+    with (
+        patch.dict(
+            "os.environ",
+            {
+                "XAGENT_STORAGE_ROOT": str(backend_alias),
+                "XAGENT_UPLOADS_DIR": str(backend_alias / "uploads"),
+            },
+            clear=True,
+        ),
+        patch(
+            "xagent.web.sandbox_manager.build_code_mount_volumes",
+            return_value=[],
+        ),
+    ):
+        volumes = manager._make_default_volumes(
+            "user",
+            "42",
+            mount_intent=SandboxMountIntent(mount_root=str(aliased_user_dir)),
+        )
+
+    assert volumes == [
+        (str(physical_user_dir), str(physical_user_dir), "rw"),
+    ]
+
+
+def test_path_mapper_resolves_symlinked_backend_path_in_sibling_mode(tmp_path: Path):
+    physical_storage = tmp_path / "physical" / ".xagent"
+    physical_workspace = physical_storage / "uploads" / "user_42"
+    physical_workspace.mkdir(parents=True)
+    backend_alias = tmp_path / "backend-alias"
+    backend_alias.symlink_to(physical_storage, target_is_directory=True)
+    host_root = Path("/docker-host/storage-alias")
+
+    mapper = SandboxPathMapper(
+        backend_storage_root=backend_alias,
+        host_storage_root=host_root,
+    )
+
+    assert mapper.volume_for_backend_path(backend_alias / "uploads" / "user_42") == (
+        "/docker-host/storage-alias/uploads/user_42",
+        str(physical_workspace),
+        "rw",
+    )
+    assert mapper.backend_storage_root == physical_storage
+    assert mapper.host_storage_root == host_root
+    assert mapper.sandbox_storage_root == physical_storage
+
+
+def test_path_mapper_preserves_explicit_guest_domain(tmp_path: Path):
+    backend_storage = tmp_path / "backend" / ".xagent"
+    backend_storage.mkdir(parents=True)
+    mapper = SandboxPathMapper(
+        backend_storage_root=backend_storage,
+        host_storage_root=Path("/docker-host/storage"),
+        sandbox_storage_root=Path("/workspace/storage-alias"),
+    )
+
+    assert mapper.to_sandbox_target(backend_storage / "uploads" / "user_42") == Path(
+        "/workspace/storage-alias/uploads/user_42"
+    )
+    assert mapper.sandbox_storage_root == Path("/workspace/storage-alias")
 
 
 def test_default_volumes_include_build_preview_and_user_dirs(
