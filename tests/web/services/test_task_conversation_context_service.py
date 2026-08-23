@@ -1,4 +1,5 @@
 import json
+import logging
 from datetime import datetime, timedelta, timezone
 
 from sqlalchemy import create_engine
@@ -1985,5 +1986,684 @@ def test_image_only_turn_participates_correctly_in_chronological_ordering():
         assert messages[1]["tool_calls"][0]["id"] == "call-analyze"
         assert messages[2]["tool_call_id"] == "call-analyze"
         assert messages[3]["content"] == "It's a diagram."
+    finally:
+        db_session.close()
+
+
+# ---------------------------------------------------------------------------
+# Part E -- dedup scoped to one turn (item 1), turn_id in the pairing key
+# (item 2), the F1 silent-drop decision (item 4), and the summary log line
+# (item 5).
+# ---------------------------------------------------------------------------
+
+
+def test_dedup_does_not_blank_a_different_later_turns_identical_prose():
+    """Item 1a: two DIFFERENT turns whose only exchange happens to share
+    byte-identical ``assistant_content``, with nothing else between them in
+    the task-wide flat exchange order, must both keep their prose.
+
+    Before the fix, ``_dedupe_parallel_batch_prose`` ran over the flat,
+    task-wide exchange list *before* turn grouping, so adjacency in that
+    list (not an actual parallel batch) blanked the second turn's prose.
+    Adjacency across a turn boundary is not the same thing as adjacency
+    within one turn's parallel tool-call batch.
+    """
+    db_session = _create_db_session()
+    try:
+        task = _create_task(db_session)
+        shared_prose = "Looking into it now."
+
+        _add_chat_message(
+            db_session,
+            task,
+            role="user",
+            content="turn 1",
+            created_at=_ts(0),
+            turn_id="turn-1",
+        )
+        _add_trace_event(
+            db_session,
+            task,
+            event_type="tool_execution_start",
+            timestamp=_ts(1),
+            turn_id="turn-1",
+            data={
+                "tool_name": "tool_one",
+                "tool_params": {},
+                "tool_call_id": "call-1",
+                "assistant_content": shared_prose,
+            },
+        )
+        _add_trace_event(
+            db_session,
+            task,
+            event_type="tool_execution_end",
+            timestamp=_ts(2),
+            turn_id="turn-1",
+            data={
+                "tool_name": "tool_one",
+                "tool_call_id": "call-1",
+                "success": True,
+                "result": {"ok": True},
+            },
+        )
+
+        _add_chat_message(
+            db_session,
+            task,
+            role="user",
+            content="turn 2, a genuinely different later turn",
+            created_at=_ts(3),
+            turn_id="turn-2",
+        )
+        _add_trace_event(
+            db_session,
+            task,
+            event_type="tool_execution_start",
+            timestamp=_ts(4),
+            turn_id="turn-2",
+            data={
+                "tool_name": "tool_two",
+                "tool_params": {},
+                "tool_call_id": "call-2",
+                # Coincidentally identical prose -- not a parallel batch,
+                # a different turn.
+                "assistant_content": shared_prose,
+            },
+        )
+        _add_trace_event(
+            db_session,
+            task,
+            event_type="tool_execution_end",
+            timestamp=_ts(5),
+            turn_id="turn-2",
+            data={
+                "tool_name": "tool_two",
+                "tool_call_id": "call-2",
+                "success": True,
+                "result": {"ok": True},
+            },
+        )
+
+        messages = load_task_conversation_context_sync(db_session, int(task.id))
+        assistant_by_tool = {}
+        for index, message in enumerate(messages):
+            if message["role"] != "assistant" or not message.get("tool_calls"):
+                continue
+            assistant_by_tool[message["tool_calls"][0]["function"]["name"]] = message[
+                "content"
+            ]
+
+        assert assistant_by_tool["tool_one"] == shared_prose
+        assert assistant_by_tool["tool_two"] == shared_prose
+    finally:
+        db_session.close()
+
+
+def test_dedup_ignores_a_dropped_legacy_predecessor():
+    """Item 1b: a legacy exchange with no usable ``turn_id`` is dropped by
+    ``_group_exchanges_by_turn`` and never reaches rendering -- it must not
+    still act as "previous" for a real, rendered exchange that happens to
+    share its prose and immediately follows it in the flat, pre-grouping
+    order.
+    """
+    db_session = _create_db_session()
+    try:
+        task = _create_task(db_session)
+        shared_prose = "Same wording, unrelated turns."
+
+        # Legacy exchange: no turn_id on either event, so it is dropped
+        # by _group_exchanges_by_turn and never rendered.
+        _add_trace_event(
+            db_session,
+            task,
+            event_type="tool_execution_start",
+            timestamp=_ts(0),
+            data={
+                "tool_name": "legacy_tool",
+                "tool_params": {},
+                "tool_call_id": "call-legacy",
+                "assistant_content": shared_prose,
+            },
+        )
+        _add_trace_event(
+            db_session,
+            task,
+            event_type="tool_execution_end",
+            timestamp=_ts(1),
+            data={
+                "tool_name": "legacy_tool",
+                "tool_call_id": "call-legacy",
+                "success": True,
+                "result": {"ok": True},
+            },
+        )
+
+        # Real turn, immediately after in the flat order, sharing the same
+        # prose byte-for-byte.
+        _add_chat_message(
+            db_session,
+            task,
+            role="user",
+            content="go",
+            created_at=_ts(2),
+            turn_id="turn-1",
+        )
+        _add_trace_event(
+            db_session,
+            task,
+            event_type="tool_execution_start",
+            timestamp=_ts(3),
+            turn_id="turn-1",
+            data={
+                "tool_name": "real_tool",
+                "tool_params": {},
+                "tool_call_id": "call-real",
+                "assistant_content": shared_prose,
+            },
+        )
+        _add_trace_event(
+            db_session,
+            task,
+            event_type="tool_execution_end",
+            timestamp=_ts(4),
+            turn_id="turn-1",
+            data={
+                "tool_name": "real_tool",
+                "tool_call_id": "call-real",
+                "success": True,
+                "result": {"ok": True},
+            },
+        )
+
+        messages = load_task_conversation_context_sync(db_session, int(task.id))
+        assistant_messages = [
+            m for m in messages if m["role"] == "assistant" and m.get("tool_calls")
+        ]
+        assert len(assistant_messages) == 1
+        assert assistant_messages[0]["content"] == shared_prose
+        assert assistant_messages[0]["tool_calls"][0]["function"]["name"] == (
+            "real_tool"
+        )
+    finally:
+        db_session.close()
+
+
+def test_pairing_key_with_turn_id_does_not_change_well_formed_single_turn_pairing():
+    """Item 2: folding ``turn_id`` into the pending-start pairing key must
+    not change pairing for the common, well-formed case -- a single turn
+    whose start and end events both carry the same ``turn_id``."""
+    db_session = _create_db_session()
+    try:
+        task = _create_task(db_session)
+        _add_chat_message(
+            db_session,
+            task,
+            role="user",
+            content="go",
+            created_at=_ts(0),
+            turn_id="turn-1",
+        )
+        _add_trace_event(
+            db_session,
+            task,
+            event_type="tool_execution_start",
+            timestamp=_ts(1),
+            turn_id="turn-1",
+            data={
+                "tool_name": "search",
+                "tool_params": {"query": "docs"},
+                "tool_call_id": "call-1",
+                "assistant_content": "Searching the docs.",
+            },
+        )
+        _add_trace_event(
+            db_session,
+            task,
+            event_type="tool_execution_end",
+            timestamp=_ts(2),
+            turn_id="turn-1",
+            data={
+                "tool_name": "search",
+                "tool_call_id": "call-1",
+                "success": True,
+                "result": {"hits": 3},
+            },
+        )
+
+        messages = load_task_conversation_context_sync(db_session, int(task.id))
+        roles = [m["role"] for m in messages]
+        assert roles == ["user", "assistant", "tool"]
+        assert messages[1]["content"] == "Searching the docs."
+        assert messages[1]["tool_calls"][0]["id"] == "call-1"
+        assert messages[1]["tool_calls"][0]["function"]["name"] == "search"
+        assert json.loads(messages[1]["tool_calls"][0]["function"]["arguments"]) == {
+            "query": "docs"
+        }
+        assert messages[2]["tool_call_id"] == "call-1"
+        assert messages[2]["raw_result"] == {"hits": 3}
+    finally:
+        db_session.close()
+
+
+def test_pairing_key_turn_id_separates_colliding_step_and_call_ids():
+    """Item 2, exercising the actual mechanism the ``turn_id`` key addition
+    defends against, not just confirming it's a no-op for the common case.
+
+    The task description for item 2 is explicit that the exploit path --
+    two different turns' tool calls interleaving with the same
+    ``(step_id, tool_call_id)`` pair -- is unreachable today through the
+    real runtime (serialized turns, atomic DB claims, etc.). But the
+    pending-map keying logic itself can still be unit-tested directly by
+    constructing colliding trace rows (as a DAG replan restarting step
+    numbering at ``step_1`` would, paired with a reused synthesized
+    ``tool_call_{index}``-style id) and checking it does not mis-pair.
+
+    Without ``turn_id`` in the key: turn B's start (same step_id, same
+    call_id, different turn_id) overwrites turn A's pending entry, so
+    turn A's end pops turn B's start (wrong content) and turn B's end
+    finds nothing (already consumed). With ``turn_id`` folded in, the two
+    turns get distinct keys and both pair correctly.
+    """
+    db_session = _create_db_session()
+    try:
+        task = _create_task(db_session)
+        _add_chat_message(
+            db_session,
+            task,
+            role="user",
+            content="turn a",
+            created_at=_ts(0),
+            turn_id="turn-A",
+        )
+        _add_chat_message(
+            db_session,
+            task,
+            role="user",
+            content="turn b",
+            created_at=_ts(10),
+            turn_id="turn-B",
+        )
+
+        # Turn A's start -- step_id/call_id deliberately colliding with
+        # turn B's below (simulating a DAG replan that restarts step
+        # numbering at the same id).
+        _add_trace_event(
+            db_session,
+            task,
+            event_type="tool_execution_start",
+            timestamp=_ts(1),
+            step_id="step_1",
+            turn_id="turn-A",
+            data={
+                "tool_name": "tool_a",
+                "tool_params": {},
+                "tool_call_id": "call_0",
+                "assistant_content": "doing A",
+            },
+        )
+        # Turn B's start -- same step_id and call_id as turn A's, but a
+        # different turn_id.
+        _add_trace_event(
+            db_session,
+            task,
+            event_type="tool_execution_start",
+            timestamp=_ts(2),
+            step_id="step_1",
+            turn_id="turn-B",
+            data={
+                "tool_name": "tool_b",
+                "tool_params": {},
+                "tool_call_id": "call_0",
+                "assistant_content": "doing B",
+            },
+        )
+        # Turn A's end arrives next -- must pop turn A's own start, not
+        # turn B's.
+        _add_trace_event(
+            db_session,
+            task,
+            event_type="tool_execution_end",
+            timestamp=_ts(3),
+            step_id="step_1",
+            turn_id="turn-A",
+            data={
+                "tool_name": "tool_a",
+                "tool_call_id": "call_0",
+                "success": True,
+                "result": {"who": "a"},
+            },
+        )
+        # Turn B's end arrives last -- must still find turn B's own start.
+        _add_trace_event(
+            db_session,
+            task,
+            event_type="tool_execution_end",
+            timestamp=_ts(4),
+            step_id="step_1",
+            turn_id="turn-B",
+            data={
+                "tool_name": "tool_b",
+                "tool_call_id": "call_0",
+                "success": True,
+                "result": {"who": "b"},
+            },
+        )
+
+        messages = load_task_conversation_context_sync(db_session, int(task.id))
+        assistant_by_tool = {}
+        result_by_tool = {}
+        for index, message in enumerate(messages):
+            if message["role"] != "assistant" or not message.get("tool_calls"):
+                continue
+            tool_name = message["tool_calls"][0]["function"]["name"]
+            assistant_by_tool[tool_name] = message["content"]
+            tool_message = messages[index + 1]
+            assert tool_message["role"] == "tool"
+            result_by_tool[tool_name] = tool_message["raw_result"]
+
+        assert assistant_by_tool["tool_a"] == "doing A"
+        assert assistant_by_tool["tool_b"] == "doing B"
+        assert result_by_tool["tool_a"] == {"who": "a"}
+        assert result_by_tool["tool_b"] == {"who": "b"}
+    finally:
+        db_session.close()
+
+
+def test_image_budget_eviction_drops_tool_exchanges_deliberately_not_silently():
+    """Item 4 (F1): an image-only user turn evicted by the historical-image
+    ref budget must not silently take its tool exchanges down with it in a
+    way that's indistinguishable from a bug -- the row drop itself matches
+    upstream and is correct, but the turn's tool exchanges must be dropped
+    as a deliberate, counted choice (see ``_ReconstructionStats
+    .exchanges_with_unmatched_turn``), never fabricated a placement
+    elsewhere in the output."""
+    db_session = _create_db_session()
+    try:
+        task = _create_task(db_session)
+        base = _ts(0)
+
+        # The earliest image-only turn: its ref will be evicted once enough
+        # newer images exist to exhaust the budget.
+        _add_chat_message(
+            db_session,
+            task,
+            role="user",
+            content="",
+            created_at=base,
+            turn_id="turn-evicted",
+            attachments=[
+                {
+                    "file_id": "image-evicted",
+                    "name": "old-screenshot.png",
+                    "type": "image/png",
+                }
+            ],
+        )
+        _add_trace_event(
+            db_session,
+            task,
+            event_type="tool_execution_start",
+            timestamp=base + timedelta(seconds=1),
+            turn_id="turn-evicted",
+            data={
+                "tool_name": "analyze_image",
+                "tool_params": {},
+                "tool_call_id": "call-evicted",
+                "assistant_content": "Let me look at that image.",
+            },
+        )
+        _add_trace_event(
+            db_session,
+            task,
+            event_type="tool_execution_end",
+            timestamp=base + timedelta(seconds=2),
+            turn_id="turn-evicted",
+            data={
+                "tool_name": "analyze_image",
+                "tool_call_id": "call-evicted",
+                "success": True,
+                "result": {"label": "old diagram"},
+            },
+        )
+        # Its answer -- a plain transcript row, unaffected by the image
+        # budget -- must still survive.
+        _add_chat_message(
+            db_session,
+            task,
+            role="assistant",
+            content="It's an old diagram.",
+            created_at=base + timedelta(seconds=3),
+        )
+
+        # Enough newer image uploads to push the evicted turn's single ref
+        # entirely outside the budget (reverse scan keeps only the newest
+        # _MAX_HISTORICAL_IMAGE_CONTEXT_REFS refs).
+        for index in range(_MAX_HISTORICAL_IMAGE_CONTEXT_REFS):
+            _add_chat_message(
+                db_session,
+                task,
+                role="user",
+                content=f"newer image {index}",
+                created_at=base + timedelta(seconds=10 + index),
+                attachments=[
+                    {
+                        "file_id": f"image-newer-{index}",
+                        "name": f"newer-{index}.png",
+                        "type": "image/png",
+                    }
+                ],
+            )
+
+        messages = load_task_conversation_context_sync(db_session, int(task.id))
+
+        # The row drop matches upstream: the image-only row with no
+        # surviving refs is gone.
+        assert all(m.get("content") != "" or CONTEXT_REFS_KEY in m for m in messages)
+        for message in messages:
+            if CONTEXT_REFS_KEY in message:
+                file_ids = {
+                    ref["file_ref"]["file_id"] for ref in message[CONTEXT_REFS_KEY]
+                }
+                assert "image-evicted" not in file_ids
+
+        # The answer to the evicted turn survives as ordinary transcript
+        # text.
+        assert any(
+            m["role"] == "assistant" and m.get("content") == "It's an old diagram."
+            for m in messages
+        )
+
+        # The deliberate part: no fabricated placement anywhere for the
+        # evicted turn's tool exchange -- it must not appear at all.
+        tool_call_ids = {
+            call.get("id")
+            for m in messages
+            if m["role"] == "assistant"
+            for call in (m.get("tool_calls") or [])
+        }
+        assert "call-evicted" not in tool_call_ids
+        assert not any(
+            m["role"] == "tool" and m.get("tool_call_id") == "call-evicted"
+            for m in messages
+        )
+    finally:
+        db_session.close()
+
+
+def test_summary_log_line_reports_every_drop_reason_with_correct_counts(caplog):
+    """Item 5: the single summary log line at the end of
+    ``load_task_conversation_context_sync`` must report accurate counts for
+    transcript rows, placed exchanges, and every drop reason, exercised
+    together in one fixture:
+
+    - a legacy exchange with no usable turn_id (dropped by grouping)
+    - a turn whose user row is excluded by ``before_message_id`` (turn_id
+      present, but no surviving row to anchor on)
+    - a dangling tool_execution_start with no matching end
+    - a tool_execution_end with no matching start (still rendered, just
+      degraded)
+    - one well-formed turn whose exchange is actually placed
+    """
+    db_session = _create_db_session()
+    try:
+        task = _create_task(db_session)
+        base = _ts(0)
+
+        # turn-a: a normal, fully paired turn that survives.
+        _add_chat_message(
+            db_session,
+            task,
+            role="user",
+            content="turn a",
+            created_at=base,
+            turn_id="turn-a",
+        )
+        _add_chat_message(
+            db_session,
+            task,
+            role="assistant",
+            content="turn a answer",
+            created_at=base + timedelta(seconds=1),
+        )
+        _add_trace_event(
+            db_session,
+            task,
+            event_type="tool_execution_start",
+            timestamp=base + timedelta(seconds=2),
+            turn_id="turn-a",
+            data={
+                "tool_name": "tool_a",
+                "tool_params": {},
+                "tool_call_id": "call-a",
+            },
+        )
+        _add_trace_event(
+            db_session,
+            task,
+            event_type="tool_execution_end",
+            timestamp=base + timedelta(seconds=3),
+            turn_id="turn-a",
+            data={
+                "tool_name": "tool_a",
+                "tool_call_id": "call-a",
+                "success": True,
+                "result": {"ok": True},
+            },
+        )
+
+        # An orphan end, attached to turn-a's own turn_id so it lands in a
+        # surviving group (isolating the "end without start" count from
+        # the "unmatched turn" count).
+        _add_trace_event(
+            db_session,
+            task,
+            event_type="tool_execution_end",
+            timestamp=base + timedelta(seconds=4),
+            turn_id="turn-a",
+            data={
+                "tool_name": "orphan_end_tool",
+                "tool_call_id": "call-orphan-end",
+                "success": True,
+                "result": {"ok": True},
+            },
+        )
+
+        # turn-b: its user row will be excluded via before_message_id, but
+        # its tool exchange (turn_id="turn-b") is fully paired.
+        turn_b_user_row = _add_chat_message(
+            db_session,
+            task,
+            role="user",
+            content="turn b",
+            created_at=base + timedelta(seconds=5),
+            turn_id="turn-b",
+        )
+        _add_trace_event(
+            db_session,
+            task,
+            event_type="tool_execution_start",
+            timestamp=base + timedelta(seconds=6),
+            turn_id="turn-b",
+            data={
+                "tool_name": "tool_b",
+                "tool_params": {},
+                "tool_call_id": "call-b",
+            },
+        )
+        _add_trace_event(
+            db_session,
+            task,
+            event_type="tool_execution_end",
+            timestamp=base + timedelta(seconds=7),
+            turn_id="turn-b",
+            data={
+                "tool_name": "tool_b",
+                "tool_call_id": "call-b",
+                "success": True,
+                "result": {"ok": True},
+            },
+        )
+
+        # A legacy exchange with no turn_id at all.
+        _add_trace_event(
+            db_session,
+            task,
+            event_type="tool_execution_start",
+            timestamp=base + timedelta(seconds=8),
+            data={
+                "tool_name": "legacy_tool",
+                "tool_params": {},
+                "tool_call_id": "call-legacy",
+            },
+        )
+        _add_trace_event(
+            db_session,
+            task,
+            event_type="tool_execution_end",
+            timestamp=base + timedelta(seconds=9),
+            data={
+                "tool_name": "legacy_tool",
+                "tool_call_id": "call-legacy",
+                "success": True,
+                "result": {"ok": True},
+            },
+        )
+
+        # A dangling start with no matching end at all.
+        _add_trace_event(
+            db_session,
+            task,
+            event_type="tool_execution_start",
+            timestamp=base + timedelta(seconds=10),
+            turn_id="turn-a",
+            data={
+                "tool_name": "never_finishes",
+                "tool_params": {},
+                "tool_call_id": "call-dangling",
+            },
+        )
+
+        logger_name = "xagent.web.services.task_conversation_context_service"
+        with caplog.at_level(logging.INFO, logger=logger_name):
+            load_task_conversation_context_sync(
+                db_session, int(task.id), before_message_id=int(turn_b_user_row.id)
+            )
+
+        records = [
+            record
+            for record in caplog.records
+            if record.name == logger_name
+            and "task_conversation_context_reconstructed" in record.getMessage()
+        ]
+        assert len(records) == 1
+        message = records[0].getMessage()
+
+        assert "transcript_rows=2" in message
+        assert "exchanges_placed=2" in message
+        assert "exchanges_without_turn_id=1" in message
+        assert "exchanges_with_unmatched_turn=1" in message
+        assert "dangling_tool_starts=1" in message
+        assert "tool_ends_without_start=1" in message
     finally:
         db_session.close()

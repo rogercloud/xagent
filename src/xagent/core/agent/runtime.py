@@ -918,18 +918,22 @@ class PatternRuntime:
         """Close an in-flight tool trace without reporting a pause as an error."""
 
         cancellation_reason = reason or "Tool execution interrupted"
+        data: dict[str, Any] = {
+            "tool_name": tool_call.get("name"),
+            "tool_params": tool_call.get("args", {}),
+            "tool_call_id": tool_call.get("id"),
+            "success": False,
+            "interrupted": True,
+            "interrupt_reason": cancellation_reason,
+        }
+        turn_id = self._turn_id_from_payload(tool_call)
+        if turn_id:
+            data["turn_id"] = turn_id
         await self._emit_trace_event(
             TraceEventType(TraceScope.ACTION, TraceAction.END, TraceCategory.TOOL),
             task_id=self._task_id_from_payload(tool_call),
             step_id=self._step_id_from_payload(tool_call),
-            data={
-                "tool_name": tool_call.get("name"),
-                "tool_params": tool_call.get("args", {}),
-                "tool_call_id": tool_call.get("id"),
-                "success": False,
-                "interrupted": True,
-                "interrupt_reason": cancellation_reason,
-            },
+            data=data,
         )
         await self._finish_tool_span(
             tool_call=tool_call,

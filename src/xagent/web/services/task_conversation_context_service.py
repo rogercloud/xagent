@@ -119,6 +119,42 @@ class _MergeEntry:
     transcript: Optional[_TranscriptRow] = None
 
 
+@dataclass
+class _ReconstructionStats:
+    """Counts-only bookkeeping for the single summary log line.
+
+    No message content, tool results, or prose is ever stored here -- every
+    field is a count or, where noted, a size. Populated as a side effect
+    while the read pipeline runs, then emitted once by
+    ``load_task_conversation_context_sync``.
+    """
+
+    # Transcript rows retained after role/content filtering (R1) -- the rows
+    # that actually feed rendering, not the raw row count from the query.
+    transcript_rows: int = 0
+    # Tool exchanges that made it into the rendered output.
+    exchanges_placed: int = 0
+    # Exchanges with no usable turn_id (legacy rows, dropped in
+    # ``_group_exchanges_by_turn``).
+    exchanges_without_turn_id: int = 0
+    # Exchanges whose turn_id never matched a surviving user transcript row
+    # (``_merge_chronologically``): either that row's id fell outside
+    # ``before_message_id``, or it was an image-only row evicted by
+    # ``_attach_historical_image_context_refs``'s ref budget (see the
+    # module's F1 fix note). Both causes look identical from here -- a
+    # turn_id with no row to anchor on -- so they share one bucket.
+    exchanges_with_unmatched_turn: int = 0
+    # "tool_execution_start" events that never found a matching end/failure
+    # event and so never became a rendered exchange at all (see
+    # ``_load_tool_exchanges``). Behavior unchanged: still silently
+    # disappears, just now counted.
+    dangling_tool_starts: int = 0
+    # "tool_execution_end"/"tool_execution_failed" events with no matching
+    # start (renders with empty prose and empty tool_params). Behavior
+    # unchanged: still renders degraded, just now counted.
+    tool_ends_without_start: int = 0
+
+
 def load_task_conversation_context_sync(
     db: Session,
     task_id: int,
@@ -140,15 +176,32 @@ def load_task_conversation_context_sync(
             ``id < before_message_id`` are included (used when reconstructing
             context as of a specific point in the conversation).
     """
+    stats = _ReconstructionStats()
+
     transcript_rows = _load_transcript_rows(
         db, task_id, before_message_id=before_message_id
     )
-    exchanges = _load_tool_exchanges(db, task_id)
+    exchanges = _load_tool_exchanges(db, task_id, stats=stats)
 
-    merged = _merge_chronologically(transcript_rows, exchanges)
+    merged = _merge_chronologically(transcript_rows, exchanges, stats=stats)
 
     messages = _render_messages(merged)
     messages = _final_pairing_sweep(messages)
+
+    stats.transcript_rows = len(transcript_rows)
+    logger.info(
+        "task_conversation_context_reconstructed task_id=%s transcript_rows=%d "
+        "exchanges_placed=%d exchanges_without_turn_id=%d "
+        "exchanges_with_unmatched_turn=%d dangling_tool_starts=%d "
+        "tool_ends_without_start=%d",
+        task_id,
+        stats.transcript_rows,
+        stats.exchanges_placed,
+        stats.exchanges_without_turn_id,
+        stats.exchanges_with_unmatched_turn,
+        stats.dangling_tool_starts,
+        stats.tool_ends_without_start,
+    )
 
     return messages
 
@@ -243,7 +296,10 @@ def _attach_historical_image_context_refs(rows: list[_TranscriptRow]) -> None:
 # ---------------------------------------------------------------------------
 
 
-def _load_tool_exchanges(db: Session, task_id: int) -> list[_ToolExchange]:
+def _load_tool_exchanges(
+    db: Session, task_id: int, *, stats: _ReconstructionStats | None = None
+) -> list[_ToolExchange]:
+    stats = stats if stats is not None else _ReconstructionStats()
     trace_rows = (
         db.query(TraceEvent)
         .filter(
@@ -277,7 +333,30 @@ def _load_tool_exchanges(db: Session, task_id: int) -> list[_ToolExchange]:
     # column was populated simply carry ``step_id=None``, which normalizes
     # to the same empty-string discriminator for both events, reproducing
     # the old bare-``tool_call_id`` keying exactly.
-    pending: dict[tuple[str, str], _PendingToolStart] = {}
+    #
+    # ``turn_id`` is also folded into this key (when the event carries one;
+    # legacy rows without it fall back to the plain
+    # ``(step_discriminator, call_id)`` pair, unchanged from before). This
+    # is defensive hardening, not a fix for a reachable bug: exploiting a
+    # collision on the *current* two-part key would need two DIFFERENT
+    # turns' tool calls to interleave in the trace stream with the same
+    # ``step_id``/``tool_call_id`` pair, and today that can't happen --
+    # a task's turns are serialized by a per-task command gate, a running
+    # task refuses a new in-flight command before any DB write, the DB
+    # claim is atomic (``RUNNING`` is excluded from ``_APPENDABLE_STATUSES``,
+    # so a second writer can't append mid-turn), the pause -> new-message
+    # path explicitly drains the in-flight turn before starting the next,
+    # a hard cancel emits no end event at all (nothing to interleave), and
+    # trace writes are per-event synchronous commits with no batching that
+    # could reorder them across turns. ReAct's own ``step_id`` values
+    # (``react_{uuid8}``, minted once per pattern start) never repeat
+    # either, so only a DAG replan -- which restarts step numbering at
+    # ``step_1`` -- can even collide on the current key, and that
+    # collision is exactly what ``turn_id`` (unique per user message,
+    # shared by every step within one turn) discriminates away. Adding it
+    # here is insurance against a future change to any of those
+    # invariants, not evidence one is currently broken.
+    pending: dict[tuple[str, ...], _PendingToolStart] = {}
     exchanges: list[_ToolExchange] = []
 
     for trace_row in trace_rows:
@@ -291,28 +370,41 @@ def _load_tool_exchanges(db: Session, task_id: int) -> list[_ToolExchange]:
         if trace_row.event_type == "tool_execution_start":
             call_id = str(data.get("tool_call_id") or "") or f"recon-{row_id}"
             assistant_content = str(data.get("assistant_content") or "").strip()
-            pending[(step_discriminator, call_id)] = _PendingToolStart(
+            start_turn_id = str(data.get("turn_id") or "")
+            start_key: tuple[str, ...] = (
+                (step_discriminator, call_id, start_turn_id)
+                if start_turn_id
+                else (step_discriminator, call_id)
+            )
+            pending[start_key] = _PendingToolStart(
                 assistant_content=assistant_content,
                 tool_name=str(data.get("tool_name") or ""),
                 tool_params=data.get("tool_params"),
                 sort_key=(row_timestamp, row_id),
-                turn_id=str(data.get("turn_id") or ""),
+                turn_id=start_turn_id,
             )
             continue
 
         # tool_execution_end / tool_execution_failed: pop the matching start so
         # each start is consumed by exactly one end.
         raw_call_id = str(data.get("tool_call_id") or "")
+        end_turn_id = str(data.get("turn_id") or "")
         start = None
         call_id = raw_call_id
         if raw_call_id:
-            start = pending.pop((step_discriminator, raw_call_id), None)
+            end_key: tuple[str, ...] = (
+                (step_discriminator, raw_call_id, end_turn_id)
+                if end_turn_id
+                else (step_discriminator, raw_call_id)
+            )
+            start = pending.pop(end_key, None)
         if start is None:
             # No id, or id present but no matching start recorded (e.g. the
             # matching start fell outside this query, or lost its id, or its
             # step id doesn't match this end's). Fall back to a synthesized
             # key so pairing always has an identity.
             call_id = raw_call_id or f"recon-{row_id}"
+            stats.tool_ends_without_start += 1
 
         tool_name = str(data.get("tool_name") or "").strip()
         if not tool_name and start is not None:
@@ -371,15 +463,25 @@ def _load_tool_exchanges(db: Session, task_id: int) -> list[_ToolExchange]:
         )
 
     # Sort by the *start* time (sort_key), matching the order exchanges will
-    # ultimately appear in once merged with the transcript (R4).
+    # ultimately appear in once merged with the transcript (R4). Dedup of
+    # parallel-batch prose happens later, per turn group (see
+    # ``_group_exchanges_by_turn``) -- not here over this flat, task-wide
+    # list. Deduping here would compare exchanges across turn boundaries
+    # (blanking a later, unrelated turn's coincidentally identical prose)
+    # and would let an exchange that never survives grouping (no usable
+    # turn_id) still act as the "previous" entry and blank a legitimately
+    # rendered exchange right after it.
     exchanges.sort(key=lambda exchange: exchange.sort_key)
-    _dedupe_parallel_batch_prose(exchanges)
+    # Any start left in ``pending`` here never found its end/failure event
+    # and so never became an exchange at all; it silently disappears along
+    # with its prose (behavior unchanged), but is now counted.
+    stats.dangling_tool_starts += len(pending)
     return exchanges
 
 
 def _dedupe_parallel_batch_prose(exchanges: list[_ToolExchange]) -> None:
     """Blank assistant prose that exactly repeats the immediately preceding
-    exchange, in final chronological (sort-key) order.
+    exchange, within a single turn's group, in that group's internal order.
 
     Parallel tool-call batches share one ``assistant_content`` value (the
     runtime's ``active_react_step_id`` can't delimit iterations, so every
@@ -387,11 +489,19 @@ def _dedupe_parallel_batch_prose(exchanges: list[_ToolExchange]) -> None:
     blanks all but the first occurrence in a run of adjacent duplicates so
     the model doesn't see the same paragraph N times.
 
-    Deliberately positional rather than "seen anywhere before": comparing
-    against everything seen earlier in the stream would also blank prose
-    from a genuinely different, later turn that happens to be byte-identical
-    (e.g. a retried step re-emitting the same message) -- that is real
-    content, not a duplicate, and must not be dropped.
+    Called once per turn group (see ``_group_exchanges_by_turn``), never
+    over the flat, task-wide exchange list: adjacency in that list is not a
+    reliable signal here for two reasons. First, two *different* turns
+    whose only exchange happens to share byte-identical prose are adjacent
+    in the flat list whenever nothing else falls between them, and blanking
+    the second would drop real content from a later turn, not a duplicate.
+    Second, dedup running before ``_group_exchanges_by_turn`` drops
+    exchanges with no usable ``turn_id`` would let a dropped exchange --
+    one that never reaches the rendered output at all -- still serve as
+    "previous" and blank a legitimately rendered exchange that follows it.
+    Scoping this to one turn's already-grouped list closes both holes: a
+    turn boundary can never be crossed, and every candidate is guaranteed
+    to actually survive into the output.
     """
     previous: str | None = None
     for exchange in exchanges:
@@ -443,6 +553,8 @@ def _resolve_tool_result(event_type: str, data: dict[str, Any]) -> Any:
 
 def _group_exchanges_by_turn(
     exchanges: list[_ToolExchange],
+    *,
+    stats: _ReconstructionStats | None = None,
 ) -> dict[str, list[_ToolExchange]]:
     """Group tool exchanges by the durable turn_id that produced them.
 
@@ -460,19 +572,33 @@ def _group_exchanges_by_turn(
     Exchanges with no turn_id (``""``, from rows written before this
     column/field existed) are dropped entirely rather than grouped under a
     shared key or placed as singletons: see ``_merge_chronologically`` for
-    why omission, not inference, is the deliberate choice here.
+    why omission, not inference, is the deliberate choice here. Because that
+    drop happens here, before dedup, a dropped exchange can never stand in
+    as another exchange's "previous" for ``_dedupe_parallel_batch_prose``
+    below.
+
+    Parallel-batch prose dedup is applied per group, in the exchanges'
+    already-established relative order (see ``_load_tool_exchanges``'s
+    sort), immediately after each group is assembled -- never over the
+    flat cross-turn list. See ``_dedupe_parallel_batch_prose`` for why.
     """
+    stats = stats if stats is not None else _ReconstructionStats()
     groups: dict[str, list[_ToolExchange]] = {}
     for exchange in exchanges:
         if not exchange.turn_id:
+            stats.exchanges_without_turn_id += 1
             continue
         groups.setdefault(exchange.turn_id, []).append(exchange)
+    for group in groups.values():
+        _dedupe_parallel_batch_prose(group)
     return groups
 
 
 def _merge_chronologically(
     transcript_rows: list[_TranscriptRow],
     exchanges: list[_ToolExchange],
+    *,
+    stats: _ReconstructionStats | None = None,
 ) -> list[_MergeEntry]:
     """Interleave transcript rows with tool exchanges by turn_id, not timestamp.
 
@@ -490,21 +616,38 @@ def _merge_chronologically(
     pass regardless of timestamps. Joining on turn_id makes both cases
     correct by construction instead of narrowing the heuristic further.
 
-    Exchanges whose turn_id has no matching row in ``transcript_rows`` --
-    either it predates turn_id support (``""``), or its user row fell
-    outside ``before_message_id`` -- are silently omitted rather than
-    placed by adjacency or clock guesswork. Losing that detail is
-    acceptable (the conversation reconstructs with transcript text only,
-    exactly today's non-reconstructed behavior); fabricating a placement
-    is not, because a misplaced exchange can make the model believe a
-    later turn's tool results informed an earlier answer, or that a failed
-    turn never happened.
+    Exchanges whose turn_id has no matching row in ``transcript_rows``
+    (already-empty turn_ids are dropped earlier, by
+    ``_group_exchanges_by_turn``) are silently omitted rather than placed
+    by adjacency or clock guesswork. This happens when the turn's user row
+    fell outside ``before_message_id``, or -- F1 -- when it was an
+    image-only row (``content == ""``) whose context refs all fell outside
+    ``_attach_historical_image_context_refs``'s task-wide budget and so
+    were dropped by the retention filter in ``_load_transcript_rows``.
+    That row drop itself is correct: it deliberately matches upstream
+    (``chat_history_service.load_task_transcript`` /
+    ``normalize_transcript_messages`` apply the identical ``content or
+    context_refs`` predicate). What would NOT be correct is fabricating a
+    placement for the orphaned exchanges once their anchor row is gone --
+    there is no other row that legitimately "produced" them. So the
+    decision here is a deliberate drop, the same as the
+    ``before_message_id`` case: losing that detail is acceptable (the
+    conversation reconstructs with transcript text only, exactly today's
+    non-reconstructed behavior); fabricating a placement is not, because a
+    misplaced exchange can make the model believe a later turn's tool
+    results informed an earlier answer, or that a failed turn never
+    happened. The one change this module makes for that case is
+    observability: every exchange dropped this way is counted in
+    ``stats.exchanges_with_unmatched_turn`` (see ``load_task_conversation_
+    context_sync``'s summary log line) so the drop is no longer silent,
+    even though it is still real.
 
     Within a turn's group, members keep the relative order already
     established in ``_load_tool_exchanges`` (timestamp/id sort) -- safe
     because it is one turn's own clock, not a cross-turn comparison.
     """
-    exchanges_by_turn = _group_exchanges_by_turn(exchanges)
+    stats = stats if stats is not None else _ReconstructionStats()
+    exchanges_by_turn = _group_exchanges_by_turn(exchanges, stats=stats)
 
     entries: list[_MergeEntry] = []
     for row in transcript_rows:
@@ -516,7 +659,14 @@ def _merge_chronologically(
         # place the same group twice.
         group = exchanges_by_turn.pop(row.turn_id, None)
         if group:
+            stats.exchanges_placed += len(group)
             entries.append(_MergeEntry(kind="group", group=group))
+
+    # Whatever is left here never found a surviving user row to anchor on
+    # -- see the F1 discussion above. Deliberately dropped, now counted.
+    stats.exchanges_with_unmatched_turn += sum(
+        len(group) for group in exchanges_by_turn.values()
+    )
 
     return entries
 
