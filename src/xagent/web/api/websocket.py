@@ -140,6 +140,7 @@ from ..services.task_command_transport import (
     dispatch_task_command_promptly,
     enqueue_task_command,
     task_has_live_foreign_runner,
+    task_has_live_runner,
 )
 from ..services.task_execution_controller import (
     StaleTaskRunError,
@@ -3917,6 +3918,10 @@ class BackgroundTaskManager:
         # too early creates a cycle: the original execution waits for the new
         # resume task while that resume task waits for the original execution.
         self.resume_tasks: Dict[int, asyncio.Task] = {}
+        # The coordinator is evidence only for the exact run it was created
+        # to resume. A lingering old-run task must not complete a command for
+        # a newer run as an idempotent success.
+        self._resume_run_ids: dict[int, str | None] = {}
         self._resume_reservations: set[int] = set()
         self._shutting_down = False
         self._shutdown_lock = asyncio.Lock()
@@ -3928,6 +3933,7 @@ class BackgroundTaskManager:
             self._shutdown_lock.locked()
             or self.running_tasks
             or self.resume_tasks
+            or self._resume_run_ids
             or self._resume_reservations
         ):
             raise RuntimeError("Background task manager still owns background work")
@@ -3964,18 +3970,48 @@ class BackgroundTaskManager:
         self.running_tasks[task_id] = task
         logger.info(f"Registered background task for task {task_id}")
 
-    def try_reserve_resume(self, task_id: int) -> ResumeReservationOutcome:
-        """Atomically classify admission to the live-control resume slot."""
+    def resume_admission_state(
+        self,
+        task_id: int,
+        *,
+        expected_run_id: str | None = None,
+    ) -> ResumeReservationOutcome | None:
+        """Inspect existing resume ownership without taking an empty slot."""
 
         if self._shutting_down:
             return ResumeReservationOutcome.SHUTTING_DOWN
-        # Keep this check-and-add block synchronous: asyncio task switches can
-        # only happen at ``await``, so it is the in-process atomic guard.
         if task_id in self._resume_reservations:
             return ResumeReservationOutcome.RESERVATION_HELD
         existing = self.resume_tasks.get(task_id)
         if existing is not None and not existing.done():
-            return ResumeReservationOutcome.COORDINATOR_RUNNING
+            registered_run_id = self._resume_run_ids.get(task_id)
+            if expected_run_id is None or registered_run_id == expected_run_id:
+                return ResumeReservationOutcome.COORDINATOR_RUNNING
+            # The task id is still locally occupied, but by a coordinator for
+            # another run. It is not evidence that this run is resuming and it
+            # is not safe to overwrite its registration.
+            return ResumeReservationOutcome.RESERVATION_HELD
+        if existing is not None:
+            self.resume_tasks.pop(task_id, None)
+            self._resume_run_ids.pop(task_id, None)
+        return None
+
+    def try_reserve_resume(
+        self,
+        task_id: int,
+        *,
+        expected_run_id: str | None = None,
+    ) -> ResumeReservationOutcome:
+        """Atomically classify admission to the live-control resume slot."""
+
+        # Keep this inspect-and-add block synchronous: asyncio task switches
+        # can only happen at ``await``, so it is the in-process atomic guard.
+        existing_state = self.resume_admission_state(
+            task_id,
+            expected_run_id=expected_run_id,
+        )
+        if existing_state is not None:
+            return existing_state
         self._resume_reservations.add(task_id)
         return ResumeReservationOutcome.RESERVED
 
@@ -3984,7 +4020,13 @@ class BackgroundTaskManager:
 
         return self.try_reserve_resume(task_id) is ResumeReservationOutcome.RESERVED
 
-    def register_reserved_resume(self, task_id: int, task: asyncio.Task) -> None:
+    def register_reserved_resume(
+        self,
+        task_id: int,
+        task: asyncio.Task,
+        *,
+        run_id: str | None = None,
+    ) -> None:
         if self._shutting_down:
             task.cancel()
             raise RuntimeError("Background task manager is shutting down")
@@ -3992,6 +4034,7 @@ class BackgroundTaskManager:
             raise RuntimeError(f"Task {task_id} has no reserved resume slot")
         self._resume_reservations.discard(task_id)
         self.resume_tasks[task_id] = task
+        self._resume_run_ids[task_id] = run_id
         logger.info("Registered resume coordinator for task %s", task_id)
 
     def release_resume_reservation(self, task_id: int) -> None:
@@ -4033,6 +4076,7 @@ class BackgroundTaskManager:
         resume_task = self.resume_tasks.get(task_id)
         if resume_task is not None and owns_registration(resume_task):
             self.resume_tasks.pop(task_id, None)
+            self._resume_run_ids.pop(task_id, None)
             logger.info("Cleaned up resume coordinator for task %s", task_id)
 
     async def cancel_task(
@@ -4076,6 +4120,7 @@ class BackgroundTaskManager:
         if not self._shutting_down:
             self.running_tasks.pop(task_id, None)
             self.resume_tasks.pop(task_id, None)
+            self._resume_run_ids.pop(task_id, None)
             self._resume_reservations.discard(task_id)
         return BackgroundTaskCancelOutcome(requested=requested)
 
@@ -4106,6 +4151,7 @@ class BackgroundTaskManager:
                 # caller is cancelled.
                 self.running_tasks.clear()
                 self.resume_tasks.clear()
+                self._resume_run_ids.clear()
                 self._resume_reservations.clear()
 
 
@@ -6065,7 +6111,11 @@ async def _handle_chat_message_unserialized(
                             ),
                         )
                     )
-                    background_task_manager.register_reserved_resume(task_id, bg_task)
+                    background_task_manager.register_reserved_resume(
+                        task_id,
+                        bg_task,
+                        run_id=task_run_id,
+                    )
                     handoff_registered = True
                     if posted:
                         # Registration completes the local resume handoff.
@@ -7862,38 +7912,6 @@ async def _handle_resume_task_unserialized(
         task_fields = task_setup_snapshot.task
         task_owner_user_id = int(task_fields.user_id)
         task_status = cast(TaskStatus, task_fields.status)
-        # Off-turn: on an agent-cache hit this only locates the paused task's
-        # existing workspace/sandbox for ``get_agent_for_task`` below. On a
-        # miss (or a cached-scope-fingerprint mismatch), that call builds a
-        # fresh agent from this value, which can materialize a workspace
-        # directory tree and acquire a sandbox lease.
-        # resolve_execution_scope_off_turn resolves this value through three
-        # distinct outcomes:
-        # - resolver authoritative, snapshot disagrees on a namespace field:
-        #   downgrades to the resolver's own answer (with a warning) instead
-        #   of raising, so the resume still proceeds -- the value here is the
-        #   trusted resolver answer, not the snapshot.
-        # - resolver abstains, snapshot widens the abstention's fallback:
-        #   ExecutionScopeAbstentionMismatchError is re-raised rather than
-        #   downgraded, so the resume is refused outright -- an abstention
-        #   never produced an authoritative value to fall back to.
-        # - resolver abstains, snapshot narrows the abstention's fallback:
-        #   the returned value IS the snapshot (policy fields overlaid from
-        #   the fallback). That is persisted, client-influenceable data, and
-        #   it is trusted here only because it was already validated as a
-        #   narrowing of what the resolver granted, so anything the build
-        #   below materializes from it still lands inside the authorised
-        #   subtree.
-        # The turn this handler schedules is a different consumer: it is
-        # passed ``EXECUTION_SCOPE_NOT_PROVIDED`` instead of this value below
-        # so ``execute_resume_background`` performs its own fail-closed
-        # resolution before producing the resumed turn's own output, rather
-        # than inheriting this off-turn result -- that protects where the
-        # turn's own new bytes land, not the workspace/sandbox root a build
-        # above may already have fixed.
-        resolved_execution_scope = await run_db_io_cancellation_safe(
-            lambda: resolve_execution_scope_off_turn(task_id)
-        )
         raw_control_state = task_fields.control_state
         try:
             control_state = TaskControlState(str(raw_control_state))
@@ -7977,17 +7995,6 @@ async def _handle_resume_task_unserialized(
                 )
                 return ResumeCommandResult(ResumeCommandOutcome.REJECTED, reason)
 
-        if control_state is TaskControlState.RESUME_REQUESTED or (
-            task_status is TaskStatus.RUNNING
-            and control_state is TaskControlState.RUNNING
-        ):
-            logger.info(
-                "Task %s resume is already in progress for run %s",
-                task_id,
-                task_fields.run_id,
-            )
-            return ResumeCommandResult(ResumeCommandOutcome.ALREADY_IN_PROGRESS)
-
         if control_state is TaskControlState.PAUSE_REQUESTED:
             reason = "Resume command is waiting for the pending pause to settle"
             if not message_data.get("_durable_ack_sent"):
@@ -8000,6 +8007,52 @@ async def _handle_resume_task_unserialized(
                     websocket,
                 )
             return ResumeCommandResult(ResumeCommandOutcome.DEFERRED, reason)
+
+        admission_state = background_task_manager.resume_admission_state(
+            task_id,
+            expected_run_id=task_fields.run_id,
+        )
+        if admission_state is ResumeReservationOutcome.COORDINATOR_RUNNING:
+            logger.info(
+                "Task %s already has a coordinator for run %s",
+                task_id,
+                task_fields.run_id,
+            )
+            return ResumeCommandResult(ResumeCommandOutcome.ALREADY_IN_PROGRESS)
+        if admission_state in {
+            ResumeReservationOutcome.RESERVATION_HELD,
+            ResumeReservationOutcome.SHUTTING_DOWN,
+        }:
+            assert admission_state is not None
+            reason = (
+                "Resume command is waiting for the live-control resume slot "
+                f"({admission_state.value})"
+            )
+            return ResumeCommandResult(ResumeCommandOutcome.DEFERRED, reason)
+
+        if task_status is TaskStatus.RUNNING:
+            live_runner = await run_db_io_cancellation_safe(
+                lambda: task_has_live_runner(
+                    task_id,
+                    expected_run_id=task_fields.run_id,
+                )
+            )
+            if control_state is TaskControlState.RUNNING and live_runner:
+                logger.info(
+                    "Task %s run %s has an active execution lease",
+                    task_id,
+                    task_fields.run_id,
+                )
+                return ResumeCommandResult(ResumeCommandOutcome.ALREADY_IN_PROGRESS)
+            reason = "Resume command is waiting for running-task lease recovery"
+            return ResumeCommandResult(ResumeCommandOutcome.DEFERRED, reason)
+
+        # Scope resolution is a scheduling prerequisite, not evidence that an
+        # execution already exists. Idempotent and deferred outcomes above
+        # deliberately avoid this potentially expensive off-turn work.
+        resolved_execution_scope = await run_db_io_cancellation_safe(
+            lambda: resolve_execution_scope_off_turn(task_id)
+        )
 
         agent_service = await get_agent_manager().get_agent_for_task(
             task_id,
@@ -8022,7 +8075,10 @@ async def _handle_resume_task_unserialized(
                     websocket,
                 )
                 return ResumeCommandResult(ResumeCommandOutcome.REJECTED, reason)
-            reservation = background_task_manager.try_reserve_resume(task_id)
+            reservation = background_task_manager.try_reserve_resume(
+                task_id,
+                expected_run_id=task_fields.run_id,
+            )
             if reservation is ResumeReservationOutcome.COORDINATOR_RUNNING:
                 logger.info(
                     "Task %s already has a registered resume coordinator",
@@ -8078,7 +8134,11 @@ async def _handle_resume_task_unserialized(
                         resolved_execution_scope=EXECUTION_SCOPE_NOT_PROVIDED,
                     )
                 )
-                background_task_manager.register_reserved_resume(task_id, bg_task)
+                background_task_manager.register_reserved_resume(
+                    task_id,
+                    bg_task,
+                    run_id=resume_snapshot.run_id,
+                )
             except BaseException:
                 if bg_task is not None:
                     bg_task.cancel()
@@ -8199,7 +8259,6 @@ async def _execute_durable_task_command(
             )
     if command.kind in {
         TaskCommandKind.PAUSE,
-        TaskCommandKind.RESUME,
         TaskCommandKind.CANCEL,
     } and await run_db_io_cancellation_safe(
         lambda: task_has_live_foreign_runner(command.task_id)

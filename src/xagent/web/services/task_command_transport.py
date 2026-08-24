@@ -966,6 +966,30 @@ def task_has_live_foreign_runner(
         )
 
 
+def task_has_live_runner(
+    task_id: int,
+    *,
+    expected_run_id: str | None = None,
+) -> bool:
+    """Return whether the target run currently has an unexpired task lease."""
+
+    from ..models.database import get_session_local
+
+    SessionLocal = get_session_local()
+    now = _utc_now()
+    with SessionLocal() as db:
+        query = db.query(Task.id).filter(
+            Task.id == task_id,
+            Task.status == TaskStatus.RUNNING,
+            Task.runner_id.is_not(None),
+            Task.lease_expires_at.is_not(None),
+            Task.lease_expires_at >= now,
+        )
+        if expected_run_id is not None:
+            query = query.filter(Task.run_id == expected_run_id)
+        return query.first() is not None
+
+
 CommandExecutor = Callable[[ClaimedTaskCommand], Awaitable[dict[str, Any] | None]]
 CommandDisposition = Callable[[], bool]
 _dispatcher_wakeup: asyncio.Event | None = None

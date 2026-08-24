@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import threading
 from collections.abc import Callable
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from typing import Any, TypeVar
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -67,6 +68,7 @@ from xagent.web.services.task_execution_controller import StaleTaskRunError
 from xagent.web.services.task_lease_service import (
     TaskLease,
     current_task_lease,
+    get_runner_id,
 )
 
 
@@ -1936,7 +1938,13 @@ async def test_live_marker_cancellation_does_not_cancel_registered_handoff(
             background_cancelled.set()
             raise
 
-    def register_resume(_task_id: int, task_handle: asyncio.Task) -> None:
+    def register_resume(
+        _task_id: int,
+        task_handle: asyncio.Task,
+        *,
+        run_id: str | None = None,
+    ) -> None:
+        assert run_id == "marker-cancellation-run"
         registered_tasks.append(task_handle)
 
     bg_mgr.register_reserved_resume.side_effect = register_resume
@@ -2778,7 +2786,7 @@ async def test_pause_non_owner_non_admin_is_refused(db_session) -> None:
 async def test_resume_admin_on_other_users_task_runs_as_owner(db_session) -> None:
     owner = _user(db_session, "owner")
     admin = _user(db_session, "admin", is_admin=True)
-    task = _task(db_session, owner.id)
+    task = _task(db_session, owner.id, status=TaskStatus.PAUSED)
     captured, agent, mgr, ws_manager = _patched_manager_and_agent()
 
     with (
@@ -2819,6 +2827,8 @@ async def test_running_resume_completes_as_explicit_idempotent_success(
     task.run_id = "run-current"
     task.state_version = 7
     task.control_state = "running"
+    task.runner_id = get_runner_id()
+    task.lease_expires_at = datetime.now(timezone.utc) + timedelta(minutes=1)
     db_session.commit()
     _captured, agent, mgr, ws_manager = _patched_manager_and_agent()
     agent.supports_live_control = MagicMock(return_value=True)
@@ -2915,7 +2925,10 @@ async def test_resume_live_control_admin_runs_background_as_owner(db_session) ->
     resume_bg.assert_called_once()
     assert resume_bg.call_args.kwargs["task_owner_user_id"] == int(owner.id)
     assert resume_bg.call_args.kwargs["expected_run_id"] == "run-from-resume-transition"
-    bg_mgr.try_reserve_resume.assert_called_once_with(int(task.id))
+    bg_mgr.try_reserve_resume.assert_called_once_with(
+        int(task.id),
+        expected_run_id=None,
+    )
     bg_mgr.register_reserved_resume.assert_called_once()
 
 

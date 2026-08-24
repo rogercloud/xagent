@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import ExitStack
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -100,6 +101,9 @@ def _resume_runtime_patches(
     connection_manager.broadcast_to_task = AsyncMock()
     background_manager = MagicMock()
     background_manager.try_reserve_resume.return_value = outcome
+    background_manager.resume_admission_state.return_value = (
+        None if outcome is ResumeReservationOutcome.RESERVED else outcome
+    )
     background_manager.running_tasks = {}
 
     stack.enter_context(
@@ -127,10 +131,14 @@ async def test_resume_reservation_classifies_all_admission_outcomes() -> None:
     coordinator_gate = asyncio.get_running_loop().create_future()
     coordinator = asyncio.ensure_future(coordinator_gate)
     try:
-        manager.register_reserved_resume(1, coordinator)
+        manager.register_reserved_resume(1, coordinator, run_id="run-a")
         assert (
-            manager.try_reserve_resume(1)
+            manager.try_reserve_resume(1, expected_run_id="run-a")
             is ResumeReservationOutcome.COORDINATOR_RUNNING
+        )
+        assert (
+            manager.try_reserve_resume(1, expected_run_id="run-b")
+            is ResumeReservationOutcome.RESERVATION_HELD
         )
 
         manager._shutting_down = True
@@ -152,7 +160,15 @@ async def test_uncertain_resume_admission_defers_durable_command(
     db_session, outcome: ResumeReservationOutcome
 ) -> None:
     owner = _user(db_session, f"owner-{outcome.value}")
-    task = _task(db_session, int(owner.id))
+    task = _task(
+        db_session,
+        int(owner.id),
+        control_state=(
+            TaskControlState.RESUME_REQUESTED
+            if outcome is ResumeReservationOutcome.RESERVATION_HELD
+            else TaskControlState.PAUSED
+        ),
+    )
     stack, _background_manager, connection_manager, _agent_manager = (
         _resume_runtime_patches(outcome=outcome)
     )
@@ -182,6 +198,8 @@ async def test_registered_coordinator_is_an_explicit_idempotent_success(
 
     assert result is not None
     assert result["resume_outcome"] == ResumeCommandOutcome.ALREADY_IN_PROGRESS.value
+    _agent_manager.get_agent_for_task.assert_not_awaited()
+    background_manager.try_reserve_resume.assert_not_called()
     background_manager.register_reserved_resume.assert_not_called()
 
 
@@ -196,6 +214,9 @@ async def test_running_control_state_is_an_explicit_idempotent_success(
         status=TaskStatus.RUNNING,
         control_state=TaskControlState.RUNNING,
     )
+    task.runner_id = "runner-a"
+    task.lease_expires_at = datetime.now(timezone.utc) + timedelta(minutes=1)
+    db_session.commit()
     stack, background_manager, _connection_manager, _agent_manager = (
         _resume_runtime_patches(outcome=ResumeReservationOutcome.RESERVED)
     )
@@ -207,6 +228,27 @@ async def test_running_control_state_is_an_explicit_idempotent_success(
 
     assert result is not None
     assert result["resume_outcome"] == ResumeCommandOutcome.ALREADY_IN_PROGRESS.value
+    background_manager.try_reserve_resume.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_running_without_a_live_lease_defers_for_recovery(db_session) -> None:
+    owner = _user(db_session, "abandoned-running-owner")
+    task = _task(
+        db_session,
+        int(owner.id),
+        status=TaskStatus.RUNNING,
+        control_state=TaskControlState.RUNNING,
+    )
+    stack, background_manager, _connection_manager, _agent_manager = (
+        _resume_runtime_patches(outcome=ResumeReservationOutcome.RESERVED)
+    )
+
+    with stack, pytest.raises(TaskCommandDeferred, match="lease recovery"):
+        await _execute_durable_task_command(
+            _command(task, owner, "resume-abandoned-running")
+        )
+
     background_manager.try_reserve_resume.assert_not_called()
 
 
@@ -268,7 +310,11 @@ async def test_contended_resume_dispatch_stays_pending_instead_of_completed(
 @pytest.mark.asyncio
 async def test_reserved_resume_records_scheduled_result(db_session) -> None:
     owner = _user(db_session, "scheduled-owner")
-    task = _task(db_session, int(owner.id))
+    task = _task(
+        db_session,
+        int(owner.id),
+        control_state=TaskControlState.RESUME_REQUESTED,
+    )
     stack, background_manager, _connection_manager, _agent_manager = (
         _resume_runtime_patches(outcome=ResumeReservationOutcome.RESERVED)
     )
@@ -315,10 +361,13 @@ async def test_held_reservation_can_schedule_after_the_holder_releases(
     stack, background_manager, _connection_manager, _agent_manager = (
         _resume_runtime_patches(outcome=ResumeReservationOutcome.RESERVATION_HELD)
     )
-    background_manager.try_reserve_resume.side_effect = [
+    background_manager.resume_admission_state.side_effect = [
         ResumeReservationOutcome.RESERVATION_HELD,
-        ResumeReservationOutcome.RESERVED,
+        None,
     ]
+    background_manager.try_reserve_resume.return_value = (
+        ResumeReservationOutcome.RESERVED
+    )
     transition = AsyncMock(
         return_value=SimpleNamespace(run_id="run-a", status=TaskStatus.PAUSED)
     )
