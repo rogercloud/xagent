@@ -97,7 +97,6 @@ BCRYPT_COST = 12
 # shape, so the algorithm migration requires no schema change.
 SHA256_HASH_PREFIX = "sha256$v1$"
 _SHA256_DOMAIN = b"xagent-api-key:sha256:v1\0"
-_SHA256_HEX_LENGTH = hashlib.sha256().digest_size * 2
 
 # How many times we re-roll the prefix on the (extremely unlikely) chance
 # that the random prefix is already taken. The keyspace makes real
@@ -313,11 +312,6 @@ def verify_api_key(raw: str, stored_hash: str) -> bool:
         return False
 
     if is_sha256_api_key_hash(stored_hash):
-        digest = stored_hash[len(SHA256_HASH_PREFIX) :]
-        if len(digest) != _SHA256_HEX_LENGTH:
-            return False
-        if any(character not in string.hexdigits for character in digest):
-            return False
         return hmac.compare_digest(hash_api_key(raw), stored_hash)
 
     if not is_legacy_bcrypt_api_key_hash(stored_hash):
