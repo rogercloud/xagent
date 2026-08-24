@@ -255,7 +255,22 @@ def _verify_and_upgrade_api_key_hash(
     ]
     with stripe:
         # Another request may have migrated this key while this worker waited.
-        current_hash = _load_current_key_hash(key_model, key_prefix)
+        try:
+            current_hash = _load_current_key_hash(key_model, key_prefix)
+        except Exception:
+            # Refreshing the verifier only supports the best-effort migration.
+            # The initial active-key lookup already returned a detached hash,
+            # so a transient failure here must not turn a valid legacy key into
+            # a 500. Verify that snapshot and let a later request retry the
+            # migration instead.
+            logging.getLogger(__name__).warning(
+                "Failed to refresh legacy API key verifier for table=%s "
+                "key_prefix=%s; authenticating against detached snapshot",
+                key_model.__tablename__,
+                key_prefix,
+                exc_info=True,
+            )
+            return verify_api_key(raw_key, observed_hash), observed_hash
         if current_hash is None:
             return False, ""
         if not verify_api_key(raw_key, current_hash):
