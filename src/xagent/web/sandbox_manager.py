@@ -2442,28 +2442,16 @@ def _check_no_reserved_uploads_conflict(
     guest_uploads_root: str,
     reserved_prefix: str,
 ) -> None:
-    """Reject a configured mount whose guest path IS a reserved per-user dir.
+    """Reject configured mounts at or below a reserved per-user directory.
 
     The per-user workspace mount every task adds by default cannot be
-    enumerated here — user ids are runtime facts — so the exact
-    ``<guest_uploads_root>/<reserved_prefix><id>`` guest path is treated as
-    reserved: a static mount claiming that exact guest path collides with
-    the mount every future task for that user needs there, which today only
-    surfaces as ``SandboxRuntimeConflictError`` at that user's first task
-    rather than here at startup.
-
-    A mount nested *under* a reserved directory (e.g.
-    ``<uploads>/user_1/models``) is a distinct guest path and is NOT
-    rejected: nested bind mounts at different guest paths are legal —
-    ``_check_no_conflicting_volumes`` (the per-create check) and Docker
-    itself only flag exact guest-path collisions, never parent/child
-    nesting — and a deployment-named ``XAGENT_EXTERNAL_UPLOAD_DIRS`` entry
-    landing there is exactly the exception ``_fold_mount_paths`` implements
-    (see ``_MountCandidate``'s ``"deployment"`` provenance in
-    ``workspace_binding.py``): an operator-named mount keeps its own bind
-    regardless of where it falls relative to the reserved subtree. A mount
-    elsewhere under the uploads root (e.g. a shared knowledge-base
-    directory) does not match the reserved shape either and still passes.
+    enumerated here — user ids are runtime facts — so the whole
+    ``<guest_uploads_root>/<reserved_prefix><id>/...`` subtree is reserved.
+    Docker permits a more-specific nested bind, but it would shadow the
+    manager-generated workspace bind and invalidate the guarantee that
+    host-created task directories are immediately visible in the sandbox.
+    Mounts elsewhere under the uploads root (for example a shared knowledge
+    base) remain valid.
     """
     reserved_re = re.compile(rf"^{re.escape(reserved_prefix)}\d+$")
     prefix_with_sep = guest_uploads_root + "/"
@@ -2472,16 +2460,14 @@ def _check_no_reserved_uploads_conflict(
         if not norm_guest.startswith(prefix_with_sep):
             continue
         remainder = norm_guest[len(prefix_with_sep) :]
-        if "/" in remainder:
-            # Nested under a reserved directory, not the directory itself.
-            continue
-        if reserved_re.match(remainder):
+        user_component = remainder.split("/", 1)[0]
+        if reserved_re.fullmatch(user_component):
             raise SandboxRuntimeConflictError(
                 f"Configured sandbox mount with guest path {guest_path!r} "
-                "collides with the reserved per-user uploads path "
+                "overlaps the reserved per-user uploads subtree "
                 f"{guest_uploads_root!r}/{reserved_prefix}<id>: every task's "
-                "default workspace mount for that user needs that exact "
-                "guest path."
+                "default workspace mount requires that subtree to remain "
+                "unshadowed."
             )
 
 

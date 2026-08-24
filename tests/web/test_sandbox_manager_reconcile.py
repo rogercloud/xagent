@@ -856,15 +856,10 @@ class TestReadinessReservedUploadsSubtree:
                 await check_sandbox_static_readiness(manager)
 
     @pytest.mark.asyncio
-    async def test_allows_mount_nested_inside_a_reserved_user_dir(
+    async def test_rejects_mount_nested_inside_a_reserved_user_dir(
         self, tmp_path
     ) -> None:
-        """A mount nested *under* a reserved per-user directory is a
-        distinct guest path from the reserved directory itself: nested bind
-        mounts at different guest paths are legal -- the per-create check
-        (``_check_no_conflicting_volumes``) and Docker itself only flag
-        exact guest-path collisions, never parent/child nesting -- so this
-        deployment boots today and must keep booting."""
+        """A nested static bind would shadow the managed workspace bind."""
         uploads_dir = tmp_path / "uploads"
         with (
             patch.dict(
@@ -884,17 +879,14 @@ class TestReadinessReservedUploadsSubtree:
             ),
         ):
             manager, _service = _make_manager()
-            await check_sandbox_static_readiness(manager)
+            with pytest.raises(SandboxRuntimeConflictError):
+                await check_sandbox_static_readiness(manager)
 
     @pytest.mark.asyncio
-    async def test_allows_external_upload_dir_nested_inside_a_reserved_user_dir(
+    async def test_rejects_external_upload_dir_nested_inside_a_reserved_user_dir(
         self, tmp_path
     ) -> None:
-        """An operator-named ``XAGENT_EXTERNAL_UPLOAD_DIRS`` entry keeps its
-        own bind even when it lands under a reserved per-user directory
-        (see ``_MountCandidate``'s ``"deployment"`` provenance in
-        ``workspace_binding.py``) -- this is the deployment-named exception
-        ``_fold_mount_paths`` implements, and it must stay startable."""
+        """Deployment external mounts cannot shadow managed workspaces either."""
         uploads_dir = tmp_path / "uploads"
         external_dir = uploads_dir / "user_5" / "shared"
         external_dir.mkdir(parents=True)
@@ -913,7 +905,8 @@ class TestReadinessReservedUploadsSubtree:
             ),
         ):
             manager, _service = _make_manager()
-            await check_sandbox_static_readiness(manager)
+            with pytest.raises(SandboxRuntimeConflictError):
+                await check_sandbox_static_readiness(manager)
 
     @pytest.mark.asyncio
     async def test_allows_mount_elsewhere_under_uploads_root(self, tmp_path) -> None:
