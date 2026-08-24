@@ -165,6 +165,49 @@ def test_legacy_personal_key_wrong_secret_does_not_migrate():
     assert _load_key_hash(UserApiKey, prefix) == legacy_hash
 
 
+def test_legacy_personal_key_uses_snapshot_when_hash_refresh_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A migration-only reread failure must not reject a valid legacy key."""
+    from xagent.web.api.v1 import deps
+
+    full_key, prefix = _create_personal_key()
+    legacy_hash = bcrypt.hashpw(full_key.encode(), bcrypt.gensalt(rounds=4)).decode()
+    _replace_key_hash(UserApiKey, prefix, legacy_hash)
+
+    def fail_refresh(_key_model, _key_prefix):  # type: ignore[no-untyped-def]
+        raise TimeoutError("migration verifier refresh timed out")
+
+    monkeypatch.setattr(deps, "_load_current_key_hash", fail_refresh)
+
+    resp = client.get("/v1/me", headers={"Authorization": f"Bearer {full_key}"})
+
+    assert resp.status_code == 200, resp.text
+    assert _load_key_hash(UserApiKey, prefix) == legacy_hash
+
+
+def test_legacy_personal_key_refresh_failure_still_rejects_wrong_secret(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Snapshot fallback preserves an opaque 401 for an invalid secret."""
+    from xagent.web.api.v1 import deps
+
+    full_key, prefix = _create_personal_key()
+    legacy_hash = bcrypt.hashpw(full_key.encode(), bcrypt.gensalt(rounds=4)).decode()
+    _replace_key_hash(UserApiKey, prefix, legacy_hash)
+    wrong_key = full_key[:-1] + ("A" if full_key[-1] != "A" else "B")
+
+    def fail_refresh(_key_model, _key_prefix):  # type: ignore[no-untyped-def]
+        raise TimeoutError("migration verifier refresh timed out")
+
+    monkeypatch.setattr(deps, "_load_current_key_hash", fail_refresh)
+
+    resp = client.get("/v1/me", headers={"Authorization": f"Bearer {wrong_key}"})
+
+    _assert_invalid_api_key(resp)
+    assert _load_key_hash(UserApiKey, prefix) == legacy_hash
+
+
 def test_legacy_runtime_key_migrates_after_successful_authentication():
     from xagent.web.api.v1.deps import (
         _resolve_principal_from_credentials,
@@ -287,7 +330,7 @@ def test_unknown_prefix_returns_401():
 
 
 def test_known_prefix_wrong_secret_returns_401():
-    """Prefix is real but the secret doesn't bcrypt-match."""
+    """Prefix is real but the secret doesn't match the stored verifier."""
     full_key, _prefix = _create_personal_key()
     # Replace just the secret half with a different (but well-formed) value
     parts = full_key.split("_")
@@ -368,17 +411,17 @@ def test_generated_manager_key_returns_401():
 
 
 @pytest.mark.asyncio
-async def test_runtime_key_auth_runs_sql_and_bcrypt_off_event_loop(
+async def test_runtime_key_auth_runs_sql_and_verification_off_event_loop(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Runtime-key auth owns its Session and bcrypt work in one DB worker."""
+    """Runtime-key auth owns its Session and verification in one DB worker."""
 
     from xagent.web.api.v1 import deps
 
     agent_id, full_key, prefix = _create_agent_and_key()
     event_loop_thread = threading.get_ident()
     query_threads: list[int] = []
-    bcrypt_threads: list[int] = []
+    verification_threads: list[int] = []
     original_load = deps._load_runtime_key_record
     original_verify = deps.verify_api_key
 
@@ -387,7 +430,7 @@ async def test_runtime_key_auth_runs_sql_and_bcrypt_off_event_loop(
         return original_load(key_prefix)
 
     def recording_verify(raw: str, key_hash: str) -> bool:
-        bcrypt_threads.append(threading.get_ident())
+        verification_threads.append(threading.get_ident())
         return original_verify(raw, key_hash)
 
     monkeypatch.setattr(deps, "_load_runtime_key_record", recording_load)
@@ -401,7 +444,7 @@ async def test_runtime_key_auth_runs_sql_and_bcrypt_off_event_loop(
     assert principal.agent.id == agent_id
     assert principal.key.key_prefix == prefix
     assert query_threads and query_threads[0] != event_loop_thread
-    assert bcrypt_threads == query_threads
+    assert verification_threads == query_threads
 
 
 @pytest.mark.asyncio
@@ -505,7 +548,7 @@ async def test_runtime_key_auth_cancellation_drains_worker_before_propagating(
 
 
 @pytest.mark.asyncio
-async def test_personal_key_auth_runs_sql_and_bcrypt_off_event_loop(
+async def test_personal_key_auth_runs_sql_and_verification_off_event_loop(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Personal-key auth follows the same worker-owned snapshot boundary."""
@@ -515,7 +558,7 @@ async def test_personal_key_auth_runs_sql_and_bcrypt_off_event_loop(
     full_key, prefix = _create_personal_key()
     event_loop_thread = threading.get_ident()
     query_threads: list[int] = []
-    bcrypt_threads: list[int] = []
+    verification_threads: list[int] = []
     original_load = deps._load_personal_key_record
     original_verify = deps.verify_api_key
 
@@ -524,7 +567,7 @@ async def test_personal_key_auth_runs_sql_and_bcrypt_off_event_loop(
         return original_load(key_prefix)
 
     def recording_verify(raw: str, key_hash: str) -> bool:
-        bcrypt_threads.append(threading.get_ident())
+        verification_threads.append(threading.get_ident())
         return original_verify(raw, key_hash)
 
     monkeypatch.setattr(deps, "_load_personal_key_record", recording_load)
@@ -537,7 +580,7 @@ async def test_personal_key_auth_runs_sql_and_bcrypt_off_event_loop(
     assert user.username == "admin"
     assert key.key_prefix == prefix
     assert query_threads and query_threads[0] != event_loop_thread
-    assert bcrypt_threads == query_threads
+    assert verification_threads == query_threads
 
 
 def test_paused_key_returns_401():
@@ -692,7 +735,7 @@ def test_unknown_prefix_takes_similar_time_to_wrong_secret():
     # Warm the bcrypt module a bit so first-call overhead doesn't skew
     bcrypt.checkpw(b"warm", bcrypt.hashpw(b"warm", bcrypt.gensalt(rounds=BCRYPT_COST)))
 
-    # Wrong secret (prefix hits index, then bcrypt runs)
+    # Wrong secret (prefix hits index, then dummy bcrypt padding runs)
     t0 = time.perf_counter()
     resp1 = client.get(
         "/v1/me", headers={"Authorization": f"Bearer {wrong_secret_key}"}
@@ -723,7 +766,7 @@ def test_unknown_prefix_takes_similar_time_to_wrong_secret():
 def test_internal_exception_returns_v1_envelope_not_fastapi_detail():
     """Non-V1ApiError exceptions on /v1/* must still match SDK contract.
 
-    If an upstream layer (db.query, bcrypt, dependency) raises an
+    If an upstream layer (db.query, verifier, dependency) raises an
     unexpected exception, the response MUST be the stable
     ``{"error": {"code": "internal_error", "message": ...}}`` shape --
     not FastAPI's default ``{"detail": "Internal Server Error"}``,

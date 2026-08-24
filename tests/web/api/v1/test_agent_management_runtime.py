@@ -41,15 +41,12 @@ pytestmark = pytest.mark.usefixtures("_test_db")
 # one test instead of hanging the suite, so it is sized for the worst CI
 # machine rather than for the expected one.
 #
-# It has to be generous because the code these handshakes straddle is
-# deliberately expensive. Runtime-key delivery hashes with bcrypt at
-# ``BCRYPT_COST`` 12 -- ~100ms per draw on idle commodity hardware, up to
-# ``PREFIX_COLLISION_RETRIES`` draws -- and then commits. CI runs this suite
-# as ``pytest -n 4`` on a 4-vCPU runner that is simultaneously driving a
-# Docker daemon, so the 2s budget these waits used to carry (~9x headroom on
-# an idle workstation) was routinely missed there. Oversubscribing an
-# 18-core machine ~8x reproduces the exact CI failures: ``assert False`` on a
-# handshake wait, ``TimeoutError`` on a settlement wait.
+# It has to be generous because CI runs this suite as ``pytest -n 4`` on a
+# 4-vCPU runner that is simultaneously driving a Docker daemon and contended
+# database transactions. The 2s budget these waits used to carry was routinely
+# missed there. Oversubscribing an 18-core machine ~8x reproduces the exact CI
+# failures: ``assert False`` on a handshake wait, ``TimeoutError`` on a
+# settlement wait.
 _HANDSHAKE_TIMEOUT = 30.0
 
 # Deliberately short, and deliberately not the constant above: this probe
