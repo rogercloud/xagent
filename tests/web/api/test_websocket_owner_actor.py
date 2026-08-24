@@ -34,6 +34,7 @@ from xagent.core.execution_scope import (
 )
 from xagent.web.api import websocket as websocket_api
 from xagent.web.api.websocket import (
+    ResumeReservationOutcome,
     _claim_user_message_delivery_isolated,
     _execute_durable_task_command,
     _handle_chat_message_unserialized,
@@ -57,6 +58,7 @@ from xagent.web.models.user import User
 from xagent.web.services import task_orchestrator
 from xagent.web.services.chat_history_service import DELIVERY_FAILED, DELIVERY_PENDING
 from xagent.web.services.task_command_transport import (
+    COMMAND_COMPLETED,
     ClaimedTaskCommand,
     TaskCommandKind,
     TaskCommandRejected,
@@ -2582,7 +2584,7 @@ async def test_durable_resume_propagates_stale_run_error(db_session) -> None:
     _captured, agent, mgr, ws_manager = _patched_manager_and_agent()
     agent.supports_live_control.return_value = True
     bg_mgr = MagicMock()
-    bg_mgr.reserve_resume.return_value = True
+    bg_mgr.try_reserve_resume.return_value = ResumeReservationOutcome.RESERVED
 
     with (
         patch("xagent.web.api.chat.get_agent_manager", return_value=mgr),
@@ -2809,7 +2811,9 @@ async def test_resume_admin_on_other_users_task_runs_as_owner(db_session) -> Non
 
 
 @pytest.mark.asyncio
-async def test_resume_rejection_embeds_known_control_state(db_session) -> None:
+async def test_running_resume_completes_as_explicit_idempotent_success(
+    db_session,
+) -> None:
     owner = _user(db_session, "owner")
     task = _task(db_session, owner.id, status=TaskStatus.RUNNING)
     task.run_id = "run-current"
@@ -2825,28 +2829,30 @@ async def test_resume_rejection_embeds_known_control_state(db_session) -> None:
     ):
         await handle_resume_task(MagicMock(), int(task.id), {"user": owner})
 
-        # The rejection is sent from a dispatched command that
-        # ``dispatch_task_command_promptly`` may detach after its 50ms
-        # deadline, so the "task" payload can land after this call returns.
-        payload = None
+        command = None
         for _ in range(100):
-            for call in ws_manager.send_personal_message.await_args_list:
-                if call.args and "task" in call.args[0]:
-                    payload = call.args[0]
-                    break
-            if payload is not None:
+            db_session.expire_all()
+            command = (
+                db_session.query(TaskExecutionCommand)
+                .filter(
+                    TaskExecutionCommand.task_id == int(task.id),
+                    TaskExecutionCommand.kind == TaskCommandKind.RESUME.value,
+                )
+                .one_or_none()
+            )
+            if command is not None and command.status == COMMAND_COMPLETED:
                 break
             await asyncio.sleep(0.01)
         else:
-            raise AssertionError("resume rejection payload did not arrive in time")
+            raise AssertionError("idempotent resume did not complete in time")
 
-    assert payload["task"] == {
-        "id": int(task.id),
-        "run_id": "run-current",
-        "state_version": 7,
-        "control_state": "running",
-        "status": "running",
-    }
+    assert command is not None
+    assert command.result["resume_outcome"] == "already_in_progress"
+    assert not [
+        call
+        for call in ws_manager.send_personal_message.await_args_list
+        if call.args and call.args[0].get("type") == "error"
+    ]
 
 
 @pytest.mark.asyncio
@@ -2869,6 +2875,7 @@ async def test_resume_live_control_admin_runs_background_as_owner(db_session) ->
     )
     bg_mgr = MagicMock()
     bg_mgr.running_tasks.get = MagicMock(return_value=None)
+    bg_mgr.try_reserve_resume.return_value = ResumeReservationOutcome.RESERVED
 
     with (
         patch("xagent.web.api.chat.get_agent_manager", return_value=mgr),
@@ -2908,7 +2915,7 @@ async def test_resume_live_control_admin_runs_background_as_owner(db_session) ->
     resume_bg.assert_called_once()
     assert resume_bg.call_args.kwargs["task_owner_user_id"] == int(owner.id)
     assert resume_bg.call_args.kwargs["expected_run_id"] == "run-from-resume-transition"
-    bg_mgr.reserve_resume.assert_called_once_with(int(task.id))
+    bg_mgr.try_reserve_resume.assert_called_once_with(int(task.id))
     bg_mgr.register_reserved_resume.assert_called_once()
 
 
@@ -2919,7 +2926,7 @@ async def test_resume_registration_failure_cancels_coordinator(db_session) -> No
     captured, agent, mgr, ws_manager = _patched_manager_and_agent()
     agent.supports_live_control = MagicMock(return_value=True)
     bg_mgr = MagicMock()
-    bg_mgr.reserve_resume.return_value = True
+    bg_mgr.try_reserve_resume.return_value = ResumeReservationOutcome.RESERVED
     bg_mgr.running_tasks.get.return_value = None
     bg_mgr.register_reserved_resume.side_effect = RuntimeError("reservation lost")
     bg_handle = MagicMock()

@@ -1,6 +1,7 @@
 """WebSocket real-time communication handler"""
 
 import asyncio
+import enum
 import json
 import logging
 import re
@@ -3875,6 +3876,35 @@ class BackgroundTaskCancelOutcome:
     requested: bool
 
 
+class ResumeReservationOutcome(str, enum.Enum):
+    """Result of trying to take the single live-control resume slot."""
+
+    RESERVED = "reserved"
+    # Another caller owns the pre-registration window. Its transition or
+    # coordinator registration may still fail, so this is not yet proof that
+    # the task is resuming.
+    RESERVATION_HELD = "reservation_held"
+    # A registered resume coordinator is already responsible for the task.
+    COORDINATOR_RUNNING = "coordinator_running"
+    # This process no longer admits new background work.
+    SHUTTING_DOWN = "shutting_down"
+
+
+class ResumeCommandOutcome(str, enum.Enum):
+    """Durable meaning of one handled RESUME command."""
+
+    SCHEDULED = "scheduled"
+    ALREADY_IN_PROGRESS = "already_in_progress"
+    DEFERRED = "deferred"
+    REJECTED = "rejected"
+
+
+@dataclass(frozen=True)
+class ResumeCommandResult:
+    outcome: ResumeCommandOutcome
+    reason: str | None = None
+
+
 # Background task manager: ensures only one active background execution per task
 class BackgroundTaskManager:
     """Manages background task execution, ensuring only one background process per task at a time"""
@@ -3934,20 +3964,25 @@ class BackgroundTaskManager:
         self.running_tasks[task_id] = task
         logger.info(f"Registered background task for task {task_id}")
 
-    def reserve_resume(self, task_id: int) -> bool:
-        """Atomically reserve the single live-control resume slot."""
+    def try_reserve_resume(self, task_id: int) -> ResumeReservationOutcome:
+        """Atomically classify admission to the live-control resume slot."""
 
         if self._shutting_down:
-            return False
+            return ResumeReservationOutcome.SHUTTING_DOWN
         # Keep this check-and-add block synchronous: asyncio task switches can
         # only happen at ``await``, so it is the in-process atomic guard.
+        if task_id in self._resume_reservations:
+            return ResumeReservationOutcome.RESERVATION_HELD
         existing = self.resume_tasks.get(task_id)
-        if task_id in self._resume_reservations or (
-            existing is not None and not existing.done()
-        ):
-            return False
+        if existing is not None and not existing.done():
+            return ResumeReservationOutcome.COORDINATOR_RUNNING
         self._resume_reservations.add(task_id)
-        return True
+        return ResumeReservationOutcome.RESERVED
+
+    def reserve_resume(self, task_id: int) -> bool:
+        """Boolean compatibility wrapper for callers that cannot classify."""
+
+        return self.try_reserve_resume(task_id) is ResumeReservationOutcome.RESERVED
 
     def register_reserved_resume(self, task_id: int, task: asyncio.Task) -> None:
         if self._shutting_down:
@@ -7792,7 +7827,7 @@ def _active_native_interaction_id_sync(task_id: int) -> int | None:
 
 async def _handle_resume_task_unserialized(
     websocket: WebSocket, task_id: int, message_data: dict
-) -> None:
+) -> ResumeCommandResult:
     """Handle task resume request"""
     try:
         user = message_data.get("user")
@@ -7816,12 +7851,13 @@ async def _handle_resume_task_unserialized(
                 task_id,
                 user.id,
             )
-            message_data["_durable_command_error"] = "Task not found or access denied"
+            reason = "Task not found or access denied"
+            message_data["_durable_command_error"] = reason
             await manager.send_personal_message(
                 {"type": "error", "message": "Task not found or access denied"},
                 websocket,
             )
-            return
+            return ResumeCommandResult(ResumeCommandOutcome.REJECTED, reason)
 
         task_fields = task_setup_snapshot.task
         task_owner_user_id = int(task_fields.user_id)
@@ -7924,9 +7960,10 @@ async def _handle_resume_task_unserialized(
                     task_fields.run_id,
                     active_interaction_id,
                 )
-                message_data["_durable_command_error"] = (
+                reason = (
                     "This task has an unanswered question; answer it before resuming."
                 )
+                message_data["_durable_command_error"] = reason
                 await manager.send_personal_message(
                     {
                         "type": "error",
@@ -7938,7 +7975,31 @@ async def _handle_resume_task_unserialized(
                     },
                     websocket,
                 )
-                return
+                return ResumeCommandResult(ResumeCommandOutcome.REJECTED, reason)
+
+        if control_state is TaskControlState.RESUME_REQUESTED or (
+            task_status is TaskStatus.RUNNING
+            and control_state is TaskControlState.RUNNING
+        ):
+            logger.info(
+                "Task %s resume is already in progress for run %s",
+                task_id,
+                task_fields.run_id,
+            )
+            return ResumeCommandResult(ResumeCommandOutcome.ALREADY_IN_PROGRESS)
+
+        if control_state is TaskControlState.PAUSE_REQUESTED:
+            reason = "Resume command is waiting for the pending pause to settle"
+            if not message_data.get("_durable_ack_sent"):
+                await manager.send_personal_message(
+                    {
+                        "type": "error",
+                        "message": "Task pause is still in progress. Please try again.",
+                        "task": {"id": task_id, **resume_control_state},
+                    },
+                    websocket,
+                )
+            return ResumeCommandResult(ResumeCommandOutcome.DEFERRED, reason)
 
         agent_service = await get_agent_manager().get_agent_for_task(
             task_id,
@@ -7950,9 +8011,8 @@ async def _handle_resume_task_unserialized(
         )
         if getattr(agent_service, "supports_live_control", lambda: False)():
             if task_status not in {TaskStatus.PAUSED, TaskStatus.WAITING_FOR_USER}:
-                message_data["_durable_command_error"] = (
-                    "Task is not paused and cannot be resumed."
-                )
+                reason = "Task is not paused and cannot be resumed."
+                message_data["_durable_command_error"] = reason
                 await manager.send_personal_message(
                     {
                         "type": "error",
@@ -7961,17 +8021,34 @@ async def _handle_resume_task_unserialized(
                     },
                     websocket,
                 )
-                return
-            if not background_task_manager.reserve_resume(task_id):
-                await manager.send_personal_message(
-                    {
-                        "type": "error",
-                        "message": "Task resume is already in progress.",
-                        "task": {"id": task_id, **resume_control_state},
-                    },
-                    websocket,
+                return ResumeCommandResult(ResumeCommandOutcome.REJECTED, reason)
+            reservation = background_task_manager.try_reserve_resume(task_id)
+            if reservation is ResumeReservationOutcome.COORDINATOR_RUNNING:
+                logger.info(
+                    "Task %s already has a registered resume coordinator",
+                    task_id,
                 )
-                return
+                return ResumeCommandResult(ResumeCommandOutcome.ALREADY_IN_PROGRESS)
+            if reservation is not ResumeReservationOutcome.RESERVED:
+                reason = (
+                    "Resume command is waiting for the live-control resume slot "
+                    f"({reservation.value})"
+                )
+                if not message_data.get("_durable_ack_sent"):
+                    user_message = (
+                        "The server is restarting. Please try resuming again."
+                        if reservation is ResumeReservationOutcome.SHUTTING_DOWN
+                        else "Task resume is being prepared. Please try again shortly."
+                    )
+                    await manager.send_personal_message(
+                        {
+                            "type": "error",
+                            "message": user_message,
+                            "task": {"id": task_id, **resume_control_state},
+                        },
+                        websocket,
+                    )
+                return ResumeCommandResult(ResumeCommandOutcome.DEFERRED, reason)
             resume_snapshot: Any | None = None
             bg_task: asyncio.Task[None] | None = None
             try:
@@ -8020,7 +8097,7 @@ async def _handle_resume_task_unserialized(
                     )
                 raise
             logger.info(f"Task {task_id} v2 resume scheduled")
-            return
+            return ResumeCommandResult(ResumeCommandOutcome.SCHEDULED)
 
         # Unreachable: ``supports_live_control`` is defined once, on
         # ``AgentService``, and returns True unconditionally, so the block above
@@ -8032,11 +8109,13 @@ async def _handle_resume_task_unserialized(
 
     except (ValueError, KeyError, TypeError) as e:
         # Data validation error
-        message_data["_durable_command_error"] = str(e)
+        reason = str(e)
+        message_data["_durable_command_error"] = reason
         logger.error(f"Data validation error resuming task {task_id}: {e}")
         await manager.send_personal_message(
             {"type": "error", "message": f"Data validation error: {str(e)}"}, websocket
         )
+        return ResumeCommandResult(ResumeCommandOutcome.REJECTED, reason)
     except RuntimeError as e:
         # Runtime error
         logger.error(f"Runtime error resuming task {task_id}: {e}")
@@ -8130,6 +8209,7 @@ async def _execute_durable_task_command(
             "for the active task lease owner"
         )
 
+    resume_result: ResumeCommandResult | None = None
     if command.kind == TaskCommandKind.MESSAGE:
         await _handle_chat_message_unserialized(
             websocket, command.task_id, message_data
@@ -8167,11 +8247,19 @@ async def _execute_durable_task_command(
                     message_data,
                 )
             elif command.kind == TaskCommandKind.RESUME:
-                await _handle_resume_task_unserialized(
+                resume_result = await _handle_resume_task_unserialized(
                     websocket,
                     command.task_id,
                     message_data,
                 )
+                if resume_result.outcome is ResumeCommandOutcome.DEFERRED:
+                    raise TaskCommandDeferred(
+                        resume_result.reason or "Resume command will be retried"
+                    )
+                if resume_result.outcome is ResumeCommandOutcome.REJECTED:
+                    raise TaskCommandRejected(
+                        resume_result.reason or "Resume command was rejected"
+                    )
             elif command.kind == TaskCommandKind.CANCEL:
                 from .a2a import _cancel_task_unserialized
 
@@ -8211,11 +8299,14 @@ async def _execute_durable_task_command(
     durable_error = message_data.get("_durable_command_error")
     if isinstance(durable_error, str) and durable_error:
         raise TaskCommandRejected(durable_error)
-    return {
+    result = {
         "task_id": command.task_id,
         "command_id": command.command_id,
         "kind": command.kind.value,
     }
+    if resume_result is not None:
+        result["resume_outcome"] = resume_result.outcome.value
+    return result
 
 
 async def _broadcast_terminal_command_error(

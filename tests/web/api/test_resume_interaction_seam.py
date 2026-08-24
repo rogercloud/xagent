@@ -236,7 +236,7 @@ async def test_legacy_resume_without_a_receipt_is_refused_with_an_active_row(
         agent_manager.get_agent_for_task.assert_not_called()
 
     transition.assert_not_called()
-    background_manager.reserve_resume.assert_not_called()
+    background_manager.try_reserve_resume.assert_not_called()
     assert connection_manager.send_personal_message.await_count == 1
     sent = connection_manager.send_personal_message.await_args.args[0]
     assert sent["type"] == "error"
@@ -462,7 +462,7 @@ async def test_receipts_the_seam_cannot_verify_are_refused(
         agent_manager.get_agent_for_task.assert_not_called()
 
     transition.assert_not_called()
-    background_manager.reserve_resume.assert_not_called()
+    background_manager.try_reserve_resume.assert_not_called()
     assert connection_manager.send_personal_message.await_count == 1
     sent = connection_manager.send_personal_message.await_args.args[0]
     assert sent["type"] == "error"
@@ -491,7 +491,9 @@ async def test_resume_with_a_matching_receipt_is_not_refused(
     connection_manager = _connection_manager()
     background_manager = MagicMock()
     background_manager.running_tasks = {}
-    background_manager.reserve_resume.return_value = True
+    background_manager.try_reserve_resume.return_value = (
+        websocket_api.ResumeReservationOutcome.RESERVED
+    )
     transition = AsyncMock(
         return_value=SimpleNamespace(run_id=RUN_ID, status=TaskStatus.WAITING_FOR_USER)
     )
@@ -573,7 +575,9 @@ async def test_stale_run_active_row_does_not_trip_the_seam(
     connection_manager = _connection_manager()
     background_manager = MagicMock()
     background_manager.running_tasks = {}
-    background_manager.reserve_resume.return_value = True
+    background_manager.try_reserve_resume.return_value = (
+        websocket_api.ResumeReservationOutcome.RESERVED
+    )
     transition = AsyncMock(
         return_value=SimpleNamespace(run_id=RUN_ID, status=TaskStatus.WAITING_FOR_USER)
     )

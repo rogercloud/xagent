@@ -231,7 +231,9 @@ async def test_resume_cache_miss_builds_under_resolver_namespace_not_snapshot(
     connection_manager = _connection_manager()
     background_manager = MagicMock()
     background_manager.running_tasks = {}
-    background_manager.reserve_resume.return_value = True
+    background_manager.try_reserve_resume.return_value = (
+        websocket_api.ResumeReservationOutcome.RESERVED
+    )
     transition = AsyncMock(
         return_value=SimpleNamespace(run_id="run-1", status=TaskStatus.PAUSED)
     )
