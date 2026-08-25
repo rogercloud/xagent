@@ -39,8 +39,10 @@ def db_session(tmp_path):
     try:
         yield db
     finally:
-        db.close()
-        Base.metadata.drop_all(bind=get_engine())
+        try:
+            db.close()
+        finally:
+            Base.metadata.drop_all(bind=get_engine())
 
 
 def _user(db, username: str) -> User:
