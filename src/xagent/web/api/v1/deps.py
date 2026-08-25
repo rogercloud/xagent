@@ -38,11 +38,12 @@ from sqlalchemy import case
 from sqlalchemy.orm import joinedload
 
 from ....core.utils.api_key import (
+    ApiKeyVerification,
     ApiKeyKind,
     hash_api_key,
     is_legacy_bcrypt_api_key_hash,
     parse_api_key,
-    verify_api_key,
+    verify_api_key_with_timing,
     verify_dummy,
 )
 from ...models.agent import is_workforce_generated_manager_agent
@@ -151,15 +152,15 @@ def _enum_value(value: object) -> str:
     return str(getattr(value, "value", value))
 
 
-def _pad_non_bcrypt_auth_failure(stored_hash: str) -> None:
-    """Keep invalid-key timing aligned with legacy bcrypt verification.
+def _pad_api_key_auth_failure(paid_bcrypt_timing_floor: bool) -> None:
+    """Keep invalid-key timing aligned with the bcrypt compatibility floor.
 
-    A failed bcrypt verification has already paid the compatibility work
-    factor. SHA-256 and malformed stored verifiers have not, so they burn the
-    existing dummy check before returning the same opaque 401. Successful
-    SHA-256 authentication never takes this path and remains fast.
+    The verifier reports whether a completed bcrypt check paid at least the
+    configured work factor. Every other failure, including malformed ``$2``
+    strings and lower-cost bcrypt hashes, burns the dummy check before the same
+    opaque 401. Successful SHA-256 authentication never takes this path.
     """
-    if not is_legacy_bcrypt_api_key_hash(stored_hash):
+    if not paid_bcrypt_timing_floor:
         verify_dummy()
 
 
@@ -176,7 +177,10 @@ def _upgrade_api_key_hash_isolated(
     failure must not turn a valid credential into a 500, so failures are
     rolled back and logged without including any secret material. Concurrent
     first uses are safe: only the worker whose ``observed_hash`` still matches
-    can update the row.
+    can update the row. This migration-only write deliberately does not repeat
+    revoked/paused predicates from the earlier authorization read; a concurrent
+    revocation still controls future authentication even if this CAS rewrites
+    that row. SQLAlchemy also refreshes the models' ``updated_at`` on UPDATE.
     """
     if not is_legacy_bcrypt_api_key_hash(observed_hash):
         return
@@ -202,12 +206,17 @@ def _upgrade_api_key_hash_isolated(
                 key_model.__tablename__,
                 key_prefix,
             )
-    except Exception:
+    except Exception as exc:
+        # Do not attach the traceback: this frame holds ``raw_key`` and some
+        # error reporters serialize frame locals. The exception type retains a
+        # useful diagnostic without risking plaintext credential disclosure.
+        error_type = type(exc).__name__
         logging.getLogger(__name__).warning(
-            "Failed to migrate API key verifier for table=%s key_prefix=%s",
+            "Failed to migrate API key verifier for table=%s key_prefix=%s "
+            "error_type=%s",
             key_model.__tablename__,
             key_prefix,
-            exc_info=True,
+            error_type,
         )
 
 
@@ -224,7 +233,7 @@ def _verify_and_upgrade_api_key_hash(
     key_prefix: str,
     raw_key: str,
     observed_hash: str,
-) -> bool:
+) -> ApiKeyVerification:
     """Verify a detached hash and best-effort migrate successful legacy keys.
 
     Verification never waits on a migration lock. This keeps invalid legacy
@@ -233,16 +242,17 @@ def _verify_and_upgrade_api_key_hash(
     non-blocking stripe limits in-process migration traffic; losing the stripe
     only defers migration to a later request.
     """
-    if not verify_api_key(raw_key, observed_hash):
-        return False
+    verification = verify_api_key_with_timing(raw_key, observed_hash)
+    if not verification.verified:
+        return verification
     if not is_legacy_bcrypt_api_key_hash(observed_hash):
-        return True
+        return verification
 
     stripe = _LEGACY_HASH_MIGRATION_LOCKS[
         hash((key_model.__tablename__, key_prefix)) % len(_LEGACY_HASH_MIGRATION_LOCKS)
     ]
     if not stripe.acquire(blocking=False):
-        return True
+        return verification
     try:
         _upgrade_api_key_hash_isolated(
             key_model,
@@ -252,7 +262,7 @@ def _verify_and_upgrade_api_key_hash(
         )
     finally:
         stripe.release()
-    return True
+    return verification
 
 
 def active_runtime_key_filters(prefix: str) -> tuple[Any, ...]:
@@ -369,14 +379,14 @@ def _resolve_principal_from_credentials(
     # function. Malformed stored hashes fail closed. A SHA-256 rejection pays
     # the legacy dummy cost so all invalid-key paths retain the timing-oracle
     # defense; successful SHA-256 requests stay fast.
-    verified = _verify_and_upgrade_api_key_hash(
+    verification = _verify_and_upgrade_api_key_hash(
         AgentApiKey,
         key_prefix=prefix,
         raw_key=raw,
         observed_hash=record.key_hash,
     )
-    if not verified:
-        _pad_non_bcrypt_auth_failure(record.key_hash)
+    if not verification.verified:
+        _pad_api_key_auth_failure(verification.paid_bcrypt_timing_floor)
         raise V1ApiError(V1ErrorCode.INVALID_API_KEY, 401)
 
     # Workforce-bound key: resolves to the workforce itself, never to
@@ -385,7 +395,7 @@ def _resolve_principal_from_credentials(
     if record.workforce_id is not None:
         workforce = record.workforce
         if workforce is None:
-            _pad_non_bcrypt_auth_failure(record.key_hash)
+            _pad_api_key_auth_failure(verification.paid_bcrypt_timing_floor)
             raise V1ApiError(V1ErrorCode.INVALID_API_KEY, 401)
         return ApiKeyPrincipal(key=record.key, workforce=workforce)
 
@@ -396,7 +406,7 @@ def _resolve_principal_from_credentials(
     # fresh key instead of investigating an imaginary agent.
     agent = record.agent
     if agent is None or is_workforce_generated_manager_agent(agent):
-        _pad_non_bcrypt_auth_failure(record.key_hash)
+        _pad_api_key_auth_failure(verification.paid_bcrypt_timing_floor)
         raise V1ApiError(V1ErrorCode.INVALID_API_KEY, 401)
 
     return ApiKeyPrincipal(key=record.key, agent=agent)
@@ -576,19 +586,19 @@ def _resolve_user_from_personal_credentials(
 
     # The loading Session is already closed before a possible legacy bcrypt
     # check runs.
-    verified = _verify_and_upgrade_api_key_hash(
+    verification = _verify_and_upgrade_api_key_hash(
         UserApiKey,
         key_prefix=parsed.prefix,
         raw_key=raw,
         observed_hash=record.key_hash,
     )
-    if not verified:
-        _pad_non_bcrypt_auth_failure(record.key_hash)
+    if not verification.verified:
+        _pad_api_key_auth_failure(verification.paid_bcrypt_timing_floor)
         raise V1ApiError(V1ErrorCode.INVALID_API_KEY, 401)
 
     user = record.user
     if user is None:
-        _pad_non_bcrypt_auth_failure(record.key_hash)
+        _pad_api_key_auth_failure(verification.paid_bcrypt_timing_floor)
         raise V1ApiError(V1ErrorCode.INVALID_API_KEY, 401)
 
     return user, record.key

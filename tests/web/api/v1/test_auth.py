@@ -9,7 +9,7 @@ Test plumbing (client, _test_db fixture, auth helpers) is shared via
 
 import asyncio
 import threading
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, wait
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
@@ -21,7 +21,6 @@ from sqlalchemy import create_engine, text
 from sqlalchemy.pool import QueuePool
 
 from xagent.core.utils.api_key import (
-    BCRYPT_COST,
     SHA256_HASH_PREFIX,
     hash_api_key,
     verify_api_key,
@@ -173,22 +172,24 @@ def test_legacy_personal_key_migration_session_failure_does_not_reject_key(
     full_key, prefix = _create_personal_key()
     legacy_hash = bcrypt.hashpw(full_key.encode(), bcrypt.gensalt(rounds=4)).decode()
     _replace_key_hash(UserApiKey, prefix, legacy_hash)
-    original_get_session_local = deps.get_session_local
-    calls = 0
+    session_local = deps.get_session_local()
 
-    def fail_migration_session():  # type: ignore[no-untyped-def]
-        nonlocal calls
-        calls += 1
-        if calls == 2:
+    class MigrationFailingSessionFactory:
+        def __call__(self):  # type: ignore[no-untyped-def]
+            return session_local()
+
+        def begin(self):  # type: ignore[no-untyped-def]
             raise RuntimeError("migration Session factory unavailable")
-        return original_get_session_local()
 
-    monkeypatch.setattr(deps, "get_session_local", fail_migration_session)
+    monkeypatch.setattr(
+        deps,
+        "get_session_local",
+        lambda: MigrationFailingSessionFactory(),
+    )
 
     resp = client.get("/v1/me", headers={"Authorization": f"Bearer {full_key}"})
 
     assert resp.status_code == 200, resp.text
-    assert calls == 2
     assert _load_key_hash(UserApiKey, prefix) == legacy_hash
 
 
@@ -210,6 +211,12 @@ def test_legacy_runtime_key_migrates_after_successful_authentication():
     assert principal.agent.id == agent_id
     assert _load_key_hash(AgentApiKey, prefix) == hash_api_key(full_key)
 
+    second_principal = _resolve_principal_from_credentials(
+        HTTPAuthorizationCredentials(scheme="Bearer", credentials=full_key)
+    )
+    assert second_principal.agent is not None
+    assert second_principal.agent.id == agent_id
+
     # A concurrent worker holding the old snapshot cannot overwrite the
     # winner's digest with a stale compare-and-swap.
     different_key = full_key[:-1] + ("A" if full_key[-1] != "A" else "B")
@@ -225,7 +232,7 @@ def test_legacy_runtime_key_migrates_after_successful_authentication():
 def test_concurrent_wrong_legacy_secrets_verify_without_serializing(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Wrong secrets for a live prefix never wait on a migration stripe."""
+    """Legacy verification stays concurrent and precedes migration coordination."""
     from xagent.web.api.v1 import deps
     from xagent.web.api.v1.errors import V1ApiError
 
@@ -238,9 +245,9 @@ def test_concurrent_wrong_legacy_secrets_verify_without_serializing(
     peak_checks = 0
     count_lock = threading.Lock()
     verification_barrier = threading.Barrier(8)
-    original_verify = deps.verify_api_key
+    original_verify = deps.verify_api_key_with_timing
 
-    def recording_verify(raw: str, stored_hash: str) -> bool:
+    def recording_verify(raw: str, stored_hash: str):  # type: ignore[no-untyped-def]
         nonlocal active_checks, legacy_checks, peak_checks
         if stored_hash.startswith("$2"):
             with count_lock:
@@ -255,7 +262,7 @@ def test_concurrent_wrong_legacy_secrets_verify_without_serializing(
                     active_checks -= 1
         return original_verify(raw, stored_hash)
 
-    monkeypatch.setattr(deps, "verify_api_key", recording_verify)
+    monkeypatch.setattr(deps, "verify_api_key_with_timing", recording_verify)
     credentials = HTTPAuthorizationCredentials(
         scheme="Bearer",
         credentials=wrong_key,
@@ -275,6 +282,64 @@ def test_concurrent_wrong_legacy_secrets_verify_without_serializing(
     assert legacy_checks == 8
     assert peak_checks == 8
     assert _load_key_hash(AgentApiKey, prefix) == legacy_hash
+
+
+def test_concurrent_valid_legacy_auth_does_not_wait_for_migration(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Only one migration runs while other verified requests return promptly."""
+    from xagent.web.api.v1 import deps
+
+    agent_id, full_key, prefix = _create_agent_and_key()
+    legacy_hash = bcrypt.hashpw(full_key.encode(), bcrypt.gensalt(rounds=4)).decode()
+    _replace_key_hash(AgentApiKey, prefix, legacy_hash)
+    verification_barrier = threading.Barrier(8)
+    migration_started = threading.Event()
+    release_migration = threading.Event()
+    original_verify = deps.verify_api_key_with_timing
+    original_upgrade = deps._upgrade_api_key_hash_isolated
+    migration_calls = 0
+    count_lock = threading.Lock()
+
+    def synchronized_verify(raw: str, stored_hash: str):  # type: ignore[no-untyped-def]
+        verification_barrier.wait(timeout=2)
+        return original_verify(raw, stored_hash)
+
+    def blocking_upgrade(*args, **kwargs):  # type: ignore[no-untyped-def]
+        nonlocal migration_calls
+        with count_lock:
+            migration_calls += 1
+        migration_started.set()
+        assert release_migration.wait(timeout=2)
+        return original_upgrade(*args, **kwargs)
+
+    monkeypatch.setattr(deps, "verify_api_key_with_timing", synchronized_verify)
+    monkeypatch.setattr(deps, "_upgrade_api_key_hash_isolated", blocking_upgrade)
+    credentials = HTTPAuthorizationCredentials(
+        scheme="Bearer",
+        credentials=full_key,
+    )
+    pool = ThreadPoolExecutor(max_workers=8)
+    futures = [
+        pool.submit(deps._resolve_principal_from_credentials, credentials)
+        for _ in range(8)
+    ]
+    try:
+        assert migration_started.wait(timeout=2)
+        completed, _pending = wait(futures, timeout=1)
+        completed_before_migration = len(completed)
+    finally:
+        release_migration.set()
+        pool.shutdown(wait=True)
+
+    principals = [future.result() for future in futures]
+    assert completed_before_migration == 7
+    assert migration_calls == 1
+    assert all(
+        principal.agent is not None and principal.agent.id == agent_id
+        for principal in principals
+    )
+    assert _load_key_hash(AgentApiKey, prefix) == hash_api_key(full_key)
 
 
 def test_agent_runtime_key_cannot_authenticate_me():
@@ -338,6 +403,32 @@ def test_known_prefix_wrong_secret_returns_401():
     _assert_invalid_api_key(resp)
 
 
+def test_malformed_bcrypt_verifier_uses_dummy_padding(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A malformed ``$2`` value has not paid bcrypt's timing floor."""
+    from xagent.web.api.v1 import deps
+
+    full_key, prefix = _create_personal_key()
+    _replace_key_hash(
+        UserApiKey,
+        prefix,
+        "$2b$12$this-is-not-a-valid-bcrypt-hash",
+    )
+    dummy_calls = 0
+
+    def record_dummy() -> None:
+        nonlocal dummy_calls
+        dummy_calls += 1
+
+    monkeypatch.setattr(deps, "verify_dummy", record_dummy)
+
+    resp = client.get("/v1/me", headers={"Authorization": f"Bearer {full_key}"})
+
+    _assert_invalid_api_key(resp)
+    assert dummy_calls == 1
+
+
 def test_revoked_key_returns_401():
     """Once DELETE rotates / revokes, the old key must stop working."""
     full_key, prefix = _create_personal_key()
@@ -392,9 +483,20 @@ def test_unexpired_key_with_naive_future_expiry_authenticates():
     assert resp.status_code == 200, resp.text
 
 
-def test_generated_manager_key_returns_401():
+def test_generated_manager_key_returns_401_with_dummy_padding(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from xagent.web.api.v1 import deps
+
     agent_id, full_key, _prefix = _create_agent_and_key()
     _mark_generated_manager(agent_id)
+    dummy_calls = 0
+
+    def record_dummy() -> None:
+        nonlocal dummy_calls
+        dummy_calls += 1
+
+    monkeypatch.setattr(deps, "verify_dummy", record_dummy)
 
     resp = client.post(
         "/v1/chat/tasks",
@@ -406,6 +508,7 @@ def test_generated_manager_key_returns_401():
     )
 
     _assert_invalid_api_key(resp)
+    assert dummy_calls == 1
 
 
 @pytest.mark.asyncio
@@ -421,18 +524,18 @@ async def test_runtime_key_auth_runs_sql_and_verification_off_event_loop(
     query_threads: list[int] = []
     verification_threads: list[int] = []
     original_load = deps._load_runtime_key_record
-    original_verify = deps.verify_api_key
+    original_verify = deps.verify_api_key_with_timing
 
     def recording_load(key_prefix: str):  # type: ignore[no-untyped-def]
         query_threads.append(threading.get_ident())
         return original_load(key_prefix)
 
-    def recording_verify(raw: str, key_hash: str) -> bool:
+    def recording_verify(raw: str, key_hash: str):  # type: ignore[no-untyped-def]
         verification_threads.append(threading.get_ident())
         return original_verify(raw, key_hash)
 
     monkeypatch.setattr(deps, "_load_runtime_key_record", recording_load)
-    monkeypatch.setattr(deps, "verify_api_key", recording_verify)
+    monkeypatch.setattr(deps, "verify_api_key_with_timing", recording_verify)
 
     principal = await deps.get_principal_from_api_key(
         HTTPAuthorizationCredentials(scheme="Bearer", credentials=full_key)
@@ -552,18 +655,18 @@ async def test_personal_key_auth_runs_sql_and_verification_off_event_loop(
     query_threads: list[int] = []
     verification_threads: list[int] = []
     original_load = deps._load_personal_key_record
-    original_verify = deps.verify_api_key
+    original_verify = deps.verify_api_key_with_timing
 
     def recording_load(key_prefix: str):  # type: ignore[no-untyped-def]
         query_threads.append(threading.get_ident())
         return original_load(key_prefix)
 
-    def recording_verify(raw: str, key_hash: str) -> bool:
+    def recording_verify(raw: str, key_hash: str):  # type: ignore[no-untyped-def]
         verification_threads.append(threading.get_ident())
         return original_verify(raw, key_hash)
 
     monkeypatch.setattr(deps, "_load_personal_key_record", recording_load)
-    monkeypatch.setattr(deps, "verify_api_key", recording_verify)
+    monkeypatch.setattr(deps, "verify_api_key_with_timing", recording_verify)
 
     user, key = await deps.get_user_from_personal_key(
         HTTPAuthorizationCredentials(scheme="Bearer", credentials=full_key)
@@ -715,31 +818,33 @@ async def test_record_key_usage_pool_wait_keeps_event_loop_responsive(
 # ===== timing oracle defense =====
 
 
-def test_unknown_prefix_performs_the_same_bcrypt_work_as_wrong_secret():
-    """Both HTTP rejection paths perform one real bcrypt check at equal cost."""
+def test_unknown_prefix_and_wrong_sha_secret_each_use_dummy_padding(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Both fast failure branches deterministically route through the dummy."""
+    from xagent.web.api.v1 import deps
+
     full_key, _prefix = _create_personal_key()
     parts = full_key.split("_")
     parts[3] = "z" * 32
     wrong_secret_key = "_".join(parts)
+    dummy_calls = 0
 
-    with patch.object(bcrypt, "checkpw", wraps=bcrypt.checkpw) as checkpw:
-        resp1 = client.get(
-            "/v1/me", headers={"Authorization": f"Bearer {wrong_secret_key}"}
-        )
-        assert resp1.status_code == 401
-        checkpw.assert_called_once()
-        real_password, real_hash = checkpw.call_args.args
-        assert real_password == b"dummy"
-        assert int(real_hash.split(b"$")[2]) == BCRYPT_COST
-        checkpw.reset_mock()
+    def record_dummy() -> None:
+        nonlocal dummy_calls
+        dummy_calls += 1
 
-        fake_key = "xag_personal_ZZZZZZ_" + "x" * 32
-        resp2 = client.get("/v1/me", headers={"Authorization": f"Bearer {fake_key}"})
-        assert resp2.status_code == 401
-        assert resp2.json() == resp1.json()
-        checkpw.assert_called_once()
-        _dummy_password, dummy_hash = checkpw.call_args.args
-        assert int(dummy_hash.split(b"$")[2]) == BCRYPT_COST
+    monkeypatch.setattr(deps, "verify_dummy", record_dummy)
+    resp1 = client.get(
+        "/v1/me", headers={"Authorization": f"Bearer {wrong_secret_key}"}
+    )
+    assert resp1.status_code == 401
+    assert dummy_calls == 1
+
+    fake_key = "xag_personal_ZZZZZZ_" + "x" * 32
+    resp2 = client.get("/v1/me", headers={"Authorization": f"Bearer {fake_key}"})
+    assert resp2.status_code == 401
+    assert dummy_calls == 2
 
 
 # ===== /v1/* internal_error envelope (catch-all) =====
