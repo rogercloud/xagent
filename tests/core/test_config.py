@@ -37,6 +37,7 @@ from xagent.config import (
     DEEPDOC_XINFERENCE_USERNAME,
     EXTERNAL_SKILLS_LIBRARY_DIRS,
     EXTERNAL_UPLOAD_DIRS,
+    ExternalUploadsDirConfigurationError,
     FILE_DELIVERY_ACCEL_REDIRECT_ENABLED,
     FILE_DELIVERY_ACCEL_REDIRECT_PREFIX,
     FILE_DELIVERY_REDIRECT_ENABLED,
@@ -1206,10 +1207,10 @@ class TestGetExternalUploadDirs:
             monkeypatch.setenv(EXTERNAL_UPLOAD_DIRS, f"{dir1},{dir2}")
             result = get_external_upload_dirs()
             assert len(result) == 2
-            assert dir1.resolve() in result
-            assert dir2.resolve() in result
+            assert dir1 in result
+            assert dir2 in result
 
-    def test_expands_environment_tilde_and_resolves_symlinks(
+    def test_expands_environment_tilde_and_preserves_symlink_spelling(
         self, tmp_path, monkeypatch
     ):
         physical = tmp_path / "physical" / "uploads"
@@ -1220,7 +1221,18 @@ class TestGetExternalUploadDirs:
         monkeypatch.setenv("EXTERNAL_NAME", "alias")
         monkeypatch.setenv(EXTERNAL_UPLOAD_DIRS, "~/$EXTERNAL_NAME")
 
-        assert get_external_upload_dirs() == [physical]
+        assert get_external_upload_dirs() == [alias]
+
+    def test_rejects_symlink_followed_by_dotdot(self, tmp_path, monkeypatch):
+        base = tmp_path / "base"
+        outside = tmp_path / "outside" / "nested"
+        base.mkdir()
+        outside.mkdir(parents=True)
+        (base / "link").symlink_to(outside, target_is_directory=True)
+        monkeypatch.setenv(EXTERNAL_UPLOAD_DIRS, str(base / "link" / ".."))
+
+        with pytest.raises(ExternalUploadsDirConfigurationError, match="two different"):
+            get_external_upload_dirs()
 
     def test_relative_dir_is_pinned_to_first_working_directory(
         self, tmp_path, monkeypatch
@@ -1230,9 +1242,7 @@ class TestGetExternalUploadDirs:
         external = first_cwd / "relative-external"
         external.mkdir(parents=True)
         second_cwd.mkdir()
-        relative_spelling = f"relative-external-{tmp_path.name}"
-        external.rename(first_cwd / relative_spelling)
-        external = first_cwd / relative_spelling
+        relative_spelling = "relative-external"
         monkeypatch.setenv(EXTERNAL_UPLOAD_DIRS, relative_spelling)
 
         monkeypatch.chdir(first_cwd)

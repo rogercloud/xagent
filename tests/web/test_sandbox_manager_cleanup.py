@@ -169,24 +169,86 @@ def test_path_mapper_resolves_symlinked_backend_path_in_sibling_mode(tmp_path: P
         str(physical_workspace),
         "rw",
     )
-    assert mapper.backend_storage_root == physical_storage
+    assert mapper.backend_storage_root == backend_alias
+    assert mapper.backend_storage_root_physical == physical_storage
     assert mapper.host_storage_root == host_root
-    assert mapper.sandbox_storage_root == physical_storage
 
 
-def test_path_mapper_preserves_explicit_guest_domain(tmp_path: Path):
+def test_path_mapper_preserves_docker_host_root_spelling(tmp_path: Path):
     backend_storage = tmp_path / "backend" / ".xagent"
     backend_storage.mkdir(parents=True)
+    host_root = Path("/docker-host/storage-link/../storage")
+    mapper = SandboxPathMapper(
+        backend_storage_root=backend_storage,
+        host_storage_root=host_root,
+    )
+
+    assert mapper.host_storage_root == host_root
+    assert mapper.to_host_bind_source(backend_storage / "uploads") == (
+        host_root / "uploads"
+    )
+
+
+def test_path_mapper_preserves_internal_symlink_for_sibling_host_translation(
+    tmp_path: Path,
+):
+    backend_storage = tmp_path / "backend" / ".xagent"
+    physical_uploads = tmp_path / "bigdisk" / "uploads"
+    backend_storage.mkdir(parents=True)
+    (physical_uploads / "user_42").mkdir(parents=True)
+    (backend_storage / "uploads").symlink_to(physical_uploads, target_is_directory=True)
     mapper = SandboxPathMapper(
         backend_storage_root=backend_storage,
         host_storage_root=Path("/docker-host/storage"),
-        sandbox_storage_root=Path("/workspace/storage-alias"),
     )
 
-    assert mapper.to_sandbox_target(backend_storage / "uploads" / "user_42") == Path(
-        "/workspace/storage-alias/uploads/user_42"
+    assert mapper.volume_for_backend_path(backend_storage / "uploads" / "user_42") == (
+        "/docker-host/storage/uploads/user_42",
+        str(physical_uploads / "user_42"),
+        "rw",
     )
-    assert mapper.sandbox_storage_root == Path("/workspace/storage-alias")
+
+
+def test_default_volumes_preserve_internal_symlink_for_sibling_host_translation(
+    manager: SandboxManager, tmp_path: Path
+):
+    """The complete runtime-volume path must retain the host-side suffix."""
+    backend_storage = tmp_path / "backend" / ".xagent"
+    physical_uploads = tmp_path / "bigdisk" / "uploads"
+    physical_workspace = physical_uploads / "user_42"
+    backend_storage.mkdir(parents=True)
+    physical_workspace.mkdir(parents=True)
+    (backend_storage / "uploads").symlink_to(physical_uploads, target_is_directory=True)
+    lexical_workspace = backend_storage / "uploads" / "user_42"
+
+    with (
+        patch.dict(
+            "os.environ",
+            {
+                "XAGENT_STORAGE_ROOT": str(backend_storage),
+                "XAGENT_UPLOADS_DIR": str(backend_storage / "uploads"),
+                "XAGENT_SANDBOX_HOST_STORAGE_ROOT": "/docker-host/storage",
+            },
+            clear=True,
+        ),
+        patch(
+            "xagent.web.sandbox_manager.build_code_mount_volumes",
+            return_value=[],
+        ),
+    ):
+        volumes = manager._make_default_volumes(
+            "user",
+            "42",
+            mount_intent=SandboxMountIntent(mount_root=str(lexical_workspace)),
+        )
+
+    assert volumes == [
+        (
+            "/docker-host/storage/uploads/user_42",
+            str(physical_workspace),
+            "rw",
+        )
+    ]
 
 
 def test_default_volumes_include_build_preview_and_user_dirs(

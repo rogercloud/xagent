@@ -170,7 +170,7 @@ class SandboxLeaseProvider:
         return SandboxLease(self, concurrency_safe=concurrency_safe)
 
     def workspace_dirs_are_host_mounted(self, directories: Sequence[str]) -> bool:
-        """Whether verified RW mounts cover every workspace guest target.
+        """Whether the provider's desired RW mounts cover every guest target.
 
         ``SandboxManager`` creates all workspace mounts as read-write volumes
         from backend/host storage into the sandbox.  ``TaskWorkspace`` creates
@@ -186,32 +186,12 @@ class SandboxLeaseProvider:
         retains the fallback because its requested volumes are not proof of
         the mounts on a reused sandbox.
         """
-        if not directories:
-            return True
-        if self._manager._backend_probe is not True:
-            return False
-
-        path_mapper = SandboxPathMapper.from_env()
-        mount_roots = tuple(
-            Path(
-                canonical_sandbox_path(str(path_mapper.to_sandbox_target(backend_path)))
-            )
-            for backend_path, _should_create in self._manager._workspace_mount_paths(
-                self._lifecycle_type,
-                self._lifecycle_id,
-                self._mount_intent,
-            )
+        return self._manager.workspace_dirs_are_host_mounted(
+            self._lifecycle_type,
+            self._lifecycle_id,
+            self._mount_intent,
+            directories,
         )
-        if not mount_roots:
-            return False
-
-        for directory in directories:
-            candidate = Path(
-                canonical_sandbox_path(str(path_mapper.to_sandbox_target(directory)))
-            )
-            if not any(candidate.is_relative_to(root) for root in mount_roots):
-                return False
-        return True
 
     async def acquire_worker_slot(self) -> int:
         """Reserve one worker slot, waiting when all workers are busy."""
@@ -302,24 +282,49 @@ def absolute_backend_mount_path(path: str | Path) -> Path:
     return backend_path
 
 
-def resolve_backend_mount_path(path: str | Path) -> str:
-    """Return the physical absolute identity of a backend-domain path.
+def backend_mount_path_views(path: str | Path) -> tuple[Path, Path]:
+    """Return stable lexical and physical views of one backend path.
 
-    Workspace tools resolve their roots before opening files. Mount producers
-    use the same resolution so the host source and guest target expose the
-    directory those tools actually address, including through symlinks.
+    The lexical view is the only safe input for Docker-host translation in
+    sibling mode; the physical view is the identity workspace tools address
+    and therefore the sandbox guest target. A spelling whose lexical cleanup
+    changes its physical meaning (notably ``symlink/..``) cannot safely enter
+    a desired spec, because that spec canonicalizes paths before Docker sees
+    them, so reject it rather than silently mounting a different directory.
     """
-    return os.path.realpath(absolute_backend_mount_path(path))
+    absolute = absolute_backend_mount_path(path)
+    lexical = Path(canonical_sandbox_path(str(absolute)))
+    physical_configured = Path(os.path.realpath(absolute))
+    physical_lexical = Path(os.path.realpath(lexical))
+    if physical_configured != physical_lexical:
+        raise SandboxContractError(
+            f"Backend mount path {str(path)!r} is ambiguous: lexical "
+            f"normalization gives {str(lexical)!r}, resolving to "
+            f"{str(physical_lexical)!r}, while the configured spelling "
+            f"resolves to {str(physical_configured)!r}. Configure the "
+            "physical directory directly instead of using '..' after a symlink."
+        )
+    return lexical, physical_lexical
+
+
+def resolve_backend_mount_path(path: str | Path) -> str:
+    """Return the physical identity of a backend-domain path.
+
+    Use this for filesystem identity, containment, authorization and sandbox
+    guest targets. Docker-host translation must instead retain the lexical
+    view returned by :func:`backend_mount_path_views`.
+    """
+    return str(backend_mount_path_views(path)[1])
 
 
 class SandboxPathMapper:
-    """Translate physical backend workspace paths into sandbox volume tuples.
+    """Translate backend workspace paths into cross-domain volume tuples.
 
-    Backend operands are resolved because ``TaskWorkspace`` uses physical
-    paths. The optional host root is deliberately left untouched: it belongs
-    to the Docker-host namespace, where this backend process cannot resolve
-    symlinks. An explicit sandbox root is likewise already a guest-domain
-    path and receives lexical normalization only.
+    A backend path has two load-bearing views: its lexical spelling maps to
+    the Docker-host storage root in sibling mode, while its physical identity
+    is the guest target used by ``TaskWorkspace``. The optional host root is
+    deliberately never resolved here because it belongs to the Docker-host
+    namespace, not this backend process's filesystem.
     """
 
     def __init__(
@@ -327,15 +332,23 @@ class SandboxPathMapper:
         *,
         backend_storage_root: Path,
         host_storage_root: Path | None,
-        sandbox_storage_root: Path | None = None,
     ) -> None:
-        self.backend_storage_root = self._as_backend_path(backend_storage_root)
+        (
+            self.backend_storage_root,
+            self.backend_storage_root_physical,
+        ) = backend_mount_path_views(backend_storage_root)
+        # This path belongs to the Docker-host namespace. Preserve its spelling
+        # exactly; the backend cannot safely normalize symlinks or ``..`` in a
+        # filesystem namespace it does not own.
         self.host_storage_root = host_storage_root
-        self.sandbox_storage_root = (
-            self.backend_storage_root
-            if sandbox_storage_root is None
-            else Path(canonical_sandbox_path(str(sandbox_storage_root)))
-        )
+        if (
+            self.host_storage_root is not None
+            and not self.host_storage_root.is_absolute()
+        ):
+            raise SandboxContractError(
+                "XAGENT_SANDBOX_HOST_STORAGE_ROOT must be an absolute "
+                f"Docker-host path, got {str(host_storage_root)!r}"
+            )
 
     @classmethod
     def from_env(cls) -> "SandboxPathMapper":
@@ -348,35 +361,28 @@ class SandboxPathMapper:
     def uses_host_storage_root(self) -> bool:
         return self.host_storage_root is not None
 
-    @staticmethod
-    def _as_backend_path(path: str | Path) -> Path:
-        return Path(resolve_backend_mount_path(path))
-
-    def _relative_to_backend_storage(self, backend_path: Path) -> Path | None:
+    def _relative_to_backend_storage(self, lexical_path: Path) -> Path | None:
         try:
-            return backend_path.relative_to(self.backend_storage_root)
+            return lexical_path.relative_to(self.backend_storage_root)
         except ValueError:
             return None
 
     def to_host_bind_source(self, backend_path: str | Path) -> Path:
-        path = self._as_backend_path(backend_path)
+        lexical_path, physical_path = backend_mount_path_views(backend_path)
         if self.host_storage_root is None:
-            return path
+            return physical_path
 
-        relative_path = self._relative_to_backend_storage(path)
+        relative_path = self._relative_to_backend_storage(lexical_path)
         if relative_path is None:
-            return path
+            # External directories outside the translated storage root retain
+            # the historical contract that their absolute spelling must also
+            # exist in the Docker-host namespace.
+            return lexical_path
         return self.host_storage_root / relative_path
 
     def to_sandbox_target(self, backend_path: str | Path) -> Path:
-        path = self._as_backend_path(backend_path)
-        if self.host_storage_root is None:
-            return path
-
-        relative_path = self._relative_to_backend_storage(path)
-        if relative_path is None:
-            return path
-        return self.sandbox_storage_root / relative_path
+        _lexical_path, physical_path = backend_mount_path_views(backend_path)
+        return physical_path
 
     def volume_for_backend_path(
         self, backend_path: str | Path, mode: str = "rw"
@@ -839,6 +845,42 @@ class SandboxManager:
             paths.append((mount_root, True))
 
         return paths
+
+    def workspace_dirs_are_host_mounted(
+        self,
+        lifecycle_type: str,
+        lifecycle_id: str,
+        mount_intent: SandboxMountIntent | None,
+        directories: Sequence[str],
+    ) -> bool:
+        """Whether the desired workspace mounts cover every guest directory.
+
+        The manager owns both the backend capability result and the mount
+        construction inputs, so the lease provider delegates the answer here
+        instead of reaching through several manager-private attributes.
+        """
+        if not directories:
+            return True
+        if self._backend_probe is not True:
+            return False
+
+        path_mapper = SandboxPathMapper.from_env()
+        mount_roots = tuple(
+            path_mapper.to_sandbox_target(backend_path)
+            for backend_path, _should_create in self._workspace_mount_paths(
+                lifecycle_type,
+                lifecycle_id,
+                mount_intent,
+            )
+        )
+        if not mount_roots:
+            return False
+
+        for directory in directories:
+            candidate = path_mapper.to_sandbox_target(directory)
+            if not any(candidate.is_relative_to(root) for root in mount_roots):
+                return False
+        return True
 
     def _prepare_workspace_mounts(
         self,
@@ -2467,7 +2509,8 @@ def _check_no_reserved_uploads_conflict(
                 "overlaps the reserved per-user uploads subtree "
                 f"{guest_uploads_root!r}/{reserved_prefix}<id>: every task's "
                 "default workspace mount requires that subtree to remain "
-                "unshadowed."
+                "unshadowed. Move the mount elsewhere under the uploads root "
+                "or mount an ancestor instead."
             )
 
 

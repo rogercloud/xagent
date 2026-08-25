@@ -352,7 +352,7 @@ class TestScopeDerivedEscapeFailsClosed:
         binding = build_chat_workspace_binding(OWNER_ID, self._ca_scope("actor7"))
 
         assert binding.mount_intent.mount_root == str(ca_root)
-        assert binding.mount_intent.extra_mounts == (str(outside),)
+        assert binding.mount_intent.extra_mounts == (str(link),)
 
 
 class TestDeploymentAuthorizationIdentityDomain:
@@ -418,9 +418,7 @@ class TestDeploymentAuthorizationIdentityDomain:
 
         assert binding_a.mount_intent == binding_b.mount_intent
         assert binding_a.mount_intent.mount_root == str(ca_root)
-        assert binding_a.mount_intent.extra_mounts == (
-            str((ca_root / "actor7").resolve()),
-        )
+        assert binding_a.mount_intent.extra_mounts == (str(ca_root / "actor7"),)
 
     def test_a_symlink_alias_of_the_path_authorizes_the_same_physical_dir(
         self, _uploads_dir, tmp_path, monkeypatch
@@ -437,7 +435,7 @@ class TestDeploymentAuthorizationIdentityDomain:
         binding_b = build_chat_workspace_binding(OWNER_ID, self._ca_scope("actor9"))
 
         assert binding_a.mount_intent == binding_b.mount_intent
-        assert binding_a.mount_intent.extra_mounts == (str(alias.resolve()),)
+        assert binding_a.mount_intent.extra_mounts == (str(alias),)
 
     def test_ancestor_spelled_non_canonically_still_absorbs_the_mount_root(
         self, _uploads_dir, monkeypatch
@@ -464,13 +462,10 @@ class TestDeploymentAuthorizationIdentityDomain:
         assert binding.mount_intent.mount_root == str(user_root)
         assert binding.mount_intent.extra_mounts == ()
 
-    def test_symlink_and_dotdot_uses_its_physical_directory(
+    def test_symlink_and_dotdot_is_rejected_as_ambiguous(
         self, _uploads_dir, tmp_path, monkeypatch
     ):
-        """``..`` after a symlink follows filesystem, not lexical, semantics."""
-        # Nested one level down, so resolving ``link/..`` lands on a directory
-        # that is not an ancestor of the mount root and remains a separate
-        # deployment mount.
+        """Desired-spec cleanup must not change the mounted directory."""
         outside = tmp_path.parent / f"{tmp_path.name}-outside-root" / "nested"
         outside.mkdir(parents=True)
         user_root = scoped_user_root(_uploads_dir, OWNER_ID, ())
@@ -488,10 +483,8 @@ class TestDeploymentAuthorizationIdentityDomain:
             lambda: [Path(f"{user_root}/link/..")],
         )
 
-        binding = build_chat_workspace_binding(OWNER_ID, scope)
-
-        assert binding.mount_intent.mount_root == str(user_root / "proj")
-        assert binding.mount_intent.extra_mounts == (str(outside.parent),)
+        with pytest.raises(SandboxContractError, match="ambiguous"):
+            build_chat_workspace_binding(OWNER_ID, scope)
 
 
 class TestInternalScopedRow:
@@ -734,7 +727,7 @@ class TestBackendPathDomain:
     def test_uploads_dir_spelled_through_a_symlink_prepares_the_bound_root(
         self, tmp_path, monkeypatch
     ):
-        """Preparation and mounting follow the same physical path semantics."""
+        """A lexical cleanup that changes identity is rejected."""
         base = tmp_path / "base"
         base.mkdir()
         outside = tmp_path / "outside" / "nested"
@@ -745,15 +738,13 @@ class TestBackendPathDomain:
         )
         monkeypatch.setattr(workspace_binding, "get_external_upload_dirs", lambda: [])
 
-        binding = build_chat_workspace_binding(OWNER_ID, None)
-
-        assert binding.prepare_root == binding.mount_intent.mount_root
-        assert binding.prepare_root == str(outside.parent / f"user_{OWNER_ID}")
+        with pytest.raises(SandboxContractError, match="ambiguous"):
+            build_chat_workspace_binding(OWNER_ID, None)
 
     def test_symlink_escaping_the_root_keeps_its_own_mount(
         self, _uploads_dir, tmp_path, monkeypatch
     ):
-        """An operator-named target outside the root keeps a physical bind."""
+        """An operator-named target keeps its lexical, translatable bind."""
         outside = tmp_path.parent / f"{tmp_path.name}-outside-kb"
         outside.mkdir()
         user_root = scoped_user_root(_uploads_dir, OWNER_ID, ())
@@ -767,7 +758,7 @@ class TestBackendPathDomain:
         binding = build_chat_workspace_binding(OWNER_ID, None)
 
         assert binding.mount_intent.mount_root == str(user_root)
-        assert binding.mount_intent.extra_mounts == (str(outside),)
+        assert binding.mount_intent.extra_mounts == (str(link),)
 
     def test_symlink_staying_inside_the_root_still_folds_away(
         self, _uploads_dir, tmp_path, monkeypatch
@@ -803,5 +794,5 @@ class TestBackendPathDomain:
 
         binding = build_chat_workspace_binding(OWNER_ID, None)
 
-        assert binding.mount_intent.mount_root == str(_uploads_dir)
+        assert binding.mount_intent.mount_root == str(alias)
         assert binding.mount_intent.extra_mounts == ()

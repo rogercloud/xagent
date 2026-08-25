@@ -264,6 +264,17 @@ In Docker sibling mode, `SANDBOX_VOLUMES` sources are host-side paths. Use
 absolute host paths; relative paths and `~` are rejected instead of being
 expanded inside the backend container.
 
+Sandbox workspace guest paths are reserved below
+`<XAGENT_UPLOADS_DIR>/user_<id>`. A `SANDBOX_VOLUMES` destination or
+`XAGENT_EXTERNAL_UPLOAD_DIRS` mount at that directory or any descendant now
+fails backend readiness, because Docker would let the more-specific bind hide
+the managed workspace. Move shared mounts elsewhere under the uploads root
+(for example `<uploads>/shared`) or mount a suitable ancestor before upgrading.
+
+External-upload symlink aliases authorize the physical directory they resolve
+to. Ordinary aliases are supported, but ambiguous spellings such as
+`symlink/..` are rejected; configure the intended directory directly.
+
 > **Required action on upgrade:** Every existing deployment with
 > `SANDBOX_ENABLED=true` and `SANDBOX_IMPLEMENTATION=docker` must provide
 > `XAGENT_SANDBOX_NAMESPACE` before upgrading. The Compose overlay below sets

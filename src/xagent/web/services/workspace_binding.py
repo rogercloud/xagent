@@ -1,4 +1,4 @@
-"""Chat workspace binding: the CA-physical sandbox mount intent.
+"""Chat workspace binding: the CA sandbox mount set.
 
 Two different concerns share one conceptual workspace root:
 
@@ -10,8 +10,8 @@ Two different concerns share one conceptual workspace root:
   here recomputes the same allowlist purely as folding input, and the two
   are pinned equivalent by test (see
   ``tests/web/test_execution_scope_workspace_web.py``);
-- what the sandbox container actually gets bind-mounted (the *CA*-physical
-  view: one mount root plus any genuinely separate extra mounts --
+- what the sandbox container actually gets bind-mounted (the *CA* view: one
+  mount root plus any genuinely separate extra mounts --
   ``ChatWorkspaceBinding.mount_intent``, which ``chat.py`` consumes
   directly when creating/reusing the task's sandbox). This module is that
   view's single construction point.
@@ -40,12 +40,13 @@ projection removes. That is a hard invariant rather than a best effort: an
 Actor subtree that cannot fold into the CA root fails the build instead of
 becoming an Actor-specific bind.
 
-Because that classification is lexical, every candidate is first resolved to
-its physical identity in the backend path domain. The final mount intent,
-workspace tools, and sandbox guest target therefore all name the same path even
-when an operator configured a symlink. What an escape from the physical mount
-root means still depends on provenance -- see :class:`_MountCandidate` and
-:func:`_fold_mount_paths`.
+Containment and authorization compare each candidate's physical identity in the
+backend path domain. The final mount intent deliberately retains a lexical
+backend spelling for Docker-host translation; ``SandboxPathMapper`` derives the
+matching physical guest target separately. Both views name the same directory,
+including when an operator configured an ordinary symlink. What an escape from
+the physical mount root means still depends on provenance -- see
+:class:`_MountCandidate` and :func:`_fold_mount_paths`.
 """
 
 from __future__ import annotations
@@ -62,7 +63,7 @@ from ...sandbox import (
     SandboxMountIntent,
     canonical_sandbox_path,
 )
-from ..sandbox_manager import resolve_backend_mount_path
+from ..sandbox_manager import backend_mount_path_views
 
 logger = logging.getLogger(__name__)
 
@@ -125,6 +126,15 @@ class _MountCandidate:
     origin: Literal["scope", "deployment"]
 
 
+@dataclass(frozen=True)
+class _NormalizedMountCandidate:
+    """One candidate's translatable spelling and physical identity."""
+
+    lexical_path: str
+    physical_path: str
+    origin: Literal["scope", "deployment"]
+
+
 def _build_external_allowlist(
     owner_id: int, scope: Optional[ExecutionScope]
 ) -> tuple[_MountCandidate, ...]:
@@ -155,30 +165,31 @@ def _build_external_allowlist(
 
 
 def _canonical_mount_path(path: str) -> str:
-    """Return one mount path's stable physical backend identity.
+    """Return one mount path's stable lexical backend spelling.
 
     Raw configuration may be relative, environment-expanded, ``~``-prefixed,
-    or symlinked. Resolve all of that before creating ``SandboxMountIntent``;
-    its POSIX canonicalizer then only normalizes the already-physical spelling
-    used by the workspace, mount intent, and sandbox target.
+    or symlinked. The spelling stored in ``SandboxMountIntent`` must retain
+    symlinks so ``SandboxPathMapper`` can translate it to the Docker-host
+    storage root; physical identity is carried separately while folding.
     """
-    return canonical_sandbox_path(resolve_backend_mount_path(path))
+    lexical, _physical = backend_mount_path_views(path)
+    return canonical_sandbox_path(str(lexical))
 
 
 def canonical_workspace_base(owner_id: int, segments: Sequence[str] = ()) -> str:
-    """Return one owner's physical workspace root at ``segments``.
+    """Return one owner's stable lexical workspace root at ``segments``.
 
-    Every producer composes and resolves the path here so file tools and the
-    desired sandbox spec use one byte-identical identity, including when the
-    configured uploads root or a workspace segment is a symlink.
+    ``TaskWorkspace`` resolves this spelling before file access. Keeping the
+    lexical form here preserves the relative path needed for sibling-Docker
+    host translation while both views still name the same directory.
     """
     return _canonical_mount_path(
         str(scoped_user_root(get_uploads_dir(), owner_id, tuple(segments)))
     )
 
 
-def _lexical_relation(root: str, path: str) -> str:
-    """``SandboxMountIntent``'s verdict for one path against one root."""
+def _path_relation(root: str, path: str) -> str:
+    """``SandboxMountIntent``'s verdict inside one already-chosen domain."""
     probe = SandboxMountIntent(mount_root=root, extra_mounts=(path,))
     if probe.covered_extras:
         return "covered"
@@ -187,19 +198,38 @@ def _lexical_relation(root: str, path: str) -> str:
     return "disjoint"
 
 
-def _fold_relation(root: str, resolved_root: str, path: str, resolved_path: str) -> str:
-    """Return a fold verdict, failing safe if physical identity moved.
+def _normalize_mount_candidate(candidate: _MountCandidate) -> _NormalizedMountCandidate:
+    lexical, physical = backend_mount_path_views(candidate.path)
+    return _NormalizedMountCandidate(
+        lexical_path=canonical_sandbox_path(str(lexical)),
+        physical_path=canonical_sandbox_path(str(physical)),
+        origin=candidate.origin,
+    )
 
-    Callers already canonicalize to currently observable physical identities.
-    Resolving once more protects the classification if a previously missing
-    component materializes as a symlink during construction: a disagreement
-    becomes ``disjoint`` and provenance decides whether a separate deployment
-    mount is allowed or a scope-derived escape is rejected.
+
+def _dedupe_mount_candidates(
+    candidates: Sequence[_NormalizedMountCandidate],
+) -> tuple[_NormalizedMountCandidate, ...]:
+    """Choose one deterministic lexical spelling per physical directory.
+
+    A deployment spelling wins over a scope-derived spelling because it is
+    stable across every Actor sharing the sandbox and is the spelling the
+    operator authorized. Ties use the lexical spelling so environment order
+    cannot change the desired runtime spec.
     """
-    lexical = _lexical_relation(root, path)
-    if lexical != _lexical_relation(resolved_root, resolved_path):
-        return "disjoint"
-    return lexical
+    selected: dict[str, _NormalizedMountCandidate] = {}
+    for candidate in candidates:
+        existing = selected.get(candidate.physical_path)
+        if (
+            existing is None
+            or (candidate.origin == "deployment" and existing.origin == "scope")
+            or (
+                candidate.origin == existing.origin
+                and candidate.lexical_path < existing.lexical_path
+            )
+        ):
+            selected[candidate.physical_path] = candidate
+    return tuple(selected[physical_path] for physical_path in sorted(selected))
 
 
 def _fold_mount_paths(
@@ -207,14 +237,12 @@ def _fold_mount_paths(
 ) -> tuple[str, tuple[str, ...]]:
     """Collapse a mount root and allowlist candidates into one physical set.
 
-    Root and candidate paths first enter the identity domain the whole fold
-    decides in (:func:`_canonical_mount_path`), which is
-    ``SandboxMountIntent``'s own mount-path identity. Every step below --
-    coverage, symlink resolution, authorization, promotion, the returned
-    spelling -- therefore judges one mount point once, however it was typed.
+    Each path keeps two views: folding and authorization use its physical
+    identity, while the returned ``SandboxMountIntent`` retains one stable
+    lexical backend spelling so sibling-mode host translation remains valid.
 
     Then, repeatedly, each candidate is classified against the current root
-    by :func:`_fold_relation`:
+    by :func:`_path_relation`:
 
     - a candidate the root already covers (equal to it or a descendant) is
       redundant and dropped;
@@ -238,22 +266,24 @@ def _fold_mount_paths(
     physical directory; a symlink alias counts because aliases and their
     targets intentionally share one mount identity.
 
-    Returns the final physical root and surviving physical candidates in
-    candidate order. ``SandboxMountIntent`` still owns their deduplication
-    and ordering.
+    Returns the final lexical root and surviving lexical candidates. Physical
+    aliases are deduplicated before folding, preferring deployment spellings.
     """
-    root = _canonical_mount_path(mount_root)
-    remaining = tuple(
-        _MountCandidate(_canonical_mount_path(c.path), c.origin) for c in candidates
+    root_lexical, root_physical = backend_mount_path_views(mount_root)
+    root = _NormalizedMountCandidate(
+        lexical_path=canonical_sandbox_path(str(root_lexical)),
+        physical_path=canonical_sandbox_path(str(root_physical)),
+        origin="scope",
     )
-    deployment_identities = {c.path for c in remaining if c.origin == "deployment"}
-    resolved = {c.path: resolve_backend_mount_path(c.path) for c in remaining}
-    resolved_root = resolve_backend_mount_path(root)
+    normalized = tuple(_normalize_mount_candidate(c) for c in candidates)
+    deployment_identities = {
+        c.physical_path for c in normalized if c.origin == "deployment"
+    }
+    remaining = _dedupe_mount_candidates(normalized)
 
     while True:
         verdicts = [
-            (c, _fold_relation(root, resolved_root, c.path, resolved[c.path]))
-            for c in remaining
+            (c, _path_relation(root.physical_path, c.physical_path)) for c in remaining
         ]
         covering = [c for c, verdict in verdicts if verdict == "covering"]
         if not covering:
@@ -263,27 +293,31 @@ def _fold_mount_paths(
             for candidate, verdict in verdicts:
                 if (
                     verdict == "disjoint"
-                    and candidate.path not in deployment_identities
+                    and candidate.physical_path not in deployment_identities
                 ):
                     raise SandboxMountEscapeError(
-                        f"Workspace path {candidate.path!r} (resolving to "
-                        f"{resolved[candidate.path]!r}) is neither inside nor "
-                        f"a parent of sandbox mount root {root!r} (resolving "
-                        f"to {resolved_root!r}); refusing to bind it as a "
+                        f"Workspace path {candidate.lexical_path!r} (resolving to "
+                        f"{candidate.physical_path!r}) is neither inside nor "
+                        "a parent of sandbox mount root "
+                        f"{root.lexical_path!r} (resolving to "
+                        f"{root.physical_path!r}); refusing to bind it as a "
                         "separate mount"
                     )
-            return root, tuple(
-                c.path for c, verdict in verdicts if verdict != "covered"
+            return root.lexical_path, tuple(
+                c.lexical_path for c, verdict in verdicts if verdict != "covered"
             )
-        new_root = min(covering, key=lambda c: len(c.path))
-        remaining = tuple(c for c in remaining if c.path != new_root.path)
-        root, resolved_root = new_root.path, resolved[new_root.path]
+        new_root = min(
+            covering,
+            key=lambda c: (len(c.physical_path), c.physical_path, c.lexical_path),
+        )
+        remaining = tuple(c for c in remaining if c is not new_root)
+        root = new_root
 
 
 def build_chat_workspace_binding(
     owner_id: int, scope: Optional[ExecutionScope]
 ) -> ChatWorkspaceBinding:
-    """Build the CA-physical mount intent for a task's sandbox.
+    """Build the CA mount intent for a task's sandbox.
 
     Called from ``chat.py`` (task creation and agent reconstruction alike)
     to build ``mount_intent`` for the task's sandbox lease provider; the

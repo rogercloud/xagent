@@ -1599,6 +1599,10 @@ class UploadsDirConfigurationError(Exception):
     """
 
 
+class ExternalUploadsDirConfigurationError(Exception):
+    """A configured external upload directory has two physical meanings."""
+
+
 # First absolutized reading of each cwd-dependent uploads root, kept so the
 # root cannot move mid-process (see _require_unambiguous_uploads_dir). Keyed by
 # the configured spelling, so changing the configuration still takes effect.
@@ -1608,6 +1612,17 @@ _pinned_relative_uploads_roots: dict[str, Path] = {}
 # through separate calls. Pin cwd-dependent spellings on first use so a later
 # process-wide chdir cannot make those consumers name different directories.
 _pinned_relative_external_upload_dirs: dict[str, Path] = {}
+
+
+def _reset_path_config_caches_for_tests() -> None:
+    """Clear cwd-dependent path pins between tests.
+
+    Production code deliberately keeps these values for the process lifetime;
+    tests need an explicit reset boundary so their result cannot depend on
+    which working directory an earlier test pinned for the same spelling.
+    """
+    _pinned_relative_uploads_roots.clear()
+    _pinned_relative_external_upload_dirs.clear()
 
 
 def _require_unambiguous_uploads_dir(uploads_dir: Path) -> Path:
@@ -1626,9 +1641,10 @@ def _require_unambiguous_uploads_dir(uploads_dir: Path) -> Path:
     They agree on every spelling but one: a symlink followed by ``..``, where
     the lexical form discards the symlink the physical form follows. That
     configuration gives one logical directory two readings. Workspace mount
-    producers now deliberately resolve to the physical reading, but rejecting
-    this ambiguous spelling at the shared configuration boundary also keeps
-    older and non-mount consumers from choosing the other one.
+    producers retain both readings -- the lexical one for Docker-host path
+    translation and the physical one for file identity -- so rejecting this
+    ambiguous spelling at the shared configuration boundary prevents those
+    two load-bearing views from naming different directories.
 
     An ordinary symlink is untouched -- following one is not a disagreement,
     both spellings still name a single directory.
@@ -2003,9 +2019,10 @@ def get_external_upload_dirs() -> list[Path]:
 
     The XAGENT_EXTERNAL_UPLOAD_DIRS environment variable should contain
     a comma-separated list of directory paths. Environment variables and
-    ``~`` are expanded, relative paths are pinned to their first observed
-    working directory, and symlinks are resolved so callers receive stable
-    physical absolute paths.
+    ``~`` are expanded and relative paths are pinned to their first observed
+    working directory. The returned path deliberately preserves its symlink
+    spelling: Docker sibling-mode translation needs that backend-relative
+    spelling, while file-access consumers resolve it in their own domain.
 
     Example: /path/to/uploads1,/path/to/uploads2
 
@@ -2029,13 +2046,26 @@ def get_external_upload_dirs() -> list[Path]:
                 absolute = _pinned_relative_external_upload_dirs.setdefault(
                     dir_path, Path.cwd() / expanded
                 )
-            path = Path(os.path.realpath(absolute))
-            if path.is_dir():
-                result.append(path)
+            from .sandbox.base import canonical_sandbox_path
+
+            canonical = Path(canonical_sandbox_path(str(absolute)))
+            physical_configured = os.path.realpath(absolute)
+            physical_canonical = os.path.realpath(canonical)
+            if physical_configured != physical_canonical:
+                raise ExternalUploadsDirConfigurationError(
+                    f"External upload directory {dir_path!r} names two different "
+                    "directories depending on normalization: lexically it is "
+                    f"{str(canonical)!r}, resolving to {physical_canonical!r}, "
+                    "while resolving the configured spelling directly gives "
+                    f"{physical_configured!r}. A '..' segment after a symlink "
+                    "does that; configure the directory you actually mean."
+                )
+            if canonical.is_dir():
+                result.append(canonical)
             else:
                 logger.warning(
                     "External upload directory does not exist or is not a directory: %r",
-                    path,
+                    canonical,
                 )
 
     return result
