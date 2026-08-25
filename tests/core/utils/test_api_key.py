@@ -33,8 +33,8 @@ from xagent.core.utils.api_key import (
     KEY_SECRET_LENGTH,
     PREFIX_COLLISION_RETRIES,
     SHA256_HASH_PREFIX,
-    ApiKeyVerification,
     ApiKeyKind,
+    ApiKeyVerification,
     generate_api_key,
     hash_api_key,
     is_legacy_bcrypt_api_key_hash,
@@ -281,9 +281,7 @@ def test_verify_dummy_runs_without_raising() -> None:
 def test_verify_dummy_uses_the_same_bcrypt_cost_as_real_verification() -> None:
     """Both paths execute bcrypt at the configured cost, without timing CI."""
     full, _prefix, _key_hash = generate_api_key(db=None)
-    key_hash = bcrypt.hashpw(
-        full.encode(), bcrypt.gensalt(rounds=BCRYPT_COST)
-    ).decode()
+    key_hash = bcrypt.hashpw(full.encode(), bcrypt.gensalt(rounds=BCRYPT_COST)).decode()
     with patch.object(
         api_key_module.bcrypt, "checkpw", wraps=api_key_module.bcrypt.checkpw
     ) as checkpw:
