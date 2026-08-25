@@ -14,6 +14,7 @@ from xagent.core.tools.adapters.vibe.sandboxed_tool.sandboxed_tool_wrapper impor
 from xagent.sandbox.base import (
     ResolvedSandboxRuntimeSpec,
     SandboxConfig,
+    SandboxContractError,
     SandboxInfo,
     SandboxMountIntent,
     SandboxTemplate,
@@ -187,6 +188,14 @@ def test_path_mapper_preserves_docker_host_root_spelling(tmp_path: Path):
     assert mapper.project(backend_storage / "uploads").host_source == (
         host_root / "uploads"
     )
+
+
+def test_path_mapper_rejects_relative_docker_host_storage_root(tmp_path: Path):
+    with pytest.raises(SandboxContractError, match="must be an absolute"):
+        SandboxPathMapper(
+            backend_storage_root=tmp_path / "backend" / ".xagent",
+            host_storage_root=Path("relative/storage"),
+        )
 
 
 @pytest.mark.parametrize(

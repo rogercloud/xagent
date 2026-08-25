@@ -248,8 +248,10 @@ overlay defaults `XAGENT_SANDBOX_HOST_PROJECT_ROOT` to the current project root
 and binds `${XAGENT_HOST_STORAGE_ROOT:-/root/.xagent}` to `/root/.xagent`. It
 also passes `XAGENT_SANDBOX_HOST_STORAGE_ROOT` into the backend so sandbox
 workspace mounts under `/root/.xagent` are translated back to the host storage
-path before they reach the host Docker daemon. Override these values when the
-host checkout or storage directory lives elsewhere:
+path before they reach the host Docker daemon. When set,
+`XAGENT_SANDBOX_HOST_STORAGE_ROOT` must be an absolute Docker-host path;
+relative paths and `~` are not supported. Override these values when the host
+checkout or storage directory lives elsewhere:
 
 ```bash
 XAGENT_SANDBOX_HOST_PROJECT_ROOT="$PWD" \
@@ -274,6 +276,9 @@ the managed workspace. Move shared mounts elsewhere under the uploads root
 External-upload symlink aliases authorize the physical directory they resolve
 to. Ordinary aliases are supported, but ambiguous spellings such as
 `symlink/..` are rejected; configure the intended directory directly.
+Xagent creates and owns each `<uploads>/user_<id>` directory as a normal
+directory; replacing one with a symlink or changing that topology while the
+service is running is unsupported.
 
 > **Required action on upgrade:** Every existing deployment with
 > `SANDBOX_ENABLED=true` and `SANDBOX_IMPLEMENTATION=docker` must provide

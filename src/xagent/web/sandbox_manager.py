@@ -185,6 +185,12 @@ class SandboxLeaseProvider:
         A legacy backend that cannot inspect/reconcile its runtime spec also
         retains the fallback because its requested volumes are not proof of
         the mounts on a reused sandbox.
+
+        In sibling-Docker mode this capability proves containment in the
+        reconciled desired guest-mount paths; it cannot independently resolve
+        Docker-host bind sources in the host filesystem namespace. The
+        deployment must keep its backend/host storage mapping and symlink
+        topology consistent.
         """
         return self._manager.workspace_dirs_are_host_mounted(
             self._lifecycle_type,
@@ -927,6 +933,18 @@ class SandboxManager:
         The manager owns both the backend capability result and the mount
         construction inputs, so the lease provider delegates the answer here
         instead of reaching through several manager-private attributes.
+
+        A ``True`` result proves containment after projecting backend paths to
+        the reconciled desired guest targets. In sibling-Docker mode it does
+        not prove that the corresponding bind source resolves to the intended
+        directory on the Docker host, whose filesystem namespace this process
+        cannot inspect.
+
+        Raises:
+            SandboxContractError: Backend or Docker-host path mapping is
+                ambiguous or invalid.
+            UploadsDirConfigurationError: The default user uploads root is
+                ambiguous when deriving a user-lifecycle workspace mount.
         """
         if not directories:
             return True

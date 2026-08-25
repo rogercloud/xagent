@@ -769,7 +769,7 @@ class ToolFactory:
                 # directories already exist. TaskWorkspace creates them in
                 # its constructor; MockWorkspace deliberately does not, so it
                 # must retain the historical in-sandbox mkdir fallback.
-                directories_exist_on_host = all(
+                directories_exist_on_backend_storage = all(
                     Path(directory).is_dir() for directory in directories
                 )
                 # Resolve on the concrete type: getattr(instance, ...) against
@@ -780,7 +780,7 @@ class ToolFactory:
                     type(sandbox), "workspace_dirs_are_host_mounted", None
                 )
                 workspace_is_host_mounted = False
-                if directories_exist_on_host and callable(host_mount_check):
+                if directories_exist_on_backend_storage and callable(host_mount_check):
                     try:
                         workspace_is_host_mounted = (
                             host_mount_check(sandbox, directories) is True
