@@ -38,8 +38,8 @@ from sqlalchemy import case
 from sqlalchemy.orm import joinedload
 
 from ....core.utils.api_key import (
-    ApiKeyVerification,
     ApiKeyKind,
+    ApiKeyVerification,
     hash_api_key,
     is_legacy_bcrypt_api_key_hash,
     parse_api_key,
