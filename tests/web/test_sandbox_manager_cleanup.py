@@ -184,9 +184,63 @@ def test_path_mapper_preserves_docker_host_root_spelling(tmp_path: Path):
     )
 
     assert mapper.host_storage_root == host_root
-    assert mapper.to_host_bind_source(backend_storage / "uploads") == (
+    assert mapper.project(backend_storage / "uploads").host_source == (
         host_root / "uploads"
     )
+
+
+@pytest.mark.parametrize(
+    ("topology", "expected_kind"),
+    (
+        ("lexical-in-physical-in", "lexical-storage"),
+        ("lexical-in-physical-out", "lexical-storage"),
+        ("lexical-out-physical-in", "physical-storage-alias"),
+        ("lexical-out-physical-out", "external"),
+    ),
+)
+def test_path_mapper_projects_all_storage_containment_quadrants(
+    tmp_path: Path,
+    topology: str,
+    expected_kind: str,
+):
+    backend_storage = tmp_path / "backend" / ".xagent"
+    backend_storage.mkdir(parents=True)
+    host_root = Path("/docker-host/storage")
+
+    if topology == "lexical-in-physical-in":
+        backend_path = backend_storage / "uploads" / "user_42"
+        backend_path.mkdir(parents=True)
+        expected_host_source = host_root / "uploads" / "user_42"
+    elif topology == "lexical-in-physical-out":
+        physical_uploads = tmp_path / "bigdisk" / "uploads"
+        (physical_uploads / "user_42").mkdir(parents=True)
+        (backend_storage / "uploads").symlink_to(
+            physical_uploads, target_is_directory=True
+        )
+        backend_path = backend_storage / "uploads" / "user_42"
+        expected_host_source = host_root / "uploads" / "user_42"
+    elif topology == "lexical-out-physical-in":
+        physical_uploads = backend_storage / "uploads"
+        (physical_uploads / "user_42").mkdir(parents=True)
+        uploads_alias = tmp_path / "uploads-alias"
+        uploads_alias.symlink_to(physical_uploads, target_is_directory=True)
+        backend_path = uploads_alias / "user_42"
+        expected_host_source = host_root / "uploads" / "user_42"
+    else:
+        backend_path = tmp_path / "shared" / "user_42"
+        backend_path.mkdir(parents=True)
+        expected_host_source = backend_path
+
+    projection = SandboxPathMapper(
+        backend_storage_root=backend_storage,
+        host_storage_root=host_root,
+    ).project(backend_path)
+
+    assert projection.backend.lexical == backend_path
+    assert projection.backend.physical == backend_path.resolve()
+    assert projection.host_source == expected_host_source
+    assert projection.guest_target == backend_path.resolve()
+    assert projection.mapping_kind == expected_kind
 
 
 def test_path_mapper_preserves_internal_symlink_for_sibling_host_translation(
@@ -227,6 +281,48 @@ def test_default_volumes_preserve_internal_symlink_for_sibling_host_translation(
             {
                 "XAGENT_STORAGE_ROOT": str(backend_storage),
                 "XAGENT_UPLOADS_DIR": str(backend_storage / "uploads"),
+                "XAGENT_SANDBOX_HOST_STORAGE_ROOT": "/docker-host/storage",
+            },
+            clear=True,
+        ),
+        patch(
+            "xagent.web.sandbox_manager.build_code_mount_volumes",
+            return_value=[],
+        ),
+    ):
+        volumes = manager._make_default_volumes(
+            "user",
+            "42",
+            mount_intent=SandboxMountIntent(mount_root=str(lexical_workspace)),
+        )
+
+    assert volumes == [
+        (
+            "/docker-host/storage/uploads/user_42",
+            str(physical_workspace),
+            "rw",
+        )
+    ]
+
+
+def test_default_volumes_translate_external_alias_back_into_storage(
+    manager: SandboxManager, tmp_path: Path
+):
+    """An uploads alias may be lexically external but physically in storage."""
+    backend_storage = tmp_path / "backend" / ".xagent"
+    physical_uploads = backend_storage / "uploads"
+    physical_workspace = physical_uploads / "user_42"
+    physical_workspace.mkdir(parents=True)
+    uploads_alias = tmp_path / "uploads-alias"
+    uploads_alias.symlink_to(physical_uploads, target_is_directory=True)
+    lexical_workspace = uploads_alias / "user_42"
+
+    with (
+        patch.dict(
+            "os.environ",
+            {
+                "XAGENT_STORAGE_ROOT": str(backend_storage),
+                "XAGENT_UPLOADS_DIR": str(uploads_alias),
                 "XAGENT_SANDBOX_HOST_STORAGE_ROOT": "/docker-host/storage",
             },
             clear=True,

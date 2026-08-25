@@ -172,8 +172,8 @@ def _canonical_mount_path(path: str) -> str:
     symlinks so ``SandboxPathMapper`` can translate it to the Docker-host
     storage root; physical identity is carried separately while folding.
     """
-    lexical, _physical = backend_mount_path_views(path)
-    return canonical_sandbox_path(str(lexical))
+    views = backend_mount_path_views(path)
+    return canonical_sandbox_path(str(views.lexical))
 
 
 def canonical_workspace_base(owner_id: int, segments: Sequence[str] = ()) -> str:
@@ -199,10 +199,10 @@ def _path_relation(root: str, path: str) -> str:
 
 
 def _normalize_mount_candidate(candidate: _MountCandidate) -> _NormalizedMountCandidate:
-    lexical, physical = backend_mount_path_views(candidate.path)
+    views = backend_mount_path_views(candidate.path)
     return _NormalizedMountCandidate(
-        lexical_path=canonical_sandbox_path(str(lexical)),
-        physical_path=canonical_sandbox_path(str(physical)),
+        lexical_path=canonical_sandbox_path(str(views.lexical)),
+        physical_path=canonical_sandbox_path(str(views.physical)),
         origin=candidate.origin,
     )
 
@@ -269,10 +269,10 @@ def _fold_mount_paths(
     Returns the final lexical root and surviving lexical candidates. Physical
     aliases are deduplicated before folding, preferring deployment spellings.
     """
-    root_lexical, root_physical = backend_mount_path_views(mount_root)
+    root_views = backend_mount_path_views(mount_root)
     root = _NormalizedMountCandidate(
-        lexical_path=canonical_sandbox_path(str(root_lexical)),
-        physical_path=canonical_sandbox_path(str(root_physical)),
+        lexical_path=canonical_sandbox_path(str(root_views.lexical)),
+        physical_path=canonical_sandbox_path(str(root_views.physical)),
         origin="scope",
     )
     normalized = tuple(_normalize_mount_candidate(c) for c in candidates)

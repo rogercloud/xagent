@@ -882,6 +882,52 @@ class TestReadinessReservedUploadsSubtree:
             with pytest.raises(SandboxRuntimeConflictError):
                 await check_sandbox_static_readiness(manager)
 
+    @pytest.mark.parametrize("guest_path", ["/user_0", "/user_0/nested"])
+    @pytest.mark.asyncio
+    async def test_root_uploads_dir_still_rejects_reserved_user_subtree(
+        self, tmp_path, guest_path
+    ) -> None:
+        """The root separator must not turn the reserved prefix into ``//``."""
+        with (
+            patch.dict(
+                "os.environ",
+                {
+                    "XAGENT_UPLOADS_DIR": "/",
+                    "SANDBOX_VOLUMES": f"{tmp_path / 'host'}:{guest_path}:rw",
+                },
+                clear=True,
+            ),
+            patch(
+                "xagent.web.sandbox_manager.build_code_mount_volumes",
+                return_value=[],
+            ),
+        ):
+            manager, _service = _make_manager()
+            with pytest.raises(SandboxRuntimeConflictError):
+                await check_sandbox_static_readiness(manager)
+
+    @pytest.mark.parametrize("guest_path", ["/", "/shared"])
+    @pytest.mark.asyncio
+    async def test_root_uploads_dir_allows_non_reserved_mounts(
+        self, tmp_path, guest_path
+    ) -> None:
+        with (
+            patch.dict(
+                "os.environ",
+                {
+                    "XAGENT_UPLOADS_DIR": "/",
+                    "SANDBOX_VOLUMES": f"{tmp_path / 'host'}:{guest_path}:rw",
+                },
+                clear=True,
+            ),
+            patch(
+                "xagent.web.sandbox_manager.build_code_mount_volumes",
+                return_value=[],
+            ),
+        ):
+            manager, _service = _make_manager()
+            await check_sandbox_static_readiness(manager)
+
     @pytest.mark.asyncio
     async def test_rejects_external_upload_dir_nested_inside_a_reserved_user_dir(
         self, tmp_path

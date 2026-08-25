@@ -12,7 +12,7 @@ from collections.abc import AsyncIterator, Callable, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
+from typing import Literal, Optional
 
 from ..config import (
     SANDBOX_VOLUMES,
@@ -282,7 +282,33 @@ def absolute_backend_mount_path(path: str | Path) -> Path:
     return backend_path
 
 
-def backend_mount_path_views(path: str | Path) -> tuple[Path, Path]:
+@dataclass(frozen=True)
+class BackendMountPathViews:
+    """The spelling and filesystem identity of one backend-domain path."""
+
+    lexical: Path
+    physical: Path
+
+
+SandboxMountMappingKind = Literal[
+    "local-physical",
+    "lexical-storage",
+    "physical-storage-alias",
+    "external",
+]
+
+
+@dataclass(frozen=True)
+class SandboxMountProjection:
+    """One backend path projected into host and sandbox path domains."""
+
+    backend: BackendMountPathViews
+    host_source: Path
+    guest_target: Path
+    mapping_kind: SandboxMountMappingKind
+
+
+def backend_mount_path_views(path: str | Path) -> BackendMountPathViews:
     """Return stable lexical and physical views of one backend path.
 
     The lexical view is the only safe input for Docker-host translation in
@@ -304,17 +330,28 @@ def backend_mount_path_views(path: str | Path) -> tuple[Path, Path]:
             f"resolves to {str(physical_configured)!r}. Configure the "
             "physical directory directly instead of using '..' after a symlink."
         )
-    return lexical, physical_lexical
+    return BackendMountPathViews(lexical=lexical, physical=physical_lexical)
 
 
-def resolve_backend_mount_path(path: str | Path) -> str:
-    """Return the physical identity of a backend-domain path.
+def dedupe_backend_mount_paths(
+    paths: Sequence[str | Path],
+) -> tuple[Path, ...]:
+    """Choose one stable lexical spelling per backend physical directory.
 
-    Use this for filesystem identity, containment, authorization and sandbox
-    guest targets. Docker-host translation must instead retain the lexical
-    view returned by :func:`backend_mount_path_views`.
+    This helper is deliberately limited to plain backend-domain paths. Callers
+    with additional policy, such as workspace binding's deployment-vs-scope
+    provenance, must keep that policy in their own layer. Docker-host paths
+    must never pass through this function because the backend cannot resolve
+    identities in the host filesystem namespace.
     """
-    return str(backend_mount_path_views(path)[1])
+    selected: dict[str, Path] = {}
+    for path in paths:
+        views = backend_mount_path_views(path)
+        physical_key = str(views.physical)
+        existing = selected.get(physical_key)
+        if existing is None or str(views.lexical) < str(existing):
+            selected[physical_key] = views.lexical
+    return tuple(selected[key] for key in sorted(selected))
 
 
 class SandboxPathMapper:
@@ -333,10 +370,7 @@ class SandboxPathMapper:
         backend_storage_root: Path,
         host_storage_root: Path | None,
     ) -> None:
-        (
-            self.backend_storage_root,
-            self.backend_storage_root_physical,
-        ) = backend_mount_path_views(backend_storage_root)
+        self.backend_storage = backend_mount_path_views(backend_storage_root)
         # This path belongs to the Docker-host namespace. Preserve its spelling
         # exactly; the backend cannot safely normalize symlinks or ``..`` in a
         # filesystem namespace it does not own.
@@ -361,35 +395,70 @@ class SandboxPathMapper:
     def uses_host_storage_root(self) -> bool:
         return self.host_storage_root is not None
 
-    def _relative_to_backend_storage(self, lexical_path: Path) -> Path | None:
+    @property
+    def backend_storage_root(self) -> Path:
+        return self.backend_storage.lexical
+
+    @property
+    def backend_storage_root_physical(self) -> Path:
+        return self.backend_storage.physical
+
+    @staticmethod
+    def _relative_to(path: Path, root: Path) -> Path | None:
         try:
-            return lexical_path.relative_to(self.backend_storage_root)
+            return path.relative_to(root)
         except ValueError:
             return None
 
-    def to_host_bind_source(self, backend_path: str | Path) -> Path:
-        lexical_path, physical_path = backend_mount_path_views(backend_path)
-        if self.host_storage_root is None:
-            return physical_path
+    def project(self, backend_path: str | Path) -> SandboxMountProjection:
+        """Project one path once, preserving the boundary between domains.
 
-        relative_path = self._relative_to_backend_storage(lexical_path)
+        Lexical containment has priority in sibling-Docker mode because an
+        internal symlink still has a valid host-side suffix. If the lexical
+        spelling is outside storage, physical containment recovers aliases
+        that point back into storage. Only paths outside storage in both
+        views retain their backend spelling as a Docker-host source.
+        """
+        backend = backend_mount_path_views(backend_path)
+        if self.host_storage_root is None:
+            return SandboxMountProjection(
+                backend=backend,
+                host_source=backend.physical,
+                guest_target=backend.physical,
+                mapping_kind="local-physical",
+            )
+
+        relative_path = self._relative_to(backend.lexical, self.backend_storage_root)
+        mapping_kind: SandboxMountMappingKind = "lexical-storage"
+        if relative_path is None:
+            relative_path = self._relative_to(
+                backend.physical, self.backend_storage_root_physical
+            )
+            mapping_kind = "physical-storage-alias"
         if relative_path is None:
             # External directories outside the translated storage root retain
             # the historical contract that their absolute spelling must also
             # exist in the Docker-host namespace.
-            return lexical_path
-        return self.host_storage_root / relative_path
-
-    def to_sandbox_target(self, backend_path: str | Path) -> Path:
-        _lexical_path, physical_path = backend_mount_path_views(backend_path)
-        return physical_path
+            return SandboxMountProjection(
+                backend=backend,
+                host_source=backend.lexical,
+                guest_target=backend.physical,
+                mapping_kind="external",
+            )
+        return SandboxMountProjection(
+            backend=backend,
+            host_source=self.host_storage_root / relative_path,
+            guest_target=backend.physical,
+            mapping_kind=mapping_kind,
+        )
 
     def volume_for_backend_path(
         self, backend_path: str | Path, mode: str = "rw"
     ) -> tuple[str, str, str]:
+        projection = self.project(backend_path)
         return (
-            str(self.to_host_bind_source(backend_path)),
-            str(self.to_sandbox_target(backend_path)),
+            str(projection.host_source),
+            str(projection.guest_target),
             mode,
         )
 
@@ -866,7 +935,7 @@ class SandboxManager:
 
         path_mapper = SandboxPathMapper.from_env()
         mount_roots = tuple(
-            path_mapper.to_sandbox_target(backend_path)
+            path_mapper.project(backend_path).guest_target
             for backend_path, _should_create in self._workspace_mount_paths(
                 lifecycle_type,
                 lifecycle_id,
@@ -877,7 +946,7 @@ class SandboxManager:
             return False
 
         for directory in directories:
-            candidate = path_mapper.to_sandbox_target(directory)
+            candidate = path_mapper.project(directory).guest_target
             if not any(candidate.is_relative_to(root) for root in mount_roots):
                 return False
         return True
@@ -2496,7 +2565,7 @@ def _check_no_reserved_uploads_conflict(
     base) remain valid.
     """
     reserved_re = re.compile(rf"^{re.escape(reserved_prefix)}\d+$")
-    prefix_with_sep = guest_uploads_root + "/"
+    prefix_with_sep = guest_uploads_root.rstrip("/") + "/"
     for _host_path, guest_path, _mode in volumes:
         norm_guest = canonical_sandbox_path(guest_path)
         if not norm_guest.startswith(prefix_with_sep):
@@ -2542,15 +2611,12 @@ async def check_sandbox_static_readiness(sandbox_mgr: "SandboxManager") -> None:
     using the same ``host_side_sources`` flag the runtime build path uses)
     and code mounts (``build_code_mount_volumes``) are already host-domain
     triples and are compared as-is. External upload dirs are backend-domain
-    paths: they are absolutized through ``absolute_backend_mount_path`` (the
-    same owner the runtime mount-building path uses, so a relative
-    ``XAGENT_EXTERNAL_UPLOAD_DIRS`` entry is checked as the directory it
-    actually names) and folded (normalized + deduplicated, the same
-    backend-domain normalization ``SandboxMountIntent`` itself applies)
-    before being converted to host domain through the same
-    ``SandboxPathMapper`` the runtime mount-building path uses. Conflict
-    detection itself always runs in the post-mapper host domain, over the
-    combined triple set from all three sources.
+    paths: they are normalized and deduplicated by backend physical identity
+    through ``dedupe_backend_mount_paths`` before being converted to host
+    domain through the same ``SandboxPathMapper`` the runtime mount-building
+    path uses. One stable lexical spelling is retained for sibling-Docker host
+    translation. Conflict detection itself always runs in the post-mapper host
+    domain, over the combined triple set from all three sources.
 
     Beyond mutual conflicts among the configured mounts, one configured
     mount can also collide with a mount that does not exist yet: every
@@ -2579,9 +2645,7 @@ async def check_sandbox_static_readiness(sandbox_mgr: "SandboxManager") -> None:
     )
     volumes.extend(build_code_mount_volumes())
 
-    folded_external = SandboxMountIntent(
-        extra_mounts=tuple(str(absolute_backend_mount_path(d)) for d in external_dirs)
-    ).extra_mounts
+    folded_external = dedupe_backend_mount_paths(external_dirs)
     for backend_dir in folded_external:
         volumes.append(path_mapper.volume_for_backend_path(backend_dir, "rw"))
 
