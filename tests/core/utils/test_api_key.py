@@ -12,8 +12,8 @@ Covers the three key contracts callers rely on:
 
 Plus a couple of robustness checks:
 
-  - verify_dummy spends roughly the same time as a real verify_api_key
-    call, so an attacker can't enumerate prefixes by timing.
+  - verify_dummy spends roughly the same time as a bcrypt verification at
+    BCRYPT_COST, so an attacker can't enumerate prefixes by timing.
   - generate_api_key retries on prefix collision and gives up cleanly
     if a mock keeps colliding.
 """
@@ -33,6 +33,7 @@ from xagent.core.utils.api_key import (
     KEY_SECRET_LENGTH,
     PREFIX_COLLISION_RETRIES,
     SHA256_HASH_PREFIX,
+    ApiKeyVerification,
     ApiKeyKind,
     generate_api_key,
     hash_api_key,
@@ -40,6 +41,7 @@ from xagent.core.utils.api_key import (
     is_sha256_api_key_hash,
     parse_api_key,
     verify_api_key,
+    verify_api_key_with_timing,
     verify_dummy,
 )
 
@@ -211,6 +213,26 @@ def test_verify_legacy_bcrypt_hash() -> None:
     assert is_sha256_api_key_hash(legacy_hash) is False
     assert verify_api_key(full, legacy_hash) is True
     assert verify_api_key(full[:-1] + "y", legacy_hash) is False
+
+
+def test_verification_reports_whether_bcrypt_timing_floor_was_paid() -> None:
+    """Malformed and low-cost bcrypt failures still require dummy padding."""
+    full = "xag_ABC123_" + "x" * KEY_SECRET_LENGTH
+    wrong = full[:-1] + "y"
+    low_cost_hash = bcrypt.hashpw(full.encode(), bcrypt.gensalt(rounds=4)).decode()
+    floor_hash = bcrypt.hashpw(
+        full.encode(), bcrypt.gensalt(rounds=BCRYPT_COST)
+    ).decode()
+
+    assert verify_api_key_with_timing(
+        wrong, "$2b$12$this-is-not-a-valid-bcrypt-hash"
+    ) == ApiKeyVerification(False, False)
+    assert verify_api_key_with_timing(wrong, low_cost_hash) == ApiKeyVerification(
+        False, False
+    )
+    assert verify_api_key_with_timing(wrong, floor_hash) == ApiKeyVerification(
+        False, True
+    )
 
 
 def test_verify_empty_inputs_return_false() -> None:

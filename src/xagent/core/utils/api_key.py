@@ -33,9 +33,10 @@ Why SHA-256 is appropriate here:
 Why ``verify_dummy`` exists:
     Failed authentication retains the legacy bcrypt timing floor so an
     attacker cannot distinguish a missing prefix from a known prefix with a
-    wrong secret. A failed legacy bcrypt check already pays that cost; other
-    failure branches call ``verify_dummy``. Successful current-format
-    authentication deliberately stays on the fast SHA-256 path.
+    wrong secret. A bcrypt check that completed at the configured work factor
+    already pays that cost; other failure branches call ``verify_dummy``.
+    Successful current-format authentication deliberately stays on the fast
+    SHA-256 path.
 """
 
 import hashlib
@@ -72,6 +73,18 @@ class ParsedApiKey(NamedTuple):
     kind: ApiKeyKind
     prefix: str
     secret: str
+
+
+class ApiKeyVerification(NamedTuple):
+    """Verification outcome plus the work already paid on a failed request.
+
+    ``paid_bcrypt_timing_floor`` is true only when bcrypt completed with at
+    least :data:`BCRYPT_COST` rounds. HTTP authentication uses this bit to
+    decide whether a failed request still needs one dummy bcrypt check.
+    """
+
+    verified: bool
+    paid_bcrypt_timing_floor: bool
 
 
 # Length of the public-safe lookup handle. 6 chars over a 62-symbol alphabet
@@ -130,7 +143,12 @@ def hash_api_key(raw: str) -> str:
 
 
 def is_legacy_bcrypt_api_key_hash(stored_hash: object) -> bool:
-    """Return whether ``stored_hash`` is a legacy bcrypt verifier."""
+    """Return whether ``stored_hash`` declares a bcrypt verifier.
+
+    The legacy name is retained for compatibility. This is a long-term read
+    contract, not a removable migration shim: untouched xagent keys can stay
+    bcrypt indefinitely, and downstream consumers still mint bcrypt verifiers.
+    """
     return isinstance(stored_hash, str) and stored_hash.startswith("$2")
 
 
@@ -287,11 +305,20 @@ def parse_api_key(raw: str) -> Optional[ParsedApiKey]:
     return ParsedApiKey(kind=kind, prefix=prefix, secret=secret)
 
 
-def verify_api_key(raw: str, stored_hash: str) -> bool:
-    """Verify a raw API key against a current SHA-256 or legacy bcrypt hash.
+def _bcrypt_paid_timing_floor(stored_hash: str) -> bool:
+    """Whether a completed bcrypt check used at least our dummy work factor."""
+    try:
+        return int(stored_hash.split("$", 3)[2]) >= BCRYPT_COST
+    except (IndexError, ValueError):
+        return False
+
+
+def verify_api_key_with_timing(raw: str, stored_hash: str) -> ApiKeyVerification:
+    """Verify a key and report whether a failure already paid the timing floor.
 
     SHA-256 comparisons use :func:`hmac.compare_digest`. Bcrypt remains a
-    read-only compatibility path for keys issued before the migration.
+    read-only compatibility path for older xagent keys and ecosystem consumers
+    that still store bcrypt verifiers.
 
     Args:
         raw: The full plaintext key. Caller must NOT log this.
@@ -299,7 +326,8 @@ def verify_api_key(raw: str, stored_hash: str) -> bool:
             from a key table's ``key_hash`` column.
 
     Returns:
-        True if and only if the declared verifier confirms the key matches.
+        :class:`ApiKeyVerification` containing the match result and whether a
+        completed bcrypt check used at least :data:`BCRYPT_COST` rounds.
 
     Notes:
         Any malformed input (empty raw, malformed stored_hash) returns
@@ -307,23 +335,39 @@ def verify_api_key(raw: str, stored_hash: str) -> bool:
         and bcrypt's exception cases are treated like a wrong key.
     """
     if not isinstance(raw, str) or not raw:
-        return False
+        return ApiKeyVerification(False, False)
     if not isinstance(stored_hash, str) or not stored_hash:
-        return False
+        return ApiKeyVerification(False, False)
 
     try:
         if is_sha256_api_key_hash(stored_hash):
-            return hmac.compare_digest(hash_api_key(raw), stored_hash)
+            return ApiKeyVerification(
+                hmac.compare_digest(hash_api_key(raw), stored_hash),
+                False,
+            )
 
         if not is_legacy_bcrypt_api_key_hash(stored_hash):
-            return False
-        return bcrypt.checkpw(raw.encode("utf-8"), stored_hash.encode("utf-8"))
+            return ApiKeyVerification(False, False)
+        verified = bcrypt.checkpw(raw.encode("utf-8"), stored_hash.encode("utf-8"))
+        return ApiKeyVerification(
+            verified,
+            _bcrypt_paid_timing_floor(stored_hash),
+        )
     except (ValueError, TypeError):
         # ValueError covers malformed bcrypt strings and UTF-8 encoding
         # failures (including lone surrogates). compare_digest raises
         # TypeError for non-ASCII str values. Stored verifier corruption and
         # malformed caller input both fail closed instead of becoming a 500.
-        return False
+        return ApiKeyVerification(False, False)
+
+
+def verify_api_key(raw: str, stored_hash: str) -> bool:
+    """Return whether ``raw`` matches a current SHA-256 or bcrypt verifier.
+
+    This stable bool API is used by downstream consumers. HTTP authentication
+    uses :func:`verify_api_key_with_timing` to retain failure timing symmetry.
+    """
+    return verify_api_key_with_timing(raw, stored_hash).verified
 
 
 def verify_dummy() -> None:
@@ -331,9 +375,10 @@ def verify_dummy() -> None:
 
     The HTTP authentication layer calls this for missing or malformed
     credentials, prefix misses, current-format or unknown-verifier
-    mismatches, and orphaned owners. A failed legacy bcrypt verification has
-    already paid the compatibility work factor and does not call this again.
-    Successful SHA-256 authentication intentionally performs no dummy work.
+    mismatches, low-cost or malformed bcrypt values, and orphaned owners. A
+    failed bcrypt verification at the configured work factor has already paid
+    the compatibility floor and does not call this again. Successful SHA-256
+    authentication intentionally performs no dummy work.
 
     The return value is intentionally ignored; we only care about the
     side effect of CPU time spent.
