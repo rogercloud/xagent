@@ -181,22 +181,21 @@ def _upgrade_api_key_hash_isolated(
     if not is_legacy_bcrypt_api_key_hash(observed_hash):
         return
 
-    replacement = hash_api_key(raw_key)
-    session_local = get_session_local()
-    db = session_local()
     try:
-        updated = (
-            db.query(key_model)
-            .filter(
-                key_model.key_prefix == key_prefix,
-                key_model.key_hash == observed_hash,
+        replacement = hash_api_key(raw_key)
+        session_local = get_session_local()
+        with session_local.begin() as db:
+            updated = (
+                db.query(key_model)
+                .filter(
+                    key_model.key_prefix == key_prefix,
+                    key_model.key_hash == observed_hash,
+                )
+                .update(
+                    {key_model.key_hash: replacement},
+                    synchronize_session=False,
+                )
             )
-            .update(
-                {key_model.key_hash: replacement},
-                synchronize_session=False,
-            )
-        )
-        db.commit()
         if updated:
             logging.getLogger(__name__).info(
                 "Migrated API key verifier to SHA-256 for table=%s key_prefix=%s",
@@ -204,35 +203,19 @@ def _upgrade_api_key_hash_isolated(
                 key_prefix,
             )
     except Exception:
-        db.rollback()
         logging.getLogger(__name__).warning(
             "Failed to migrate API key verifier for table=%s key_prefix=%s",
             key_model.__tablename__,
             key_prefix,
             exc_info=True,
         )
-    finally:
-        db.close()
 
 
-# A successful legacy check must not turn a same-key request burst into one
-# bcrypt call per default-executor worker. Fixed stripes bound memory while
-# serializing only legacy migration candidates; current SHA-256 keys never
-# touch these locks. Database compare-and-swap remains the cross-process
-# correctness guard.
+# These fixed stripes only suppress concurrent best-effort migration attempts
+# after a legacy key has already verified. Acquisition is non-blocking: request
+# authentication never waits on a stripe, and the database compare-and-swap
+# remains the cross-process correctness guard.
 _LEGACY_HASH_MIGRATION_LOCKS = tuple(threading.Lock() for _ in range(64))
-
-
-def _load_current_key_hash(key_model: type[Any], key_prefix: str) -> str | None:
-    """Re-read one verifier after winning its in-process migration stripe."""
-    session_local = get_session_local()
-    with session_local() as db:
-        current = (
-            db.query(key_model.key_hash)
-            .filter(key_model.key_prefix == key_prefix)
-            .scalar()
-        )
-    return str(current) if current is not None else None
 
 
 def _verify_and_upgrade_api_key_hash(
@@ -241,47 +224,35 @@ def _verify_and_upgrade_api_key_hash(
     key_prefix: str,
     raw_key: str,
     observed_hash: str,
-) -> tuple[bool, str]:
-    """Verify one key and lazily upgrade a legacy verifier without a stampede.
+) -> bool:
+    """Verify a detached hash and best-effort migrate successful legacy keys.
 
-    Returns both the result and the verifier actually checked. Callers use the
-    latter to decide whether a failed path already paid the bcrypt timing floor.
+    Verification never waits on a migration lock. This keeps invalid legacy
+    secrets independent and avoids exposing a persistent timing difference
+    between real and nonexistent prefixes. After a successful bcrypt check, a
+    non-blocking stripe limits in-process migration traffic; losing the stripe
+    only defers migration to a later request.
     """
+    if not verify_api_key(raw_key, observed_hash):
+        return False
     if not is_legacy_bcrypt_api_key_hash(observed_hash):
-        return verify_api_key(raw_key, observed_hash), observed_hash
+        return True
 
     stripe = _LEGACY_HASH_MIGRATION_LOCKS[
         hash((key_model.__tablename__, key_prefix)) % len(_LEGACY_HASH_MIGRATION_LOCKS)
     ]
-    with stripe:
-        # Another request may have migrated this key while this worker waited.
-        try:
-            current_hash = _load_current_key_hash(key_model, key_prefix)
-        except Exception:
-            # Refreshing the verifier only supports the best-effort migration.
-            # The initial active-key lookup already returned a detached hash,
-            # so a transient failure here must not turn a valid legacy key into
-            # a 500. Verify that snapshot and let a later request retry the
-            # migration instead.
-            logging.getLogger(__name__).warning(
-                "Failed to refresh legacy API key verifier for table=%s "
-                "key_prefix=%s; authenticating against detached snapshot",
-                key_model.__tablename__,
-                key_prefix,
-                exc_info=True,
-            )
-            return verify_api_key(raw_key, observed_hash), observed_hash
-        if current_hash is None:
-            return False, ""
-        if not verify_api_key(raw_key, current_hash):
-            return False, current_hash
+    if not stripe.acquire(blocking=False):
+        return True
+    try:
         _upgrade_api_key_hash_isolated(
             key_model,
             key_prefix=key_prefix,
             raw_key=raw_key,
-            observed_hash=current_hash,
+            observed_hash=observed_hash,
         )
-        return True, current_hash
+    finally:
+        stripe.release()
+    return True
 
 
 def active_runtime_key_filters(prefix: str) -> tuple[Any, ...]:
@@ -398,14 +369,14 @@ def _resolve_principal_from_credentials(
     # function. Malformed stored hashes fail closed. A SHA-256 rejection pays
     # the legacy dummy cost so all invalid-key paths retain the timing-oracle
     # defense; successful SHA-256 requests stay fast.
-    verified, checked_hash = _verify_and_upgrade_api_key_hash(
+    verified = _verify_and_upgrade_api_key_hash(
         AgentApiKey,
         key_prefix=prefix,
         raw_key=raw,
         observed_hash=record.key_hash,
     )
     if not verified:
-        _pad_non_bcrypt_auth_failure(checked_hash)
+        _pad_non_bcrypt_auth_failure(record.key_hash)
         raise V1ApiError(V1ErrorCode.INVALID_API_KEY, 401)
 
     # Workforce-bound key: resolves to the workforce itself, never to
@@ -414,7 +385,7 @@ def _resolve_principal_from_credentials(
     if record.workforce_id is not None:
         workforce = record.workforce
         if workforce is None:
-            _pad_non_bcrypt_auth_failure(checked_hash)
+            _pad_non_bcrypt_auth_failure(record.key_hash)
             raise V1ApiError(V1ErrorCode.INVALID_API_KEY, 401)
         return ApiKeyPrincipal(key=record.key, workforce=workforce)
 
@@ -425,7 +396,7 @@ def _resolve_principal_from_credentials(
     # fresh key instead of investigating an imaginary agent.
     agent = record.agent
     if agent is None or is_workforce_generated_manager_agent(agent):
-        _pad_non_bcrypt_auth_failure(checked_hash)
+        _pad_non_bcrypt_auth_failure(record.key_hash)
         raise V1ApiError(V1ErrorCode.INVALID_API_KEY, 401)
 
     return ApiKeyPrincipal(key=record.key, agent=agent)
@@ -605,19 +576,19 @@ def _resolve_user_from_personal_credentials(
 
     # The loading Session is already closed before a possible legacy bcrypt
     # check runs.
-    verified, checked_hash = _verify_and_upgrade_api_key_hash(
+    verified = _verify_and_upgrade_api_key_hash(
         UserApiKey,
         key_prefix=parsed.prefix,
         raw_key=raw,
         observed_hash=record.key_hash,
     )
     if not verified:
-        _pad_non_bcrypt_auth_failure(checked_hash)
+        _pad_non_bcrypt_auth_failure(record.key_hash)
         raise V1ApiError(V1ErrorCode.INVALID_API_KEY, 401)
 
     user = record.user
     if user is None:
-        _pad_non_bcrypt_auth_failure(checked_hash)
+        _pad_non_bcrypt_auth_failure(record.key_hash)
         raise V1ApiError(V1ErrorCode.INVALID_API_KEY, 401)
 
     return user, record.key

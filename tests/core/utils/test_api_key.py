@@ -233,11 +233,19 @@ def test_verify_garbage_hash_returns_false() -> None:
         SHA256_HASH_PREFIX + "0" * 63,
         SHA256_HASH_PREFIX + "0" * 63 + "z",
         SHA256_HASH_PREFIX + "0" * 65,
+        SHA256_HASH_PREFIX + "A" * 64,
+        SHA256_HASH_PREFIX + "é" * 64,
     ],
 )
 def test_verify_malformed_sha256_hash_returns_false(stored_hash: str) -> None:
     full, _prefix, _hash = generate_api_key(db=None)
     assert verify_api_key(full, stored_hash) is False
+
+
+def test_verify_unencodable_raw_key_returns_false() -> None:
+    """A lone surrogate is malformed input, not an internal server error."""
+    _full, _prefix, stored_hash = generate_api_key(db=None)
+    assert verify_api_key(chr(0xD800), stored_hash) is False
 
 
 # ===== verify_dummy =====
