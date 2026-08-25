@@ -165,46 +165,31 @@ def test_legacy_personal_key_wrong_secret_does_not_migrate():
     assert _load_key_hash(UserApiKey, prefix) == legacy_hash
 
 
-def test_legacy_personal_key_uses_snapshot_when_hash_refresh_fails(
+def test_legacy_personal_key_migration_session_failure_does_not_reject_key(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A migration-only reread failure must not reject a valid legacy key."""
+    """Even Session construction for best-effort migration cannot escape."""
     from xagent.web.api.v1 import deps
 
     full_key, prefix = _create_personal_key()
     legacy_hash = bcrypt.hashpw(full_key.encode(), bcrypt.gensalt(rounds=4)).decode()
     _replace_key_hash(UserApiKey, prefix, legacy_hash)
+    original_get_session_local = deps.get_session_local
+    calls = 0
 
-    def fail_refresh(_key_model, _key_prefix):  # type: ignore[no-untyped-def]
-        raise TimeoutError("migration verifier refresh timed out")
+    def fail_migration_session():  # type: ignore[no-untyped-def]
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise RuntimeError("migration Session factory unavailable")
+        return original_get_session_local()
 
-    monkeypatch.setattr(deps, "_load_current_key_hash", fail_refresh)
+    monkeypatch.setattr(deps, "get_session_local", fail_migration_session)
 
     resp = client.get("/v1/me", headers={"Authorization": f"Bearer {full_key}"})
 
     assert resp.status_code == 200, resp.text
-    assert _load_key_hash(UserApiKey, prefix) == legacy_hash
-
-
-def test_legacy_personal_key_refresh_failure_still_rejects_wrong_secret(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Snapshot fallback preserves an opaque 401 for an invalid secret."""
-    from xagent.web.api.v1 import deps
-
-    full_key, prefix = _create_personal_key()
-    legacy_hash = bcrypt.hashpw(full_key.encode(), bcrypt.gensalt(rounds=4)).decode()
-    _replace_key_hash(UserApiKey, prefix, legacy_hash)
-    wrong_key = full_key[:-1] + ("A" if full_key[-1] != "A" else "B")
-
-    def fail_refresh(_key_model, _key_prefix):  # type: ignore[no-untyped-def]
-        raise TimeoutError("migration verifier refresh timed out")
-
-    monkeypatch.setattr(deps, "_load_current_key_hash", fail_refresh)
-
-    resp = client.get("/v1/me", headers={"Authorization": f"Bearer {wrong_key}"})
-
-    _assert_invalid_api_key(resp)
+    assert calls == 2
     assert _load_key_hash(UserApiKey, prefix) == legacy_hash
 
 
@@ -238,45 +223,59 @@ def test_legacy_runtime_key_migrates_after_successful_authentication():
     assert _load_key_hash(AgentApiKey, prefix) == hash_api_key(full_key)
 
 
-def test_concurrent_legacy_runtime_auth_pays_one_bcrypt(
+def test_concurrent_wrong_legacy_secrets_verify_without_serializing(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A same-key request burst cannot stampede the legacy verifier."""
+    """Wrong secrets for a live prefix never wait on a migration stripe."""
     from xagent.web.api.v1 import deps
+    from xagent.web.api.v1.errors import V1ApiError
 
-    agent_id, full_key, prefix = _create_agent_and_key()
+    _agent_id, full_key, prefix = _create_agent_and_key()
     legacy_hash = bcrypt.hashpw(full_key.encode(), bcrypt.gensalt(rounds=4)).decode()
     _replace_key_hash(AgentApiKey, prefix, legacy_hash)
+    wrong_key = full_key[:-1] + ("A" if full_key[-1] != "A" else "B")
     legacy_checks = 0
+    active_checks = 0
+    peak_checks = 0
     count_lock = threading.Lock()
+    verification_barrier = threading.Barrier(8)
     original_verify = deps.verify_api_key
 
     def recording_verify(raw: str, stored_hash: str) -> bool:
-        nonlocal legacy_checks
+        nonlocal active_checks, legacy_checks, peak_checks
         if stored_hash.startswith("$2"):
             with count_lock:
                 legacy_checks += 1
+                active_checks += 1
+                peak_checks = max(peak_checks, active_checks)
+            try:
+                verification_barrier.wait(timeout=2)
+                return original_verify(raw, stored_hash)
+            finally:
+                with count_lock:
+                    active_checks -= 1
         return original_verify(raw, stored_hash)
 
     monkeypatch.setattr(deps, "verify_api_key", recording_verify)
     credentials = HTTPAuthorizationCredentials(
         scheme="Bearer",
-        credentials=full_key,
+        credentials=wrong_key,
     )
-    with ThreadPoolExecutor(max_workers=8) as pool:
-        principals = list(
-            pool.map(
-                lambda _index: deps._resolve_principal_from_credentials(credentials),
-                range(8),
-            )
-        )
 
-    assert all(
-        principal.agent is not None and principal.agent.id == agent_id
-        for principal in principals
-    )
-    assert legacy_checks == 1
-    assert _load_key_hash(AgentApiKey, prefix) == hash_api_key(full_key)
+    def authenticate(_index: int) -> bool:
+        try:
+            deps._resolve_principal_from_credentials(credentials)
+        except V1ApiError:
+            return False
+        return True
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        authenticated = list(pool.map(authenticate, range(8)))
+
+    assert authenticated == [False] * 8
+    assert legacy_checks == 8
+    assert peak_checks == 8
+    assert _load_key_hash(AgentApiKey, prefix) == legacy_hash
 
 
 def test_agent_runtime_key_cannot_authenticate_me():

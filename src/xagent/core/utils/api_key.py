@@ -31,11 +31,11 @@ Why SHA-256 is appropriate here:
     guessing. The versioned storage prefix leaves room for later algorithms.
 
 Why ``verify_dummy`` exists:
-    To prevent a timing oracle: an attacker who can measure response
-    latency must not be able to distinguish "prefix not found" from
-    "prefix found, secret wrong". Both paths must spend the same ~100ms
-    bcrypt work. ``verify_dummy`` is called on the prefix-miss branch to
-    keep timings symmetric.
+    Failed authentication retains the legacy bcrypt timing floor so an
+    attacker cannot distinguish a missing prefix from a known prefix with a
+    wrong secret. A failed legacy bcrypt check already pays that cost; other
+    failure branches call ``verify_dummy``. Successful current-format
+    authentication deliberately stays on the fast SHA-256 path.
 """
 
 import hashlib
@@ -311,28 +311,29 @@ def verify_api_key(raw: str, stored_hash: str) -> bool:
     if not isinstance(stored_hash, str) or not stored_hash:
         return False
 
-    if is_sha256_api_key_hash(stored_hash):
-        return hmac.compare_digest(hash_api_key(raw), stored_hash)
-
-    if not is_legacy_bcrypt_api_key_hash(stored_hash):
-        return False
     try:
+        if is_sha256_api_key_hash(stored_hash):
+            return hmac.compare_digest(hash_api_key(raw), stored_hash)
+
+        if not is_legacy_bcrypt_api_key_hash(stored_hash):
+            return False
         return bcrypt.checkpw(raw.encode("utf-8"), stored_hash.encode("utf-8"))
     except (ValueError, TypeError):
-        # ValueError: bcrypt rejects mangled hash strings.
-        # TypeError: defensive -- shouldn't happen given the encode() above.
+        # ValueError covers malformed bcrypt strings and UTF-8 encoding
+        # failures (including lone surrogates). compare_digest raises
+        # TypeError for non-ASCII str values. Stored verifier corruption and
+        # malformed caller input both fail closed instead of becoming a 500.
         return False
 
 
 def verify_dummy() -> None:
-    """Burn the same ~100ms of bcrypt work that ``verify_api_key`` would.
+    """Burn one legacy bcrypt check on an otherwise fast failure path.
 
-    Call this on the auth path where the prefix lookup missed the index --
-    i.e. the row doesn't exist or is revoked. Without this, the response
-    time for "no such prefix" (fast: index miss returns immediately) would
-    differ visibly from the time for "prefix found, bcrypt rejected"
-    (slow: ~100ms), letting an attacker enumerate which prefixes exist
-    just by timing.
+    The HTTP authentication layer calls this for missing or malformed
+    credentials, prefix misses, current-format or unknown-verifier
+    mismatches, and orphaned owners. A failed legacy bcrypt verification has
+    already paid the compatibility work factor and does not call this again.
+    Successful SHA-256 authentication intentionally performs no dummy work.
 
     The return value is intentionally ignored; we only care about the
     side effect of CPU time spent.
