@@ -8330,7 +8330,7 @@ async def _handle_resume_task_unserialized(
                 f"({outcome.value})",
             )
 
-        async def _notify_resume_already_in_progress() -> None:
+        async def _resync_client_to_running_task() -> None:
             """Correct a stale client on the one path nothing else corrects.
 
             Used only by the already-RUNNING branch. There the row genuinely
@@ -8346,21 +8346,25 @@ async def _handle_resume_task_unserialized(
             exactly when the producer supplied none; passing this handler's
             setup snapshot would ship a value already stale by construction.
 
-            ``type: "error"`` is what the chat client resyncs task status from
-            (``getWebSocketTaskStatus`` in ``app-context-chat.tsx`` reads
-            ``task.status`` and dispatches ``UPDATE_TASK_STATUS``). It also
-            renders a failed chat bubble, which is wrong for an idempotent
-            success. Before #1499 this branch rejected outright with "Task is
-            not paused and cannot be resumed.", so the bubble was correct
-            then and it is the *outcome* that changed underneath it, not the
-            frame. Fixing it properly needs a control-only frame type and a
-            frontend handler that resyncs without ``ADD_MESSAGE``; tracked in
-            #1779. ``task_resumed`` is not a substitute --
-            ``taskEventMatchesControlState`` requires ``control_state`` to be
-            ``running`` for that type and re-applies the stale status
-            otherwise. A ``task_info`` trace event cannot stand in either:
-            the client rebuilds the whole task record from that frame, so a
-            partial payload blanks the title, description, and model ids.
+            ``task_resumed`` rather than ``error``: the command succeeded, and
+            ``case "error"`` in ``app-context-chat.tsx`` unconditionally
+            appends a failed chat bubble, so an error frame would report a
+            success as a failure. ``case "task_resumed"`` is the codebase's
+            control-only shape -- it dispatches ``UPDATE_TASK_STATUS`` with
+            status, run id, state version and control state, and adds no
+            message.
+
+            This type is only usable *here*. ``taskEventMatchesControlState``
+            maps ``task_resumed`` to ``["running"]``, and this branch is the
+            one place that has already established ``control_state`` is
+            ``RUNNING`` -- via a fresh ``task_has_live_runner`` read that also
+            requires an unexpired lease on this exact run. On a branch whose
+            control state is ``resume_requested`` the same frame would fail
+            that match and re-apply the stale status instead.
+
+            A ``task_info`` trace event cannot stand in: the client rebuilds
+            the whole task record from that frame, so a partial payload
+            blanks the title, description, and model ids.
 
             Best-effort by construction: the origin socket is same-worker
             only, so a command claimed after a restart or by another worker
@@ -8371,8 +8375,8 @@ async def _handle_resume_task_unserialized(
             try:
                 await manager.send_personal_message(
                     {
-                        "type": "error",
-                        "message": "Task resume is already in progress.",
+                        "type": "task_resumed",
+                        "message": "Task is already running.",
                         "task": {"id": task_id},
                     },
                     websocket,
@@ -8439,7 +8443,7 @@ async def _handle_resume_task_unserialized(
                     task_id,
                     task_fields.run_id,
                 )
-                await _notify_resume_already_in_progress()
+                await _resync_client_to_running_task()
                 return ResumeCommandResult(ResumeCommandOutcome.ALREADY_IN_PROGRESS)
             if live_runner:
                 # The lease is live; it is the control state that has not

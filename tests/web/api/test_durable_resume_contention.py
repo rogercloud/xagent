@@ -252,11 +252,7 @@ async def test_registered_coordinator_is_an_explicit_idempotent_success(
     # from the snapshot or from the row, would re-confirm the state it was
     # meant to correct. The coordinator's own ``task_resumed`` broadcast is
     # the correction.
-    assert not [
-        call
-        for call in connection_manager.send_personal_message.await_args_list
-        if call.args and call.args[0].get("type") == "error"
-    ]
+    connection_manager.send_personal_message.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -615,7 +611,7 @@ async def test_idempotent_resume_still_corrects_a_stale_client(db_session) -> No
     frames = [
         call.args[0]
         for call in connection_manager.send_personal_message.await_args_list
-        if call.args and call.args[0].get("type") == "error"
+        if call.args and call.args[0].get("type") == "task_resumed"
     ]
     assert len(frames) == 1
     # No state tuple by design: the transport attaches the live row, and the
@@ -647,8 +643,8 @@ async def test_idempotent_resume_frame_is_enriched_with_the_live_row(
 
     enriched = await websocket_api._with_current_task_control_state(
         {
-            "type": "error",
-            "message": "Task resume is already in progress.",
+            "type": "task_resumed",
+            "message": "Task is already running.",
             "task": {"id": int(task.id)},
         }
     )
@@ -867,14 +863,25 @@ async def test_running_resume_correction_reaches_the_client_enriched(
     assert result is not None
     assert result["resume_outcome"] == ResumeCommandOutcome.ALREADY_IN_PROGRESS.value
 
-    frames = [frame for frame in sink.sent if frame.get("type") == "error"]
+    frames = [frame for frame in sink.sent if frame.get("type") == "task_resumed"]
     assert len(frames) == 1
     # The live row, attached by the transport because the handler supplied no
-    # tuple. ``task.status`` is the field the chat client resyncs from.
+    # tuple of its own.
     assert frames[0]["task"]["status"] == TaskStatus.RUNNING.value
     assert frames[0]["task"]["state_version"] == 12
     assert frames[0]["task"]["run_id"] == "run-a"
     assert frames[0]["status"] == TaskStatus.RUNNING.value
+    # Load-bearing for the frame type: the client's
+    # ``taskEventMatchesControlState`` maps ``task_resumed`` to
+    # ``["running"]``, so a control state of anything else -- for instance
+    # ``resume_requested`` on a coordinator branch -- would make the client
+    # discard the event-specific handling and re-apply the stale status
+    # instead. This branch is the one place the control state is already
+    # known to be RUNNING.
+    assert frames[0]["control_state"] == TaskControlState.RUNNING.value
+    # And it must not be an ``error`` frame: that handler appends a failed
+    # chat bubble, which would report this success as a failure.
+    assert not [f for f in sink.sent if f.get("type") in {"error", "task_error"}]
 
 
 @pytest.mark.asyncio
