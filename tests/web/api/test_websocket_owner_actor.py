@@ -2668,6 +2668,7 @@ async def test_durable_resume_propagates_stale_run_error(db_session) -> None:
     _captured, agent, mgr, ws_manager = _patched_manager_and_agent()
     agent.supports_live_control.return_value = True
     bg_mgr = MagicMock()
+    bg_mgr.resume_admission_state.return_value = None
     bg_mgr.try_reserve_resume.return_value = ResumeReservationOutcome.RESERVED
 
     with (
@@ -2960,11 +2961,30 @@ async def test_running_resume_completes_as_explicit_idempotent_success(
 
     assert command is not None
     assert command.result["resume_outcome"] == "already_in_progress"
-    assert not [
-        call
-        for call in ws_manager.send_personal_message.await_args_list
-        if call.args and call.args[0].get("type") == "error"
-    ]
+
+    # The durable row records an idempotent success, but the client that
+    # asked still gets the task's state tuple: the resume control only
+    # renders while the client believes the task is paused, so a silent
+    # completion would leave a stale client clicking resume forever. This is
+    # the payload shape a resume correction has always carried.
+    payload = None
+    for _ in range(100):
+        for call in ws_manager.send_personal_message.await_args_list:
+            if call.args and "task" in call.args[0]:
+                payload = call.args[0]
+                break
+        if payload is not None:
+            break
+        await asyncio.sleep(0.01)
+    else:
+        raise AssertionError("idempotent resume correction did not arrive in time")
+
+    # The handler deliberately supplies no state tuple: its own setup
+    # snapshot can be stale by the time this branch fires, and
+    # ``send_personal_message`` attaches the live row precisely when the
+    # producer supplied none. The attachment is pinned by
+    # ``test_idempotent_resume_frame_is_enriched_with_the_live_row``.
+    assert payload["task"] == {"id": int(task.id)}
 
 
 @pytest.mark.asyncio
@@ -2987,6 +3007,7 @@ async def test_resume_live_control_admin_runs_background_as_owner(db_session) ->
     )
     bg_mgr = MagicMock()
     bg_mgr.running_tasks.get = MagicMock(return_value=None)
+    bg_mgr.resume_admission_state.return_value = None
     bg_mgr.try_reserve_resume.return_value = ResumeReservationOutcome.RESERVED
 
     with (
@@ -3041,6 +3062,7 @@ async def test_resume_registration_failure_cancels_coordinator(db_session) -> No
     captured, agent, mgr, ws_manager = _patched_manager_and_agent()
     agent.supports_live_control = MagicMock(return_value=True)
     bg_mgr = MagicMock()
+    bg_mgr.resume_admission_state.return_value = None
     bg_mgr.try_reserve_resume.return_value = ResumeReservationOutcome.RESERVED
     bg_mgr.running_tasks.get.return_value = None
     bg_mgr.register_reserved_resume.side_effect = RuntimeError("reservation lost")

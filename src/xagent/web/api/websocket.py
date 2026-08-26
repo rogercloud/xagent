@@ -4009,6 +4009,21 @@ class ResumeReservationOutcome(str, enum.Enum):
     SHUTTING_DOWN = "shutting_down"
 
 
+class AnyResumeRun:
+    """Marker admitting a coordinator for *any* run as idempotency evidence.
+
+    Distinguishes "do not check the run" from an explicit ``None``, which
+    means "this task has no run id, so only a coordinator registered without
+    one is evidence". Without the marker a caller that simply had no run id
+    to hand would silently accept a coordinator belonging to a different run.
+    """
+
+    __slots__ = ()
+
+
+ANY_RESUME_RUN = AnyResumeRun()
+
+
 class ResumeCommandOutcome(str, enum.Enum):
     """Durable meaning of one handled RESUME command."""
 
@@ -4021,7 +4036,19 @@ class ResumeCommandOutcome(str, enum.Enum):
 @dataclass(frozen=True)
 class ResumeCommandResult:
     outcome: ResumeCommandOutcome
+    # Human-readable text. Lands in the command row's ``error`` column and,
+    # for deferrals, in the message a budget exhaustion reports.
     reason: str | None = None
+    # Stable machine-readable code, mirroring the ``stale_run`` code the
+    # CANCEL branch already emits. Populates ``result["rejection_reason"]``
+    # so a client can branch without matching human-readable text.
+    reason_code: str | None = None
+    # Whether ``reason`` is wording this module wrote for the sender. Terminal
+    # deferral broadcasts go through the redaction chokepoint, so without this
+    # the text is replaced by the generic string and the deferral becomes
+    # indistinguishable from an outright failure -- see
+    # ``ClientVisibleTaskCommandDeferred``.
+    client_visible: bool = False
 
 
 # Background task manager: ensures only one active background execution per task
@@ -4030,12 +4057,12 @@ class BackgroundTaskManager:
 
     def __init__(self) -> None:
         # task_id -> asyncio.Task
-        self.running_tasks: Dict[int, asyncio.Task] = {}
+        self.running_tasks: dict[int, asyncio.Task] = {}
         # Resume coordinators are deliberately tracked separately while they
         # wait for the current execution. Replacing ``running_tasks[task_id]``
         # too early creates a cycle: the original execution waits for the new
         # resume task while that resume task waits for the original execution.
-        self.resume_tasks: Dict[int, asyncio.Task] = {}
+        self.resume_tasks: dict[int, asyncio.Task] = {}
         # The coordinator is evidence only for the exact run it was created
         # to resume. A lingering old-run task must not complete a command for
         # a newer run as an idempotent success.
@@ -4092,9 +4119,20 @@ class BackgroundTaskManager:
         self,
         task_id: int,
         *,
-        expected_run_id: str | None = None,
+        expected_run_id: str | None | AnyResumeRun,
     ) -> ResumeReservationOutcome | None:
-        """Inspect existing resume ownership without taking an empty slot."""
+        """Classify existing resume ownership without taking an empty slot.
+
+        Returns ``None`` when the slot is free. Not a pure read: a coordinator
+        that has already finished is reclaimed here, dropping both its task
+        and its registered run id, so a finished registration never reports
+        the slot as occupied.
+
+        ``expected_run_id`` is the evidence axis. Pass :data:`ANY_RESUME_RUN`
+        to accept a coordinator for any run; an explicit ``None`` means the
+        task has no run id and only a coordinator registered without one
+        counts.
+        """
 
         if self._shutting_down:
             return ResumeReservationOutcome.SHUTTING_DOWN
@@ -4103,7 +4141,10 @@ class BackgroundTaskManager:
         existing = self.resume_tasks.get(task_id)
         if existing is not None and not existing.done():
             registered_run_id = self._resume_run_ids.get(task_id)
-            if expected_run_id is None or registered_run_id == expected_run_id:
+            if (
+                isinstance(expected_run_id, AnyResumeRun)
+                or registered_run_id == expected_run_id
+            ):
                 return ResumeReservationOutcome.COORDINATOR_RUNNING
             # The task id is still locally occupied, but by a coordinator for
             # another run. It is not evidence that this run is resuming and it
@@ -4118,7 +4159,7 @@ class BackgroundTaskManager:
         self,
         task_id: int,
         *,
-        expected_run_id: str | None = None,
+        expected_run_id: str | None | AnyResumeRun,
     ) -> ResumeReservationOutcome:
         """Atomically classify admission to the live-control resume slot."""
 
@@ -4134,16 +4175,23 @@ class BackgroundTaskManager:
         return ResumeReservationOutcome.RESERVED
 
     def reserve_resume(self, task_id: int) -> bool:
-        """Boolean compatibility wrapper for callers that cannot classify."""
+        """Boolean compatibility wrapper for callers that cannot classify.
 
-        return self.try_reserve_resume(task_id) is ResumeReservationOutcome.RESERVED
+        Keeps the pre-classification contract: any unfinished coordinator
+        reports the slot as taken, whichever run it belongs to.
+        """
+
+        return (
+            self.try_reserve_resume(task_id, expected_run_id=ANY_RESUME_RUN)
+            is ResumeReservationOutcome.RESERVED
+        )
 
     def register_reserved_resume(
         self,
         task_id: int,
         task: asyncio.Task,
         *,
-        run_id: str | None = None,
+        run_id: str | None,
     ) -> None:
         if self._shutting_down:
             task.cancel()
@@ -8152,7 +8200,11 @@ async def _handle_resume_task_unserialized(
                 {"type": "error", "message": "Task not found or access denied"},
                 websocket,
             )
-            return ResumeCommandResult(ResumeCommandOutcome.REJECTED, reason)
+            return ResumeCommandResult(
+                ResumeCommandOutcome.REJECTED,
+                reason,
+                reason_code="task_not_found",
+            )
 
         task_fields = task_setup_snapshot.task
         task_owner_user_id = int(task_fields.user_id)
@@ -8247,20 +8299,89 @@ async def _handle_resume_task_unserialized(
                     },
                     websocket,
                 )
-                return ResumeCommandResult(ResumeCommandOutcome.REJECTED, reason)
+                return ResumeCommandResult(
+                    ResumeCommandOutcome.REJECTED,
+                    reason,
+                    reason_code="interaction_pending",
+                )
 
-        if control_state is TaskControlState.PAUSE_REQUESTED:
-            reason = "Resume command is waiting for the pending pause to settle"
-            if not message_data.get("_durable_ack_sent"):
+        attempt_count = message_data.get("_durable_attempt_count")
+
+        def _log_resume_deferral(classification: str) -> None:
+            # Deferrals are deliberately silent to the client (a retry that
+            # usually resolves within a second is not a failure), so the
+            # command row's ``error`` column is otherwise the only trace. A
+            # stuck queue has to be diagnosable from application logs alone.
+            logger.info(
+                "Deferring resume for task %s run %s: %s (attempt %s)",
+                task_id,
+                task_fields.run_id,
+                classification,
+                attempt_count,
+            )
+
+        def _defer_for_slot(outcome: ResumeReservationOutcome) -> ResumeCommandResult:
+            _log_resume_deferral(
+                f"live-control resume slot is unavailable ({outcome.value})"
+            )
+            return ResumeCommandResult(
+                ResumeCommandOutcome.DEFERRED,
+                "Resume command is waiting for the live-control resume slot "
+                f"({outcome.value})",
+            )
+
+        async def _notify_resume_already_in_progress() -> None:
+            # The durable row records an idempotent success, but the client
+            # that asked for the resume still has to be corrected. The resume
+            # control only renders while the client believes the task is
+            # paused, so without this frame a stale client re-issues the
+            # command forever and never learns the task is already running.
+            # ``type: "error"`` is the frame the chat client resyncs task
+            # status from -- see ``getWebSocketTaskStatus`` in
+            # ``frontend/src/contexts/app-context-chat.tsx``, which reads
+            # ``task.status`` and dispatches ``UPDATE_TASK_STATUS``. A
+            # ``task_info`` trace event cannot stand in: the client rebuilds
+            # the whole task record from that frame, so a payload carrying
+            # only the control tuple blanks the title, description, model
+            # ids, and execution mode.
+            #
+            # Deliberately no state tuple: ``send_personal_message`` runs
+            # ``_with_current_task_control_state``, which attaches the live
+            # row only when the producer supplied none. ``resume_control_state``
+            # is the setup snapshot read at the top of this handler, and on
+            # the COORDINATOR_RUNNING paths the row still reads ``paused``
+            # (the RESUME_REQUESTED transition passes no status), so sending
+            # it would re-confirm the very state this frame exists to correct.
+            #
+            # Best-effort by construction: the origin socket is same-worker
+            # only, so a command claimed after a restart or by another worker
+            # sends this into the discarding sink. The durable outcome, not
+            # this frame, is the authoritative record.
+            try:
                 await manager.send_personal_message(
                     {
                         "type": "error",
-                        "message": "Task pause is still in progress. Please try again.",
-                        "task": {"id": task_id, **resume_control_state},
+                        "message": "Task resume is already in progress.",
+                        "task": {"id": task_id},
                     },
                     websocket,
                 )
-            return ResumeCommandResult(ResumeCommandOutcome.DEFERRED, reason)
+            except Exception:
+                # A half-open socket must not turn an idempotent success into
+                # a durable command failure: the resume really is in flight.
+                logger.warning(
+                    "Could not deliver the resume-already-in-progress notice "
+                    "for task %s",
+                    task_id,
+                    exc_info=True,
+                )
+
+        if control_state is TaskControlState.PAUSE_REQUESTED:
+            _log_resume_deferral("pending pause has not settled")
+            return ResumeCommandResult(
+                ResumeCommandOutcome.DEFERRED,
+                "Resume command is waiting for the pending pause to settle",
+            )
 
         admission_state = background_task_manager.resume_admission_state(
             task_id,
@@ -8272,17 +8393,14 @@ async def _handle_resume_task_unserialized(
                 task_id,
                 task_fields.run_id,
             )
+            await _notify_resume_already_in_progress()
             return ResumeCommandResult(ResumeCommandOutcome.ALREADY_IN_PROGRESS)
-        if admission_state in {
-            ResumeReservationOutcome.RESERVATION_HELD,
-            ResumeReservationOutcome.SHUTTING_DOWN,
-        }:
-            assert admission_state is not None
-            reason = (
-                "Resume command is waiting for the live-control resume slot "
-                f"({admission_state.value})"
-            )
-            return ResumeCommandResult(ResumeCommandOutcome.DEFERRED, reason)
+        if admission_state is not None:
+            # Only RESERVATION_HELD and SHUTTING_DOWN remain: RESERVED is
+            # never returned by an inspection and COORDINATOR_RUNNING
+            # returned above. Both are uncertain rather than terminal, so
+            # they defer for a durable retry.
+            return _defer_for_slot(admission_state)
 
         if task_status is TaskStatus.RUNNING:
             live_runner = await run_db_io_cancellation_safe(
@@ -8297,13 +8415,73 @@ async def _handle_resume_task_unserialized(
                     task_id,
                     task_fields.run_id,
                 )
+                await _notify_resume_already_in_progress()
                 return ResumeCommandResult(ResumeCommandOutcome.ALREADY_IN_PROGRESS)
-            reason = "Resume command is waiting for running-task lease recovery"
-            return ResumeCommandResult(ResumeCommandOutcome.DEFERRED, reason)
+            if live_runner:
+                # The lease is live; it is the control state that has not
+                # settled. Naming the lease here would send whoever reads the
+                # log after the wrong thing.
+                _log_resume_deferral(
+                    "running task holds a live lease but its control state is "
+                    f"{control_state.value}"
+                )
+                return ResumeCommandResult(
+                    ResumeCommandOutcome.DEFERRED,
+                    "Resume command is waiting for the running task's control "
+                    "state to settle",
+                )
+            _log_resume_deferral("running task has no live lease yet")
+            return ResumeCommandResult(
+                ResumeCommandOutcome.DEFERRED,
+                "Resume command is waiting for running-task lease recovery",
+            )
+        if task_status in {
+            TaskStatus.PAUSED,
+            TaskStatus.WAITING_FOR_USER,
+        } and await run_db_io_cancellation_safe(
+            lambda: task_has_live_foreign_runner(task_id)
+        ):
+            # The idempotency evidence above only classifies RUNNING rows,
+            # but a settling turn commits PAUSED/WAITING_FOR_USER while still
+            # holding its lease: the finalizer writes the status and the lease
+            # columns are only cleared later, by ``finish_turn``. Scheduling
+            # into that window steals a live lease, and the previous owner's
+            # ownership-fenced settlement then matches no row and silently
+            # skips its delivery reconciliation. Deferring is bounded: a lease
+            # on a non-RUNNING row cannot be refreshed, so it expires within
+            # ``XAGENT_TASK_LEASE_TTL_SECONDS``. Same-process holds are not
+            # foreign and are already serialised through ``previous_task``.
+            _log_resume_deferral("another process still holds a live task lease")
+            return ResumeCommandResult(
+                ResumeCommandOutcome.DEFERRED,
+                "Resume command is waiting for the active task lease owner",
+                # Same wording, and the same reason for it, as the PAUSE and
+                # CANCEL arms of the shared guard this branch replaces for
+                # RESUME. It has to survive the redaction chokepoint for the
+                # same reason theirs does.
+                client_visible=True,
+            )
 
         # Scope resolution is a scheduling prerequisite, not evidence that an
         # execution already exists. Idempotent and deferred outcomes above
-        # deliberately avoid this potentially expensive off-turn work.
+        # deliberately avoid this potentially expensive off-turn work: on an
+        # agent-cache miss, or a cached-scope-fingerprint mismatch,
+        # ``get_agent_for_task`` below builds a fresh agent from this value,
+        # which can materialize a workspace directory tree and acquire a
+        # sandbox lease.
+        #
+        # ``resolve_execution_scope_off_turn`` has three distinct outcomes:
+        # resolver authoritative with a snapshot disagreement downgrades to
+        # the resolver's own answer; resolver abstention with a widening
+        # snapshot re-raises, refusing the resume outright; resolver
+        # abstention with a narrowing snapshot returns the snapshot itself,
+        # which is persisted, client-influenceable data trusted only because
+        # it was already validated as a narrowing of what the resolver
+        # granted. The turn scheduled below is a different consumer and gets
+        # ``EXECUTION_SCOPE_NOT_PROVIDED`` instead, so it resolves its own
+        # scope fail-closed rather than inheriting this off-turn result. The
+        # equivalent call in ``_handle_pause_task_unserialized`` carries the
+        # same reasoning in full.
         resolved_execution_scope = await run_db_io_cancellation_safe(
             lambda: resolve_execution_scope_off_turn(task_id)
         )
@@ -8328,7 +8506,11 @@ async def _handle_resume_task_unserialized(
                     },
                     websocket,
                 )
-                return ResumeCommandResult(ResumeCommandOutcome.REJECTED, reason)
+                return ResumeCommandResult(
+                    ResumeCommandOutcome.REJECTED,
+                    reason,
+                    reason_code="not_resumable",
+                )
             reservation = background_task_manager.try_reserve_resume(
                 task_id,
                 expected_run_id=task_fields.run_id,
@@ -8338,27 +8520,10 @@ async def _handle_resume_task_unserialized(
                     "Task %s already has a registered resume coordinator",
                     task_id,
                 )
+                await _notify_resume_already_in_progress()
                 return ResumeCommandResult(ResumeCommandOutcome.ALREADY_IN_PROGRESS)
             if reservation is not ResumeReservationOutcome.RESERVED:
-                reason = (
-                    "Resume command is waiting for the live-control resume slot "
-                    f"({reservation.value})"
-                )
-                if not message_data.get("_durable_ack_sent"):
-                    user_message = (
-                        "The server is restarting. Please try resuming again."
-                        if reservation is ResumeReservationOutcome.SHUTTING_DOWN
-                        else "Task resume is being prepared. Please try again shortly."
-                    )
-                    await manager.send_personal_message(
-                        {
-                            "type": "error",
-                            "message": user_message,
-                            "task": {"id": task_id, **resume_control_state},
-                        },
-                        websocket,
-                    )
-                return ResumeCommandResult(ResumeCommandOutcome.DEFERRED, reason)
+                return _defer_for_slot(reservation)
             resume_snapshot: Any | None = None
             bg_task: asyncio.Task[None] | None = None
             try:
@@ -8431,7 +8596,11 @@ async def _handle_resume_task_unserialized(
         await manager.send_personal_message(
             {"type": "error", "message": client_safe_error_message(e)}, websocket
         )
-        return ResumeCommandResult(ResumeCommandOutcome.REJECTED, reason)
+        return ResumeCommandResult(
+            ResumeCommandOutcome.REJECTED,
+            reason,
+            reason_code="invalid_command_payload",
+        )
     except RuntimeError as e:
         # Runtime error
         # No traceback: this branch passes the text through to the client
@@ -8566,12 +8735,16 @@ async def _execute_durable_task_command(
                     message_data,
                 )
                 if resume_result.outcome is ResumeCommandOutcome.DEFERRED:
-                    raise TaskCommandDeferred(
+                    deferral_message = (
                         resume_result.reason or "Resume command will be retried"
                     )
+                    if resume_result.client_visible:
+                        raise ClientVisibleTaskCommandDeferred(deferral_message)
+                    raise TaskCommandDeferred(deferral_message)
                 if resume_result.outcome is ResumeCommandOutcome.REJECTED:
                     raise TaskCommandRejected(
-                        resume_result.reason or "Resume command was rejected"
+                        resume_result.reason or "Resume command was rejected",
+                        reason=resume_result.reason_code,
                     )
             elif command.kind == TaskCommandKind.CANCEL:
                 from .a2a import _cancel_task_unserialized

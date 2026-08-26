@@ -483,6 +483,37 @@ async def test_resume_completes_when_the_target_run_has_a_live_foreign_owner(
 
 
 @pytest.mark.asyncio
+async def test_resume_defers_when_a_settling_turn_still_holds_a_foreign_lease(
+    db_session,
+) -> None:
+    """RESUME still defers for a foreign lease in a state it cannot classify.
+
+    The idempotency evidence only settles RUNNING rows. A turn that has
+    committed WAITING_FOR_USER but whose lease columns have not been cleared
+    yet is not evidence that anything is resuming, so the command must defer
+    rather than schedule into the previous owner's live lease.
+    """
+
+    user, task = _create_running_task(db_session)
+    task.status = TaskStatus.WAITING_FOR_USER
+    task.control_state = "waiting_for_user"
+    db_session.commit()
+    command = ClaimedTaskCommand(
+        id=1,
+        task_id=int(task.id),
+        actor_user_id=int(user.id),
+        command_id="resume-into-foreign-lease",
+        kind=TaskCommandKind.RESUME,
+        payload={"type": "resume_task"},
+        target_run_id="run-1",
+        attempt_count=1,
+    )
+
+    with pytest.raises(TaskCommandDeferred):
+        await execute_durable_task_command(command)
+
+
+@pytest.mark.asyncio
 async def test_cancel_command_does_not_require_persisted_actor(db_session) -> None:
     _user, task = _create_running_task(db_session)
     task.runner_id = None
