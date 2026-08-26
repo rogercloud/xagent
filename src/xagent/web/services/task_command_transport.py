@@ -969,9 +969,17 @@ def task_has_live_foreign_runner(
 def task_has_live_runner(
     task_id: int,
     *,
-    expected_run_id: str | None = None,
+    expected_run_id: str | None,
 ) -> bool:
-    """Return whether the target run currently has an unexpired task lease."""
+    """Return whether the target run currently has an unexpired task lease.
+
+    ``expected_run_id`` is required and has no wildcard: an omitted default
+    would let a lease belonging to a different run stand in as idempotency
+    evidence for the run actually being asked about. An explicit ``None``
+    means the row's own run id is NULL, matching how ``expected_run_id`` reads
+    on ``BackgroundTaskManager.resume_admission_state``. Callers that really
+    do want "any run" should ask ``task_has_live_foreign_runner`` instead.
+    """
 
     from ..models.database import get_session_local
 
@@ -985,9 +993,7 @@ def task_has_live_runner(
             Task.lease_expires_at.is_not(None),
             Task.lease_expires_at >= now,
         )
-        if expected_run_id is not None:
-            query = query.filter(Task.run_id == expected_run_id)
-        return query.first() is not None
+        return query.filter(Task.run_id == expected_run_id).first() is not None
 
 
 CommandExecutor = Callable[[ClaimedTaskCommand], Awaitable[dict[str, Any] | None]]

@@ -8331,32 +8331,43 @@ async def _handle_resume_task_unserialized(
             )
 
         async def _notify_resume_already_in_progress() -> None:
-            # The durable row records an idempotent success, but the client
-            # that asked for the resume still has to be corrected. The resume
-            # control only renders while the client believes the task is
-            # paused, so without this frame a stale client re-issues the
-            # command forever and never learns the task is already running.
-            # ``type: "error"`` is the frame the chat client resyncs task
-            # status from -- see ``getWebSocketTaskStatus`` in
-            # ``frontend/src/contexts/app-context-chat.tsx``, which reads
-            # ``task.status`` and dispatches ``UPDATE_TASK_STATUS``. A
-            # ``task_info`` trace event cannot stand in: the client rebuilds
-            # the whole task record from that frame, so a payload carrying
-            # only the control tuple blanks the title, description, model
-            # ids, and execution mode.
-            #
-            # Deliberately no state tuple: ``send_personal_message`` runs
-            # ``_with_current_task_control_state``, which attaches the live
-            # row only when the producer supplied none. ``resume_control_state``
-            # is the setup snapshot read at the top of this handler, and on
-            # the COORDINATOR_RUNNING paths the row still reads ``paused``
-            # (the RESUME_REQUESTED transition passes no status), so sending
-            # it would re-confirm the very state this frame exists to correct.
-            #
-            # Best-effort by construction: the origin socket is same-worker
-            # only, so a command claimed after a restart or by another worker
-            # sends this into the discarding sink. The durable outcome, not
-            # this frame, is the authoritative record.
+            """Correct a stale client on the one path nothing else corrects.
+
+            Used only by the already-RUNNING branch. There the row genuinely
+            reads ``running``, and no resume is starting, so no
+            ``task_resumed`` broadcast will ever arrive to clear the client's
+            belief that the task is paused -- the resume control renders on
+            local status alone. The coordinator branches are deliberately
+            silent instead: their row still reads ``paused`` until the lease
+            claim, and their coordinator broadcasts the correction itself.
+
+            No state tuple is supplied. ``send_personal_message`` runs
+            ``_with_current_task_control_state``, which attaches the live row
+            exactly when the producer supplied none; passing this handler's
+            setup snapshot would ship a value already stale by construction.
+
+            ``type: "error"`` is what the chat client resyncs task status from
+            (``getWebSocketTaskStatus`` in ``app-context-chat.tsx`` reads
+            ``task.status`` and dispatches ``UPDATE_TASK_STATUS``). It also
+            renders a failed chat bubble, which is wrong for an idempotent
+            success. Before #1499 this branch rejected outright with "Task is
+            not paused and cannot be resumed.", so the bubble was correct
+            then and it is the *outcome* that changed underneath it, not the
+            frame. Fixing it properly needs a control-only frame type and a
+            frontend handler that resyncs without ``ADD_MESSAGE``; tracked in
+            #1779. ``task_resumed`` is not a substitute --
+            ``taskEventMatchesControlState`` requires ``control_state`` to be
+            ``running`` for that type and re-applies the stale status
+            otherwise. A ``task_info`` trace event cannot stand in either:
+            the client rebuilds the whole task record from that frame, so a
+            partial payload blanks the title, description, and model ids.
+
+            Best-effort by construction: the origin socket is same-worker
+            only, so a command claimed after a restart or by another worker
+            sends this into the discarding sink. The durable outcome, not
+            this frame, is the authoritative record.
+            """
+
             try:
                 await manager.send_personal_message(
                     {
@@ -8393,7 +8404,20 @@ async def _handle_resume_task_unserialized(
                 task_id,
                 task_fields.run_id,
             )
-            await _notify_resume_already_in_progress()
+            # No client frame here, and this is a trade rather than a pure
+            # win. A registration lasts the whole resumed execution, so for
+            # most of this window the row already reads ``running`` and a
+            # frame would have carried the correction. Only the slice before
+            # the lease claim reads ``paused`` -- the RESUME_REQUESTED
+            # transition writes just ``control_state`` -- and there a frame
+            # re-confirms the state it was meant to correct.
+            #
+            # The correction is instead the coordinator's own ``task_resumed``
+            # broadcast at lease commit. That is a single unrepeated event,
+            # where re-clicking Resume used to be retriable, so a client that
+            # was momentarily not in ``connections_for_task`` when it fired
+            # stays stale until it reloads. Tracked with the rest of the
+            # coordinator-evidence gaps in #1781.
             return ResumeCommandResult(ResumeCommandOutcome.ALREADY_IN_PROGRESS)
         if admission_state is not None:
             # Only RESERVATION_HELD and SHUTTING_DOWN remain: RESERVED is
@@ -8520,7 +8544,8 @@ async def _handle_resume_task_unserialized(
                     "Task %s already has a registered resume coordinator",
                     task_id,
                 )
-                await _notify_resume_already_in_progress()
+                # Silent for the same reason, and with the same trade, as
+                # the admission-state branch above.
                 return ResumeCommandResult(ResumeCommandOutcome.ALREADY_IN_PROGRESS)
             if reservation is not ResumeReservationOutcome.RESERVED:
                 return _defer_for_slot(reservation)
@@ -8531,6 +8556,27 @@ async def _handle_resume_task_unserialized(
                     task_id,
                     TaskControlState.RESUME_REQUESTED,
                     expected_run_id=task_fields.run_id,
+                    # Every admission decision above was made from the setup
+                    # snapshot. ``expected_run_id`` alone cannot notice a
+                    # writer that moved the row while preserving its run id,
+                    # and the reachable such writer is a competing resume,
+                    # not a cancel: ``_acquire_reply_prelease_sync`` and
+                    # ``_acquire_a2a_resume_prelease_sync`` come in over HTTP,
+                    # bypassing the durable queue entirely, and
+                    # ``acquire_task_lease_no_commit`` keeps the existing run
+                    # (``candidate_run_id = expected_run_id or uuid4()``)
+                    # while bumping ``state_version``. Without this fence a
+                    # v1 reply and a websocket Resume landing together both
+                    # transition the row and schedule two coordinators
+                    # against one lease.
+                    #
+                    # An A2A cancel writes the same shape -- FAILED, lease
+                    # cleared, run id preserved -- but cannot actually
+                    # interleave here: cancels reach the DB only through the
+                    # durable queue, and ``_unfinished_earlier_command``
+                    # serialises commands per task, so a PROCESSING resume
+                    # blocks the cancel from being claimed at all.
+                    expected_state_version=task_fields.state_version,
                 )
                 previous_task = background_task_manager.running_tasks.get(task_id)
                 bg_task = asyncio.create_task(
@@ -8563,17 +8609,33 @@ async def _handle_resume_task_unserialized(
                     bg_task.cancel()
                 background_task_manager.release_resume_reservation(task_id)
                 if resume_snapshot is not None:
-                    await asyncio.shield(
-                        task_execution_controller.transition(
-                            task_id,
-                            (
-                                TaskControlState.WAITING_FOR_USER
-                                if resume_snapshot.status == TaskStatus.WAITING_FOR_USER
-                                else TaskControlState.PAUSED
-                            ),
-                            expected_run_id=resume_snapshot.run_id,
+                    try:
+                        await asyncio.shield(
+                            task_execution_controller.transition(
+                                task_id,
+                                (
+                                    TaskControlState.WAITING_FOR_USER
+                                    if resume_snapshot.status
+                                    == TaskStatus.WAITING_FOR_USER
+                                    else TaskControlState.PAUSED
+                                ),
+                                expected_run_id=resume_snapshot.run_id,
+                                expected_state_version=resume_snapshot.state_version,
+                            )
                         )
-                    )
+                    except StaleTaskRunError:
+                        # Someone else moved the row since the transition this
+                        # is undoing -- a cancel, or the coordinator's own
+                        # lease claim. Their state wins; rolling back would
+                        # resurrect the state we are abandoning. Swallowed
+                        # rather than raised so it cannot mask the failure
+                        # that brought us here.
+                        logger.info(
+                            "Skipped resume rollback for task %s: row moved past "
+                            "state version %s",
+                            task_id,
+                            resume_snapshot.state_version,
+                        )
                 raise
             logger.info(f"Task {task_id} v2 resume scheduled")
             return ResumeCommandResult(ResumeCommandOutcome.SCHEDULED)

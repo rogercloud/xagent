@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from collections.abc import Iterator
 from contextlib import ExitStack, contextmanager
@@ -245,18 +246,17 @@ async def test_registered_coordinator_is_an_explicit_idempotent_success(
     background_manager.try_reserve_resume.assert_not_called()
     background_manager.register_reserved_resume.assert_not_called()
 
-    # This is the path where the handler's setup snapshot is provably stale:
-    # the row still reads ``paused`` because the RESUME_REQUESTED transition
-    # writes no status. The frame must therefore carry no tuple of its own,
-    # so the transport attaches the live row instead of re-confirming the
-    # state the client already believes.
-    frames = [
-        call.args[0]
+    # Deliberately silent. A registered coordinator has not reached its lease
+    # claim, so the live row still reads ``paused`` -- the RESUME_REQUESTED
+    # transition writes only ``control_state`` -- and any frame built here,
+    # from the snapshot or from the row, would re-confirm the state it was
+    # meant to correct. The coordinator's own ``task_resumed`` broadcast is
+    # the correction.
+    assert not [
+        call
         for call in connection_manager.send_personal_message.await_args_list
         if call.args and call.args[0].get("type") == "error"
     ]
-    assert len(frames) == 1
-    assert frames[0]["task"] == {"id": int(task.id)}
 
 
 @pytest.mark.asyncio
@@ -787,3 +787,163 @@ async def test_unresumable_rejection_still_embeds_the_control_tuple(
         "control_state": TaskControlState.RUNNING.value,
         "status": TaskStatus.COMPLETED.value,
     }
+
+
+def _free_slot_manager() -> MagicMock:
+    """A manager whose resume slot is free, so the handler reaches the
+    status-based branches instead of returning on a MagicMock."""
+
+    manager = MagicMock()
+    manager.resume_admission_state.return_value = None
+    manager.running_tasks = {}
+    return manager
+
+
+class _RecordingWebSocket:
+    """Minimal websocket sink that keeps what a client would actually receive."""
+
+    def __init__(self) -> None:
+        self.sent: list[dict] = []
+
+    async def send_text(self, message: str) -> None:
+        self.sent.append(json.loads(message))
+
+
+@pytest.mark.asyncio
+async def test_running_resume_correction_reaches_the_client_enriched(
+    db_session,
+) -> None:
+    """Drive the real send path, not a mock, and read the client-visible frame.
+
+    ``test_idempotent_resume_frame_is_enriched_with_the_live_row`` already
+    pins enrichment, but it calls the enricher directly on a hand-built dict.
+    This one goes through a real ``ConnectionManager`` and a real socket sink
+    from the real durable command, so it also fails if the handler stops
+    routing the frame, or starts supplying a tuple of its own and suppressing
+    enrichment -- both verified by mutation.
+    """
+
+    owner = _user(db_session, "real-send-path-owner")
+    task = _task(
+        db_session,
+        int(owner.id),
+        status=TaskStatus.RUNNING,
+        control_state=TaskControlState.RUNNING,
+    )
+    task.runner_id = "another-process"
+    task.lease_expires_at = datetime.now(timezone.utc) + timedelta(minutes=1)
+    task.state_version = 12
+    db_session.commit()
+
+    sink = _RecordingWebSocket()
+    real_manager = websocket_api.ConnectionManager()
+    real_manager.register_connection(sink, int(task.id))
+    # The durable executor routes personal detail to the command's recorded
+    # origin, never to task membership, so the sink has to be bound as the
+    # origin for this exact command id.
+    command = _command(task, owner, "resume-real-send-path")
+
+    agent = MagicMock()
+    agent.supports_live_control.return_value = True
+    agent_manager = MagicMock()
+    agent_manager.get_agent_for_task = AsyncMock(return_value=agent)
+
+    with (
+        patch("xagent.web.api.chat.get_agent_manager", return_value=agent_manager),
+        patch.object(websocket_api, "manager", real_manager),
+        patch.object(websocket_api, "background_task_manager", _free_slot_manager()),
+    ):
+        websocket_api._command_origins.register(command.command_id, sink, int(task.id))
+        try:
+            result = await _execute_durable_task_command(command)
+        finally:
+            # ``_execute_durable_task_command`` is the inner call, so the
+            # discard that normally runs in ``execute_durable_task_command``
+            # does not; the registry is module-global.
+            websocket_api._command_origins.discard_command(
+                command.command_id, int(task.id)
+            )
+
+    assert result is not None
+    assert result["resume_outcome"] == ResumeCommandOutcome.ALREADY_IN_PROGRESS.value
+
+    frames = [frame for frame in sink.sent if frame.get("type") == "error"]
+    assert len(frames) == 1
+    # The live row, attached by the transport because the handler supplied no
+    # tuple. ``task.status`` is the field the chat client resyncs from.
+    assert frames[0]["task"]["status"] == TaskStatus.RUNNING.value
+    assert frames[0]["task"]["state_version"] == 12
+    assert frames[0]["task"]["run_id"] == "run-a"
+    assert frames[0]["status"] == TaskStatus.RUNNING.value
+
+
+@pytest.mark.asyncio
+async def test_resume_refuses_a_row_that_moved_after_the_admission_snapshot(
+    db_session,
+) -> None:
+    """A cancel landing mid-handler must not get a resume scheduled over it.
+
+    The writes staged here are an A2A cancel's -- terminal status, lease
+    cleared, run id preserved -- because that is the sharpest shape: neither
+    ``expected_run_id`` nor the foreign-lease check notices any of it, so only
+    the state-version fence can. A real A2A cancel cannot interleave at this
+    exact point (the durable queue serialises commands per task), but the
+    reachable writers the fence exists for -- the a2a and v1 reply preleases,
+    which arrive over HTTP and preserve the run id while bumping the version
+    -- move the row the same way as far as this transition can tell.
+    """
+
+    owner = _user(db_session, "cancelled-midflight-owner")
+    task = _task(db_session, int(owner.id))
+    task.state_version = 3
+    db_session.commit()
+    task_id = int(task.id)
+
+    resume_started = asyncio.Event()
+
+    async def execute_resume_background(**_kwargs) -> None:
+        resume_started.set()
+
+    with (
+        _resume_runtime_patches(outcome=ResumeReservationOutcome.RESERVED) as (
+            _background_manager,
+            _connection_manager,
+            _agent_manager,
+        ),
+        patch.object(
+            websocket_api,
+            "execute_resume_background",
+            side_effect=execute_resume_background,
+        ),
+    ):
+        # Land the cancel between the handler's snapshot read and its
+        # transition, which is the window the fence exists for. Scope
+        # resolution is a convenient seam inside that window, not the last
+        # await in it -- ``get_agent_for_task`` runs after it.
+        def land_cancel_then_resolve(*args, **kwargs):
+            row = db_session.query(Task).filter(Task.id == task_id).one()
+            row.status = TaskStatus.FAILED
+            row.control_state = TaskControlState.FAILED.value
+            row.runner_id = None
+            row.lease_expires_at = None
+            row.state_version = 4
+            db_session.commit()
+            return None
+
+        with patch.object(
+            websocket_api,
+            "resolve_execution_scope_off_turn",
+            side_effect=land_cancel_then_resolve,
+        ):
+            with pytest.raises(TaskCommandRejected) as excinfo:
+                await _execute_durable_task_command(
+                    _command(task, owner, "resume-over-a-cancel")
+                )
+
+    assert excinfo.value.reason == "stale_run"
+    assert not resume_started.is_set()
+
+    db_session.expire_all()
+    row = db_session.query(Task).filter(Task.id == task_id).one()
+    assert row.status == TaskStatus.FAILED
+    assert row.control_state == TaskControlState.FAILED.value
