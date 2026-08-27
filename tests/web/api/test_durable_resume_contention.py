@@ -885,7 +885,7 @@ async def test_running_resume_correction_reaches_the_client_enriched(
 
 
 @pytest.mark.asyncio
-async def test_resume_refuses_a_row_that_moved_after_the_admission_snapshot(
+async def test_resume_defers_when_the_row_moves_under_the_admission_snapshot(
     db_session,
 ) -> None:
     """A cancel landing mid-handler must not get a resume scheduled over it.
@@ -913,8 +913,8 @@ async def test_resume_refuses_a_row_that_moved_after_the_admission_snapshot(
 
     with (
         _resume_runtime_patches(outcome=ResumeReservationOutcome.RESERVED) as (
-            _background_manager,
-            _connection_manager,
+            background_manager,
+            connection_manager,
             _agent_manager,
         ),
         patch.object(
@@ -942,12 +942,30 @@ async def test_resume_refuses_a_row_that_moved_after_the_admission_snapshot(
             "resolve_execution_scope_off_turn",
             side_effect=land_cancel_then_resolve,
         ):
-            with pytest.raises(TaskCommandRejected) as excinfo:
+            # Deferred, not rejected. The mover is overwhelmingly likely to
+            # be a competing resume -- the same situation the RUNNING branch
+            # calls an idempotent success -- so a terminal COMMAND_FAILED
+            # would give one interleaving of that race the harshest outcome
+            # in the handler. The retry re-reads the row and re-decides.
+            with pytest.raises(
+                TaskCommandDeferred,
+                match="changed while it was being admitted",
+            ):
                 await _execute_durable_task_command(
                     _command(task, owner, "resume-over-a-cancel")
                 )
 
-    assert excinfo.value.reason == "stale_run"
+    # The raw internal diagnostic must not reach the client. Asserting on the
+    # exception text does not show that -- the pre-check's wording happens not
+    # to contain the phrase either way. What the old code actually did was
+    # fall into the runtime-error arm and send a personal
+    # ``{"type": "error", "message": "Runtime error: ..."}`` frame, so the
+    # absence of any frame at all is the property worth pinning.
+    connection_manager.send_personal_message.assert_not_awaited()
+    # The reservation has to go back, or every later RESUME reads
+    # RESERVATION_HELD and defers itself into a terminal failure -- the exact
+    # outcome this deferral exists to avoid.
+    background_manager.release_resume_reservation.assert_called_once_with(int(task.id))
     assert not resume_started.is_set()
 
     db_session.expire_all()

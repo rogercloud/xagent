@@ -16,6 +16,7 @@ from xagent.web.models.task import Task, TaskStatus
 from xagent.web.models.user import User
 from xagent.web.services.task_execution_controller import (
     StaleTaskRunError,
+    StaleTaskStateVersionError,
     TaskControlState,
     TaskExecutionController,
     apply_task_control_transition,
@@ -277,6 +278,40 @@ def test_transition_rejects_a_stale_state_version(db_session) -> None:
     assert stored.state_version == running.state_version
 
 
+def test_run_and_version_fences_raise_distinguishable_errors(db_session) -> None:
+    """A rotated run and a moved version must not look alike to a caller.
+
+    They mean opposite things: a rotated run targets an execution that no
+    longer exists and is terminal, while a moved version is still this run's
+    row and is worth re-reading. Callers cannot tell them apart by message,
+    so the version fence raises its own subclass.
+    """
+
+    task = _create_task(db_session)
+    running = transition_task_control_state_sync(
+        int(task.id),
+        TaskControlState.RUNNING,
+        status=TaskStatus.RUNNING,
+        new_run=True,
+    )
+
+    with pytest.raises(StaleTaskRunError) as rotated:
+        transition_task_control_state_sync(
+            int(task.id),
+            TaskControlState.PAUSED,
+            expected_run_id="some-other-run",
+        )
+    assert not isinstance(rotated.value, StaleTaskStateVersionError)
+
+    with pytest.raises(StaleTaskStateVersionError):
+        transition_task_control_state_sync(
+            int(task.id),
+            TaskControlState.PAUSED,
+            expected_run_id=running.run_id,
+            expected_state_version=running.state_version - 1,
+        )
+
+
 def test_transition_rejects_a_version_that_moved_under_a_stale_orm_row(
     db_session,
 ) -> None:
@@ -320,7 +355,12 @@ def test_transition_rejects_a_version_that_moved_under_a_stale_orm_row(
             )
             writer.commit()
 
-        with pytest.raises(StaleTaskRunError, match="at state version"):
+        # The rowcount miss cannot tell which fence rejected it, so when a
+        # version was supplied it reports the deferrable type -- the safe half
+        # of that ambiguity, since the retry reads a fresh row and can then
+        # tell precisely. This is the only path that reaches that selection;
+        # the pre-check above covers the unambiguous cases.
+        with pytest.raises(StaleTaskStateVersionError, match="at state version"):
             apply_task_control_transition(
                 stale_row,
                 TaskControlState.RESUME_REQUESTED,

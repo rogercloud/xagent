@@ -145,6 +145,7 @@ from ..services.task_command_transport import (
 )
 from ..services.task_execution_controller import (
     StaleTaskRunError,
+    StaleTaskStateVersionError,
     TaskControlSnapshot,
     TaskControlState,
     apply_task_control_transition,
@@ -6357,7 +6358,7 @@ async def _handle_chat_message_unserialized(
                             "until the resume owner is ready",
                             task_id,
                         )
-                    await task_execution_controller.transition(
+                    handoff_snapshot = await task_execution_controller.transition(
                         task_id,
                         TaskControlState.RESUME_REQUESTED,
                         expected_run_id=task_run_id,
@@ -6369,7 +6370,27 @@ async def _handle_chat_message_unserialized(
                             task_id=task_id,
                             agent_service=agent_service,
                             task_owner_user_id=task_owner_user_id,
-                            expected_run_id=task_run_id,
+                            # Also the transition's run, for the same reason
+                            # as the registration below: a ``None`` here
+                            # reaches ``acquire_task_lease_no_commit``, whose
+                            # ``candidate_run_id = expected_run_id or uuid4()``
+                            # would mint a *second* run and claim the lease
+                            # under it -- leaving the row, the coordinator
+                            # registration, and the execution on three
+                            # different answers for one resume.
+                            #
+                            # Two further effects on that formerly-NULL path,
+                            # both intended. The claim now carries
+                            # ``WHERE run_id = :expected``, so if the run
+                            # rotates before it lands -- the window includes
+                            # the unbounded ``await previous_task`` -- the
+                            # claim returns None and the delivery fails
+                            # cleanly instead of stealing the lease. And the
+                            # ``expected_run_id is None`` branch that clears
+                            # the checkpoint pointers is now skipped, which
+                            # is what a resume wants: those pointers are the
+                            # anchor it is resuming from.
+                            expected_run_id=handoff_snapshot.run_id,
                             previous_task=previous_task,
                             resolved_execution_scope=resolved_execution_scope,
                             pending_user_message=(
@@ -6403,7 +6424,16 @@ async def _handle_chat_message_unserialized(
                     background_task_manager.register_reserved_resume(
                         task_id,
                         bg_task,
-                        run_id=task_run_id,
+                        # The transition's run id, not the routing snapshot's.
+                        # ``apply_task_control_transition`` mints a fresh run
+                        # for a legacy row whose ``run_id`` is NULL, so the
+                        # pre-transition value would register this coordinator
+                        # under ``None`` while the task runs under a uuid. A
+                        # later RESUME asking about that uuid would then read
+                        # a live resume as RESERVATION_HELD and defer itself
+                        # to a terminal failure. The other three registration
+                        # sites already use their post-transition value.
+                        run_id=handoff_snapshot.run_id,
                     )
                     handoff_registered = True
                     if posted:
@@ -8195,7 +8225,6 @@ async def _handle_resume_task_unserialized(
                 user.id,
             )
             reason = "Task not found or access denied"
-            message_data["_durable_command_error"] = reason
             await manager.send_personal_message(
                 {"type": "error", "message": "Task not found or access denied"},
                 websocket,
@@ -8287,7 +8316,6 @@ async def _handle_resume_task_unserialized(
                 reason = (
                     "This task has an unanswered question; answer it before resuming."
                 )
-                message_data["_durable_command_error"] = reason
                 await manager.send_personal_message(
                     {
                         "type": "error",
@@ -8525,7 +8553,6 @@ async def _handle_resume_task_unserialized(
         if getattr(agent_service, "supports_live_control", lambda: False)():
             if task_status not in {TaskStatus.PAUSED, TaskStatus.WAITING_FOR_USER}:
                 reason = "Task is not paused and cannot be resumed."
-                message_data["_durable_command_error"] = reason
                 await manager.send_personal_message(
                     {
                         "type": "error",
@@ -8582,6 +8609,53 @@ async def _handle_resume_task_unserialized(
                     # blocks the cancel from being claimed at all.
                     expected_state_version=task_fields.state_version,
                 )
+            except StaleTaskStateVersionError as exc:
+                # Only the version fence lands here. A rotated run raises the
+                # base class and keeps its old meaning -- the command targets
+                # an execution that no longer exists, nothing will make it
+                # valid, so it propagates and stays terminal.
+                #
+                # The fence added a trigger with the opposite meaning: the row
+                # is still this run's, someone simply wrote first, and the
+                # writer is overwhelmingly a competing resume -- the same
+                # situation the RUNNING branch calls an idempotent success.
+                # Letting that through as terminal would hand one interleaving
+                # of that race the harshest outcome in the handler, and
+                # (because these are RuntimeErrors) leak the raw diagnostic to
+                # the client through the arm below on the way out. That arm
+                # still does so for the rotated-run raise -- deliberate, per
+                # the #1479 note on it -- so what this closes is the leak the
+                # fence itself introduced, not the arm.
+                #
+                # Deferring re-runs the whole admission decision against a
+                # fresh row, so it lands on whichever outcome is actually true
+                # rather than guessing from a snapshot already known to be
+                # stale.
+                #
+                # One imprecision is deliberate: a rotated run caught by the
+                # SQL fence rather than the pre-check cannot be told apart
+                # from a moved version -- the UPDATE carried both predicates
+                # and reports only that it matched nothing -- so it lands here
+                # too and defers once. That costs a single retry, because the
+                # dispatcher re-reads the run before re-entering this handler
+                # and rejects a genuinely rotated one terminally.
+                background_task_manager.release_resume_reservation(task_id)
+                _log_resume_deferral(f"row moved under the admission snapshot ({exc})")
+                return ResumeCommandResult(
+                    ResumeCommandOutcome.DEFERRED,
+                    "Resume command is waiting to re-read a task row that "
+                    "changed while it was being admitted",
+                )
+            except BaseException:
+                # Everything else the transition can fail with -- a rotated
+                # run, a deleted row, a DB error -- keeps its previous
+                # meaning and propagates. The reservation still has to go
+                # back: this arm exists only because splitting the deferral
+                # case out of the block below would otherwise let these
+                # escape without releasing it.
+                background_task_manager.release_resume_reservation(task_id)
+                raise
+            try:
                 previous_task = background_task_manager.running_tasks.get(task_id)
                 bg_task = asyncio.create_task(
                     execute_resume_background(
@@ -8627,18 +8701,24 @@ async def _handle_resume_task_unserialized(
                                 expected_state_version=resume_snapshot.state_version,
                             )
                         )
-                    except StaleTaskRunError:
+                    except (StaleTaskRunError, ValueError):
                         # Someone else moved the row since the transition this
-                        # is undoing -- a cancel, or the coordinator's own
-                        # lease claim. Their state wins; rolling back would
-                        # resurrect the state we are abandoning. Swallowed
-                        # rather than raised so it cannot mask the failure
-                        # that brought us here.
+                        # is undoing -- a cancel, the coordinator's own lease
+                        # claim, or a hard delete, which surfaces as the bare
+                        # ValueError ``transition_task_control_state_sync``
+                        # raises for a missing row. Their outcome wins;
+                        # rolling back would resurrect the state we are
+                        # abandoning. Swallowed rather than raised so it
+                        # cannot mask the failure that brought us here, which
+                        # is the whole point of this arm -- so it has to
+                        # cover every way the rollback can legitimately fail
+                        # to find its row, not just the version fence.
                         logger.info(
                             "Skipped resume rollback for task %s: row moved past "
                             "state version %s",
                             task_id,
                             resume_snapshot.state_version,
+                            exc_info=True,
                         )
                 raise
             logger.info(f"Task {task_id} v2 resume scheduled")
@@ -8655,7 +8735,6 @@ async def _handle_resume_task_unserialized(
     except (ValueError, KeyError, TypeError) as e:
         # Data validation error
         reason = str(e)
-        message_data["_durable_command_error"] = reason
         logger.error(
             "Data validation error resuming task %s: %s", task_id, e, exc_info=True
         )

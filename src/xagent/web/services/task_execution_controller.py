@@ -37,6 +37,22 @@ class StaleTaskRunError(RuntimeError):
     """Raised when a late transition targets an execution that is no longer current."""
 
 
+class StaleTaskStateVersionError(StaleTaskRunError):
+    """The run still matches, but the row moved since the caller read it.
+
+    Separated from its parent because the two mean opposite things to a
+    caller. A rotated run is terminal: the execution being targeted no longer
+    exists and no retry can make it exist. A moved version is not: the row is
+    still this run's, someone simply wrote to it first, so re-reading and
+    re-deciding is the correct response.
+
+    Raised for an ambiguous rowcount miss too. There the UPDATE carried both
+    fences and cannot say which one rejected it, and deferring is the safe
+    half of that ambiguity: the retry reads a fresh row, and a genuinely
+    rotated run is then caught precisely by the run check above.
+    """
+
+
 @dataclass(frozen=True)
 class TaskControlSnapshot:
     task_id: int
@@ -111,7 +127,7 @@ def apply_task_control_transition(
         expected_state_version is not None
         and current_state_version != expected_state_version
     ):
-        raise StaleTaskRunError(
+        raise StaleTaskStateVersionError(
             f"task {task.id} state changed from version "
             f"{expected_state_version} to {current_state_version}"
         )
@@ -161,7 +177,12 @@ def apply_task_control_transition(
                 # this is the line an operator reads while diagnosing a
                 # rejected transition, and blaming the run id when only the
                 # version moved sends them the wrong way.
-                raise StaleTaskRunError(
+                error_type = (
+                    StaleTaskStateVersionError
+                    if expected_state_version is not None
+                    else StaleTaskRunError
+                )
+                raise error_type(
                     f"task {task_id} no longer matches run {expected_run_id} "
                     f"at state version {expected_state_version}"
                 )
