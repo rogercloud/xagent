@@ -185,8 +185,14 @@ def test_no_delivery_producer_can_bypass_the_client_safe_message() -> None:
         f"expected exactly 26 producers, matched {result.producers}; "
         "review the changed sites and bump deliberately"
     )
-    assert result.error_payloads == 35, (
-        f"expected exactly 35 error payloads, matched {result.error_payloads}; "
+    # 35 -> 34 in #1658: ``_resync_client_to_running_task`` used to correct a
+    # stale client with an ``error`` frame even though the command had
+    # succeeded, which the chat client renders as a failed bubble. It now
+    # sends ``task_resumed``, the control-only shape, so one site leaves this
+    # census. A reduction here is the safe direction for what this guard
+    # protects -- one fewer path on which raw text can reach a chat client.
+    assert result.error_payloads == 34, (
+        f"expected exactly 34 error payloads, matched {result.error_payloads}; "
         "review the changed sites and bump deliberately"
     )
     # Every allowlist entry must be earned by a live call site: a stale entry
