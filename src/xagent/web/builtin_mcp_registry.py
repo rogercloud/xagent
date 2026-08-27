@@ -133,6 +133,7 @@ def get_builtin_oauth_provider_rows() -> list[dict[str, Any]]:
                 "chat:write.public",
                 "channels:read",
                 "channels:history",
+                "channels:join",
                 "groups:read",
                 "groups:history",
                 "im:read",
@@ -377,7 +378,7 @@ def get_builtin_public_mcp_app_rows() -> list[dict[str, Any]]:
             "transport": "oauth",
             "provider_name": "google",
             "category": "Scheduling",
-            "oauth_scopes": ["https://www.googleapis.com/auth/calendar"],
+            "oauth_scopes": ["https://www.googleapis.com/auth/calendar.events"],
             "is_visible_in_connector": True,
             "launch_config": {
                 "command": "python",
@@ -697,7 +698,7 @@ def get_builtin_public_mcp_app_rows() -> list[dict[str, Any]]:
         {
             "app_id": "slack",
             "name": "Slack",
-            "description": "Connect to Slack to search and read channel, thread, and DM history, post messages and replies, react to messages, and upload files, e.g. incident summaries and recommended fixes.",
+            "description": "Connect to Slack to search and read channel, thread, and DM history, post messages and replies, react to messages, upload files, and join public channels when asked to, e.g. incident summaries and recommended fixes.",
             "icon": "https://www.google.com/s2/favicons?domain=slack.com&sz=128",
             "transport": "oauth",
             "provider_name": "slack",
@@ -707,6 +708,7 @@ def get_builtin_public_mcp_app_rows() -> list[dict[str, Any]]:
                 "chat:write.public",
                 "channels:read",
                 "channels:history",
+                "channels:join",
                 "groups:read",
                 "groups:history",
                 "im:read",
