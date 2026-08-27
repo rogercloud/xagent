@@ -9028,7 +9028,7 @@ async def _handle_resume_task_unserialized(
                                 expected_state_version=resume_snapshot.state_version,
                             )
                         )
-                    except (StaleTaskRunError, ValueError):
+                    except (StaleTaskRunError, ValueError) as rollback_exc:
                         # Someone else moved the row since the transition this
                         # is undoing -- a cancel, the coordinator's own lease
                         # claim, or a hard delete, which surfaces as the bare
@@ -9040,11 +9040,17 @@ async def _handle_resume_task_unserialized(
                         # is the whole point of this arm -- so it has to
                         # cover every way the rollback can legitimately fail
                         # to find its row, not just the version fence.
+                        # The reason has to come from the exception, not from
+                        # the version fence: this arm also catches a row that
+                        # was deleted outright, and reporting that as an
+                        # ordinary version-fence skip sends whoever reads the
+                        # log after a race that did not happen.
                         logger.info(
-                            "Skipped resume rollback for task %s: row moved past "
-                            "state version %s",
+                            "Skipped resume rollback for task %s (expected "
+                            "state version %s): %s",
                             task_id,
                             resume_snapshot.state_version,
+                            rollback_exc,
                             exc_info=True,
                         )
                 raise

@@ -972,3 +972,67 @@ async def test_resume_defers_when_the_row_moves_under_the_admission_snapshot(
     row = db_session.query(Task).filter(Task.id == task_id).one()
     assert row.status == TaskStatus.FAILED
     assert row.control_state == TaskControlState.FAILED.value
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("late_outcome", "expected"),
+    [
+        (
+            ResumeReservationOutcome.COORDINATOR_RUNNING,
+            ResumeCommandOutcome.ALREADY_IN_PROGRESS,
+        ),
+        (ResumeReservationOutcome.RESERVATION_HELD, None),
+        (ResumeReservationOutcome.SHUTTING_DOWN, None),
+    ],
+)
+async def test_slot_taken_between_admission_and_reservation(
+    db_session,
+    late_outcome: ResumeReservationOutcome,
+    expected: ResumeCommandOutcome | None,
+) -> None:
+    """The second reservation attempt has its own contention branches.
+
+    Admission and reservation are two separate reads of the same slot, with
+    the scope resolution and the agent build -- both of which await, and
+    either of which can be slow -- in between. So the slot can be free at
+    admission and taken by the time it is claimed, which is the only way to
+    reach the branches at the ``try_reserve_resume`` call site rather than at
+    ``resume_admission_state``. Every other test in this file short-circuits
+    at the earlier call, so without this one those branches are unreached.
+    """
+
+    owner = _user(db_session, f"late-contention-{late_outcome.value}")
+    task = _task(db_session, int(owner.id))
+
+    with _resume_runtime_patches(outcome=ResumeReservationOutcome.RESERVED) as (
+        background_manager,
+        _connection_manager,
+        agent_manager,
+    ):
+        # Free at admission, taken by the time the slot is claimed.
+        background_manager.resume_admission_state.return_value = None
+        background_manager.try_reserve_resume.return_value = late_outcome
+
+        if expected is ResumeCommandOutcome.ALREADY_IN_PROGRESS:
+            result = await _execute_durable_task_command(
+                _command(task, owner, f"late-{late_outcome.value}")
+            )
+            assert result is not None
+            assert result["resume_outcome"] == expected.value
+        else:
+            with pytest.raises(TaskCommandDeferred, match="resume slot"):
+                await _execute_durable_task_command(
+                    _command(task, owner, f"late-{late_outcome.value}")
+                )
+
+    # Reaching this call site at all means the earlier admission check passed,
+    # so the expensive prerequisites were paid before the contention showed up
+    # -- which is exactly why this branch has to exist separately.
+    agent_manager.get_agent_for_task.assert_awaited_once()
+    background_manager.try_reserve_resume.assert_called_once_with(
+        int(task.id),
+        expected_run_id="run-a",
+    )
+    # No reservation was taken, so none may be released.
+    background_manager.release_resume_reservation.assert_not_called()
