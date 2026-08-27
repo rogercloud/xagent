@@ -99,7 +99,10 @@ from ..services.chat_history_service import (
     inspect_user_message_delivery,
     mark_user_message_delivery_sync,
 )
-from ..services.client_error_messages import CLIENT_SAFE_TASK_FAILURE
+from ..services.client_error_messages import (
+    CLIENT_SAFE_TASK_FAILURE,
+    CLIENT_SAFE_VALIDATION_ERROR,
+)
 from ..services.db_runtime import (
     await_task_settlement,
     cancel_and_drain_async_task,
@@ -362,9 +365,6 @@ def _client_message_id(value: Any) -> str | None:
 # text in its message - so broadcasts carry CLIENT_SAFE_TASK_FAILURE, never
 # the exception text. Still #1479: whether the sender copy should also be
 # narrowed when the initiator is an anonymous public connection.
-CLIENT_SAFE_VALIDATION_ERROR = "The message could not be processed. Please try again."
-
-
 class ClientVisibleError(Exception):
     """Marker: this exception's text was written for the end user.
 
@@ -398,29 +398,31 @@ class ClientVisibleTaskCommandDeferred(ClientVisibleError, TaskCommandDeferred):
     """
 
 
-def client_safe_error_message(error: BaseException) -> str:
+def client_safe_error_message(
+    error: BaseException,
+    *,
+    fallback: str = CLIENT_SAFE_VALIDATION_ERROR,
+) -> str:
     """The only way an exception may become text a chat client can see.
 
     ``tests/web/api/test_websocket_client_safe_errors.py`` enforces this for
-    the shapes it recognizes: direct calls to the delivery producers, and
-    ``error``/``agent_error`` dict *literals* handed to ``send_personal_message``,
-    ``broadcast_to_task`` or ``send_text``.
+    the shapes it recognizes: delivery producers and known error-event payloads
+    handed to ``send_personal_message``, ``broadcast_to_task`` or ``send_text``.
 
-    It does not reach payloads assembled by a helper, spread into a dict, or
-    forwarded through a wrapper (#1497). It also only ever inspects the
-    ``message`` key of a literal ``type`` it already knows: the background
-    failure broadcast at ``execute_task_background`` is invisible on both
-    counts at once, carrying its text under ``error`` with type ``task_error``
-    (#1497). A ``type`` built from a variable is likewise unseen (#1547).
+    The sweep recognizes the client egress shapes used by this module,
+    including terminal task helpers, dict-spread overrides, both ``message``
+    and ``error`` fields, and the deferred-delivery wrapper. It is still a
+    deliberately small static check rather than general data-flow analysis;
+    for example, a payload ``type`` built from a variable remains outside its
+    scope (#1547).
 
-    Read a passing sweep as "the recognized shapes are clean", never as
-    "nothing reaches a client raw".
+    Read a passing sweep as "the recognized egress shapes are clean", never
+    as "arbitrary Python data flow cannot reach a client raw".
     """
-    if isinstance(error, ClientVisibleError):
-        message = str(error)
-        if message.strip():
-            return message
-    return CLIENT_SAFE_VALIDATION_ERROR
+    if not isinstance(error, ClientVisibleError):
+        return fallback
+    message = str(error)
+    return message if message.strip() else fallback
 
 
 def client_safe_task_command_failure(
@@ -601,7 +603,7 @@ def _terminal_task_error_payload(
             current_payload = _task_error_payload(
                 db,
                 task_id,
-                message,
+                CLIENT_SAFE_TASK_FAILURE,
                 event_type=event_type,
             )
             logger.info(
@@ -643,7 +645,7 @@ def _terminal_task_error_payload(
         return _task_error_payload(
             db,
             task_id,
-            message,
+            CLIENT_SAFE_TASK_FAILURE,
             event_type=event_type,
         )
     except Exception:
@@ -651,7 +653,7 @@ def _terminal_task_error_payload(
         logger.warning("Failed to persist terminal task error", exc_info=True)
         return {
             "type": event_type,
-            "message": message,
+            "message": CLIENT_SAFE_TASK_FAILURE,
             "task": {
                 "id": task_id,
                 "status": TaskStatus.FAILED.value,
@@ -2795,7 +2797,6 @@ async def execute_task_background(
             # Send task completion event (includes agent response info)
             await manager.broadcast_to_task(
                 {
-                    "type": "task_completed",
                     "task": {
                         "id": broadcast_meta["id"],
                         "title": broadcast_meta["title"],
@@ -2812,6 +2813,7 @@ async def execute_task_background(
                     "error_code": result.get("error_code"),
                     "error_details": result.get("error_details"),
                     **control_event_state,
+                    "type": "task_completed",
                     "chat_response": chat_response
                     if isinstance(chat_response, dict)
                     else None,
@@ -2869,6 +2871,10 @@ async def execute_task_background(
             raise
 
         error_message = str(e)
+        client_error_message = client_safe_error_message(
+            e,
+            fallback=CLIENT_SAFE_TASK_FAILURE,
+        )
         terminal_payload = await run_db_io_cancellation_safe(
             lambda: _terminal_task_error_payload(
                 task_id,
@@ -2894,14 +2900,17 @@ async def execute_task_background(
                 f"Background task {task_id} execution failed: {e}", exc_info=True
             )
             # Genuine failure: _terminal_task_error_payload persists FAILED
-            # + the real error_message and builds the notification payload.
+            # + the real error_message for diagnostics. Replace every
+            # client-visible copy in the notification payload: the spread
+            # already carries ``message``, while older clients also read
+            # ``error``.
             try:
-                message = str(e)
                 await manager.broadcast_to_task(
                     {
                         **terminal_payload,
                         "task_id": task_id,
-                        "error": message,
+                        "message": client_error_message,
+                        "error": client_error_message,
                         "timestamp": datetime.now(timezone.utc).timestamp(),
                     },
                     task_id,
@@ -3750,7 +3759,6 @@ async def execute_resume_background(
 
         await manager.broadcast_to_task(
             {
-                "type": "task_completed",
                 "task": {
                     "id": task_id,
                     "title": task_title,
@@ -3766,6 +3774,7 @@ async def execute_resume_background(
                 "error_code": result.get("error_code"),
                 "error_details": result.get("error_details"),
                 **control_event_state,
+                "type": "task_completed",
                 "metadata": result.get("metadata", {}),
                 "timestamp": datetime.now(timezone.utc).timestamp(),
             },
@@ -3857,12 +3866,15 @@ async def execute_resume_background(
                 exc_info=True,
             )
             settlement_error = error_message
-            broadcast_error_message = error_message
+            broadcast_error_message = client_safe_error_message(
+                e,
+                fallback=CLIENT_SAFE_TASK_FAILURE,
+            )
             if delivery_turn_id is not None and not delivery_was_dispatched:
                 if await mark_deferred_delivery_failed():
                     await notify_deferred_delivery(
                         False,
-                        error_message,
+                        CLIENT_SAFE_VALIDATION_ERROR,
                         retry_with_new_id=True,
                         rejection_outcome="not_accepted",
                     )
@@ -3886,10 +3898,22 @@ async def execute_resume_background(
                 )
                 return
         if lease is None:
-            await manager.broadcast_to_task(
-                create_terminal_task_error_event(task_id, error_message),
-                task_id,
-            )
+            if broadcast_error_message is not None:
+                await manager.broadcast_to_task(
+                    create_terminal_task_error_event(
+                        task_id,
+                        broadcast_error_message,
+                    ),
+                    task_id,
+                )
+            else:
+                await manager.broadcast_to_task(
+                    create_terminal_task_error_event(
+                        task_id,
+                        CLIENT_SAFE_TASK_FAILURE,
+                    ),
+                    task_id,
+                )
     finally:
 
         async def finalize_resume_resources() -> None:
@@ -4005,7 +4029,6 @@ async def execute_resume_background(
                                 )
                                 await manager.broadcast_to_task(
                                     {
-                                        "type": event_type,
                                         "task_id": task_id,
                                         "message": message,
                                         "timestamp": datetime.now(
@@ -4016,6 +4039,7 @@ async def execute_resume_background(
                                             if restored_snapshot is not None
                                             else {}
                                         ),
+                                        "type": event_type,
                                     },
                                     task_id,
                                 )
@@ -6187,12 +6211,12 @@ async def _handle_chat_message_unserialized(
             return False
         timestamp = datetime.now(timezone.utc).timestamp()
         if authorized_task_id is not None:
-            error_payload = await _read_task_error_payload_offloop(
+            safe_error_payload = await _read_task_error_payload_offloop(
                 authorized_task_id,
                 CLIENT_SAFE_TASK_FAILURE,
             )
             await manager.broadcast_to_task(
-                {**error_payload, "timestamp": timestamp},
+                {**safe_error_payload, "timestamp": timestamp},
                 authorized_task_id,
             )
             if suppress_delivery_ack:
@@ -7983,7 +8007,10 @@ async def send_historical_data_as_stream(
             "error",
             task_id,
             {
-                "message": f"Data format error: {str(e)}",
+                "message": client_safe_error_message(
+                    e,
+                    fallback="Task history could not be loaded. Please try again.",
+                ),
             },
         )
         await manager.send_personal_message(error_event, websocket)
