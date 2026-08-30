@@ -48,7 +48,7 @@ from .skill_tool import (
 )
 
 READ_FILE_CONTEXT_LIMIT = 12_000
-COMPACT_SUMMARY_MAX_TOKENS = 1024
+COMPACT_SUMMARY_MAX_TOKENS = 8192
 COMPACT_SUMMARY_MIN_TOKENS = 256
 COMPACT_CONTEXT_REF_MAX_TOKENS = 2048
 COMPACT_DROPPED_REF_NOTICE_MAX_CHARS = 2048
@@ -1399,6 +1399,25 @@ class ExecutionContext:
         ]
 
     def _llm_compact_max_tokens(self) -> int:
+        """Output budget for the compaction summary.
+
+        Two bounds, both load-bearing. ``threshold // 4`` is what keeps
+        compaction from looping: the post-compaction context is the summary
+        plus the latest user message, so a summary bounded by a quarter of the
+        threshold is necessarily well under the threshold that triggered this
+        pass. ``COMPACT_SUMMARY_MAX_TOKENS`` bounds it in absolute terms,
+        because the threshold scales with the *input* window while providers
+        cap the *output* separately and much lower -- at a 1M-token window,
+        ``threshold // 4`` alone would ask for ~187k output tokens and the
+        request would simply be rejected, collapsing compaction to the
+        message-dropping fallback it exists to avoid.
+
+        The absolute ceiling was 1024, which bound at every realistic window
+        and left no room for a reasoning model, whose reasoning is drawn from
+        this same allowance and could consume it entirely before any summary
+        text was emitted. 8192 clears that while staying under the output
+        limits mainstream providers actually enforce.
+        """
         return max(
             COMPACT_SUMMARY_MIN_TOKENS,
             min(COMPACT_SUMMARY_MAX_TOKENS, self.compact_config.threshold // 4),

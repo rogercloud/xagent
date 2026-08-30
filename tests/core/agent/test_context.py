@@ -1885,3 +1885,56 @@ def test_clock_timezone_survives_serialization_and_child_contexts() -> None:
 
     child = context.create_child_context(task="sub-task")
     assert child.clock_zone().key == "Australia/Melbourne"
+
+
+def _context_over_threshold(threshold: int) -> ExecutionContext:
+    ctx = ExecutionContext()
+    ctx.compact_config.threshold = threshold
+    ctx.add_user_message("current request")
+    # Token estimation is chars//4, so this clears the threshold and makes the
+    # request materialize.
+    ctx.add_tool_result(
+        "read_file", {"output": "x" * (threshold * 8)}, tool_call_id="call-1"
+    )
+    return ctx
+
+
+def test_llm_compact_budget_scales_with_the_threshold() -> None:
+    """Below the absolute ceiling the budget tracks the threshold.
+
+    The old ceiling of 1024 bound at every realistic window, leaving a
+    reasoning model no room -- its reasoning comes out of this same allowance.
+    """
+    request = _context_over_threshold(20_000).build_llm_compact_request_if_needed()
+
+    assert request is not None
+    assert request["max_tokens"] == 5_000
+
+
+def test_llm_compact_budget_stays_under_provider_output_limits() -> None:
+    """The absolute ceiling is what makes a large window safe.
+
+    The threshold scales with the *input* window, while providers cap the
+    *output* separately and much lower. Without a ceiling a 1M-token window
+    asks for ~187k output tokens, the request is rejected, and compaction
+    collapses into the message-dropping fallback it exists to avoid.
+    """
+    for window_threshold in (96_000, 150_000, 750_000):
+        request = _context_over_threshold(
+            window_threshold
+        ).build_llm_compact_request_if_needed()
+
+        assert request is not None
+        assert request["max_tokens"] == 8192
+
+
+def test_llm_compact_budget_keeps_its_floor_for_a_tiny_threshold() -> None:
+    ctx = ExecutionContext()
+    ctx.compact_config.threshold = 1
+    ctx.add_user_message("current request")
+    ctx.add_tool_result("read_file", {"output": "x" * 400}, tool_call_id="call-1")
+
+    request = ctx.build_llm_compact_request_if_needed()
+
+    assert request is not None
+    assert request["max_tokens"] == 256
