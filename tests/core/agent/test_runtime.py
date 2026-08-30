@@ -1469,3 +1469,75 @@ async def test_compaction_records_that_an_unusable_summary_was_discarded() -> No
     assert any(
         event["data"].get("llm_summary_unusable") is True for event in tracer.events
     )
+
+
+@pytest.mark.asyncio
+async def test_compaction_retries_with_a_smaller_budget_before_truncating() -> None:
+    """The requested budget is a guess; a wrong guess must not cost the summary.
+
+    It follows the model's *input* window, while providers cap the *output*
+    separately and much lower. Nothing in the model config records that limit
+    -- the one number stored per model is a default to send, not a ceiling the
+    model can produce -- so a model whose output cap sits below the requested
+    budget would previously have lost its summary entirely and fallen back to
+    dropping messages, the outcome this path exists to avoid.
+    """
+    context = ExecutionContext(execution_id="budget-retry")
+    context.compact_config.threshold = 32000
+    context.add_user_message("current request")
+    context.add_tool_result(
+        "read_file", {"output": "x" * 200_000}, tool_call_id="call-1"
+    )
+
+    class OutputCappedLLM:
+        model_name = "compact-test"
+
+        def __init__(self) -> None:
+            self.budgets: list[int] = []
+
+        async def chat(self, **kwargs: Any) -> Any:
+            budget = kwargs["max_tokens"]
+            self.budgets.append(budget)
+            if budget > 1024:
+                raise RuntimeError("max_tokens is too large for this model")
+            return {"content": "summary within the model's output cap"}
+
+    llm = OutputCappedLLM()
+    result = await PatternRuntime().compact_context_if_needed(
+        context=context, llm=llm, metadata={"phase": "test"}
+    )
+
+    # Asked big, was refused, asked small, succeeded -- and summarized rather
+    # than dropping messages.
+    assert llm.budgets == [8000, 256]
+    assert result.compacted
+    assert result.strategy == "llm_summary"
+    assert "output cap" in context.messages[0].content
+
+
+@pytest.mark.asyncio
+async def test_compaction_does_not_retry_when_already_at_the_floor() -> None:
+    """A failure at the smallest budget is not a budget problem."""
+    context = ExecutionContext(execution_id="budget-floor")
+    context.compact_config.threshold = 1
+    context.add_user_message("current request")
+    context.add_tool_result("read_file", {"output": "x" * 200}, tool_call_id="call-1")
+
+    class AlwaysFailingLLM:
+        model_name = "compact-test"
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def chat(self, **kwargs: Any) -> Any:
+            self.calls += 1
+            raise RuntimeError("upstream is down")
+
+    llm = AlwaysFailingLLM()
+    result = await PatternRuntime().compact_context_if_needed(
+        context=context, llm=llm, metadata={"phase": "test"}
+    )
+
+    assert llm.calls == 1
+    assert result.strategy == "truncate"
+    assert "upstream is down" in result.metadata["llm_compact_error"]

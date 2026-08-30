@@ -21,6 +21,7 @@ from ..context_materializer import (
     materialize_llm_kwargs,
 )
 from ..model.chat.basic.base import BaseLLM
+from ..model.chat.error import retry_on
 from ..model.chat.exceptions import LLMToolProtocolError
 from ..model.chat.token_context import extract_cached_input_tokens
 from ..model.chat.tool_protocol import TOOL_PROTOCOL_ERROR_KEY
@@ -33,6 +34,7 @@ from ..tools.user_interaction import (
     WAITING_FOR_USER_STATUS,
     tool_result_waits_for_user,
 )
+from .context.execution import COMPACT_SUMMARY_MIN_TOKENS
 from .result import normalize_tool_failure_code, tool_result_succeeded
 from .streaming import merge_streamed_tool_call_arguments
 
@@ -1242,6 +1244,68 @@ class PatternRuntime:
             },
         )
 
+    async def _run_compact_llm_call(
+        self,
+        llm: Any,
+        *,
+        messages: list[dict[str, Any]],
+        max_tokens: int,
+        metadata: dict[str, Any],
+        outcome: dict[str, Any],
+    ) -> Any:
+        """Ask for a summary, and if the budget was the problem, ask for less.
+
+        The requested budget is derived from the compaction threshold, which
+        follows the model's *input* window; providers cap the *output*
+        separately and much lower, and nothing in the model config records
+        that limit -- the one number stored per model is a default to send,
+        not a ceiling the model can produce. So the budget is a guess, and a
+        wrong guess previously meant the whole summary was abandoned and
+        compaction fell back to dropping messages, which is the outcome this
+        whole path exists to avoid.
+
+        Retrying smaller lets the provider answer the question we cannot:
+        ``COMPACT_SUMMARY_MIN_TOKENS`` is the floor the code used before the
+        budget was raised, so it is a value known to have worked. This also
+        keeps a future mis-set ceiling from silently costing the summary.
+        """
+        try:
+            return await self.run_llm_call(
+                llm, messages=messages, max_tokens=max_tokens
+            )
+        except LLMCallInterrupted:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            if max_tokens <= COMPACT_SUMMARY_MIN_TOKENS:
+                raise
+            if retry_on(exc):
+                # Transient by class -- the LLM object is already wrapped in
+                # backoff retries, so reaching here means those are spent.
+                # Sending the same request again with a smaller output budget
+                # would not address the cause and would double an outage's
+                # cost, for a fallback that is free.
+                raise
+            if self._interrupt_requested:
+                raise
+            logger.warning(
+                "Context compaction summary failed at max_tokens=%d; retrying "
+                "at %d. Error: %s",
+                max_tokens,
+                COMPACT_SUMMARY_MIN_TOKENS,
+                exc,
+            )
+            try:
+                response = await self.run_llm_call(
+                    llm, messages=messages, max_tokens=COMPACT_SUMMARY_MIN_TOKENS
+                )
+            except Exception as retry_exc:
+                # Surface both: the retry's error is what stopped us, but the
+                # first one is the one that says the budget was suspect.
+                raise retry_exc from exc
+            metadata["compact_budget_reduced_to"] = COMPACT_SUMMARY_MIN_TOKENS
+            outcome["compact_budget_reduced_to"] = COMPACT_SUMMARY_MIN_TOKENS
+            return response
+
     async def compact_context_if_needed(
         self,
         *,
@@ -1263,6 +1327,10 @@ class PatternRuntime:
         # is indistinguishable in the trace from compaction that never tried
         # to summarize at all.
         unusable_summary_metadata: dict[str, Any] | None = None
+        # Written by ``_run_compact_llm_call`` when it had to lower the
+        # budget, so the compact trace event can say so alongside the other
+        # degrade markers.
+        compact_outcome: dict[str, Any] = {}
         if (
             llm is not None
             and callable(getattr(llm, "chat", None))
@@ -1279,10 +1347,12 @@ class PatternRuntime:
                         messages=request["messages"],
                         metadata=llm_metadata,
                     )
-                    response = await self.run_llm_call(
+                    response = await self._run_compact_llm_call(
                         llm,
                         messages=request["messages"],
                         max_tokens=request["max_tokens"],
+                        metadata=llm_metadata,
+                        outcome=compact_outcome,
                     )
                     await self.on_llm_end(
                         context=context,
@@ -1296,6 +1366,7 @@ class PatternRuntime:
                     )
                     for key, value in request_metadata.items():
                         result.metadata.setdefault(key, value)
+                    result.metadata.update(compact_outcome)
                     if not getattr(result, "compacted", False):
                         logger.warning(
                             "Context compaction summary was unusable; falling "
