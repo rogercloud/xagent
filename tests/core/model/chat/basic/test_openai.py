@@ -1724,14 +1724,27 @@ class TestFieldContent:
         assert field_content(delta, "reasoning_content") == (True, "step 1")
 
 
-def _bad_request(message: str) -> openai.BadRequestError:
+def _bad_request(
+    message: str,
+    *,
+    param: str | None = None,
+    code: str | None = None,
+    metadata: dict | None = None,
+) -> openai.BadRequestError:
+    error_payload: dict = {"message": message, "type": "invalid_request_error"}
+    if code is not None:
+        error_payload["code"] = code
+    if param is not None:
+        error_payload["param"] = param
+    if metadata is not None:
+        error_payload["metadata"] = metadata
     return openai.BadRequestError(
         f"Error code: 400 - {{'error': {{'message': '{message}'}}}}",
         response=httpx.Response(
             400,
             request=httpx.Request("POST", "https://api.openai.com/v1/chat/completions"),
         ),
-        body={"error": {"message": message, "code": 400}},
+        body={"error": error_payload},
     )
 
 
@@ -1855,8 +1868,11 @@ class TestRejectedParameterDegrade:
         ``provider_raw`` can echo a whole request body -- from starting a
         retry that cannot help."""
         mock_client = mocker.AsyncMock()
+        # A real out-of-range rejection names the same param as an
+        # unsupported-parameter one; the param alone must not be taken as
+        # licence to rename.
         mock_client.chat.completions.create.side_effect = _bad_request(
-            "max_tokens is too large: 200000"
+            "max_tokens is too large: 200000", param="max_tokens"
         )
         mocker.patch(
             "xagent.core.model.chat.basic.openai.AsyncOpenAI",
@@ -2038,3 +2054,164 @@ class TestReasoningFallbackIsDeclared:
         response = await llm.chat([{"role": "user", "content": "Summarize."}])
 
         assert CONTENT_SOURCE_KEY not in response
+
+
+class TestRejectedParameterIdentification:
+    """Which parameter a 400 is about, when the text alone cannot say.
+
+    ``_format_openai_error`` appends ``provider_raw`` and ``previous_errors``,
+    so for a gateway that tried several upstreams the message is several
+    providers' complaints concatenated. A keyword found there may belong to an
+    attempt unrelated to this failure.
+    """
+
+    @pytest.mark.asyncio
+    async def test_echoed_request_does_not_condemn_an_unrejected_parameter(
+        self, openai_llm_config, mock_chat_completion, mocker
+    ):
+        """The rejection is about response_format; an earlier upstream in the
+        gateway's chain merely grumbled about max_tokens. Renaming max_tokens
+        here would spend the one retry on a parameter this endpoint accepts,
+        and lose the response_format recovery that would have worked.
+        """
+        mock_client = mocker.AsyncMock()
+        mock_client.chat.completions.create.side_effect = [
+            _bad_request(
+                "Unsupported parameter: 'response_format' is not supported "
+                "with this model.",
+                param="response_format",
+                metadata={
+                    "provider_name": "upstream-a",
+                    "previous_errors": (
+                        '{"error": "max_tokens must be <= 4096 for this model"}'
+                    ),
+                },
+            ),
+            mock_chat_completion,
+        ]
+        mocker.patch(
+            "xagent.core.model.chat.basic.openai.AsyncOpenAI",
+            return_value=mock_client,
+        )
+
+        llm = OpenAILLM(**openai_llm_config)
+        await llm.chat(
+            [{"role": "user", "content": "Summarize."}],
+            max_tokens=5000,
+            response_format={"type": "json_object"},
+        )
+
+        assert mock_client.chat.completions.create.await_count == 2
+        retry_kwargs = mock_client.chat.completions.create.call_args_list[1].kwargs
+        assert "response_format" not in retry_kwargs
+        assert retry_kwargs["max_tokens"] == 5000
+        assert "max_completion_tokens" not in retry_kwargs
+
+    @pytest.mark.asyncio
+    async def test_explicit_param_settles_it_without_reading_the_text(
+        self, openai_llm_config, mock_chat_completion, mocker
+    ):
+        """Even a message that names max_completion_tokens does not override
+        the endpoint's own answer about which parameter it rejected."""
+        mock_client = mocker.AsyncMock()
+        mock_client.chat.completions.create.side_effect = [
+            _bad_request(
+                "response_format rejected; note this model wants "
+                "max_completion_tokens in general.",
+                param="response_format",
+            ),
+            mock_chat_completion,
+        ]
+        mocker.patch(
+            "xagent.core.model.chat.basic.openai.AsyncOpenAI",
+            return_value=mock_client,
+        )
+
+        llm = OpenAILLM(**openai_llm_config)
+        await llm.chat(
+            [{"role": "user", "content": "Summarize."}],
+            max_tokens=5000,
+            response_format={"type": "json_object"},
+        )
+
+        retry_kwargs = mock_client.chat.completions.create.call_args_list[1].kwargs
+        assert "response_format" not in retry_kwargs
+        assert retry_kwargs["max_tokens"] == 5000
+
+
+class TestSequentiallyRejectedParameters:
+    """Endpoints commonly report one invalid parameter per response."""
+
+    @pytest.mark.asyncio
+    async def test_two_rejections_in_a_row_are_both_degraded(
+        self, openai_llm_config, mock_chat_completion, mocker
+    ):
+        mock_client = mocker.AsyncMock()
+        mock_client.chat.completions.create.side_effect = [
+            _bad_request(
+                _MAX_TOKENS_REJECTION, param="max_tokens", code="unsupported_parameter"
+            ),
+            _bad_request(
+                "Unsupported parameter: 'response_format'.",
+                param="response_format",
+            ),
+            mock_chat_completion,
+        ]
+        mocker.patch(
+            "xagent.core.model.chat.basic.openai.AsyncOpenAI",
+            return_value=mock_client,
+        )
+
+        llm = OpenAILLM(**openai_llm_config)
+        response = await llm.chat(
+            [{"role": "user", "content": "Summarize."}],
+            max_tokens=5000,
+            response_format={"type": "json_object"},
+        )
+
+        assert response["content"] == "Hello World"
+        assert mock_client.chat.completions.create.await_count == 3
+        final_kwargs = mock_client.chat.completions.create.call_args_list[2].kwargs
+        assert final_kwargs["max_completion_tokens"] == 5000
+        assert "response_format" not in final_kwargs
+
+    @pytest.mark.asyncio
+    async def test_the_loop_is_bounded_by_the_supported_degrades(
+        self, openai_llm_config, mocker
+    ):
+        """Bounded by construction: each degrade removes or renames a
+        parameter and fires only while that parameter is still present, so an
+        endpoint that keeps rejecting the same one cannot spin.
+
+        Four identical rejections are queued for two degradable parameters;
+        the loop must stop after three requests, not consume them all.
+        """
+        mock_client = mocker.AsyncMock()
+        mock_client.chat.completions.create.side_effect = [
+            _bad_request(
+                _MAX_TOKENS_REJECTION, param="max_tokens", code="unsupported_parameter"
+            ),
+            _bad_request(
+                "Unsupported parameter: 'response_format'.", param="response_format"
+            ),
+            _bad_request(
+                _MAX_TOKENS_REJECTION, param="max_tokens", code="unsupported_parameter"
+            ),
+            _bad_request(
+                _MAX_TOKENS_REJECTION, param="max_tokens", code="unsupported_parameter"
+            ),
+        ]
+        mocker.patch(
+            "xagent.core.model.chat.basic.openai.AsyncOpenAI",
+            return_value=mock_client,
+        )
+
+        llm = OpenAILLM(**openai_llm_config)
+        with pytest.raises(RuntimeError):
+            await llm.chat(
+                [{"role": "user", "content": "Summarize."}],
+                max_tokens=5000,
+                response_format={"type": "json_object"},
+            )
+
+        assert mock_client.chat.completions.create.await_count == 3
