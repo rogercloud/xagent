@@ -11,7 +11,13 @@ from ....utils.security import redact_sensitive_text
 from ..exceptions import LLMEmptyContentError, LLMRetryableError, LLMTimeoutError
 from ..timeout_config import TimeoutConfig
 from ..token_context import add_token_usage, extract_cached_input_tokens
-from ..types import PROVIDER_STATE_METADATA_KEY, ChunkType, StreamChunk
+from ..types import (
+    CONTENT_SOURCE_KEY,
+    CONTENT_SOURCE_REASONING_FALLBACK,
+    PROVIDER_STATE_METADATA_KEY,
+    ChunkType,
+    StreamChunk,
+)
 from .base import BaseLLM
 
 logger = logging.getLogger(__name__)
@@ -601,6 +607,7 @@ class OpenAICompatibleLLM(BaseLLM):
                     return {
                         "type": "text",
                         "content": reasoning_content,
+                        CONTENT_SOURCE_KEY: CONTENT_SOURCE_REASONING_FALLBACK,
                         "reasoning_content": reasoning_content,
                         "reasoning": reasoning_content,
                         "raw": resp.model_dump(),
@@ -950,6 +957,7 @@ class OpenAICompatibleLLM(BaseLLM):
                     return {
                         "type": "text",
                         "content": reasoning_content,
+                        CONTENT_SOURCE_KEY: CONTENT_SOURCE_REASONING_FALLBACK,
                         "reasoning_content": reasoning_content,
                         "reasoning": reasoning_content,
                         "raw": response.model_dump(),

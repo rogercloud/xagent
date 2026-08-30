@@ -11,6 +11,7 @@ import pytest
 from openai.types.chat.chat_completion_chunk import ChoiceDelta
 from pydantic import BaseModel, ConfigDict
 
+from xagent.core.agent.context.execution import ExecutionContext
 from xagent.core.model.chat.basic.base import BaseLLM
 from xagent.core.model.chat.basic.openai import (
     PROVIDER_STATE_METADATA_KEY,
@@ -20,6 +21,10 @@ from xagent.core.model.chat.basic.openai import (
 )
 from xagent.core.model.chat.error import retry_on
 from xagent.core.model.chat.exceptions import LLMEmptyContentError, LLMRetryableError
+from xagent.core.model.chat.types import (
+    CONTENT_SOURCE_KEY,
+    CONTENT_SOURCE_REASONING_FALLBACK,
+)
 from xagent.core.retry.strategy import FixedDelay
 from xagent.core.retry.wrapper import create_retry_wrapper
 
@@ -1945,3 +1950,91 @@ class TestRejectedParameterDegrade:
         retry_kwargs = mock_client.chat.completions.create.call_args_list[1].kwargs
         assert retry_kwargs["max_completion_tokens"] == 5000
         assert retry_kwargs["extra_body"] == {"probe": 1}
+
+
+class TestReasoningFallbackIsDeclared:
+    """The client marks content it substituted, and compaction honours it.
+
+    These two live in different packages; without a test that runs the real
+    producer into the real consumer, a change to the response shape on one
+    side would silently stop the other from recognising it.
+    """
+
+    @staticmethod
+    def _truncated_reasoning_completion():
+        message = SimpleNamespace(
+            role="assistant",
+            content="",
+            tool_calls=None,
+            reasoning_content="Let me think about the file first",
+        )
+        return SimpleNamespace(
+            choices=[SimpleNamespace(message=message, finish_reason="length")],
+            usage=None,
+            model_dump=lambda: {"choices": [{"finish_reason": "length"}]},
+        )
+
+    @pytest.mark.asyncio
+    async def test_client_marks_a_substituted_reasoning_trace(
+        self, openai_llm_config, mocker
+    ):
+        mock_client = mocker.AsyncMock()
+        mock_client.chat.completions.create.return_value = (
+            self._truncated_reasoning_completion()
+        )
+        mocker.patch(
+            "xagent.core.model.chat.basic.openai.AsyncOpenAI",
+            return_value=mock_client,
+        )
+
+        llm = OpenAILLM(**openai_llm_config)
+        response = await llm.chat([{"role": "user", "content": "Summarize."}])
+
+        assert response["content"] == "Let me think about the file first"
+        assert response[CONTENT_SOURCE_KEY] == CONTENT_SOURCE_REASONING_FALLBACK
+
+    @pytest.mark.asyncio
+    async def test_compaction_rejects_what_the_client_marked(
+        self, openai_llm_config, mocker
+    ):
+        """The producer's real output, fed to the real consumer."""
+        mock_client = mocker.AsyncMock()
+        mock_client.chat.completions.create.return_value = (
+            self._truncated_reasoning_completion()
+        )
+        mocker.patch(
+            "xagent.core.model.chat.basic.openai.AsyncOpenAI",
+            return_value=mock_client,
+        )
+
+        llm = OpenAILLM(**openai_llm_config)
+        response = await llm.chat([{"role": "user", "content": "Summarize."}])
+
+        context = ExecutionContext()
+        context.compact_config.threshold = 1
+        context.add_user_message("current request")
+        context.add_tool_result(
+            "read_file", {"output": "x" * 200}, tool_call_id="call-1"
+        )
+        before = list(context.messages)
+
+        result = context.compact_with_llm_response(response, llm=None)
+
+        assert not result.compacted
+        assert context.messages == before
+
+    @pytest.mark.asyncio
+    async def test_an_ordinary_answer_carries_no_marker(
+        self, openai_llm_config, mock_chat_completion, mocker
+    ):
+        mock_client = mocker.AsyncMock()
+        mock_client.chat.completions.create.return_value = mock_chat_completion
+        mocker.patch(
+            "xagent.core.model.chat.basic.openai.AsyncOpenAI",
+            return_value=mock_client,
+        )
+
+        llm = OpenAILLM(**openai_llm_config)
+        response = await llm.chat([{"role": "user", "content": "Summarize."}])
+
+        assert CONTENT_SOURCE_KEY not in response

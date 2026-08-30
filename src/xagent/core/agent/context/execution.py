@@ -17,6 +17,10 @@ from ...context_ref import (
     split_tool_result_supersedes_scope,
 )
 from ...file_ref import FILE_REF_MODEL_INSTRUCTIONS
+from ...model.chat.types import (
+    CONTENT_SOURCE_KEY,
+    CONTENT_SOURCE_REASONING_FALLBACK,
+)
 from ...tools.artifacts import (
     format_tool_result_for_observation,
     sanitize_tool_result_for_public_context,
@@ -1146,7 +1150,11 @@ class ExecutionContext:
         original_tokens: int | None = None,
     ) -> CompactResult:
         original_count = len(self.messages)
-        summary = self._compact_response_text(response).strip()
+        summary = (
+            ""
+            if self._is_reasoning_fallback(response)
+            else self._compact_response_text(response).strip()
+        )
         if not summary:
             return CompactResult(
                 compacted=False,
@@ -1441,6 +1449,28 @@ class ExecutionContext:
                 if context_refs_text:
                     chunks.append(context_refs_text)
         return "\n".join(chunks)
+
+    @staticmethod
+    def _is_reasoning_fallback(response: Any) -> bool:
+        """True when the client substituted a reasoning trace for content.
+
+        A reasoning model that spends its whole output budget thinking returns
+        no content, and the OpenAI-compatible client surfaces the trace in its
+        place so a caller does not read a truncated-but-healthy response as an
+        empty one -- reasonable for a connection test, wrong here. The summary
+        replaces every prior message, so accepting a chain of thought as the
+        summary rewrites the agent's history into deliberation it never
+        concluded. Better to have no summary and fall back to dropping
+        messages, which at least leaves real ones.
+
+        The client declares the substitution rather than leaving it to be
+        recognised by shape, so this cannot drift apart from the code that
+        performs it.
+        """
+        return (
+            isinstance(response, dict)
+            and response.get(CONTENT_SOURCE_KEY) == CONTENT_SOURCE_REASONING_FALLBACK
+        )
 
     def _compact_response_text(self, response: Any) -> str:
         if isinstance(response, str):
