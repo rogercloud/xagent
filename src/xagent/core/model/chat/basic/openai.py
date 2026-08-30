@@ -69,6 +69,42 @@ def _openai_error_details(error: BaseException) -> list[str]:
     return details
 
 
+def _degrade_rejected_params(
+    completion_params: dict[str, Any], error_msg: str
+) -> list[str]:
+    """Drop or rename request parameters a compatible endpoint rejected.
+
+    Returns the names degraded, empty when the 400 was about something else
+    and the caller should re-raise. Each parameter is judged independently:
+    one 400 can name both, and treating them as alternatives would silently
+    skip a degrade that was also needed.
+
+    ``max_tokens`` is renamed rather than dropped -- reasoning models spell
+    the same budget ``max_completion_tokens``, and for context compaction that
+    budget is what keeps a summary small enough not to re-trigger the next
+    compaction. The trigger is anchored on the replacement name, or on
+    "unsupported parameter": ``error_msg`` carries ``provider_raw`` and
+    ``previous_errors`` blobs (see ``_openai_error_details``), i.e. arbitrary
+    upstream text that can mention ``max_tokens`` for unrelated reasons -- an
+    out-of-range value, or a provider echoing the request back.
+    """
+    lowered = error_msg.lower()
+    degraded: list[str] = []
+
+    if "max_tokens" in completion_params and (
+        "max_completion_tokens" in lowered
+        or ("max_tokens" in lowered and "unsupported parameter" in lowered)
+    ):
+        completion_params["max_completion_tokens"] = completion_params.pop("max_tokens")
+        degraded.append("max_tokens")
+
+    if "response_format" in completion_params and "response_format" in lowered:
+        completion_params.pop("response_format")
+        degraded.append("response_format")
+
+    return degraded
+
+
 def _format_openai_error(prefix: str, error: BaseException) -> str:
     message = str(getattr(error, "message", None) or error)
     status_code = getattr(error, "status_code", None)
@@ -589,30 +625,26 @@ class OpenAICompatibleLLM(BaseLLM):
             try:
                 response = await _make_api_call()
             except openai.BadRequestError as e:
-                # Check if error is related to response_format
                 error_msg = _format_openai_error("OpenAI bad request", e)
-                if (
-                    "response_format" in error_msg.lower()
-                    and "response_format" in completion_params
-                ):
-                    # Remove response_format and retry
-                    logger.warning(
-                        f"API doesn't support response_format, retrying without it. Error: {error_msg}"
-                    )
-                    completion_params.pop("response_format")
+                degraded = _degrade_rejected_params(completion_params, error_msg)
+                if not degraded:
+                    raise
+                logger.warning(
+                    "API rejected %s, retrying without it. Error: %s",
+                    " and ".join(degraded),
+                    error_msg,
+                )
+                if "response_format" in degraded:
+                    # Fall through to the main flow with response_format now
+                    # None, which is what the structured-output degrade check
+                    # below is gated on.
                     response_format = None
 
-                    # Retry without response_format and fall through to the
-                    # main flow (the structured-output degrade check below is
-                    # gated on response_format, now None). A BadRequestError
-                    # raised here is not caught by this clause -- it
-                    # propagates to the outer ``except openai.BadRequestError``
-                    # below, which wraps it into RuntimeError like every other
-                    # failure path.
-                    response = await _make_api_call()
-
-                else:
-                    raise
+                # A BadRequestError raised here is not caught by this clause
+                # -- it propagates to the outer ``except openai
+                # .BadRequestError`` below, which wraps it into RuntimeError
+                # like every other failure path.
+                response = await _make_api_call()
 
             result = _process_response(response, request_thinking=thinking)
 
@@ -814,25 +846,20 @@ class OpenAICompatibleLLM(BaseLLM):
             try:
                 response = await _make_api_call()
             except openai.BadRequestError as e:
-                # Check if error is related to response_format
                 error_msg = _format_openai_error("OpenAI bad request", e)
-                if (
-                    "response_format" in error_msg.lower()
-                    and "response_format" in completion_params
-                ):
-                    # Remove response_format and retry
-                    logger.warning(
-                        f"API doesn't support response_format, retrying without it. Error: {error_msg}"
-                    )
-                    completion_params.pop("response_format")
-
-                    # Retry without response_format. A BadRequestError raised
-                    # here is not caught by this clause -- it propagates to
-                    # the outer ``except openai.BadRequestError`` below, which
-                    # wraps it into RuntimeError like every other failure path.
-                    response = await _make_api_call()
-                else:
+                degraded = _degrade_rejected_params(completion_params, error_msg)
+                if not degraded:
                     raise
+                logger.warning(
+                    "API rejected %s, retrying without it. Error: %s",
+                    " and ".join(degraded),
+                    error_msg,
+                )
+                # A BadRequestError raised here is not caught by this clause
+                # -- it propagates to the outer ``except openai
+                # .BadRequestError`` below, which wraps it into RuntimeError
+                # like every other failure path.
+                response = await _make_api_call()
 
             # Validate response
             if not hasattr(response, "choices") or not response.choices:
@@ -1061,28 +1088,23 @@ class OpenAICompatibleLLM(BaseLLM):
                         **completion_params
                     )
             except openai.BadRequestError as e:
-                # Check if error is related to response_format
                 error_msg = _format_openai_error("OpenAI bad request", e)
-                if (
-                    "response_format" in error_msg.lower()
-                    and "response_format" in completion_params
-                ):
-                    # Remove response_format and retry
-                    logger.warning(
-                        f"API doesn't support response_format, retrying without it. Error: {error_msg}"
-                    )
-                    completion_params.pop("response_format")
-
-                    if extra_body:
-                        stream = await self._client.chat.completions.create(
-                            extra_body=extra_body, **completion_params
-                        )
-                    else:
-                        stream = await self._client.chat.completions.create(
-                            **completion_params
-                        )
-                else:
+                degraded = _degrade_rejected_params(completion_params, error_msg)
+                if not degraded:
                     raise
+                logger.warning(
+                    "API rejected %s, retrying without it. Error: %s",
+                    " and ".join(degraded),
+                    error_msg,
+                )
+                if extra_body:
+                    stream = await self._client.chat.completions.create(
+                        extra_body=extra_body, **completion_params
+                    )
+                else:
+                    stream = await self._client.chat.completions.create(
+                        **completion_params
+                    )
 
             # Timeout control
             first_token = True

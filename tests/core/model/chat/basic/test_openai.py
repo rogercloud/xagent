@@ -1717,3 +1717,231 @@ class TestFieldContent:
 
         assert "reasoning_content" not in delta.model_fields_set
         assert field_content(delta, "reasoning_content") == (True, "step 1")
+
+
+def _bad_request(message: str) -> openai.BadRequestError:
+    return openai.BadRequestError(
+        f"Error code: 400 - {{'error': {{'message': '{message}'}}}}",
+        response=httpx.Response(
+            400,
+            request=httpx.Request("POST", "https://api.openai.com/v1/chat/completions"),
+        ),
+        body={"error": {"message": message, "code": 400}},
+    )
+
+
+_MAX_TOKENS_REJECTION = (
+    "Unsupported parameter: 'max_tokens' is not supported with this model. "
+    "Use 'max_completion_tokens' instead."
+)
+
+
+class TestRejectedParameterDegrade:
+    """Reasoning models spell the output budget ``max_completion_tokens``.
+
+    Context compaction is the only caller that sends an output budget at all,
+    so without this a reasoning model converses normally while every
+    compaction fails and falls back to dropping messages.
+    """
+
+    @pytest.mark.asyncio
+    async def test_chat_renames_max_tokens(
+        self, openai_llm_config, mock_chat_completion, mocker
+    ):
+        mock_client = mocker.AsyncMock()
+        mock_client.chat.completions.create.side_effect = [
+            _bad_request(_MAX_TOKENS_REJECTION),
+            mock_chat_completion,
+        ]
+        mocker.patch(
+            "xagent.core.model.chat.basic.openai.AsyncOpenAI",
+            return_value=mock_client,
+        )
+
+        llm = OpenAILLM(**openai_llm_config)
+        response = await llm.chat(
+            [{"role": "user", "content": "Summarize."}], max_tokens=5000
+        )
+
+        assert response["content"] == "Hello World"
+        retry_kwargs = mock_client.chat.completions.create.call_args_list[1].kwargs
+        # Renamed, not dropped: for compaction the budget is what keeps a
+        # summary from re-triggering the next compaction.
+        assert "max_tokens" not in retry_kwargs
+        assert retry_kwargs["max_completion_tokens"] == 5000
+
+    @pytest.mark.asyncio
+    async def test_one_rejection_naming_both_degrades_both(
+        self, openai_llm_config, mock_chat_completion, mocker
+    ):
+        """The two degrades are independent, not alternatives.
+
+        Judging them with if/elif let a response_format rejection be skipped
+        whenever the same error text also mentioned max_tokens -- and
+        ``vision_chat`` always sends both parameters together, so the
+        precondition is routinely met.
+        """
+        mock_client = mocker.AsyncMock()
+        mock_client.chat.completions.create.side_effect = [
+            _bad_request(
+                "Unsupported parameter: 'max_tokens' is not supported with this "
+                "model. Use 'max_completion_tokens' instead. response_format is "
+                "also not supported."
+            ),
+            mock_chat_completion,
+        ]
+        mocker.patch(
+            "xagent.core.model.chat.basic.openai.AsyncOpenAI",
+            return_value=mock_client,
+        )
+
+        llm = OpenAILLM(**openai_llm_config)
+        await llm.chat(
+            [{"role": "user", "content": "Summarize."}],
+            max_tokens=5000,
+            response_format={"type": "json_object"},
+        )
+
+        retry_kwargs = mock_client.chat.completions.create.call_args_list[1].kwargs
+        assert retry_kwargs["max_completion_tokens"] == 5000
+        assert "response_format" not in retry_kwargs
+
+    @pytest.mark.asyncio
+    async def test_response_format_degrade_survives_a_max_tokens_mention(
+        self, openai_llm_config, mock_chat_completion, mocker
+    ):
+        """Regression guard: an error that merely echoes ``max_tokens`` in its
+        upstream blob must not consume the response_format degrade.
+
+        Here max_tokens is present in the request but the rejection is about
+        response_format alone, so only response_format is degraded and
+        max_tokens is left as it was.
+        """
+        mock_client = mocker.AsyncMock()
+        mock_client.chat.completions.create.side_effect = [
+            _bad_request(
+                "response_format is not supported by this model "
+                "(request had max_tokens=5000)"
+            ),
+            mock_chat_completion,
+        ]
+        mocker.patch(
+            "xagent.core.model.chat.basic.openai.AsyncOpenAI",
+            return_value=mock_client,
+        )
+
+        llm = OpenAILLM(**openai_llm_config)
+        await llm.chat(
+            [{"role": "user", "content": "Summarize."}],
+            max_tokens=5000,
+            response_format={"type": "json_object"},
+        )
+
+        retry_kwargs = mock_client.chat.completions.create.call_args_list[1].kwargs
+        assert "response_format" not in retry_kwargs
+        assert retry_kwargs["max_tokens"] == 5000
+        assert "max_completion_tokens" not in retry_kwargs
+
+    @pytest.mark.asyncio
+    async def test_an_out_of_range_value_does_not_trigger_the_rename(
+        self, openai_llm_config, mocker
+    ):
+        """Anchoring on the replacement name keeps arbitrary upstream text --
+        ``provider_raw`` can echo a whole request body -- from starting a
+        retry that cannot help."""
+        mock_client = mocker.AsyncMock()
+        mock_client.chat.completions.create.side_effect = _bad_request(
+            "max_tokens is too large: 200000"
+        )
+        mocker.patch(
+            "xagent.core.model.chat.basic.openai.AsyncOpenAI",
+            return_value=mock_client,
+        )
+
+        llm = OpenAILLM(**openai_llm_config)
+        with pytest.raises(RuntimeError, match="too large"):
+            await llm.chat(
+                [{"role": "user", "content": "Summarize."}], max_tokens=200000
+            )
+
+        assert mock_client.chat.completions.create.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_no_budget_in_the_request_means_no_rename(
+        self, openai_llm_config, mocker
+    ):
+        mock_client = mocker.AsyncMock()
+        mock_client.chat.completions.create.side_effect = _bad_request(
+            _MAX_TOKENS_REJECTION
+        )
+        mocker.patch(
+            "xagent.core.model.chat.basic.openai.AsyncOpenAI",
+            return_value=mock_client,
+        )
+
+        llm = OpenAILLM(**openai_llm_config)
+        with pytest.raises(RuntimeError):
+            await llm.chat([{"role": "user", "content": "Summarize."}])
+
+        assert mock_client.chat.completions.create.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_vision_chat_renames_max_tokens(
+        self, openai_llm_config, mock_chat_completion, mocker
+    ):
+        mock_client = mocker.AsyncMock()
+        mock_client.chat.completions.create.side_effect = [
+            _bad_request(_MAX_TOKENS_REJECTION),
+            mock_chat_completion,
+        ]
+        mocker.patch(
+            "xagent.core.model.chat.basic.openai.AsyncOpenAI",
+            return_value=mock_client,
+        )
+
+        llm = OpenAILLM(**openai_llm_config, abilities=["chat", "vision"])
+        response = await llm.vision_chat(
+            [{"role": "user", "content": "Describe this image."}], max_tokens=5000
+        )
+
+        assert response["content"] == "Hello World"
+        retry_kwargs = mock_client.chat.completions.create.call_args_list[1].kwargs
+        assert retry_kwargs["max_completion_tokens"] == 5000
+
+    @pytest.mark.asyncio
+    async def test_stream_chat_renames_max_tokens_and_keeps_extra_body(
+        self, openai_llm_config, mocker
+    ):
+        """The streaming path rebuilds the stream itself rather than reusing
+        the non-streaming helper, so its retry needs its own coverage --
+        including the ``extra_body`` branch, which the sibling methods do not
+        have."""
+
+        async def one_chunk_stream():
+            yield _stream_chunk(finish_reason="stop")
+
+        mock_client = mocker.AsyncMock()
+        mock_client.chat.completions.create.side_effect = [
+            _bad_request(_MAX_TOKENS_REJECTION),
+            one_chunk_stream(),
+        ]
+        mocker.patch(
+            "xagent.core.model.chat.basic.openai.AsyncOpenAI",
+            return_value=mock_client,
+        )
+
+        llm = OpenAILLM(**openai_llm_config)
+        mocker.patch.object(
+            llm, "_prepare_provider_reasoning_extra_body", return_value={"probe": 1}
+        )
+        _ = [
+            chunk
+            async for chunk in llm.stream_chat(
+                [{"role": "user", "content": "Summarize."}], max_tokens=5000
+            )
+        ]
+
+        assert mock_client.chat.completions.create.await_count == 2
+        retry_kwargs = mock_client.chat.completions.create.call_args_list[1].kwargs
+        assert retry_kwargs["max_completion_tokens"] == 5000
+        assert retry_kwargs["extra_body"] == {"probe": 1}
