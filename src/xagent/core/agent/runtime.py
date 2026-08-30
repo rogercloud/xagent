@@ -1255,6 +1255,14 @@ class PatternRuntime:
         compact_with_llm_response = getattr(context, "compact_with_llm_response", None)
         compact_if_needed = getattr(context, "compact_if_needed", None)
         result = None
+        # Set when the summary path ran but produced nothing usable, so the
+        # message-dropping fallback below can say why it is running. The error
+        # path already records ``llm_compact_error``; without this, a summary
+        # that was requested, paid for, and then discarded -- an empty
+        # completion, or a reasoning trace the client marked as substituted --
+        # is indistinguishable in the trace from compaction that never tried
+        # to summarize at all.
+        unusable_summary_metadata: dict[str, Any] | None = None
         if (
             llm is not None
             and callable(getattr(llm, "chat", None))
@@ -1288,6 +1296,16 @@ class PatternRuntime:
                     )
                     for key, value in request_metadata.items():
                         result.metadata.setdefault(key, value)
+                    if not getattr(result, "compacted", False):
+                        logger.warning(
+                            "Context compaction summary was unusable; falling "
+                            "back to dropping messages. execution_id=%s",
+                            getattr(context, "execution_id", None),
+                        )
+                        unusable_summary_metadata = {
+                            "llm_summary_unusable": True,
+                            **request_metadata,
+                        }
                 except LLMCallInterrupted:
                     raise
                 except Exception as exc:  # noqa: BLE001
@@ -1307,6 +1325,11 @@ class PatternRuntime:
             if not callable(compact_if_needed):
                 return result
             result = compact_if_needed(llm)
+            if inspect.isawaitable(result):
+                result = await result
+            if result is not None and unusable_summary_metadata is not None:
+                result.metadata.update(unusable_summary_metadata)
+                result.metadata["fallback_strategy"] = result.strategy
 
         if result is None:
             return None

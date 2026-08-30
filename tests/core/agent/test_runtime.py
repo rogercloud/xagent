@@ -1410,3 +1410,62 @@ async def test_compact_context_if_needed_falls_back_to_truncate_without_orphans(
             for message in ctx.messages
         ]
     )
+
+
+@pytest.mark.asyncio
+async def test_compaction_records_that_an_unusable_summary_was_discarded() -> None:
+    """A summary that was requested and then discarded must leave a trace.
+
+    The error path already records ``llm_compact_error``. Without an
+    equivalent here, a summary that came back empty -- or that the client
+    marked as a substituted reasoning trace -- is indistinguishable in the
+    trace from compaction that never attempted to summarize, which is exactly
+    the case an operator would want to see.
+    """
+
+    class CompactTracer:
+        """Accepts the full trace_event signature, including ``step_id``,
+        which the compaction events carry."""
+
+        def __init__(self) -> None:
+            self.events: list[dict[str, Any]] = []
+
+        async def trace_event(
+            self, event_type: Any, *, data: dict[str, Any] | None = None, **_: Any
+        ) -> None:
+            self.events.append(
+                {
+                    "event_type": getattr(event_type, "value", str(event_type)),
+                    "data": data or {},
+                }
+            )
+
+    tracer = CompactTracer()
+    runtime = PatternRuntime(tracer=tracer)
+    context = ExecutionContext(execution_id="unusable-summary")
+    context.compact_config.threshold = 1
+    context.add_user_message("current request")
+    context.add_tool_result("read_file", {"output": "x" * 200}, tool_call_id="call-1")
+
+    class EmptySummaryLLM:
+        model_name = "compact-test"
+
+        async def chat(self, **_: Any) -> Any:
+            return {"content": ""}
+
+    result = await runtime.compact_context_if_needed(
+        context=context,
+        llm=EmptySummaryLLM(),
+        metadata={"phase": "test"},
+    )
+
+    assert result.compacted
+    # Fell back to dropping messages, and said so.
+    assert result.strategy == "truncate"
+    assert result.metadata["llm_summary_unusable"] is True
+    assert result.metadata["fallback_strategy"] == "truncate"
+    # The emitted compact event carries it too, so this is visible without
+    # reading the return value.
+    assert any(
+        event["data"].get("llm_summary_unusable") is True for event in tracer.events
+    )
