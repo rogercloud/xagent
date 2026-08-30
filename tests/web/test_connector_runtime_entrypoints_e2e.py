@@ -358,13 +358,17 @@ async def test_telegram_cancellation_during_voice_cleanup_closes_managed_lease(
         assert 123 not in bot.user_preparing_executions
     finally:
         allow_close.set()
-        if process_task is not None:
-            if not process_task.done():
-                process_task.cancel()
-            await asyncio.gather(process_task, return_exceptions=True)
-        if managed_lease is not None and not managed_lease._closed:
-            await managed_lease.close()
-        db.close()
+        try:
+            if process_task is not None:
+                if not process_task.done():
+                    process_task.cancel()
+                await asyncio.gather(process_task, return_exceptions=True)
+        finally:
+            try:
+                if managed_lease is not None and not managed_lease._closed:
+                    await managed_lease.close()
+            finally:
+                db.close()
 
 
 def _context_row_count(task_id: int) -> int:
