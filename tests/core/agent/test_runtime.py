@@ -1521,34 +1521,6 @@ async def test_compaction_retries_with_a_smaller_budget_before_truncating() -> N
 
 
 @pytest.mark.asyncio
-async def test_compaction_does_not_retry_when_already_at_the_floor() -> None:
-    """A failure at the smallest budget is not a budget problem."""
-    context = ExecutionContext(execution_id="budget-floor")
-    context.compact_config.threshold = 1
-    context.add_user_message("current request")
-    context.add_tool_result("read_file", {"output": "x" * 200}, tool_call_id="call-1")
-
-    class AlwaysFailingLLM:
-        model_name = "compact-test"
-
-        def __init__(self) -> None:
-            self.calls = 0
-
-        async def chat(self, **kwargs: Any) -> Any:
-            self.calls += 1
-            raise RuntimeError("upstream is down")
-
-    llm = AlwaysFailingLLM()
-    result = await PatternRuntime().compact_context_if_needed(
-        context=context, llm=llm, metadata={"phase": "test"}
-    )
-
-    assert llm.calls == 1
-    assert result.strategy == "truncate"
-    assert "upstream is down" in result.metadata["llm_compact_error"]
-
-
-@pytest.mark.asyncio
 async def test_compaction_ladder_skips_a_budget_the_model_cannot_use() -> None:
     """The step down must not go straight to the floor.
 

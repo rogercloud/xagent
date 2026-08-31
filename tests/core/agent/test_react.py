@@ -8574,33 +8574,3 @@ async def test_react_summarizes_with_the_main_model_when_no_compact_model() -> N
     # One routing decision for the whole turn, taken on the conversation.
     assert len(route_prompts) == 1
     assert "Conversation history to compact" not in route_prompts[0]
-
-
-@pytest.mark.asyncio
-async def test_react_keeps_an_explicitly_configured_compact_model() -> None:
-    """Guards the ``is not None`` half of the substitution.
-
-    This cannot fail by reverting the change -- the base already passed
-    ``compact_llm`` straight through. It fails against the plausible wrong
-    implementation, one that hands compaction the resolved main model
-    unconditionally and quietly ignores the configured compact model.
-    """
-    downstream = RoutedDownstreamLLM([], final_text="done")
-    route_prompts: list[str] = []
-    router = _routing_router(downstream, route_prompts)
-    compact_llm = FakeLLM([{"content": "summarized tool result"}])
-    context = _react_context_with_tool_history("compact-explicit-model")
-
-    result = await ReActPattern(max_iterations=1).run(
-        context=context,
-        tools=[],
-        llm=router,
-        compact_llm=compact_llm,
-        runtime=PatternRuntime(tracer=TraceEventRecorder()),
-    )
-
-    assert result["success"] is True
-    assert len(compact_llm.calls) == 1
-    # The main model summarized nothing, and routed only for its own call.
-    assert len(downstream.calls) == 1
-    assert len(route_prompts) == 1

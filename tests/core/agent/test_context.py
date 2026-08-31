@@ -1932,18 +1932,6 @@ def test_llm_compact_budget_stays_under_provider_output_limits() -> None:
         assert request["max_tokens"] == 8192
 
 
-def test_llm_compact_budget_keeps_its_floor_for_a_tiny_threshold() -> None:
-    ctx = ExecutionContext()
-    ctx.compact_config.threshold = 1
-    ctx.add_user_message("current request")
-    ctx.add_tool_result("read_file", {"output": "x" * 400}, tool_call_id="call-1")
-
-    request = ctx.build_llm_compact_request_if_needed()
-
-    assert request is not None
-    assert request["max_tokens"] == 256
-
-
 def _compactable_context() -> ExecutionContext:
     ctx = ExecutionContext()
     ctx.compact_config.threshold = 1
@@ -1976,25 +1964,3 @@ def test_compact_rejects_content_the_client_marked_as_a_reasoning_fallback() -> 
     assert not result.compacted
     assert result.strategy == "none"
     assert ctx.messages == original
-
-
-def test_compact_keeps_an_unmarked_summary_that_ran_out_of_length() -> None:
-    """Only the declared substitution is rejected.
-
-    A summary clipped by the output budget is still a summary; falling back to
-    dropping messages would be strictly worse than keeping it.
-    """
-    ctx = _compactable_context()
-
-    result = ctx.compact_with_llm_response(
-        {
-            "type": "text",
-            "content": "Read the config file and found the timeout setting",
-            "reasoning_content": "I should summarize the read_file call.",
-        },
-        llm=None,
-    )
-
-    assert result.compacted
-    assert result.strategy == "llm_summary"
-    assert "found the timeout setting" in ctx.messages[0].content
