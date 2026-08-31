@@ -17,7 +17,12 @@ from xagent.core.agent.runtime import (
     prepare_llm_for_context,
     resolved_llm_metadata,
 )
-from xagent.core.model.chat.types import ChunkType, StreamChunk
+from xagent.core.model.chat.types import (
+    CONTENT_SOURCE_KEY,
+    CONTENT_SOURCE_REASONING_FALLBACK,
+    ChunkType,
+    StreamChunk,
+)
 from xagent.core.task_runtime import PREFERRED_INPUT_MODALITIES_METADATA_KEY
 
 
@@ -1498,7 +1503,7 @@ async def test_compaction_retries_with_a_smaller_budget_before_truncating() -> N
         async def chat(self, **kwargs: Any) -> Any:
             budget = kwargs["max_tokens"]
             self.budgets.append(budget)
-            if budget > 1024:
+            if budget > 4096:
                 raise RuntimeError("max_tokens is too large for this model")
             return {"content": "summary within the model's output cap"}
 
@@ -1507,9 +1512,9 @@ async def test_compaction_retries_with_a_smaller_budget_before_truncating() -> N
         context=context, llm=llm, metadata={"phase": "test"}
     )
 
-    # Asked big, was refused, asked small, succeeded -- and summarized rather
+    # Asked big, was refused, stepped down, succeeded -- and summarized rather
     # than dropping messages.
-    assert llm.budgets == [8000, 256]
+    assert llm.budgets == [8000, 1024]
     assert result.compacted
     assert result.strategy == "llm_summary"
     assert "output cap" in context.messages[0].content
@@ -1541,3 +1546,54 @@ async def test_compaction_does_not_retry_when_already_at_the_floor() -> None:
     assert llm.calls == 1
     assert result.strategy == "truncate"
     assert "upstream is down" in result.metadata["llm_compact_error"]
+
+
+@pytest.mark.asyncio
+async def test_compaction_ladder_skips_a_budget_the_model_cannot_use() -> None:
+    """The step down must not go straight to the floor.
+
+    A reasoning model draws its reasoning from the same allowance, so a
+    budget that is merely *accepted* can still produce no summary -- the
+    client marks such a response as a substituted reasoning trace and
+    compaction rejects it. 1024 is on the ladder because it was the ceiling
+    before this PR raised it, and is therefore known to leave room for an
+    answer; jumping from 8000 to 256 would spend a request to arrive at the
+    same truncation.
+    """
+    context = ExecutionContext(execution_id="budget-ladder")
+    context.compact_config.threshold = 32000
+    context.add_user_message("current request")
+    context.add_tool_result(
+        "read_file", {"output": "x" * 200_000}, tool_call_id="call-1"
+    )
+
+    class CappedReasoningLLM:
+        model_name = "compact-test"
+
+        def __init__(self) -> None:
+            self.budgets: list[int] = []
+
+        async def chat(self, **kwargs: Any) -> Any:
+            budget = kwargs["max_tokens"]
+            self.budgets.append(budget)
+            if budget > 4096:
+                raise RuntimeError("max_tokens is too large for this model")
+            if budget < 1024:
+                # Whole allowance spent reasoning; the client surfaces the
+                # trace in place of content and marks it.
+                return {
+                    "content": "thinking about the file",
+                    CONTENT_SOURCE_KEY: CONTENT_SOURCE_REASONING_FALLBACK,
+                    "reasoning_content": "thinking about the file",
+                }
+            return {"content": "a real summary of the prior work"}
+
+    llm = CappedReasoningLLM()
+    result = await PatternRuntime().compact_context_if_needed(
+        context=context, llm=llm, metadata={"phase": "test"}
+    )
+
+    assert llm.budgets == [8000, 1024]
+    assert result.compacted
+    assert result.strategy == "llm_summary"
+    assert "a real summary" in context.messages[0].content

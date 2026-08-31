@@ -34,7 +34,7 @@ from ..tools.user_interaction import (
     WAITING_FOR_USER_STATUS,
     tool_result_waits_for_user,
 )
-from .context.execution import COMPACT_SUMMARY_MIN_TOKENS
+from .context.execution import COMPACT_SUMMARY_FALLBACK_BUDGETS
 from .result import normalize_tool_failure_code, tool_result_succeeded
 from .streaming import merge_streamed_tool_call_arguments
 
@@ -1276,7 +1276,12 @@ class PatternRuntime:
         except LLMCallInterrupted:
             raise
         except Exception as exc:  # noqa: BLE001
-            if max_tokens <= COMPACT_SUMMARY_MIN_TOKENS:
+            budgets = [
+                budget
+                for budget in COMPACT_SUMMARY_FALLBACK_BUDGETS
+                if budget < max_tokens
+            ]
+            if not budgets:
                 raise
             if retry_on(exc):
                 # Transient by class -- the LLM object is already wrapped in
@@ -1287,24 +1292,32 @@ class PatternRuntime:
                 raise
             if self._interrupt_requested:
                 raise
-            logger.warning(
-                "Context compaction summary failed at max_tokens=%d; retrying "
-                "at %d. Error: %s",
-                max_tokens,
-                COMPACT_SUMMARY_MIN_TOKENS,
-                exc,
-            )
-            try:
-                response = await self.run_llm_call(
-                    llm, messages=messages, max_tokens=COMPACT_SUMMARY_MIN_TOKENS
+            first_exc = exc
+            for budget in budgets:
+                logger.warning(
+                    "Context compaction summary failed at max_tokens=%d; "
+                    "retrying at %d. Error: %s",
+                    max_tokens,
+                    budget,
+                    exc,
                 )
-            except Exception as retry_exc:
-                # Surface both: the retry's error is what stopped us, but the
-                # first one is the one that says the budget was suspect.
-                raise retry_exc from exc
-            metadata["compact_budget_reduced_to"] = COMPACT_SUMMARY_MIN_TOKENS
-            outcome["compact_budget_reduced_to"] = COMPACT_SUMMARY_MIN_TOKENS
-            return response
+                try:
+                    response = await self.run_llm_call(
+                        llm, messages=messages, max_tokens=budget
+                    )
+                except LLMCallInterrupted:
+                    raise
+                except Exception as retry_exc:  # noqa: BLE001
+                    exc = retry_exc
+                    if retry_on(retry_exc) or self._interrupt_requested:
+                        break
+                    continue
+                metadata["compact_budget_reduced_to"] = budget
+                outcome["compact_budget_reduced_to"] = budget
+                return response
+            # Surface the last failure, chained to the first: the first one is
+            # the one that says the budget was suspect.
+            raise exc from first_exc
 
     async def compact_context_if_needed(
         self,

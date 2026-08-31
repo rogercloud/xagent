@@ -54,6 +54,15 @@ from .skill_tool import (
 READ_FILE_CONTEXT_LIMIT = 12_000
 COMPACT_SUMMARY_MAX_TOKENS = 8192
 COMPACT_SUMMARY_MIN_TOKENS = 256
+# Budgets to fall back through when the requested one is refused, largest
+# first. The request is derived from the model's *input* window while
+# providers cap the *output* separately and much lower, and that limit is not
+# recorded anywhere -- so the budget is a guess and this ladder lets the
+# provider correct it. 1024 is here because it was the ceiling before this
+# change and is therefore known to work; skipping straight to the floor would
+# hand a reasoning model an allowance it can spend entirely on reasoning,
+# producing no summary and truncating anyway.
+COMPACT_SUMMARY_FALLBACK_BUDGETS = (1024, COMPACT_SUMMARY_MIN_TOKENS)
 COMPACT_CONTEXT_REF_MAX_TOKENS = 2048
 COMPACT_DROPPED_REF_NOTICE_MAX_CHARS = 2048
 COMPACT_DROPPED_TOOL_NOTICE_MAX_CHARS = 1024
