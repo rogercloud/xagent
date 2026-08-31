@@ -1731,6 +1731,14 @@ def _bad_request(
     code: str | None = None,
     metadata: dict | None = None,
 ) -> openai.BadRequestError:
+    """Build the error the way the SDK does, from a wire-shaped response.
+
+    Constructing ``BadRequestError`` by hand invites getting the body shape
+    wrong: the wire format wraps the error object, but the SDK unwraps it in
+    ``_make_status_error``, so a hand-built wrapped body is a shape no real
+    error has -- and code that reads it passes its tests while doing nothing
+    in production. Going through the SDK removes the choice.
+    """
     error_payload: dict = {"message": message, "type": "invalid_request_error"}
     if code is not None:
         error_payload["code"] = code
@@ -1738,14 +1746,16 @@ def _bad_request(
         error_payload["param"] = param
     if metadata is not None:
         error_payload["metadata"] = metadata
-    return openai.BadRequestError(
-        f"Error code: 400 - {{'error': {{'message': '{message}'}}}}",
-        response=httpx.Response(
-            400,
-            request=httpx.Request("POST", "https://api.openai.com/v1/chat/completions"),
-        ),
-        body={"error": error_payload},
+    response = httpx.Response(
+        400,
+        request=httpx.Request("POST", "https://api.openai.com/v1/chat/completions"),
+        json={"error": error_payload},
     )
+    error = openai.AsyncOpenAI(api_key="test-key")._make_status_error_from_response(
+        response
+    )
+    assert isinstance(error, openai.BadRequestError)
+    return error
 
 
 _MAX_TOKENS_REJECTION = (
@@ -2102,6 +2112,51 @@ class TestRejectedParameterIdentification:
         )
 
         assert mock_client.chat.completions.create.await_count == 2
+        retry_kwargs = mock_client.chat.completions.create.call_args_list[1].kwargs
+        assert "response_format" not in retry_kwargs
+        assert retry_kwargs["max_tokens"] == 5000
+        assert "max_completion_tokens" not in retry_kwargs
+
+    @pytest.mark.asyncio
+    async def test_upstream_blob_naming_the_replacement_does_not_rename(
+        self, openai_llm_config, mock_chat_completion, mocker
+    ):
+        """The sharpest form of the problem.
+
+        Here the echoed upstream text names ``max_completion_tokens`` itself,
+        which is the one phrase the text-only rule trusts. Only the endpoint's
+        own ``param`` can say that this rejection is about response_format --
+        so this fails unless that field is actually readable, which it is not
+        when the code looks for a wrapper the SDK has already unwrapped.
+        """
+        mock_client = mocker.AsyncMock()
+        mock_client.chat.completions.create.side_effect = [
+            _bad_request(
+                "Unsupported parameter: 'response_format' is not supported "
+                "with this model.",
+                param="response_format",
+                code="unsupported_parameter",
+                metadata={
+                    "provider_name": "upstream-a",
+                    "previous_errors": (
+                        '{"error": "use max_completion_tokens for this model"}'
+                    ),
+                },
+            ),
+            mock_chat_completion,
+        ]
+        mocker.patch(
+            "xagent.core.model.chat.basic.openai.AsyncOpenAI",
+            return_value=mock_client,
+        )
+
+        llm = OpenAILLM(**openai_llm_config)
+        await llm.chat(
+            [{"role": "user", "content": "Summarize."}],
+            max_tokens=5000,
+            response_format={"type": "json_object"},
+        )
+
         retry_kwargs = mock_client.chat.completions.create.call_args_list[1].kwargs
         assert "response_format" not in retry_kwargs
         assert retry_kwargs["max_tokens"] == 5000

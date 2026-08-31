@@ -51,16 +51,36 @@ def _openai_error_body(error: BaseException) -> Any:
         return None
 
 
-def _openai_error_code(error: BaseException) -> str | None:
-    """The machine-readable code for a 400, when the endpoint sends one."""
+def _openai_error_payload(error: BaseException) -> dict[str, Any] | None:
+    """The error object itself, whichever shape it arrives in.
+
+    The wire format wraps it (``{"error": {...}}``), but the SDK unwraps that
+    in ``_make_status_error``, so ``BadRequestError.body`` is the inner object
+    already. Code that only looked for the wrapper therefore found nothing on
+    any error the SDK actually produced -- and passed its tests, because the
+    fixtures hand-built the wire shape. Normalize here so both work.
+    """
     body = _openai_error_body(error)
     if not isinstance(body, dict):
         return None
-    error_payload = body.get("error")
-    if not isinstance(error_payload, dict):
+    inner = body.get("error")
+    return inner if isinstance(inner, dict) else body
+
+
+def _openai_error_code(error: BaseException) -> str | None:
+    """The machine-readable code for a 400, when the endpoint sends one.
+
+    The SDK lifts it onto the exception; the payload is the fallback for
+    anything that did not come through the SDK.
+    """
+    code = getattr(error, "code", None)
+    if isinstance(code, str) and code:
+        return code
+    error_payload = _openai_error_payload(error)
+    if error_payload is None:
         return None
-    code = error_payload.get("code")
-    return code if isinstance(code, str) and code else None
+    payload_code = error_payload.get("code")
+    return payload_code if isinstance(payload_code, str) and payload_code else None
 
 
 def _openai_rejected_param(error: BaseException) -> str | None:
@@ -74,13 +94,10 @@ def _openai_rejected_param(error: BaseException) -> str | None:
     concatenated, and a keyword found there may belong to an attempt that has
     nothing to do with this failure. ``param`` describes only this one.
     """
-    body = _openai_error_body(error)
-    if not isinstance(body, dict):
-        return None
-    error_payload = body.get("error")
-    if not isinstance(error_payload, dict):
-        return None
-    param = error_payload.get("param")
+    param = getattr(error, "param", None)
+    if not isinstance(param, str) or not param:
+        error_payload = _openai_error_payload(error)
+        param = error_payload.get("param") if error_payload is not None else None
     if not isinstance(param, str) or not param:
         return None
     # Structured-output rejections name a path ("response_format.json_schema
@@ -92,25 +109,23 @@ def _openai_rejected_param(error: BaseException) -> str | None:
 
 def _openai_error_details(error: BaseException) -> list[str]:
     details: list[str] = []
-    body = _openai_error_body(error)
-    if isinstance(body, dict):
-        error_payload = body.get("error")
-        if isinstance(error_payload, dict):
-            metadata = error_payload.get("metadata")
-            if isinstance(metadata, dict):
-                provider_name = metadata.get("provider_name")
-                if provider_name:
-                    details.append(f"provider_name={provider_name}")
-                raw = metadata.get("raw")
-                if raw:
-                    details.append("provider_raw=" + _truncate_error_detail(raw))
-                previous_errors = metadata.get("previous_errors")
-                if previous_errors:
-                    details.append(
-                        "previous_errors=" + _truncate_error_detail(previous_errors)
-                    )
-            elif metadata is not None:
-                details.append("metadata=" + _truncate_error_detail(metadata))
+    error_payload = _openai_error_payload(error)
+    if error_payload is not None:
+        metadata = error_payload.get("metadata")
+        if isinstance(metadata, dict):
+            provider_name = metadata.get("provider_name")
+            if provider_name:
+                details.append(f"provider_name={provider_name}")
+            raw = metadata.get("raw")
+            if raw:
+                details.append("provider_raw=" + _truncate_error_detail(raw))
+            previous_errors = metadata.get("previous_errors")
+            if previous_errors:
+                details.append(
+                    "previous_errors=" + _truncate_error_detail(previous_errors)
+                )
+        elif metadata is not None:
+            details.append("metadata=" + _truncate_error_detail(metadata))
     return details
 
 
