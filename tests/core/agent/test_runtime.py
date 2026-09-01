@@ -1612,3 +1612,30 @@ async def test_compaction_stops_descending_once_a_budget_is_accepted() -> None:
     assert llm.budgets == [8000]
     assert result.strategy == "truncate"
     assert result.metadata["llm_summary_unusable"] is True
+    # A summary was attempted here, so the "no summary model at all" marker
+    # must stay off: the two reach the same fallback and would otherwise be
+    # indistinguishable again, which is what the marker exists to prevent.
+    assert "llm_summary_unavailable" not in result.metadata
+
+
+@pytest.mark.asyncio
+async def test_compaction_marks_messages_dropped_for_want_of_a_summary_model() -> None:
+    """Dropping messages because no summary model was reachable used to look
+    exactly like dropping them after a summary failed -- both produced a bare
+    ``truncate`` result, and only the failure path left a marker behind. That
+    made "nobody gave compaction a model" invisible in the trace.
+    """
+    context = ExecutionContext(execution_id="no-compact-model")
+    context.compact_config.threshold = 1
+    context.compact_config.max_messages = 2
+    for index in range(6):
+        context.add_user_message(f"m{index}")
+
+    result = await PatternRuntime().compact_context_if_needed(
+        context=context, llm=None, metadata={"phase": "test"}
+    )
+
+    assert result.compacted is True
+    assert result.strategy == "truncate"
+    assert result.metadata["llm_summary_unavailable"] is True
+    assert result.metadata["fallback_strategy"] == "truncate"

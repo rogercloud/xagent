@@ -1964,3 +1964,24 @@ def test_compact_rejects_content_the_client_marked_as_a_reasoning_fallback() -> 
     assert not result.compacted
     assert result.strategy == "none"
     assert ctx.messages == original
+
+
+def test_from_dict_ignores_the_retired_compact_strategy_key() -> None:
+    """Contexts persisted before the strategy knob was removed still carry
+    ``"strategy": "truncate"`` inside ``compact_config``, and those rows are
+    live -- every resumed execution reloads one. ``from_dict`` has to keep
+    accepting the key instead of choking on it.
+    """
+    context = ExecutionContext()
+    context.compact_config.threshold = 1234
+    context.compact_config.max_messages = 7
+
+    payload = context.to_dict()
+    assert "strategy" not in payload["compact_config"]
+    payload["compact_config"]["strategy"] = "truncate"
+
+    restored = ExecutionContext.from_dict(payload)
+
+    assert restored.compact_config.threshold == 1234
+    assert restored.compact_config.max_messages == 7
+    assert not hasattr(restored.compact_config, "strategy")

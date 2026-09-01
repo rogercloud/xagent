@@ -104,11 +104,15 @@ class MergeStrategy(str, Enum):
 
 @dataclass
 class CompactConfig:
-    """Compaction policy for message history."""
+    """Compaction policy for message history.
+
+    There is no strategy knob: compaction always tries to summarize, and
+    dropping the oldest messages is only the backstop for when it cannot.
+    ``max_messages`` sizes that backstop's retained tail.
+    """
 
     enabled: bool = True
     threshold: int = 32000
-    strategy: str = "truncate"
     max_messages: int = 20
 
 
@@ -975,7 +979,6 @@ class ExecutionContext:
             "compact_config": {
                 "enabled": self.compact_config.enabled,
                 "threshold": self.compact_config.threshold,
-                "strategy": self.compact_config.strategy,
                 "max_messages": self.compact_config.max_messages,
             },
             # Backward compatibility for older serialized payloads.
@@ -1019,7 +1022,6 @@ class ExecutionContext:
         compact_config = CompactConfig(
             enabled=compact.get("enabled", True),
             threshold=compact.get("threshold", CompactConfig().threshold),
-            strategy=compact.get("strategy", "truncate"),
             max_messages=compact.get("max_messages", 20),
         )
         created_at = (
@@ -1069,7 +1071,14 @@ class ExecutionContext:
 
         return context
 
-    def compact_if_needed(self, llm: Any = None) -> CompactResult:
+    def compact_if_needed(self) -> CompactResult:
+        """Shrink the context by dropping old messages, if it is over budget.
+
+        This is the backstop, not a strategy the caller chooses: the runtime
+        summarizes first and only reaches here when summarization was
+        unavailable or produced nothing usable. Everything it removes is lost
+        outright, so a caller that can summarize should.
+        """
         if not self.compact_config.enabled:
             return CompactResult(
                 compacted=False,
@@ -1080,7 +1089,7 @@ class ExecutionContext:
 
         total_tokens = self._get_total_tokens()
         if total_tokens > self.compact_config.threshold:
-            result = self._compact(llm)
+            result = self._drop_oldest_messages()
             return self._annotate_compact_result(result, total_tokens)
 
         return CompactResult(
@@ -1114,40 +1123,34 @@ class ExecutionContext:
             },
         }
 
-    def _compact(self, llm: Any = None) -> CompactResult:
-        original_count = len(self.messages)
-        if self.compact_config.strategy == "truncate":
-            keep_count = min(max(0, self.compact_config.max_messages), original_count)
-            retained = self._tail_window_preserving_tool_pairs(keep_count)
-            removed = max(0, original_count - len(retained))
-            # The window is a suffix minus any interior tool fragments sanitized
-            # out of it, so diff by object identity rather than slicing a prefix.
-            retained_ids = {id(message) for message in retained}
-            dropped_tool_counts = self._dropped_tool_result_counts(
-                [
-                    message
-                    for message in self.messages
-                    if id(message) not in retained_ids
-                ]
-            )
-            self.messages = retained
-            return CompactResult(
-                compacted=True,
-                original_count=original_count,
-                final_count=len(self.messages),
-                strategy="truncate",
-                metadata={
-                    "removed_count": removed,
-                    "dropped_tool_result_count": sum(dropped_tool_counts.values()),
-                    "dropped_tool_results_by_name": dropped_tool_counts,
-                },
-            )
+    def _drop_oldest_messages(self) -> CompactResult:
+        """Keep a tail window and discard everything before it.
 
+        Lossy and unconditional -- the dropped turns are not summarized,
+        recorded, or recoverable from the context. ``strategy="truncate"`` on
+        the result is the trace label for that outcome, not a mode.
+        """
+        original_count = len(self.messages)
+        keep_count = min(max(0, self.compact_config.max_messages), original_count)
+        retained = self._tail_window_preserving_tool_pairs(keep_count)
+        removed = max(0, original_count - len(retained))
+        # The window is a suffix minus any interior tool fragments sanitized
+        # out of it, so diff by object identity rather than slicing a prefix.
+        retained_ids = {id(message) for message in retained}
+        dropped_tool_counts = self._dropped_tool_result_counts(
+            [message for message in self.messages if id(message) not in retained_ids]
+        )
+        self.messages = retained
         return CompactResult(
-            compacted=False,
+            compacted=True,
             original_count=original_count,
             final_count=len(self.messages),
-            strategy="none",
+            strategy="truncate",
+            metadata={
+                "removed_count": removed,
+                "dropped_tool_result_count": sum(dropped_tool_counts.values()),
+                "dropped_tool_results_by_name": dropped_tool_counts,
+            },
         )
 
     def _annotate_compact_result(
