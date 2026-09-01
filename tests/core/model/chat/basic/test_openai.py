@@ -2221,3 +2221,76 @@ class TestSequentiallyRejectedParameters:
             )
 
         assert mock_client.chat.completions.create.await_count == 3
+
+    @pytest.mark.asyncio
+    async def test_vision_chat_degrades_two_rejections_in_a_row(
+        self, openai_llm_config, mock_chat_completion, mocker
+    ):
+        mock_client = mocker.AsyncMock()
+        mock_client.chat.completions.create.side_effect = [
+            _bad_request(
+                _MAX_TOKENS_REJECTION, param="max_tokens", code="unsupported_parameter"
+            ),
+            _bad_request(
+                "Unsupported parameter: 'response_format'.", param="response_format"
+            ),
+            mock_chat_completion,
+        ]
+        mocker.patch(
+            "xagent.core.model.chat.basic.openai.AsyncOpenAI",
+            return_value=mock_client,
+        )
+
+        llm = OpenAILLM(**openai_llm_config, abilities=["chat", "vision"])
+        response = await llm.vision_chat(
+            [{"role": "user", "content": "Describe this image."}],
+            max_tokens=5000,
+            response_format={"type": "json_object"},
+        )
+
+        assert response["content"] == "Hello World"
+        assert mock_client.chat.completions.create.await_count == 3
+        final_kwargs = mock_client.chat.completions.create.call_args_list[2].kwargs
+        assert final_kwargs["max_completion_tokens"] == 5000
+        assert "response_format" not in final_kwargs
+
+    @pytest.mark.asyncio
+    async def test_stream_chat_degrades_two_rejections_in_a_row(
+        self, openai_llm_config, mocker
+    ):
+        """The streaming path rebuilds the stream inside the loop rather than
+        calling the shared helper the other two use, so its second round needs
+        its own coverage."""
+
+        async def one_chunk_stream():
+            yield _stream_chunk(finish_reason="stop")
+
+        mock_client = mocker.AsyncMock()
+        mock_client.chat.completions.create.side_effect = [
+            _bad_request(
+                _MAX_TOKENS_REJECTION, param="max_tokens", code="unsupported_parameter"
+            ),
+            _bad_request(
+                "Unsupported parameter: 'response_format'.", param="response_format"
+            ),
+            one_chunk_stream(),
+        ]
+        mocker.patch(
+            "xagent.core.model.chat.basic.openai.AsyncOpenAI",
+            return_value=mock_client,
+        )
+
+        llm = OpenAILLM(**openai_llm_config)
+        _ = [
+            chunk
+            async for chunk in llm.stream_chat(
+                [{"role": "user", "content": "Summarize."}],
+                max_tokens=5000,
+                response_format={"type": "json_object"},
+            )
+        ]
+
+        assert mock_client.chat.completions.create.await_count == 3
+        final_kwargs = mock_client.chat.completions.create.call_args_list[2].kwargs
+        assert final_kwargs["max_completion_tokens"] == 5000
+        assert "response_format" not in final_kwargs
