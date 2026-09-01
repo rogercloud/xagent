@@ -1340,10 +1340,14 @@ class PatternRuntime:
         # is indistinguishable in the trace from compaction that never tried
         # to summarize at all.
         unusable_summary_metadata: dict[str, Any] | None = None
-        # Cleared once the summary path is entered. Reaching the fallback with
-        # this still set means no summary was ever attempted -- previously
-        # indistinguishable in the trace from a summary that was attempted and
-        # failed, since both just produced a "truncate" result.
+        # Cleared as soon as a usable summary path exists -- a model with a
+        # ``chat`` method plus a context that implements the compact protocol.
+        # It is deliberately NOT tied to a summary actually being attempted: a
+        # context that declines to build a request (nothing visible to
+        # summarize) had a summarizer available and must not be reported as
+        # lacking one. Reaching the fallback with this still set means no
+        # summarizer was reachable at all, which the trace previously could
+        # not distinguish from a summary that was attempted and failed.
         summary_unavailable_metadata: dict[str, Any] | None = {
             "llm_summary_unavailable": True,
         }
@@ -1422,14 +1426,22 @@ class PatternRuntime:
             result = compact_if_needed()
             if inspect.isawaitable(result):
                 result = await result
-            dropped_messages = getattr(result, "compacted", False)
+            # ``compacted`` is True even when the tail window already held
+            # every message and nothing was removed, so it cannot stand in for
+            # "messages were dropped" -- claiming a drop that did not happen
+            # would be the same kind of lie this marker exists to prevent.
+            removed_count = (getattr(result, "metadata", None) or {}).get(
+                "removed_count", 0
+            )
             fallback_metadata = unusable_summary_metadata
-            if fallback_metadata is None and dropped_messages:
+            if fallback_metadata is None and removed_count > 0:
                 fallback_metadata = summary_unavailable_metadata
                 if fallback_metadata is not None:
                     logger.warning(
-                        "Context compaction had no usable summary model; "
-                        "dropping messages instead. execution_id=%s",
+                        "Context compaction found no reachable summary path "
+                        "(no compact model, or a context that cannot build a "
+                        "compact request); dropping messages instead. "
+                        "execution_id=%s",
                         getattr(context, "execution_id", None),
                     )
             if result is not None and fallback_metadata is not None:
