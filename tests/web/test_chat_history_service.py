@@ -1,3 +1,4 @@
+from datetime import datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -7,10 +8,10 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import sessionmaker
 
 from xagent.core.agent.transcript import build_assistant_transcript_content
-from xagent.core.context_ref import CONTEXT_REFS_KEY
+from xagent.core.context_ref import CONTEXT_REFS_KEY, ContextReference
 from xagent.web.models.chat_message import TaskChatMessage
 from xagent.web.models.database import Base
-from xagent.web.models.task import Task, TaskStatus
+from xagent.web.models.task import Task, TaskStatus, TraceEvent
 from xagent.web.models.uploaded_file import UploadedFile
 from xagent.web.models.user import User
 from xagent.web.services import chat_history_service
@@ -24,6 +25,7 @@ from xagent.web.services.chat_history_service import (
     get_latest_waiting_question,
     inspect_user_message_delivery,
     load_task_transcript,
+    load_task_transcript_window,
     mark_user_message_delivery,
     persist_assistant_message,
     persist_assistant_message_no_commit,
@@ -63,6 +65,184 @@ def _create_task(db_session):
 )
 def test_safe_str_only_special_cases_none(value: object | None, expected: str) -> None:
     assert safe_str(value) == expected
+
+
+def _persist_compact_event(
+    db_session,
+    task_id: int,
+    *,
+    watermark: int | None,
+    summary: str = "Compacted conversation summary: earlier work.",
+    build_id: str | None = None,
+    context_refs: list[dict] | None = None,
+    seconds: int = 0,
+):
+    """Write one compact END trace row, the way the trace handler would."""
+    data: dict = {"compact_type": "execution_context", "strategy": "llm_summary"}
+    if summary is not None:
+        data["summary"] = summary
+    if watermark is not None:
+        data["watermark_message_id"] = watermark
+    if context_refs is not None:
+        data["summary_context_refs"] = context_refs
+    event = TraceEvent(
+        task_id=task_id,
+        build_id=build_id,
+        event_id=f"evt-{watermark}-{build_id or 'main'}-{seconds}",
+        event_type="action_end_compact",
+        timestamp=datetime(2026, 1, 1, 0, 0, seconds, tzinfo=timezone.utc),
+        data=data,
+    )
+    db_session.add(event)
+    db_session.commit()
+    return event
+
+
+def test_transcript_window_replays_summary_instead_of_absorbed_rows():
+    """The regression pin for compaction surviving a turn.
+
+    Deliberately asserts on the *window* rather than on any one query helper:
+    when the reconstruction service later takes over this read path, this test
+    must still fail if the summary stops being applied.
+    """
+    db_session = _create_db_session()
+    try:
+        task = _create_task(db_session)
+        absorbed = persist_user_message(
+            db_session, int(task.id), int(task.user_id), "old turn"
+        )
+        assert absorbed is not None
+        _persist_compact_event(db_session, int(task.id), watermark=int(absorbed.id))
+        recent = persist_user_message(
+            db_session, int(task.id), int(task.user_id), "new turn"
+        )
+        assert recent is not None
+
+        window = load_task_transcript_window(db_session, int(task.id))
+
+        assert [m["role"] for m in window.messages] == ["system", "user"]
+        assert window.messages[0]["content"].startswith("Compacted conversation")
+        assert window.messages[1]["content"] == "new turn"
+        # The absorbed row is gone from the context but still in the table:
+        # it is user-visible chat history and compaction must not destroy it.
+        assert "old turn" not in [m["content"] for m in window.messages]
+        assert (
+            db_session.query(TaskChatMessage)
+            .filter(TaskChatMessage.id == int(absorbed.id))
+            .count()
+            == 1
+        )
+        # Reported so this turn's compaction can record what it absorbed.
+        assert window.watermark == int(recent.id)
+    finally:
+        db_session.close()
+
+
+def test_transcript_window_ignores_a_sub_agent_compact_event():
+    """A delegated sub-agent compacts its own context and writes its own
+    compact events under the SAME task_id, distinguished only by build_id.
+    Adopting one would hide this task's real history behind a watermark that
+    never described it."""
+    db_session = _create_db_session()
+    try:
+        task = _create_task(db_session)
+        first = persist_user_message(
+            db_session, int(task.id), int(task.user_id), "kept"
+        )
+        assert first is not None
+        _persist_compact_event(
+            db_session,
+            int(task.id),
+            watermark=int(first.id),
+            summary="sub-agent summary",
+            build_id="sub-agent-1",
+        )
+
+        window = load_task_transcript_window(db_session, int(task.id))
+
+        assert [m["content"] for m in window.messages] == ["kept"]
+        assert window.watermark == int(first.id)
+    finally:
+        db_session.close()
+
+
+def test_transcript_window_skips_a_summary_that_covers_the_replay_point():
+    """Replaying from an earlier point (an edit or a branch) must not adopt a
+    summary that already absorbed rows at or past that point -- it speaks for
+    turns this replay is meant to discard."""
+    db_session = _create_db_session()
+    try:
+        task = _create_task(db_session)
+        first = persist_user_message(
+            db_session, int(task.id), int(task.user_id), "first"
+        )
+        second = persist_user_message(
+            db_session, int(task.id), int(task.user_id), "second"
+        )
+        third = persist_user_message(
+            db_session, int(task.id), int(task.user_id), "third"
+        )
+        assert first is not None and second is not None and third is not None
+        _persist_compact_event(db_session, int(task.id), watermark=int(second.id))
+
+        window = load_task_transcript_window(
+            db_session, int(task.id), before_message_id=int(second.id)
+        )
+
+        assert [m["content"] for m in window.messages] == ["first"]
+        assert window.watermark == int(first.id)
+    finally:
+        db_session.close()
+
+
+def test_transcript_window_ignores_a_compact_event_without_a_watermark():
+    """Events written before this feature carry no watermark. They cannot say
+    what they cover, so the only safe reading is to replay in full."""
+    db_session = _create_db_session()
+    try:
+        task = _create_task(db_session)
+        message = persist_user_message(
+            db_session, int(task.id), int(task.user_id), "still here"
+        )
+        assert message is not None
+        _persist_compact_event(db_session, int(task.id), watermark=None)
+
+        window = load_task_transcript_window(db_session, int(task.id))
+
+        assert [m["content"] for m in window.messages] == ["still here"]
+    finally:
+        db_session.close()
+
+
+def test_transcript_window_restores_the_summary_context_refs():
+    """Compaction picks which images survive a summary. Dropping them on
+    replay would silently reverse that decision."""
+    db_session = _create_db_session()
+    try:
+        task = _create_task(db_session)
+        absorbed = persist_user_message(
+            db_session, int(task.id), int(task.user_id), "old"
+        )
+        assert absorbed is not None
+        # Built through the real model, not hand-written: the normalizer that
+        # runs on the way out validates this shape, so a fabricated dict would
+        # be silently dropped and the test would pass against broken code.
+        ref = ContextReference(
+            file_ref={"file_id": "img-1", "filename": "chart.png"}
+        ).durable_dict()
+        _persist_compact_event(
+            db_session,
+            int(task.id),
+            watermark=int(absorbed.id),
+            context_refs=[ref],
+        )
+
+        window = load_task_transcript_window(db_session, int(task.id))
+
+        assert window.messages[0]["role"] == "system"
+        assert window.messages[0][CONTEXT_REFS_KEY] == [ref]
+    finally:
+        db_session.close()
 
 
 def test_load_task_transcript_returns_prior_turns_only():
@@ -138,6 +318,9 @@ def test_load_task_transcript_coerces_nullable_fields_to_empty_strings(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     message = SimpleNamespace(
+        # Real rows always carry their primary key; the window's watermark is
+        # derived from it.
+        id=7,
         role="assistant",
         content=None,
         message_type=None,

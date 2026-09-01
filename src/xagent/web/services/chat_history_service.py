@@ -12,12 +12,18 @@ from sqlalchemy.orm import Session
 from sqlalchemy.sql.elements import ColumnElement
 
 from ...core.agent.attachments import build_image_context_references
+from ...core.agent.context.execution import (
+    COMPACT_CONTEXT_REFS_METADATA_KEY,
+    COMPACT_SUMMARY_METADATA_KEY,
+    COMPACT_WATERMARK_METADATA_KEY,
+)
 from ...core.agent.transcript import (
     build_assistant_transcript_content,
     normalize_transcript_messages,
 )
 from ...core.context_ref import CONTEXT_REFS_KEY, ContextReference
 from ..models.chat_message import TaskChatMessage
+from ..models.task import TraceEvent
 from .assistant_history_safety import (
     LEGACY_UNTRUSTED_ASSISTANT_MESSAGE_TYPE,
     assistant_history_has_safe_ancillary_payload,
@@ -723,12 +729,114 @@ def persist_assistant_message_no_commit(
     return message
 
 
+# The stored ``event_type`` for a completed context compaction. Written by
+# ``ws_trace_handlers.get_event_type_mapping`` from
+# ``TraceEventType(ACTION, END, COMPACT)``.
+_COMPACT_END_EVENT_TYPE = "action_end_compact"
+
+
+@dataclass(frozen=True)
+class CompactSummary:
+    """A stored summary and the transcript row it stands in for."""
+
+    content: str
+    watermark_message_id: int
+    context_refs: tuple[Dict[str, Any], ...] = ()
+
+
+@dataclass(frozen=True)
+class TranscriptWindow:
+    """What a turn replays, plus the point a later summary stands in for.
+
+    ``watermark`` is the largest stored row id this window covers. Hand it to
+    the agent so a compaction during this turn can record what its summary
+    absorbed; without it the summary is unpositionable and the next turn falls
+    back to replaying everything.
+    """
+
+    messages: List[Dict[str, Any]]
+    watermark: Optional[int]
+
+
+def _latest_compact_summary(
+    db: Session,
+    task_id: int,
+    *,
+    before_message_id: Optional[int],
+) -> Optional[CompactSummary]:
+    """The newest usable summary for this task, or None to replay in full.
+
+    ``build_id IS NULL`` is load-bearing, not a tidiness filter. A delegated
+    sub-agent compacts its own context and writes its own compact events under
+    the SAME ``task_id``, carrying a ``build_id``. Those describe a different
+    conversation entirely, and adopting one would silently drop this task's
+    real history behind a watermark that never belonged to it.
+    """
+    query = (
+        db.query(TraceEvent.data)
+        .filter(
+            TraceEvent.task_id == task_id,
+            TraceEvent.event_type == _COMPACT_END_EVENT_TYPE,
+            TraceEvent.build_id.is_(None),
+        )
+        .order_by(TraceEvent.timestamp.desc(), TraceEvent.id.desc())
+    )
+    if before_message_id is not None:
+        # Replaying the conversation as of an earlier point (an edit or a
+        # branch) invalidates any summary that already absorbed rows at or
+        # past that point: it speaks for turns this replay is meant to
+        # discard. Watermarks only ever advance, so skipping those leaves the
+        # newest summary that is still entirely in the replayed past.
+        query = query.filter(
+            TraceEvent.data[COMPACT_WATERMARK_METADATA_KEY].as_integer()
+            < before_message_id
+        )
+
+    row = query.first()
+    if row is None:
+        return None
+    data = row[0]
+    if not isinstance(data, dict):
+        return None
+    content = data.get(COMPACT_SUMMARY_METADATA_KEY)
+    watermark = data.get(COMPACT_WATERMARK_METADATA_KEY)
+    # Compact events written before this feature carry neither key. Treating
+    # that as "no summary" replays in full -- the pre-existing behaviour, and
+    # the only safe reading of an event that cannot say what it covers.
+    if not isinstance(content, str) or not content.strip():
+        return None
+    if not isinstance(watermark, int) or isinstance(watermark, bool):
+        return None
+    raw_refs = data.get(COMPACT_CONTEXT_REFS_METADATA_KEY)
+    context_refs = (
+        tuple(ref for ref in raw_refs if isinstance(ref, dict))
+        if isinstance(raw_refs, list)
+        else ()
+    )
+    return CompactSummary(
+        content=content,
+        watermark_message_id=watermark,
+        context_refs=context_refs,
+    )
+
+
 def load_task_transcript(
     db: Session,
     task_id: int,
     *,
     before_message_id: Optional[int] = None,
 ) -> List[Dict[str, Any]]:
+    return load_task_transcript_window(
+        db, task_id, before_message_id=before_message_id
+    ).messages
+
+
+def load_task_transcript_window(
+    db: Session,
+    task_id: int,
+    *,
+    before_message_id: Optional[int] = None,
+) -> TranscriptWindow:
     if before_message_id is not None:
         # Check if the reference message actually exists
         exists = (
@@ -743,17 +851,28 @@ def load_task_transcript(
             logger.warning(
                 "Message id: {before_message_id} does not exit, returning empty list."
             )
-            return []
+            return TranscriptWindow(messages=[], watermark=None)
+
+    summary = _latest_compact_summary(db, task_id, before_message_id=before_message_id)
 
     query = db.query(TaskChatMessage).filter(TaskChatMessage.task_id == task_id)
     if before_message_id is not None:
         query = query.filter(TaskChatMessage.id < before_message_id)
+    if summary is not None:
+        # Everything at or below the watermark is what the summary says. The
+        # rows stay in the table -- they are the user-visible chat history --
+        # they just stop being replayed into the model's context.
+        query = query.filter(TaskChatMessage.id > summary.watermark_message_id)
 
     stored_messages = query.order_by(TaskChatMessage.id.asc()).all()
     retained_references: list[tuple[ContextReference, ...]] = [
         () for _ in stored_messages
     ]
     remaining_references = _MAX_HISTORICAL_IMAGE_CONTEXT_REFS
+    summary_refs: tuple[Dict[str, Any], ...] = ()
+    if summary is not None and summary.context_refs:
+        summary_refs = summary.context_refs[:remaining_references]
+        remaining_references -= len(summary_refs)
     for index in range(len(stored_messages) - 1, -1, -1):
         if remaining_references <= 0:
             break
@@ -786,7 +905,27 @@ def load_task_transcript(
                 reference.durable_dict() for reference in references
             ]
         messages.append(item)
-    return normalize_transcript_messages(messages)
+    if summary is not None:
+        summary_item: Dict[str, Any] = {
+            "role": "system",
+            "content": summary.content,
+        }
+        if summary_refs:
+            summary_item[CONTEXT_REFS_KEY] = list(summary_refs)
+        messages.insert(0, summary_item)
+
+    # The largest row this window covers, for the next compaction to record.
+    # Rows this turn goes on to write land above it and are replayed verbatim
+    # next time; that is deliberate. Their ids do not exist yet, and claiming
+    # a summary covers work whose rows were never seen would lose them.
+    watermark: Optional[int] = summary.watermark_message_id if summary else None
+    if stored_messages:
+        watermark = max(watermark or 0, int(stored_messages[-1].id))
+
+    return TranscriptWindow(
+        messages=normalize_transcript_messages(messages),
+        watermark=watermark,
+    )
 
 
 def get_latest_waiting_question(
