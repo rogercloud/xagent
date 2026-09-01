@@ -1513,8 +1513,9 @@ async def test_compaction_retries_with_a_smaller_budget_before_truncating() -> N
     )
 
     # Asked big, was refused, stepped down, succeeded -- and summarized rather
-    # than dropping messages.
-    assert llm.budgets == [8000, 1024]
+    # than dropping messages. The step lands on the largest rung the cap
+    # allows, not the smallest one available.
+    assert llm.budgets == [8000, 4096]
     assert result.compacted
     assert result.strategy == "llm_summary"
     assert "output cap" in context.messages[0].content
@@ -1565,7 +1566,49 @@ async def test_compaction_ladder_skips_a_budget_the_model_cannot_use() -> None:
         context=context, llm=llm, metadata={"phase": "test"}
     )
 
-    assert llm.budgets == [8000, 1024]
+    assert llm.budgets == [8000, 4096]
     assert result.compacted
     assert result.strategy == "llm_summary"
     assert "a real summary" in context.messages[0].content
+
+
+@pytest.mark.asyncio
+async def test_compaction_stops_descending_once_a_budget_is_accepted() -> None:
+    """Accepted-but-unusable ends the ladder rather than continuing down.
+
+    A response is unusable because the allowance was too small for the model
+    to finish, so usability is monotone in the budget: every smaller rung is
+    unusable too. Continuing to step down would spend requests to arrive at
+    the same truncation. Here the model accepts anything but can never
+    produce a summary, so the ladder must stop at the first accepted rung.
+    """
+    context = ExecutionContext(execution_id="budget-monotone")
+    context.compact_config.threshold = 32000
+    context.add_user_message("current request")
+    context.add_tool_result(
+        "read_file", {"output": "x" * 200_000}, tool_call_id="call-1"
+    )
+
+    class AlwaysReasoningLLM:
+        model_name = "compact-test"
+
+        def __init__(self) -> None:
+            self.budgets: list[int] = []
+
+        async def chat(self, **kwargs: Any) -> Any:
+            self.budgets.append(kwargs["max_tokens"])
+            return {
+                "content": "still thinking",
+                CONTENT_SOURCE_KEY: CONTENT_SOURCE_REASONING_FALLBACK,
+                "reasoning_content": "still thinking",
+            }
+
+    llm = AlwaysReasoningLLM()
+    result = await PatternRuntime().compact_context_if_needed(
+        context=context, llm=llm, metadata={"phase": "test"}
+    )
+
+    # One request, not one per rung.
+    assert llm.budgets == [8000]
+    assert result.strategy == "truncate"
+    assert result.metadata["llm_summary_unusable"] is True

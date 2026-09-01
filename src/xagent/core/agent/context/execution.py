@@ -58,11 +58,23 @@ COMPACT_SUMMARY_MIN_TOKENS = 256
 # first. The request is derived from the model's *input* window while
 # providers cap the *output* separately and much lower, and that limit is not
 # recorded anywhere -- so the budget is a guess and this ladder lets the
-# provider correct it. 1024 is here because it was the ceiling before this
-# change and is therefore known to work; skipping straight to the floor would
-# hand a reasoning model an allowance it can spend entirely on reasoning,
-# producing no summary and truncating anyway.
-COMPACT_SUMMARY_FALLBACK_BUDGETS = (1024, COMPACT_SUMMARY_MIN_TOKENS)
+# provider correct it.
+#
+# The rungs are dense between the ceiling and the floor because the first
+# budget the provider *accepts* is the one the summary gets written with, and
+# a reasoning model draws its reasoning from that same allowance: accepted is
+# not the same as sufficient. A ladder of only (1024, 256) meant a model
+# capped at 4096 fell from 8192 straight to 1024 -- the very allowance this
+# change raised the ceiling to get away from -- and produced a reasoning trace
+# instead of a summary. Halving keeps the first accepted rung as large as the
+# cap allows.
+#
+# Descending stops at the first accepted budget even when its response turns
+# out to be unusable. Usability is monotone in the budget: a response is
+# unusable because the allowance was too small for the model to finish, so
+# every smaller rung is unusable too and stepping further down only spends
+# requests to reach the same truncation.
+COMPACT_SUMMARY_FALLBACK_BUDGETS = (4096, 2048, 1024, COMPACT_SUMMARY_MIN_TOKENS)
 COMPACT_CONTEXT_REF_MAX_TOKENS = 2048
 COMPACT_DROPPED_REF_NOTICE_MAX_CHARS = 2048
 COMPACT_DROPPED_TOOL_NOTICE_MAX_CHARS = 1024
