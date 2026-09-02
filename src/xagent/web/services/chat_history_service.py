@@ -733,6 +733,12 @@ def persist_assistant_message_no_commit(
 # ``ws_trace_handlers.get_event_type_mapping`` from
 # ``TraceEventType(ACTION, END, COMPACT)``.
 _COMPACT_END_EVENT_TYPE = "action_end_compact"
+# How far back to keep looking for a reusable summary. The SQL filter below
+# already excludes every event that cannot carry one, so reaching a second
+# candidate means the first had a well-formed key with unusable content --
+# corruption, not a normal outcome. A handful is plenty; the point of looping
+# at all is that "this one is unusable" must never be read as "there is none".
+_COMPACT_SUMMARY_SCAN_LIMIT = 8
 
 
 @dataclass(frozen=True)
@@ -766,6 +772,20 @@ def _latest_compact_summary(
 ) -> Optional[CompactSummary]:
     """The newest usable summary for this task, or None to replay in full.
 
+    Reads down the ordered candidates rather than judging only the newest
+    one. The message-dropping backstop emits an ``action_end_compact`` event
+    too -- same type, deliberately carrying no summary, because it stands in
+    for nothing -- so the newest event is routinely not the newest *usable*
+    one. Stopping at the newest would let one backstop turn mask a perfectly
+    good summary and send every later turn back to replaying everything.
+
+    Selecting on the payload, not on ``strategy``: the question here is "can
+    this be replayed", and only the summary and watermark answer it.
+    ``strategy == "llm_summary"`` answers "how was this produced", which is a
+    different question -- a summary emitted with no watermark, or any event
+    written before this feature existed, carries that strategy and still
+    cannot be positioned.
+
     ``build_id IS NULL`` is load-bearing, not a tidiness filter. A delegated
     sub-agent compacts its own context and writes its own compact events under
     the SAME ``task_id``, carrying a ``build_id``. Those describe a different
@@ -778,6 +798,16 @@ def _latest_compact_summary(
             TraceEvent.task_id == task_id,
             TraceEvent.event_type == _COMPACT_END_EVENT_TYPE,
             TraceEvent.build_id.is_(None),
+            # Keeps backstop events and pre-feature rows out of the candidate
+            # set entirely, so a run of them cannot exhaust the scan limit
+            # below. SQL only sees whether the keys are there; whether the
+            # content is usable is settled in Python.
+            #
+            # The ``as_*`` coercions are required, not cosmetic: a bare
+            # ``data[key].isnot(None)`` compares as JSON and matches rows
+            # where the key is absent, which silently filters nothing.
+            TraceEvent.data[COMPACT_SUMMARY_METADATA_KEY].as_string().isnot(None),
+            TraceEvent.data[COMPACT_WATERMARK_METADATA_KEY].as_integer().isnot(None),
         )
         .order_by(TraceEvent.timestamp.desc(), TraceEvent.id.desc())
     )
@@ -792,19 +822,24 @@ def _latest_compact_summary(
             < before_message_id
         )
 
-    row = query.first()
-    if row is None:
-        return None
-    data = row[0]
+    for (data,) in query.limit(_COMPACT_SUMMARY_SCAN_LIMIT).all():
+        summary = _compact_summary_from_event(data)
+        if summary is not None:
+            return summary
+    return None
+
+
+def _compact_summary_from_event(data: Any) -> Optional[CompactSummary]:
+    """Read one compact event payload, or None if it cannot be replayed."""
     if not isinstance(data, dict):
         return None
     content = data.get(COMPACT_SUMMARY_METADATA_KEY)
     watermark = data.get(COMPACT_WATERMARK_METADATA_KEY)
-    # Compact events written before this feature carry neither key. Treating
-    # that as "no summary" replays in full -- the pre-existing behaviour, and
-    # the only safe reading of an event that cannot say what it covers.
     if not isinstance(content, str) or not content.strip():
         return None
+    # ``bool`` is an ``int`` subclass, so this rejects a stray ``true`` that
+    # would otherwise be read as "the summary covers rows up to 1" and drop
+    # the entire transcript.
     if not isinstance(watermark, int) or isinstance(watermark, bool):
         return None
     raw_refs = data.get(COMPACT_CONTEXT_REFS_METADATA_KEY)
@@ -869,10 +904,6 @@ def load_task_transcript_window(
         () for _ in stored_messages
     ]
     remaining_references = _MAX_HISTORICAL_IMAGE_CONTEXT_REFS
-    summary_refs: tuple[Dict[str, Any], ...] = ()
-    if summary is not None and summary.context_refs:
-        summary_refs = summary.context_refs[:remaining_references]
-        remaining_references -= len(summary_refs)
     for index in range(len(stored_messages) - 1, -1, -1):
         if remaining_references <= 0:
             break
@@ -910,8 +941,19 @@ def load_task_transcript_window(
             "role": "system",
             "content": summary.content,
         }
-        if summary_refs:
-            summary_item[CONTEXT_REFS_KEY] = list(summary_refs)
+        # The summary stands for the oldest part of the conversation, so it
+        # takes what the newest-first walk above left over -- one allocation
+        # under one rule, not a reserved slice ahead of it. Giving it first
+        # pick starved the images the user had only just sent: a compaction
+        # can legitimately retain more references than this window replays
+        # (its own budget counts tokens, this one counts references), so a
+        # reserved slice can consume the window outright. Recency also
+        # matters more than the age of the decision -- when compaction chose
+        # what to keep, the newest attachment did not exist yet.
+        if summary.context_refs and remaining_references > 0:
+            summary_item[CONTEXT_REFS_KEY] = list(
+                summary.context_refs[:remaining_references]
+            )
         messages.insert(0, summary_item)
 
     # The largest row this window covers, for the next compaction to record.

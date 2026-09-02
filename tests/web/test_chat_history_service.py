@@ -72,13 +72,14 @@ def _persist_compact_event(
     task_id: int,
     *,
     watermark: int | None,
-    summary: str = "Compacted conversation summary: earlier work.",
+    summary: str | None = "Compacted conversation summary: earlier work.",
+    strategy: str = "llm_summary",
     build_id: str | None = None,
     context_refs: list[dict] | None = None,
     seconds: int = 0,
 ):
     """Write one compact END trace row, the way the trace handler would."""
-    data: dict = {"compact_type": "execution_context", "strategy": "llm_summary"}
+    data: dict = {"compact_type": "execution_context", "strategy": strategy}
     if summary is not None:
         data["summary"] = summary
     if watermark is not None:
@@ -134,6 +135,213 @@ def test_transcript_window_replays_summary_instead_of_absorbed_rows():
         )
         # Reported so this turn's compaction can record what it absorbed.
         assert window.watermark == int(recent.id)
+    finally:
+        db_session.close()
+
+
+def test_transcript_window_looks_past_a_newer_backstop_event():
+    """A dropped-messages turn must not mask the summary before it.
+
+    The backstop emits an ``action_end_compact`` event of its own -- same
+    type, deliberately carrying no summary. Judging only the newest event
+    read that as "no summary exists" and sent every later turn back to
+    replaying the whole transcript, which is the cost this feature removes.
+    """
+    db_session = _create_db_session()
+    try:
+        task = _create_task(db_session)
+        absorbed = persist_user_message(
+            db_session, int(task.id), int(task.user_id), "old turn"
+        )
+        assert absorbed is not None
+        _persist_compact_event(db_session, int(task.id), watermark=int(absorbed.id))
+        recent = persist_user_message(
+            db_session, int(task.id), int(task.user_id), "new turn"
+        )
+        assert recent is not None
+        # A later turn whose summary was unusable, so it dropped messages.
+        _persist_compact_event(
+            db_session,
+            int(task.id),
+            watermark=None,
+            summary=None,
+            strategy="truncate",
+            seconds=30,
+        )
+
+        window = load_task_transcript_window(db_session, int(task.id))
+
+        assert [m["role"] for m in window.messages] == ["system", "user"]
+        assert window.messages[0]["content"].startswith("Compacted conversation")
+        assert window.messages[1]["content"] == "new turn"
+    finally:
+        db_session.close()
+
+
+def test_transcript_window_looks_past_a_well_formed_but_unusable_summary():
+    """SQL can see that the keys are present; only Python can see that the
+    content is not usable. A row that passes the query and fails validation
+    must not end the search -- that is the same "unusable read as absent"
+    confusion the backstop case exposed, one layer further in.
+
+    ``watermark: True`` is the sharper half: ``bool`` is an ``int`` subclass,
+    so an unguarded read would take it as "covers rows up to 1" and drop the
+    whole transcript.
+    """
+    db_session = _create_db_session()
+    try:
+        task = _create_task(db_session)
+        absorbed = persist_user_message(
+            db_session, int(task.id), int(task.user_id), "old turn"
+        )
+        assert absorbed is not None
+        _persist_compact_event(db_session, int(task.id), watermark=int(absorbed.id))
+        persist_user_message(db_session, int(task.id), int(task.user_id), "new turn")
+        _persist_compact_event(
+            db_session, int(task.id), watermark=999, summary="   ", seconds=30
+        )
+        _persist_compact_event(
+            db_session, int(task.id), watermark=True, summary="bad", seconds=40
+        )
+
+        window = load_task_transcript_window(db_session, int(task.id))
+
+        assert window.messages[0]["content"].startswith("Compacted conversation")
+        assert [m["content"] for m in window.messages[1:]] == ["new turn"]
+    finally:
+        db_session.close()
+
+
+def test_transcript_window_survives_more_backstops_than_the_scan_limit():
+    """The scan limit must not become the new masking bug.
+
+    Reading down the candidates fixes one backstop turn, but a bounded scan
+    would still be exhausted by a run of them. The query filters unusable
+    payloads out in SQL so backstop events never occupy a candidate slot at
+    all -- which is what keeps the bound safe rather than merely rarer.
+    """
+    db_session = _create_db_session()
+    try:
+        task = _create_task(db_session)
+        absorbed = persist_user_message(
+            db_session, int(task.id), int(task.user_id), "old turn"
+        )
+        assert absorbed is not None
+        _persist_compact_event(db_session, int(task.id), watermark=int(absorbed.id))
+        persist_user_message(db_session, int(task.id), int(task.user_id), "new turn")
+        for offset in range(chat_history_service._COMPACT_SUMMARY_SCAN_LIMIT + 2):
+            _persist_compact_event(
+                db_session,
+                int(task.id),
+                watermark=None,
+                summary=None,
+                strategy="truncate",
+                seconds=30 + offset,
+            )
+
+        window = load_task_transcript_window(db_session, int(task.id))
+
+        assert window.messages[0]["content"].startswith("Compacted conversation")
+        assert [m["content"] for m in window.messages[1:]] == ["new turn"]
+    finally:
+        db_session.close()
+
+
+def test_transcript_window_ignores_a_summary_event_with_no_watermark():
+    """``strategy`` is not the discriminator: a summary emitted without a
+    watermark carries ``llm_summary`` and still cannot be positioned. It must
+    neither be adopted nor mask an older summary that can be."""
+    db_session = _create_db_session()
+    try:
+        task = _create_task(db_session)
+        absorbed = persist_user_message(
+            db_session, int(task.id), int(task.user_id), "old turn"
+        )
+        assert absorbed is not None
+        _persist_compact_event(db_session, int(task.id), watermark=int(absorbed.id))
+        persist_user_message(db_session, int(task.id), int(task.user_id), "new turn")
+        _persist_compact_event(
+            db_session,
+            int(task.id),
+            watermark=None,
+            summary="unpositionable summary",
+            seconds=30,
+        )
+
+        window = load_task_transcript_window(db_session, int(task.id))
+
+        assert window.messages[0]["content"].startswith("Compacted conversation")
+        assert [m["content"] for m in window.messages[1:]] == ["new turn"]
+    finally:
+        db_session.close()
+
+
+def test_post_summary_images_outrank_the_summary_refs():
+    """One reference window, one rule: newest first.
+
+    A compaction's own reference budget counts tokens, this window counts
+    references, so a summary can legitimately hold more than the window
+    replays -- 20 low-detail images cost 1860 of its 2048 tokens. Reserving
+    a slice for the summary ahead of the rows let that consume the window
+    outright, and the image the user had only just sent arrived with no
+    reference at all.
+    """
+    db_session = _create_db_session()
+    try:
+        task = _create_task(db_session)
+        absorbed = persist_user_message(
+            db_session, int(task.id), int(task.user_id), "old turn"
+        )
+        assert absorbed is not None
+        summary_refs = [
+            ContextReference(
+                file_ref={"file_id": f"old-{index}", "filename": f"old{index}.png"},
+                detail="low",
+            ).durable_dict()
+            for index in range(20)
+        ]
+        _persist_compact_event(
+            db_session,
+            int(task.id),
+            watermark=int(absorbed.id),
+            context_refs=summary_refs,
+        )
+        db_session.add(
+            UploadedFile(
+                file_id="new-shot",
+                user_id=int(task.user_id),
+                task_id=int(task.id),
+                filename="new.png",
+                storage_path="/tmp/new-shot/new.png",
+                mime_type="image/png",
+                file_size=10,
+            )
+        )
+        db_session.commit()
+        persist_user_message(
+            db_session,
+            int(task.id),
+            int(task.user_id),
+            "look at this",
+            attachments=[
+                {
+                    "file_id": "new-shot",
+                    "filename": "new.png",
+                    "mime_type": "image/png",
+                    "size": 10,
+                }
+            ],
+        )
+        db_session.commit()
+
+        window = load_task_transcript_window(db_session, int(task.id))
+
+        newest = window.messages[-1]
+        assert newest["content"] == "look at this"
+        assert len(newest[CONTEXT_REFS_KEY]) == 1
+        # The summary still gets the remainder rather than nothing: it is last
+        # in one allocation, not excluded from it.
+        assert len(window.messages[0][CONTEXT_REFS_KEY]) == 15
     finally:
         db_session.close()
 
