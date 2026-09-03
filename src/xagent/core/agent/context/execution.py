@@ -70,6 +70,16 @@ COMPACT_WATERMARK_METADATA_KEY = "watermark_message_id"
 # compaction judged worth the budget.
 COMPACT_CONTEXT_REFS_METADATA_KEY = "summary_context_refs"
 
+# Floor for the per-message cap on what compaction is asked to read. Unlike
+# the summary's output budget this has no ceiling: providers cap output far
+# below input, which is why ``COMPACT_SUMMARY_MAX_TOKENS`` exists, but nothing
+# caps a single input message except the window it has to fit in -- so the
+# input cap can scale with the window without ever outgrowing a provider
+# limit. The floor says only that a message this small was never what
+# exhausted a context window; it stops a tiny threshold from capping
+# everything to nothing.
+COMPACT_TRANSCRIPT_MESSAGE_MIN_TOKENS = 2048
+
 COMPACT_SUMMARY_MAX_TOKENS = 8192
 COMPACT_SUMMARY_MIN_TOKENS = 256
 # Budgets to fall back through when the requested one is refused, largest
@@ -1138,15 +1148,25 @@ class ExecutionContext:
             return None
 
         max_tokens = self._llm_compact_max_tokens()
+        omitted: list[dict[str, Any]] = []
+        messages = self._build_llm_compact_prompt(visible_messages, omitted=omitted)
+        metadata: dict[str, Any] = {
+            "original_tokens": total_tokens,
+            "threshold": self.compact_config.threshold,
+            "max_summary_tokens": max_tokens,
+        }
+        if omitted:
+            # Surfaced so a thin summary has a visible cause. Counts and sizes
+            # only -- never the omitted content, which is the whole reason it
+            # was left out.
+            metadata["omitted_message_count"] = len(omitted)
+            metadata["omitted_messages"] = omitted
+            metadata["max_message_tokens"] = self._compact_message_max_tokens()
         return {
-            "messages": self._build_llm_compact_prompt(visible_messages),
+            "messages": messages,
             "original_tokens": total_tokens,
             "max_tokens": max_tokens,
-            "metadata": {
-                "original_tokens": total_tokens,
-                "threshold": self.compact_config.threshold,
-                "max_summary_tokens": max_tokens,
-            },
+            "metadata": metadata,
         }
 
     def _drop_oldest_messages(self) -> CompactResult:
@@ -1440,9 +1460,11 @@ class ExecutionContext:
         return None
 
     def _build_llm_compact_prompt(
-        self, messages: list[Message]
+        self,
+        messages: list[Message],
+        omitted: list[dict[str, Any]] | None = None,
     ) -> list[dict[str, str]]:
-        transcript = self._compact_transcript(messages)
+        transcript = self._compact_transcript(messages, omitted=omitted)
         return [
             {
                 "role": "system",
@@ -1502,7 +1524,31 @@ class ExecutionContext:
             min(COMPACT_SUMMARY_MAX_TOKENS, self.compact_config.threshold // 4),
         )
 
-    def _compact_transcript(self, messages: list[Message]) -> str:
+    def _compact_message_max_tokens(self) -> int:
+        """Cap on what any single message contributes to a summary request.
+
+        A summary is written by reading the history, so a message large enough
+        to exhaust the window on its own makes compaction impossible rather
+        than merely expensive: the request cannot be sent, the backstop then
+        finds a message count small enough that its tail window keeps
+        everything, and the context stays over budget with nothing able to
+        shrink it.
+
+        Shares the summary output budget's ``threshold // 4`` denominator on
+        purpose -- no single message should be able to claim more of the
+        request than the whole summary is allowed to produce.
+        """
+        return max(
+            COMPACT_TRANSCRIPT_MESSAGE_MIN_TOKENS,
+            self.compact_config.threshold // 4,
+        )
+
+    def _compact_transcript(
+        self,
+        messages: list[Message],
+        omitted: list[dict[str, Any]] | None = None,
+    ) -> str:
+        max_message_tokens = self._compact_message_max_tokens()
         chunks: list[str] = []
         for index, message in enumerate(messages, start=1):
             header = f"{index}. {message.role.upper()}"
@@ -1514,12 +1560,47 @@ class ExecutionContext:
                     "tool_calls="
                     + json.dumps(message.tool_calls, ensure_ascii=False, default=str)
                 )
-            chunks.append(message.content)
+            content_tokens = max(1, len(message.content) // 4)
+            if content_tokens > max_message_tokens:
+                chunks.append(self._omitted_content_notice(message, content_tokens))
+                if omitted is not None:
+                    omitted.append(
+                        {
+                            "index": index,
+                            "role": message.role,
+                            "tool_name": message.metadata.get("tool_name"),
+                            "estimated_tokens": content_tokens,
+                        }
+                    )
+            else:
+                chunks.append(message.content)
             if message.context_refs:
                 context_refs_text = message.context_refs_text()
                 if context_refs_text:
                     chunks.append(context_refs_text)
         return "\n".join(chunks)
+
+    @staticmethod
+    def _omitted_content_notice(message: Message, content_tokens: int) -> str:
+        """Stand-in for a message too large to include in a summary request.
+
+        Replaces the whole message rather than a prefix of it. A byte-slice
+        can land inside a structured value -- a JSON key, an identifier -- and
+        the model completes the severed token by guessing, which reads as data
+        and is silently wrong. Naming what was dropped instead lets the
+        summary say the work happened and point at where to re-read it.
+
+        Deterministic by construction: the text is derived only from the
+        message, never from the clock or a request id, so retrying the same
+        compaction at a smaller output budget sends a byte-identical request.
+        """
+        tool_name = message.metadata.get("tool_name")
+        subject = f"{tool_name} result" if tool_name else f"{message.role} message"
+        return (
+            f"[content omitted from this summary request: {subject}, "
+            f"~{content_tokens} tokens. It ran and produced output; re-read "
+            f"the source for its contents rather than reconstructing them.]"
+        )
 
     @staticmethod
     def _is_reasoning_fallback(response: Any) -> bool:

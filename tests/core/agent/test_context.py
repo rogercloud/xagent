@@ -1993,3 +1993,75 @@ def test_compact_config_round_trip_drops_the_retired_strategy_key() -> None:
     assert restored.compact_config.threshold == 1234
     assert restored.compact_config.max_messages == 7
     assert not hasattr(restored.compact_config, "strategy")
+
+
+def test_compact_request_omits_a_message_too_large_to_read() -> None:
+    """A single oversized result must not make compaction impossible.
+
+    Compaction writes its summary by reading the history, so one message big
+    enough to exhaust the window on its own cannot be summarized at all --
+    and the backstop cannot help either, because a context that short has a
+    tail window wide enough to keep every message, so nothing is dropped and
+    the context stays over budget with no way out.
+    """
+    context = ExecutionContext(execution_id="oversized")
+    context.compact_config.threshold = 24000
+    context.add_user_message("summarize the repo")
+    context.add_tool_result(
+        "read_file", {"output": "x" * 900_000}, tool_call_id="call-1"
+    )
+
+    request = context.build_llm_compact_request_if_needed()
+
+    assert request is not None
+    assert request["original_tokens"] > 200_000
+    prompt_tokens = sum(len(m["content"]) for m in request["messages"]) // 4
+    # The point of the cap: the request is now sendable at all.
+    assert prompt_tokens < context.compact_config.threshold
+    omitted = request["metadata"]["omitted_messages"]
+    assert [entry["tool_name"] for entry in omitted] == ["read_file"]
+    assert request["metadata"]["omitted_message_count"] == 1
+
+
+def test_compact_request_keeps_messages_under_the_cap_verbatim() -> None:
+    """The cap is for outliers. Ordinary history must reach the summary
+    whole, or every summary silently degrades."""
+    context = ExecutionContext(execution_id="ordinary")
+    context.compact_config.threshold = 24000
+    context.add_user_message("a question worth summarizing")
+    context.add_tool_result("read_file", {"output": "y" * 4_000}, tool_call_id="call-1")
+
+    request = context.build_llm_compact_request_if_needed()
+
+    assert request is None or "omitted_messages" not in request["metadata"]
+
+
+def test_oversized_content_is_replaced_whole_not_sliced() -> None:
+    """Never a half field. A byte-slice can land inside a structured value
+    and the model completes the severed token by guessing, which reads as
+    data and is silently wrong -- the failure this replacement exists to
+    avoid. The stand-in must also be free of any per-turn value, so retrying
+    the same compaction at a lower output budget sends an identical request.
+    """
+    context = ExecutionContext(execution_id="whole-not-sliced")
+    context.compact_config.threshold = 24000
+    context.add_user_message("go")
+    context.add_tool_result(
+        "fetch_page",
+        {
+            "output": '{"handle": {"workspace": "4b33784773d5", "branch": "main"}}'
+            * 5000
+        },
+        tool_call_id="call-1",
+    )
+
+    first = context.build_llm_compact_request_if_needed()
+    second = context.build_llm_compact_request_if_needed()
+
+    assert first is not None and second is not None
+    transcript = first["messages"][-1]["content"]
+    assert "4b33784773d5" not in transcript
+    assert "fetch_page result" in transcript
+    # Byte-identical across builds: nothing in the notice comes from the
+    # clock or a request id.
+    assert transcript == second["messages"][-1]["content"]
