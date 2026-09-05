@@ -1211,14 +1211,17 @@ def make_agent_outbound_handler(task_id: int, *, authoritative: bool = False) ->
                     task_id,
                     str(payload["content"]),
                 )
-            event = create_final_answer_stream_event(
+            final_answer_event = create_final_answer_stream_event(
                 payload_type, task_id, dict(payload)
             )
             if authoritative:
                 await asyncio.to_thread(
-                    _persist_agent_outbound_event, task_id, event, authoritative=True
+                    _persist_agent_outbound_event,
+                    task_id,
+                    final_answer_event,
+                    authoritative=True,
                 )
-            await manager.broadcast_to_task(event, task_id)
+            await manager.broadcast_to_task(final_answer_event, task_id)
             return
 
         if payload.get("visible") is False:
