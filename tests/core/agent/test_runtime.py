@@ -1786,7 +1786,10 @@ async def test_compaction_preserves_context_after_provider_rejects_its_length() 
 
         async def chat(self, **kwargs: Any) -> Any:
             self.budgets.append(kwargs["max_tokens"])
-            raise RuntimeError("maximum context length exceeded")
+            raise RuntimeError(
+                "The input token count (461428) exceeds the maximum number "
+                "of tokens allowed (131072)."
+            )
 
     llm = RejectingLLM()
     result = await PatternRuntime().compact_context_if_needed(context=context, llm=llm)

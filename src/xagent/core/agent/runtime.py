@@ -22,7 +22,7 @@ from ..context_materializer import (
 )
 from ..model.chat.basic.base import BaseLLM
 from ..model.chat.error import is_context_length_error, retry_on
-from ..model.chat.exceptions import LLMToolProtocolError
+from ..model.chat.exceptions import LLMContextLengthError, LLMToolProtocolError
 from ..model.chat.token_context import extract_cached_input_tokens
 from ..model.chat.tool_protocol import TOOL_PROTOCOL_ERROR_KEY
 from ..model.chat.types import ChunkType
@@ -289,6 +289,12 @@ class PatternRuntime:
                 raise LLMCallInterrupted(
                     self.interrupt_reason or "interrupted during LLM call"
                 ) from exc
+            raise
+        except Exception as exc:  # noqa: BLE001
+            if is_context_length_error(exc):
+                if isinstance(exc, LLMContextLengthError):
+                    raise
+                raise LLMContextLengthError(str(exc)) from exc
             raise
         finally:
             self._active_llm_tasks.discard(task)

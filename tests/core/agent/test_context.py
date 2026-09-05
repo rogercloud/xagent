@@ -13,6 +13,7 @@ from xagent.core.agent.context import (
     MergeStrategy,
     Message,
 )
+from xagent.core.agent.context import execution as execution_module
 from xagent.core.agent.context import enrichment as enrichment_module
 from xagent.core.agent.context.enrichment import (
     MEMORY_CONTEXT_METADATA_KEY,
@@ -2149,6 +2150,33 @@ def test_compact_request_blocks_when_context_window_is_unknown() -> None:
     assert request["blocked"] is True
     assert request["metadata"]["llm_compact_context_window_unknown"] is True
     assert request["max_tokens"] == 0
+
+
+def test_compact_request_blocks_when_tokenizer_cannot_load(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    context = ExecutionContext(execution_id="offline-tokenizer")
+    context.compact_config.threshold = 1
+    context.add_user_message("requirement that must survive")
+    original_messages = list(context.messages)
+
+    execution_module._compact_token_encoding.cache_clear()
+
+    def fail_to_load(_: str) -> None:
+        raise OSError("offline")
+
+    monkeypatch.setattr(execution_module.tiktoken, "get_encoding", fail_to_load)
+    try:
+        request = context.build_llm_compact_request_if_needed(context_window=32_000)
+    finally:
+        execution_module._compact_token_encoding.cache_clear()
+
+    assert request is not None
+    assert request["blocked"] is True
+    assert request["metadata"]["llm_compact_tokenizer_unavailable"] is True
+    assert request["metadata"]["compact_tokenizer_error_type"] == "OSError"
+    assert request["max_tokens"] == 0
+    assert context.messages == original_messages
 
 
 def test_compact_request_blocks_when_tool_calls_overflow_the_window() -> None:

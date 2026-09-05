@@ -1,7 +1,11 @@
 import httpx
 import openai
 
-from .exceptions import LLMRetryableError, LLMToolProtocolError
+from .exceptions import (
+    LLMContextLengthError,
+    LLMRetryableError,
+    LLMToolProtocolError,
+)
 
 try:
     from zai.core._errors import APIStatusError as ZaiAPIStatusError  # type: ignore
@@ -14,6 +18,7 @@ _CONTEXT_LENGTH_ERROR_MARKERS = (
     "context length exceeded",
     "maximum context length",
     "exceeds the context window",
+    "exceeds the maximum number of tokens allowed",
     "input is too long",
     "prompt is too long",
     "too many input tokens",
@@ -26,6 +31,8 @@ def is_context_length_error(error: BaseException) -> bool:
     current: BaseException | None = error
     while current is not None and id(current) not in seen:
         seen.add(id(current))
+        if isinstance(current, LLMContextLengthError):
+            return True
         message = str(current).lower()
         if any(marker in message for marker in _CONTEXT_LENGTH_ERROR_MARKERS):
             return True
@@ -34,6 +41,9 @@ def is_context_length_error(error: BaseException) -> bool:
 
 
 def retry_on(e: Exception) -> bool:
+    if is_context_length_error(e):
+        return False
+
     ERRORS = (
         httpx.TimeoutException,
         httpx.NetworkError,

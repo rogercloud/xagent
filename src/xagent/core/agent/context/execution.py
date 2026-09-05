@@ -5,6 +5,7 @@ from collections import Counter
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from enum import Enum
+from functools import lru_cache
 from typing import Any
 from uuid import uuid4
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -82,7 +83,6 @@ COMPACT_CONTEXT_REFS_METADATA_KEY = "summary_context_refs"
 # everything to nothing.
 COMPACT_TRANSCRIPT_MESSAGE_MIN_TOKENS = 2048
 COMPACT_REQUEST_SAFETY_TOKENS = 512
-COMPACT_TOKEN_ENCODING = tiktoken.get_encoding("cl100k_base")
 COMPACT_TOKEN_COUNT_CHUNK_CHARS = 1_024
 # The minimal safe allowlist for whole-message omission. A matching recorded
 # tool call is also required, so the summary retains the source path and exact
@@ -120,14 +120,22 @@ COMPACT_DROPPED_TOOL_NOTICE_MAX_CHARS = 1024
 COMPACT_DROPPED_TOOL_NAME_MAX_CHARS = 64
 
 
+@lru_cache(maxsize=1)
+def _compact_token_encoding() -> Any:
+    # get_encoding may download its merge table on the first cache miss. Keep
+    # that I/O out of module import so an offline deployment can still start.
+    return tiktoken.get_encoding("cl100k_base")
+
+
 def _count_compact_request_tokens(content: str) -> int:
     # Encoding very long repetitive strings in one pass can make tiktoken's
     # BPE merge work disproportionately expensive. Independent chunks also
     # form a conservative count because tokens cannot merge across a chunk
     # boundary.
+    encoding = _compact_token_encoding()
     return sum(
         len(
-            COMPACT_TOKEN_ENCODING.encode(
+            encoding.encode(
                 content[offset : offset + COMPACT_TOKEN_COUNT_CHUNK_CHARS],
                 disallowed_special=(),
             )
@@ -1180,16 +1188,10 @@ class ExecutionContext:
         max_tokens = self._llm_compact_max_tokens()
         omitted: list[dict[str, Any]] = []
         messages = self._build_llm_compact_prompt(visible_messages, omitted=omitted)
-        request_input_tokens = sum(
-            max(1, _count_compact_request_tokens(str(message.get("content") or "")))
-            for message in messages
-        )
         metadata: dict[str, Any] = {
             "original_tokens": total_tokens,
             "threshold": self.compact_config.threshold,
             "max_summary_tokens": max_tokens,
-            "compact_request_input_tokens": request_input_tokens,
-            "compact_request_tokenizer": "cl100k_base",
         }
         if not isinstance(context_window, int) or context_window <= 0:
             metadata["llm_compact_context_window_unknown"] = True
@@ -1200,6 +1202,30 @@ class ExecutionContext:
                 "max_tokens": 0,
                 "metadata": metadata,
             }
+        try:
+            request_input_tokens = sum(
+                max(
+                    1,
+                    _count_compact_request_tokens(str(message.get("content") or "")),
+                )
+                for message in messages
+            )
+        except Exception as exc:  # noqa: BLE001
+            metadata.update(
+                {
+                    "llm_compact_tokenizer_unavailable": True,
+                    "compact_tokenizer_error_type": type(exc).__name__,
+                }
+            )
+            return {
+                "blocked": True,
+                "messages": messages,
+                "original_tokens": total_tokens,
+                "max_tokens": 0,
+                "metadata": metadata,
+            }
+        metadata["compact_request_input_tokens"] = request_input_tokens
+        metadata["compact_request_tokenizer"] = "cl100k_base"
 
         available_output_tokens = (
             context_window - request_input_tokens - COMPACT_REQUEST_SAFETY_TOKENS
