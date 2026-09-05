@@ -9,6 +9,30 @@ except ImportError:
     ZaiAPIStatusError = None
 
 
+_CONTEXT_LENGTH_ERROR_MARKERS = (
+    "context_length_exceeded",
+    "context length exceeded",
+    "maximum context length",
+    "exceeds the context window",
+    "input is too long",
+    "prompt is too long",
+    "too many input tokens",
+)
+
+
+def is_context_length_error(error: BaseException) -> bool:
+    """Recognize provider context-window failures through wrapper exceptions."""
+    seen: set[int] = set()
+    current: BaseException | None = error
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        message = str(current).lower()
+        if any(marker in message for marker in _CONTEXT_LENGTH_ERROR_MARKERS):
+            return True
+        current = current.__cause__ or current.__context__
+    return False
+
+
 def retry_on(e: Exception) -> bool:
     ERRORS = (
         httpx.TimeoutException,

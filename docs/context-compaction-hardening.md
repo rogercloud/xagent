@@ -12,8 +12,8 @@ recovery pipeline.
   differ.
 - Count the complete provider request, including wrappers, tool calls, message
   content, context references, and output allowance.
-- Prefer a model tokenizer over the current character heuristic where one is
-  available.
+- Use the resolved model's tokenizer where available; keep the conservative
+  generic tokenizer only as a fallback.
 - Verify both the summary request and the post-compaction agent request.
 
 ## Recoverability

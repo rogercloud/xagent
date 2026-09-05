@@ -1314,6 +1314,7 @@ async def test_auto_pattern_falls_back_to_the_main_llm_for_compaction() -> None:
             "react done",
         ]
     )
+    llm.context_window = 32_000
     pattern = AutoPattern()
     context = ExecutionContext()
     context.compact_config.threshold = 1

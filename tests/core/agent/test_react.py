@@ -5696,6 +5696,8 @@ async def test_react_pattern_traces_context_compaction() -> None:
     context.compact_config.threshold = 1
     for index in range(3):
         context.add_user_message(f"message {index}")
+    llm = FakeLLM([{"content": "summary"}, {"content": "done"}])
+    llm.context_window = 32_000
 
     result = await ReActPattern(max_iterations=1).run(
         context=context,
@@ -5703,7 +5705,7 @@ async def test_react_pattern_traces_context_compaction() -> None:
         # Two responses: compaction now summarizes with the main model when no
         # compact model is configured, so it consumes one before the turn's
         # own call.
-        llm=FakeLLM([{"content": "summary"}, {"content": "done"}]),
+        llm=llm,
         runtime=runtime,
     )
 
@@ -5743,6 +5745,7 @@ async def test_react_pattern_uses_compact_llm_for_context_compaction() -> None:
             }
         ]
     )
+    compact_llm.context_window = 32_000
 
     result = await ReActPattern(max_iterations=1).run(
         context=context,

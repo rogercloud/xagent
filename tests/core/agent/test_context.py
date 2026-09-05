@@ -951,7 +951,7 @@ def test_compact_with_llm_summarizes_history_and_preserves_current_user() -> Non
     ctx.add_tool_result("read_file", {"output": "x" * 200}, tool_call_id="call-1")
     llm = CompactLLM()
 
-    request = ctx.build_llm_compact_request_if_needed()
+    request = ctx.build_llm_compact_request_if_needed(context_window=32_000)
     assert request is not None
     assert request["max_tokens"] == 256
     prompt = request["messages"]
@@ -1342,7 +1342,7 @@ def test_compact_with_llm_preserves_waiting_for_user_response() -> None:
         },
     )
 
-    request = ctx.build_llm_compact_request_if_needed()
+    request = ctx.build_llm_compact_request_if_needed(context_window=32_000)
     assert request is not None
 
     result = ctx.compact_with_llm_response(
@@ -1433,7 +1433,7 @@ def test_reconstructed_context_above_threshold_triggers_llm_summary() -> None:
     assert read_file_message.metadata["raw_result"] == {"output": "kpi table"}
 
     llm = CompactLLM()
-    request = ctx.build_llm_compact_request_if_needed()
+    request = ctx.build_llm_compact_request_if_needed(context_window=32_000)
     assert request is not None
 
     result = ctx.compact_with_llm_response(
@@ -1909,7 +1909,9 @@ def test_llm_compact_budget_scales_with_the_threshold() -> None:
     The old ceiling of 1024 bound at every realistic window, leaving a
     reasoning model no room -- its reasoning comes out of this same allowance.
     """
-    request = _context_over_threshold(20_000).build_llm_compact_request_if_needed()
+    request = _context_over_threshold(20_000).build_llm_compact_request_if_needed(
+        context_window=32_000
+    )
 
     assert request is not None
     assert request["max_tokens"] == 5_000
@@ -1926,7 +1928,7 @@ def test_llm_compact_budget_stays_under_provider_output_limits() -> None:
     for window_threshold in (96_000, 150_000, 750_000):
         request = _context_over_threshold(
             window_threshold
-        ).build_llm_compact_request_if_needed()
+        ).build_llm_compact_request_if_needed(context_window=window_threshold * 2)
 
         assert request is not None
         assert request["max_tokens"] == 8192
@@ -2024,7 +2026,7 @@ def test_compact_request_omits_a_message_too_large_to_read() -> None:
         "read_file", {"output": "x" * 900_000}, tool_call_id="call-1"
     )
 
-    request = context.build_llm_compact_request_if_needed()
+    request = context.build_llm_compact_request_if_needed(context_window=32_000)
 
     assert request is not None
     assert request["original_tokens"] > 200_000
@@ -2044,7 +2046,7 @@ def test_compact_request_keeps_messages_under_the_cap_verbatim() -> None:
     for index in range(7):
         context.add_user_message(f"ordinary-{index}:" + "y" * 16_000)
 
-    request = context.build_llm_compact_request_if_needed()
+    request = context.build_llm_compact_request_if_needed(context_window=32_000)
 
     assert request is not None
     transcript = request["messages"][-1]["content"]
@@ -2069,7 +2071,7 @@ def test_compact_request_never_omits_an_oversized_user_requirement() -> None:
     assert "omitted_messages" not in request["metadata"]
 
 
-def test_compact_request_never_omits_an_unrecoverable_tool_result() -> None:
+def test_compact_request_preserves_an_unrecoverable_tool_result_when_blocked() -> None:
     context = ExecutionContext(execution_id="write-receipt")
     context.compact_config.threshold = 24000
     marker = "ONE_TIME_WRITE_RECEIPT"
@@ -2096,20 +2098,18 @@ def test_compact_request_never_omits_an_unrecoverable_tool_result() -> None:
     request = context.build_llm_compact_request_if_needed(context_window=32_000)
 
     assert request is not None
-    assert not request.get("blocked")
+    assert request["blocked"] is True
     assert marker in request["messages"][-1]["content"]
     assert "omitted_messages" not in request["metadata"]
-    input_tokens = request["metadata"]["compact_request_input_tokens"]
-    safety_tokens = request["metadata"]["compact_request_safety_tokens"]
-    assert input_tokens + request["max_tokens"] + safety_tokens <= 32_000
+    assert request["metadata"]["llm_compact_request_too_large"] is True
 
 
 def test_compact_request_budgets_the_complete_rendered_prompt() -> None:
     context = ExecutionContext(execution_id="complete-budget")
     context.compact_config.threshold = 24000
     for index in range(5):
-        context.add_user_message(f"message-{index}:" + "x" * 19_000)
-    context.add_user_message("y" * 24_000)
+        context.add_user_message(f"message-{index}:" + "word " * 4_500)
+    context.add_user_message("tail " * 5_000)
 
     request = context.build_llm_compact_request_if_needed(context_window=32_000)
 
@@ -2119,6 +2119,36 @@ def test_compact_request_budgets_the_complete_rendered_prompt() -> None:
     safety_tokens = request["metadata"]["compact_request_safety_tokens"]
     assert input_tokens + request["max_tokens"] + safety_tokens <= 32_000
     assert request["max_tokens"] < 6_000
+
+
+def test_compact_request_counts_cjk_tokens_before_sending() -> None:
+    context = ExecutionContext(execution_id="cjk-budget")
+    context.compact_config.threshold = 24_000
+    marker = "重要约束必须保留"
+    context.add_user_message(marker + "重要约束" * 25_000)
+    context.add_assistant_message("继续处理")
+
+    request = context.build_llm_compact_request_if_needed(context_window=32_000)
+
+    assert request is not None
+    assert request["blocked"] is True
+    assert request["metadata"]["compact_request_input_tokens"] > 32_000
+    assert request["metadata"]["compact_request_tokenizer"] == "cl100k_base"
+    assert marker in request["messages"][-1]["content"]
+
+
+def test_compact_request_blocks_when_context_window_is_unknown() -> None:
+    context = ExecutionContext(execution_id="unknown-window")
+    context.compact_config.threshold = 1
+    context.add_user_message("requirement that must survive")
+    context.add_assistant_message("work in progress")
+
+    request = context.build_llm_compact_request_if_needed()
+
+    assert request is not None
+    assert request["blocked"] is True
+    assert request["metadata"]["llm_compact_context_window_unknown"] is True
+    assert request["max_tokens"] == 0
 
 
 def test_compact_request_blocks_when_tool_calls_overflow_the_window() -> None:
@@ -2180,8 +2210,8 @@ def test_oversized_content_is_replaced_whole_not_sliced() -> None:
         tool_call_id="call-1",
     )
 
-    first = context.build_llm_compact_request_if_needed()
-    second = context.build_llm_compact_request_if_needed()
+    first = context.build_llm_compact_request_if_needed(context_window=32_000)
+    second = context.build_llm_compact_request_if_needed(context_window=32_000)
 
     assert first is not None and second is not None
     transcript = first["messages"][-1]["content"]

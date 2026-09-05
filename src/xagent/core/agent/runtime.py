@@ -21,7 +21,7 @@ from ..context_materializer import (
     materialize_llm_kwargs,
 )
 from ..model.chat.basic.base import BaseLLM
-from ..model.chat.error import retry_on
+from ..model.chat.error import is_context_length_error, retry_on
 from ..model.chat.exceptions import LLMToolProtocolError
 from ..model.chat.token_context import extract_cached_input_tokens
 from ..model.chat.tool_protocol import TOOL_PROTOCOL_ERROR_KEY
@@ -1276,6 +1276,8 @@ class PatternRuntime:
         except LLMCallInterrupted:
             raise
         except Exception as exc:  # noqa: BLE001
+            if is_context_length_error(exc):
+                raise
             budgets = [
                 budget
                 for budget in COMPACT_SUMMARY_FALLBACK_BUDGETS
@@ -1309,7 +1311,11 @@ class PatternRuntime:
                     raise
                 except Exception as retry_exc:  # noqa: BLE001
                     exc = retry_exc
-                    if retry_on(retry_exc) or self._interrupt_requested:
+                    if (
+                        is_context_length_error(retry_exc)
+                        or retry_on(retry_exc)
+                        or self._interrupt_requested
+                    ):
                         break
                     continue
                 metadata["compact_budget_reduced_to"] = budget
@@ -1438,10 +1444,26 @@ class PatternRuntime:
                         )
                         if not callable(compact_if_needed):
                             raise
-                        result = compact_if_needed()
-                        result.metadata["llm_compact_error"] = str(exc)
-                        result.metadata["fallback_strategy"] = result.strategy
-                        result.metadata.update(request_metadata)
+                        if is_context_length_error(exc):
+                            compaction_blocked = True
+                            message_count = len(getattr(context, "messages", ()))
+                            result = CompactResult(
+                                compacted=False,
+                                original_count=message_count,
+                                final_count=message_count,
+                                strategy="none",
+                                metadata={
+                                    **request_metadata,
+                                    "llm_compact_error": str(exc),
+                                    "llm_compact_context_length_error": True,
+                                    "fallback_suppressed": True,
+                                },
+                            )
+                        else:
+                            result = compact_if_needed()
+                            result.metadata["llm_compact_error"] = str(exc)
+                            result.metadata["fallback_strategy"] = result.strategy
+                            result.metadata.update(request_metadata)
 
         # Backstop. ``compact_if_needed`` drops the oldest messages outright,
         # so it runs only after summarization was skipped, errored, or came
