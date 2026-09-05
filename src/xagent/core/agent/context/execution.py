@@ -79,6 +79,13 @@ COMPACT_CONTEXT_REFS_METADATA_KEY = "summary_context_refs"
 # exhausted a context window; it stops a tiny threshold from capping
 # everything to nothing.
 COMPACT_TRANSCRIPT_MESSAGE_MIN_TOKENS = 2048
+COMPACT_REQUEST_SAFETY_TOKENS = 512
+# The minimal safe allowlist for whole-message omission. A matching recorded
+# tool call is also required, so the summary retains the source path and exact
+# read arguments. Other tool results may contain one-time handles or write
+# receipts and must not be assumed recoverable merely because their role is
+# ``tool``.
+COMPACT_REREADABLE_TOOL_NAMES = frozenset({"read_file"})
 
 COMPACT_SUMMARY_MAX_TOKENS = 8192
 COMPACT_SUMMARY_MIN_TOKENS = 256
@@ -1135,7 +1142,9 @@ class ExecutionContext:
             strategy="none",
         )
 
-    def build_llm_compact_request_if_needed(self) -> dict[str, Any] | None:
+    def build_llm_compact_request_if_needed(
+        self, *, context_window: int | None = None
+    ) -> dict[str, Any] | None:
         if not self.compact_config.enabled:
             return None
 
@@ -1150,11 +1159,34 @@ class ExecutionContext:
         max_tokens = self._llm_compact_max_tokens()
         omitted: list[dict[str, Any]] = []
         messages = self._build_llm_compact_prompt(visible_messages, omitted=omitted)
+        request_input_tokens = sum(
+            max(1, len(str(message.get("content") or "")) // 4) for message in messages
+        )
         metadata: dict[str, Any] = {
             "original_tokens": total_tokens,
             "threshold": self.compact_config.threshold,
             "max_summary_tokens": max_tokens,
+            "compact_request_input_tokens": request_input_tokens,
         }
+        if isinstance(context_window, int) and context_window > 0:
+            available_output_tokens = (
+                context_window - request_input_tokens - COMPACT_REQUEST_SAFETY_TOKENS
+            )
+            metadata["compact_context_window"] = context_window
+            metadata["compact_request_safety_tokens"] = COMPACT_REQUEST_SAFETY_TOKENS
+            if available_output_tokens < COMPACT_SUMMARY_MIN_TOKENS:
+                metadata["llm_compact_request_too_large"] = True
+                return {
+                    "blocked": True,
+                    "messages": messages,
+                    "original_tokens": total_tokens,
+                    "max_tokens": 0,
+                    "metadata": metadata,
+                }
+            if available_output_tokens < max_tokens:
+                max_tokens = available_output_tokens
+                metadata["max_summary_tokens"] = max_tokens
+                metadata["compact_budget_reduced_to"] = max_tokens
         if omitted:
             # Surfaced so a thin summary has a visible cause. Counts and sizes
             # only -- never the omitted content, which is the whole reason it
@@ -1549,6 +1581,15 @@ class ExecutionContext:
         omitted: list[dict[str, Any]] | None = None,
     ) -> str:
         max_message_tokens = self._compact_message_max_tokens()
+        rereadable_tool_call_ids = {
+            str(tool_call["id"])
+            for message in messages
+            for tool_call in message.tool_calls or ()
+            if isinstance(tool_call, dict)
+            and tool_call.get("id")
+            and self._compact_tool_call_name(tool_call) in COMPACT_REREADABLE_TOOL_NAMES
+            and self._compact_tool_call_arguments(tool_call)
+        }
         chunks: list[str] = []
         for index, message in enumerate(messages, start=1):
             header = f"{index}. {message.role.upper()}"
@@ -1561,7 +1602,16 @@ class ExecutionContext:
                     + json.dumps(message.tool_calls, ensure_ascii=False, default=str)
                 )
             content_tokens = max(1, len(message.content) // 4)
-            if content_tokens > max_message_tokens:
+            can_reread = (
+                message.role == "tool"
+                and message.metadata.get("tool_name") in COMPACT_REREADABLE_TOOL_NAMES
+                and message.tool_call_id is not None
+                and str(message.tool_call_id) in rereadable_tool_call_ids
+            )
+            # User, system, assistant, and non-rereadable tool messages are
+            # their own source. Omitting one here would permanently discard it
+            # when the summary replaces the raw history.
+            if can_reread and content_tokens > max_message_tokens:
                 chunks.append(self._omitted_content_notice(message, content_tokens))
                 if omitted is not None:
                     omitted.append(
@@ -1581,6 +1631,20 @@ class ExecutionContext:
         return "\n".join(chunks)
 
     @staticmethod
+    def _compact_tool_call_name(tool_call: dict[str, Any]) -> str:
+        function = tool_call.get("function")
+        if isinstance(function, dict):
+            return str(function.get("name") or "")
+        return str(tool_call.get("name") or "")
+
+    @staticmethod
+    def _compact_tool_call_arguments(tool_call: dict[str, Any]) -> Any:
+        function = tool_call.get("function")
+        if isinstance(function, dict):
+            return function.get("arguments")
+        return tool_call.get("args")
+
+    @staticmethod
     def _omitted_content_notice(message: Message, content_tokens: int) -> str:
         """Stand-in for a message too large to include in a summary request.
 
@@ -1595,11 +1659,11 @@ class ExecutionContext:
         compaction at a smaller output budget sends a byte-identical request.
         """
         tool_name = message.metadata.get("tool_name")
-        subject = f"{tool_name} result" if tool_name else f"{message.role} message"
+        subject = f"{tool_name} result" if tool_name else "tool result"
         return (
             f"[content omitted from this summary request: {subject}, "
-            f"~{content_tokens} tokens. It ran and produced output; re-read "
-            f"the source for its contents rather than reconstructing them.]"
+            f"~{content_tokens} tokens. Re-run the recorded read-only tool "
+            f"call if its contents are needed rather than reconstructing them.]"
         )
 
     @staticmethod

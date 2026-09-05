@@ -2007,6 +2007,19 @@ def test_compact_request_omits_a_message_too_large_to_read() -> None:
     context = ExecutionContext(execution_id="oversized")
     context.compact_config.threshold = 24000
     context.add_user_message("summarize the repo")
+    context.add_assistant_message(
+        "",
+        tool_calls=[
+            {
+                "id": "call-1",
+                "type": "function",
+                "function": {
+                    "name": "read_file",
+                    "arguments": '{"path":"large.txt"}',
+                },
+            }
+        ],
+    )
     context.add_tool_result(
         "read_file", {"output": "x" * 900_000}, tool_call_id="call-1"
     )
@@ -2028,12 +2041,111 @@ def test_compact_request_keeps_messages_under_the_cap_verbatim() -> None:
     whole, or every summary silently degrades."""
     context = ExecutionContext(execution_id="ordinary")
     context.compact_config.threshold = 24000
-    context.add_user_message("a question worth summarizing")
-    context.add_tool_result("read_file", {"output": "y" * 4_000}, tool_call_id="call-1")
+    for index in range(7):
+        context.add_user_message(f"ordinary-{index}:" + "y" * 16_000)
 
     request = context.build_llm_compact_request_if_needed()
 
-    assert request is None or "omitted_messages" not in request["metadata"]
+    assert request is not None
+    transcript = request["messages"][-1]["content"]
+    for index in range(7):
+        assert f"ordinary-{index}:" in transcript
+    assert "omitted_messages" not in request["metadata"]
+
+
+def test_compact_request_never_omits_an_oversized_user_requirement() -> None:
+    context = ExecutionContext(execution_id="user-requirement")
+    context.compact_config.threshold = 24000
+    marker = "ORIGINAL_REQUIREMENT_MUST_SURVIVE"
+    context.add_user_message(marker + ":" + "u" * 28_000)
+    context.add_assistant_message("a" * 70_000)
+    context.add_user_message("continue")
+
+    request = context.build_llm_compact_request_if_needed(context_window=32_000)
+
+    assert request is not None
+    assert not request.get("blocked")
+    assert marker in request["messages"][-1]["content"]
+    assert "omitted_messages" not in request["metadata"]
+
+
+def test_compact_request_never_omits_an_unrecoverable_tool_result() -> None:
+    context = ExecutionContext(execution_id="write-receipt")
+    context.compact_config.threshold = 24000
+    marker = "ONE_TIME_WRITE_RECEIPT"
+    context.add_user_message("create the remote resource")
+    context.add_assistant_message(
+        "",
+        tool_calls=[
+            {
+                "id": "call-1",
+                "type": "function",
+                "function": {
+                    "name": "create_resource",
+                    "arguments": '{"name":"report"}',
+                },
+            }
+        ],
+    )
+    context.add_tool_result(
+        "create_resource",
+        {"output": marker + ":" + "r" * 120_000},
+        tool_call_id="call-1",
+    )
+
+    request = context.build_llm_compact_request_if_needed(context_window=32_000)
+
+    assert request is not None
+    assert not request.get("blocked")
+    assert marker in request["messages"][-1]["content"]
+    assert "omitted_messages" not in request["metadata"]
+    input_tokens = request["metadata"]["compact_request_input_tokens"]
+    safety_tokens = request["metadata"]["compact_request_safety_tokens"]
+    assert input_tokens + request["max_tokens"] + safety_tokens <= 32_000
+
+
+def test_compact_request_budgets_the_complete_rendered_prompt() -> None:
+    context = ExecutionContext(execution_id="complete-budget")
+    context.compact_config.threshold = 24000
+    for index in range(5):
+        context.add_user_message(f"message-{index}:" + "x" * 19_000)
+    context.add_user_message("y" * 24_000)
+
+    request = context.build_llm_compact_request_if_needed(context_window=32_000)
+
+    assert request is not None
+    assert not request.get("blocked")
+    input_tokens = request["metadata"]["compact_request_input_tokens"]
+    safety_tokens = request["metadata"]["compact_request_safety_tokens"]
+    assert input_tokens + request["max_tokens"] + safety_tokens <= 32_000
+    assert request["max_tokens"] < 6_000
+
+
+def test_compact_request_blocks_when_tool_calls_overflow_the_window() -> None:
+    context = ExecutionContext(execution_id="tool-call-budget")
+    context.compact_config.threshold = 24000
+    for _ in range(6):
+        context.add_user_message("z" * 17_000)
+    context.add_assistant_message(
+        "",
+        tool_calls=[
+            {
+                "id": "call-1",
+                "type": "function",
+                "function": {
+                    "name": "large_call",
+                    "arguments": "v" * 200_000,
+                },
+            }
+        ],
+    )
+
+    request = context.build_llm_compact_request_if_needed(context_window=32_000)
+
+    assert request is not None
+    assert request["blocked"] is True
+    assert request["metadata"]["llm_compact_request_too_large"] is True
+    assert request["max_tokens"] == 0
 
 
 def test_oversized_content_is_replaced_whole_not_sliced() -> None:
@@ -2046,8 +2158,21 @@ def test_oversized_content_is_replaced_whole_not_sliced() -> None:
     context = ExecutionContext(execution_id="whole-not-sliced")
     context.compact_config.threshold = 24000
     context.add_user_message("go")
+    context.add_assistant_message(
+        "",
+        tool_calls=[
+            {
+                "id": "call-1",
+                "type": "function",
+                "function": {
+                    "name": "read_file",
+                    "arguments": '{"path":"large.json"}',
+                },
+            }
+        ],
+    )
     context.add_tool_result(
-        "fetch_page",
+        "read_file",
         {
             "output": '{"handle": {"workspace": "4b33784773d5", "branch": "main"}}'
             * 5000
@@ -2061,7 +2186,7 @@ def test_oversized_content_is_replaced_whole_not_sliced() -> None:
     assert first is not None and second is not None
     transcript = first["messages"][-1]["content"]
     assert "4b33784773d5" not in transcript
-    assert "fetch_page result" in transcript
+    assert "read_file result" in transcript
     # Byte-identical across builds: nothing in the notice comes from the
     # clock or a request id.
     assert transcript == second["messages"][-1]["content"]

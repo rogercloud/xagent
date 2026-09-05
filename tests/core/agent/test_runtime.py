@@ -1721,6 +1721,45 @@ class _SummarizingLLM:
         return {"content": "what happened earlier"}
 
 
+@pytest.mark.asyncio
+async def test_compaction_does_not_truncate_an_unsendable_safe_request() -> None:
+    context = ExecutionContext(execution_id="unsafe-to-truncate")
+    context.compact_config.threshold = 24000
+    context.compact_config.max_messages = 2
+    for _ in range(6):
+        context.add_user_message("z" * 17_000)
+    context.add_assistant_message(
+        "",
+        tool_calls=[
+            {
+                "id": "call-1",
+                "type": "function",
+                "function": {
+                    "name": "large_call",
+                    "arguments": "v" * 200_000,
+                },
+            }
+        ],
+    )
+    original_messages = list(context.messages)
+
+    class UnusedLLM:
+        context_window = 32_000
+
+        async def chat(self, **_: Any) -> Any:  # pragma: no cover - must not run
+            raise AssertionError("an oversized compact request must not be sent")
+
+    result = await PatternRuntime().compact_context_if_needed(
+        context=context,
+        llm=UnusedLLM(),
+    )
+
+    assert not result.compacted
+    assert result.metadata["llm_compact_request_too_large"] is True
+    assert result.metadata["fallback_suppressed"] is True
+    assert context.messages == original_messages
+
+
 def _oversized_context(execution_id: str) -> ExecutionContext:
     context = ExecutionContext(execution_id=execution_id)
     context.compact_config.threshold = 32000
