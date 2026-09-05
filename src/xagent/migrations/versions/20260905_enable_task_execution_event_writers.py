@@ -63,13 +63,16 @@ def upgrade() -> None:
 def downgrade() -> None:
     if op.get_context().as_sql:
         raise RuntimeError("Event-writer downgrade requires an online version check")
-    if op.get_bind().scalar(
+    inspector = sa.inspect(op.get_bind())
+    has_tasks = inspector.has_table("tasks")
+    if has_tasks and op.get_bind().scalar(
         sa.text("SELECT count(*) FROM tasks WHERE conversation_storage_version <> 1")
     ):
         raise RuntimeError("Cannot downgrade while event-backed tasks exist")
-    if sa.inspect(op.get_bind()).has_table("task_chat_messages"):
+    if inspector.has_table("task_chat_messages"):
         op.drop_index(
             "ix_task_chat_messages_execution_event_id", table_name="task_chat_messages"
         )
         op.drop_column("task_chat_messages", "execution_event_id")
-    _replace_check("conversation_storage_version = 1")
+    if has_tasks:
+        _replace_check("conversation_storage_version = 1")

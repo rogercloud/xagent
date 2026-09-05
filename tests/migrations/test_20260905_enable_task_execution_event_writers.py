@@ -64,3 +64,27 @@ def test_upgrade_preserves_tasks_and_inbound_cascade_rows(engine):
             )
             == 1
         )
+
+
+@pytest.mark.parametrize("with_chat_table", [False, True])
+def test_upgrade_downgrade_without_metadata_owned_tasks(engine, with_chat_table):
+    with engine.begin() as db:
+        if with_chat_table:
+            db.execute(
+                sa.text("CREATE TABLE task_chat_messages (id INTEGER PRIMARY KEY)")
+            )
+        run(db, STORAGE, "upgrade")
+        run(db, WRITERS, "upgrade")
+        if with_chat_table:
+            assert "execution_event_id" in {
+                column["name"]
+                for column in sa.inspect(db).get_columns("task_chat_messages")
+            }
+        run(db, WRITERS, "downgrade")
+        run(db, STORAGE, "downgrade")
+        assert not sa.inspect(db).has_table("tasks")
+        if with_chat_table:
+            assert [
+                column["name"]
+                for column in sa.inspect(db).get_columns("task_chat_messages")
+            ] == ["id"]
