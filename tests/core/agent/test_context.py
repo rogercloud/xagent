@@ -13,8 +13,8 @@ from xagent.core.agent.context import (
     MergeStrategy,
     Message,
 )
-from xagent.core.agent.context import execution as execution_module
 from xagent.core.agent.context import enrichment as enrichment_module
+from xagent.core.agent.context import execution as execution_module
 from xagent.core.agent.context.enrichment import (
     MEMORY_CONTEXT_METADATA_KEY,
     SKILL_CONTEXT_METADATA_KEY,
