@@ -3,6 +3,7 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor, TimeoutError
 from datetime import datetime, timezone
 from threading import Event
+from unittest.mock import Mock
 from uuid import uuid4
 
 import pytest
@@ -274,3 +275,31 @@ def test_payload_keeps_complete_tool_results_and_normalizes_jsonb_hazards(
             ).event_id
             == rows[1].event_id
         )
+
+
+@pytest.mark.parametrize("limit", [-1, 0, 101, 10**9])
+def test_page_size_rejected_before_database_access(limit):
+    db = Mock(spec=Session)
+    with pytest.raises(ValueError, match="limit must be between 1 and 100"):
+        load_task_execution_events(db, task_id=1, scope_id="root", limit=limit)
+    db.scalars.assert_not_called()
+
+
+def test_page_size_bounds_and_default_preserve_cursor_pagination(engine, task_id):
+    with Session(engine) as db:
+        for index in range(101):
+            append(db, task_id, key=f"event-{index}")
+        db.commit()
+        for options in ({}, {"limit": 100}):
+            rows = load_task_execution_events(
+                db, task_id=task_id, scope_id="root", **options
+            )
+            assert [row.sequence for row in rows] == list(range(1, 101))
+        first = load_task_execution_events(
+            db, task_id=task_id, scope_id="root", limit=1
+        )
+        assert [row.sequence for row in first] == [1]
+        last = load_task_execution_events(
+            db, task_id=task_id, scope_id="root", after_sequence=100
+        )
+        assert [row.sequence for row in last] == [101]

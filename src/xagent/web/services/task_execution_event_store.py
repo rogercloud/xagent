@@ -18,6 +18,8 @@ from ..models.task import Task
 from ..models.task_execution_event import TaskExecutionEvent
 from ..utils.json_payload_sanitizer import sanitize_json_payload
 
+MAX_EXECUTION_EVENT_PAGE_SIZE = 100
+
 
 class ExecutionEventConflict(ValueError):
     """An idempotency key was reused for a different fact."""
@@ -118,9 +120,11 @@ def load_task_execution_events(
     task_id: int,
     scope_id: str,
     after_sequence: int = 0,
-    limit: int = 100,
+    limit: int = MAX_EXECUTION_EVENT_PAGE_SIZE,
 ) -> list[TaskExecutionEvent]:
-    """Read one scope in commit order using the caller's transaction snapshot."""
+    """Read one scope in commit order; reject page sizes outside 1–100."""
+    if not 1 <= limit <= MAX_EXECUTION_EVENT_PAGE_SIZE:
+        raise ValueError(f"limit must be between 1 and {MAX_EXECUTION_EVENT_PAGE_SIZE}")
     return list(
         db.scalars(
             select(TaskExecutionEvent)

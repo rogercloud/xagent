@@ -55,7 +55,8 @@ or correlation raises `ExecutionEventConflict`. Callers must finish their
 transaction, including on errors; this helper never commits or rolls it back.
 
 `load_task_execution_events` requires task and scope, and reads by sequence
-with a bounded page size. It uses the caller's transaction snapshot; another
+with a page size of 1–100 (default 100). Out-of-range sizes raise `ValueError`
+before querying the database. It uses the caller's transaction snapshot; another
 connection cannot see uncommitted events, while read-your-writes in the same
 Session is intentional. Authorization remains the future calling service's
 responsibility. Neither helper is an externally exposed endpoint.
