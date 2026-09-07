@@ -2173,7 +2173,9 @@ def _schedule_bg(
 
         started_at = trigger_execution.start()
         bg_task.add_done_callback(
-            lambda task: trigger_execution.finish(started_at, cancelled=task.cancelled())
+            lambda task: trigger_execution.finish(
+                started_at, cancelled=task.cancelled()
+            )
         )
     logger.info(
         "task %s scheduled in background v2 (source=%s, force_fresh=%s)",

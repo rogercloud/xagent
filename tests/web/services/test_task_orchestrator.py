@@ -3032,13 +3032,14 @@ async def test_schedule_bg_cleanup_handles_missing_payload_turn_id(db_session) -
 @pytest.mark.asyncio
 @pytest.mark.parametrize("source", ["web", "trigger"])
 async def test_schedule_bg_preserves_public_safe_required_mcp_failure(
-    db_session, monkeypatch, source,
+    db_session,
+    monkeypatch,
+    source,
 ) -> None:
     """A typed, curated setup failure remains actionable to the client."""
+    from xagent.core.utils import setup_metrics
     from xagent.web.api.websocket import background_task_manager
     from xagent.web.api.websocket import manager as ws_manager
-
-    from xagent.core.utils import setup_metrics
 
     counters = setup_metrics.SetupMetrics()
     monkeypatch.setattr(setup_metrics, "trigger_execution", counters)
