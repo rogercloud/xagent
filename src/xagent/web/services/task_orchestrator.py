@@ -2168,6 +2168,13 @@ def _schedule_bg(
 
     bg_task = asyncio.create_task(_runner())
     background_task_manager.register_task(task_id, bg_task)
+    if task_source == "trigger":
+        from ...core.utils.setup_metrics import trigger_execution
+
+        started_at = trigger_execution.start()
+        bg_task.add_done_callback(
+            lambda task: trigger_execution.finish(started_at, cancelled=task.cancelled())
+        )
     logger.info(
         "task %s scheduled in background v2 (source=%s, force_fresh=%s)",
         task_id,
