@@ -3084,6 +3084,8 @@ async def test_schedule_bg_preserves_public_safe_required_mcp_failure(
         await background
         assert counters.active == 0
         assert counters.completed == (source == "trigger")
+        assert counters.failed == (source == "trigger")
+        assert counters.cancelled == 0
 
     db_session.expire_all()
     persisted = db_session.get(Task, int(task.id))
@@ -4210,3 +4212,29 @@ async def test_incidental_failure_persists_the_generic_history_type(
     assert settled["client_message_type"] == TASK_FAILURE_MESSAGE_TYPE
     assert settled["client_error_message"] == CLIENT_SAFE_TASK_FAILURE
     assert "secret-token-xyz" not in settled["client_error_message"]
+
+
+@pytest.mark.asyncio
+async def test_trigger_metrics_cancelled_before_runner_starts(monkeypatch) -> None:
+    from xagent.core.utils import setup_metrics
+    from xagent.web.api.websocket import background_task_manager
+
+    counters = setup_metrics.SetupMetrics()
+    monkeypatch.setattr(setup_metrics, "trigger_execution", counters)
+    with patch.object(background_task_manager, "register_task"):
+        background = _schedule_bg(
+            task_id=1,
+            task_owner_user_id=1,
+            task_source="trigger",
+            payload=TaskTurnPayload("hello"),
+            force_fresh=False,
+            context=None,
+        )
+        assert counters.active == 1
+        background.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await background
+    assert counters.active == 0
+    assert counters.completed == 1
+    assert counters.cancelled == 1
+    assert counters.failed == 0

@@ -1788,7 +1788,10 @@ def _schedule_bg(
     )
     from ..api.websocket import manager as websocket_manager
 
+    execution_failed = False
+
     async def _runner() -> None:
+        nonlocal execution_failed
         lease: TaskLease | None = task_lease
         stop_event: asyncio.Event | None = None
         hb_task: asyncio.Task[TaskLeaseHeartbeatOutcome] | None = None
@@ -1931,6 +1934,9 @@ def _schedule_bg(
                     settlement_error = "task execution cancelled"
                 raise
             except Exception as setup_or_run_err:
+                # Handled setup/run failures settle and return normally, so
+                # the done callback cannot infer them from task.exception().
+                execution_failed = True
                 if is_database_pool_timeout(setup_or_run_err):
                     # The failed setup/run checkout already waited for the
                     # exhausted pool. An immediate settlement would perform a
@@ -2174,7 +2180,10 @@ def _schedule_bg(
         started_at = trigger_execution.start()
         bg_task.add_done_callback(
             lambda task: trigger_execution.finish(
-                started_at, cancelled=task.cancelled()
+                started_at,
+                cancelled=task.cancelled(),
+                failed=not task.cancelled()
+                and (execution_failed or task.exception() is not None),
             )
         )
     logger.info(
