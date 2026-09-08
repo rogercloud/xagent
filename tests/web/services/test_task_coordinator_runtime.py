@@ -85,6 +85,56 @@ async def test_remote_owner_is_not_adopted(registry, database):
         await other.close()
 
 
+@pytest.mark.parametrize("action", ["retry", "cancel_waiter", "shutdown"])
+async def test_wake_during_release_waits_for_cleanup(
+    registry, database, monkeypatch, action
+):
+    owner = await registry.ensure(database[1])
+    committed, unblock = Event(), Event()
+    original = owner._release
+
+    def blocked_release():
+        result = original()
+        committed.set()
+        assert unblock.wait(5)
+        return result
+
+    monkeypatch.setattr(owner, "_release", blocked_release)
+    closer = asyncio.create_task(owner.close())
+    waiters = []
+    shutdown = None
+    try:
+        await wait_thread_event(committed)
+        with database[0]() as db:
+            assert db.get(Task, database[1]).runner_id is None
+        waiters = [asyncio.create_task(registry.ensure(database[1])) for _ in range(2)]
+        await asyncio.sleep(0)
+        assert all(not waiter.done() for waiter in waiters)
+        assert registry._coordinators[database[1]] is owner
+        if action == "cancel_waiter":
+            waiters[0].cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await waiters[0]
+            assert not owner._close_task.cancelled()
+        elif action == "shutdown":
+            shutdown = asyncio.create_task(registry.close())
+            await asyncio.sleep(0)
+    finally:
+        unblock.set()
+    await closer
+    if shutdown is not None:
+        await shutdown
+        assert await asyncio.gather(*waiters) == [None, None]
+        assert not registry._coordinators
+    else:
+        successor = await waiters[-1]
+        assert successor is not None
+        assert successor is not owner
+        assert successor.lease.attempt_id != owner.lease.attempt_id
+        if action == "retry":
+            assert await waiters[0] is successor
+
+
 async def test_cancelled_acquisition_drains_commit_and_cleans_slot(
     registry, database, monkeypatch
 ):

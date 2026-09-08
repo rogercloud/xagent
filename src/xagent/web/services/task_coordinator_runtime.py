@@ -62,12 +62,23 @@ class TaskCoordinatorRegistry:
         self._close_task: asyncio.Task[None] | None = None
 
     async def ensure(self, task_id: int) -> TaskCoordinator | None:
-        if self._close_task is not None:
-            return None
-        coordinator = self._coordinators.get(task_id)
-        if coordinator is None:
-            coordinator = TaskCoordinator(self, task_id)
-            self._coordinators[task_id] = coordinator
+        while True:
+            if self._close_task is not None:
+                return None
+            coordinator = self._coordinators.get(task_id)
+            if coordinator is None:
+                coordinator = TaskCoordinator(self, task_id)
+                self._coordinators[task_id] = coordinator
+                break
+            if coordinator.state in (
+                CoordinatorState.ACQUIRING,
+                CoordinatorState.ACTIVE,
+            ):
+                break
+            # Preserve this wake without replacing an owner that is still
+            # draining. Cancellation of the waiter must not abort cleanup.
+            assert coordinator._close_task is not None
+            await asyncio.shield(coordinator._close_task)
         coordinator._waiters += 1
         try:
             await asyncio.shield(coordinator._startup)
