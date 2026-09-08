@@ -14,7 +14,7 @@ from datetime import datetime, timedelta, timezone
 from enum import Enum
 from typing import Any, Callable, Coroutine, Iterator, Sequence, TypeVar, cast
 
-from sqlalchemy import and_, case, false, func, or_, update
+from sqlalchemy import and_, case, false, func, or_, select, update
 from sqlalchemy.exc import MultipleResultsFound
 from sqlalchemy.orm import Query, Session
 from sqlalchemy.sql.elements import ColumnElement
@@ -150,6 +150,32 @@ def lock_task_lease_no_commit(db: Session, lease: TaskLease) -> bool:
         .execution_options(synchronize_session=False)
     )
     return _rowcount(result) == 1
+
+
+def lock_task_lease_for_settlement_no_commit(db: Session, lease: TaskLease) -> bool:
+    """Take the finalizer's full row lock before any weaker task write lock.
+
+    On PostgreSQL, upgrading a no-op UPDATE's lock to FOR UPDATE can deadlock
+    with a checkpoint that holds the task FK's KEY SHARE lock and then updates
+    its checkpoint pointer. Acquire FOR UPDATE directly, preserving its
+    exclusion of concurrent FK inserts as well as task updates. SQLite needs
+    the existing conditional UPDATE because it ignores FOR UPDATE.
+    """
+    if db.get_bind().dialect.name != "postgresql":
+        return lock_task_lease_no_commit(db, lease)
+    return (
+        db.execute(
+            select(Task.id)
+            .where(
+                Task.id == lease.task_id,
+                Task.runner_id == lease.runner_id,
+                Task.run_id == lease.run_id,
+                task_lease_attempt_predicate(lease),
+            )
+            .with_for_update()
+        ).scalar_one_or_none()
+        is not None
+    )
 
 
 _CURRENT_TASK_LEASE: ContextVar[TaskLease | None] = ContextVar(
