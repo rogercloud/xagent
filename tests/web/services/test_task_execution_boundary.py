@@ -3,7 +3,7 @@
 import subprocess
 import sys
 import textwrap
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock, call
 
 import pytest
 
@@ -52,8 +52,10 @@ def test_execution_services_and_tracer_load_without_api_routes() -> None:
 @pytest.mark.asyncio
 async def test_event_delivery_uses_the_host_sink(monkeypatch) -> None:
     monkeypatch.setattr(task_events, "_task_event_sink", None)
+    monkeypatch.setattr(task_events, "_warned_missing_sink", False)
+    counter = Mock()
+    monkeypatch.setattr(task_events, "increment_counter", counter)
     event = {"type": "task_completed", "task_id": 42}
-    await task_events.publish_task_event(event, 42)
 
     sink = AsyncMock()
     task_events.set_task_event_sink(sink)
@@ -63,6 +65,42 @@ async def test_event_delivery_uses_the_host_sink(monkeypatch) -> None:
     sink.side_effect = RuntimeError("delivery failed")
     with pytest.raises(RuntimeError, match="delivery failed"):
         await task_events.publish_task_event(event, 42)
+    counter.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_missing_sink_counts_every_event_and_warns_once_until_registered(
+    monkeypatch, caplog
+) -> None:
+    monkeypatch.setattr(task_events, "_task_event_sink", None)
+    monkeypatch.setattr(task_events, "_warned_missing_sink", False)
+    counter = Mock()
+    monkeypatch.setattr(task_events, "increment_counter", counter)
+    event = {"type": "task_error", "message": "private event content"}
+
+    await task_events.publish_task_event(event, 42)
+    task_events.set_task_event_sink(None)
+    await task_events.publish_task_event(event, 42)
+    warnings = [r for r in caplog.records if r.name == task_events.__name__]
+    assert len(warnings) == 1
+    assert warnings[0].levelname == "WARNING"
+    assert "no host event sink" in warnings[0].message
+    assert event["message"] not in caplog.text
+
+    sink = AsyncMock()
+    task_events.set_task_event_sink(sink)
+    await task_events.publish_task_event(event, 42)
+    sink.assert_awaited_once_with(event, 42)
+    assert counter.call_count == 2
+
+    task_events.set_task_event_sink(None)
+    await task_events.publish_task_event(event, 42)
+    warnings = [r for r in caplog.records if r.name == task_events.__name__]
+    assert len(warnings) == 2
+    assert (
+        counter.call_args_list
+        == [call("xagent.task_events.dropped", attributes={"outcome": "no_sink"})] * 3
+    )
 
 
 def test_web_host_registers_event_delivery_on_import() -> None:

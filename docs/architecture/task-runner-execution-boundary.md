@@ -23,8 +23,13 @@ Execution publishes task events through `task_events.publish_task_event`.
 The WebSocket host registers a sink which delegates to its connection manager.
 The existing connection manager still attaches current control-state fields,
 serializes messages and handles disconnected sockets. Publisher errors propagate
-to the existing execution error handling. A process with no sink has no live
-listeners; persistence does not depend on live delivery.
+to the existing execution error handling. Without a sink, live events are not
+forwarded; persistence and task execution still proceed. Every such event increments
+`xagent.task_events.dropped` with `outcome=no_sink`. The first event without a sink
+also logs a warning; repeated warnings are suppressed until a sink is registered.
+This distinguishes missing host delivery from a registered host with no connected
+clients, which the connection manager records as `outcome=empty`. WebSocket sink
+registration remains at module import and is covered by a fresh-process test.
 
 Resume accepts an optional delivery callback instead of a WebSocket and client
 message ID. The WebSocket adapter binds these using `make_delivery_notifier`.
