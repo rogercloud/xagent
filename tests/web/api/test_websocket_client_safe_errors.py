@@ -167,6 +167,25 @@ async def test_execute_task_uses_the_authentication_error_contract(
     )
 
 
+@pytest.mark.parametrize("mutation", ["wrong_helper_import", "missing_constant"])
+def test_delivery_guard_rejects_invalid_route_bindings(monkeypatch, mutation):
+    path = Path(websocket_api.__file__)
+    read_text = Path.read_text
+    source = read_text(path, encoding="utf-8")
+    if mutation == "wrong_helper_import":
+        source = source.replace("    client_safe_error_message,\n", "")
+        source += "\nfrom ..services.assistant_history_safety import safe_str as client_safe_error_message\n"
+    else:
+        source = source.replace("    CLIENT_SAFE_TASK_FAILURE,\n", "", 1)
+
+    def mutated_read(candidate, *args, **kwargs):
+        return source if candidate == path else read_text(candidate, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", mutated_read)
+    with pytest.raises(AssertionError):
+        test_no_delivery_producer_can_bypass_the_client_safe_message()
+
+
 def test_no_delivery_producer_can_bypass_the_client_safe_message() -> None:
     """Exception text may not reach a client through the *recognized* shapes.
 

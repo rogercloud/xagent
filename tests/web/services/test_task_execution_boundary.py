@@ -27,6 +27,16 @@ def test_execution_services_and_tracer_load_without_api_routes() -> None:
 
                 sys.meta_path.insert(0, RejectRoutes())
                 from xagent.web.services import agent_service_manager, task_execution, task_orchestrator
+                from xagent.web.services.external_task_cancel import _broadcast_external_cancel_terminal_event
+                import asyncio
+                from unittest.mock import AsyncMock, patch
+                from xagent.web.services import task_events
+                sink = AsyncMock()
+                task_events.set_task_event_sink(sink)
+                event = {"type": "task_error", "task_id": 1}
+                with patch.object(task_execution, "create_terminal_task_error_event", return_value=event):
+                    asyncio.run(_broadcast_external_cancel_terminal_event(1))
+                sink.assert_awaited_once_with(event, 1)
                 from xagent.web.tracing import create_task_tracer
                 create_task_tracer(1, user_id=1)
                 """
@@ -53,3 +63,30 @@ async def test_event_delivery_uses_the_host_sink(monkeypatch) -> None:
     sink.side_effect = RuntimeError("delivery failed")
     with pytest.raises(RuntimeError, match="delivery failed"):
         await task_events.publish_task_event(event, 42)
+
+
+def test_web_host_registers_event_delivery_on_import() -> None:
+    # A fresh process exercises registration, not an adapter installed by a
+    # previous test or an importlib.reload that leaves old module state behind.
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            textwrap.dedent("""
+            import asyncio
+            from unittest.mock import AsyncMock, patch
+            from xagent.web.services import task_events
+            assert task_events._task_event_sink is None
+            from xagent.web.api import websocket
+            event = {"type": "task_completed", "task_id": 42}
+            sink = AsyncMock()
+            with patch.object(websocket.manager, "broadcast_to_task", sink):
+                asyncio.run(task_events.publish_task_event(event, 42))
+            sink.assert_awaited_once_with(event, 42)
+        """),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert result.returncode == 0, result.stderr

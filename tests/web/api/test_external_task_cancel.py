@@ -21,7 +21,7 @@ from xagent.web.api import websocket as websocket_api
 from xagent.web.models.agent import Agent
 from xagent.web.models.chat_message import TaskChatMessage
 from xagent.web.models.task import Task, TaskStatus
-from xagent.web.services import external_task_cancel
+from xagent.web.services import external_task_cancel, task_events
 from xagent.web.services import task_execution as task_execution_service
 from xagent.web.services import task_orchestrator
 from xagent.web.services.assistant_history_safety import (
@@ -234,6 +234,46 @@ async def test_external_cancel_broadcasts_terminal_frame(
     assert cancelled.error_message == EXTERNAL_CANCEL_ERROR_MESSAGE
     assert cancelled.runner_id is None
     assert cancelled.lease_expires_at is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("delivery_fails", [False, True])
+async def test_external_cancel_publishes_after_commit(monkeypatch, delivery_fails):
+    agent_id, owner_user_id = _create_agent()
+    task_id = _create_task(
+        agent_id=agent_id,
+        owner_user_id=owner_user_id,
+        title="external cancel event sink",
+    )
+
+    observed_statuses = []
+
+    async def deliver(event, published_task_id):
+        observed_statuses.append(_load_task(task_id).status)
+        if delivery_fails:
+            raise RuntimeError("disconnected host")
+
+    sink = AsyncMock(side_effect=deliver)
+    monkeypatch.setattr(task_events, "_task_event_sink", sink)
+    monkeypatch.setattr(
+        task_execution_service.background_task_manager,
+        "cancel_task",
+        AsyncMock(return_value=MagicMock(requested=False)),
+    )
+    await cancel_external_task_unserialized(
+        task_id=task_id,
+        agent_id=agent_id,
+        expected_run_id="run-external",
+        expected_state_version=4,
+    )
+    sink.assert_awaited_once()
+    event, published_task_id = sink.await_args.args
+    assert published_task_id == task_id
+    assert event["type"] == "task_error"
+    assert event["message"] == EXTERNAL_TURN_INTERRUPTED_MESSAGE
+    assert observed_statuses == [TaskStatus.FAILED]
+    assert _load_task(task_id).state_version == 5
+    assert _interruption_transcript_count(task_id) == 1
 
 
 @pytest.mark.asyncio
