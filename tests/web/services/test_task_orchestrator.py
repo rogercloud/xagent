@@ -4352,7 +4352,8 @@ async def test_cancelled_runner_drains_persistence_before_settlement(
 ):
     from xagent.core.agent.checkpoint import CHECKPOINT_EVENT_TYPE
     from xagent.core.agent.trace import TraceEvent as CoreTraceEvent
-    from xagent.web.api import trace_handlers, websocket
+    from xagent.web.api import websocket
+    from xagent.web.services import task_execution, trace_handlers
     from xagent.web.services.task_lease_service import bind_task_lease_context
 
     turn_id = f"cancel-persist-{kind}-{write_fails}"
@@ -4382,14 +4383,14 @@ async def test_cancelled_runner_drains_persistence_before_settlement(
 
     factory = sessionmaker(db_session.get_bind(), class_=WriterSession)
     monkeypatch.setattr(trace_handlers, "get_db", lambda: iter([factory()]))
-    monkeypatch.setattr(websocket, "get_db", lambda: iter([factory()]))
+    monkeypatch.setattr(task_execution, "get_db", lambda: iter([factory()]))
     broadcast = AsyncMock()
     monkeypatch.setattr(websocket.manager, "broadcast_to_task", broadcast)
 
     async def execute(*args, **kwargs):
         with bind_task_lease_context(lease):
             if kind == "outbound":
-                await websocket.make_agent_outbound_handler(task.id)(
+                await task_execution.make_agent_outbound_handler(task.id)(
                     {"message": "progress", "event_id": turn_id}
                 )
             else:
