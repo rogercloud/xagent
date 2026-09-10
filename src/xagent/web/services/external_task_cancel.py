@@ -430,8 +430,8 @@ def _finalize_external_cancel_sync(
 
 
 async def _broadcast_external_cancel_terminal_event(task_id: int) -> None:
-    from ..api.websocket import create_terminal_task_error_event
     from ..api.websocket import manager as websocket_manager
+    from .task_execution import create_terminal_task_error_event
 
     try:
         await websocket_manager.broadcast_to_task(
@@ -470,7 +470,7 @@ async def cancel_external_task_unserialized(
         )
     )
     if not already_settled:
-        from ..api.websocket import background_task_manager
+        from .task_execution import background_task_manager
 
         await background_task_manager.cancel_task(
             task_id,

@@ -21,6 +21,7 @@ PRODUCERS: dict[str, int | None] = {
     "finish_delivery": 1,
     "notify_deferred_delivery": 1,
     "send_message_delivery": None,  # keyword-only
+    "delivery_notifier": None,  # transport callback, keyword-only
 }
 
 # Issue #1479 removes the last deliberate RuntimeError passthroughs. Keep the
@@ -68,7 +69,12 @@ def _message_expression(node: ast.Call, index: int | None) -> ast.expr | None:
 
 
 # ``send_text`` takes a serialized payload, so the dict sits one call deeper.
-ERROR_PAYLOAD_SINKS = {"send_personal_message", "broadcast_to_task", "send_text"}
+ERROR_PAYLOAD_SINKS = {
+    "send_personal_message",
+    "broadcast_to_task",
+    "send_text",
+    "publish_task_event",
+}
 
 # Both render in the client's conversation, so both are the same disclosure
 # surface. ``agent_error`` was missing until review found a producer using it.

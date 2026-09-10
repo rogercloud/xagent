@@ -124,7 +124,7 @@ class ClarificationDraft:
         ``ClarificationDraft`` (under ``result["clarification_draft"]``) is
         serialized into trace events by handlers that use the ``to_dict``
         protocol -- ``DatabaseTraceHandler._serialize_data_for_json`` and its
-        WebSocket twins, ``WebSocketTraceHandler._serialize_data`` in
+        WebSocket twins, ``TaskEventTraceHandler._serialize_data`` in
         ``ws_trace_handlers.py`` and ``SharedWebSocketTracer._serialize_data``
         in ``websocket.py``, call ``value.to_dict()`` whenever it is
         callable, and then recursively re-serialize whatever that call
