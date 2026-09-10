@@ -44,7 +44,8 @@ a socket callback.
   retain their existing ordering.
 - Background task handles, AgentService instances and heartbeat objects remain
   process-local. Resume can still receive already-acquired resources.
-- The command dispatcher retains its existing WebSocket control adapters and
+- Command execution uses the transport-independent service described in
+  [Runner control command boundary](task-control-boundary.md), preserving the
   current PAUSE/RESUME/CANCEL/MESSAGE protocol.
 - Agent/tool configuration retains its existing optional request context. This
   stage changes ownership and delivery dependencies, not configuration semantics.
