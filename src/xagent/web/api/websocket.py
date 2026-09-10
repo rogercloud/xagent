@@ -7,7 +7,6 @@ import logging
 import time
 import uuid
 from collections import OrderedDict
-from collections.abc import Awaitable, Callable
 from contextlib import contextmanager
 from copy import deepcopy
 from dataclasses import dataclass
@@ -78,7 +77,7 @@ from ..models.uploaded_file import UploadedFile
 from ..models.user import User
 from ..services import task_execution as task_execution_service
 from ..services.llm_utils import AutoModelUnavailableError
-from ..services.task_events import set_task_event_sink
+from ..services.task_events import DeliveryNotifier, set_task_event_sink
 from ..services.task_execution import (
     ClientVisibleError,
     ClientVisibleValidationError,
@@ -420,7 +419,7 @@ def _safe_log_argument(value: object) -> object:
 
 def make_delivery_notifier(
     websocket: WebSocket, client_message_id: str | None
-) -> Callable[..., Awaitable[None]] | None:
+) -> DeliveryNotifier | None:
     """Bind a client connection to the execution service's delivery callback."""
     if client_message_id is None:
         return None

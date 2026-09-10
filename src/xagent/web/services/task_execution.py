@@ -7,7 +7,6 @@ import re
 import shutil
 import time
 import uuid
-from collections.abc import Awaitable, Callable
 from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -51,7 +50,7 @@ from ..models.database import (
 from ..models.task import Task, TaskStatus
 from ..models.uploaded_file import UploadedFile
 from .llm_utils import AutoModelUnavailableError
-from .task_events import publish_task_event
+from .task_events import DeliveryNotifier, publish_task_event
 from .task_lease_service import (
     lock_task_lease_for_settlement_no_commit,
     lock_task_lease_no_commit,
@@ -2381,7 +2380,7 @@ async def execute_resume_background(
     pending_user_message: Optional[Dict[str, Any]] = None,
     delivery_turn_id: str | None = None,
     delivery_already_dispatched: bool = False,
-    delivery_notifier: Callable[..., Awaitable[None]] | None = None,
+    delivery_notifier: DeliveryNotifier | None = None,
     # Defaulting to None is a structurally open door, not exercised by any
     # caller today: acquire_task_lease_no_commit (task_lease_service.py)
     # mints a fresh uuid for a None here, so a future call site that
