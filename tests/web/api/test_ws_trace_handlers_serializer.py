@@ -1,7 +1,7 @@
 """Direct coverage for ``serialize_trace_data``.
 
 This is the module-level function ``TaskEventTraceHandler._serialize_data``
-now delegates to (see ``ws_trace_handlers.py``). The whole point of lifting
+now delegates to (see ``task_event_trace_handler.py``). The whole point of lifting
 it out of the class was to let a second caller -- the v1 SSE
 content-projection layer -- reuse the exact same pass without going through
 ``TaskEventTraceHandler``. These tests call it directly, the way that

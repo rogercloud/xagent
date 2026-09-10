@@ -350,7 +350,7 @@ def _convert_timestamp_to_utc_timestamp(timestamp: Any) -> float:
 
 
 class TaskEventTraceHandler(TraceHandler):
-    """Trace handler that sends events to WebSocket clients."""
+    """Trace handler that publishes events through the host event delivery adapter."""
 
     def __init__(self, task_id: int):
         self.task_id = task_id
@@ -358,7 +358,7 @@ class TaskEventTraceHandler(TraceHandler):
         self._task_description_loaded = False
 
     async def handle_event(self, event: TraceEvent) -> None:
-        """Send trace event to WebSocket clients using unified stream format."""
+        """Publish a trace event through the host adapter using unified stream format."""
         with observe_duration("xagent.websocket.trace_handler.duration"):
             await self._handle_event(event)
 
@@ -386,7 +386,7 @@ class TaskEventTraceHandler(TraceHandler):
                 ):
                     stream_event = None
 
-            # Send to all connected WebSocket clients for this task
+            # Publish through the host event delivery adapter for this task
             if stream_event:
                 increment_counter(
                     "xagent.websocket.trace.events",

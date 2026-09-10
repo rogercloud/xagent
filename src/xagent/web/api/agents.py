@@ -4,7 +4,7 @@ import logging
 import secrets
 import uuid
 from datetime import datetime, timezone
-from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional
+from typing import Any, Dict, List, Literal, Optional
 
 from fastapi import APIRouter, Body, Depends, HTTPException, Request
 from pydantic import BaseModel, Field
@@ -38,9 +38,6 @@ from ..services.agent_access import (
     accessible_agent_permissions,
     list_accessible_agents,
 )
-
-if TYPE_CHECKING:
-    pass
 from ..services.agent_management import (
     AgentManagementRuntime,
     AgentManagementService,
