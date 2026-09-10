@@ -182,8 +182,8 @@ def test_no_delivery_producer_can_bypass_the_client_safe_message() -> None:
     """
     # Explicit encoding: this module carries non-ASCII prose, and the
     # platform default would decode it as cp1252/GBK on a Windows runner.
-    # Scan both sides of the extracted boundary as one definition graph. The
-    # helper bodies used by the route adapter now live in the execution service.
+    # Scan each module independently: imported helpers must retain their exact
+    # origin, and constants must be available in the module that uses them.
     trees = [
         ast.parse(Path(module.__file__).read_text(encoding="utf-8"))
         for module in (websocket_api, task_execution_service)
@@ -192,31 +192,13 @@ def test_no_delivery_producer_can_bypass_the_client_safe_message() -> None:
         if isinstance(node, ast.ImportFrom) and node.level == 1:
             node.level = 2
             node.module = "services." + (node.module or "")
-    definitions = {
-        node.name
-        for tree in trees
-        for node in tree.body
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
-    }
-    body = []
-    imports = set()
-    for tree in trees:
-        for node in tree.body:
-            if isinstance(node, ast.ImportFrom):
-                aliases = []
-                for alias in node.names:
-                    key = (node.level, node.module, alias.name, alias.asname)
-                    if (
-                        key not in imports
-                        and (alias.asname or alias.name) not in definitions
-                    ):
-                        imports.add(key)
-                        aliases.append(alias)
-                if not aliases:
-                    continue
-                node.names = aliases
-            body.append(node)
-    result = _scan(ast.Module(body=body, type_ignores=[]))
+    results = [_scan(tree) for tree in trees]
+    result = type(results[0])(
+        offenders=[item for result in results for item in result.offenders],
+        producers=sum(result.producers for result in results),
+        error_payloads=sum(result.error_payloads for result in results),
+        used_allowlist=set().union(*(result.used_allowlist for result in results)),
+    )
 
     modules = (websocket_api, task_execution_service)
     for builder in SAFE_MESSAGE_BUILDERS:

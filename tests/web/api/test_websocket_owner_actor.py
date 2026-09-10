@@ -1203,7 +1203,7 @@ async def test_chat_turn_rejection_payload_is_loaded_off_loop(
             side_effect=read_payload,
         ),
         patch(
-            "xagent.web.services.task_execution._task_error_payload",
+            "xagent.web.api.websocket._task_error_payload",
             side_effect=AssertionError("payload query ran on the event loop"),
         ),
     ):
@@ -2259,7 +2259,7 @@ async def test_live_injection_skips_the_close_on_a_replayed_turn_id(
             "xagent.web.services.task_execution.execute_resume_background", AsyncMock()
         ),
         patch(
-            "xagent.web.services.task_execution.close_legacy_resume_interaction_sync",
+            "xagent.web.api.websocket.close_legacy_resume_interaction_sync",
         ) as close_mock,
     ):
         await _handle_chat_message_unserialized(
@@ -4308,9 +4308,9 @@ async def test_deferred_injection_marker_failure_does_not_abort_resume(
             "xagent.web.services.task_execution.background_task_manager.promote_resume_task"
         ),
         patch(
-            "xagent.web.api.websocket.mark_user_message_delivery_sync",
+            "xagent.web.services.task_execution.mark_user_message_delivery_sync",
             side_effect=mark_delivery,
-        ),
+        ) as mark_mock,
     ):
         await execute_resume_background(
             task_id=int(task.id),
@@ -4328,6 +4328,9 @@ async def test_deferred_injection_marker_failure_does_not_abort_resume(
             ),
         )
 
+    mark_mock.assert_any_call(
+        int(task.id), "deferred-marker-turn", websocket_api.DELIVERY_DISPATCHED
+    )
     agent.resume_execution_by_id.assert_awaited_once_with(str(task.id))
     accepted = [
         call.args[0]
@@ -4335,6 +4338,8 @@ async def test_deferred_injection_marker_failure_does_not_abort_resume(
         if call.args[0].get("type") == "message_accepted"
     ]
     assert len(accepted) == 1
+    db_session.refresh(task)
+    assert task.status == TaskStatus.COMPLETED
 
 
 @pytest.mark.asyncio
@@ -4392,9 +4397,9 @@ async def test_deferred_injection_marker_cancellation_does_not_abort_resume(
             "xagent.web.services.task_execution.background_task_manager.promote_resume_task"
         ),
         patch(
-            "xagent.web.api.websocket.mark_user_message_delivery_sync",
+            "xagent.web.services.task_execution.mark_user_message_delivery_sync",
             side_effect=mark_delivery,
-        ),
+        ) as mark_mock,
     ):
         await execute_resume_background(
             task_id=int(task.id),
@@ -4412,6 +4417,9 @@ async def test_deferred_injection_marker_cancellation_does_not_abort_resume(
             ),
         )
 
+    mark_mock.assert_any_call(
+        int(task.id), "deferred-marker-cancel-turn", websocket_api.DELIVERY_DISPATCHED
+    )
     agent.resume_execution_by_id.assert_awaited_once_with(str(task.id))
     accepted = [
         call.args[0]
@@ -4419,6 +4427,8 @@ async def test_deferred_injection_marker_cancellation_does_not_abort_resume(
         if call.args[0].get("type") == "message_accepted"
     ]
     assert len(accepted) == 1
+    db_session.refresh(task)
+    assert task.status == TaskStatus.COMPLETED
 
 
 @pytest.mark.asyncio
@@ -4581,9 +4591,9 @@ async def test_deferred_injection_closes_the_row_the_online_handler_observed(
             "xagent.web.services.task_execution.background_task_manager.promote_resume_task"
         ),
         patch(
-            "xagent.web.api.websocket.active_interaction_id_sync",
+            "xagent.web.services.task_interaction_close.active_interaction_id_sync",
             side_effect=AssertionError("the deferred path must not read its own"),
-        ),
+        ) as read_mock,
         patch(
             "xagent.web.services.task_execution.close_legacy_resume_interaction_sync",
             return_value=1,
@@ -4609,6 +4619,15 @@ async def test_deferred_injection_closes_the_row_the_online_handler_observed(
     close_mock.assert_called_once()
     assert close_mock.call_args.kwargs["task_id"] == int(task.id)
     assert close_mock.call_args.kwargs["interaction_id"] == 9876
+
+    read_mock.assert_not_called()
+    agent.resume_execution_by_id.assert_awaited_once_with(str(task.id))
+    db_session.refresh(task)
+    assert task.status == TaskStatus.COMPLETED
+    assert any(
+        call.args[0].get("type") == "message_accepted"
+        for call in ws_manager.send_personal_message.call_args_list
+    )
 
 
 @pytest.mark.asyncio
@@ -4682,9 +4701,9 @@ async def test_deferred_injection_skips_the_close_on_a_replayed_turn_id(
             "xagent.web.services.task_execution.background_task_manager.promote_resume_task"
         ),
         patch(
-            "xagent.web.api.websocket.active_interaction_id_sync",
+            "xagent.web.services.task_interaction_close.active_interaction_id_sync",
             side_effect=AssertionError("the deferred path must not read its own"),
-        ),
+        ) as read_mock,
         patch(
             "xagent.web.services.task_execution.close_legacy_resume_interaction_sync",
         ) as close_mock,
@@ -4710,6 +4729,15 @@ async def test_deferred_injection_skips_the_close_on_a_replayed_turn_id(
 
     agent.post_user_message.assert_awaited_once()
     close_mock.assert_not_called()
+
+    read_mock.assert_not_called()
+    agent.resume_execution_by_id.assert_awaited_once_with(str(task.id))
+    db_session.refresh(task)
+    assert task.status == TaskStatus.COMPLETED
+    assert any(
+        call.args[0].get("type") == "message_accepted"
+        for call in ws_manager.send_personal_message.call_args_list
+    )
 
 
 @pytest.mark.asyncio
