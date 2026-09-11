@@ -63,6 +63,8 @@ class TaskCommandDelivery(Protocol):
 
     Replies must raise ConnectionError when delivery fails because the
     recipient disconnected. Hosts translate transport-specific exceptions.
+    Commands without a local recipient intentionally use discard_command_reply,
+    which neither delivers nor raises; command_reply also uses it without a host.
     """
 
     def reply_for(self, command_id: str, task_id: int) -> CommandReply: ...

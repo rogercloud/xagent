@@ -180,6 +180,10 @@ def test_control_and_reply_commands_execute_without_api_routes() -> None:
                         db.add(user)
                         db.flush()
                         uid = user.id
+                        admin = User(username="runner-admin", password_hash="unused", is_admin=True)
+                        db.add(admin)
+                        db.flush()
+                        admin_id = admin.id
                         db.add(Agent(id=1, user_id=uid, name="cancel-agent"))
                         db.flush()
                         tasks = [
@@ -253,16 +257,18 @@ def test_control_and_reply_commands_execute_without_api_routes() -> None:
                         assert canceled.agent_config["a2a_state"] == "TASK_STATE_CANCELED"
                         assert canceled.state_version == 1
                         assert db.query(TaskChatMessage).filter_by(task_id=ids[0]).count() == 1
-                    # Durable ingress already acknowledged the message. Exercise
-                    # replay directly too, so a no-op handler cannot pass merely
-                    # because the completed transcript row was seeded above.
+                    # The durable commands above suppress duplicate acknowledgements.
+                    # This direct replay sends its own acknowledgement and must
+                    # short-circuit before acquiring an agent for live execution.
                     with get_session_local()() as db:
                         actor = db.get(User, uid)
                         db.expunge(actor)
                     reply = AsyncMock()
-                    await handle_task_message(reply, ids[0], {
-                        "client_message_id": "message-command", "message": "hello", "user": actor,
-                    })
+                    with patch.object(agent_service_manager, "get_agent_manager") as replay_manager:
+                        await handle_task_message(reply, ids[0], {
+                            "client_message_id": "message-command", "message": "hello", "user": actor,
+                        })
+                        replay_manager.return_value.get_agent_for_task.assert_not_called()
                     reply.assert_awaited_once()
                     ack = reply.await_args.args[0]
                     assert ack["type"] == "message_accepted", ack
@@ -276,7 +282,7 @@ def test_control_and_reply_commands_execute_without_api_routes() -> None:
                         task.control_state = "completed"
                         db.commit()
                     fresh = ClaimedTaskCommand(
-                        id=5, task_id=ids[0], actor_user_id=uid,
+                        id=5, task_id=ids[0], actor_user_id=admin_id,
                         command_id="fresh-message-command", kind=TaskCommandKind.MESSAGE,
                         payload={"client_message_id": "fresh-message-command", "message": "new turn"},
                         target_run_id="message", attempt_count=1,
@@ -288,7 +294,7 @@ def test_control_and_reply_commands_execute_without_api_routes() -> None:
                         kwargs = begin.await_args.kwargs
                         assert kwargs["task_id"] == ids[0]
                         assert kwargs["task_owner_user_id"] == uid
-                        assert kwargs["actor_user_id"] == uid
+                        assert kwargs["actor_user_id"] == admin_id
                         assert kwargs["kind"] == TurnKind.APPEND
                         assert kwargs["payload"].turn_id == "fresh-message-command"
                         assert kwargs["payload"].transcript_message == "new turn"
