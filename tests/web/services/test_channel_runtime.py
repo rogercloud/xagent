@@ -10,6 +10,7 @@ from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import QueuePool
 
+from tests.web.pool_contention_shared import GUARD_TIMEOUT
 from xagent.core.file_storage.factory import get_unscoped_file_storage
 from xagent.core.file_storage.storage import FsspecFileStorage
 from xagent.core.workspace import TaskWorkspace
@@ -1510,7 +1511,7 @@ async def test_prepare_channel_task_compensates_late_claim_before_cancellation(
 
     def blocking_prepare(**_kwargs):  # type: ignore[no-untyped-def]
         worker_started.set()
-        assert allow_worker.wait(timeout=2)
+        assert allow_worker.wait(timeout=GUARD_TIMEOUT)
         return claim
 
     def compensate(snapshot: channel_runtime._ChannelTaskClaimSnapshot) -> bool:
@@ -1535,13 +1536,17 @@ async def test_prepare_channel_task_compensates_late_claim_before_cancellation(
             channel_name="Telegram",
         )
     )
-    await asyncio.to_thread(worker_started.wait, 2)
-    preparation.cancel()
-    allow_worker.set()
-
-    with pytest.raises(asyncio.CancelledError):
-        await preparation
-    assert compensated == [claim]
+    try:
+        assert await asyncio.to_thread(worker_started.wait, GUARD_TIMEOUT)
+        preparation.cancel()
+        allow_worker.set()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(preparation, timeout=GUARD_TIMEOUT)
+        assert compensated == [claim]
+    finally:
+        allow_worker.set()
+        preparation.cancel()
+        await asyncio.gather(preparation, return_exceptions=True)
 
 
 @pytest.mark.asyncio
