@@ -1782,7 +1782,9 @@ def _resume_error_task(agent_id: int, *, context_id: str) -> int:
 
 def test_resume_lease_contention_preserves_the_a2a_error() -> None:
     agent_id, full_key = _create_published_agent_with_key()
+    _resume_error_task(agent_id, context_id="ctx-resume-busy-filler")
     task_id = _resume_error_task(agent_id, context_id="ctx-resume-busy")
+    assert task_id != agent_id
 
     with patch.object(
         task_resume, "_acquire_a2a_resume_prelease_sync", return_value=None
@@ -1821,6 +1823,13 @@ def test_resume_lease_contention_preserves_the_a2a_error() -> None:
             }
         ],
     }
+
+    db = _direct_db_session()
+    try:
+        recovered = db.query(Task).filter(Task.id == task_id).one()
+        assert recovered.status == TaskStatus.WAITING_FOR_USER
+    finally:
+        db.close()
 
 
 @pytest.mark.parametrize(
