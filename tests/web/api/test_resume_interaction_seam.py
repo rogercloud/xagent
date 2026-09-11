@@ -946,9 +946,7 @@ async def test_legacy_resume_is_not_refused_when_the_active_interaction_read_is_
             )
         )
         stack.enter_context(
-            caplog.at_level(
-                logging.INFO, logger="xagent.web.services.task_command_execution"
-            )
+            caplog.at_level(logging.INFO, logger=command_execution_service.__name__)
         )
 
         result = await command_execution_service.resume_task(
