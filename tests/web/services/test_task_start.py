@@ -97,11 +97,12 @@ def test_task_starts_execute_without_api_routes() -> None:
                             agent_id=agent_id, task_owner_user_id=owner, agent_execution_mode="balanced",
                             text="a2a first", message_id="message-1", context_id=None, task_id=None,
                         )
+                        legacy_handle_index = len(background)
                         await task_start.execute_existing_task(
                             task_id=legacy_id, task_owner_user_id=owner, task_source="internal",
                             task_description="saved task", context={}, actor_user_id=owner,
                         )
-                        assert background[-1].done()
+                        assert background[legacy_handle_index].done()
                         await asyncio.gather(*background)
                     with get_session_local()() as db:
                         sdk_messages = db.query(TaskChatMessage).filter_by(task_id=created.task_id, role="user").order_by(TaskChatMessage.id).all()

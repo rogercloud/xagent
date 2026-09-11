@@ -135,7 +135,7 @@ def _resolve_turn_files(
         raise
     except DurableStorageOperationError as exc:
         # Transient storage fault, not a client error -- 503 so SDK can retry.
-        # The V1ApiError envelope reaches the client without a traceback, so
+        # The SDK adapter returns a 503 envelope without a traceback, so
         # this log line is the only record of the provider fault (#1467).
         # ``task_id`` is None on the create path -- one of this function's two
         # callers, not an edge case -- so the owner and the requested ids carry
