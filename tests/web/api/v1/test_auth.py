@@ -323,11 +323,11 @@ def test_concurrent_valid_legacy_auth_does_not_wait_for_migration(
         credentials=full_key,
     )
     pool = ThreadPoolExecutor(max_workers=8)
-    futures = [
-        pool.submit(deps._resolve_principal_from_credentials, credentials)
-        for _ in range(8)
-    ]
     try:
+        futures = [
+            pool.submit(deps._resolve_principal_from_credentials, credentials)
+            for _ in range(8)
+        ]
         assert migration_started.wait(timeout=GUARD_TIMEOUT)
         completed = as_completed(futures, timeout=GUARD_TIMEOUT)
         # One request is deliberately parked in migration. Observe the other
@@ -649,7 +649,9 @@ async def test_runtime_key_auth_cancellation_drains_worker_before_propagating(
     finally:
         allow_worker.set()
         auth.cancel()
-        await asyncio.gather(auth, return_exceptions=True)
+        await asyncio.wait_for(
+            asyncio.gather(auth, return_exceptions=True), timeout=GUARD_TIMEOUT
+        )
 
 
 @pytest.mark.asyncio
@@ -809,7 +811,7 @@ async def test_record_key_usage_pool_wait_keeps_event_loop_responsive(
     async def invoke_usage() -> None:
         await record_key_usage(prefix)
 
-    from tests.web.pool_contention_shared import GUARD_TIMEOUT, gated_pool_checkout
+    from tests.web.pool_contention_shared import gated_pool_checkout
 
     try:
         with gated_pool_checkout(engine) as gate:

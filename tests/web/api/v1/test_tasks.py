@@ -725,7 +725,9 @@ async def test_cancelled_upload_cleans_partial_local_file_and_metadata(
     finally:
         allow_write.set()
         upload_task.cancel()
-        await asyncio.gather(upload_task, return_exceptions=True)
+        await asyncio.wait_for(
+            asyncio.gather(upload_task, return_exceptions=True), timeout=GUARD_TIMEOUT
+        )
 
     assert written_path is not None
     assert not written_path.exists()
