@@ -42,7 +42,7 @@ def start_payload(**overrides):
         "kind": "create",
         "message": "Read the attachment",
         "execution_message": "Read the attachment\n[file_id: uploaded-file-1]",
-        "file_ids": ("uploaded-file-1",),
+        "file_ids": ["uploaded-file-1"],
         "before_message_id": None,
         "timezone": "Asia/Taipei",
     }
@@ -103,7 +103,7 @@ def test_json_round_trip_preserves_execution_input_and_turn_identity(kind, force
     decoded = read_task_start_command(command)
     assert decoded == start
     assert decoded.message != decoded.execution_message
-    assert decoded.file_ids == ("uploaded-file-1",)
+    assert decoded.file_ids == ["uploaded-file-1"]
     assert decoded.timezone == "Asia/Taipei"
 
 

@@ -9,7 +9,6 @@ outside this first version.
 
 from __future__ import annotations
 
-import json
 from typing import Annotated, Literal, Self
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -55,7 +54,7 @@ class TaskStartPayload(BaseModel):
     kind: Literal["create", "append"]
     message: str
     execution_message: str | None = None
-    file_ids: tuple[_FileId, ...] = ()
+    file_ids: list[_FileId] = Field(default_factory=list)
     before_message_id: Annotated[int, Field(gt=0)] | None = None
     timezone: str | None = None
     force_fresh: bool = False
@@ -138,7 +137,7 @@ def read_task_start_command(command: ClaimedTaskCommand) -> TaskStartPayload:
     """
     if command.kind != TaskCommandKind.START:
         raise ValueError("Expected a START command")
-    start = TaskStartPayload.model_validate_json(json.dumps(command.payload))
+    start = TaskStartPayload.model_validate(command.payload)
     if start.run_id != command.target_run_id or start.turn_id != command.command_id:
         raise ValueError("START payload does not match its command identity")
     return start
