@@ -1536,7 +1536,7 @@ async def test_running_chat_message_uses_one_offloop_scope_and_no_request_sessio
                 "xagent.web.services.task_execution.background_task_manager", bg_manager
             ),
             patch(
-                "xagent.web.api.websocket.task_execution_controller.transition",
+                "xagent.web.services.task_execution_controller.task_execution_controller.transition",
                 new=AsyncMock(
                     return_value=SimpleNamespace(
                         run_id="live-run", status=TaskStatus.RUNNING
@@ -3392,7 +3392,7 @@ async def test_durable_resume_propagates_stale_run_error(db_session) -> None:
         patch("xagent.web.api.websocket.manager", ws_manager),
         patch("xagent.web.services.task_execution.background_task_manager", bg_mgr),
         patch(
-            "xagent.web.api.websocket.task_execution_controller.transition",
+            "xagent.web.services.task_execution_controller.task_execution_controller.transition",
             new=AsyncMock(side_effect=StaleTaskRunError("run rotated")),
         ),
         pytest.raises(StaleTaskRunError, match="run rotated"),
@@ -3744,7 +3744,7 @@ async def test_resume_live_control_admin_runs_background_as_owner(db_session) ->
             "xagent.web.services.task_execution.execute_resume_background", resume_bg
         ),
         patch(
-            "xagent.web.api.websocket.task_execution_controller.transition",
+            "xagent.web.services.task_execution_controller.task_execution_controller.transition",
             new=transition,
         ),
         patch("xagent.web.services.task_execution.background_task_manager", bg_mgr),

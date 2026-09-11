@@ -36,7 +36,7 @@ from xagent.web.api import websocket as websocket_api
 from xagent.web.api.v1 import tasks as v1_tasks
 from xagent.web.api.v1.errors import V1ApiError
 from xagent.web.models.user import User
-from xagent.web.services import task_command_execution
+from xagent.web.services import task_command_execution, task_start
 from xagent.web.services.managed_file_ref import (
     _MAX_LOG_VALUE_LENGTH,
     DURABLE_FAULT_LOG_PREFIX,
@@ -372,23 +372,26 @@ def test_v1_turn_attachment_durable_fault_logs_the_provider_cause(
     def fail_resolve(**_kwargs: Any) -> None:
         raise _wrapped_fault()
 
-    monkeypatch.setattr(v1_tasks, "resolve_turn_file_infos", fail_resolve)
+    monkeypatch.setattr(task_start, "resolve_turn_file_infos", fail_resolve)
 
-    with caplog.at_level(logging.WARNING, logger=v1_tasks.logger.name):
+    with caplog.at_level(logging.WARNING, logger=task_start.logger.name):
         with pytest.raises(V1ApiError) as raised:
-            v1_tasks._resolve_turn_files_or_400(
-                file_ids=["8ac1f2"],
-                owner_user_id=7,
-                db=cast(Any, None),
-                task_id=42,
-            )
+            try:
+                task_start._resolve_turn_files(
+                    file_ids=["8ac1f2"],
+                    owner_user_id=7,
+                    db=cast(Any, None),
+                    task_id=42,
+                )
+            except DurableStorageOperationError as exc:
+                v1_tasks._raise_v1_storage_unavailable(exc)
 
     assert raised.value.http_status == 503
     assert _STORAGE_KEY not in raised.value.message
     assert _PROVIDER_MESSAGE not in raised.value.message
 
     rendered = _warning_matching(
-        caplog, v1_tasks.logger.name, "during turn attachment resolution"
+        caplog, task_start.logger.name, "during turn attachment resolution"
     )
     assert "task_id=42" in rendered
     # The create path has task_id=None, so these carry identification there.
@@ -420,23 +423,26 @@ def test_v1_turn_attachment_integrity_fault_is_not_reported_as_an_outage(
             storage_key="users/7/uploads/8ac1f2/corrupt.txt",
         )
 
-    monkeypatch.setattr(v1_tasks, "resolve_turn_file_infos", fail_resolve)
+    monkeypatch.setattr(task_start, "resolve_turn_file_infos", fail_resolve)
 
-    with caplog.at_level(logging.WARNING, logger=v1_tasks.logger.name):
+    with caplog.at_level(logging.WARNING, logger=task_start.logger.name):
         with pytest.raises(V1ApiError) as raised:
-            v1_tasks._resolve_turn_files_or_400(
-                file_ids=["8ac1f2"],
-                owner_user_id=7,
-                db=cast(Any, None),
-                task_id=42,
-            )
+            try:
+                task_start._resolve_turn_files(
+                    file_ids=["8ac1f2"],
+                    owner_user_id=7,
+                    db=cast(Any, None),
+                    task_id=42,
+                )
+            except DurableStorageOperationError as exc:
+                v1_tasks._raise_v1_storage_unavailable(exc)
 
     assert raised.value.http_status == 503
     # The envelope is deliberately unchanged; what must not happen is a second,
     # contradicting record calling permanent corruption a transient outage.
     assert not [
         line
-        for line in _warnings(caplog, v1_tasks.logger.name)
+        for line in _warnings(caplog, task_start.logger.name)
         if DURABLE_FAULT_LOG_PREFIX in line
     ], "an integrity fault emitted an outage warning -- the arms are misordered"
 
@@ -956,7 +962,7 @@ _MODULES_WITH_DURABLE_ARM_PAIRS = (
     ("web/api/files.py", 7, lambda: files_api),
     ("web/api/websocket.py", 1, lambda: websocket_api),
     ("web/services/task_command_execution.py", 2, lambda: task_command_execution),
-    ("web/api/v1/tasks.py", 1, lambda: v1_tasks),
+    ("web/services/task_start.py", 1, lambda: task_start),
     (
         "core/tools/adapters/vibe/file_ingestion_tool.py",
         1,
@@ -989,7 +995,7 @@ _DIRECT_HELPER_SITES = frozenset(
             ("file_id", "storage_key"),
         ),
         (
-            "web/api/v1/tasks.py",
+            "web/services/task_start.py",
             "turn attachment resolution",
             ("task_id", "owner_user_id", "file_ids"),
         ),
