@@ -2703,14 +2703,7 @@ async def test_durable_safe_error_degrades_when_origin_is_unverifiable(
 
     personal = _personal_targets(manager_mock)
     assert SECRET not in repr(personal)
-    safe_targets = [
-        ws
-        for payload, ws in personal
-        if payload.get("error_code") == "message_processing_failed"
-    ]
-    assert all(
-        isinstance(ws, websocket_api._DiscardingCommandWebSocket) for ws in safe_targets
-    ), f"durable error rerouted to a real socket: {safe_targets}"
+    manager_mock.send_personal_message.assert_not_awaited()
 
 
 @pytest.mark.asyncio
