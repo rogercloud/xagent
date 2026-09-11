@@ -24,7 +24,7 @@ import errno
 import io
 import logging
 from pathlib import Path
-from typing import Any, Iterator, cast
+from typing import Any, Iterator
 
 import pytest
 from fastapi import HTTPException
@@ -33,8 +33,8 @@ from fastapi.datastructures import UploadFile
 from xagent.core.file_storage.factory import get_unscoped_file_storage
 from xagent.web.api import files as files_api
 from xagent.web.api import websocket as websocket_api
-from xagent.web.api.v1 import tasks as v1_tasks
-from xagent.web.api.v1.errors import V1ApiError
+from xagent.web.models.agent import Agent
+from xagent.web.models.task import Task, TaskStatus
 from xagent.web.models.user import User
 from xagent.web.services import task_command_execution, task_start
 from xagent.web.services.managed_file_ref import (
@@ -45,9 +45,9 @@ from xagent.web.services.managed_file_ref import (
     log_durable_storage_fault,
 )
 
-from .conftest import _direct_db_session, _setup_admin
+from .conftest import _admin_headers, _direct_db_session, _setup_admin, client
 
-# Not module-wide: only the end-to-end upload test touches the database. The
+# Not module-wide: only the upload and SDK endpoint tests need the database. The
 # other tests drive the helper directly and would pay a schema create/drop for
 # nothing.
 
@@ -363,7 +363,45 @@ async def test_upload_durable_write_failure_logs_the_provider_cause(
     _assert_cause_chain_recorded(rendered)
 
 
+@pytest.fixture(params=["create", "append"])
+def sdk_attachment_request(request: pytest.FixtureRequest, _test_db: None):
+    headers = _admin_headers()
+    response = client.post(
+        "/api/agents",
+        headers=headers,
+        json={"name": "attachment-fault-agent", "execution_mode": "balanced"},
+    )
+    assert response.status_code == 200, response.text
+    agent_id = response.json()["id"]
+    response = client.post(f"/api/agents/{agent_id}/api-key", headers=headers)
+    assert response.status_code == 200, response.text
+    headers = {"Authorization": f"Bearer {response.json()['full_key']}"}
+    task_id = None
+    with _direct_db_session() as db:
+        owner_id = int(db.get(Agent, agent_id).user_id)
+        if request.param == "append":
+            task = Task(
+                user_id=owner_id,
+                agent_id=agent_id,
+                title="completed SDK task",
+                source="sdk",
+                status=TaskStatus.COMPLETED,
+            )
+            db.add(task)
+            db.commit()
+            task_id = int(task.id)
+    url = "/v1/chat/tasks"
+    if task_id is not None:
+        url += f"/{task_id}/messages"
+    body = {
+        "agent_id": agent_id,
+        "message": {"content": "use the attachment", "files": ["8ac1f2"]},
+    }
+    return url, headers, body, owner_id, task_id
+
+
 def test_v1_turn_attachment_durable_fault_logs_the_provider_cause(
+    sdk_attachment_request,
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
@@ -374,33 +412,32 @@ def test_v1_turn_attachment_durable_fault_logs_the_provider_cause(
 
     monkeypatch.setattr(task_start, "resolve_turn_file_infos", fail_resolve)
 
+    url, headers, body, owner_id, task_id = sdk_attachment_request
     with caplog.at_level(logging.WARNING, logger=task_start.logger.name):
-        with pytest.raises(V1ApiError) as raised:
-            try:
-                task_start._resolve_turn_files(
-                    file_ids=["8ac1f2"],
-                    owner_user_id=7,
-                    db=cast(Any, None),
-                    task_id=42,
-                )
-            except DurableStorageOperationError as exc:
-                v1_tasks._raise_v1_storage_unavailable(exc)
+        response = client.post(url, headers=headers, json=body)
 
-    assert raised.value.http_status == 503
-    assert _STORAGE_KEY not in raised.value.message
-    assert _PROVIDER_MESSAGE not in raised.value.message
+    assert response.status_code == 503, response.text
+    assert response.json()["error"]["code"] == "internal_error"
+    assert (
+        response.json()["error"]["message"]
+        == "File storage is temporarily unavailable."
+    )
+    assert _STORAGE_KEY not in response.text
+    assert _PROVIDER_MESSAGE not in response.text
 
     rendered = _warning_matching(
         caplog, task_start.logger.name, "during turn attachment resolution"
     )
-    assert "task_id=42" in rendered
+    if task_id is not None:
+        assert f"task_id={task_id}" in rendered
     # The create path has task_id=None, so these carry identification there.
-    assert "owner_user_id=7" in rendered
+    assert f"owner_user_id={owner_id}" in rendered
     assert "file_ids=8ac1f2" in rendered
     _assert_cause_chain_recorded(rendered)
 
 
 def test_v1_turn_attachment_integrity_fault_is_not_reported_as_an_outage(
+    sdk_attachment_request,
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
@@ -425,19 +462,16 @@ def test_v1_turn_attachment_integrity_fault_is_not_reported_as_an_outage(
 
     monkeypatch.setattr(task_start, "resolve_turn_file_infos", fail_resolve)
 
+    url, headers, body, _owner_id, _task_id = sdk_attachment_request
     with caplog.at_level(logging.WARNING, logger=task_start.logger.name):
-        with pytest.raises(V1ApiError) as raised:
-            try:
-                task_start._resolve_turn_files(
-                    file_ids=["8ac1f2"],
-                    owner_user_id=7,
-                    db=cast(Any, None),
-                    task_id=42,
-                )
-            except DurableStorageOperationError as exc:
-                v1_tasks._raise_v1_storage_unavailable(exc)
+        response = client.post(url, headers=headers, json=body)
 
-    assert raised.value.http_status == 503
+    assert response.status_code == 503, response.text
+    assert response.json()["error"]["code"] == "internal_error"
+    assert (
+        response.json()["error"]["message"]
+        == "File storage is temporarily unavailable."
+    )
     # The envelope is deliberately unchanged; what must not happen is a second,
     # contradicting record calling permanent corruption a transient outage.
     assert not [

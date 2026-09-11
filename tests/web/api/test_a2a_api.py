@@ -1246,12 +1246,12 @@ async def test_a2a_handover_restores_input_required_on_unreadable_checkpoint() -
         "xagent.web.services.agent_service_manager.get_agent_manager",
         return_value=agent_manager,
     ):
-        assert await a2a_api._start_a2a_turn(
+        assert await task_resume.resume_a2a_task(
             agent_id=agent_id,
             task_owner_user_id=owner_id,
             task_id=snapshot.id,
-            agent_execution_mode="balanced",
-            context_id=None,
+            previous_run_id=snapshot.run_id,
+            resumable_status=snapshot.status,
             text="follow up after handover",
             message_id="msg-handover",
         )
