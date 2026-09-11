@@ -157,7 +157,7 @@ def test_control_and_reply_commands_execute_without_api_routes() -> None:
             from xagent.web.models.agent import Agent
             from xagent.web.models.task import Task, TaskStatus
             from xagent.web.models.chat_message import TaskChatMessage
-            from xagent.web.services.task_command_execution import execute_durable_task_command
+            from xagent.web.services.task_command_execution import execute_durable_task_command, handle_task_message
             from xagent.web.services.task_command_transport import (
                 ClaimedTaskCommand,
                 TaskCommandKind,
@@ -165,6 +165,7 @@ def test_control_and_reply_commands_execute_without_api_routes() -> None:
             from xagent.web.services import agent_service_manager
             from xagent.core.agent.runner import UserMessageInjectionOutcome
             from xagent.web.services import task_execution, task_resume
+            from xagent.web.services.task_orchestrator import TaskTurnOrchestrator, TurnKind
             from xagent.web.services.task_lease_service import (
                 stop_task_lease_heartbeat, release_task_lease_no_commit,
             )
@@ -252,6 +253,45 @@ def test_control_and_reply_commands_execute_without_api_routes() -> None:
                         assert canceled.agent_config["a2a_state"] == "TASK_STATE_CANCELED"
                         assert canceled.state_version == 1
                         assert db.query(TaskChatMessage).filter_by(task_id=ids[0]).count() == 1
+                    # Durable ingress already acknowledged the message. Exercise
+                    # replay directly too, so a no-op handler cannot pass merely
+                    # because the completed transcript row was seeded above.
+                    with get_session_local()() as db:
+                        actor = db.get(User, uid)
+                        db.expunge(actor)
+                    reply = AsyncMock()
+                    await handle_task_message(reply, ids[0], {
+                        "client_message_id": "message-command", "message": "hello", "user": actor,
+                    })
+                    reply.assert_awaited_once()
+                    ack = reply.await_args.args[0]
+                    assert ack["type"] == "message_accepted", ack
+                    assert ack["client_message_id"] == "message-command", ack
+                    assert ack["turn_id"] == "message-command", ack
+                    # Exercise a fresh MESSAGE through preparation and dispatch,
+                    # with only the orchestrator's turn-start boundary replaced.
+                    with get_session_local()() as db:
+                        task = db.get(Task, ids[0])
+                        task.status = TaskStatus.COMPLETED
+                        task.control_state = "completed"
+                        db.commit()
+                    fresh = ClaimedTaskCommand(
+                        id=5, task_id=ids[0], actor_user_id=uid,
+                        command_id="fresh-message-command", kind=TaskCommandKind.MESSAGE,
+                        payload={"client_message_id": "fresh-message-command", "message": "new turn"},
+                        target_run_id="message", attempt_count=1,
+                    )
+                    with patch.object(TaskTurnOrchestrator, "begin_turn", new_callable=AsyncMock) as begin:
+                        result = await execute_durable_task_command(fresh)
+                        assert result["kind"] == "message", result
+                        begin.assert_awaited_once()
+                        kwargs = begin.await_args.kwargs
+                        assert kwargs["task_id"] == ids[0]
+                        assert kwargs["task_owner_user_id"] == uid
+                        assert kwargs["actor_user_id"] == uid
+                        assert kwargs["kind"] == TurnKind.APPEND
+                        assert kwargs["payload"].turn_id == "fresh-message-command"
+                        assert kwargs["payload"].transcript_message == "new turn"
                     # Both reply paths run their real claims, writes and scheduling
                     # without loading HTTP routes. Only the Agent and execution
                     # leaf are replaced, so no model or external tools are needed.
