@@ -51,7 +51,6 @@ from xagent.web.models.task import TaskStatus
 from xagent.web.services import agent_service_manager as agent_runtime_service
 from xagent.web.services import task_command_execution as command_execution_service
 from xagent.web.services import task_execution as task_execution_service
-from xagent.web.services import task_execution_controller as task_control_service
 from xagent.web.services import task_setup_snapshot as snapshot_module
 from xagent.web.services.agent_service_manager import AgentServiceManager
 from xagent.web.services.task_setup_snapshot import (
@@ -264,9 +263,7 @@ async def test_resume_cache_miss_builds_under_resolver_namespace_not_snapshot(
         stack.enter_context(patch.object(websocket_api, "manager", connection_manager))
         stack.enter_context(
             patch.object(
-                task_control_service.task_execution_controller,
-                "transition",
-                new=transition,
+                websocket_api.task_execution_controller, "transition", new=transition
             )
         )
         stack.enter_context(

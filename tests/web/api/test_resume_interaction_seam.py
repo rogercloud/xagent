@@ -46,7 +46,6 @@ from xagent.web.services import agent_service_manager as agent_runtime_service
 from xagent.web.services import ops_signals
 from xagent.web.services import task_command_execution as command_execution_service
 from xagent.web.services import task_execution as task_execution_service
-from xagent.web.services import task_execution_controller as task_control_service
 from xagent.web.services.task_interaction_close import (
     ACTIVE_INTERACTION_UNAVAILABLE_REASONS,
     ActiveInteractionUnavailable,
@@ -226,9 +225,7 @@ async def test_legacy_resume_without_a_receipt_is_refused_with_an_active_row(
         stack.enter_context(patch.object(websocket_api, "manager", connection_manager))
         stack.enter_context(
             patch.object(
-                task_control_service.task_execution_controller,
-                "transition",
-                new=transition,
+                websocket_api.task_execution_controller, "transition", new=transition
             )
         )
         stack.enter_context(
@@ -314,9 +311,7 @@ async def test_legacy_resume_without_a_receipt_is_refused_on_the_fallback_path(
         stack.enter_context(patch.object(websocket_api, "manager", connection_manager))
         stack.enter_context(
             patch.object(
-                task_control_service.task_execution_controller,
-                "transition",
-                new=transition,
+                websocket_api.task_execution_controller, "transition", new=transition
             )
         )
         stack.enter_context(
@@ -422,9 +417,7 @@ async def test_legacy_resume_is_not_refused_when_the_task_marker_is_null(
         stack.enter_context(patch.object(websocket_api, "manager", connection_manager))
         stack.enter_context(
             patch.object(
-                task_control_service.task_execution_controller,
-                "transition",
-                new=transition,
+                websocket_api.task_execution_controller, "transition", new=transition
             )
         )
         stack.enter_context(
@@ -611,9 +604,7 @@ async def test_receipts_the_seam_cannot_verify_are_refused(
         stack.enter_context(patch.object(websocket_api, "manager", connection_manager))
         stack.enter_context(
             patch.object(
-                task_control_service.task_execution_controller,
-                "transition",
-                new=transition,
+                websocket_api.task_execution_controller, "transition", new=transition
             )
         )
         stack.enter_context(
@@ -705,9 +696,7 @@ async def test_resume_with_a_matching_receipt_is_not_refused(
         stack.enter_context(patch.object(websocket_api, "manager", connection_manager))
         stack.enter_context(
             patch.object(
-                task_control_service.task_execution_controller,
-                "transition",
-                new=transition,
+                websocket_api.task_execution_controller, "transition", new=transition
             )
         )
         stack.enter_context(
@@ -807,9 +796,7 @@ async def test_stale_run_active_row_does_not_trip_the_seam(
         stack.enter_context(patch.object(websocket_api, "manager", connection_manager))
         stack.enter_context(
             patch.object(
-                task_control_service.task_execution_controller,
-                "transition",
-                new=transition,
+                websocket_api.task_execution_controller, "transition", new=transition
             )
         )
         stack.enter_context(
@@ -926,9 +913,7 @@ async def test_legacy_resume_is_not_refused_when_the_active_interaction_read_is_
         stack.enter_context(patch.object(websocket_api, "manager", connection_manager))
         stack.enter_context(
             patch.object(
-                task_control_service.task_execution_controller,
-                "transition",
-                new=transition,
+                websocket_api.task_execution_controller, "transition", new=transition
             )
         )
         stack.enter_context(

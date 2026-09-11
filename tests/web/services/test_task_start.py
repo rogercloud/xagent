@@ -11,6 +11,7 @@ from unittest.mock import AsyncMock, Mock
 
 import pytest
 
+from tests.web.pool_contention_shared import GUARD_TIMEOUT
 from xagent.web.models.task import TaskStatus
 from xagent.web.services import task_start
 
@@ -85,7 +86,12 @@ def test_task_starts_execute_without_api_routes() -> None:
                             actor_user_id=owner, request_agent_id=agent_id, request_workforce_id=None,
                             message="second", file_ids=(), connector_runtime_context=(),
                         )
+                        assert appended.run_id
                         assert appended.run_id != created.run_id
+                        with get_session_local()() as db:
+                            row = db.get(Task, appended.task_id)
+                            assert row.run_id == appended.run_id
+                            assert row.state_version == appended.state_version
                         assert not hasattr(appended, "background_task")
                         a2a = await task_start.start_a2a_turn(
                             agent_id=agent_id, task_owner_user_id=owner, agent_execution_mode="balanced",
@@ -95,6 +101,7 @@ def test_task_starts_execute_without_api_routes() -> None:
                             task_id=legacy_id, task_owner_user_id=owner, task_source="internal",
                             task_description="saved task", context={}, actor_user_id=owner,
                         )
+                        assert background[-1].done()
                         await asyncio.gather(*background)
                     with get_session_local()() as db:
                         sdk_messages = db.query(TaskChatMessage).filter_by(task_id=created.task_id, role="user").order_by(TaskChatMessage.id).all()
@@ -189,3 +196,36 @@ async def test_sdk_start_cancellation_after_claim_still_schedules(monkeypatch, k
         if not operation.done():
             operation.cancel()
         await asyncio.gather(operation, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_legacy_execute_waits_for_background_completion(monkeypatch):
+    scheduled = asyncio.Event()
+    background = asyncio.get_running_loop().create_future()
+
+    async def schedule(**kwargs):
+        scheduled.set()
+        return background
+
+    monkeypatch.setattr(
+        task_start.TaskTurnOrchestrator, "schedule_existing_task_execution", schedule
+    )
+    execution = asyncio.create_task(
+        task_start.execute_existing_task(
+            task_id=91,
+            task_owner_user_id=3,
+            task_source="internal",
+            task_description="saved task",
+            context={},
+            actor_user_id=3,
+        )
+    )
+    try:
+        await asyncio.wait_for(scheduled.wait(), timeout=GUARD_TIMEOUT)
+        assert not execution.done()
+        background.set_result(None)
+        await asyncio.wait_for(execution, timeout=GUARD_TIMEOUT)
+    finally:
+        if not background.done():
+            background.set_result(None)
+        await asyncio.gather(execution, return_exceptions=True)

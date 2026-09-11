@@ -20,6 +20,7 @@ from ...core.agent.checkpoint import (
 from ..models.agent import Agent
 from ..models.database import get_session_local
 from ..models.task import Task, TaskStatus
+from ..services import a2a_task_read as a2a_task_read_service
 from ..services import task_resume as task_resume_service
 from ..services import task_start as task_start_service
 from ..services.a2a_protocol import (
@@ -345,7 +346,7 @@ async def _load_a2a_task_or_error(
     agent_id: int,
     task_id: int,
 ) -> A2ATaskSnapshot:
-    task = await task_start_service._fetch_fresh_a2a_task_isolated(agent_id, task_id)
+    task = await a2a_task_read_service.load_a2a_task_snapshot(agent_id, task_id)
     if task is None:
         raise a2a_error("task_not_found", "Task not found.", status_code=404)
     return task
@@ -375,7 +376,7 @@ def _task_stream_response(
             if remaining <= 0:
                 return
             await asyncio.sleep(min(0.5, remaining))
-            fresh = await task_start_service._fetch_fresh_a2a_task_isolated(
+            fresh = await a2a_task_read_service.load_a2a_task_snapshot(
                 agent_id,
                 started_task_id,
             )
@@ -438,9 +439,7 @@ async def _wait_for_task(
         if remaining <= 0:
             return fresh
         await asyncio.sleep(min(0.25, remaining))
-        fetched = await task_start_service._fetch_fresh_a2a_task_isolated(
-            agent_id, task_id
-        )
+        fetched = await a2a_task_read_service.load_a2a_task_snapshot(agent_id, task_id)
         if fetched is None:
             raise a2a_error("task_not_found", "Task not found.", status_code=404)
         fresh = fetched
@@ -732,7 +731,7 @@ async def cancel_task(
             lambda: load_task_command(command.command_db_id)
         )
         if stored is not None and stored.status == COMMAND_COMPLETED:
-            fresh = await task_start_service._fetch_fresh_a2a_task_isolated(
+            fresh = await a2a_task_read_service.load_a2a_task_snapshot(
                 bound_agent_id, task_id
             )
             if fresh is None:

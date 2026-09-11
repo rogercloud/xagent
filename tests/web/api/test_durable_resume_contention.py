@@ -20,7 +20,6 @@ from xagent.web.models.task_command import TaskExecutionCommand
 from xagent.web.models.user import User
 from xagent.web.services import task_command_execution as command_execution_service
 from xagent.web.services import task_execution as task_execution_service
-from xagent.web.services import task_execution_controller as task_control_service
 from xagent.web.services.task_command_execution import (
     ResumeCommandOutcome,
     _execute_durable_task_command,
@@ -407,7 +406,7 @@ async def test_reserved_resume_records_scheduled_result(db_session) -> None:
             _agent_manager,
         ),
         patch.object(
-            task_control_service.task_execution_controller,
+            websocket_api.task_execution_controller,
             "transition",
             new=transition,
         ),
@@ -448,7 +447,7 @@ async def test_held_reservation_can_schedule_after_the_holder_releases(
             _agent_manager,
         ),
         patch.object(
-            task_control_service.task_execution_controller,
+            websocket_api.task_execution_controller,
             "transition",
             new=transition,
         ),
@@ -574,7 +573,7 @@ async def test_expired_foreign_lease_does_not_defer_a_settled_resume(
             _agent_manager,
         ),
         patch.object(
-            task_control_service.task_execution_controller,
+            websocket_api.task_execution_controller,
             "transition",
             new=transition,
         ),
@@ -732,7 +731,7 @@ async def test_two_concurrent_durable_resumes_schedule_one_execution(
             return_value=None,
         ),
         patch.object(
-            task_control_service.task_execution_controller, "transition", new=transition
+            websocket_api.task_execution_controller, "transition", new=transition
         ),
         patch.object(
             task_execution_service,

@@ -20,6 +20,7 @@ from ..models.database import get_session_local
 from ..models.task import Task, TaskStatus
 from ..models.workforce import WorkforceRun
 from .a2a_protocol import A2ATaskSnapshot, new_context_id, task_context_id
+from .a2a_task_read import load_a2a_task_snapshot
 from .connector_runtime import (
     bind_create_connector_runtime_plan,
     persist_create_connector_runtime_context,
@@ -434,9 +435,9 @@ def resolve_sdk_task(task_id: int, scope: SdkTaskScope, db: Session) -> Task:
 
     Any other case — missing row, row belongs to a different owner,
     or row was created by the Web UI / internal paths — raises
-    :class:`V1ApiError` with ``task_not_found`` (404 not 403, so the
-    existence of tasks under other owners / other surfaces isn't
-    observable through error code).
+    :class:`TaskStartRejected` with ``task_not_found``. Missing and
+    inaccessible tasks share one rejection so adapters can preserve
+    non-disclosing error responses.
 
     The ``source == "sdk"`` filter exists because an SDK API key
     binds to an owner, not to a particular product surface. Without
@@ -454,7 +455,7 @@ def resolve_sdk_task(task_id: int, scope: SdkTaskScope, db: Session) -> Task:
         db: SQLAlchemy session.
 
     Raises:
-        V1ApiError(TASK_NOT_FOUND, 404): task missing, not owned by
+        TaskStartRejected: task missing, not owned by
             the calling key, or not created by the SDK.
     """
     query = db.query(Task).filter(
@@ -714,7 +715,7 @@ async def start_a2a_turn(
                 text=text,
                 message_id=message_id,
             )
-            fresh = await _fetch_fresh_a2a_task_isolated(
+            fresh = await load_a2a_task_snapshot(
                 agent_id,
                 prepared_task.id,
             )
@@ -749,7 +750,7 @@ async def start_a2a_turn(
         except TaskTurnError as exc:
             raise TaskStartRejected("a2a_busy", task_id=prepared_task.id) from exc
 
-        fresh = await _fetch_fresh_a2a_task_isolated(
+        fresh = await load_a2a_task_snapshot(
             agent_id,
             prepared_task.id,
         )
@@ -762,35 +763,6 @@ async def start_a2a_turn(
             return await start_unserialized()
     start_task = asyncio.create_task(start_unserialized())
     return await drain_async_task_cancellation_safe(start_task)
-
-
-def _fetch_fresh_a2a_task(
-    agent_id: int,
-    task_id: int,
-) -> A2ATaskSnapshot | None:
-    """Load one detached A2A task snapshot in a worker-owned Session."""
-
-    SessionLocal = get_session_local()
-    with SessionLocal() as db:
-        fresh = (
-            db.query(Task)
-            .filter(
-                Task.id == task_id,
-                Task.agent_id == agent_id,
-                Task.source == "a2a",
-            )
-            .first()
-        )
-        return A2ATaskSnapshot.from_task(fresh) if fresh is not None else None
-
-
-async def _fetch_fresh_a2a_task_isolated(
-    agent_id: int,
-    task_id: int,
-) -> A2ATaskSnapshot | None:
-    return await run_db_io_cancellation_safe(
-        lambda: _fetch_fresh_a2a_task(agent_id, task_id)
-    )
 
 
 async def execute_existing_task(
@@ -814,4 +786,6 @@ async def execute_existing_task(
         context=context,
         actor_user_id=actor_user_id,
     )
+    # Legacy WebSocket execute_task must not return until execution finishes.
+    # Keep that ordering even though scheduling owns the background handle.
     await background_task

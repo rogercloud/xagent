@@ -620,7 +620,7 @@ async def test_resume_handler_resolves_scope_once_off_loop_for_agent_lookup() ->
                 return_value=agent_manager,
             ),
             patch(
-                "xagent.web.services.task_execution_controller.task_execution_controller.transition",
+                "xagent.web.api.websocket.task_execution_controller.transition",
                 new=transition,
             ),
             patch(
@@ -721,7 +721,7 @@ async def test_resume_survives_a_scope_authority_mismatch() -> None:
                 return_value=agent_manager,
             ),
             patch(
-                "xagent.web.services.task_execution_controller.task_execution_controller.transition",
+                "xagent.web.api.websocket.task_execution_controller.transition",
                 new=AsyncMock(
                     return_value=SimpleNamespace(
                         run_id="run-a", status=TaskStatus.PAUSED
@@ -1105,7 +1105,7 @@ async def test_resume_pool_timeout_does_not_start_secondary_db_cleanup(caplog) -
                 mark_delivery,
             ),
             patch(
-                "xagent.web.services.task_execution_controller.task_execution_controller.snapshot",
+                "xagent.web.api.websocket.task_execution_controller.snapshot",
                 new=snapshot,
             ),
             patch(
@@ -1952,7 +1952,7 @@ async def test_resume_error_delivery_pool_timeout_skips_lease_checkout() -> None
                 mark_delivery,
             ),
             patch(
-                "xagent.web.services.task_execution_controller.task_execution_controller.snapshot",
+                "xagent.web.api.websocket.task_execution_controller.snapshot",
                 new=snapshot,
             ),
             patch(

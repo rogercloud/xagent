@@ -35,6 +35,7 @@ from xagent.web.models.task import Task, TaskStatus, TraceEvent
 from xagent.web.models.task_command import TaskExecutionCommand
 from xagent.web.models.task_interaction import TaskInteractionRequest
 from xagent.web.services import a2a_task_cancel as a2a_cancel_service
+from xagent.web.services import a2a_task_read
 from xagent.web.services import task_command_execution as command_execution_service
 from xagent.web.services import task_execution as task_execution_service
 from xagent.web.services import task_resume, task_start
@@ -2153,8 +2154,8 @@ async def test_stream_artifact_updates_are_incremental_and_finalize(
 
     monkeypatch.setattr(a2a_api.asyncio, "sleep", no_sleep)
     monkeypatch.setattr(
-        task_start,
-        "_fetch_fresh_a2a_task",
+        a2a_task_read,
+        "_load_a2a_task_snapshot_sync",
         lambda _agent_id, _task_id: next(fresh_tasks),
     )
 
@@ -2209,7 +2210,7 @@ async def test_a2a_poll_pool_wait_does_not_block_event_loop(
         db.commit()
 
     held_connection = engine.connect()
-    monkeypatch.setattr(task_start, "get_session_local", lambda: SessionLocal)
+    monkeypatch.setattr(a2a_task_read, "get_session_local", lambda: SessionLocal)
     ticker_stop = asyncio.Event()
     ticks = 0
 
@@ -2220,9 +2221,7 @@ async def test_a2a_poll_pool_wait_does_not_block_event_loop(
             await asyncio.sleep(0.01)
 
     with gated_pool_checkout(engine) as gate:
-        fetch_task = asyncio.create_task(
-            task_start._fetch_fresh_a2a_task_isolated(7, 101)
-        )
+        fetch_task = asyncio.create_task(a2a_task_read.load_a2a_task_snapshot(7, 101))
         ticker_task = asyncio.create_task(ticker())
         try:
             await gate.wait_until_contending()
@@ -2380,7 +2379,7 @@ async def test_subscribe_closes_loader_session_before_returning_stream(
         )
         db.commit()
     session_closed.clear()
-    monkeypatch.setattr(task_start, "get_session_local", lambda: SessionLocal)
+    monkeypatch.setattr(a2a_task_read, "get_session_local", lambda: SessionLocal)
     agent = a2a_api.AgentPrincipalSnapshot(
         id=7,
         user_id=1,
