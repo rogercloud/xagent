@@ -6,7 +6,7 @@ import asyncio
 import logging
 from datetime import datetime, timezone
 from typing import Annotated, Any, Literal, Self, cast
-from uuid import uuid4
+from uuid import NAMESPACE_URL, uuid4, uuid5
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 from sqlalchemy import exists, func, select
@@ -43,6 +43,7 @@ from .task_resume import (
     TaskReplyResumeResult,
     TaskResumeBusyError,
     TaskResumeNotResumableError,
+    TaskResumeRetryableError,
 )
 
 logger = logging.getLogger(__name__)
@@ -90,12 +91,14 @@ def _admit_reply(
             or task.source != source
         ):
             raise TaskResumeBusyError
-        existing = (
-            db.query(TaskExecutionCommand)
-            .filter_by(task_id=ctx.task_id, command_id=command_id)
-            .first()
-        )
-        if existing is not None:
+        while True:
+            existing = (
+                db.query(TaskExecutionCommand)
+                .filter_by(task_id=ctx.task_id, command_id=command_id)
+                .first()
+            )
+            if existing is None:
+                break
             owner = db.get(User, task.user_id)
             if (
                 owner is None
@@ -106,6 +109,18 @@ def _admit_reply(
                 or existing.payload != payload.model_dump(mode="json")
             ):
                 raise TaskResumeBusyError
+            if (
+                source == "a2a"
+                and cast(dict[str, Any], existing.result or {}).get("outcome")
+                == "retryable_unavailable"
+            ):
+                # Keep each command's acceptance snapshot immutable. A
+                # retry gets one deterministic successor, while injection
+                # still uses the original A2A message ID.
+                command_id = uuid5(
+                    NAMESPACE_URL, f"a2a-reply-retry:{ctx.task_id}:{existing.id}"
+                ).hex
+                continue
             return int(existing.id)
         changed = (
             db.query(Task)
@@ -113,6 +128,12 @@ def _admit_reply(
                 Task.id == ctx.task_id,
                 Task.run_id == ctx.run_id,
                 Task.status == ctx.status,
+                # A prior execution may have published its resting status
+                # before releasing its lease. Its finalizer would overwrite
+                # resume_requested, so admission waits until release finishes.
+                Task.runner_id.is_(None),
+                Task.lease_attempt_id.is_(None),
+                Task.lease_expires_at.is_(None),
                 Task.control_state.in_(("idle", ctx.status.value)),
             )
             .update(
@@ -393,6 +414,8 @@ async def _execute_resume_input(command: ClaimedTaskCommand) -> SettledTaskComma
         outcome = "not_resumable"
     except CheckpointAccessRefusedError as exc:
         outcome = "not_resumable" if exc.reason == "superseded_legacy" else "busy"
+    except TaskResumeRetryableError:
+        outcome = "retryable_unavailable"
     except CheckpointReadError:
         outcome = "unavailable"
     except AutoModelUnavailableError:

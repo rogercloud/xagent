@@ -167,3 +167,187 @@ def test_invalid_reply_payload_cannot_acquire_lease(reply, invalid):
         module._handoff(command)
     with get_session_local()() as db:
         assert db.get(Task, reply.task_id).runner_id is None
+
+
+@pytest.mark.parametrize(
+    "source,status",
+    [
+        ("sdk", TaskStatus.WAITING_FOR_USER),
+        ("a2a", TaskStatus.WAITING_FOR_USER),
+        ("a2a", TaskStatus.PAUSED),
+    ],
+)
+def test_reply_waits_for_previous_execution_to_release_lease(reply, source, status):
+    from datetime import datetime, timedelta, timezone
+
+    from xagent.web.services.task_lease_service import TaskLease
+    from xagent.web.services.task_orchestrator import settle_task_lease_isolated
+
+    ctx = replace(reply, status=status)
+    with get_session_local()() as db:
+        task = db.get(Task, ctx.task_id)
+        task.source = source
+        task.status = status
+        task.control_state = status.value
+        task.runner_id = "old-worker"
+        task.lease_attempt_id = "old-attempt"
+        task.lease_expires_at = datetime.now(timezone.utc) + timedelta(seconds=60)
+        task.last_heartbeat_at = datetime.now(timezone.utc)
+        db.commit()
+    with pytest.raises(TaskResumeBusyError):
+        module._admit_reply(ctx, source, "message", "reply")
+    with get_session_local()() as db:
+        assert db.query(TaskExecutionCommand).count() == 0
+        assert db.get(Task, ctx.task_id).control_state == status.value
+    assert settle_task_lease_isolated(
+        TaskLease(
+            task_id=ctx.task_id,
+            runner_id="old-worker",
+            run_id=ctx.run_id,
+            attempt_id="old-attempt",
+        )
+    )
+    command_id = module._admit_reply(ctx, source, "message", "reply")
+    with get_session_local()() as db:
+        command = claim_task_command(db, runner_id="worker-1", command_db_id=command_id)
+    _, lease, _, _ = module._handoff(command)
+    assert lease.run_id == ctx.run_id
+
+
+@pytest.mark.asyncio
+async def test_a2a_retries_checkpoint_read_failure_with_same_message_id(
+    reply, monkeypatch
+):
+    from types import SimpleNamespace
+
+    from xagent.core.agent.checkpoint import CheckpointUnavailableError
+    from xagent.core.agent.runner import UserMessageInjectionOutcome
+    from xagent.web.services.task_lease_service import stop_task_lease_heartbeat
+
+    with get_session_local()() as db:
+        db.get(Task, reply.task_id).source = "a2a"
+        db.commit()
+    post = AsyncMock(
+        side_effect=[
+            CheckpointUnavailableError("temporary read outage"),
+            UserMessageInjectionOutcome.POSTED_FRESH,
+        ]
+    )
+    manager = SimpleNamespace(
+        get_agent_for_task=AsyncMock(
+            return_value=SimpleNamespace(post_user_message=post)
+        )
+    )
+    monkeypatch.setattr(
+        task_resume.agent_runtime_service, "get_agent_manager", lambda: manager
+    )
+
+    async def schedule(**kwargs):
+        await stop_task_lease_heartbeat(
+            kwargs["heartbeat_task"], kwargs["heartbeat_stop"]
+        )
+
+    scheduled = AsyncMock(side_effect=schedule)
+    monkeypatch.setattr(task_resume, "_schedule_waiting_a2a_resume", scheduled)
+    original_id = module._admit_reply(reply, "a2a", "message-1", "original-command")
+    with get_session_local()() as db:
+        first = claim_task_command(db, runner_id="worker-1", command_db_id=original_id)
+        original_version = db.get(
+            TaskExecutionCommand, original_id
+        ).target_state_version
+    await module.execute_resume_input(first)
+    assert module._read_reply_outcome(original_id)["outcome"] == "retryable_unavailable"
+    with get_session_local()() as db:
+        task = db.get(Task, reply.task_id)
+        assert task.runner_id is None
+        assert task.control_state == "waiting_for_user"
+    retry_id = module._admit_reply(reply, "a2a", "message-1", "original-command")
+    assert retry_id != original_id
+    assert (
+        module._admit_reply(reply, "a2a", "message-1", "original-command") == retry_id
+    )
+    with get_session_local()() as db:
+        second = claim_task_command(db, runner_id="worker-1", command_db_id=retry_id)
+    await module.execute_resume_input(second)
+    assert module._read_reply_outcome(retry_id)["outcome"] == "accepted"
+    assert (
+        module._admit_reply(reply, "a2a", "message-1", "original-command") == retry_id
+    )
+    assert post.await_count == 2
+    assert {call.kwargs["turn_id"] for call in post.await_args_list} == {
+        f"a2a:{reply.task_id}:message-1"
+    }
+    scheduled.assert_awaited_once()
+    with get_session_local()() as db:
+        assert db.query(TaskExecutionCommand).count() == 2
+        assert (
+            db.get(TaskExecutionCommand, original_id).target_state_version
+            == original_version
+        )
+
+
+@pytest.mark.parametrize("outcome", ["unavailable", "accepted", "not_resumable"])
+def test_a2a_does_not_retry_unknown_or_terminal_outcome(reply, outcome):
+    with get_session_local()() as db:
+        db.get(Task, reply.task_id).source = "a2a"
+        db.commit()
+    command_id = module._admit_reply(reply, "a2a", "message", "original")
+    with get_session_local()() as db:
+        command = claim_task_command(db, runner_id="worker-1", command_db_id=command_id)
+    _, lease, _, state = module._handoff(command)
+    assert task_resume._restore_a2a_resume_prelease_sync(
+        lease, status=TaskStatus.WAITING_FOR_USER
+    )
+    module._record_outcome(command, state, outcome)
+    assert module._admit_reply(reply, "a2a", "message", "original") == command_id
+    with get_session_local()() as db:
+        assert db.query(TaskExecutionCommand).count() == 1
+        assert (
+            claim_task_command(db, runner_id="worker-1", command_db_id=command_id)
+            is None
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure_stage", ["after_injection", "lease_restore"])
+async def test_a2a_unsafe_checkpoint_failure_cannot_create_retry(
+    reply, monkeypatch, failure_stage
+):
+    from types import SimpleNamespace
+
+    from xagent.core.agent.checkpoint import CheckpointUnavailableError
+    from xagent.core.agent.runner import UserMessageInjectionOutcome
+
+    with get_session_local()() as db:
+        db.get(Task, reply.task_id).source = "a2a"
+        db.commit()
+    post = AsyncMock(return_value=UserMessageInjectionOutcome.POSTED_FRESH)
+    manager = SimpleNamespace(
+        get_agent_for_task=AsyncMock(
+            return_value=SimpleNamespace(post_user_message=post)
+        )
+    )
+    monkeypatch.setattr(
+        task_resume.agent_runtime_service, "get_agent_manager", lambda: manager
+    )
+    failure = CheckpointUnavailableError("temporary outage")
+    if failure_stage == "after_injection":
+        monkeypatch.setattr(
+            task_resume, "_schedule_waiting_a2a_resume", AsyncMock(side_effect=failure)
+        )
+    else:
+        post.side_effect = failure
+        monkeypatch.setattr(
+            task_resume,
+            "_restore_a2a_resume_prelease_isolated",
+            AsyncMock(return_value=False),
+        )
+    command_id = module._admit_reply(reply, "a2a", "message", "original")
+    with get_session_local()() as db:
+        command = claim_task_command(db, runner_id="worker-1", command_db_id=command_id)
+    await module.execute_resume_input(command)
+    assert module._read_reply_outcome(command_id)["outcome"] == "unavailable"
+    assert module._admit_reply(reply, "a2a", "message", "original") == command_id
+    post.assert_awaited_once()
+    with get_session_local()() as db:
+        assert db.query(TaskExecutionCommand).count() == 1

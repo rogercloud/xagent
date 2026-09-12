@@ -15,7 +15,7 @@ from uuid import uuid4
 
 from sqlalchemy import func
 
-from ...core.agent.checkpoint import CheckpointReadError
+from ...core.agent.checkpoint import CheckpointReadError, CheckpointUnavailableError
 from ...core.agent.runner import UserMessageInjectionOutcome
 from ..models.database import get_session_local
 from ..models.task import Task, TaskStatus
@@ -63,6 +63,10 @@ class TaskResumeNotWaitingError(Exception):
 
 class TaskResumeNotResumableError(Exception):
     """No run-fenced checkpoint accepted the reply."""
+
+
+class TaskResumeRetryableError(CheckpointUnavailableError):
+    """A temporary read failed before injection and its lease was restored."""
 
 
 @dataclass(frozen=True)
@@ -412,6 +416,7 @@ async def resume_a2a_task(
         run_task_lease_heartbeat(task_lease, heartbeat_stop)
     )
     ownership_transferred = False
+    message_posted = False
     prelease_cleanup_done = False
 
     async def stop_and_restore_prelease() -> bool:
@@ -517,6 +522,7 @@ async def resume_a2a_task(
                 heartbeat_task,
             )
 
+        message_posted = bool(posted)
         if not posted:
             # Untagged or otherwise unreadable legacy checkpoints are never
             # resumed under a fabricated run or transcript fallback. Release
@@ -561,6 +567,10 @@ async def resume_a2a_task(
                 raise TaskLeaseLostError(
                     f"Task {task_id} lease changed before A2A checkpoint-failure fallback"
                 ) from exc
+            if not message_posted and isinstance(exc, CheckpointUnavailableError):
+                # AgentRunner reads the checkpoint baseline before mutating
+                # the context. A read failure here did not inject this reply.
+                raise TaskResumeRetryableError(str(exc)) from exc
         raise
     except BaseException:
         if not ownership_transferred and not prelease_cleanup_done:
