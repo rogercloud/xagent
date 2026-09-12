@@ -9,7 +9,7 @@ from typing import Annotated, Any, Literal, Self, cast
 from uuid import NAMESPACE_URL, uuid4, uuid5
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
-from sqlalchemy import exists, func, select
+from sqlalchemy import and_, exists, func, or_, select
 from sqlalchemy.orm import Session
 
 from ...config import get_task_lease_ttl_seconds
@@ -128,16 +128,25 @@ def _admit_reply(
                 Task.id == ctx.task_id,
                 Task.run_id == ctx.run_id,
                 Task.status == ctx.status,
-                # A prior execution may have published its resting status
-                # before releasing its lease. Its finalizer would overwrite
-                # resume_requested, so admission waits until release finishes.
-                Task.runner_id.is_(None),
-                Task.lease_attempt_id.is_(None),
-                Task.lease_expires_at.is_(None),
+                # Wait for live owners to finish. Reclaim an expired resting
+                # lease here: the recovery sweep only scans RUNNING tasks.
+                or_(
+                    and_(
+                        Task.runner_id.is_(None),
+                        Task.lease_attempt_id.is_(None),
+                        Task.lease_expires_at.is_(None),
+                    ),
+                    Task.lease_expires_at < datetime.now(timezone.utc),
+                ),
                 Task.control_state.in_(("idle", ctx.status.value)),
             )
             .update(
                 {
+                    # Invalidate the old attempt in this same transaction so
+                    # its heartbeat/finalizer cannot overwrite admission.
+                    Task.runner_id: None,
+                    Task.lease_attempt_id: None,
+                    Task.lease_expires_at: None,
                     Task.control_state: "resume_requested",
                     Task.state_version: func.coalesce(Task.state_version, 0) + 1,
                 },

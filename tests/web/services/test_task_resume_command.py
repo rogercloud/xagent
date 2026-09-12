@@ -351,3 +351,83 @@ async def test_a2a_unsafe_checkpoint_failure_cannot_create_retry(
     post.assert_awaited_once()
     with get_session_local()() as db:
         assert db.query(TaskExecutionCommand).count() == 1
+
+
+@pytest.mark.parametrize(
+    "source,status",
+    [
+        ("sdk", TaskStatus.WAITING_FOR_USER),
+        ("a2a", TaskStatus.WAITING_FOR_USER),
+        ("a2a", TaskStatus.PAUSED),
+    ],
+)
+def test_reply_reclaims_expired_resting_lease_atomically(
+    reply, monkeypatch, source, status
+):
+    from datetime import datetime, timedelta, timezone
+
+    from xagent.web.services.task_lease_service import (
+        TaskLease,
+        TaskLeaseRefreshState,
+        refresh_task_lease,
+    )
+    from xagent.web.services.task_orchestrator import settle_task_lease_isolated
+
+    ctx = replace(reply, status=status)
+    # Use the new worker's runner ID too: the attempt must fence an old
+    # execution even when the process identity is reused.
+    old_lease = TaskLease(
+        task_id=ctx.task_id,
+        runner_id="worker-1",
+        run_id=ctx.run_id,
+        attempt_id="old-attempt",
+    )
+    expired_at = datetime.now(timezone.utc) - timedelta(minutes=10)
+    with get_session_local()() as db:
+        task = db.get(Task, ctx.task_id)
+        task.source = source
+        task.status = status
+        task.control_state = status.value
+        task.runner_id = old_lease.runner_id
+        task.lease_attempt_id = old_lease.attempt_id
+        task.lease_expires_at = expired_at
+        original_version = task.state_version
+        db.commit()
+
+    def fail_staging(*args, **kwargs):
+        raise RuntimeError("command staging failed")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(module, "stage_task_command", fail_staging)
+        with pytest.raises(RuntimeError, match="command staging failed"):
+            module._admit_reply(ctx, source, "message", "reply")
+    with get_session_local()() as db:
+        task = db.get(Task, ctx.task_id)
+        assert task.runner_id == old_lease.runner_id
+        assert task.lease_attempt_id == old_lease.attempt_id
+        assert task.lease_expires_at.replace(tzinfo=timezone.utc) == expired_at
+        assert task.control_state == status.value
+        assert task.state_version == original_version
+        assert db.query(TaskExecutionCommand).count() == 0
+
+    command_id = module._admit_reply(ctx, source, "message", "reply")
+    assert not settle_task_lease_isolated(old_lease)
+    with get_session_local()() as db:
+        assert refresh_task_lease(db, old_lease) == TaskLeaseRefreshState.LOST
+        task = db.get(Task, ctx.task_id)
+        assert task.runner_id is None
+        assert task.lease_attempt_id is None
+        assert task.lease_expires_at is None
+        assert task.control_state == "resume_requested"
+        assert task.state_version == original_version + 1
+        command = claim_task_command(db, runner_id="worker-1", command_db_id=command_id)
+    _, lease, _, state = module._handoff(command)
+    assert lease.run_id == ctx.run_id
+    assert lease.attempt_id != old_lease.attempt_id
+    assert not settle_task_lease_isolated(old_lease)
+    with get_session_local()() as db:
+        assert refresh_task_lease(db, old_lease) == TaskLeaseRefreshState.LOST
+        task = db.get(Task, ctx.task_id)
+        assert task.lease_attempt_id == lease.attempt_id
+        assert task.state_version == state["state_version"]
+        assert task.control_state == "running"
