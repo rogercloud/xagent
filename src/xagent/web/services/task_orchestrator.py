@@ -48,7 +48,7 @@ import asyncio
 import enum
 import logging
 import time
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 from uuid import uuid4
@@ -1190,7 +1190,7 @@ def _claim_turn_no_commit(
     lease = acquire_task_lease_no_commit(db, task_id, expected_run_id=accepted.run_id)
     if lease is None:
         raise RuntimeError(f"task {task_id} could not stage its exact execution lease")
-    return _ClaimedTurn(**asdict(accepted), task_lease=lease)
+    return _ClaimedTurn(**vars(accepted), task_lease=lease)
 
 
 def _begin_turn_atomic_sync(

@@ -42,6 +42,9 @@ INTERACTION_PROTOCOL_MODE = "XAGENT_INTERACTION_PROTOCOL_MODE"
 INTERACTION_NATIVE_SOURCES = "XAGENT_INTERACTION_NATIVE_SOURCES"
 SHARED_TASK_EXECUTION_ENABLED = "XAGENT_SHARED_TASK_EXECUTION_ENABLED"
 TASK_EVENT_CHANNEL_PREFIX = "XAGENT_TASK_EVENT_CHANNEL_PREFIX"
+ENCRYPTION_KEY = "ENCRYPTION_KEY"
+# Public development fallback; runtime credential storage must reject it.
+DEV_FALLBACK_ENCRYPTION_KEY = "RQMpe38gK3m0szjpSmTNw_sP3Y54r6hDc6JewBoPKXc="
 TASK_LEASE_TTL_SECONDS = "XAGENT_TASK_LEASE_TTL_SECONDS"
 TASK_LEASE_HEARTBEAT_SECONDS = "XAGENT_TASK_LEASE_HEARTBEAT_SECONDS"
 TASK_LEASE_RECOVERY_INTERVAL_SECONDS = "XAGENT_TASK_LEASE_RECOVERY_INTERVAL_SECONDS"
@@ -749,6 +752,18 @@ def get_redis_url() -> str | None:
 def get_shared_task_execution_enabled() -> bool:
     """Enable durable task handoff and the shared event bridge when explicitly configured."""
     return _get_bool_env(SHARED_TASK_EXECUTION_ENABLED, False)
+
+
+def get_task_runtime_secrets_encryption_key() -> str | None:
+    """Return an explicitly configured, non-default ENCRYPTION_KEY.
+
+    Single-turn connector credentials must never use the published development
+    fallback. Invalid Fernet keys are rejected by the store before any write.
+    """
+    key = os.getenv(ENCRYPTION_KEY)
+    if not key or key == DEV_FALLBACK_ENCRYPTION_KEY:
+        return None
+    return key
 
 
 def get_task_event_channel_prefix() -> str:

@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 from anyio import BrokenResourceError, ClosedResourceError
@@ -611,3 +611,139 @@ def test_detach_task_connections_removes_forward_and_reverse_membership() -> Non
     assert detached == [first_websocket, second_websocket]
     assert connection_manager.active_connections == {other_task_id: [other_websocket]}
     assert connection_manager._connection_task_ids == {other_websocket: other_task_id}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "status", [TaskStatus.RUNNING, TaskStatus.COMPLETED, TaskStatus.WAITING_FOR_USER]
+)
+async def test_shared_reconciliation_reads_persisted_state_and_stops(
+    current_task, monkeypatch, status
+):
+    import threading
+
+    from xagent.web.models.database import get_session_local
+    from xagent.web.services import task_event_bridge, task_stream_snapshot
+
+    with get_session_local()() as db:
+        task = db.get(Task, current_task.id)
+        task.status = status
+        task.control_state = status.value
+        task.output = "complete durable result"
+        task.lease_attempt_id = "attempt-current"
+        db.commit()
+    monkeypatch.setenv("XAGENT_SHARED_TASK_EXECUTION_ENABLED", "true")
+    monkeypatch.setattr(
+        task_event_bridge, "_bridge", SimpleNamespace(discard_recipient=lambda ws: None)
+    )
+    loop_thread = threading.get_ident()
+    read_threads = []
+    load = task_stream_snapshot.load_task_stream_snapshots
+
+    def load_off_loop(task_ids):
+        read_threads.append(threading.get_ident())
+        return load(task_ids)
+
+    monkeypatch.setattr(
+        task_stream_snapshot, "load_task_stream_snapshots", load_off_loop
+    )
+    received = asyncio.Event()
+
+    class Socket(_RecordingWebSocket):
+        async def send_text(self, message):
+            await super().send_text(message)
+            received.set()
+
+    socket = Socket()
+    manager = ConnectionManager()
+    manager.register_connection(socket, current_task.id)
+    writer = manager._writers[socket]
+    manager.start_stream_reconciliation()
+    reconciler = manager._stream_reconciler
+    try:
+        await asyncio.wait_for(received.wait(), timeout=2)
+        frame = json.loads(socket.messages[0])
+        assert frame["type"] == "task_stream_snapshot"
+        assert frame["task_id"] == current_task.id
+        assert frame["run_id"] == "run-current"
+        assert frame["state_version"] == 7
+        assert frame["status"] == status.value
+        assert frame["lease_attempt_id"] == "attempt-current"
+        assert frame["output"] == (
+            "complete durable result" if status == TaskStatus.COMPLETED else None
+        )
+        if status == TaskStatus.WAITING_FOR_USER:
+            assert "question" in frame and "interactions" in frame
+        assert read_threads and loop_thread not in read_threads
+    finally:
+        await asyncio.wait_for(manager.stop_stream_reconciliation(), timeout=2)
+        manager.disconnect(socket)
+        await asyncio.wait_for(
+            asyncio.gather(writer.task, return_exceptions=True), timeout=2
+        )
+    assert reconciler.done()
+    assert manager._stream_reconciler is None
+    assert not manager.active_connections
+
+
+@pytest.mark.asyncio
+async def test_shared_delivery_logs_connection_without_writer(monkeypatch, caplog):
+    monkeypatch.setenv("XAGENT_SHARED_TASK_EXECUTION_ENABLED", "false")
+    manager = ConnectionManager()
+    socket = _RecordingWebSocket()
+    manager.register_connection(socket, 42)
+    await manager.deliver_shared_event(
+        {"type": "diagnostic", "content": "private content"}, 42
+    )
+    assert "connection has no writer task_id=42" in caplog.text
+    assert "private content" not in caplog.text
+    manager.disconnect(socket)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("started", [False, True])
+async def test_manager_disconnect_reentry_cleans_writer_and_both_origin_registries(
+    monkeypatch, started
+):
+    from xagent.web.services import task_event_bridge
+
+    monkeypatch.setenv("XAGENT_SHARED_TASK_EXECUTION_ENABLED", "true")
+    monkeypatch.setenv("XAGENT_REDIS_URL", "redis://localhost:6379/0")
+    bridge = task_event_bridge.TaskEventBridge()
+    bridge.ready.set()
+    monkeypatch.setattr(task_event_bridge, "_bridge", bridge)
+    origins = websocket_api._CommandOriginRegistry()
+    monkeypatch.setattr(websocket_api, "_command_origins", origins)
+    manager = ConnectionManager()
+    disconnect = Mock(wraps=manager.disconnect)
+    monkeypatch.setattr(manager, "disconnect", disconnect)
+    socket = _BlockingSendWebSocket()
+    manager.register_connection(socket, 42)
+    writer = manager._writers[socket]
+    origins.register("command-1", socket, 42)
+    origin = bridge.register_origin(42, "command-1", AsyncMock(), recipient=socket)
+    acknowledgement = writer.enqueue("pending", acknowledge=True)
+    try:
+        if started:
+            await asyncio.wait_for(socket.send_started.wait(), timeout=1)
+        manager.disconnect(socket)
+        await asyncio.wait_for(
+            asyncio.gather(writer.task, return_exceptions=True), timeout=2
+        )
+        with pytest.raises(ConnectionError):
+            await asyncio.wait_for(acknowledgement, timeout=1)
+        # stop() re-enters the real manager once; the writer has already been
+        # popped, so this must terminate and leave both origin registries clean.
+        assert disconnect.call_count == 2
+        assert writer.closed and writer.queue.empty()
+        assert not manager._writers
+        assert not manager._connection_task_ids
+        assert not manager.active_connections
+        assert not origins.has("command-1", 42)
+        assert origin not in bridge._origins
+        manager.disconnect(socket)
+        assert disconnect.call_count == 3
+    finally:
+        manager.disconnect(socket)
+        await asyncio.gather(writer.task, return_exceptions=True)
+        await bridge.close()
