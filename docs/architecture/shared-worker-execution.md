@@ -1,14 +1,19 @@
-# Shared task execution foundations
+# Shared task execution foundations and handoff
 
-This change contains the acceptance/data and event/recovery foundations for shared task execution. Application startup and task execution remain on the existing path. It does not start a shared worker or the Redis event bridge.
+This change contains the acceptance/data, event/recovery, worker handoff, and SDK/Workforce/A2A/Trigger ingress adapters for shared task execution. Application startup and task execution remain on the existing path. It does not start a shared worker or the Redis event bridge.
 
 ## Acceptance and persistence
 
-`_AcceptedTurn` represents a persisted turn without an execution lease. The existing `_claim_turn_no_commit` still acquires the lease and returns `_ClaimedTurn` inside the same transaction before scheduling. Message and file binding, Workforce projection, commit reconciliation and local scheduling keep their existing contracts. Terminal finalization now also writes `Task.output` in the same transaction as the assistant transcript on the local path. This brings forward the same content (or failure clearing) that `finish_turn` writes later, allowing shared readers to observe terminal status and durable output together.
+`_AcceptedTurn` represents a persisted turn without an execution lease. With shared execution enabled, acceptance returns `_EnqueuedTurn`: the new run, transcript, file bindings, runtime inputs and START command commit in the same transaction. The request host does not acquire an execution lease or return a local background task. With the flag disabled, the existing `_ClaimedTurn` and local scheduling path is preserved.
 
-`task_runtime_secrets` stores encrypted, single-turn connector secrets and auth selectors. Reads verify task, turn, run and the owner's stable subject. Storage, binding and cleanup operations are available to later ingress/worker integration; existing connector runtime paths do not use this store yet. No secret values are added to task APIs or event payloads. The store requires a valid, explicitly configured `ENCRYPTION_KEY` and rejects the published development key, including when copied from `example.env`. Unavailable key configuration returns `connector_runtime_unavailable` before writing.
+A worker consumes START by validating its immutable task/run/version/actor references and its live command claim. Acquiring the exact execution lease and completing START are one transaction; command completion acknowledges handoff, not agent completion. Later controls route to the task's current live owner. Already claimed MESSAGE commands execute directly without nesting another START. Cancellation drains handoff through local registration so it cannot abandon a newly committed lease; process death remains subject to lease recovery.
 
-These inputs belong to one execution, not the lifetime of a paused conversation. After its lease is released into `paused` or `waiting_for_user`, cleanup removes them. A subsequent resume must supply fresh secret/auth-selector values through ingress; missing required values fail with `runtime_secret_unavailable`. Resuming must not silently reuse or omit an earlier execution's credentials. The integration that first enables staging must wire terminal deletion and the compensation sweep in the same change. There is no TTL or running sweep in this foundation PR.
+`task_runtime_secrets` stores encrypted connector secrets and auth selectors per accepted run. Reads verify task, acceptance turn, run and the owner's stable subject. Resume uses the run binding even when the reply creates a new transcript turn. Paused and waiting-for-user runs retain their inputs across workers; completed, failed, replaced, or deleted runs lose them. A new APPEND run never inherits the old run's inputs. Exact-run terminal cleanup and the recovery-loop sweep compensate interrupted deletion without deleting a newer run's values.
+
+No secret values are added to task APIs or event payloads. The store requires a valid, explicitly configured `ENCRYPTION_KEY` and rejects the published development key, including when copied from `example.env`. Unavailable key configuration returns `connector_runtime_unavailable` before writing. Missing accepted inputs fail with `runtime_secret_unavailable`; persisted storage does not extend upstream credential validity or bypass revocation.
+
+SDK and A2A replies enqueue RESUME_INPUT for worker-side checkpoint preparation and reuse the existing run. Their APIs wait for the persisted preparation outcome. Legacy existing-task execution uses an explicit START variant without adding another user transcript row. Legacy and Trigger completion waits poll the exact durable run without retaining a database connection or accepting a replacement run's outcome. Workforce and Trigger projections remain part of their existing acceptance and terminal transactions.
+
 
 Nullable `reply_host_id` and `reply_origin` fields identify the creating ingress and its exact socket registration. They are stored when a command is created; duplicate submissions cannot overwrite the route. The migration preserves existing commands and can be downgraded independently.
 
@@ -26,7 +31,7 @@ The frontend handles unavailable/resync notifications and exact-run snapshots. I
 
 `XAGENT_TASK_EVENT_CHANNEL_PREFIX` defaults to `xagent:task-events:v1`. Redis logical DB numbers do not isolate Pub/Sub; separate deployments need different prefixes.
 
-Follow-up changes will implement START handoff and lease fencing, resume/existing-task and ingress adapters, channel bots, and worker/web lifecycle integration. The final integration will enable shared execution by default, after those paths are complete. No intermediate PR should turn it on prematurely.
+Follow-up changes will implement channel bots and worker/web lifecycle integration. The final integration will enable shared execution by default, after those paths are complete. No intermediate PR should turn it on prematurely.
 
 ## Validation
 

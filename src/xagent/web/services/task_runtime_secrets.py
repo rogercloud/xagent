@@ -1,4 +1,4 @@
-"""Single-turn encrypted storage shared by request and execution processes."""
+"""Run-scoped encrypted storage shared by request and execution processes."""
 
 from __future__ import annotations
 
@@ -61,8 +61,8 @@ def stage_runtime_values(
 
     Bind them to the accepted run with ``bind_runtime_values_to_run`` before
     committing this same transaction. Unbound inputs must not be committed.
-    The ingress that first wires these writes must also wire terminal cleanup
-    and the compensation sweep in the same change; there is no independent TTL.
+    Terminal settlement and the recovery sweep remove finished or replaced
+    runs; paused and waiting runs retain their inputs without an independent TTL.
     """
     if not values_by_ref:
         return
@@ -107,16 +107,28 @@ def load_runtime_values(
     db: Session,
     *,
     task: Task,
-    turn_id: str,
+    turn_id: str | None = None,
     required: bool = False,
 ) -> dict[str, Any] | None:
-    row = db.execute(
-        select(TaskRuntimeSecret).where(
-            TaskRuntimeSecret.task_id == task.id,
-            TaskRuntimeSecret.turn_id == turn_id,
-        )
-    ).scalar_one_or_none()
+    query = select(TaskRuntimeSecret).where(TaskRuntimeSecret.task_id == task.id)
+    if turn_id is not None:
+        query = query.where(TaskRuntimeSecret.turn_id == turn_id)
+    else:
+        # Reply transcript IDs change; the accepted inputs belong to the run.
+        query = query.where(TaskRuntimeSecret.run_id == task.run_id)
+    row = db.execute(query).scalar_one_or_none()
     if row is None:
+        if turn_id is None and task.run_id is not None:
+            from ..models.task_command import TaskExecutionCommand
+
+            accepted = db.execute(
+                select(TaskExecutionCommand.payload).where(
+                    TaskExecutionCommand.task_id == task.id,
+                    TaskExecutionCommand.target_run_id == task.run_id,
+                    TaskExecutionCommand.kind == "start",
+                )
+            ).scalar_one_or_none()
+            required = required or bool(accepted and accepted.get("runtime_values_ref"))
         if required:
             raise _unavailable()
         return None
@@ -132,7 +144,7 @@ def load_runtime_values(
     if (
         not isinstance(body, dict)
         or body.get("task_id") != task.id
-        or body.get("turn_id") != turn_id
+        or body.get("turn_id") != row.turn_id
         or body.get("owner_subject") != owner
         or not isinstance(body.get("values"), dict)
     ):
@@ -161,38 +173,34 @@ def delete_runtime_values(*, task_id: int, turn_id: str) -> None:
         db.commit()
 
 
-def clean_finished_runtime_values() -> None:
+def clean_finished_runtime_values(
+    *, task_id: int | None = None, run_id: str | None = None
+) -> None:
     """Compensate interrupted cleanup without expiring queued or active inputs.
 
     Accepted inputs already have a run binding at commit; another session
     cannot observe the intermediate unbound rows in the acceptance transaction.
-    PAUSED and WAITING_FOR_USER end this execution's access once its lease is
-    released. Resuming requires freshly supplied values; required loads of
-    removed inputs fail with runtime_secret_unavailable, never an empty secret.
+    Paused and waiting runs retain their accepted inputs for resumption on
+    any worker. Only terminal or replaced runs are removed. Optional scope
+    keeps an old execution's cleanup from deleting a newer run's inputs.
     """
-    with get_session_local()() as db:
-        rows = (
-            db.execute(
-                select(TaskRuntimeSecret.id)
-                .join(Task)
-                .where(
-                    (TaskRuntimeSecret.run_id.is_distinct_from(Task.run_id))
-                    | (
-                        Task.runner_id.is_(None)
-                        & Task.status.in_(
-                            [
-                                TaskStatus.COMPLETED,
-                                TaskStatus.FAILED,
-                                TaskStatus.PAUSED,
-                                TaskStatus.WAITING_FOR_USER,
-                            ]
-                        )
-                    )
-                )
+    statement = (
+        select(TaskRuntimeSecret.id)
+        .join(Task)
+        .where(
+            TaskRuntimeSecret.run_id.is_distinct_from(Task.run_id)
+            | (
+                Task.runner_id.is_(None)
+                & Task.status.in_((TaskStatus.COMPLETED, TaskStatus.FAILED))
             )
-            .scalars()
-            .all()
         )
+    )
+    if task_id is not None:
+        statement = statement.where(TaskRuntimeSecret.task_id == task_id)
+    if run_id is not None:
+        statement = statement.where(TaskRuntimeSecret.run_id == run_id)
+    with get_session_local()() as db:
+        rows = db.execute(statement).scalars().all()
         if rows:
             db.execute(delete(TaskRuntimeSecret).where(TaskRuntimeSecret.id.in_(rows)))
         db.commit()
