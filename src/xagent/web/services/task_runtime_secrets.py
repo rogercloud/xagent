@@ -5,18 +5,19 @@ from __future__ import annotations
 import json
 from typing import Any, cast
 
-from cryptography.fernet import InvalidToken
+from cryptography.fernet import Fernet, InvalidToken
 from sqlalchemy import delete, select, update
 from sqlalchemy.engine import CursorResult
 from sqlalchemy.orm import Session
 
+from ...config import get_task_runtime_secrets_encryption_key
 from ...core.tools.adapters.vibe.connector_runtime import (
+    ERROR_CONNECTOR_RUNTIME_UNAVAILABLE,
     ERROR_RUNTIME_SECRET_UNAVAILABLE,
     RUNTIME_SECRET_REASON_STORE_LOST,
     ConnectorRef,
     ConnectorRuntimeError,
 )
-from ...core.utils.encryption import get_cipher
 from ..models.database import get_session_local
 from ..models.task import Task, TaskStatus
 from ..models.task_runtime_secret import TaskRuntimeSecret
@@ -32,6 +33,23 @@ def _unavailable() -> ConnectorRuntimeError:
     )
 
 
+def _runtime_cipher() -> Fernet:
+    key = get_task_runtime_secrets_encryption_key()
+    if key is not None:
+        try:
+            return Fernet(key.encode())
+        except (ValueError, UnicodeError):
+            pass
+    # Do not reuse get_cipher(): another feature may have cached the public
+    # development fallback. Never include the configured key in this error.
+    raise ConnectorRuntimeError(
+        ERROR_CONNECTOR_RUNTIME_UNAVAILABLE,
+        "Connector runtime storage requires a valid, non-default ENCRYPTION_KEY.",
+        details={"reason": "encryption_key_unavailable"},
+        status_code=503,
+    )
+
+
 def stage_runtime_values(
     db: Session,
     *,
@@ -43,9 +61,12 @@ def stage_runtime_values(
 
     Bind them to the accepted run with ``bind_runtime_values_to_run`` before
     committing this same transaction. Unbound inputs must not be committed.
+    The ingress that first wires these writes must also wire terminal cleanup
+    and the compensation sweep in the same change; there is no independent TTL.
     """
     if not values_by_ref:
         return
+    cipher = _runtime_cipher()
     owner_subject = db.execute(
         select(User.actor_subject)
         .join(Task, Task.user_id == User.id)
@@ -57,9 +78,7 @@ def stage_runtime_values(
         "owner_subject": owner_subject,
         "values": {ref.storage_key: values for ref, values in values_by_ref.items()},
     }
-    ciphertext = (
-        get_cipher().encrypt(json.dumps(body, allow_nan=False).encode()).decode()
-    )
+    ciphertext = cipher.encrypt(json.dumps(body, allow_nan=False).encode()).decode()
     db.add(
         TaskRuntimeSecret(
             task_id=task_id,
@@ -91,6 +110,12 @@ def load_runtime_values(
     turn_id: str,
     required: bool = False,
 ) -> dict[str, Any] | None:
+    """Read scoped inputs; both configuration and stored-value errors are 503.
+
+    An unavailable key raises connector_runtime_unavailable. A valid key that
+    cannot decrypt the row raises runtime_secret_unavailable, as do missing
+    required inputs or mismatched ownership/run bindings.
+    """
     row = db.execute(
         select(TaskRuntimeSecret).where(
             TaskRuntimeSecret.task_id == task.id,
@@ -107,7 +132,7 @@ def load_runtime_values(
     if owner != row.owner_subject or row.run_id != task.run_id:
         raise _unavailable()
     try:
-        body = json.loads(get_cipher().decrypt(row.ciphertext.encode()))
+        body = json.loads(_runtime_cipher().decrypt(row.ciphertext.encode()))
     except (InvalidToken, ValueError, UnicodeError):
         raise _unavailable() from None
     if (
@@ -147,6 +172,9 @@ def clean_finished_runtime_values() -> None:
 
     Accepted inputs already have a run binding at commit; another session
     cannot observe the intermediate unbound rows in the acceptance transaction.
+    PAUSED and WAITING_FOR_USER end this execution's access once its lease is
+    released. Resuming requires freshly supplied values; required loads of
+    removed inputs fail with runtime_secret_unavailable, never an empty secret.
     """
     with get_session_local()() as db:
         rows = (

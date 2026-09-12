@@ -1,8 +1,11 @@
 """Single-turn runtime inputs remain encrypted, scoped and transactional."""
 
 import pytest
+from cryptography.fernet import Fernet, InvalidToken
 
 from xagent.core.tools.adapters.vibe.connector_runtime import (
+    ERROR_CONNECTOR_RUNTIME_UNAVAILABLE,
+    ERROR_RUNTIME_SECRET_UNAVAILABLE,
     ConnectorRef,
     ConnectorRuntimeError,
 )
@@ -23,6 +26,13 @@ VALUES = {
         "auth_selector": {"account": "synthetic-account"},
     }
 }
+
+
+@pytest.fixture(autouse=True)
+def private_encryption_key(monkeypatch):
+    key = Fernet.generate_key().decode()
+    monkeypatch.setenv("ENCRYPTION_KEY", key)
+    return key
 
 
 @pytest.fixture
@@ -114,11 +124,16 @@ def test_compensation_preserves_queued_and_active_inputs(task_id):
         assert db.query(TaskRuntimeSecret).count() == 0
 
 
-def test_compensation_waits_for_waiting_execution_to_release_lease(task_id):
+@pytest.mark.parametrize(
+    "resting_status", [TaskStatus.PAUSED, TaskStatus.WAITING_FOR_USER]
+)
+def test_resumed_execution_requires_fresh_values_after_lease_release(
+    task_id, resting_status
+):
     with get_session_local()() as db:
         stage(db, task_id)
         task = db.get(Task, task_id)
-        task.status = TaskStatus.WAITING_FOR_USER
+        task.status = resting_status
         task.runner_id = "worker"
         db.commit()
     clean_finished_runtime_values()
@@ -129,6 +144,14 @@ def test_compensation_waits_for_waiting_execution_to_release_lease(task_id):
     clean_finished_runtime_values()
     with get_session_local()() as db:
         assert db.query(TaskRuntimeSecret).count() == 0
+        task = db.get(Task, task_id)
+        task.status = TaskStatus.RUNNING
+        task.runner_id = "resumed-worker"
+        with pytest.raises(ConnectorRuntimeError) as error:
+            load_runtime_values(db, task=task, turn_id="turn-1", required=True)
+        assert error.value.code == ERROR_RUNTIME_SECRET_UNAVAILABLE
+        stage(db, task_id)
+        assert load_runtime_values(db, task=task, turn_id="turn-1", required=True)
 
 
 def test_cleanup_cannot_observe_inputs_before_transaction_binds_run(task_id):
@@ -152,3 +175,85 @@ def test_cleanup_cannot_observe_inputs_before_transaction_binds_run(task_id):
         assert load_runtime_values(
             observer, task=observer.get(Task, task_id), turn_id="turn-1", required=True
         )
+
+
+@pytest.mark.parametrize(
+    "key",
+    [None, "", "RQMpe38gK3m0szjpSmTNw_sP3Y54r6hDc6JewBoPKXc=", "invalid-key", "非密钥"],
+)
+def test_invalid_key_refuses_staging_without_writing(task_id, monkeypatch, key):
+    monkeypatch.delenv("ENCRYPTION_KEY", raising=False)
+    if key is not None:
+        monkeypatch.setenv("ENCRYPTION_KEY", key)
+    with get_session_local()() as db:
+        with pytest.raises(ConnectorRuntimeError) as error:
+            stage(db, task_id)
+        assert error.value.code == ERROR_CONNECTOR_RUNTIME_UNAVAILABLE
+        assert error.value.status_code == 503
+        assert "synthetic-secret" not in str(error.value)
+        db.commit()
+    with get_session_local()() as observer:
+        assert observer.query(TaskRuntimeSecret).count() == 0
+
+
+def test_store_does_not_reuse_cached_development_cipher(
+    task_id, monkeypatch, private_encryption_key
+):
+    from xagent.core.utils.encryption import get_cipher
+
+    get_cipher.cache_clear()
+    try:
+        monkeypatch.delenv("ENCRYPTION_KEY")
+        development_cipher = get_cipher()
+        monkeypatch.setenv("ENCRYPTION_KEY", private_encryption_key)
+        with get_session_local()() as db:
+            stage(db, task_id)
+            ciphertext = db.query(TaskRuntimeSecret).one().ciphertext.encode()
+            assert b"synthetic-secret" in Fernet(
+                private_encryption_key.encode()
+            ).decrypt(ciphertext)
+            with pytest.raises(InvalidToken):
+                development_cipher.decrypt(ciphertext)
+            assert load_runtime_values(
+                db, task=db.get(Task, task_id), turn_id="turn-1", required=True
+            )
+    finally:
+        get_cipher.cache_clear()
+
+
+@pytest.mark.parametrize(
+    "key_state", ["unset", "empty", "default", "malformed", "rotated"]
+)
+def test_read_distinguishes_key_configuration_from_decryption_failure(
+    task_id, monkeypatch, key_state
+):
+    from xagent.config import DEV_FALLBACK_ENCRYPTION_KEY
+
+    with get_session_local()() as db:
+        stage(db, task_id)
+        db.commit()
+    if key_state == "unset":
+        monkeypatch.delenv("ENCRYPTION_KEY")
+    else:
+        monkeypatch.setenv(
+            "ENCRYPTION_KEY",
+            {
+                "empty": "",
+                "default": DEV_FALLBACK_ENCRYPTION_KEY,
+                "malformed": "not-a-fernet-key",
+                "rotated": Fernet.generate_key().decode(),
+            }[key_state],
+        )
+    with get_session_local()() as db:
+        with pytest.raises(ConnectorRuntimeError) as error:
+            load_runtime_values(
+                db, task=db.get(Task, task_id), turn_id="turn-1", required=True
+            )
+        assert error.value.code == (
+            ERROR_RUNTIME_SECRET_UNAVAILABLE
+            if key_state == "rotated"
+            else ERROR_CONNECTOR_RUNTIME_UNAVAILABLE
+        )
+        assert error.value.status_code == 503
+        assert "synthetic-secret" not in str(error.value)
+        assert db.query(TaskRuntimeSecret).count() == 1
