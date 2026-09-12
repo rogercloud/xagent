@@ -45,6 +45,8 @@ class TaskStartPayload(BaseModel):
     arbitrary request context, connector secrets or a transferred lease.
     """
 
+    # Frozen prevents field rebinding, not mutation of nested lists. Producers
+    # must not mutate file_ids after validation.
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
 
     version: Annotated[int, Field(ge=1, le=1)]
@@ -77,8 +79,10 @@ def stage_task_start_command(
 
     The caller must have reserved the turn through its task-state CAS in THIS
     transaction, including authorization, message persistence and file binding.
-    That write holds SQLite's writer lock; the row lock also protects this
-    check on PostgreSQL. This helper does not replace business acceptance.
+    That write holds SQLite's writer lock and PostgreSQL's task row lock until
+    the transaction ends. FOR UPDATE retains explicit locking at this check;
+    it is not the only lock in a valid acceptance transaction. This helper
+    does not replace business acceptance.
 
     Do not commit a RUNNING turn and call this in a later transaction. On any
     failure the caller must roll back the entire acceptance transaction, as for

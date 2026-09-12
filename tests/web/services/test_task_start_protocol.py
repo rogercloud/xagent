@@ -336,3 +336,100 @@ def test_append_acceptance_rollback_preserves_previous_turn(db_session):
         assert transcript.turn_id == "previous-turn"
         assert transcript.content == "previous input"
         assert observer.get(TaskExecutionCommand, staged.staged_db_id) is None
+
+
+@pytest.mark.postgresql
+@pytest.mark.parametrize("commit", [True, False], ids=["commit", "rollback"])
+def test_postgres_acceptance_and_start_share_transaction_lock(commit):
+    """The acceptance CAS, transcript and START resolve as one transaction.
+
+    The competing write uses no command identity, so a unique-key conflict
+    cannot masquerade as task-row locking. FOR UPDATE in staging is not the
+    sole lock: the required acceptance CAS already owns this row.
+    """
+    from sqlalchemy import select, text, update
+    from sqlalchemy.exc import OperationalError
+    from sqlalchemy.orm import sessionmaker
+
+    from tests.shared.postgres_disposable import disposable_database_factory
+
+    with disposable_database_factory("start_protocol") as make_database:
+        engine = make_database("acceptance")
+        Base.metadata.create_all(engine)
+        sessions = sessionmaker(bind=engine)
+        with sessions() as setup:
+            user, task = accept_turn(setup, start_payload())
+            setup.commit()
+            task_id, actor_id = task.id, user.id
+
+        start = start_payload(
+            kind="append", run_id="run-2", state_version=2, turn_id="turn-2"
+        )
+        with sessions() as owner, sessions() as competitor:
+            accepted = owner.execute(
+                update(Task)
+                .where(Task.id == task_id, Task.state_version == 1)
+                .values(run_id=start.run_id, state_version=2)
+            )
+            assert accepted.rowcount == 1
+            owner.add(
+                TaskChatMessage(
+                    task_id=task_id,
+                    user_id=actor_id,
+                    role="user",
+                    message_type="user_message",
+                    content=start.message,
+                    turn_id=start.turn_id,
+                )
+            )
+            stage_task_start_command(
+                owner, task_id=task_id, actor_user_id=actor_id, start=start
+            )
+            assert competitor.execute(select(TaskExecutionCommand)).first() is None
+            assert (
+                competitor.execute(
+                    select(TaskChatMessage).where(
+                        TaskChatMessage.turn_id == start.turn_id
+                    )
+                ).first()
+                is None
+            )
+            competitor.execute(text("SET LOCAL lock_timeout = '200ms'"))
+            with pytest.raises(OperationalError) as blocked:
+                competitor.execute(
+                    update(Task)
+                    .where(Task.id == task_id, Task.state_version == 1)
+                    .values(state_version=3)
+                )
+            assert blocked.value.orig.pgcode == "55P03"
+            competitor.rollback()
+
+            if commit:
+                owner.commit()
+            else:
+                owner.rollback()
+            with sessions() as observer:
+                task = observer.get(Task, task_id)
+                assert task.run_id == ("run-2" if commit else "run-1")
+                assert task.state_version == (2 if commit else 1)
+                command = observer.execute(
+                    select(TaskExecutionCommand)
+                ).scalar_one_or_none()
+                message = observer.execute(
+                    select(TaskChatMessage).where(
+                        TaskChatMessage.turn_id == start.turn_id
+                    )
+                ).scalar_one_or_none()
+                assert (command is not None) == commit
+                assert (message is not None) == commit
+                if command is not None:
+                    assert command.payload == start.model_dump(mode="json")
+            # Once the owner resolves, the competing CAS runs rather than waits;
+            # it loses after commit and can reserve the old version after rollback.
+            result = competitor.execute(
+                update(Task)
+                .where(Task.id == task_id, Task.state_version == 1)
+                .values(state_version=3)
+            )
+            assert result.rowcount == (0 if commit else 1)
+            competitor.rollback()

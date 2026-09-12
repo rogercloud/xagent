@@ -101,8 +101,8 @@ preserve applicable Workforce projections in that transaction as well.
 absence of lease metadata, then delegates to `stage_task_command` as the final
 write. It does not itself accept a turn or commit. The caller must roll back
 all acceptance writes on failure or a conflicting payload. On SQLite the
-caller's acceptance write owns the writer lock; PostgreSQL also locks the task
-row during staging. Calling staging in a later transaction is not this contract.
+caller's acceptance write owns the writer lock; on PostgreSQL the acceptance
+CAS already holds the task row lock, and staging explicitly requests it again. Calling staging in a later transaction is not this contract.
 
 `read_task_start_command` strictly decodes the JSON and checks its run and turn
 against the immutable command envelope. It does not authorize execution or
@@ -110,7 +110,12 @@ check the current task state. The eventual consumer must acquire the exact run's
 lease and start its heartbeat before executing, and finish START processing
 after the local scheduling handoff rather than waiting for the whole run.
 The accepted public run identity is retained; adding a new client-visible queue
-status is not required by this protocol.
+status is not required by this protocol. RUNNING continues to mean an accepted,
+active turn, including the interval before a runner claims it; lease ownership
+distinguishes execution admission. This preserves the existing client-visible
+status contract. A distinct QUEUED status would require coordinated changes to
+status storage, API/client handling, acceptance and the staging precondition,
+and the transition performed when the runner acquires its lease.
 
 This step adds no effect receipts and no safe replay guarantee for a START whose
 execution outcome is unknown. The existing generic retry behavior must not be

@@ -673,6 +673,8 @@ def _claimable_query(
         .join(Task, Task.id == TaskExecutionCommand.task_id)
         .filter(
             # START remains dormant until runner consumption is implemented.
+            # Keep it in the earlier-command check: later commands must not
+            # overtake START. Without a consumer they remain blocked.
             TaskExecutionCommand.kind != TaskCommandKind.START.value,
             _claim_availability_predicate(now),
             ~_unfinished_earlier_command(),
