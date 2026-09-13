@@ -110,6 +110,12 @@ def load_runtime_values(
     turn_id: str | None = None,
     required: bool = False,
 ) -> dict[str, Any] | None:
+    """Read scoped inputs; both configuration and stored-value errors are 503.
+
+    An unavailable key raises connector_runtime_unavailable. A valid key that
+    cannot decrypt the row raises runtime_secret_unavailable, as do missing
+    required inputs or mismatched ownership/run bindings.
+    """
     query = select(TaskRuntimeSecret).where(TaskRuntimeSecret.task_id == task.id)
     if turn_id is not None:
         query = query.where(TaskRuntimeSecret.turn_id == turn_id)

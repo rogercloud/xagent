@@ -43,6 +43,8 @@ INTERACTION_NATIVE_SOURCES = "XAGENT_INTERACTION_NATIVE_SOURCES"
 SHARED_TASK_EXECUTION_ENABLED = "XAGENT_SHARED_TASK_EXECUTION_ENABLED"
 TASK_EVENT_CHANNEL_PREFIX = "XAGENT_TASK_EVENT_CHANNEL_PREFIX"
 ENCRYPTION_KEY = "ENCRYPTION_KEY"
+# Public development fallback; runtime credential storage must reject it.
+DEV_FALLBACK_ENCRYPTION_KEY = "RQMpe38gK3m0szjpSmTNw_sP3Y54r6hDc6JewBoPKXc="
 TASK_LEASE_TTL_SECONDS = "XAGENT_TASK_LEASE_TTL_SECONDS"
 TASK_LEASE_HEARTBEAT_SECONDS = "XAGENT_TASK_LEASE_HEARTBEAT_SECONDS"
 TASK_LEASE_RECOVERY_INTERVAL_SECONDS = "XAGENT_TASK_LEASE_RECOVERY_INTERVAL_SECONDS"
@@ -759,7 +761,7 @@ def get_task_runtime_secrets_encryption_key() -> str | None:
     fallback. Invalid Fernet keys are rejected by the store before any write.
     """
     key = os.getenv(ENCRYPTION_KEY)
-    if not key or key == "RQMpe38gK3m0szjpSmTNw_sP3Y54r6hDc6JewBoPKXc=":
+    if not key or key == DEV_FALLBACK_ENCRYPTION_KEY:
         return None
     return key
 

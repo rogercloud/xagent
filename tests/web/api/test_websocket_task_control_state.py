@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 from anyio import BrokenResourceError, ClosedResourceError
@@ -698,3 +698,52 @@ async def test_shared_delivery_logs_connection_without_writer(monkeypatch, caplo
     assert "connection has no writer task_id=42" in caplog.text
     assert "private content" not in caplog.text
     manager.disconnect(socket)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("started", [False, True])
+async def test_manager_disconnect_reentry_cleans_writer_and_both_origin_registries(
+    monkeypatch, started
+):
+    from xagent.web.services import task_event_bridge
+
+    monkeypatch.setenv("XAGENT_SHARED_TASK_EXECUTION_ENABLED", "true")
+    monkeypatch.setenv("XAGENT_REDIS_URL", "redis://localhost:6379/0")
+    bridge = task_event_bridge.TaskEventBridge()
+    bridge.ready.set()
+    monkeypatch.setattr(task_event_bridge, "_bridge", bridge)
+    origins = websocket_api._CommandOriginRegistry()
+    monkeypatch.setattr(websocket_api, "_command_origins", origins)
+    manager = ConnectionManager()
+    disconnect = Mock(wraps=manager.disconnect)
+    monkeypatch.setattr(manager, "disconnect", disconnect)
+    socket = _BlockingSendWebSocket()
+    manager.register_connection(socket, 42)
+    writer = manager._writers[socket]
+    origins.register("command-1", socket, 42)
+    origin = bridge.register_origin(42, "command-1", AsyncMock(), recipient=socket)
+    acknowledgement = writer.enqueue("pending", acknowledge=True)
+    try:
+        if started:
+            await asyncio.wait_for(socket.send_started.wait(), timeout=1)
+        manager.disconnect(socket)
+        await asyncio.wait_for(
+            asyncio.gather(writer.task, return_exceptions=True), timeout=2
+        )
+        with pytest.raises(ConnectionError):
+            await asyncio.wait_for(acknowledgement, timeout=1)
+        # stop() re-enters the real manager once; the writer has already been
+        # popped, so this must terminate and leave both origin registries clean.
+        assert disconnect.call_count == 2
+        assert writer.closed and writer.queue.empty()
+        assert not manager._writers
+        assert not manager._connection_task_ids
+        assert not manager.active_connections
+        assert not origins.has("command-1", 42)
+        assert origin not in bridge._origins
+        manager.disconnect(socket)
+        assert disconnect.call_count == 3
+    finally:
+        manager.disconnect(socket)
+        await asyncio.gather(writer.task, return_exceptions=True)
+        await bridge.close()

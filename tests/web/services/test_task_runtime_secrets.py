@@ -280,3 +280,41 @@ def test_missing_accepted_values_fail_even_when_optional(task_id):
         with pytest.raises(ConnectorRuntimeError) as error:
             load_runtime_values(db, task=db.get(Task, task_id))
         assert error.value.code == ERROR_RUNTIME_SECRET_UNAVAILABLE
+
+
+@pytest.mark.parametrize(
+    "key_state", ["unset", "empty", "default", "malformed", "rotated"]
+)
+def test_read_distinguishes_key_configuration_from_decryption_failure(
+    task_id, monkeypatch, key_state
+):
+    from xagent.config import DEV_FALLBACK_ENCRYPTION_KEY
+
+    with get_session_local()() as db:
+        stage(db, task_id)
+        db.commit()
+    if key_state == "unset":
+        monkeypatch.delenv("ENCRYPTION_KEY")
+    else:
+        monkeypatch.setenv(
+            "ENCRYPTION_KEY",
+            {
+                "empty": "",
+                "default": DEV_FALLBACK_ENCRYPTION_KEY,
+                "malformed": "not-a-fernet-key",
+                "rotated": Fernet.generate_key().decode(),
+            }[key_state],
+        )
+    with get_session_local()() as db:
+        with pytest.raises(ConnectorRuntimeError) as error:
+            load_runtime_values(
+                db, task=db.get(Task, task_id), turn_id="turn-1", required=True
+            )
+        assert error.value.code == (
+            ERROR_RUNTIME_SECRET_UNAVAILABLE
+            if key_state == "rotated"
+            else ERROR_CONNECTOR_RUNTIME_UNAVAILABLE
+        )
+        assert error.value.status_code == 503
+        assert "synthetic-secret" not in str(error.value)
+        assert db.query(TaskRuntimeSecret).count() == 1
