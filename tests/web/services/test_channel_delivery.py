@@ -5,7 +5,7 @@
 
 import asyncio
 from datetime import datetime, timedelta, timezone
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 
@@ -190,6 +190,18 @@ async def test_terminal_command_with_replaced_run_reports_interruption(accepted)
 
 
 @pytest.mark.asyncio
+async def test_channel_pending_wait_is_bounded_and_keeps_command(selected, monkeypatch):
+    bridge = Mock(host_id="ingress")
+    bridge.register_origin.return_value = "origin"
+    monkeypatch.setattr(shared, "get_task_event_bridge", lambda: bridge)
+    monkeypatch.setattr(shared, "get_task_reply_wait_timeout_seconds", lambda: 0.03)
+    result = await asyncio.wait_for(selected.execute(TaskTurnPayload("hello"), None), 1)
+    assert result["status"] == "accepted"
+    with get_session_local()() as db:
+        assert db.query(TaskExecutionCommand).one().status == "pending"
+
+
+@pytest.mark.asyncio
 async def test_preaccept_stop_preserves_resumable_task_and_files(selected, tmp_path):
     from xagent.web.models.uploaded_file import UploadedFile
 
@@ -231,6 +243,24 @@ async def test_preaccept_stop_cannot_modify_replacement(selected):
         task = db.get(Task, selected.selection.task_id)
         assert task.run_id == "new-run"
         assert task.status == TaskStatus.PENDING
+
+
+@pytest.mark.asyncio
+async def test_new_after_pending_stop_discards_the_old_delivery(accepted, selected):
+    from tests.web.test_telegram_task_commands import _bot
+
+    selected.accepted = True
+    selected.command_db_id = accepted
+    bot = _bot(selected.selection.channel_id)
+    bot.user_active_executions[123] = (selected.selection.task_id, selected)
+    assert bot._stop_current_conversation(123)
+    await selected.stop_task
+    assert not selected.discard_output
+    assert bot._start_new_conversation(123) == (True, True)
+    await selected.stop_task
+    with get_session_local()() as db:
+        assert db.get(TaskChannelDelivery, accepted).status == "discarded"
+        assert db.query(TaskExecutionCommand).filter_by(kind="pause").count() == 1
 
 
 @pytest.mark.asyncio

@@ -10,6 +10,7 @@ from uuid import uuid4
 
 from sqlalchemy import exists, select
 
+from ...config import get_task_reply_wait_timeout_seconds
 from ...core.agent.trace import (
     TraceAction,
     TraceCategory,
@@ -26,6 +27,7 @@ from ..models.task_channel_delivery import TaskChannelDelivery
 from ..models.task_command import TaskExecutionCommand
 from ..models.uploaded_file import UploadedFile
 from .channel_delivery import (
+    PENDING_CHANNEL_RESULT,
     ChannelSender,
     deliver_channel_result,
 )
@@ -258,6 +260,8 @@ class SharedChannelTurn:
             raise cancellation
         if self.stop_requested:
             self.request_stop()
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + get_task_reply_wait_timeout_seconds()
         while True:
             try:
                 result = await run_db_io_cancellation_safe(
@@ -267,6 +271,8 @@ class SharedChannelTurn:
                 return {"success": True, "status": "interrupted"}
             if result is not None:
                 return result
+            if loop.time() >= deadline:
+                return dict(PENDING_CHANNEL_RESULT)
             await asyncio.sleep(0.25)
 
 
