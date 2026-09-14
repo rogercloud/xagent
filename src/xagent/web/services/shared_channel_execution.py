@@ -9,6 +9,8 @@ from typing import Any, cast
 from uuid import uuid4
 
 from sqlalchemy import exists, select
+from sqlalchemy.exc import InterfaceError, OperationalError
+from sqlalchemy.exc import TimeoutError as DatabaseTimeoutError
 
 from ...config import get_task_reply_wait_timeout_seconds
 from ...core.agent.trace import (
@@ -260,6 +262,8 @@ class SharedChannelTurn:
             raise cancellation
         if self.stop_requested:
             self.request_stop()
+        unavailable_since: float | None = None
+        retry_delay = 0.25
         loop = asyncio.get_running_loop()
         deadline = loop.time() + get_task_reply_wait_timeout_seconds()
         while True:
@@ -267,8 +271,22 @@ class SharedChannelTurn:
                 result = await run_db_io_cancellation_safe(
                     lambda: _read_channel_result(command_db_id, self.run_id)
                 )
+            except (DatabaseTimeoutError, OperationalError, InterfaceError):
+                if unavailable_since is None:
+                    unavailable_since = loop.time()
+                    logger.warning(
+                        "Channel result query unavailable; retrying task_id=%s",
+                        self.selection.task_id,
+                    )
+                if loop.time() >= deadline:
+                    return dict(PENDING_CHANNEL_RESULT)
+                await asyncio.sleep(retry_delay)
+                retry_delay = min(retry_delay * 2, 5.0)
+                continue
             except TaskLeaseLostError:
                 return {"success": True, "status": "interrupted"}
+            unavailable_since = None
+            retry_delay = 0.25
             if result is not None:
                 return result
             if loop.time() >= deadline:
