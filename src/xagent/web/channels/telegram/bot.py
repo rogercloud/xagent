@@ -38,6 +38,7 @@ from ...models.database import get_session_local
 from ...models.task import TaskStatus
 from ...models.user import User
 from ...services.agent_service_manager import get_agent_manager
+from ...services.channel_delivery import ChannelDelivery, recover_channel_results
 from ...services.channel_runtime import (
     TELEGRAM_TASK_LIST_LIMIT,
     ChannelAgentSnapshot,
@@ -879,6 +880,11 @@ class TelegramBotInstance:
         active_trace_handler = self._active_trace_handlers().get(user_id)
         if active_trace_handler is not None:
             active_trace_handler.cancel(discard_output=discard_output)
+        active_execution = self.user_active_executions.get(user_id)
+        if active_execution is not None and isinstance(
+            active_execution[1], SharedChannelTurn
+        ):
+            active_execution[1].discard_output = discard_output
         stopped = self._stop_user_active_execution(user_id, reason=reason)
         preparing = user_id in self.user_preparing_executions
         if preparing and not stopped:
@@ -1909,6 +1915,12 @@ class TelegramBotInstance:
                     return
 
                 if shared_turn is not None:
+                    shared_turn.delivery_destination = {
+                        "chat_id": last_message.chat.id,
+                        "message_id": last_message.message_id,
+                        "message_thread_id": last_message.message_thread_id,
+                        "loading_message_id": loading_msg.message_id,
+                    }
                     result = await self._await_execution_with_stop_monitor(
                         user_id,
                         shared_turn.execute(
@@ -1924,6 +1936,30 @@ class TelegramBotInstance:
                         ),
                         reason="Telegram stop requested",
                     )
+                    if tg_handler.discard_output:
+                        await shared_turn.discard_delivery()
+                    else:
+
+                        async def deliver_current(
+                            delivery: ChannelDelivery, final_result: dict[str, Any]
+                        ) -> None:
+                            await self._deliver_telegram_result(
+                                project_execution_result_for_channel(
+                                    final_result
+                                ).visible_text,
+                                task_id=task_id,
+                                owner_user_id=owner_user_id,
+                                last_message=last_message,
+                                loading_msg=loading_msg,
+                                tg_handler=tg_handler,
+                                require_delivery=True,
+                            )
+
+                        await shared_turn.deliver(
+                            deliver_current,
+                            pending_notice=result.get("status") == "accepted",
+                        )
+                    return
                 else:
                     local_service: Any = agent_service
                     local_lease = cast(ManagedTaskLease, managed_lease)
@@ -1974,133 +2010,14 @@ class TelegramBotInstance:
                 )
                 return
 
-            output, image_refs, file_refs = self._extract_telegram_output_refs(
+            await self._deliver_telegram_result(
                 projection.visible_text,
+                task_id=task_id,
+                owner_user_id=owner_user_id,
+                last_message=last_message,
+                loading_msg=loading_msg,
+                tg_handler=tg_handler,
             )
-            if not output and (image_refs or file_refs):
-                output = "Task completed."
-
-            def is_cancelled() -> bool:
-                # discard_output, not cancelled: a /stop must still deliver
-                # (and keep) this answer for the user who is still here.
-                return bool(tg_handler is not None and tg_handler.discard_output)
-
-            max_len = 4000
-            text_chunks = [
-                output[i : i + max_len] for i in range(0, len(output), max_len)
-            ]
-            # An empty output with no attachments yields no chunks, and the
-            # sends below index [0] unconditionally. The resulting IndexError
-            # lands in a handler that can no longer reply -- the lease is
-            # already settled -- so the user would get nothing at all. The
-            # placeholder must be non-empty: Telegram rejects empty text with
-            # "Bad Request: message text is empty", which would strand the
-            # loading message as the permanent final state. Reuse the
-            # attachment-only wording so both no-text paths converge.
-            if not text_chunks:
-                text_chunks = ["Task completed."]
-
-            # Every send below is an awaited round trip, so a cancellation can
-            # land mid-flight. deliver_cancellation_safe() re-checks afterwards
-            # and removes a late success, raising CancelledDelivery so the rest
-            # of the output sequence is abandoned.
-            async def delete_loading(_result: Any) -> None:
-                await loading_msg.delete()
-
-            async def delete_answer(msg: Any) -> None:
-                await msg.delete()
-
-            try:
-                try:
-                    html_chunk0 = markdown_to_tg_html(text_chunks[0])
-                    await deliver_cancellation_safe(
-                        lambda: loading_msg.edit_text(
-                            html_chunk0, parse_mode=ParseMode.HTML
-                        ),
-                        is_cancelled=is_cancelled,
-                        delete=delete_loading,
-                        description=f"final text for task {task_id}",
-                    )
-                except CancelledDelivery:
-                    return
-                except Exception as e:
-                    if "message is not modified" not in str(e).lower():
-                        try:
-                            await deliver_cancellation_safe(
-                                lambda: loading_msg.edit_text(text_chunks[0]),
-                                is_cancelled=is_cancelled,
-                                delete=delete_loading,
-                                description=f"final text for task {task_id}",
-                            )
-                        except CancelledDelivery:
-                            return
-                        except Exception as e2:
-                            if "message is not modified" not in str(e2).lower():
-                                logger.warning(f"Failed to edit message: {e2}")
-
-                for chunk in text_chunks[1:]:
-                    html_chunk = markdown_to_tg_html(chunk)
-                    try:
-                        await deliver_cancellation_safe(
-                            lambda: last_message.answer(
-                                html_chunk, parse_mode=ParseMode.HTML
-                            ),
-                            is_cancelled=is_cancelled,
-                            delete=delete_answer,
-                            description=f"output chunk for task {task_id}",
-                        )
-                    except CancelledDelivery:
-                        return
-                    except Exception:
-                        await deliver_cancellation_safe(
-                            lambda: last_message.answer(chunk),
-                            is_cancelled=is_cancelled,
-                            delete=delete_answer,
-                            description=f"output chunk for task {task_id}",
-                        )
-            except CancelledDelivery:
-                return
-
-            try:
-                if image_refs:
-                    failed_image_refs = await self._send_output_images(
-                        image_refs=image_refs,
-                        user_id=owner_user_id,
-                        task_id=task_id,
-                        reply_to=last_message,
-                        is_cancelled=is_cancelled,
-                    )
-                    if failed_image_refs:
-                        await deliver_cancellation_safe(
-                            lambda: self._send_image_fallback_message(
-                                image_refs=failed_image_refs,
-                                reply_to=last_message,
-                            ),
-                            is_cancelled=is_cancelled,
-                            delete=lambda msg: msg.delete(),
-                            description=f"image fallback for task {task_id}",
-                        )
-
-                if file_refs:
-                    failed_file_refs = await self._send_output_files(
-                        file_refs=file_refs,
-                        user_id=owner_user_id,
-                        task_id=task_id,
-                        reply_to=last_message,
-                        is_cancelled=is_cancelled,
-                    )
-                    if failed_file_refs:
-                        await deliver_cancellation_safe(
-                            lambda: self._send_file_fallback_message(
-                                file_refs=failed_file_refs,
-                                reply_to=last_message,
-                            ),
-                            is_cancelled=is_cancelled,
-                            delete=lambda msg: msg.delete(),
-                            description=f"file fallback for task {task_id}",
-                        )
-            except CancelledDelivery:
-                return
         except TaskLeaseLostError:
             logger.warning(
                 "Telegram execution lost task %s lease; skipping stale result",
@@ -2196,6 +2113,193 @@ class TelegramBotInstance:
 
             cleanup_task = asyncio.create_task(_cleanup_message_batch())
             await drain_async_task_cancellation_safe(cleanup_task)
+
+    async def _deliver_telegram_result(
+        self,
+        output_text: str,
+        *,
+        task_id: int,
+        owner_user_id: int,
+        last_message: types.Message,
+        loading_msg: types.Message,
+        tg_handler: TelegramTraceHandler | None = None,
+        require_delivery: bool = False,
+        shared_turn: SharedChannelTurn | None = None,
+    ) -> None:
+        output, image_refs, file_refs = self._extract_telegram_output_refs(
+            output_text,
+        )
+        if not output and (image_refs or file_refs):
+            output = "Task completed."
+
+        def is_cancelled() -> bool:
+            # discard_output, not cancelled: a /stop must still deliver
+            # (and keep) this answer for the user who is still here.
+            return bool(
+                (tg_handler is not None and tg_handler.discard_output)
+                or (shared_turn is not None and shared_turn.discard_output)
+            )
+
+        max_len = 4000
+        text_chunks = [output[i : i + max_len] for i in range(0, len(output), max_len)]
+        # An empty output with no attachments yields no chunks, and the
+        # sends below index [0] unconditionally. The resulting IndexError
+        # lands in a handler that can no longer reply -- the lease is
+        # already settled -- so the user would get nothing at all. The
+        # placeholder must be non-empty: Telegram rejects empty text with
+        # "Bad Request: message text is empty", which would strand the
+        # loading message as the permanent final state. Reuse the
+        # attachment-only wording so both no-text paths converge.
+        if not text_chunks:
+            text_chunks = ["Task completed."]
+
+        # Every send below is an awaited round trip, so a cancellation can
+        # land mid-flight. deliver_cancellation_safe() re-checks afterwards
+        # and removes a late success, raising CancelledDelivery so the rest
+        # of the output sequence is abandoned.
+        async def delete_loading(_result: Any) -> None:
+            await loading_msg.delete()
+
+        async def delete_answer(msg: Any) -> None:
+            await msg.delete()
+
+        try:
+            try:
+                html_chunk0 = markdown_to_tg_html(text_chunks[0])
+                await deliver_cancellation_safe(
+                    lambda: loading_msg.edit_text(
+                        html_chunk0, parse_mode=ParseMode.HTML
+                    ),
+                    is_cancelled=is_cancelled,
+                    delete=delete_loading,
+                    description=f"final text for task {task_id}",
+                )
+            except CancelledDelivery:
+                return
+            except Exception as e:
+                if "message is not modified" not in str(e).lower():
+                    try:
+                        await deliver_cancellation_safe(
+                            lambda: loading_msg.edit_text(text_chunks[0]),
+                            is_cancelled=is_cancelled,
+                            delete=delete_loading,
+                            description=f"final text for task {task_id}",
+                        )
+                    except CancelledDelivery:
+                        return
+                    except Exception as e2:
+                        if "message is not modified" not in str(e2).lower():
+                            if require_delivery:
+                                raise
+                            logger.warning(f"Failed to edit message: {e2}")
+
+            for chunk in text_chunks[1:]:
+                html_chunk = markdown_to_tg_html(chunk)
+                try:
+                    await deliver_cancellation_safe(
+                        lambda: last_message.answer(
+                            html_chunk, parse_mode=ParseMode.HTML
+                        ),
+                        is_cancelled=is_cancelled,
+                        delete=delete_answer,
+                        description=f"output chunk for task {task_id}",
+                    )
+                except CancelledDelivery:
+                    return
+                except Exception:
+                    await deliver_cancellation_safe(
+                        lambda: last_message.answer(chunk),
+                        is_cancelled=is_cancelled,
+                        delete=delete_answer,
+                        description=f"output chunk for task {task_id}",
+                    )
+        except CancelledDelivery:
+            return
+
+        try:
+            if image_refs:
+                failed_image_refs = await self._send_output_images(
+                    image_refs=image_refs,
+                    user_id=owner_user_id,
+                    task_id=task_id,
+                    reply_to=last_message,
+                    is_cancelled=is_cancelled,
+                )
+                if failed_image_refs:
+                    await deliver_cancellation_safe(
+                        lambda: self._send_image_fallback_message(
+                            image_refs=failed_image_refs,
+                            reply_to=last_message,
+                        ),
+                        is_cancelled=is_cancelled,
+                        delete=lambda msg: msg.delete(),
+                        description=f"image fallback for task {task_id}",
+                    )
+
+            if file_refs:
+                failed_file_refs = await self._send_output_files(
+                    file_refs=file_refs,
+                    user_id=owner_user_id,
+                    task_id=task_id,
+                    reply_to=last_message,
+                    is_cancelled=is_cancelled,
+                )
+                if failed_file_refs:
+                    await deliver_cancellation_safe(
+                        lambda: self._send_file_fallback_message(
+                            file_refs=failed_file_refs,
+                            reply_to=last_message,
+                        ),
+                        is_cancelled=is_cancelled,
+                        delete=lambda msg: msg.delete(),
+                        description=f"file fallback for task {task_id}",
+                    )
+        except CancelledDelivery:
+            return
+
+    async def _deliver_shared_result(
+        self, delivery: ChannelDelivery, result: dict[str, Any]
+    ) -> None:
+        active = next(
+            (
+                (user_id, turn)
+                for user_id, (_, turn) in self.user_active_executions.items()
+                if isinstance(turn, SharedChannelTurn)
+                and turn.command_db_id == delivery.command_id
+            ),
+            None,
+        )
+        if active is not None and active[1].discard_output:
+            self.user_active_executions.pop(active[0], None)
+            return
+        destination = delivery.destination
+        chat_id = destination["chat_id"]
+        chat = types.Chat(id=chat_id, type="private" if chat_id > 0 else "supergroup")
+        message = types.Message(
+            message_id=destination["message_id"],
+            date=datetime.now(timezone.utc),
+            chat=chat,
+            message_thread_id=destination.get("message_thread_id"),
+        ).as_(self.bot)
+        loading = types.Message(
+            message_id=destination["loading_message_id"],
+            date=datetime.now(timezone.utc),
+            chat=chat,
+        ).as_(self.bot)
+        await self._deliver_telegram_result(
+            project_execution_result_for_channel(result).visible_text,
+            task_id=delivery.task_id,
+            owner_user_id=delivery.user_id,
+            last_message=message,
+            loading_msg=loading,
+            require_delivery=True,
+            shared_turn=active[1] if active is not None else None,
+        )
+        if active is not None and self.user_active_executions.get(active[0]) == (
+            delivery.task_id,
+            active[1],
+        ):
+            self.user_active_executions.pop(active[0], None)
 
     async def _send_output_images(
         self,
@@ -2548,6 +2652,11 @@ class TelegramChannelManager:
             await self._sync_bots_async()
             if not get_shared_task_execution_enabled():
                 return
+            for bot in tuple(self.bots.values()):
+                if bot.channel_id is not None:
+                    await recover_channel_results(
+                        bot.channel_id, bot._deliver_shared_result
+                    )
             # CRUD may reach another web replica. The designated ingress
             # observes its committed configuration without opening extra bots.
             await asyncio.sleep(30)

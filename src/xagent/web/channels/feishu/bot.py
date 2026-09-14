@@ -17,6 +17,7 @@ from ....config import get_channel_ingress_enabled, get_shared_task_execution_en
 from ....core.file_ref import build_file_id_ref
 from ...models.task import TaskStatus
 from ...services.agent_service_manager import get_agent_manager
+from ...services.channel_delivery import ChannelDelivery, recover_channel_results
 from ...services.channel_runtime import (
     ChannelAuthorizationError,
     ChannelConfigurationError,
@@ -381,6 +382,10 @@ class FeishuBotInstance:
                     agent_service.tracer.add_handler(fs_handler)
 
             if shared_turn is not None:
+                shared_turn.delivery_destination = {
+                    "chat_id": chat_id,
+                    "loading_message_id": loading_msg_id,
+                }
                 result = await shared_turn.execute(
                     TaskTurnPayload(
                         transcript_message=text,
@@ -392,6 +397,11 @@ class FeishuBotInstance:
                     ),
                     fs_handler,
                 )
+                await shared_turn.deliver(
+                    self._deliver_shared_result,
+                    pending_notice=result.get("status") == "accepted",
+                )
+                return
             else:
                 local_service: Any = agent_service
                 local_lease = cast(ManagedTaskLease, managed_lease)
@@ -481,6 +491,26 @@ class FeishuBotInstance:
                 await shared_turn.close()
             if managed_lease is not None:
                 await managed_lease.close()
+
+    async def _deliver_shared_result(
+        self, delivery: ChannelDelivery, result: dict[str, Any]
+    ) -> None:
+        projection = project_execution_result_for_channel(result)
+        chat_id = delivery.destination["chat_id"]
+        loading_id = delivery.destination["loading_message_id"]
+        chunks = [
+            projection.visible_text[i : i + 4000]
+            for i in range(0, len(projection.visible_text), 4000)
+        ]
+        if loading_id:
+            await self._update_text(
+                chat_id, loading_id, chunks[0], require_delivery=True
+            )
+        elif not await self._send_text(chat_id, chunks[0]):
+            raise ConnectionError("Feishu final message was not accepted")
+        for chunk in chunks[1:]:
+            if not await self._send_text(chat_id, chunk):
+                raise ConnectionError("Feishu final message was not accepted")
 
     async def _download_and_register_files(
         self,
@@ -627,7 +657,14 @@ class FeishuBotInstance:
             logger.error(f"Error sending Feishu message: {e}")
             return None
 
-    async def _update_text(self, chat_id: str, message_id: str, text: str) -> None:
+    async def _update_text(
+        self,
+        chat_id: str,
+        message_id: str,
+        text: str,
+        *,
+        require_delivery: bool = False,
+    ) -> None:
         try:
             card_content = {
                 "config": {"wide_screen_mode": True},
@@ -653,8 +690,16 @@ class FeishuBotInstance:
                 )
                 if resp.code == 230001:  # "This message is NOT a card." error
                     logger.info("Falling back to send_text instead of update_text")
-                    await self._send_text(chat_id, text)
+                    sent = await self._send_text(chat_id, text)
+                    if sent:
+                        return
+                if require_delivery:
+                    raise ConnectionError(
+                        "Feishu final message update was not accepted"
+                    )
         except Exception as e:
+            if require_delivery:
+                raise
             logger.error(f"Error updating Feishu message: {e}")
 
     async def start(self) -> None:
@@ -800,6 +845,11 @@ class FeishuChannelManager:
             await self._sync_bots_async()
             if not get_shared_task_execution_enabled():
                 return
+            for bot in tuple(self.bots.values()):
+                if bot.channel_id is not None:
+                    await recover_channel_results(
+                        bot.channel_id, bot._deliver_shared_result
+                    )
             # CRUD may reach another web replica. The designated ingress
             # observes its committed configuration without opening extra bots.
             await asyncio.sleep(30)

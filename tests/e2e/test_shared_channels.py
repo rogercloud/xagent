@@ -198,6 +198,8 @@ async def test_channel_callback_runs_remotely_and_returns_answer(
                 message_id=77, edit_text=AsyncMock(), delete=AsyncMock()
             )
             message = SimpleNamespace(
+                message_id=1,
+                message_thread_id=None,
                 from_user=SimpleNamespace(id=123),
                 chat=SimpleNamespace(id=456),
                 answer=AsyncMock(return_value=loading),
