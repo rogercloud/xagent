@@ -108,6 +108,12 @@ async def reply_to_task(
 
     try:
         result = await task_resume_service.resume_task_reply(ctx)
+    except task_resume_service.TaskResumeOutcomeUnknownError as exc:
+        raise V1ApiError(
+            V1ErrorCode.REPLY_OUTCOME_UNKNOWN,
+            504,
+            details={"accepted": True, "task_id": task_id},
+        ) from exc
     except task_resume_service.TaskResumeBusyError as exc:
         raise V1ApiError(V1ErrorCode.TASK_BUSY, 409) from exc
     except task_resume_service.TaskResumeNotWaitingError as exc:

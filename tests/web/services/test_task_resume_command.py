@@ -431,3 +431,130 @@ def test_reply_reclaims_expired_resting_lease_atomically(
         assert task.lease_attempt_id == lease.attempt_id
         assert task.state_version == state["state_version"]
         assert task.control_state == "running"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("source", ["sdk", "a2a"])
+async def test_following_command_waits_for_reply_registration(
+    reply, monkeypatch, source
+):
+    import asyncio
+    import threading
+
+    from xagent.web.services import task_command_execution
+    from xagent.web.services.task_command_transport import (
+        TaskCommandKind,
+        stage_task_command,
+    )
+
+    with get_session_local()() as db:
+        db.get(Task, reply.task_id).source = source
+        db.commit()
+    command_id = module._admit_reply(reply, source, "message", "reply")
+    with get_session_local()() as db:
+        command = claim_task_command(db, runner_id="worker-1", command_db_id=command_id)
+    committed, release = threading.Event(), threading.Event()
+    original = module._handoff
+    registered = False
+
+    def slow_handoff(command):
+        handoff = original(command)
+        committed.set()
+        assert release.wait(5)
+        return handoff
+
+    async def prepare(*args, **kwargs):
+        nonlocal registered
+        registered = True
+
+    async def followup(command):
+        assert registered
+        return {}
+
+    monkeypatch.setattr(module, "_handoff", slow_handoff)
+    monkeypatch.setattr(
+        task_resume,
+        "resume_task_reply" if source == "sdk" else "resume_a2a_task",
+        prepare,
+    )
+    effects = AsyncMock(side_effect=followup)
+    monkeypatch.setattr(
+        task_command_execution, "_execute_and_report_task_command", effects
+    )
+    resume = asyncio.create_task(
+        task_command_execution.execute_durable_task_command(command)
+    )
+    next_task = None
+    try:
+        assert await asyncio.to_thread(committed.wait, 5)
+        with get_session_local()() as db:
+            staged = stage_task_command(
+                db,
+                task_id=reply.task_id,
+                actor_user_id=reply.task_owner_user_id,
+                command_id="followup",
+                kind=TaskCommandKind.MESSAGE,
+                payload={"message": "next"},
+            )
+            db.commit()
+            following = claim_task_command(
+                db, runner_id="worker-1", command_db_id=staged.staged_db_id
+            )
+            assert following is not None
+        next_task = asyncio.create_task(
+            task_command_execution.execute_durable_task_command(following)
+        )
+        await asyncio.sleep(0.05)
+        effects.assert_not_awaited()
+        release.set()
+        await asyncio.wait_for(asyncio.gather(resume, next_task), 5)
+        effects.assert_awaited_once()
+    finally:
+        release.set()
+        await asyncio.gather(
+            resume, *([next_task] if next_task else []), return_exceptions=True
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("source", ["sdk", "a2a"])
+async def test_reply_timeout_retains_accepted_command_for_later_execution(
+    reply, monkeypatch, source
+):
+    from unittest.mock import Mock
+
+    from xagent.web.services import task_event_bridge
+
+    monkeypatch.setattr(task_event_bridge, "_bridge", Mock())
+    monkeypatch.setattr(module, "get_task_reply_wait_timeout_seconds", lambda: 0.01)
+    with get_session_local()() as db:
+        db.get(Task, reply.task_id).source = source
+        db.commit()
+    with pytest.raises(task_resume.TaskResumeOutcomeUnknownError):
+        await module.enqueue_resume_input(
+            reply, source=source, message_id="message", command_id="accepted"
+        )
+    with get_session_local()() as db:
+        row = db.query(TaskExecutionCommand).one()
+        assert row.status == "pending"
+        assert db.get(Task, reply.task_id).control_state == "resume_requested"
+        command_id = row.id
+    assert module._admit_reply(reply, source, "message", "accepted") == command_id
+    with pytest.raises(TaskResumeBusyError):
+        module._admit_reply(reply, source, "message", "duplicate")
+    prepare = AsyncMock()
+    monkeypatch.setattr(
+        task_resume,
+        "resume_task_reply" if source == "sdk" else "resume_a2a_task",
+        prepare,
+    )
+    with get_session_local()() as db:
+        command = claim_task_command(db, runner_id="worker-1", command_db_id=command_id)
+    await module.execute_resume_input(command)
+    prepare.assert_awaited_once()
+    assert module._read_reply_outcome(command_id)["outcome"] == "accepted"
+    with get_session_local()() as db:
+        assert (
+            claim_task_command(db, runner_id="worker-1", command_db_id=command_id)
+            is None
+        )

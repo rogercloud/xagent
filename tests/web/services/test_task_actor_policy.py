@@ -101,3 +101,23 @@ def test_client_cannot_supply_shared_actor_reference():
             "custom": "preserved",
         }
     ) == {"custom": "preserved"}
+
+
+@pytest.mark.parametrize("shared", [False, True])
+def test_actor_task_append_keeps_domain_rejection(actor_task, monkeypatch, shared):
+    from xagent.web.services.task_orchestrator import TaskTurnError
+
+    monkeypatch.setenv("XAGENT_SHARED_TASK_EXECUTION_ENABLED", str(shared).lower())
+    task_id, owner_id = actor_task
+    with get_session_local()() as db:
+        db.get(Task, task_id).status = TaskStatus.COMPLETED
+        db.commit()
+        with pytest.raises(TaskTurnError) as error:
+            TaskTurnOrchestrator.claim_append_turn_no_commit(
+                db,
+                task_id=task_id,
+                task_owner_user_id=owner_id,
+                actor_user_id=owner_id,
+                payload=TaskTurnPayload("again"),
+            )
+        assert error.value.reason == "actor_task_reuse_unsupported"

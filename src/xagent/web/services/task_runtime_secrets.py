@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime, timezone
 from typing import Any, cast
 
 from cryptography.fernet import Fernet, InvalidToken
-from sqlalchemy import delete, select, update
+from sqlalchemy import delete, exists, select, update
 from sqlalchemy.engine import CursorResult
 from sqlalchemy.orm import Session
 
@@ -180,33 +181,45 @@ def delete_runtime_values(*, task_id: int, turn_id: str) -> None:
 
 
 def clean_finished_runtime_values(
-    *, task_id: int | None = None, run_id: str | None = None
-) -> None:
-    """Compensate interrupted cleanup without expiring queued or active inputs.
+    *,
+    task_id: int | None = None,
+    run_id: str | None = None,
+    after_id: int | None = None,
+    batch_size: int = 100,
+) -> int | None:
+    """Remove a bounded page of finished or replaced runs; return the next cursor.
 
-    Accepted inputs already have a run binding at commit; another session
-    cannot observe the intermediate unbound rows in the acceptance transaction.
-    Paused and waiting runs retain their accepted inputs for resumption on
-    any worker. Only terminal or replaced runs are removed. Optional scope
-    keeps an old execution's cleanup from deleting a newer run's inputs.
+    Page before filtering lifecycle state so active inputs cannot make a sweep
+    unbounded. Paused and waiting runs retain their values without a TTL.
+    Scope and lifecycle are checked again by DELETE in the same transaction.
     """
-    statement = (
-        select(TaskRuntimeSecret.id)
-        .join(Task)
-        .where(
+    page = select(TaskRuntimeSecret.id).order_by(TaskRuntimeSecret.id).limit(batch_size)
+    if after_id is not None:
+        page = page.where(TaskRuntimeSecret.id > after_id)
+    if task_id is not None:
+        page = page.where(TaskRuntimeSecret.task_id == task_id)
+    if run_id is not None:
+        page = page.where(TaskRuntimeSecret.run_id == run_id)
+    finished = exists(
+        select(Task.id).where(
+            Task.id == TaskRuntimeSecret.task_id,
             TaskRuntimeSecret.run_id.is_distinct_from(Task.run_id)
             | (
-                Task.runner_id.is_(None)
-                & Task.status.in_((TaskStatus.COMPLETED, TaskStatus.FAILED))
-            )
+                Task.status.in_((TaskStatus.COMPLETED, TaskStatus.FAILED))
+                & (
+                    Task.runner_id.is_(None)
+                    | (Task.lease_expires_at < datetime.now(timezone.utc))
+                )
+            ),
         )
     )
-    if task_id is not None:
-        statement = statement.where(TaskRuntimeSecret.task_id == task_id)
-    if run_id is not None:
-        statement = statement.where(TaskRuntimeSecret.run_id == run_id)
     with get_session_local()() as db:
-        rows = db.execute(statement).scalars().all()
+        rows = db.execute(page).scalars().all()
         if rows:
-            db.execute(delete(TaskRuntimeSecret).where(TaskRuntimeSecret.id.in_(rows)))
+            db.execute(
+                delete(TaskRuntimeSecret)
+                .where(TaskRuntimeSecret.id.in_(rows), finished)
+                .execution_options(synchronize_session=False)
+            )
         db.commit()
+    return int(rows[-1]) if len(rows) == batch_size else None

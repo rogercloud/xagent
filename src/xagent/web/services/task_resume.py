@@ -53,6 +53,10 @@ from .task_lease_service import (
 logger = logging.getLogger(__name__)
 
 
+class TaskResumeOutcomeUnknownError(Exception):
+    """An accepted reply is still pending; callers must check status before resending."""
+
+
 class TaskResumeBusyError(Exception):
     """Another execution owns the task or has already claimed its resume."""
 

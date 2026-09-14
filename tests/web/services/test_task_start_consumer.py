@@ -405,3 +405,113 @@ def test_terminal_settlement_deletes_only_accepted_run_values(accepted, monkeypa
     )
     with get_session_local()() as db:
         assert db.query(TaskRuntimeSecret).count() == 0
+
+
+@pytest.mark.asyncio
+async def test_following_command_waits_for_start_registration(accepted, monkeypatch):
+    import asyncio
+    import threading
+    from unittest.mock import AsyncMock
+
+    from xagent.web.services import task_command_execution
+    from xagent.web.services.task_command_transport import (
+        TaskCommandKind,
+        stage_task_command,
+    )
+
+    committed, release = threading.Event(), threading.Event()
+    original = consumer._commit_handoff
+    registered = False
+
+    def slow_handoff(command):
+        handoff = original(command)
+        committed.set()
+        assert release.wait(5)
+        return handoff
+
+    async def schedule(**kwargs):
+        nonlocal registered
+        registered = True
+
+    async def followup(command):
+        assert registered
+        with get_session_local()() as db:
+            task = db.get(Task, accepted.task_id)
+            assert task.run_id == accepted.target_run_id
+            assert task.runner_id == "worker-1"
+        return {}
+
+    monkeypatch.setattr(consumer, "_commit_handoff", slow_handoff)
+    monkeypatch.setattr(consumer, "_schedule_committed_turn", schedule)
+    effects = AsyncMock(side_effect=followup)
+    monkeypatch.setattr(
+        task_command_execution, "_execute_and_report_task_command", effects
+    )
+    start = asyncio.create_task(
+        task_command_execution.execute_durable_task_command(accepted)
+    )
+    next_task = None
+    try:
+        assert await asyncio.to_thread(committed.wait, 5)
+        with get_session_local()() as db:
+            task = db.get(Task, accepted.task_id)
+            staged = stage_task_command(
+                db,
+                task_id=task.id,
+                actor_user_id=task.user_id,
+                command_id="followup",
+                kind=TaskCommandKind.MESSAGE,
+                payload={"message": "next"},
+            )
+            db.commit()
+            command = claim_task_command(
+                db, runner_id="worker-1", command_db_id=staged.staged_db_id
+            )
+            assert command is not None
+        next_task = asyncio.create_task(
+            task_command_execution.execute_durable_task_command(command)
+        )
+        await asyncio.sleep(0.05)
+        effects.assert_not_awaited()
+        release.set()
+        await asyncio.wait_for(asyncio.gather(start, next_task), 5)
+        effects.assert_awaited_once()
+    finally:
+        release.set()
+        await asyncio.gather(
+            start, *([next_task] if next_task else []), return_exceptions=True
+        )
+
+
+def test_completion_wait_recovers_owner_lost_after_real_result_finalization(accepted):
+    from xagent.web.services.task_completion import _is_run_finished
+    from xagent.web.services.task_execution import (
+        _finalize_task_execution_result_isolated,
+        _PreparedTaskFileOutputs,
+    )
+
+    handoff = consumer._commit_handoff(accepted)
+    result = _finalize_task_execution_result_isolated(
+        task_id=accepted.task_id,
+        task_user_id=handoff.task_owner_user_id,
+        pre_run_status=TaskStatus.RUNNING,
+        result={"success": True, "output": "finished"},
+        expected_run_id="run-1",
+        task_lease=handoff.claimed.task_lease,
+        resolved_scope_segments=(),
+        prepared_outputs=_PreparedTaskFileOutputs((), (), ()),
+    )
+    assert result.terminal_state_committed
+    assert not _is_run_finished(accepted.task_id, "run-1")
+    with get_session_local()() as db:
+        task = db.get(Task, accepted.task_id)
+        assert task.status == TaskStatus.COMPLETED
+        assert task.runner_id == "worker-1"
+        task.lease_expires_at = datetime.now(timezone.utc) - timedelta(minutes=10)
+        db.commit()
+    assert _is_run_finished(accepted.task_id, "run-1")
+    with get_session_local()() as db:
+        task = db.get(Task, accepted.task_id)
+        assert task.runner_id is None
+        assert task.output == "finished"
+        assert task.status == TaskStatus.COMPLETED

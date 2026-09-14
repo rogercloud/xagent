@@ -189,3 +189,149 @@ def test_completion_wait_requires_release_and_rejects_replacement(ingress, statu
     assert _is_run_finished(task_id, "run-1")
     with pytest.raises(TaskRunChanged):
         _is_run_finished(task_id, "run-2")
+
+
+@pytest.mark.parametrize(
+    "status",
+    [
+        TaskStatus.COMPLETED,
+        TaskStatus.FAILED,
+        TaskStatus.PAUSED,
+        TaskStatus.WAITING_FOR_USER,
+    ],
+)
+def test_completion_releases_only_expired_owner_of_requested_run(ingress, status):
+    from datetime import datetime, timedelta, timezone
+
+    owner, _ = ingress
+    with get_session_local()() as db:
+        task = Task(
+            user_id=owner,
+            title="dead owner",
+            run_id="run-1",
+            status=status,
+            runner_id="worker",
+            lease_attempt_id="attempt",
+            lease_expires_at=datetime.now(timezone.utc) + timedelta(minutes=1),
+        )
+        db.add(task)
+        db.commit()
+        task_id = task.id
+    assert not _is_run_finished(task_id, "run-1")
+    with get_session_local()() as db:
+        db.get(Task, task_id).lease_expires_at = datetime.now(timezone.utc) - timedelta(
+            minutes=1
+        )
+        db.commit()
+    with pytest.raises(TaskRunChanged):
+        _is_run_finished(task_id, "previous-run")
+    with get_session_local()() as db:
+        assert db.get(Task, task_id).runner_id == "worker"
+    assert _is_run_finished(task_id, "run-1")
+    with get_session_local()() as db:
+        task = db.get(Task, task_id)
+        assert task.runner_id is None
+        assert task.lease_attempt_id is None
+        assert task.status == status
+
+
+@pytest.mark.asyncio
+async def test_sdk_append_records_current_actor_after_owner_transfer(
+    ingress, monkeypatch
+):
+    from xagent.web.services import task_start_consumer
+    from xagent.web.services.task_command_transport import claim_task_command
+
+    owner, agent_id = ingress
+    first = await task_start.create_sdk_task(
+        agent_id=agent_id,
+        task_owner_user_id=owner,
+        actor_user_id=owner,
+        message="first",
+        timezone=None,
+        file_ids=(),
+        connector_runtime_context=(),
+    )
+    with get_session_local()() as db:
+        actor = User(username="new-owner", password_hash="unused")
+        db.add(actor)
+        db.flush()
+        actor_id, actor_subject = actor.id, actor.actor_subject
+        db.get(Agent, agent_id).user_id = actor_id
+        task = db.get(Task, first.task_id)
+        task.status = TaskStatus.COMPLETED
+        task.control_state = "completed"
+        db.query(TaskExecutionCommand).update({"status": "completed"})
+        db.commit()
+    second = await task_start.append_sdk_turn(
+        task_id=first.task_id,
+        scope=task_start.SdkTaskScope(agent_id=agent_id, workforce_id=None),
+        actor_user_id=actor_id,
+        request_agent_id=agent_id,
+        request_workforce_id=None,
+        message="second",
+        file_ids=(),
+        connector_runtime_context=(),
+    )
+    monkeypatch.setattr(task_start_consumer, "get_runner_id", lambda: "worker")
+    with get_session_local()() as db:
+        row = (
+            db.query(TaskExecutionCommand).filter_by(target_run_id=second.run_id).one()
+        )
+        assert row.actor_user_id == actor_id
+        assert row.actor_subject == actor_subject
+        assert row.task_owner_user_id == owner
+        command = claim_task_command(db, runner_id="worker", command_db_id=row.id)
+    handoff = task_start_consumer._commit_handoff(command)
+    assert handoff.task_owner_user_id == owner
+    assert handoff.claimed.task_lease.run_id == second.run_id
+
+
+@pytest.mark.asyncio
+async def test_trigger_batch_continues_after_run_replacement(monkeypatch):
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+
+    from xagent.web.services import quota_hooks, task_completion, triggers
+
+    monkeypatch.setattr(triggers, "_get_pending_trigger_run_ids", lambda limit: [1, 2])
+    monkeypatch.setattr(
+        triggers,
+        "_load_prepared_trigger_start",
+        lambda run_id: SimpleNamespace(
+            run_id=run_id,
+            task_id=run_id,
+            trigger_id=run_id,
+            trigger_type="scheduled",
+            test=False,
+            task_owner_user_id=1,
+            prompt="run",
+        ),
+    )
+    begin = AsyncMock(
+        side_effect=[
+            SimpleNamespace(task_id=1, run_id="old", background_task=None),
+            SimpleNamespace(task_id=2, run_id="current", background_task=None),
+        ]
+    )
+    monkeypatch.setattr(triggers.TaskTurnOrchestrator, "begin_turn", begin)
+    monkeypatch.setattr(triggers, "_mark_trigger_run_started", Mock())
+    monkeypatch.setattr(quota_hooks, "record_trigger", Mock())
+    finish = Mock()
+    fail = Mock()
+    monkeypatch.setattr(triggers, "_finish_trigger_run_after_task", finish)
+    monkeypatch.setattr(triggers, "_mark_trigger_run_failed_by_id", fail)
+    monkeypatch.setattr(
+        task_completion,
+        "wait_for_task_run",
+        AsyncMock(side_effect=[TaskRunChanged(), None]),
+    )
+    assert (
+        await triggers.dispatch_pending_trigger_runs(Mock(), wait_for_completion=True)
+        == 1
+    )
+    assert begin.await_count == 2
+    fail.assert_not_called()
+    assert finish.call_count == 1
+    assert finish.call_args.args[0].run_id == 2
+    assert finish.call_args.args[1] == "current"

@@ -1954,9 +1954,13 @@ async def _start_prepared_trigger_run_id(
 
     if wait_for_completion:
         if started.background_task is None:
-            from .task_completion import wait_for_task_run
+            from .task_completion import TaskRunChanged, wait_for_task_run
 
-            await wait_for_task_run(started.task_id, started.run_id)
+            try:
+                await wait_for_task_run(started.task_id, started.run_id)
+            except TaskRunChanged:
+                logger.info("Trigger run %s task execution was replaced", start.run_id)
+                return False
         elif asyncio.isfuture(started.background_task):
             await started.background_task
         await asyncio.to_thread(_finish_trigger_run_after_task, start, started.run_id)

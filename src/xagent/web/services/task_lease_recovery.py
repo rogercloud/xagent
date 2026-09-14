@@ -323,6 +323,7 @@ async def run_task_lease_recovery_loop(
 ) -> None:
     """Continuously recover expired leases while the backend process is alive."""
 
+    secret_cursor: int | None = None
     while True:
         try:
             recovered = await recover_expired_task_leases_until_cutoff(
@@ -336,7 +337,11 @@ async def run_task_lease_recovery_loop(
             if get_shared_task_execution_enabled():
                 from .task_runtime_secrets import clean_finished_runtime_values
 
-                await run_db_io_cancellation_safe(clean_finished_runtime_values)
+                secret_cursor = await run_db_io_cancellation_safe(
+                    lambda: clean_finished_runtime_values(
+                        after_id=secret_cursor, batch_size=batch_size
+                    )
+                )
         except asyncio.CancelledError:
             raise
         except Exception as exc:

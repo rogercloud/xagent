@@ -210,7 +210,9 @@ def release_task_lease_no_commit(db: Session, lease: TaskLease) -> bool:
     return released is not None
 
 
-def recover_expired_idle_task_lease_no_commit(db: Session, task_id: int) -> bool:
+def recover_expired_idle_task_lease_no_commit(
+    db: Session, task_id: int, *, expected_run_id: str | None = None
+) -> bool:
     """Clear an expired non-running owner without changing execution evidence.
 
     RUNNING recovery still requires checkpoint classification. Command effects
@@ -221,6 +223,7 @@ def recover_expired_idle_task_lease_no_commit(db: Session, task_id: int) -> bool
         update(Task)
         .where(
             Task.id == task_id,
+            *([Task.run_id == expected_run_id] if expected_run_id is not None else []),
             task_status_predicate.ne(TaskStatus.RUNNING),
             Task.lease_expires_at < utc_now(),
         )

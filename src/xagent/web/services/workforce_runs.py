@@ -592,6 +592,7 @@ def _create_claimed_workforce_run_isolated(
             db,
             task_id=int(record.task.id),
             task_owner_user_id=user_id,
+            actor_user_id=user_id,
             payload=payload,
             context=timezone_schedule_context(request.timezone),
         )
@@ -679,6 +680,7 @@ def _create_claimed_preview_run_isolated(
             db,
             task_id=int(record.task.id),
             task_owner_user_id=user_id,
+            actor_user_id=user_id,
             payload=payload,
             context=timezone_schedule_context(request.timezone),
         )

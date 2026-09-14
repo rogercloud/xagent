@@ -13,6 +13,7 @@ from sqlalchemy import exists, func, select
 from sqlalchemy.orm import Session
 
 from ...core.tools.adapters.vibe.connector_runtime import ConnectorRuntimeError
+from ..models.agent import Agent
 from ..models.chat_message import TaskChatMessage
 from ..models.database import get_session_local
 from ..models.task import Task, TaskStatus
@@ -261,7 +262,19 @@ def _commit_handoff(command: ClaimedTaskCommand) -> _StartHandoff | SettledTaskC
             or task.user_id != row.task_owner_user_id
             or actor is None
             or actor.actor_subject != row.actor_subject
-            or (actor.id != owner.id and not actor.is_admin)
+            or (
+                actor.id != owner.id
+                and not actor.is_admin
+                and not (
+                    task.source == "sdk"
+                    and db.execute(
+                        select(Agent.id).where(
+                            Agent.id == task.agent_id, Agent.user_id == actor.id
+                        )
+                    ).scalar_one_or_none()
+                    is not None
+                )
+            )
         ):
             return _reject_start(db, row, "start_identity_changed")
         if row.target_state_version != start.state_version:
@@ -375,58 +388,63 @@ async def execute_task_start(command: ClaimedTaskCommand) -> SettledTaskCommand:
 
 
 async def _execute_task_start(command: ClaimedTaskCommand) -> SettledTaskCommand:
-    handoff = await run_db_io_cancellation_safe(lambda: _commit_handoff(command))
-    if isinstance(handoff, SettledTaskCommand):
-        return handoff
-    start = handoff.start
-    context = timezone_schedule_context(start.timezone) or {}
-    config = handoff.claimed.agent_config or {}
-    for key in ("trigger_id", "trigger_run_id", "trigger_type", "trigger_test"):
-        if key in config:
-            context[key] = config[key]
-    if start.kind == "existing":
-        from .task_orchestrator import _schedule_bg, settle_task_lease_isolated
+    from .task_execution_controller import task_execution_controller
 
-        assert start.existing_context is not None
-        try:
-            _schedule_bg(
-                task_id=command.task_id,
-                task_owner_user_id=handoff.task_owner_user_id,
-                task_source=handoff.claimed.task_source,
-                run_id=start.run_id,
-                task_lease=handoff.claimed.task_lease,
-                payload=TaskTurnPayload(
-                    transcript_message=start.message,
-                    execution_message=start.execution_message,
-                    turn_id=start.turn_id,
-                ),
-                force_fresh=False,
-                context=start.existing_context.model_dump(exclude_none=True),
-            )
-        except BaseException:
-            await run_db_io_cancellation_safe(
-                lambda: settle_task_lease_isolated(
-                    handoff.claimed.task_lease,
-                    error_message="Existing execution scheduling failed",
+    # Command completion releases the durable queue before registration.
+    # Keep the local handoff barrier until the exact execution is registered.
+    async with task_execution_controller.command(command.task_id):
+        handoff = await run_db_io_cancellation_safe(lambda: _commit_handoff(command))
+        if isinstance(handoff, SettledTaskCommand):
+            return handoff
+        start = handoff.start
+        context = timezone_schedule_context(start.timezone) or {}
+        config = handoff.claimed.agent_config or {}
+        for key in ("trigger_id", "trigger_run_id", "trigger_type", "trigger_test"):
+            if key in config:
+                context[key] = config[key]
+        if start.kind == "existing":
+            from .task_orchestrator import _schedule_bg, settle_task_lease_isolated
+
+            assert start.existing_context is not None
+            try:
+                _schedule_bg(
+                    task_id=command.task_id,
+                    task_owner_user_id=handoff.task_owner_user_id,
+                    task_source=handoff.claimed.task_source,
+                    run_id=start.run_id,
+                    task_lease=handoff.claimed.task_lease,
+                    payload=TaskTurnPayload(
+                        transcript_message=start.message,
+                        execution_message=start.execution_message,
+                        turn_id=start.turn_id,
+                    ),
+                    force_fresh=False,
+                    context=start.existing_context.model_dump(exclude_none=True),
                 )
-            )
-            raise
+            except BaseException:
+                await run_db_io_cancellation_safe(
+                    lambda: settle_task_lease_isolated(
+                        handoff.claimed.task_lease,
+                        error_message="Existing execution scheduling failed",
+                    )
+                )
+                raise
+            return SettledTaskCommand({"run_id": start.run_id})
+        # This returns after local scheduling, not after Agent execution. The
+        # command is already terminal, so subsequent controls can proceed.
+        await _schedule_committed_turn(
+            task_id=command.task_id,
+            task_owner_user_id=handoff.task_owner_user_id,
+            payload=TaskTurnPayload(
+                transcript_message=start.message,
+                execution_message=start.execution_message,
+                file_ids=tuple(start.file_ids),
+                turn_id=start.turn_id,
+            ),
+            claimed=handoff.claimed,
+            kind=TurnKind(start.kind),
+            force_fresh=start.force_fresh,
+            context=context,
+            mcp_runtime_authorization_policy=handoff.actor_policy,
+        )
         return SettledTaskCommand({"run_id": start.run_id})
-    # This returns after local scheduling, not after Agent execution. The
-    # command is already terminal, so subsequent controls can proceed.
-    await _schedule_committed_turn(
-        task_id=command.task_id,
-        task_owner_user_id=handoff.task_owner_user_id,
-        payload=TaskTurnPayload(
-            transcript_message=start.message,
-            execution_message=start.execution_message,
-            file_ids=tuple(start.file_ids),
-            turn_id=start.turn_id,
-        ),
-        claimed=handoff.claimed,
-        kind=TurnKind(start.kind),
-        force_fresh=start.force_fresh,
-        context=context,
-        mcp_runtime_authorization_policy=handoff.actor_policy,
-    )
-    return SettledTaskCommand({"run_id": start.run_id})

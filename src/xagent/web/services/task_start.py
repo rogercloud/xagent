@@ -225,6 +225,7 @@ def _prepare_created_task_isolated(
     *,
     agent_id: int,
     task_owner_user_id: int,
+    actor_user_id: int,
     message: str,
     file_ids: tuple[str, ...],
     connector_runtime_context: tuple[dict[str, Any], ...],
@@ -289,6 +290,7 @@ def _prepare_created_task_isolated(
             task_id=task_id,
             task_owner_user_id=task_owner_user_id,
             payload=payload,
+            actor_user_id=actor_user_id,
             context=timezone_schedule_context(timezone),
         )
         if not get_shared_task_execution_enabled():
@@ -368,6 +370,7 @@ def _prepare_append_turn_isolated(
     scope: SdkTaskScope,
     request_agent_id: int | None,
     request_workforce_id: int | None,
+    actor_user_id: int,
     message: str,
     file_ids: tuple[str, ...],
     connector_runtime_context: tuple[dict[str, Any], ...],
@@ -420,6 +423,7 @@ def _prepare_append_turn_isolated(
             task_id=int(task.id),
             task_owner_user_id=task_owner_user_id,
             payload=payload,
+            actor_user_id=actor_user_id,
         )
         if not get_shared_task_execution_enabled():
             _store_connector_runtime_values_or_fail(
@@ -521,6 +525,7 @@ async def create_sdk_task(
     async def _prepare_and_schedule() -> tuple[_PreparedCreateTaskStart, TurnStarted]:
         prepared = await run_db_io_cancellation_safe(
             lambda: _prepare_created_task_isolated(
+                actor_user_id=actor_user_id,
                 agent_id=agent_id,
                 task_owner_user_id=task_owner_user_id,
                 message=message,
@@ -583,6 +588,7 @@ async def append_sdk_turn(
         TaskTurnOrchestrator.ensure_no_background_turn(task_id)
         prepared = await run_db_io_cancellation_safe(
             lambda: _prepare_append_turn_isolated(
+                actor_user_id=actor_user_id,
                 task_id=task_id,
                 scope=scope,
                 request_agent_id=request_agent_id,
@@ -666,6 +672,7 @@ def _prepare_a2a_turn_sync(
                 task_id=int(task.id),
                 task_owner_user_id=task_owner_user_id,
                 payload=payload,
+                actor_user_id=task_owner_user_id,
             )
             db.flush()
             db.refresh(task)
@@ -812,7 +819,7 @@ async def execute_existing_task(
     from .task_execution_host import enqueues_task_turns
 
     if enqueues_task_turns():
-        from .task_completion import wait_for_task_run
+        from .task_completion import TaskRunChanged, wait_for_task_run
         from .task_existing_command import enqueue_existing_execution
 
         run_id = await run_db_io_cancellation_safe(
@@ -824,7 +831,10 @@ async def execute_existing_task(
                 actor_user_id=actor_user_id,
             )
         )
-        await wait_for_task_run(task_id, run_id)
+        try:
+            await wait_for_task_run(task_id, run_id)
+        except TaskRunChanged as exc:
+            raise TaskTurnError("run_changed") from exc
         return
     background_task = await TaskTurnOrchestrator.schedule_existing_task_execution(
         task_id=task_id,

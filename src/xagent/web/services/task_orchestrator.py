@@ -562,6 +562,7 @@ class TaskTurnOrchestrator:
         task_id: int,
         task_owner_user_id: int,
         payload: TaskTurnPayload,
+        actor_user_id: int | None = None,
         context: Optional[dict[str, Any]] = None,
         mcp_runtime_authorization_policy: MCPBuiltinOAuthActorPolicy | None = None,
     ) -> "_PreparedTurn":
@@ -578,6 +579,7 @@ class TaskTurnOrchestrator:
             task_id=task_id,
             task_owner_user_id=task_owner_user_id,
             payload=payload,
+            actor_user_id=actor_user_id,
             context=context,
             kind=TurnKind.CREATE,
             mcp_runtime_authorization_policy=mcp_runtime_authorization_policy,
@@ -590,6 +592,7 @@ class TaskTurnOrchestrator:
         task_id: int,
         task_owner_user_id: int,
         payload: TaskTurnPayload,
+        actor_user_id: int | None = None,
         context: Optional[dict[str, Any]] = None,
     ) -> "_PreparedTurn":
         """Stage one APPEND turn inside a domain-owned transaction.
@@ -604,6 +607,7 @@ class TaskTurnOrchestrator:
             task_id=task_id,
             task_owner_user_id=task_owner_user_id,
             payload=payload,
+            actor_user_id=actor_user_id,
             context=context,
             kind=TurnKind.APPEND,
         )
@@ -1224,9 +1228,10 @@ def _claim_turn_no_commit(
         task = db.get(Task, task_id)
         if task is None or task.user_id != task_owner_user_id:
             raise TaskTurnNotFoundError(task_id)
-        bind_shared_actor_policy(
-            task, mcp_runtime_authorization_policy, is_create=kind is TurnKind.CREATE
-        )
+        if kind is TurnKind.CREATE:
+            bind_shared_actor_policy(
+                task, mcp_runtime_authorization_policy, is_create=True
+            )
     accepted = _accept_turn_no_commit(
         db,
         task_id,
@@ -1274,7 +1279,9 @@ def _claim_turn_no_commit(
         staged = stage_task_start_command(
             db,
             task_id=task_id,
-            actor_user_id=actor_user_id or task_owner_user_id,
+            actor_user_id=(
+                task_owner_user_id if actor_user_id is None else actor_user_id
+            ),
             start=start,
         )
         if not staged.created or not staged.payload_matches:

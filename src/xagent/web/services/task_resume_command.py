@@ -12,7 +12,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 from sqlalchemy import and_, exists, func, or_, select
 from sqlalchemy.orm import Session
 
-from ...config import get_task_lease_ttl_seconds
+from ...config import get_task_lease_ttl_seconds, get_task_reply_wait_timeout_seconds
 from ...core.agent.checkpoint import (
     CheckpointAccessRefusedError,
     CheckpointCorruptError,
@@ -43,6 +43,7 @@ from .task_resume import (
     TaskReplyResumeResult,
     TaskResumeBusyError,
     TaskResumeNotResumableError,
+    TaskResumeOutcomeUnknownError,
     TaskResumeRetryableError,
 )
 
@@ -231,12 +232,16 @@ async def enqueue_resume_input(
     notify_task_command_dispatcher()
     # These APIs already wait for checkpoint validation and local scheduling.
     # Preserve that response boundary while preparation now runs on a worker.
+    deadline = asyncio.get_running_loop().time() + get_task_reply_wait_timeout_seconds()
     while (
         result := await run_db_io_cancellation_safe(
             lambda: _read_reply_outcome(command_db_id)
         )
     ) is None:
-        await asyncio.sleep(0.25)
+        remaining = deadline - asyncio.get_running_loop().time()
+        if remaining <= 0:
+            raise TaskResumeOutcomeUnknownError
+        await asyncio.sleep(min(0.25, remaining))
     if result["outcome"] == "busy":
         raise TaskResumeBusyError
     if result["outcome"] == "not_resumable":
@@ -384,55 +389,62 @@ async def execute_resume_input(command: ClaimedTaskCommand) -> SettledTaskComman
 
 
 async def _execute_resume_input(command: ClaimedTaskCommand) -> SettledTaskCommand:
-    from .task_resume import resume_a2a_task, resume_task_reply
+    from .task_execution_controller import task_execution_controller
 
-    payload, lease, owner_id, state = await run_db_io_cancellation_safe(
-        lambda: _handoff(command)
-    )
-    outcome = "unavailable"
-    try:
-        if payload.source == "sdk":
-            await resume_task_reply(
-                TaskReplyInput(
-                    task_id=command.task_id,
+    # Command completion releases the durable queue before registration.
+    # Keep the local handoff barrier until the exact execution is registered.
+    async with task_execution_controller.command(command.task_id):
+        from .task_resume import resume_a2a_task, resume_task_reply
+
+        payload, lease, owner_id, state = await run_db_io_cancellation_safe(
+            lambda: _handoff(command)
+        )
+        outcome = "unavailable"
+        try:
+            if payload.source == "sdk":
+                await resume_task_reply(
+                    TaskReplyInput(
+                        task_id=command.task_id,
+                        agent_id=payload.agent_id,
+                        task_owner_user_id=owner_id,
+                        run_id=payload.run_id,
+                        status=TaskStatus(payload.prior_status),
+                        text=payload.text,
+                    ),
+                    preacquired_lease=lease,
+                    preacquired_state=state,
+                    turn_id=command.command_id,
+                )
+            else:
+                await resume_a2a_task(
                     agent_id=payload.agent_id,
                     task_owner_user_id=owner_id,
-                    run_id=payload.run_id,
-                    status=TaskStatus(payload.prior_status),
+                    task_id=command.task_id,
+                    previous_run_id=payload.run_id,
+                    resumable_status=TaskStatus(payload.prior_status),
                     text=payload.text,
-                ),
-                preacquired_lease=lease,
-                preacquired_state=state,
-                turn_id=command.command_id,
+                    message_id=payload.message_id,
+                    preacquired_lease=lease,
+                )
+            outcome = "accepted"
+        except TaskResumeBusyError:
+            outcome = "busy"
+        except (TaskResumeNotResumableError, CheckpointCorruptError):
+            outcome = "not_resumable"
+        except CheckpointAccessRefusedError as exc:
+            outcome = "not_resumable" if exc.reason == "superseded_legacy" else "busy"
+        except TaskResumeRetryableError:
+            outcome = "retryable_unavailable"
+        except CheckpointReadError:
+            outcome = "unavailable"
+        except AutoModelUnavailableError:
+            outcome = "auto_model_unavailable"
+        except Exception:
+            logger.exception(
+                "Shared reply preparation failed task_id=%s", command.task_id
             )
-        else:
-            await resume_a2a_task(
-                agent_id=payload.agent_id,
-                task_owner_user_id=owner_id,
-                task_id=command.task_id,
-                previous_run_id=payload.run_id,
-                resumable_status=TaskStatus(payload.prior_status),
-                text=payload.text,
-                message_id=payload.message_id,
-                preacquired_lease=lease,
+        finally:
+            await run_db_io_cancellation_safe(
+                lambda: _record_outcome(command, state, outcome)
             )
-        outcome = "accepted"
-    except TaskResumeBusyError:
-        outcome = "busy"
-    except (TaskResumeNotResumableError, CheckpointCorruptError):
-        outcome = "not_resumable"
-    except CheckpointAccessRefusedError as exc:
-        outcome = "not_resumable" if exc.reason == "superseded_legacy" else "busy"
-    except TaskResumeRetryableError:
-        outcome = "retryable_unavailable"
-    except CheckpointReadError:
-        outcome = "unavailable"
-    except AutoModelUnavailableError:
-        outcome = "auto_model_unavailable"
-    except Exception:
-        logger.exception("Shared reply preparation failed task_id=%s", command.task_id)
-    finally:
-        await run_db_io_cancellation_safe(
-            lambda: _record_outcome(command, state, outcome)
-        )
-    return SettledTaskCommand({**state, "outcome": outcome})
+        return SettledTaskCommand({**state, "outcome": outcome})

@@ -318,3 +318,61 @@ def test_read_distinguishes_key_configuration_from_decryption_failure(
         assert error.value.status_code == 503
         assert "synthetic-secret" not in str(error.value)
         assert db.query(TaskRuntimeSecret).count() == 1
+
+
+@pytest.mark.parametrize(
+    "status,removed",
+    [
+        (TaskStatus.COMPLETED, True),
+        (TaskStatus.FAILED, True),
+        (TaskStatus.PAUSED, False),
+        (TaskStatus.WAITING_FOR_USER, False),
+        (TaskStatus.RUNNING, False),
+    ],
+)
+def test_expired_terminal_owner_does_not_leak_inputs(task_id, status, removed):
+    from datetime import datetime, timedelta, timezone
+
+    with get_session_local()() as db:
+        stage(db, task_id)
+        task = db.get(Task, task_id)
+        task.status = status
+        task.runner_id = "dead-worker"
+        task.lease_attempt_id = "dead-attempt"
+        task.lease_expires_at = datetime.now(timezone.utc) + timedelta(minutes=1)
+        db.commit()
+    clean_finished_runtime_values()
+    with get_session_local()() as db:
+        assert db.query(TaskRuntimeSecret).count() == 1
+        db.get(Task, task_id).lease_expires_at = datetime.now(timezone.utc) - timedelta(
+            minutes=1
+        )
+        db.commit()
+    clean_finished_runtime_values()
+    with get_session_local()() as db:
+        assert db.query(TaskRuntimeSecret).count() == (0 if removed else 1)
+
+
+def test_cleanup_pages_past_retained_inputs(task_id):
+    with get_session_local()() as db:
+        owner = db.get(Task, task_id).user_id
+        for i in range(5):
+            task = Task(
+                user_id=owner,
+                title=str(i),
+                run_id="run-1",
+                status=TaskStatus.WAITING_FOR_USER if i < 4 else TaskStatus.COMPLETED,
+            )
+            db.add(task)
+            db.flush()
+            stage(db, task.id)
+        db.commit()
+    cursor = clean_finished_runtime_values(batch_size=2)
+    assert cursor is not None
+    cursor = clean_finished_runtime_values(batch_size=2, after_id=cursor)
+    assert cursor is not None
+    with get_session_local()() as db:
+        assert db.query(TaskRuntimeSecret).count() == 5
+    assert clean_finished_runtime_values(batch_size=2, after_id=cursor) is None
+    with get_session_local()() as db:
+        assert db.query(TaskRuntimeSecret).count() == 4

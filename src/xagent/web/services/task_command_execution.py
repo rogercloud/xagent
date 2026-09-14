@@ -1237,6 +1237,7 @@ def _prepare_task_message_sync(
                 db,
                 task_id=routing.task_id,
                 task_owner_user_id=routing.task_owner_user_id,
+                actor_user_id=actor_user_id,
                 payload=turn_payload,
             )
             # The atomic claim uses a bulk UPDATE. Refresh the Task before
@@ -3786,8 +3787,15 @@ async def _terminal_command_event_draft(
 async def execute_durable_task_command(
     command: ClaimedTaskCommand,
 ) -> dict[str, Any] | None | SettledTaskCommand:
+    from ...config import get_shared_task_execution_enabled
     from .task_execution_host import claimed_command_execution
 
+    if get_shared_task_execution_enabled():
+        # A preceding START/RESUME_INPUT can be terminal in the database while
+        # its handler is still registering execution. Wait before any command
+        # effects, then release: ordinary handlers own their nested local gates.
+        async with task_execution_controller.command(command.task_id):
+            pass
     with claimed_command_execution():
         if command.kind == TaskCommandKind.RESUME_INPUT:
             from .task_resume_command import execute_resume_input
