@@ -59,11 +59,13 @@ from .workspace_binding import canonical_workspace_base
 logger = logging.getLogger(__name__)
 
 
-def _discard_pending_selection(selection: SelectedChannelTask) -> None:
+def _settle_pending_selection(
+    selection: SelectedChannelTask, *, stopped: bool = False
+) -> None:
     if not selection.is_new_task:
         return
     with get_session_local()() as db:
-        db.query(Task).filter(
+        pending = db.query(Task).filter(
             Task.id == selection.task_id,
             Task.user_id == selection.user_id,
             Task.status == TaskStatus.PENDING,
@@ -71,7 +73,21 @@ def _discard_pending_selection(selection: SelectedChannelTask) -> None:
             Task.state_version == selection.state_version,
             Task.runner_id.is_(None),
             ~exists(select(1).where(TaskExecutionCommand.task_id == selection.task_id)),
-        ).delete(synchronize_session=False)
+        )
+        if stopped:
+            # Keep the new conversation and its uploaded files resumable.
+            # The original selection fences a concurrent accepted command.
+            pending.update(
+                {
+                    Task.status: TaskStatus.PAUSED,
+                    Task.control_state: "paused",
+                    Task.run_id: str(uuid4()),
+                    Task.state_version: Task.state_version + 1,
+                },
+                synchronize_session=False,
+            )
+        else:
+            pending.delete(synchronize_session=False)
         db.commit()
 
 
@@ -184,7 +200,7 @@ class SharedChannelTurn:
             await self.stop_task
         elif not self.accepted:
             await run_db_io_cancellation_safe(
-                lambda: _discard_pending_selection(self.selection)
+                lambda: _settle_pending_selection(self.selection, stopped=True)
             )
 
     async def close(self) -> None:
@@ -194,7 +210,9 @@ class SharedChannelTurn:
             await asyncio.gather(self.stop_task, return_exceptions=True)
         if not self.accepted:
             await run_db_io_cancellation_safe(
-                lambda: _discard_pending_selection(self.selection)
+                lambda: _settle_pending_selection(
+                    self.selection, stopped=self.stop_requested
+                )
             )
 
     async def execute(
@@ -283,7 +301,7 @@ async def prepare_shared_channel_turn(
             raise cancellation
         return None
     if cancellation is not None:
-        await run_db_io_cancellation_safe(lambda: _discard_pending_selection(selection))
+        await run_db_io_cancellation_safe(lambda: _settle_pending_selection(selection))
         raise cancellation
     try:
         workspace = await run_db_io_cancellation_safe(
@@ -291,7 +309,7 @@ async def prepare_shared_channel_turn(
         )
         return SharedChannelTurn(selection, workspace)
     except BaseException:
-        await run_db_io_cancellation_safe(lambda: _discard_pending_selection(selection))
+        await run_db_io_cancellation_safe(lambda: _settle_pending_selection(selection))
         raise
 
 
