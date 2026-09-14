@@ -1,0 +1,91 @@
+# Shared worker deployment and upgrade
+
+Shared execution is enabled by default. A `combined` process serves HTTP/WebSocket
+requests and executes accepted tasks; a `web` process only accepts requests; a
+standalone `worker` executes them. Celery workers handle background jobs and are
+not substitutes for the standalone Agent worker.
+
+## Configuration and upgrade
+
+1. Stop old application processes before upgrading the database. Back up the
+   database and retain the existing private encryption key. Do not run old local
+   executors alongside shared executors against the same database.
+2. Configure the same `DATABASE_URL`, `XAGENT_REDIS_URL`, private `ENCRYPTION_KEY`,
+   and `XAGENT_TASK_EVENT_CHANNEL_PREFIX` on web and execution hosts. Generate a
+   Fernet key for a new deployment with:
+   `python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"`.
+   The empty example value and published development keys are rejected. Preserve
+   the key on restart; replacing it makes existing encrypted values unreadable.
+3. Mount the same task storage and upload storage at the same paths on all hosts.
+   Set `XAGENT_STORAGE_ROOT` and `XAGENT_UPLOADS_DIR` accordingly. Redis alone does
+   not share files. Use a distinct event prefix for each deployment: Redis Pub/Sub
+   does not isolate channels by logical database number.
+4. Start one web/combined process first to apply the application's database
+   migrations, then start standalone workers using the same application version.
+   The migrations include task command, runtime credential, and channel delivery
+   tables. Standalone workers require the migrated schema.
+5. Set `XAGENT_TASK_EXECUTION_ROLE=web` for acceptance-only hosts, `worker` for
+   `python -m xagent.web.worker`, or `combined` for a host doing both. Start web
+   hosts with `python -m xagent.web`.
+6. For Telegram, Feishu, or Slack, set `XAGENT_CHANNEL_INGRESS_ENABLED=true` on
+   exactly one designated web/combined process. All others keep it `false`.
+   This is an operational designation, not automatic leader election. If it is
+   disabled everywhere, no bot connection starts; startup logs state this.
+
+For a deliberate single-process local deployment, set
+`XAGENT_SHARED_TASK_EXECUTION_ENABLED=false` and use the `combined` role.
+Shared execution requirements do not apply in that mode.
+
+## Sandbox ownership
+
+Every concurrent execution process using Docker or BoxLite must have its own
+stable `XAGENT_SANDBOX_WORKER_ID`, such as `worker-1` and `worker-2`. Reuse an ID
+when restarting its process, and stop the old process before reusing that ID.
+Do not copy one ID across replicas or derive it from a new random process ID.
+
+Docker also requires a stable deployment `XAGENT_SANDBOX_NAMESPACE`. Container
+names, ownership labels, and SQL metadata use a scope derived from both values.
+BoxLite uses a separate home directory and SQL metadata scope per worker ID.
+The Compose sandbox overlays supply role-specific identities for their fixed
+single instances. Additional execution replicas must supply distinct identities.
+
+A replacement worker creates its own sandbox resources; it does not adopt or
+clean up another worker's resources. Workspace files remain shared. Existing
+unscoped sandbox resources from local mode need operator cleanup after draining
+that deployment; changing an identity does not migrate those resources.
+
+## Channel replies and failure recovery
+
+Accepted channel commands and final-reply destinations are committed together.
+The designated ingress checks pending final replies every 30 seconds, including
+after restart. A separate delivery claim prevents ordinary concurrent sends;
+its 60-second lease is renewed during delivery. Platform failures retry after
+30 seconds without running the Agent again. Channel access is checked again
+before recovery sends a stored answer.
+
+The guarantee is at-least-once delivery while access remains authorized and the
+platform eventually accepts the reply. If the platform receives a reply just
+before ingress crashes or its delivery acknowledgement cannot be saved, a retry
+may repeat the reply or attachments. Platform sends and database commits cannot
+be made one transaction. Reusing the loading message where supported reduces
+visible duplicates, but does not eliminate this failure window.
+
+If waiting for execution reaches `XAGENT_TASK_REPLY_WAIT_TIMEOUT_SECONDS`, ingress
+posts an accepted/still-processing notice and leaves the final reply pending.
+A temporary database read failure retries within the same deadline. Loss of the
+progress route disables progress forwarding for that turn after the first
+failure; it does not repeatedly delay execution. Final replies use durable
+recovery rather than the old in-memory progress route.
+
+Stopping a newly selected task before acceptance leaves it paused with its
+uploaded files, so it can be continued. It cannot modify a newer replacement run.
+
+## Runtime credential lifetime
+
+Run-scoped credentials remain encrypted while a task is paused or waiting for
+user input. `XAGENT_TASK_RUNTIME_SECRETS_TTL_SECONDS` is a positive integer,
+defaulting to 86400 (24 hours), measured from acceptance. Resume does not extend
+this lifetime. Reads reject expired credentials immediately, even before the
+cleanup sweep deletes them. Finished and replaced runs are also cleaned up.
+After expiration, submit fresh runtime credentials with a new request; an old
+run cannot silently reuse expired values.

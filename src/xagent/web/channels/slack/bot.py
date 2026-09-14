@@ -1279,6 +1279,9 @@ class SlackChannelManager:
         self._sync_lock = asyncio.Lock()
 
     async def start(self) -> None:
+        if not get_channel_ingress_enabled():
+            logger.info("Slack channel ingress disabled on this host")
+            return
         while get_channel_ingress_enabled():
             await self._sync_bots_async()
             if not get_shared_task_execution_enabled():
