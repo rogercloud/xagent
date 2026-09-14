@@ -42,6 +42,18 @@ pytest's automatic startup skips.
 | `test_shared_gmail.py` | Agent and workforce Gmail callback through actual signature verification, mail ingestion, and worker completion. |
 | `test_shared_network_recovery.py` | A controllable TCP link interrupts only the test hosts' Redis connections. An in-flight task still persists its result, an unaccepted START leaves no task behind, and clients recover after reconnection. |
 
+In `test_shared_channels.py`, the bot callbacks and their event bridge run in
+pytest's process. Spawned web/worker hosts have channel ingress disabled, so
+these cases do not exercise a live platform connection or designated-ingress
+subscription startup. `test_channel_delivery_recovery.py` separately kills and
+restarts an ingress subprocess and verifies persisted reply recovery through the
+Feishu renderer, with platform network sends simulated. The four Docker suites
+also inherit the shared-execution autouse fixture.
+
+Outside E2E, the suite defaults to local execution; shared service/worker tests
+explicitly override that fixture. Passing legacy tests alone does not validate
+the shared default.
+
 The existing MinIO and PostgreSQL 17 E2E suites still require Docker; they also
 run with shared execution enabled. The SQLite subprocess tests do not replace
 those storage/backend-specific checks.
