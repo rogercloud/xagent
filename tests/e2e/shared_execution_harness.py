@@ -31,8 +31,68 @@ def _install_model_boundary(root: Path, role: str) -> None:
 
         async def chat(self, messages, **kwargs):
             with (root / f"model-{os.getpid()}.jsonl").open("a") as log:
-                log.write(json.dumps({"role": role, "messages": messages}) + "\n")
+                log.write(
+                    json.dumps(
+                        {
+                            "role": role,
+                            "messages": messages,
+                            "tools": [
+                                t["function"]["name"]
+                                for t in kwargs.get("tools", []) or []
+                            ],
+                        }
+                    )
+                    + "\n"
+                )
             text = json.dumps(messages)
+            tool_names = {t["function"]["name"] for t in kwargs.get("tools", []) or []}
+            if "generate_execution_plan" in tool_names:
+                return {
+                    "tool_calls": [
+                        {
+                            "id": "e2e-plan",
+                            "function": {
+                                "name": "generate_execution_plan",
+                                "arguments": json.dumps(
+                                    {
+                                        "response_language": "English",
+                                        "steps": [
+                                            {
+                                                "id": "answer",
+                                                "task": "Answer the question in English",
+                                                "dependencies": [],
+                                                "description": "Produce the answer",
+                                                "termination_condition": "The answer is ready",
+                                                "completion_evidence": "A final answer",
+                                                "tool_names": [],
+                                            }
+                                        ],
+                                    }
+                                ),
+                            },
+                        }
+                    ]
+                }
+            if "assess_dag_completion" in tool_names:
+                return {
+                    "tool_calls": [
+                        {
+                            "id": "e2e-assess",
+                            "function": {
+                                "name": "assess_dag_completion",
+                                "arguments": json.dumps(
+                                    {
+                                        "status": "completed",
+                                        "reason": "The answer is ready",
+                                        "answer": "Shared E2E answer",
+                                        "missing_work": "",
+                                        "replan_instruction": "",
+                                    }
+                                ),
+                            },
+                        }
+                    ]
+                }
             if any(
                 t["function"]["name"] == "select_execution_pattern"
                 for t in kwargs.get("tools", []) or []
@@ -45,9 +105,15 @@ def _install_model_boundary(root: Path, role: str) -> None:
                                 "name": "select_execution_pattern",
                                 "arguments": json.dumps(
                                     {
-                                        "action": "react",
+                                        "action": "final_answer"
+                                        if "e2e:route-final" in text
+                                        else "plan_execute"
+                                        if "e2e:route-dag" in text
+                                        else "react",
                                         "reason": "Exercise the agent runtime",
-                                        "answer": "",
+                                        "answer": "Shared E2E answer"
+                                        if "e2e:route-final" in text
+                                        else "",
                                         "requires_current_or_external_facts": False,
                                         "existing_context_sufficient": True,
                                         "evidence_basis": "Test question",
@@ -86,7 +152,7 @@ def _install_model_boundary(root: Path, role: str) -> None:
                 for m in messages
                 if m.get("role") == "tool"
             }
-            if "e2e:files" in text:
+            if "e2e:files" in text and "e2e:ask" not in text:
                 if "e2e-read" not in results:
                     return {
                         "tool_calls": [
@@ -178,10 +244,14 @@ def _host(pipe, environment: dict[str, str], role: str, root: str) -> None:
     os.dup2(log.fileno(), 1)
     os.dup2(log.fileno(), 2)
     _install_model_boundary(root_path, role)
+    if (root_path / "gmail-public-key.pem").exists():
+        from tests.e2e.test_shared_gmail import install_gmail_network_boundary
+
+        install_gmail_network_boundary(root_path)
     from xagent.web import sandbox_manager
 
     sandbox_manager.get_sandbox_manager = lambda: None
-    if role == "web":
+    if role in {"web", "combined"}:
         import uvicorn
 
         from xagent.web.app import app
@@ -260,7 +330,7 @@ class SharedExecutionApp:
             ready = parent.recv()
         except EOFError:
             pytest.fail(self.diagnostics())
-        if role == "web":
+        if role in {"web", "combined"}:
             self.client = httpx.Client(
                 base_url=f"http://127.0.0.1:{ready['port']}", timeout=30
             )
