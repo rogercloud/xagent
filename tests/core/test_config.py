@@ -2962,3 +2962,18 @@ def test_unknown_task_execution_role_rejected(monkeypatch):
     monkeypatch.setenv(config.TASK_EXECUTION_ROLE, "other")
     with pytest.raises(ValueError, match="combined, web or worker"):
         config.validate_task_execution_host_config()
+
+
+@pytest.mark.parametrize("configured_home", [None, "/custom/boxlite"])
+def test_shared_boxlite_home_is_scoped_to_worker(
+    monkeypatch, tmp_path, configured_home
+):
+    monkeypatch.setenv("XAGENT_SHARED_TASK_EXECUTION_ENABLED", "true")
+    monkeypatch.setenv("XAGENT_SANDBOX_WORKER_ID", "worker-1")
+    monkeypatch.setenv("XAGENT_STORAGE_ROOT", str(tmp_path))
+    if configured_home is None:
+        monkeypatch.delenv(BOXLITE_HOME_DIR, raising=False)
+    else:
+        monkeypatch.setenv(BOXLITE_HOME_DIR, configured_home)
+    expected_root = Path(configured_home) if configured_home else tmp_path / "boxlite"
+    assert get_boxlite_home_dir() == expected_root / "worker-1"
