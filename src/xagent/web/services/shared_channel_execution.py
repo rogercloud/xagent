@@ -22,8 +22,13 @@ from ...core.execution_scope import resolve_execution_scope
 from ...core.workspace import TaskWorkspace
 from ..models.database import get_session_local
 from ..models.task import Task, TaskStatus
+from ..models.task_channel_delivery import TaskChannelDelivery
 from ..models.task_command import TaskExecutionCommand
 from ..models.uploaded_file import UploadedFile
+from .channel_delivery import (
+    ChannelSender,
+    deliver_channel_result,
+)
 from .channel_runtime import (
     SelectedChannelTask,
     _load_channel_owner_sync,
@@ -98,14 +103,45 @@ class SharedChannelTurn:
     stop_requested: bool = False
     origin: str | None = None
     stop_task: asyncio.Task | None = None
+    delivery_destination: dict[str, Any] | None = None
+    command_db_id: int | None = None
+    discard_output: bool = False
+
+    async def deliver(
+        self, sender: ChannelSender, *, pending_notice: bool = False
+    ) -> bool:
+        assert self.command_db_id is not None
+        return await deliver_channel_result(
+            self.command_db_id, sender, pending_notice=pending_notice
+        )
+
+    async def discard_delivery(self) -> None:
+        if self.command_db_id is None:
+            return
+
+        def discard() -> None:
+            with get_session_local()() as db:
+                db.query(TaskChannelDelivery).filter(
+                    TaskChannelDelivery.command_id == self.command_db_id,
+                    TaskChannelDelivery.status == "pending",
+                ).update(
+                    {"status": "discarded", "claim_token": None},
+                    synchronize_session=False,
+                )
+                db.commit()
+
+        await run_db_io_cancellation_safe(discard)
 
     def request_stop(self) -> bool:
         self.stop_requested = True
-        if self.accepted and self.stop_task is None:
+        if self.accepted and (self.stop_task is None or self.stop_task.done()):
             self.stop_task = asyncio.create_task(self._enqueue_stop())
         return True
 
     async def _enqueue_stop(self) -> None:
+        if self.discard_output:
+            await self.discard_delivery()
+
         def enqueue() -> None:
             with get_session_local()() as db:
                 task = db.execute(
@@ -197,6 +233,7 @@ class SharedChannelTurn:
         )
         command_db_id, cancellation = await await_task_settlement(acceptance)
         self.accepted = True
+        self.command_db_id = command_db_id
         notify_task_command_dispatcher()
         if cancellation is not None:
             self.request_stop()
@@ -204,9 +241,12 @@ class SharedChannelTurn:
         if self.stop_requested:
             self.request_stop()
         while True:
-            result = await run_db_io_cancellation_safe(
-                lambda: _read_channel_result(command_db_id, self.run_id)
-            )
+            try:
+                result = await run_db_io_cancellation_safe(
+                    lambda: _read_channel_result(command_db_id, self.run_id)
+                )
+            except TaskLeaseLostError:
+                return {"success": True, "status": "interrupted"}
             if result is not None:
                 return result
             await asyncio.sleep(0.25)
@@ -338,6 +378,14 @@ def _accept_channel_turn(
             reply_host_id=host_id,
             reply_origin=turn.origin,
         )
+        if turn.delivery_destination is not None:
+            db.add(
+                TaskChannelDelivery(
+                    command_id=staged.staged_db_id,
+                    channel_id=selection.channel_id,
+                    destination=turn.delivery_destination,
+                )
+            )
         try:
             db.commit()
         except Exception:

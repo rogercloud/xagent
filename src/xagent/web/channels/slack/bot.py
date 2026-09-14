@@ -28,6 +28,7 @@ from ....config import (
 from ....core.file_ref import build_file_id_ref
 from ...models.task import TaskStatus
 from ...services.agent_service_manager import get_agent_manager
+from ...services.channel_delivery import ChannelDelivery, recover_channel_results
 from ...services.channel_runtime import (
     ChannelAuthorizationError,
     ChannelConfigurationError,
@@ -616,6 +617,11 @@ class SlackBotInstance:
                     agent_service.tracer.add_handler(trace_handler)
 
             if shared_turn is not None:
+                shared_turn.delivery_destination = {
+                    "chat_id": slack_channel_id,
+                    "thread_ts": thread_ts,
+                    "loading_ts": loading_ts,
+                }
                 result = await shared_turn.execute(
                     TaskTurnPayload(
                         transcript_message=display_message or prompt_text,
@@ -627,6 +633,11 @@ class SlackBotInstance:
                     ),
                     trace_handler,
                 )
+                await shared_turn.deliver(
+                    self._deliver_shared_result,
+                    pending_notice=result.get("status") == "accepted",
+                )
+                return
             else:
                 local_service: Any = agent_service
                 local_lease = cast(ManagedTaskLease, managed_lease)
@@ -778,6 +789,33 @@ class SlackBotInstance:
             self._save_active_tasks()
             text = "Started a new task. Please describe your request."
         await self._send_text(channel_id, text, thread_ts=thread_ts)
+
+    async def _deliver_shared_result(
+        self, delivery: ChannelDelivery, result: dict[str, Any]
+    ) -> None:
+        projection = project_execution_result_for_channel(result)
+        destination = delivery.destination
+        output, output_files = strip_slack_file_refs(projection.visible_text)
+        await self._send_final_text(
+            channel_id=destination["chat_id"],
+            thread_ts=destination["thread_ts"],
+            loading_ts=destination["loading_ts"],
+            text=output or "Task completed.",
+        )
+        if output_files:
+            failed = await self._send_output_files(
+                refs=output_files,
+                channel_id=destination["chat_id"],
+                thread_ts=destination["thread_ts"],
+                user_id=delivery.user_id,
+                task_id=delivery.task_id,
+            )
+            if failed:
+                await self._send_file_fallback_message(
+                    refs=failed,
+                    channel_id=destination["chat_id"],
+                    thread_ts=destination["thread_ts"],
+                )
 
     async def _download_and_register_files(
         self,
@@ -1245,6 +1283,11 @@ class SlackChannelManager:
             await self._sync_bots_async()
             if not get_shared_task_execution_enabled():
                 return
+            for bot in (*self.bots.values(), *self.oauth_bots.values()):
+                if bot.channel_id is not None:
+                    await recover_channel_results(
+                        bot.channel_id, bot._deliver_shared_result
+                    )
             # CRUD may reach another web replica. The designated ingress
             # observes its committed configuration without opening extra bots.
             await asyncio.sleep(30)
