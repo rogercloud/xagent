@@ -190,6 +190,50 @@ async def test_terminal_command_with_replaced_run_reports_interruption(accepted)
 
 
 @pytest.mark.asyncio
+async def test_preaccept_stop_preserves_resumable_task_and_files(selected, tmp_path):
+    from xagent.web.models.uploaded_file import UploadedFile
+
+    path = tmp_path / "input.txt"
+    path.write_text("input")
+    with get_session_local()() as db:
+        db.add(
+            UploadedFile(
+                task_id=selected.selection.task_id,
+                user_id=selected.selection.user_id,
+                filename=path.name,
+                storage_path=str(path),
+            )
+        )
+        db.commit()
+    selected.origin = None
+    await selected.stop()
+    await selected.stop()
+    await selected.close()
+    with get_session_local()() as db:
+        task = db.get(Task, selected.selection.task_id)
+        assert task.status == TaskStatus.PAUSED
+        assert task.control_state == "paused"
+        assert task.run_id is not None
+        assert task.state_version == selected.selection.state_version + 1
+        assert db.query(UploadedFile).one().task_id == task.id
+    assert path.read_text() == "input"
+
+
+@pytest.mark.asyncio
+async def test_preaccept_stop_cannot_modify_replacement(selected):
+    with get_session_local()() as db:
+        task = db.get(Task, selected.selection.task_id)
+        task.run_id = "new-run"
+        task.state_version += 1
+        db.commit()
+    await selected.stop()
+    with get_session_local()() as db:
+        task = db.get(Task, selected.selection.task_id)
+        assert task.run_id == "new-run"
+        assert task.status == TaskStatus.PENDING
+
+
+@pytest.mark.asyncio
 async def test_lost_delivery_claim_cancels_inflight_sender(accepted, monkeypatch):
     complete(accepted)
     monkeypatch.setattr(delivery, "_DELIVERY_LEASE_SECONDS", 0.03)

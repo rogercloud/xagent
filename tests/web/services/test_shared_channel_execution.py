@@ -100,7 +100,7 @@ def test_acceptance_persists_start_and_single_transcript_without_lease(selected)
         assert command.payload["before_message_id"] == messages[0].id
     with pytest.raises(TaskTurnError):
         shared._accept_channel_turn(selected, TaskTurnPayload("second"), "ingress")
-    shared._discard_pending_selection(selected.selection)
+    shared._settle_pending_selection(selected.selection)
     with get_session_local()() as db:
         assert db.get(Task, selected.selection.task_id) is not None
 
