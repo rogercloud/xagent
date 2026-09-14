@@ -9,7 +9,9 @@ from xagent.web.models.database import Base, get_engine, get_session_local, init
 from xagent.web.models.task import Task, TaskStatus
 from xagent.web.models.task_command import TaskExecutionCommand
 from xagent.web.models.user import User
+from xagent.web.services import task_coordinator_runtime, task_coordinator_service
 from xagent.web.services import task_start_consumer as consumer
+from xagent.web.services.task_command_execution import execute_durable_task_command
 from xagent.web.services.task_command_transport import (
     SettledTaskCommand,
     TaskCommandRejected,
@@ -21,10 +23,29 @@ from xagent.web.services.task_start_protocol import (
 )
 
 
+def owner_lease(task_id):
+    with get_session_local()() as db, db.begin():
+        task_coordinator_service.recover_expired_idle_task_lease_no_commit(db, task_id)
+        lease = task_coordinator_service.acquire_task_lease_no_commit(
+            db, task_id, runner_id="worker-1"
+        )
+        if lease is None:
+            task = db.get(Task, task_id)
+            assert task.runner_id == "worker-1"
+            lease = task_coordinator_service.TaskLease(
+                task_id, task.runner_id, task.lease_attempt_id
+            )
+        return lease
+
+
+def commit_handoff(command):
+    return consumer._commit_handoff(command, owner_lease(command.task_id))
+
+
 @pytest.fixture
-def accepted(tmp_path, monkeypatch):
+async def accepted(tmp_path, monkeypatch):
     monkeypatch.setenv("XAGENT_SHARED_TASK_EXECUTION_ENABLED", "true")
-    monkeypatch.setattr(consumer, "get_runner_id", lambda: "worker-1")
+    monkeypatch.setattr(task_coordinator_runtime, "get_runner_id", lambda: "worker-1")
     init_db(db_url=f"sqlite:///{tmp_path / 'consumer.db'}")
     with get_session_local()() as db:
         user = User(username="owner", password_hash="unused")
@@ -34,10 +55,10 @@ def accepted(tmp_path, monkeypatch):
             user_id=user.id,
             title="Shared",
             source="sdk",
-            status=TaskStatus.RUNNING,
-            run_id="run-1",
+            status=TaskStatus.PENDING,
+            run_id=None,
             state_version=1,
-            control_state="running",
+            control_state="idle",
         )
         db.add(task)
         db.flush()
@@ -60,22 +81,23 @@ def accepted(tmp_path, monkeypatch):
         )
         assert command is not None
     yield command
+    await task_coordinator_runtime.close_task_coordinators()
     Base.metadata.drop_all(bind=get_engine())
 
 
 def test_handoff_commits_lease_and_completion_together(accepted):
-    handoff = consumer._commit_handoff(accepted)
+    handoff = commit_handoff(accepted)
     with get_session_local()() as db:
         task = db.get(Task, accepted.task_id)
         command = db.get(TaskExecutionCommand, accepted.id)
         assert task.run_id == "run-1"
-        assert task.state_version == 1
+        assert task.state_version == 2
         assert task.runner_id == "worker-1"
         assert task.lease_attempt_id == handoff.claimed.task_lease.attempt_id
         assert command.status == "completed"
         assert command.result["lease_attempt_id"] == task.lease_attempt_id
     with pytest.raises(TaskCommandRejected):
-        consumer._commit_handoff(accepted)
+        commit_handoff(accepted)
 
 
 def test_completion_fence_failure_rolls_back_lease(accepted, monkeypatch):
@@ -83,9 +105,9 @@ def test_completion_fence_failure_rolls_back_lease(accepted, monkeypatch):
         consumer, "finish_task_command_no_commit", lambda *a, **kw: False
     )
     with pytest.raises(TaskCommandRejected):
-        consumer._commit_handoff(accepted)
+        commit_handoff(accepted)
     with get_session_local()() as db:
-        assert db.get(Task, accepted.task_id).lease_attempt_id is None
+        assert db.get(Task, accepted.task_id).status == TaskStatus.PENDING
         assert db.get(TaskExecutionCommand, accepted.id).status == "processing"
 
 
@@ -99,9 +121,9 @@ def test_old_or_expired_claim_cannot_acquire_lease(accepted, expired):
             row.attempt_count += 1
         db.commit()
     with pytest.raises(TaskCommandRejected):
-        consumer._commit_handoff(accepted)
+        commit_handoff(accepted)
     with get_session_local()() as db:
-        assert db.get(Task, accepted.task_id).lease_attempt_id is None
+        assert db.get(Task, accepted.task_id).status == TaskStatus.PENDING
         assert db.get(TaskExecutionCommand, accepted.id).status == "processing"
 
 
@@ -109,9 +131,10 @@ def test_old_run_rejection_does_not_fail_new_run(accepted):
     with get_session_local()() as db:
         task = db.get(Task, accepted.task_id)
         task.run_id = "run-2"
+        task.status = TaskStatus.RUNNING
         task.state_version = 2
         db.commit()
-    assert isinstance(consumer._commit_handoff(accepted), SettledTaskCommand)
+    assert isinstance(commit_handoff(accepted), SettledTaskCommand)
     with get_session_local()() as db:
         task = db.get(Task, accepted.task_id)
         assert task.run_id == "run-2"
@@ -122,12 +145,12 @@ def test_old_run_rejection_does_not_fail_new_run(accepted):
 
 def test_invalid_current_start_settles_accepted_task(accepted):
     broken = replace(accepted, payload={**accepted.payload, "version": 999})
-    assert isinstance(consumer._commit_handoff(broken), SettledTaskCommand)
+    assert isinstance(commit_handoff(broken), SettledTaskCommand)
     with get_session_local()() as db:
         task = db.get(Task, accepted.task_id)
         assert task.status == TaskStatus.FAILED
         assert task.control_state == "failed"
-        assert task.lease_attempt_id is None
+        assert task.lease_attempt_id is not None
         assert db.get(TaskExecutionCommand, accepted.id).status == "failed"
 
 
@@ -139,6 +162,7 @@ def test_stream_reconciliation_reads_current_run_and_output_together(accepted):
         task.status = TaskStatus.COMPLETED
         task.control_state = "completed"
         task.output = "durable complete answer"
+        task.run_id = "run-1"
         db.commit()
     snapshots = load_task_stream_snapshots([accepted.task_id])
     assert len(snapshots) == 1
@@ -163,6 +187,7 @@ def test_existing_execution_accepts_without_another_transcript_row(
         task.status = TaskStatus.COMPLETED
         task.control_state = "completed"
         task.output = "previous answer"
+        db.get(TaskExecutionCommand, accepted.id).status = "completed"
         db.commit()
         owner_id = task.user_id
         before = db.query(TaskChatMessage).filter_by(task_id=task.id).count()
@@ -175,7 +200,7 @@ def test_existing_execution_accepts_without_another_transcript_row(
     )
     with get_session_local()() as db:
         task = db.get(Task, accepted.task_id)
-        assert task.run_id == run_id
+        assert task.run_id != run_id
         assert task.output == "previous answer"
         assert task.runner_id is None
         assert db.query(TaskChatMessage).filter_by(task_id=task.id).count() == before
@@ -199,8 +224,8 @@ async def test_cancellation_after_handoff_still_registers_execution(
     committed, release = threading.Event(), threading.Event()
     original = consumer._commit_handoff
 
-    def slow_handoff(command):
-        handoff = original(command)
+    def slow_handoff(command, lease):
+        handoff = original(command, lease)
         committed.set()
         assert release.wait(5)
         return handoff
@@ -208,7 +233,7 @@ async def test_cancellation_after_handoff_still_registers_execution(
     monkeypatch.setattr(consumer, "_commit_handoff", slow_handoff)
     schedule = AsyncMock()
     monkeypatch.setattr(consumer, "_schedule_committed_turn", schedule)
-    pending = asyncio.create_task(consumer.execute_task_start(accepted))
+    pending = asyncio.create_task(execute_durable_task_command(accepted))
     try:
         assert await asyncio.to_thread(committed.wait, 5)
         pending.cancel()
@@ -245,6 +270,7 @@ def test_shared_acceptance_binds_inputs_and_start_in_one_transaction(
     with get_session_local()() as db:
         task = db.get(Task, accepted.task_id)
         task.status = TaskStatus.COMPLETED
+        db.get(TaskExecutionCommand, accepted.id).status = "completed"
         db.commit()
         stage_runtime_values(
             db,
@@ -293,7 +319,7 @@ def test_terminal_transport_failure_settles_only_its_unowned_run(accepted, repla
     with get_session_local()() as db:
         assert db.get(TaskExecutionCommand, accepted.id).status == "failed"
         assert db.get(Task, accepted.task_id).status == (
-            TaskStatus.RUNNING if replaced else TaskStatus.FAILED
+            TaskStatus.PENDING if replaced else TaskStatus.FAILED
         )
 
 
@@ -313,7 +339,7 @@ def test_expired_claim_cannot_fail_accepted_run(accepted):
         expected_attempt_count=accepted.attempt_count,
     )
     with get_session_local()() as db:
-        assert db.get(Task, accepted.task_id).status == TaskStatus.RUNNING
+        assert db.get(Task, accepted.task_id).status == TaskStatus.PENDING
 
 
 def test_live_owner_routes_controls_even_without_immutable_target(accepted):
@@ -322,7 +348,7 @@ def test_live_owner_routes_controls_even_without_immutable_target(accepted):
         stage_task_command,
     )
 
-    consumer._commit_handoff(accepted)
+    commit_handoff(accepted)
     with get_session_local()() as db:
         task = db.get(Task, accepted.task_id)
         staged = stage_task_command(
@@ -356,7 +382,7 @@ def test_worker_death_after_handoff_recovers_without_replaying_start(accepted):
         recover_expired_task_leases_batch_isolated,
     )
 
-    consumer._commit_handoff(accepted)
+    commit_handoff(accepted)
     with get_session_local()() as db:
         db.get(Task, accepted.task_id).lease_expires_at = datetime.now(
             timezone.utc
@@ -399,7 +425,7 @@ def test_terminal_settlement_deletes_only_accepted_run_values(accepted, monkeypa
             db, task_id=accepted.task_id, turn_id="turn-1", run_id="run-1"
         )
         db.commit()
-    handoff = consumer._commit_handoff(accepted)
+    handoff = commit_handoff(accepted)
     assert settle_task_lease_isolated(
         handoff.claimed.task_lease, error_message="execution failed"
     )
@@ -423,8 +449,8 @@ async def test_following_command_waits_for_start_registration(accepted, monkeypa
     original = consumer._commit_handoff
     registered = False
 
-    def slow_handoff(command):
-        handoff = original(command)
+    def slow_handoff(command, lease):
+        handoff = original(command, lease)
         committed.set()
         assert release.wait(5)
         return handoff
@@ -490,7 +516,7 @@ def test_completion_wait_recovers_owner_lost_after_real_result_finalization(acce
         _PreparedTaskFileOutputs,
     )
 
-    handoff = consumer._commit_handoff(accepted)
+    handoff = commit_handoff(accepted)
     result = _finalize_task_execution_result_isolated(
         task_id=accepted.task_id,
         task_user_id=handoff.task_owner_user_id,
@@ -509,6 +535,10 @@ def test_completion_wait_recovers_owner_lost_after_real_result_finalization(acce
         assert task.runner_id == "worker-1"
         task.lease_expires_at = datetime.now(timezone.utc) - timedelta(minutes=10)
         db.commit()
+    assert not _is_run_finished(accepted.task_id, "run-1")
+    from xagent.web.services.task_lease_recovery import recover_expired_idle_task_leases
+
+    assert recover_expired_idle_task_leases(batch_size=10) == 1
     assert _is_run_finished(accepted.task_id, "run-1")
     with get_session_local()() as db:
         task = db.get(Task, accepted.task_id)

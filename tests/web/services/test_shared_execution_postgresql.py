@@ -12,6 +12,7 @@ from xagent.web.models.database import Base
 from xagent.web.models.task import Task, TaskStatus
 from xagent.web.models.task_command import TaskExecutionCommand
 from xagent.web.models.user import User
+from xagent.web.services import task_coordinator_service as ownership
 from xagent.web.services import task_event_bridge
 from xagent.web.services import task_start_consumer as consumer
 from xagent.web.services.task_command_transport import (
@@ -27,7 +28,6 @@ pytestmark = pytest.mark.postgresql
 def test_postgres_handoff_completion_and_lease_are_atomic(monkeypatch, fail_completion):
     monkeypatch.setenv("XAGENT_SHARED_TASK_EXECUTION_ENABLED", "true")
     monkeypatch.setattr(task_event_bridge, "get_task_event_bridge", lambda: Mock())
-    monkeypatch.setattr(consumer, "get_runner_id", lambda: "worker")
     with disposable_database_factory("shared_worker") as make_database:
         engine = make_database("handoff")
         Base.metadata.create_all(engine)
@@ -56,23 +56,32 @@ def test_postgres_handoff_completion_and_lease_are_atomic(monkeypatch, fail_comp
                 db, runner_id="worker", command_db_id=accepted.command_db_id
             )
             task_id = task.id
+            owner_lease = ownership.acquire_task_lease_no_commit(
+                db, task_id, runner_id="worker"
+            )
+            db.commit()
+        assert owner_lease is not None
         if fail_completion:
             monkeypatch.setattr(
                 consumer, "finish_task_command_no_commit", lambda *args, **kwargs: False
             )
             with pytest.raises(TaskCommandRejected):
-                consumer._commit_handoff(command)
+                consumer._commit_handoff(command, owner_lease)
         else:
-            handoff = consumer._commit_handoff(command)
+            handoff = consumer._commit_handoff(command, owner_lease)
             with pytest.raises(TaskCommandRejected):
-                consumer._commit_handoff(command)
+                consumer._commit_handoff(command, owner_lease)
         with sessions() as db:
             task = db.get(Task, task_id)
             row = db.get(TaskExecutionCommand, command.id)
             if fail_completion:
-                assert task.lease_attempt_id is None
+                assert task.lease_attempt_id == owner_lease.attempt_id
+                assert task.status == TaskStatus.PENDING
+                assert task.run_id is None
                 assert row.status == "processing"
             else:
                 assert task.lease_attempt_id == handoff.claimed.task_lease.attempt_id
+                assert task.run_id == accepted.run_id
+                assert task.status == TaskStatus.RUNNING
                 assert row.status == "completed"
                 assert row.result["lease_attempt_id"] == task.lease_attempt_id

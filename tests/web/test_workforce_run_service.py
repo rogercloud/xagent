@@ -378,24 +378,26 @@ async def test_create_workforce_run_creates_task_run_and_starts_turn(
     )
     db_session.refresh(uploaded_file)
 
-    assert task.status == TaskStatus.RUNNING
+    assert task.status == (TaskStatus.PENDING if shared else TaskStatus.RUNNING)
     assert task.agent_id == manager.id
     assert result.task.agent_id == manager.id
-    assert result.task.run_id == task.run_id
+    assert result.task.run_id == (command.target_run_id if shared else task.run_id)
     assert result.task.state_version == task.state_version
     assert result.task.control_state == task.control_state
     assert task.execution_mode == "think"
-    assert task.input == "Coordinate a launch brief"
+    assert task.input == (None if shared else "Coordinate a launch brief")
     assert task.agent_config["workforce_id"] == workforce.id
     assert task.agent_config["workforce_run_id"] == workforce_run.id
     assert task.agent_config["selected_file_ids"] == ["file-1"]
     assert task.agent_config["workforce_snapshot"]["manager"]["agent_id"] == manager.id
     assert task.connector_runtime_selected_refs == []
     assert workforce_run.task_id == task.id
-    assert workforce_run.status == "running"
+    assert workforce_run.status == ("pending" if shared else "running")
     assert workforce_run.is_preview is False
     assert uploaded_file.task_id == task.id
     if shared:
+        assert task.run_id is None
+        assert result.task.run_id is not None
         assert task.runner_id is None
         assert command.payload["message"] == "Coordinate a launch brief"
         assert command.payload["file_ids"] == ["file-1"]

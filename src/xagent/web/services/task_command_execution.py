@@ -3790,22 +3790,23 @@ async def execute_durable_task_command(
     from ...config import get_shared_task_execution_enabled
     from .task_execution_host import claimed_command_execution
 
+    async def execute() -> dict[str, Any] | None | SettledTaskCommand:
+        with claimed_command_execution():
+            if command.kind == TaskCommandKind.RESUME_INPUT:
+                from .task_resume_command import execute_resume_input
+
+                return await execute_resume_input(command)
+            if command.kind == TaskCommandKind.START:
+                from .task_start_consumer import execute_task_start
+
+                return await execute_task_start(command)
+            return await _execute_and_report_task_command(command)
+
     if get_shared_task_execution_enabled():
-        # A preceding START/RESUME_INPUT can be terminal in the database while
-        # its handler is still registering execution. Wait before any command
-        # effects, then release: ordinary handlers own their nested local gates.
-        async with task_execution_controller.command(command.task_id):
-            pass
-    with claimed_command_execution():
-        if command.kind == TaskCommandKind.RESUME_INPUT:
-            from .task_resume_command import execute_resume_input
+        from .task_coordinator_runtime import execute_coordinated_command
 
-            return await execute_resume_input(command)
-        if command.kind == TaskCommandKind.START:
-            from .task_start_consumer import execute_task_start
-
-            return await execute_task_start(command)
-        return await _execute_and_report_task_command(command)
+        return await execute_coordinated_command(command, execute)
+    return await execute()
 
 
 async def _execute_and_report_task_command(

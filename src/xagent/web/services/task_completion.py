@@ -6,8 +6,8 @@ from sqlalchemy import select
 
 from ..models.database import get_session_local
 from ..models.task import Task, TaskStatus
+from ..models.task_command import TaskExecutionCommand
 from .db_runtime import run_db_io_cancellation_safe
-from .task_coordinator_service import recover_expired_idle_task_lease_no_commit
 
 
 class TaskRunChanged(RuntimeError):
@@ -16,13 +16,21 @@ class TaskRunChanged(RuntimeError):
 
 def _is_run_finished(task_id: int, run_id: str) -> bool:
     with get_session_local()() as db:
-        if recover_expired_idle_task_lease_no_commit(
-            db, task_id, expected_run_id=run_id
-        ):
-            db.commit()
         row = db.execute(
             select(Task.run_id, Task.status, Task.runner_id).where(Task.id == task_id)
         ).first()
+        if row is not None and row.run_id != run_id:
+            command = db.execute(
+                select(TaskExecutionCommand.status).where(
+                    TaskExecutionCommand.task_id == task_id,
+                    TaskExecutionCommand.kind == "start",
+                    TaskExecutionCommand.target_run_id == run_id,
+                )
+            ).scalar_one_or_none()
+            if command in ("pending", "processing"):
+                return False
+            if command == "failed":
+                return True
         if row is None or row.run_id != run_id:
             raise TaskRunChanged(
                 f"Task {task_id} no longer represents the requested run"

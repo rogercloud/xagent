@@ -21,6 +21,7 @@ from ...core.tools.adapters.vibe.connector_runtime import (
 )
 from ..models.database import get_session_local
 from ..models.task import Task, TaskStatus
+from ..models.task_command import TaskExecutionCommand
 from ..models.task_runtime_secret import TaskRuntimeSecret
 from ..models.user import User
 
@@ -110,6 +111,7 @@ def load_runtime_values(
     task: Task,
     turn_id: str | None = None,
     required: bool = False,
+    run_id: str | None = None,
 ) -> dict[str, Any] | None:
     """Read scoped inputs; both configuration and stored-value errors are 503.
 
@@ -117,6 +119,7 @@ def load_runtime_values(
     cannot decrypt the row raises runtime_secret_unavailable, as do missing
     required inputs or mismatched ownership/run bindings.
     """
+    expected_run_id = run_id if run_id is not None else task.run_id
     query = select(TaskRuntimeSecret).where(TaskRuntimeSecret.task_id == task.id)
     if turn_id is not None:
         query = query.where(TaskRuntimeSecret.turn_id == turn_id)
@@ -142,7 +145,7 @@ def load_runtime_values(
     owner = db.execute(
         select(User.actor_subject).where(User.id == task.user_id)
     ).scalar_one_or_none()
-    if owner != row.owner_subject or row.run_id != task.run_id:
+    if owner != row.owner_subject or row.run_id != expected_run_id:
         raise _unavailable()
     try:
         body = json.loads(_runtime_cipher().decrypt(row.ciphertext.encode()))
@@ -200,7 +203,15 @@ def clean_finished_runtime_values(
         page = page.where(TaskRuntimeSecret.task_id == task_id)
     if run_id is not None:
         page = page.where(TaskRuntimeSecret.run_id == run_id)
-    finished = exists(
+    queued = exists(
+        select(TaskExecutionCommand.id).where(
+            TaskExecutionCommand.task_id == TaskRuntimeSecret.task_id,
+            TaskExecutionCommand.kind == "start",
+            TaskExecutionCommand.target_run_id == TaskRuntimeSecret.run_id,
+            TaskExecutionCommand.status.in_(("pending", "processing")),
+        )
+    )
+    finished = ~queued & exists(
         select(Task.id).where(
             Task.id == TaskRuntimeSecret.task_id,
             TaskRuntimeSecret.run_id.is_distinct_from(Task.run_id)

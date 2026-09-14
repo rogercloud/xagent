@@ -261,6 +261,8 @@ def test_missing_accepted_values_fail_even_when_optional(task_id):
 
     with get_session_local()() as db:
         task = db.get(Task, task_id)
+        task.status = TaskStatus.PENDING
+        task.run_id = None
         stage_task_start_command(
             db,
             task_id=task_id,
@@ -275,6 +277,8 @@ def test_missing_accepted_values_fail_even_when_optional(task_id):
                 runtime_values_ref="turn-1",
             ),
         )
+        task.status = TaskStatus.RUNNING
+        task.run_id = "run-1"
         db.commit()
     with get_session_local()() as db:
         with pytest.raises(ConnectorRuntimeError) as error:

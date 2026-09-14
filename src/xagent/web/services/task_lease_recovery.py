@@ -337,6 +337,9 @@ async def run_task_lease_recovery_loop(
             if get_shared_task_execution_enabled():
                 from .task_runtime_secrets import clean_finished_runtime_values
 
+                await run_db_io_cancellation_safe(
+                    lambda: recover_expired_idle_task_leases(batch_size=batch_size)
+                )
                 secret_cursor = await run_db_io_cancellation_safe(
                     lambda: clean_finished_runtime_values(
                         after_id=secret_cursor, batch_size=batch_size
@@ -353,3 +356,31 @@ async def run_task_lease_recovery_loop(
                 logger.exception("Task lease recovery tick failed")
 
         await asyncio.sleep(poll_interval_seconds)
+
+
+def recover_expired_idle_task_leases(*, batch_size: int) -> int:
+    """Recover a bounded page of expired owners whose execution already settled."""
+    from sqlalchemy import select
+
+    from ..models.database import get_session_local
+    from .task_coordinator_service import recover_expired_idle_task_lease_no_commit
+
+    with get_session_local()() as db:
+        candidates = (
+            db.execute(
+                select(Task.id)
+                .where(
+                    Task.status != TaskStatus.RUNNING,
+                    Task.lease_expires_at < utc_now(),
+                )
+                .order_by(Task.lease_expires_at, Task.id)
+                .limit(batch_size)
+            )
+            .scalars()
+            .all()
+        )
+    recovered = 0
+    for task_id in candidates:
+        with get_session_local()() as db, db.begin():
+            recovered += recover_expired_idle_task_lease_no_commit(db, task_id)
+    return recovered

@@ -9,6 +9,7 @@ from xagent.web.models.database import Base, get_engine, get_session_local, init
 from xagent.web.models.task import Task, TaskStatus
 from xagent.web.models.task_command import TaskExecutionCommand
 from xagent.web.models.user import User
+from xagent.web.services import task_coordinator_service as ownership
 from xagent.web.services import task_event_bridge, task_start_consumer
 from xagent.web.services.mcp_runtime import (
     MCPActorAuthorizationPolicy,
@@ -33,7 +34,6 @@ def actor_task(tmp_path, monkeypatch):
         "get_task_event_bridge",
         lambda: SimpleNamespace(require_ready=Mock()),
     )
-    monkeypatch.setattr(task_start_consumer, "get_runner_id", lambda: "worker")
     init_db(db_url=f"sqlite:///{tmp_path / 'actor.db'}")
     with get_session_local()() as db:
         user = User(username="owner", password_hash="unused")
@@ -72,7 +72,12 @@ def test_trusted_actor_reference_is_committed_before_start_and_reconstructed(
         row = db.get(TaskExecutionCommand, accepted.command_db_id)
         assert "actor:test" not in str(row.payload)
         claim = claim_task_command(db, runner_id="worker", command_db_id=row.id)
-    handoff = task_start_consumer._commit_handoff(claim)
+        owner_lease = ownership.acquire_task_lease_no_commit(
+            db, task_id, runner_id="worker"
+        )
+        db.commit()
+    assert owner_lease is not None
+    handoff = task_start_consumer._commit_handoff(claim, owner_lease)
     assert handoff.actor_policy == policy
     assert handoff.actor_policy is not policy
 

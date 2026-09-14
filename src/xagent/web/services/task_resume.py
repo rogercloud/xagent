@@ -54,7 +54,11 @@ logger = logging.getLogger(__name__)
 
 
 class TaskResumeOutcomeUnknownError(Exception):
-    """An accepted reply is still pending; callers must check status before resending."""
+    """The accepted reply may have applied; only its original identity is safe."""
+
+    def __init__(self, command_id: str | None = None):
+        self.command_id = command_id
+        super().__init__("The accepted reply's outcome is not yet known")
 
 
 class TaskResumeBusyError(Exception):
@@ -83,6 +87,8 @@ class TaskReplyInput:
     run_id: str | None
     status: TaskStatus
     text: str
+    actor_user_id: int
+    command_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -92,6 +98,7 @@ class TaskReplyResumeResult:
     run_id: str
     state_version: int
     control_state: str
+    command_id: str | None = None
 
 
 # Control states a waiting task may be claimed from. Mirrors the a2a
@@ -391,6 +398,7 @@ async def resume_a2a_task(
                 task_id=task_id,
                 agent_id=agent_id,
                 task_owner_user_id=task_owner_user_id,
+                actor_user_id=task_owner_user_id,
                 run_id=previous_run_id,
                 status=resumable_status,
                 text=text,
@@ -421,6 +429,7 @@ async def resume_a2a_task(
     )
     ownership_transferred = False
     message_posted = False
+    injection_started = False
     prelease_cleanup_done = False
 
     async def stop_and_restore_prelease() -> bool:
@@ -503,6 +512,7 @@ async def resume_a2a_task(
             assert_never(active_interaction_read)
 
         async def inject_user_message() -> tuple[Any, UserMessageInjectionOutcome]:
+            nonlocal injection_started
             from .agent_service_manager import get_agent_manager
 
             agent_service = await get_agent_manager().get_agent_for_task(
@@ -510,6 +520,7 @@ async def resume_a2a_task(
                 None,
                 task_owner_user_id=task_owner_user_id,
             )
+            injection_started = True
             posted = await agent_service.post_user_message(
                 str(task_id),
                 execution_message=text,
@@ -560,6 +571,13 @@ async def resume_a2a_task(
         )
         ownership_transferred = True
     except CheckpointReadError as exc:
+        if preacquired_lease is not None and message_posted:
+            from .task_coordinator_runtime import current_task_coordinator
+
+            coordinator = current_task_coordinator(task_id)
+            assert coordinator is not None
+            coordinator.require_recovery()
+            raise TaskResumeOutcomeUnknownError(message_id) from exc
         # Ownership was never transferred, so restore the exact prelease
         # to the prior input-required status exactly like the absent-
         # checkpoint fallback above, then let the API translate the failure.
@@ -576,7 +594,21 @@ async def resume_a2a_task(
                 # the context. A read failure here did not inject this reply.
                 raise TaskResumeRetryableError(str(exc)) from exc
         raise
-    except BaseException:
+    except BaseException as exc:
+        if (
+            preacquired_lease is not None
+            and injection_started
+            and not ownership_transferred
+            and not prelease_cleanup_done
+        ):
+            from .task_coordinator_runtime import current_task_coordinator
+
+            coordinator = current_task_coordinator(task_id)
+            assert coordinator is not None
+            coordinator.require_recovery()
+            await stop_task_lease_heartbeat(heartbeat_task, heartbeat_stop)
+            prelease_cleanup_done = True
+            raise TaskResumeOutcomeUnknownError(message_id) from exc
         if not ownership_transferred and not prelease_cleanup_done:
             cleanup_task = asyncio.create_task(stop_and_restore_prelease())
             await drain_async_task_cancellation_safe(cleanup_task)
@@ -871,6 +903,12 @@ async def resume_task_reply(
     client-message deduplication. The observed status preserves the initial
     rejection semantics; the subsequent conditional claim checks current state.
     """
+    from .task_execution_host import enqueues_task_turns
+
+    if enqueues_task_turns() and preacquired_lease is None:
+        from .task_resume_command import enqueue_resume_input
+
+        return await enqueue_resume_input(ctx, source="sdk", message_id="")
     task_id = ctx.task_id
     # RUNNING is transient: a turn is in flight, so retrying later can
     # succeed (task_busy). Other non-waiting states have no interaction to
@@ -882,12 +920,6 @@ async def resume_task_reply(
             raise TaskResumeBusyError
         raise TaskResumeNotWaitingError
 
-    from .task_execution_host import enqueues_task_turns
-
-    if enqueues_task_turns() and preacquired_lease is None:
-        from .task_resume_command import enqueue_resume_input
-
-        return await enqueue_resume_input(ctx, source="sdk", message_id="")
     prelease_info: dict[str, Any] = preacquired_state or {}
     task_lease = preacquired_lease or await acquire_task_lease_cancellation_safe(
         lambda: _acquire_reply_prelease_sync(
@@ -906,6 +938,8 @@ async def resume_task_reply(
         run_task_lease_heartbeat(task_lease, heartbeat_stop)
     )
     ownership_transferred = False
+    message_posted = False
+    injection_started = False
     prelease_cleanup_done = False
 
     async def stop_and_restore_prelease() -> bool:
@@ -973,6 +1007,7 @@ async def resume_task_reply(
             assert_never(active_interaction_read)
 
         async def inject_user_message() -> tuple[Any, bool]:
+            nonlocal injection_started
             agent_service = (
                 await agent_runtime_service.get_agent_manager().get_agent_for_task(
                     task_id,
@@ -980,6 +1015,7 @@ async def resume_task_reply(
                     task_owner_user_id=ctx.task_owner_user_id,
                 )
             )
+            injection_started = True
             posted = await agent_service.post_user_message(
                 str(task_id),
                 execution_message=ctx.text,
@@ -996,6 +1032,7 @@ async def resume_task_reply(
                 heartbeat_task,
             )
 
+        message_posted = bool(posted)
         if not posted:
             # No run-fenced checkpoint is available to resume onto. Never
             # fabricate a run or fall back to a transcript replay: release
@@ -1028,6 +1065,13 @@ async def resume_task_reply(
         )
         ownership_transferred = True
     except CheckpointReadError as exc:
+        if preacquired_lease is not None and message_posted:
+            from .task_coordinator_runtime import current_task_coordinator
+
+            coordinator = current_task_coordinator(task_id)
+            assert coordinator is not None
+            coordinator.require_recovery()
+            raise TaskResumeOutcomeUnknownError(turn_id) from exc
         if not ownership_transferred and not prelease_cleanup_done:
             cleanup_task = asyncio.create_task(stop_and_restore_prelease())
             if not await drain_async_task_cancellation_safe(cleanup_task):
@@ -1035,8 +1079,26 @@ async def resume_task_reply(
                     f"Task {task_id} lease changed before reply "
                     "checkpoint-failure fallback"
                 ) from exc
+        if not message_posted and isinstance(exc, CheckpointUnavailableError):
+            raise TaskResumeRetryableError(str(exc)) from exc
         raise
-    except BaseException:
+    except BaseException as exc:
+        if (
+            preacquired_lease is not None
+            and injection_started
+            and not ownership_transferred
+            and not prelease_cleanup_done
+        ):
+            # Injection was accepted, but its projection/scheduling did not
+            # settle. Do not restore WAITING or admit a fresh reply.
+            from .task_coordinator_runtime import current_task_coordinator
+
+            coordinator = current_task_coordinator(task_id)
+            assert coordinator is not None
+            coordinator.require_recovery()
+            await stop_task_lease_heartbeat(heartbeat_task, heartbeat_stop)
+            prelease_cleanup_done = True
+            raise TaskResumeOutcomeUnknownError(turn_id) from exc
         if not ownership_transferred and not prelease_cleanup_done:
             cleanup_task = asyncio.create_task(stop_and_restore_prelease())
             await drain_async_task_cancellation_safe(cleanup_task)

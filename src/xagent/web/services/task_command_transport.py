@@ -325,6 +325,40 @@ def _resolve_actor_subject(db: Session, actor_user_id: int | None) -> str | None
     return _load_actor_subject(db, actor_user_id)
 
 
+def command_identity_matches_task(
+    db: Session, task: Task, command: TaskExecutionCommand
+) -> bool:
+    """Revalidate the accepted actor and owner separately at execution time."""
+    from ..models.agent import Agent
+
+    owner = db.get(User, task.user_id)
+    actor = (
+        db.get(User, command.actor_user_id)
+        if command.actor_user_id is not None
+        else None
+    )
+    return bool(
+        owner is not None
+        and owner.actor_subject == command.task_owner_subject
+        and owner.id == command.task_owner_user_id
+        and actor is not None
+        and actor.actor_subject == command.actor_subject
+        and (
+            actor.id == owner.id
+            or actor.is_admin
+            or (
+                task.source == "sdk"
+                and db.execute(
+                    select(Agent.id).where(
+                        Agent.id == task.agent_id, Agent.user_id == actor.id
+                    )
+                ).scalar_one_or_none()
+                is not None
+            )
+        )
+    )
+
+
 def stage_task_command(
     db: Session,
     *,
@@ -335,6 +369,7 @@ def stage_task_command(
     payload: dict[str, Any],
     reply_host_id: str | None = None,
     reply_origin: str | None = None,
+    target_run_id: str | None = None,
 ) -> StagedTaskCommand:
     """Add an idempotent command row to the session without ending its transaction.
 
@@ -469,7 +504,7 @@ def stage_task_command(
         command_id=normalized_id,
         kind=kind.value,
         payload=payload,
-        target_run_id=snapshot.run_id,
+        target_run_id=target_run_id if target_run_id is not None else snapshot.run_id,
         target_state_version=int(snapshot.state_version or 0),
         target_runner_id=active_runner_id,
         reply_host_id=reply_host_id,
@@ -1028,10 +1063,6 @@ def fail_task_command(
                     from .task_start_consumer import settle_failed_start_no_commit
 
                     settle_failed_start_no_commit(db, handoff)
-                else:
-                    from .task_resume_command import settle_failed_reply_no_commit
-
-                    settle_failed_reply_no_commit(db, handoff)
             stage_terminal_event(
                 db,
                 command_db_id=command_db_id,

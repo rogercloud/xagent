@@ -48,7 +48,7 @@ import asyncio
 import enum
 import logging
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 from uuid import uuid4
@@ -1093,6 +1093,38 @@ def _task_requires_actor_policy_sync(
         return _task_requires_actor_policy(db, task_id, task_owner_user_id)
 
 
+def reserve_task_start_no_commit(
+    db: Session,
+    *,
+    task_id: int,
+    task_owner_user_id: int,
+    statuses: tuple[TaskStatus, ...],
+) -> bool:
+    """Lock admission without replacing the run or the owner still draining it."""
+    from sqlalchemy import exists, select
+
+    from ..models.task_command import TaskExecutionCommand
+
+    pending_start = exists(
+        select(1).where(
+            TaskExecutionCommand.task_id == task_id,
+            TaskExecutionCommand.kind == "start",
+            TaskExecutionCommand.status.in_(("pending", "processing")),
+        )
+    )
+    return (
+        db.query(Task)
+        .filter(
+            Task.id == task_id,
+            Task.user_id == task_owner_user_id,
+            Task.status.in_(statuses),
+            ~pending_start,
+        )
+        .update({Task.updated_at: Task.updated_at}, synchronize_session=False)
+        == 1
+    )
+
+
 def _accept_turn_no_commit(
     db: Session,
     task_id: int,
@@ -1115,33 +1147,57 @@ def _accept_turn_no_commit(
     else:  # APPEND
         status_filter = Task.status.in_(_APPENDABLE_STATUSES)
 
+    from .task_coordinator_runtime import current_task_coordinator
+
     run_id = str(uuid4())
-    claimed = (
-        db.query(Task)
-        .filter(
-            Task.id == task_id,
-            Task.user_id == task_owner_user_id,
-            status_filter,
+    queued = enqueues_task_turns()
+    if queued:
+        claimed: int = reserve_task_start_no_commit(
+            db,
+            task_id=task_id,
+            task_owner_user_id=task_owner_user_id,
+            statuses=(TaskStatus.PENDING,)
+            if kind == TurnKind.CREATE
+            else tuple(_APPENDABLE_STATUSES),
         )
-        .update(
-            {
-                Task.status: TaskStatus.RUNNING,
-                Task.input: payload.transcript_message,
-                Task.output: None,
-                Task.error_message: None,
-                Task.runner_id: None,
-                Task.lease_attempt_id: None,
-                Task.lease_expires_at: None,
-                Task.last_heartbeat_at: None,
-                Task.run_id: run_id,
-                Task.last_checkpoint_event_id: None,
-                Task.last_checkpoint_trace_event_id: None,
-                Task.state_version: func.coalesce(Task.state_version, 0) + 1,
-                Task.control_state: TaskControlState.RUNNING.value,
-            },
-            synchronize_session=False,
+    else:
+        values = {
+            Task.status: TaskStatus.RUNNING,
+            Task.input: payload.transcript_message,
+            Task.output: None,
+            Task.error_message: None,
+            Task.run_id: run_id,
+            Task.last_checkpoint_event_id: None,
+            Task.last_checkpoint_trace_event_id: None,
+            Task.state_version: func.coalesce(Task.state_version, 0) + 1,
+            Task.control_state: TaskControlState.RUNNING.value,
+        }
+        coordinator = current_task_coordinator(task_id)
+        predicates = []
+        if coordinator is not None:
+            from .task_coordinator_service import task_lease_predicate
+
+            assert coordinator.lease is not None
+            predicates.append(task_lease_predicate(coordinator.lease))
+        else:
+            values.update(
+                {
+                    Task.runner_id: None,
+                    Task.lease_attempt_id: None,
+                    Task.lease_expires_at: None,
+                    Task.last_heartbeat_at: None,
+                }
+            )
+        claimed = (
+            db.query(Task)
+            .filter(
+                Task.id == task_id,
+                Task.user_id == task_owner_user_id,
+                status_filter,
+                *predicates,
+            )
+            .update(values, synchronize_session=False)
         )
-    )
     if claimed == 0:
         owned = (
             db.query(Task.id, Task.status)
@@ -1194,16 +1250,13 @@ def _accept_turn_no_commit(
         # otherwise arrive after completion and resurrect the projection.
         from .workforce_runtime import sync_workforce_run_status
 
-        claimed_task = (
-            db.query(Task)
-            .filter(
-                Task.id == task_id,
-                Task.status == TaskStatus.RUNNING,
-                Task.run_id == run_id,
+        if not queued:
+            claimed_task = (
+                db.query(Task).filter(Task.id == task_id, Task.run_id == run_id).one()
             )
-            .one()
-        )
-        sync_workforce_run_status(db, claimed_task, TaskStatus.RUNNING)
+            sync_workforce_run_status(db, claimed_task, TaskStatus.RUNNING)
+    if queued:
+        return replace(result, run_id=run_id, status=TaskStatus.PENDING)
     return result
 
 
@@ -1265,6 +1318,7 @@ def _claim_turn_no_commit(
         start = TaskStartPayload(
             version=1,
             run_id=accepted.run_id,
+            expected_run_id=db.query(Task.run_id).filter(Task.id == task_id).scalar(),
             state_version=accepted.state_version,
             turn_id=payload.turn_id,
             kind=kind.value,
@@ -1907,7 +1961,10 @@ def _schedule_bg(
     runs later as its own task). Being sync removes a misleading
     suspension/cancellation point right after ``begin_turn``'s claim commit.
 
-    Owns the full lease lifecycle for the bg run:
+    Under shared coordination, the registered outer handle keeps the owner
+    alive through cleanup. Heartbeat calls observe that owner and finalization
+    settles business state without releasing it. Outside coordinator context,
+    this scheduler owns the local lease lifecycle:
 
       - primary turn claims supply the exact lease committed with the turn
         state. Delayed execution validates that same run/runner fence before

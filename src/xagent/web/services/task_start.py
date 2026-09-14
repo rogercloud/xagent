@@ -585,7 +585,8 @@ async def append_sdk_turn(
         # the domain-owned transaction stages any append mutation. The atomic
         # status predicate inside the transaction remains authoritative across
         # workers and concurrent requests.
-        TaskTurnOrchestrator.ensure_no_background_turn(task_id)
+        if not get_shared_task_execution_enabled():
+            TaskTurnOrchestrator.ensure_no_background_turn(task_id)
         prepared = await run_db_io_cancellation_safe(
             lambda: _prepare_append_turn_isolated(
                 actor_user_id=actor_user_id,

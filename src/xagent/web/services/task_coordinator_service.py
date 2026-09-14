@@ -1,7 +1,6 @@
 """Task ownership primitives for the Phase B coordinator.
 
-The command dispatcher is not wired to these primitives yet. A coordinator
-owns one TaskLease; execution writers additionally carry a fixed run in a
+A coordinator owns one TaskLease; execution writers additionally carry a fixed run in a
 TaskExecutionContext. All database operations participate in the caller's
 transaction, including command receipts and execution-state transitions.
 """
@@ -139,6 +138,7 @@ def begin_task_execution_no_commit(
     *,
     expected: TaskControlSnapshot,
     new_run: bool,
+    run_id: str | None = None,
 ) -> TaskExecutionContext | None:
     """Enter an admitted run without replacing the coordinator's acquisition.
 
@@ -148,7 +148,7 @@ def begin_task_execution_no_commit(
     """
     if not new_run and expected.run_id is None:
         raise ValueError("Resuming execution requires an existing run_id")
-    run_id = str(uuid4()) if new_run else expected.run_id
+    run_id = (run_id or str(uuid4())) if new_run else expected.run_id
     control_state = TaskControlState.RUNNING.value
     values = {
         "status": task_status_predicate.value(TaskStatus.RUNNING),

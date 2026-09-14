@@ -206,8 +206,8 @@ _DEFAULT_MESSAGES: dict[V1ErrorCode, str] = {
         "This task has no pending question to answer."
     ),
     V1ErrorCode.REPLY_OUTCOME_UNKNOWN: (
-        "Reply was accepted but preparation has not finished. "
-        "Check task status before sending another reply."
+        "Reply was accepted but its outcome is not yet known. "
+        "Repeat the same command_id to check its outcome; do not send a new reply."
     ),
     V1ErrorCode.TEMPORARILY_UNAVAILABLE: (
         "The task's saved progress could not be read. Please retry."

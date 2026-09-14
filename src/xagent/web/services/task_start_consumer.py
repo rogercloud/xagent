@@ -13,7 +13,6 @@ from sqlalchemy import exists, func, select
 from sqlalchemy.orm import Session
 
 from ...core.tools.adapters.vibe.connector_runtime import ConnectorRuntimeError
-from ..models.agent import Agent
 from ..models.chat_message import TaskChatMessage
 from ..models.database import get_session_local
 from ..models.task import Task, TaskStatus
@@ -34,9 +33,16 @@ from .task_command_transport import (
     ClaimedTaskCommand,
     SettledTaskCommand,
     TaskCommandRejected,
+    command_identity_matches_task,
     finish_task_command_no_commit,
 )
-from .task_lease_service import TaskLease, acquire_task_lease_no_commit, get_runner_id
+from .task_coordinator_service import TaskLease as TaskOwnerLease
+from .task_coordinator_service import (
+    begin_task_execution_no_commit,
+    lock_task_lease_no_commit,
+)
+from .task_execution_controller import task_control_snapshot
+from .task_lease_service import TaskLease
 from .task_orchestrator import (
     TaskTurnPayload,
     TurnKind,
@@ -112,14 +118,20 @@ def reconcile_start_acceptance(
         )
         if bound != len(set(payload.file_ids)):
             return False
-        if (
-            command.payload.get("runtime_values_ref") is not None
-            and task.run_id == accepted.run_id
-            and task.status not in (TaskStatus.COMPLETED, TaskStatus.FAILED)
+        if command.payload.get("runtime_values_ref") is not None and (
+            command.status in ("pending", "processing")
+            or (
+                task.run_id == accepted.run_id
+                and task.status not in (TaskStatus.COMPLETED, TaskStatus.FAILED)
+            )
         ):
             try:
                 load_runtime_values(
-                    db, task=task, turn_id=payload.turn_id, required=True
+                    db,
+                    task=task,
+                    turn_id=payload.turn_id,
+                    required=True,
+                    run_id=accepted.run_id,
                 )
             except ConnectorRuntimeError:
                 return False
@@ -165,23 +177,25 @@ def _reject_start(
 
 
 def settle_failed_start_no_commit(db: Session, row: TaskExecutionCommand) -> None:
-    """Settle only the unowned acceptance after its command is made terminal.
-
-    The caller locks the task before completing the command and commits both
-    writes together. The exact run/version fence preserves replacement runs.
-    """
+    """Reject the accepted input, preserving any previous run and its owner."""
+    mark_user_message_delivery(
+        db,
+        task_id=int(row.task_id),
+        turn_id=str(row.command_id),
+        status=DELIVERY_FAILED,
+    )
+    delete_runtime_values_no_commit(
+        db, task_id=int(row.task_id), turn_id=str(row.command_id)
+    )
+    # A never-started new Task needs a terminal result. An append's failure
+    # belongs to its command and must not overwrite the previous run's result.
     changed = (
         db.query(Task)
         .filter(
             Task.id == row.task_id,
-            Task.run_id == row.target_run_id,
+            Task.run_id == row.payload.get("expected_run_id"),
             Task.state_version == row.target_state_version,
-            Task.status == TaskStatus.RUNNING,
-            Task.control_state == "running",
-            Task.runner_id.is_(None),
-            Task.lease_attempt_id.is_(None),
-            Task.lease_expires_at.is_(None),
-            Task.last_heartbeat_at.is_(None),
+            Task.status == TaskStatus.PENDING,
             exists(
                 select(1).where(
                     TaskExecutionCommand.id == row.id,
@@ -200,21 +214,12 @@ def settle_failed_start_no_commit(db: Session, row: TaskExecutionCommand) -> Non
         )
     )
     if changed:
-        task = db.get(Task, row.task_id)
-        assert task is not None
-        db.refresh(task)
-        mark_user_message_delivery(
-            db,
-            task_id=int(task.id),
-            turn_id=str(row.command_id),
-            status=DELIVERY_FAILED,
-        )
-        delete_runtime_values_no_commit(
-            db, task_id=int(task.id), turn_id=str(row.command_id)
-        )
         from .task_orchestrator import sync_trigger_run_status
         from .workforce_runtime import sync_workforce_run_status
 
+        task = db.get(Task, row.task_id)
+        assert task is not None
+        db.refresh(task)
         sync_workforce_run_status(db, task, TaskStatus.FAILED)
         sync_trigger_run_status(
             db,
@@ -224,10 +229,14 @@ def settle_failed_start_no_commit(db: Session, row: TaskExecutionCommand) -> Non
         )
 
 
-def _commit_handoff(command: ClaimedTaskCommand) -> _StartHandoff | SettledTaskCommand:
+def _commit_handoff(
+    command: ClaimedTaskCommand, owner_lease: TaskOwnerLease
+) -> _StartHandoff | SettledTaskCommand:
     db = get_session_local()()
-    runner = get_runner_id()
+    runner = owner_lease.runner_id
     try:
+        if not lock_task_lease_no_commit(db, owner_lease):
+            raise TaskCommandRejected("Task owner changed", reason="stale_owner")
         # Same lock order as acceptance. On SQLite the CAS and subsequent
         # command completion are covered by the writer transaction instead.
         task = db.execute(
@@ -252,33 +261,17 @@ def _commit_handoff(command: ClaimedTaskCommand) -> _StartHandoff | SettledTaskC
             start = read_task_start_command(command)
         except (ValidationError, ValueError):
             return _reject_start(db, row, "invalid_start")
-        owner = db.get(User, task.user_id)
-        actor = (
-            db.get(User, row.actor_user_id) if row.actor_user_id is not None else None
-        )
-        if (
-            owner is None
-            or owner.actor_subject != row.task_owner_subject
-            or task.user_id != row.task_owner_user_id
-            or actor is None
-            or actor.actor_subject != row.actor_subject
-            or (
-                actor.id != owner.id
-                and not actor.is_admin
-                and not (
-                    task.source == "sdk"
-                    and db.execute(
-                        select(Agent.id).where(
-                            Agent.id == task.agent_id, Agent.user_id == actor.id
-                        )
-                    ).scalar_one_or_none()
-                    is not None
-                )
-            )
-        ):
+        if not command_identity_matches_task(db, task, row):
             return _reject_start(db, row, "start_identity_changed")
         if row.target_state_version != start.state_version:
             return _reject_start(db, row, "invalid_start_version")
+        if (
+            task.run_id != start.expected_run_id
+            or task.state_version != start.state_version
+            or task.status == TaskStatus.RUNNING
+            or (start.kind == "create" and task.status != TaskStatus.PENDING)
+        ):
+            return _reject_start(db, row, "start_state_changed")
         try:
             actor_policy = load_shared_actor_policy(
                 task, is_create=start.kind == "create"
@@ -288,39 +281,36 @@ def _commit_handoff(command: ClaimedTaskCommand) -> _StartHandoff | SettledTaskC
         try:
             if start.runtime_values_ref is not None:
                 load_runtime_values(
-                    db, task=task, turn_id=start.runtime_values_ref, required=True
+                    db,
+                    task=task,
+                    turn_id=start.runtime_values_ref,
+                    required=True,
+                    run_id=start.run_id,
                 )
         except ConnectorRuntimeError:
             # Never expose decryption details or permit missing optional
             # secrets to silently change the accepted execution input.
             return _reject_start(db, row, "runtime_values_unavailable")
-        owns_claim = exists(
-            select(1).where(
-                TaskExecutionCommand.id == command.id,
-                TaskExecutionCommand.status == COMMAND_PROCESSING,
-                TaskExecutionCommand.claimed_by == runner,
-                TaskExecutionCommand.attempt_count == command.attempt_count,
-                TaskExecutionCommand.claim_expires_at > datetime.now(timezone.utc),
-            )
-        )
-        lease = acquire_task_lease_no_commit(
+        execution = begin_task_execution_no_commit(
             db,
-            int(task.id),
-            runner_id=runner,
-            expected_run_id=start.run_id,
-            expected_status=TaskStatus.RUNNING,
-            claim_predicates=(
-                Task.state_version == start.state_version,
-                Task.control_state == "running",
-                Task.runner_id.is_(None),
-                Task.lease_attempt_id.is_(None),
-                Task.lease_expires_at.is_(None),
-                Task.last_heartbeat_at.is_(None),
-                owns_claim,
-            ),
+            owner_lease,
+            expected=task_control_snapshot(task),
+            new_run=True,
+            run_id=start.run_id,
         )
-        if lease is None:
-            return _reject_start(db, row, "start_no_longer_unowned")
+        if execution is None:
+            return _reject_start(db, row, "start_state_changed")
+        db.refresh(task)
+        setattr(task, "input", start.message)
+        from .workforce_runtime import sync_workforce_run_status
+
+        sync_workforce_run_status(db, task, TaskStatus.RUNNING)
+        lease = TaskLease(
+            task_id=owner_lease.task_id,
+            runner_id=owner_lease.runner_id,
+            attempt_id=owner_lease.attempt_id,
+            run_id=execution.run_id,
+        )
         result = {"run_id": start.run_id, "lease_attempt_id": lease.attempt_id}
         if not finish_task_command_no_commit(
             db,
@@ -344,7 +334,7 @@ def _commit_handoff(command: ClaimedTaskCommand) -> _StartHandoff | SettledTaskC
                 before_message_id=start.before_message_id,
                 task_source=cast(str | None, task.source),
                 run_id=start.run_id,
-                state_version=start.state_version,
+                state_version=int(task.state_version),
                 control_state="running",
                 agent_config=cast(dict[str, Any] | None, task.agent_config),
                 task_lease=lease,
@@ -393,7 +383,14 @@ async def _execute_task_start(command: ClaimedTaskCommand) -> SettledTaskCommand
     # Command completion releases the durable queue before registration.
     # Keep the local handoff barrier until the exact execution is registered.
     async with task_execution_controller.command(command.task_id):
-        handoff = await run_db_io_cancellation_safe(lambda: _commit_handoff(command))
+        from .task_coordinator_runtime import current_task_coordinator
+
+        coordinator = current_task_coordinator(command.task_id)
+        assert coordinator is not None and coordinator.lease is not None
+        owner_lease = coordinator.lease
+        handoff = await run_db_io_cancellation_safe(
+            lambda: _commit_handoff(command, owner_lease)
+        )
         if isinstance(handoff, SettledTaskCommand):
             return handoff
         start = handoff.start

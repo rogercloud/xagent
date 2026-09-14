@@ -9,15 +9,13 @@ from typing import Annotated, Any, Literal, Self, cast
 from uuid import NAMESPACE_URL, uuid4, uuid5
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
-from sqlalchemy import and_, exists, func, or_, select
-from sqlalchemy.orm import Session
+from sqlalchemy import exists, select
 
 from ...config import get_task_lease_ttl_seconds, get_task_reply_wait_timeout_seconds
 from ...core.agent.checkpoint import (
     CheckpointAccessRefusedError,
     CheckpointCorruptError,
     CheckpointReadError,
-    CheckpointUnavailableError,
 )
 from ..models.database import get_session_local
 from ..models.task import Task, TaskStatus
@@ -33,11 +31,18 @@ from .task_command_transport import (
     SettledTaskCommand,
     TaskCommandKind,
     TaskCommandRejected,
+    command_identity_matches_task,
     finish_task_command_no_commit,
     notify_task_command_dispatcher,
     stage_task_command,
 )
-from .task_lease_service import TaskLease, acquire_task_lease_no_commit, get_runner_id
+from .task_coordinator_service import TaskLease as TaskOwnerLease
+from .task_coordinator_service import (
+    begin_task_execution_no_commit,
+    lock_task_lease_no_commit,
+)
+from .task_execution_controller import task_control_snapshot
+from .task_lease_service import TaskLease
 from .task_resume import (
     TaskReplyInput,
     TaskReplyResumeResult,
@@ -70,17 +75,6 @@ class ResumeInput(BaseModel):
 def _admit_reply(
     ctx: TaskReplyInput, source: Literal["sdk", "a2a"], message_id: str, command_id: str
 ) -> int:
-    if ctx.run_id is None:
-        raise TaskResumeNotResumableError
-    payload = ResumeInput(
-        version=1,
-        source=source,
-        run_id=ctx.run_id,
-        agent_id=ctx.agent_id,
-        prior_status=cast(Literal["paused", "waiting_for_user"], ctx.status.value),
-        text=ctx.text,
-        message_id=message_id,
-    )
     with get_session_local()() as db:
         task = db.execute(
             select(Task).where(Task.id == ctx.task_id).with_for_update()
@@ -103,11 +97,15 @@ def _admit_reply(
             owner = db.get(User, task.user_id)
             if (
                 owner is None
-                or existing.actor_user_id != owner.id
+                or existing.kind != TaskCommandKind.RESUME_INPUT.value
+                or existing.actor_user_id != ctx.actor_user_id
                 or existing.task_owner_user_id != owner.id
-                or existing.actor_subject != owner.actor_subject
                 or existing.task_owner_subject != owner.actor_subject
-                or existing.payload != payload.model_dump(mode="json")
+                or not command_identity_matches_task(db, task, existing)
+                or existing.payload.get("text") != ctx.text
+                or existing.payload.get("agent_id") != ctx.agent_id
+                or existing.payload.get("source") != source
+                or existing.payload.get("message_id") != message_id
             ):
                 raise TaskResumeBusyError
             if (
@@ -123,47 +121,53 @@ def _admit_reply(
                 ).hex
                 continue
             return int(existing.id)
+        if ctx.status != TaskStatus.WAITING_FOR_USER and source == "sdk":
+            if ctx.status == TaskStatus.RUNNING:
+                raise TaskResumeBusyError
+            from .task_resume import TaskResumeNotWaitingError
+
+            raise TaskResumeNotWaitingError
+        if ctx.run_id is None:
+            raise TaskResumeNotResumableError
+        payload = ResumeInput(
+            version=1,
+            source=source,
+            run_id=ctx.run_id,
+            agent_id=ctx.agent_id,
+            prior_status=cast(Literal["paused", "waiting_for_user"], ctx.status.value),
+            text=ctx.text,
+            message_id=message_id,
+        )
+        pending_reply = exists(
+            select(1).where(
+                TaskExecutionCommand.task_id == ctx.task_id,
+                TaskExecutionCommand.kind == TaskCommandKind.RESUME_INPUT.value,
+                TaskExecutionCommand.status.in_(("pending", "processing")),
+            )
+        )
         changed = (
             db.query(Task)
             .filter(
                 Task.id == ctx.task_id,
                 Task.run_id == ctx.run_id,
                 Task.status == ctx.status,
-                # Wait for live owners to finish. Reclaim an expired resting
-                # lease here: the recovery sweep only scans RUNNING tasks.
-                or_(
-                    and_(
-                        Task.runner_id.is_(None),
-                        Task.lease_attempt_id.is_(None),
-                        Task.lease_expires_at.is_(None),
-                    ),
-                    Task.lease_expires_at < datetime.now(timezone.utc),
-                ),
                 Task.control_state.in_(("idle", ctx.status.value)),
+                ~pending_reply,
             )
-            .update(
-                {
-                    # Invalidate the old attempt in this same transaction so
-                    # its heartbeat/finalizer cannot overwrite admission.
-                    Task.runner_id: None,
-                    Task.lease_attempt_id: None,
-                    Task.lease_expires_at: None,
-                    Task.control_state: "resume_requested",
-                    Task.state_version: func.coalesce(Task.state_version, 0) + 1,
-                },
-                synchronize_session=False,
-            )
+            .update({Task.updated_at: Task.updated_at}, synchronize_session=False)
         )
         if changed != 1:
             raise TaskResumeBusyError
         staged = stage_task_command(
             db,
             task_id=ctx.task_id,
-            actor_user_id=ctx.task_owner_user_id,
+            actor_user_id=ctx.actor_user_id,
             command_id=command_id,
             kind=TaskCommandKind.RESUME_INPUT,
             payload=payload.model_dump(mode="json"),
         )
+        if not staged.payload_matches:
+            raise TaskResumeBusyError
         command_db_id = staged.staged_db_id
         try:
             db.commit()
@@ -226,8 +230,9 @@ async def enqueue_resume_input(
     from .task_event_bridge import get_task_event_bridge
 
     get_task_event_bridge().require_ready()
+    command_id = command_id or ctx.command_id or uuid4().hex
     command_db_id = await run_db_io_cancellation_safe(
-        lambda: _admit_reply(ctx, source, message_id, command_id or uuid4().hex)
+        lambda: _admit_reply(ctx, source, message_id, command_id)
     )
     notify_task_command_dispatcher()
     # These APIs already wait for checkpoint validation and local scheduling.
@@ -240,7 +245,7 @@ async def enqueue_resume_input(
     ) is None:
         remaining = deadline - asyncio.get_running_loop().time()
         if remaining <= 0:
-            raise TaskResumeOutcomeUnknownError
+            raise TaskResumeOutcomeUnknownError(command_id)
         await asyncio.sleep(min(0.25, remaining))
     if result["outcome"] == "busy":
         raise TaskResumeBusyError
@@ -248,24 +253,31 @@ async def enqueue_resume_input(
         raise TaskResumeNotResumableError
     if result["outcome"] == "auto_model_unavailable":
         raise AutoModelUnavailableError("Configured Auto model is unavailable")
+    if result["outcome"] == "retryable_unavailable":
+        raise TaskResumeRetryableError("Reply was not applied; checkpoint read failed")
     if result["outcome"] != "accepted":
-        raise CheckpointUnavailableError("Reply preparation did not complete")
+        raise TaskResumeOutcomeUnknownError(command_id)
     return TaskReplyResumeResult(
         run_id=result["run_id"],
         state_version=result["state_version"],
         control_state=result["control_state"],
+        command_id=command_id,
     )
 
 
-def _handoff(command: ClaimedTaskCommand) -> tuple[ResumeInput, TaskLease, int, dict]:
+def _handoff(
+    command: ClaimedTaskCommand, owner_lease: TaskOwnerLease
+) -> tuple[ResumeInput, TaskLease, int, dict]:
     try:
         payload = ResumeInput.model_validate(command.payload)
     except ValueError:
         raise TaskCommandRejected(
             "Invalid reply payload", reason="invalid_payload"
         ) from None
-    runner = get_runner_id()
+    runner = owner_lease.runner_id
     with get_session_local()() as db:
+        if not lock_task_lease_no_commit(db, owner_lease):
+            raise TaskCommandRejected("Reply owner changed", reason="stale_owner")
         task = db.execute(
             select(Task).where(Task.id == command.task_id).with_for_update()
         ).scalar_one_or_none()
@@ -281,13 +293,8 @@ def _handoff(command: ClaimedTaskCommand) -> tuple[ResumeInput, TaskLease, int, 
         ).scalar_one_or_none()
         if task is None or row is None:
             raise TaskCommandRejected("Reply claim changed", reason="stale_claim")
-        owner = db.get(User, task.user_id)
         if (
-            owner is None
-            or owner.actor_subject != row.task_owner_subject
-            or owner.id != row.task_owner_user_id
-            or owner.id != row.actor_user_id
-            or owner.actor_subject != row.actor_subject
+            not command_identity_matches_task(db, task, row)
             or task.agent_id != payload.agent_id
             or task.source != payload.source
             or row.target_run_id != payload.run_id
@@ -295,20 +302,24 @@ def _handoff(command: ClaimedTaskCommand) -> tuple[ResumeInput, TaskLease, int, 
             raise TaskCommandRejected(
                 "Reply identity changed", reason="identity_changed"
             )
-        lease = acquire_task_lease_no_commit(
-            db,
-            int(task.id),
-            runner_id=runner,
-            expected_run_id=payload.run_id,
-            expected_status=TaskStatus(payload.prior_status),
-            claim_predicates=(
-                Task.control_state == "resume_requested",
-                Task.state_version == row.target_state_version,
-                exists(select(1).where(*claim_predicates)),
-            ),
-        )
-        if lease is None:
+        if (
+            task.run_id != payload.run_id
+            or task.status != TaskStatus(payload.prior_status)
+            or task.control_state not in ("idle", payload.prior_status)
+            or task.state_version != row.target_state_version
+        ):
             raise TaskCommandRejected("Reply state changed", reason="state_changed")
+        execution = begin_task_execution_no_commit(
+            db, owner_lease, expected=task_control_snapshot(task), new_run=False
+        )
+        if execution is None:
+            raise TaskCommandRejected("Reply state changed", reason="state_changed")
+        lease = TaskLease(
+            task_id=owner_lease.task_id,
+            runner_id=owner_lease.runner_id,
+            run_id=execution.run_id,
+            attempt_id=owner_lease.attempt_id,
+        )
         db.refresh(task)
         state = {
             "run_id": lease.run_id,
@@ -356,30 +367,6 @@ def _record_outcome(command: ClaimedTaskCommand, state: dict, outcome: str) -> N
             db.commit()
 
 
-def settle_failed_reply_no_commit(db: Session, row: TaskExecutionCommand) -> None:
-    """Restore this failed admission in the command's terminal transaction."""
-    for status in (TaskStatus.PAUSED, TaskStatus.WAITING_FOR_USER):
-        db.query(Task).filter(
-            Task.id == row.task_id,
-            Task.run_id == row.target_run_id,
-            Task.state_version == row.target_state_version,
-            Task.status == status,
-            Task.control_state == "resume_requested",
-            exists(
-                select(1).where(
-                    TaskExecutionCommand.id == row.id,
-                    TaskExecutionCommand.status == COMMAND_FAILED,
-                )
-            ),
-        ).update(
-            {
-                Task.control_state: status.value,
-                Task.state_version: Task.state_version + 1,
-            },
-            synchronize_session=False,
-        )
-
-
 async def execute_resume_input(command: ClaimedTaskCommand) -> SettledTaskCommand:
     # Own handoff through scheduling so cancellation cannot abandon a lease
     # committed by the database thread before its result reaches this caller.
@@ -394,19 +381,25 @@ async def _execute_resume_input(command: ClaimedTaskCommand) -> SettledTaskComma
     # Command completion releases the durable queue before registration.
     # Keep the local handoff barrier until the exact execution is registered.
     async with task_execution_controller.command(command.task_id):
+        from .task_coordinator_runtime import current_task_coordinator
         from .task_resume import resume_a2a_task, resume_task_reply
 
+        coordinator = current_task_coordinator(command.task_id)
+        assert coordinator is not None and coordinator.lease is not None
+        owner_lease = coordinator.lease
         payload, lease, owner_id, state = await run_db_io_cancellation_safe(
-            lambda: _handoff(command)
+            lambda: _handoff(command, owner_lease)
         )
         outcome = "unavailable"
         try:
             if payload.source == "sdk":
+                assert command.actor_user_id is not None
                 await resume_task_reply(
                     TaskReplyInput(
                         task_id=command.task_id,
                         agent_id=payload.agent_id,
                         task_owner_user_id=owner_id,
+                        actor_user_id=command.actor_user_id,
                         run_id=payload.run_id,
                         status=TaskStatus(payload.prior_status),
                         text=payload.text,
@@ -427,6 +420,8 @@ async def _execute_resume_input(command: ClaimedTaskCommand) -> SettledTaskComma
                     preacquired_lease=lease,
                 )
             outcome = "accepted"
+        except TaskResumeOutcomeUnknownError:
+            outcome = "unknown"
         except TaskResumeBusyError:
             outcome = "busy"
         except (TaskResumeNotResumableError, CheckpointCorruptError):

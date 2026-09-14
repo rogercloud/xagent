@@ -15,6 +15,7 @@ from xagent.web.models.database import (
     release_db_connection_if_clean,
 )
 from xagent.web.models.task import ExecutionMode, Task, TaskStatus
+from xagent.web.models.task_command import TaskExecutionCommand
 from xagent.web.models.user import User
 from xagent.web.models.workforce import Workforce, WorkforceRun
 
@@ -524,6 +525,17 @@ def _build_start_snapshots(
         .one()
     )
 
+    run_id = task_row.run_id
+    if task_row.status == TaskStatus.PENDING and run_id is None:
+        run_id = (
+            db.query(TaskExecutionCommand.target_run_id)
+            .filter(
+                TaskExecutionCommand.task_id == task_id,
+                TaskExecutionCommand.kind == "start",
+                TaskExecutionCommand.status.in_(("pending", "processing")),
+            )
+            .scalar()
+        )
     return (
         WorkforceTaskStartSnapshot(
             id=int(task_row.id),
@@ -531,7 +543,7 @@ def _build_start_snapshots(
             title=str(task_row.title),
             status=cast(TaskStatus, task_row.status),
             created_at=cast(datetime | None, task_row.created_at),
-            run_id=(str(task_row.run_id) if task_row.run_id is not None else None),
+            run_id=(str(run_id) if run_id is not None else None),
             state_version=int(task_row.state_version or 0),
             control_state=str(task_row.control_state or "idle"),
             channel_id=(
@@ -596,7 +608,7 @@ def _create_claimed_workforce_run_isolated(
             payload=payload,
             context=timezone_schedule_context(request.timezone),
         )
-        sync_workforce_run_status(db, record.task, TaskStatus.RUNNING)
+        sync_workforce_run_status(db, record.task, claimed_turn.status)
         db.flush()
         task_snapshot, run_snapshot = _build_start_snapshots(
             db,
@@ -684,7 +696,7 @@ def _create_claimed_preview_run_isolated(
             payload=payload,
             context=timezone_schedule_context(request.timezone),
         )
-        sync_workforce_run_status(db, record.task, TaskStatus.RUNNING)
+        sync_workforce_run_status(db, record.task, claimed_turn.status)
         db.flush()
         task_snapshot, run_snapshot = _build_start_snapshots(
             db,

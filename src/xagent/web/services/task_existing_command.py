@@ -1,8 +1,9 @@
 """Accept legacy execute_task without creating another transcript message."""
 
+from typing import cast
 from uuid import uuid4
 
-from sqlalchemy import func, select
+from sqlalchemy import select
 
 from ..models.database import get_session_local
 from ..models.task import Task, TaskStatus
@@ -11,7 +12,7 @@ from ..models.user import User
 from .mcp_runtime import MCPBuiltinOAuthActorPolicyRequiredError
 from .task_command_transport import notify_task_command_dispatcher
 from .task_event_bridge import get_task_event_bridge
-from .task_orchestrator import TaskTurnError
+from .task_orchestrator import TaskTurnError, reserve_task_start_no_commit
 from .task_runtime import mcp_runtime_authorization_policy_required
 from .task_start_protocol import (
     ExistingExecutionContext,
@@ -46,24 +47,13 @@ def enqueue_existing_execution(
             raise MCPBuiltinOAuthActorPolicyRequiredError(
                 "Legacy execution does not support actor-marked tasks"
             )
-        changed = (
-            db.query(Task)
-            .filter(Task.id == task_id, Task.status != TaskStatus.RUNNING)
-            .update(
-                {
-                    Task.status: TaskStatus.RUNNING,
-                    Task.run_id: run_id,
-                    Task.control_state: "running",
-                    Task.state_version: func.coalesce(Task.state_version, 0) + 1,
-                    Task.runner_id: None,
-                    Task.lease_attempt_id: None,
-                    Task.lease_expires_at: None,
-                    Task.last_heartbeat_at: None,
-                    Task.last_checkpoint_event_id: None,
-                    Task.last_checkpoint_trace_event_id: None,
-                },
-                synchronize_session=False,
-            )
+        changed = reserve_task_start_no_commit(
+            db,
+            task_id=task_id,
+            task_owner_user_id=task_owner_user_id,
+            statuses=tuple(
+                status for status in TaskStatus if status != TaskStatus.RUNNING
+            ),
         )
         if changed != 1:
             raise TaskTurnError("busy")
@@ -71,6 +61,7 @@ def enqueue_existing_execution(
         start = TaskStartPayload(
             version=1,
             run_id=run_id,
+            expected_run_id=cast(str | None, task.run_id),
             state_version=int(task.state_version),
             turn_id=turn_id,
             kind="existing",

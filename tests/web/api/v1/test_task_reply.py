@@ -1125,7 +1125,9 @@ def test_reply_timeout_reports_accepted_outcome_unknown():
     with patch.object(
         task_resume,
         "resume_task_reply",
-        AsyncMock(side_effect=task_resume.TaskResumeOutcomeUnknownError),
+        AsyncMock(
+            side_effect=task_resume.TaskResumeOutcomeUnknownError("original-reply")
+        ),
     ):
         response = client.post(
             f"/v1/chat/tasks/{task_id}/reply",
@@ -1134,5 +1136,9 @@ def test_reply_timeout_reports_accepted_outcome_unknown():
         )
     assert response.status_code == 504, response.text
     assert response.json()["error"]["code"] == "reply_outcome_unknown"
-    assert response.json()["error"]["details"] == {"accepted": True, "task_id": task_id}
-    assert "Check task status" in response.json()["error"]["message"]
+    assert response.json()["error"]["details"] == {
+        "accepted": True,
+        "task_id": task_id,
+        "command_id": "original-reply",
+    }
+    assert "same command_id" in response.json()["error"]["message"]

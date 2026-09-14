@@ -56,6 +56,8 @@ async def test_sdk_create_and_append_return_durable_acceptance(ingress):
         assert command.target_run_id == first.run_id
         assert command.payload["timezone"] == "Asia/Taipei"
         assert command.status == "pending"
+        command.status = "completed"
+        task.run_id = first.run_id
         task.status = TaskStatus.COMPLETED
         task.control_state = "completed"
         db.commit()
@@ -102,7 +104,9 @@ async def test_a2a_create_commits_start_without_local_execution(ingress):
         command = db.query(TaskExecutionCommand).one()
         assert task.source == "a2a"
         assert task.runner_id is None
-        assert command.target_run_id == result.run_id
+        assert result.run_id is None
+        assert command.target_run_id is not None
+        assert task.status == TaskStatus.PENDING
         assert command.payload["kind"] == "create"
         assert (
             db.query(TaskChatMessage).filter_by(task_id=task.id, role="user").count()
@@ -148,9 +152,10 @@ async def test_legacy_existing_execution_waits_for_exact_durable_run(ingress):
         assert not pending.done()
         with get_session_local()() as db:
             task = db.get(Task, task_id)
-            assert task.run_id == run_id
+            assert task.run_id is None
             assert task.runner_id is None
             assert db.query(TaskChatMessage).count() == 0
+            task.run_id = run_id
             task.status = TaskStatus.COMPLETED
             task.control_state = "completed"
             db.commit()
@@ -200,7 +205,9 @@ def test_completion_wait_requires_release_and_rejects_replacement(ingress, statu
         TaskStatus.WAITING_FOR_USER,
     ],
 )
-def test_completion_releases_only_expired_owner_of_requested_run(ingress, status):
+def test_recovery_releases_expired_owner_without_mutating_business_status(
+    ingress, status
+):
     from datetime import datetime, timedelta, timezone
 
     owner, _ = ingress
@@ -227,6 +234,10 @@ def test_completion_releases_only_expired_owner_of_requested_run(ingress, status
         _is_run_finished(task_id, "previous-run")
     with get_session_local()() as db:
         assert db.get(Task, task_id).runner_id == "worker"
+    assert not _is_run_finished(task_id, "run-1")
+    from xagent.web.services.task_lease_recovery import recover_expired_idle_task_leases
+
+    assert recover_expired_idle_task_leases(batch_size=10) == 1
     assert _is_run_finished(task_id, "run-1")
     with get_session_local()() as db:
         task = db.get(Task, task_id)
@@ -273,7 +284,6 @@ async def test_sdk_append_records_current_actor_after_owner_transfer(
         file_ids=(),
         connector_runtime_context=(),
     )
-    monkeypatch.setattr(task_start_consumer, "get_runner_id", lambda: "worker")
     with get_session_local()() as db:
         row = (
             db.query(TaskExecutionCommand).filter_by(target_run_id=second.run_id).one()
@@ -282,7 +292,15 @@ async def test_sdk_append_records_current_actor_after_owner_transfer(
         assert row.actor_subject == actor_subject
         assert row.task_owner_user_id == owner
         command = claim_task_command(db, runner_id="worker", command_db_id=row.id)
-    handoff = task_start_consumer._commit_handoff(command)
+    from xagent.web.services.task_coordinator_service import (
+        acquire_task_lease_no_commit,
+    )
+
+    with get_session_local()() as db, db.begin():
+        owner_lease = acquire_task_lease_no_commit(
+            db, first.task_id, runner_id="worker"
+        )
+    handoff = task_start_consumer._commit_handoff(command, owner_lease)
     assert handoff.task_owner_user_id == owner
     assert handoff.claimed.task_lease.run_id == second.run_id
 

@@ -1,7 +1,7 @@
 """Strict START inputs for accepted turns and explicit existing execution.
 
 The existing variant executes the stored description without adding a user
-transcript row. All variants acquire their execution lease on the worker.
+transcript row. All variants begin execution under the worker coordinator's task ownership.
 """
 
 from __future__ import annotations
@@ -57,7 +57,8 @@ class TaskStartPayload(BaseModel):
 
     version: Annotated[int, Field(ge=1, le=1)]
     run_id: _Identity
-    state_version: Annotated[int, Field(ge=1)]
+    state_version: Annotated[int, Field(ge=0)]
+    expected_run_id: _Identity | None = None
     turn_id: _Identity
     kind: Literal["create", "append", "existing"]
     message: str
@@ -112,7 +113,7 @@ def stage_task_start_command(
     it is not the only lock in a valid acceptance transaction. This helper
     does not replace business acceptance.
 
-    Do not commit a RUNNING turn and call this in a later transaction. On any
+    Acceptance preserves the current run and ownership until consumption. On any
     failure the caller must roll back the entire acceptance transaction, as for
     ``stage_task_command``. A repeated identity returns its payload comparison;
     a mismatch must not be committed as a new acceptance.
@@ -135,22 +136,11 @@ def stage_task_start_command(
     if task is None:
         raise TaskCommandTaskMissing(f"Task {task_id} not found")
     if (
-        task.status != TaskStatus.RUNNING
-        or task.run_id != start.run_id
+        task.status == TaskStatus.RUNNING
+        or task.run_id != start.expected_run_id
         or task.state_version != start.state_version
-        or task.control_state != "running"
     ):
-        raise ValueError("START does not match the accepted task turn")
-    if any(
-        value is not None
-        for value in (
-            task.runner_id,
-            task.lease_attempt_id,
-            task.lease_expires_at,
-            task.last_heartbeat_at,
-        )
-    ):
-        raise ValueError("START acceptance must not own an execution lease")
+        raise ValueError("START does not match its admission snapshot")
     return stage_task_command(
         db,
         task_id=task_id,
@@ -158,6 +148,7 @@ def stage_task_start_command(
         command_id=start.turn_id,
         kind=TaskCommandKind.START,
         payload=start.model_dump(mode="json"),
+        target_run_id=start.run_id,
     )
 
 

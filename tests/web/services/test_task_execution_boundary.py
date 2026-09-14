@@ -474,7 +474,7 @@ def test_control_and_reply_commands_execute_without_api_routes() -> None:
                         )
                         a2a_resume = task_execution.background_task_manager.resume_tasks[reply_ids[0]]
                         result = await task_resume.resume_task_reply(task_resume.TaskReplyInput(
-                            task_id=reply_ids[1], agent_id=1, task_owner_user_id=uid,
+                            task_id=reply_ids[1], agent_id=1, task_owner_user_id=uid, actor_user_id=uid,
                             run_id="reply-sdk", status=TaskStatus.WAITING_FOR_USER, text="SDK answer",
                         ))
                         assert result.run_id == "reply-sdk"
