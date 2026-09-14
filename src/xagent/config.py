@@ -41,6 +41,8 @@ AGENT_RUNTIME = "XAGENT_AGENT_RUNTIME"
 INTERACTION_PROTOCOL_MODE = "XAGENT_INTERACTION_PROTOCOL_MODE"
 INTERACTION_NATIVE_SOURCES = "XAGENT_INTERACTION_NATIVE_SOURCES"
 SHARED_TASK_EXECUTION_ENABLED = "XAGENT_SHARED_TASK_EXECUTION_ENABLED"
+TASK_EXECUTION_ROLE = "XAGENT_TASK_EXECUTION_ROLE"
+CHANNEL_INGRESS_ENABLED = "XAGENT_CHANNEL_INGRESS_ENABLED"
 TASK_EVENT_CHANNEL_PREFIX = "XAGENT_TASK_EVENT_CHANNEL_PREFIX"
 ENCRYPTION_KEY = "ENCRYPTION_KEY"
 # Public development fallback; runtime credential storage must reject it.
@@ -768,8 +770,51 @@ def get_redis_url() -> str | None:
 
 
 def get_shared_task_execution_enabled() -> bool:
-    """Enable durable task handoff and the shared event bridge when explicitly configured."""
-    return _get_bool_env(SHARED_TASK_EXECUTION_ENABLED, False)
+    """Enable durable task handoff and the shared event bridge by default."""
+    return _get_bool_env(SHARED_TASK_EXECUTION_ENABLED, True)
+
+
+def get_task_execution_role() -> Literal["combined", "web", "worker"]:
+    """Get the process duties; combined hosts both ingress and execution."""
+    role = os.getenv(TASK_EXECUTION_ROLE, "combined").strip().lower()
+    if role == "combined":
+        return "combined"
+    if role == "web":
+        return "web"
+    if role == "worker":
+        return "worker"
+    raise ValueError(f"{TASK_EXECUTION_ROLE} must be combined, web or worker")
+
+
+def get_channel_ingress_enabled() -> bool:
+    """Open bot connections only on the designated shared ingress host."""
+    if get_shared_task_execution_enabled() and get_task_execution_role() == "worker":
+        return False
+    return _get_bool_env(
+        CHANNEL_INGRESS_ENABLED, not get_shared_task_execution_enabled()
+    )
+
+
+def validate_task_execution_host_config() -> None:
+    """Reject incomplete shared deployments before accepting tasks."""
+    role = get_task_execution_role()
+    if not get_shared_task_execution_enabled():
+        if role != "combined":
+            raise ValueError(
+                f"{TASK_EXECUTION_ROLE}={role} requires {SHARED_TASK_EXECUTION_ENABLED}"
+            )
+        return
+    if not get_redis_url():
+        raise ValueError(f"{SHARED_TASK_EXECUTION_ENABLED} requires {REDIS_URL}")
+    key = get_task_runtime_secrets_encryption_key()
+    if key is None:
+        raise ValueError(
+            "Shared task execution requires an explicit private common ENCRYPTION_KEY"
+        )
+    from cryptography.fernet import Fernet
+
+    Fernet(key.encode())
+    get_task_event_channel_prefix()
 
 
 def get_task_runtime_secrets_encryption_key() -> str | None:
