@@ -133,6 +133,7 @@ SANDBOX_ALLOW_LOCAL_FALLBACK_ON_CAPACITY = (
     "XAGENT_SANDBOX_ALLOW_LOCAL_FALLBACK_ON_CAPACITY"
 )
 SANDBOX_NAMESPACE = "XAGENT_SANDBOX_NAMESPACE"
+SANDBOX_WORKER_ID = "XAGENT_SANDBOX_WORKER_ID"
 BOXLITE_HOME_DIR = "BOXLITE_HOME_DIR"
 WEB_SEARCH_PROVIDER = "XAGENT_WEB_SEARCH_PROVIDER"
 WEB_CRAWL_TLS_IMPERSONATE = "XAGENT_WEB_CRAWL_TLS_IMPERSONATE"
@@ -3014,16 +3015,49 @@ def get_sandbox_namespace() -> str | None:
     return raw
 
 
-def get_boxlite_home_dir() -> Path | None:
-    """Get the BoxLite home directory path.
+def get_sandbox_worker_id() -> str | None:
+    """Stable replica identity for shared sandbox ownership, never a process UUID.
 
-    Returns:
-        Path from BOXLITE_HOME_DIR env var, or None
+    Configure a distinct identity for each concurrently running execution host
+    and reuse it on restart. Legacy local execution keeps its existing scope.
+    """
+    if not get_shared_task_execution_enabled():
+        return None
+    worker_id = os.getenv(SANDBOX_WORKER_ID, "").strip()
+    if not worker_id:
+        raise ValueError(f"Shared sandbox execution requires {SANDBOX_WORKER_ID}")
+    validate_sandbox_namespace(worker_id)
+    return worker_id
+
+
+def get_sandbox_worker_namespace() -> str | None:
+    """Scope Docker containers and metadata to one stable execution host."""
+    namespace = get_sandbox_namespace()
+    if namespace is None:
+        return None
+    worker_id = get_sandbox_worker_id()
+    if worker_id is None:
+        return namespace
+    # Hash the pair to avoid ambiguous concatenations of deployment/replica ids.
+    import hashlib
+
+    suffix = hashlib.sha256(f"{namespace}\0{worker_id}".encode()).hexdigest()[:16]
+    return f"{namespace}-{suffix}"
+
+
+def get_boxlite_home_dir() -> Path | None:
+    """Get the BoxLite home, isolated by stable worker ID in shared mode.
+
+    Local execution preserves BoxLite's default when BOXLITE_HOME_DIR is unset.
+    Shared execution uses a worker subdirectory under the configured home or
+    the unified storage root's boxlite directory.
     """
     env_str = os.getenv(BOXLITE_HOME_DIR)
-    if env_str:
-        return Path(env_str)
-    return None
+    home_dir = Path(env_str) if env_str else None
+    worker_id = get_sandbox_worker_id()
+    if worker_id is not None:
+        return (home_dir or get_storage_root() / "boxlite") / worker_id
+    return home_dir
 
 
 def get_tool_max_output_length() -> int:
