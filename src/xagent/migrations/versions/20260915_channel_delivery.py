@@ -4,7 +4,7 @@ import sqlalchemy as sa
 from alembic import op
 
 revision = "20260915_channel_delivery"
-down_revision = "20260914_add_hubspot_deals_write_scope"
+down_revision = "20260914_update_github_description"
 branch_labels = None
 depends_on = None
 
