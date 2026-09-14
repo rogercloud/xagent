@@ -384,3 +384,25 @@ async def test_progress_requires_ack_and_stops_after_first_failure(bridge, monke
     await forwarder.handle_event(event)
     publish.assert_awaited_once()
     await bridge.close()
+
+
+@pytest.mark.asyncio
+async def test_unexpected_platform_failure_returns_negative_ack(bridge, monkeypatch):
+    bridge.ready.set()
+    publish = AsyncMock()
+    monkeypatch.setattr(bridge, "_publish", publish)
+    token = bridge.register_origin(
+        42, "command", AsyncMock(side_effect=ValueError("platform failure"))
+    )
+    await bridge._deliver_reply(
+        {
+            "origin": token,
+            "task_id": 42,
+            "command_id": "command",
+            "delivery_id": "delivery",
+            "reply_host": "worker",
+            "message": {},
+        }
+    )
+    assert json.loads(publish.await_args.args[1])["delivered"] is False
+    await bridge.close()

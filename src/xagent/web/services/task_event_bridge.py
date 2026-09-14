@@ -273,6 +273,14 @@ class TaskEventBridge:
                         delivered = True
                     except ConnectionError:
                         pass
+                    except Exception:
+                        # A failed recipient must still ACK failure. Otherwise
+                        # a malformed frame looks like a silent/dead ingress.
+                        logger.exception(
+                            "Task reply recipient failed task_id=%s command_id=%s",
+                            origin.task_id,
+                            origin.command_id,
+                        )
                     origin.delivered[delivery_id] = delivered
                     while len(origin.delivered) > 128:
                         origin.delivered.popitem(last=False)
