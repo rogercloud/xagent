@@ -190,6 +190,25 @@ async def test_terminal_command_with_replaced_run_reports_interruption(accepted)
 
 
 @pytest.mark.asyncio
+async def test_channel_poll_retries_transient_read_failure(selected, monkeypatch):
+    from sqlalchemy.exc import TimeoutError as DatabaseTimeout
+
+    bridge = Mock(host_id="ingress")
+    bridge.register_origin.return_value = "origin"
+    monkeypatch.setattr(shared, "get_task_event_bridge", lambda: bridge)
+    read = Mock(
+        side_effect=[
+            DatabaseTimeout(),
+            {"success": True, "status": "completed", "output": "answer"},
+        ]
+    )
+    monkeypatch.setattr(shared, "_read_channel_result", read)
+    result = await selected.execute(TaskTurnPayload("hello"), None)
+    assert result["output"] == "answer"
+    assert read.call_count == 2
+
+
+@pytest.mark.asyncio
 async def test_channel_pending_wait_is_bounded_and_keeps_command(selected, monkeypatch):
     bridge = Mock(host_id="ingress")
     bridge.register_origin.return_value = "origin"
