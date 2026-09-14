@@ -441,6 +441,12 @@ def _accept_channel_turn(
                     or saved.payload != start.model_dump(mode="json")
                 ):
                     raise
+            logger.warning(
+                "Channel acceptance recovered after uncertain commit task_id=%s command_id=%s",
+                selection.task_id,
+                turn.command_id,
+            )
+            increment_counter("xagent.channel.acceptance.commit_recovered")
         return staged.staged_db_id
 
 
