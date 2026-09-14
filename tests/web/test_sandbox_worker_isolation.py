@@ -54,3 +54,10 @@ def test_workers_isolate_same_logical_sandbox_and_snapshot(tmp_path, monkeypatch
     assert first.get_snapshot("snapshot-1") is None
     assert second.get_info("task-1").name == "task-1"
     assert second.get_snapshot("snapshot-1").metadata == {"state": "stopped"}
+
+
+@pytest.mark.parametrize("value", ["0", "-1", "invalid"])
+def test_runtime_secret_ttl_must_be_positive(monkeypatch, value):
+    monkeypatch.setenv("XAGENT_TASK_RUNTIME_SECRETS_TTL_SECONDS", value)
+    with pytest.raises(ValueError):
+        config.get_task_runtime_secrets_ttl_seconds()
