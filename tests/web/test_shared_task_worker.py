@@ -70,6 +70,14 @@ async def test_runtime_readiness_and_shutdown_order(monkeypatch, bridge_fails):
     )
     monkeypatch.setattr(worker, "get_sandbox_manager", lambda: None)
 
+    from xagent.web.services import chrome_mcp_runtime
+
+    pool = SimpleNamespace(
+        close_all=AsyncMock(side_effect=lambda: order.append("chrome_drain"))
+    )
+    monkeypatch.setattr(chrome_mcp_runtime, "_chrome_pool", pool)
+    monkeypatch.setattr(chrome_mcp_runtime, "_chrome_pool_manager", object())
+
     async def start_bridge():
         order.append("bridge")
         if bridge_fails:
@@ -123,4 +131,9 @@ async def test_runtime_readiness_and_shutdown_order(monkeypatch, bridge_fails):
         < order.index("drain")
         < order.index("heartbeat_idle")
         < order.index("stop_bridge")
+        < order.index("chrome_drain")
     )
+
+    pool.close_all.assert_awaited_once()
+    assert chrome_mcp_runtime._chrome_pool is None
+    assert chrome_mcp_runtime._chrome_pool_manager is None

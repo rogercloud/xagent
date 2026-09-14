@@ -8,6 +8,42 @@ Run all e2e tests:
 uv run --project . --group test python -m pytest tests/e2e --run-special -q
 ```
 
+## Shared Execution
+
+Every test under `tests/e2e` enables shared execution. The autouse fixture in
+`conftest.py` overrides the legacy suite's local-execution default. Existing
+application harnesses use the combined role; the shared execution tests start
+separate HTTP/WebSocket web hosts and standalone workers with isolated SQLite
+databases and storage directories.
+
+Redis is required. Set `XAGENT_TEST_REDIS_URL` to a disposable Redis instance,
+or install `redis-server` so the fixture can start and stop a local instance.
+CI supplies a Redis service. Missing Redis fails setup rather than skipping
+these tests. Each test uses a separate event namespace and encryption key.
+
+Run the shared execution tests without Docker:
+
+```bash
+uv run --project . --group test python -m pytest tests/e2e/test_shared_*.py --run-special -q
+```
+
+The model boundary is deterministic, and platform transport calls and sandbox
+provisioning are replaced. Public HTTP/API-key/JWT and WebSocket authorization,
+durable commands, Redis event delivery, worker startup/shutdown, AgentService,
+AgentRunner, checkpoints, file tools, and database projections remain real.
+The subprocess hosts also run production background loops instead of inheriting
+pytest's automatic startup skips.
+
+| Test file | End-to-end coverage |
+| --- | --- |
+| `test_shared_execution.py` | WebSocket execute/chat, live guidance deduplication, final-answer streaming and history replay; SDK create/append/poll/SSE and file upload/read/write/download; SDK and A2A reply after replacing the worker; A2A stream/re-subscribe/query/cancel; pause/resume with competing workers; agent webhook/test/scheduled triggers; workforce owner/SDK/widget/share/preview/trigger execution including child delegation; web exit, worker SIGTERM, and recovery/resume after worker SIGKILL. |
+| `test_shared_channels.py` | Slack, Feishu, and Telegram callbacks through real SharedChannelTurn execution and forwarded traces; Telegram attachment download, worker transformation, and returned bytes; queued pause and channel deactivation before worker consumption. |
+| `test_shared_network_recovery.py` | A controllable TCP link interrupts only the test hosts' Redis connections. An in-flight task still persists its result, an unaccepted START leaves no task behind, and clients recover after reconnection. |
+
+The existing MinIO and PostgreSQL 17 E2E suites still require Docker; they also
+run with shared execution enabled. The SQLite subprocess tests do not replace
+those storage/backend-specific checks.
+
 ## File Persistence E2E Expected Behavior
 
 This document maps the expected durable file storage behavior to the e2e tests that cover it.
