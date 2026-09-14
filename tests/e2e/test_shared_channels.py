@@ -24,7 +24,8 @@ pytestmark = pytest.mark.e2e
         (platform, scenario)
         for platform in ("slack", "feishu", "telegram")
         for scenario in ("text", "file", "reply")
-    ],
+    ]
+    + [("telegram", "pending")],
 )
 async def test_channel_callback_runs_remotely_and_returns_answer(
     shared_app, monkeypatch, platform, scenario, tmp_path
@@ -38,12 +39,37 @@ async def test_channel_callback_runs_remotely_and_returns_answer(
     )
 
     app = shared_app
+    pending = scenario == "pending"
+    if pending:
+        worker, pipe = app.processes[-1], app.pipes[-1]
+        pipe.send("stop")
+        await asyncio.to_thread(worker.join, 30)
+        assert worker.exitcode == 0, app.diagnostics()
+        from xagent.web.services import shared_channel_execution
+
+        monkeypatch.setattr(
+            shared_channel_execution,
+            "get_task_reply_wait_timeout_seconds",
+            lambda: 0.03,
+        )
     with_file = scenario == "file"
     with_question = scenario == "reply"
     input_text = (
-        "e2e:files" if with_file else "e2e:ask" if with_question else "Channel question"
+        "e2e:gate"
+        if pending
+        else "e2e:files"
+        if with_file
+        else "e2e:ask"
+        if with_question
+        else "Channel question"
     )
-    expected_text = "Which choice?" if with_question else "Shared E2E answer"
+    expected_text = (
+        "still being processed"
+        if pending
+        else "Which choice?"
+        if with_question
+        else "Shared E2E answer"
+    )
     followup_text = "e2e:answer" if with_question else "Channel followup"
     monkeypatch.chdir(tmp_path)
     with get_session_local()() as db:
@@ -221,6 +247,25 @@ async def test_channel_callback_runs_remotely_and_returns_answer(
             )
             await asyncio.wait_for(bot._process_user_messages_batch(123, [message]), 30)
             assert expected_text in str(loading.edit_text.call_args_list)
+            if pending:
+                from xagent.web.services.channel_delivery import recover_channel_results
+
+                task_id, turn = bot.user_active_executions[123]
+                assert bot._stop_current_conversation(123)
+                await turn.stop_task
+                await asyncio.to_thread(app.start, "worker")
+                await asyncio.to_thread(app.wait_task, task_id, status="paused")
+                bot._deliver_telegram_result = AsyncMock()
+                # The pending notice set the retry delay; make recovery ready now.
+                from xagent.web.models.task_channel_delivery import TaskChannelDelivery
+
+                with get_session_local()() as db:
+                    db.get(TaskChannelDelivery, turn.command_db_id).available_at = None
+                    db.commit()
+                await recover_channel_results(channel_id, bot._deliver_shared_result)
+                bot._deliver_telegram_result.assert_awaited_once()
+                assert 123 not in bot.user_active_executions
+                return
             if with_file:
                 assert delivered == [b"UNIQUE SHARED INPUT\n"]
         with get_session_local()() as db:

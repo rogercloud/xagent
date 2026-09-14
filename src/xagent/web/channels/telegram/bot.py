@@ -1589,6 +1589,7 @@ class TelegramBotInstance:
         conversation_generation = self._conversation_generation(user_id)
         claimed_task_id: int | None = None
         managed_lease: ManagedTaskLease | None = None
+        awaiting_shared_delivery = False
         shared_turn: SharedChannelTurn | None = None
         turn_control: ManagedTaskLease | SharedChannelTurn | None = None
         voice_asr_model: Any | None = None
@@ -1955,9 +1956,12 @@ class TelegramBotInstance:
                                 require_delivery=True,
                             )
 
-                        await shared_turn.deliver(
+                        delivered_final = await shared_turn.deliver(
                             deliver_current,
                             pending_notice=result.get("status") == "accepted",
+                        )
+                        awaiting_shared_delivery = (
+                            result.get("status") == "accepted" and not delivered_final
                         )
                     return
                 else:
@@ -1980,7 +1984,10 @@ class TelegramBotInstance:
                             reason="Telegram stop requested",
                         )
             finally:
-                if self.user_active_executions.get(user_id) == active_execution:
+                if (
+                    self.user_active_executions.get(user_id) == active_execution
+                    and not awaiting_shared_delivery
+                ):
                     self.user_active_executions.pop(user_id, None)
                 if agent_service is not None:
                     agent_service.tracer.remove_handler(tg_handler)
