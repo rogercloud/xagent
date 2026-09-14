@@ -38,11 +38,54 @@ pytest's automatic startup skips.
 | --- | --- |
 | `test_shared_execution.py` | WebSocket execute/chat, live guidance deduplication, final-answer streaming and history replay; SDK create/append/poll/SSE and file upload/read/write/download; SDK and A2A reply after replacing the worker; A2A stream/re-subscribe/query/cancel; pause/resume with competing workers; agent webhook/test/scheduled triggers; workforce owner/SDK/widget/share/preview/trigger execution including child delegation; web exit, worker SIGTERM, and recovery/resume after worker SIGKILL. |
 | `test_shared_channels.py` | Slack, Feishu, and Telegram callbacks through real SharedChannelTurn execution and forwarded traces; Telegram attachment download, worker transformation, and returned bytes; queued pause and channel deactivation before worker consumption. |
+| `test_shared_happy_paths.py` | Agent public chat/reply/follow-up and file transfer; A2A blocking/context continuation; all execution modes and auto branches; combined host; legacy webhook. |
+| `test_shared_gmail.py` | Agent and workforce Gmail callback through actual signature verification, mail ingestion, and worker completion. |
 | `test_shared_network_recovery.py` | A controllable TCP link interrupts only the test hosts' Redis connections. An in-flight task still persists its result, an unaccepted START leaves no task behind, and clients recover after reconnection. |
 
 The existing MinIO and PostgreSQL 17 E2E suites still require Docker; they also
 run with shared execution enabled. The SQLite subprocess tests do not replace
 those storage/backend-specific checks.
+
+## Shared Execution Happy-Path Matrix
+
+Scope: supported persisted task execution entry points, successful conversation
+operations, execution patterns, and host roles. Each row must reach a real final
+result or a real waiting checkpoint followed by a successful reply. This is an
+API/callback E2E matrix, not browser UI or external-account provisioning coverage.
+Execution modes and host roles are checked once across their shared runtime;
+we do not multiply every entry by every mode, tool, media type, and deployment.
+
+| Entry / branch | Successful flow | Test |
+| --- | --- | --- |
+| Owner WebSocket execute | Existing task -> execute -> streamed answer -> persisted history | `test_websocket_execute_stream_and_reconnect` |
+| Owner / Agent widget / Agent share chat | Create/auth -> question -> waiting -> reply -> completed -> follow-up -> history | `test_agent_chat_reply_and_followup` (3 cases) |
+| Owner / Agent widget / Agent share files | Create -> upload -> chat -> real file read/write -> returned file -> guest-authorized download bytes | `test_chat_file_input_and_output` (3 cases) |
+| SDK Agent | Create -> poll/SSE -> completed -> append | `test_sdk_create_append_and_poll_execute_only_in_worker` |
+| SDK Agent files | Upload -> create with input -> real read/write -> download bytes | `test_sdk_file_input_tool_output_and_download` |
+| SDK / A2A waiting reply | Waiting checkpoint -> reply -> same run completes on a replacement worker | `test_waiting_reply_restores_checkpoint_in_new_worker` (2 cases) |
+| A2A blocking send / context continuation | Text send -> completed artifact/query -> JSON data in same context -> new completed task | `test_a2a_blocking_send_and_context_continuation` |
+| A2A streaming | Stream -> subscribe -> final artifact/status | `test_a2a_stream_disconnect_and_resubscribe` |
+| Workforce owner / SDK / widget / share / persisted preview | Upload input -> create run -> manager delegates to child and transforms file -> download output -> follow-up question -> waiting -> reply -> completed | `test_workforce_manager_and_child_execute_in_worker` (5 conversation cases) |
+| Agent webhook / test / scheduled | Authenticated callback or manual test or due dispatcher -> completed task and TriggerRun | `test_trigger_webhook_and_test_reach_terminal_task`, `test_scheduled_dispatcher_runs_task_and_settles_trigger` |
+| Workforce webhook / test / scheduled | Trigger -> manager/child execution -> completed task, WorkforceRun and TriggerRun | `test_workforce_manager_and_child_execute_in_worker` (3 trigger cases) |
+| Agent / Workforce Gmail | Signed push -> actual OIDC verification -> mail history/message fetch -> completed task/run | `test_gmail_push_runs_to_completion` (2 cases) |
+| Legacy webhook | Persisted legacy trigger -> secret verification -> callback -> completed task/run | `test_legacy_webhook_reaches_completed_task` |
+| Slack / Feishu / Telegram text | Callback -> completed -> follow-up on same task -> platform final response | `test_channel_callback_runs_remotely_and_returns_answer` (`text`, 3 cases) |
+| Slack / Feishu / Telegram reply | Callback -> question/waiting -> user reply -> completed -> platform final response | `test_channel_callback_runs_remotely_and_returns_answer` (`reply`, 3 cases) |
+| Slack / Feishu / Telegram files | Platform download -> registration -> worker read/write -> platform file or link with correct bytes | `test_channel_callback_runs_remotely_and_returns_answer` (`file`, 3 cases) |
+| Execution patterns | flash, balanced, think; auto chooses direct answer, ReAct, or DAG -> final result | `test_execution_modes_reach_final_result` (6 cases) |
+| Shared host roles | Separate web + worker for entry tests; combined host -> SDK task -> result | `shared_app`, `test_combined_host_runs_shared_task` |
+| Normal runtime controls | Running message delivered once; pause then resume; A2A cancel | `test_websocket_running_message_is_delivered_once`, `test_websocket_pause_and_resume_with_two_workers`, `test_a2a_cancel_reaches_running_worker` |
+
+Contract boundaries: A2A accepts text/JSON input, not file parts; terminal A2A
+tasks continue through a new task with the same context ID. Feishu currently
+returns a managed file link rather than uploading an output attachment. Gmail
+starts with a connected OAuth account and provisioned watch as fixture data;
+Google certificate and mailbox network responses are deterministic, while token
+signature/issuer/audience verification and callback processing are real.
+Non-persisted builder preview, browser UI, provider OAuth setup, individual tool
+integrations, and every backend/media combination are outside this matrix.
+Docker MinIO/PostgreSQL 17 validation remains a separate required CI lane.
 
 ## File Persistence E2E Expected Behavior
 

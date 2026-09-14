@@ -6,6 +6,7 @@ Redis trace forwarding, AgentService and final rendering use production code.
 
 import asyncio
 import importlib
+import io
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -18,11 +19,15 @@ pytestmark = pytest.mark.e2e
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "platform,with_file",
-    [("slack", False), ("feishu", False), ("telegram", False), ("telegram", True)],
+    "platform,scenario",
+    [
+        (platform, scenario)
+        for platform in ("slack", "feishu", "telegram")
+        for scenario in ("text", "file", "reply")
+    ],
 )
 async def test_channel_callback_runs_remotely_and_returns_answer(
-    shared_app, monkeypatch, platform, with_file, tmp_path
+    shared_app, monkeypatch, platform, scenario, tmp_path
 ):
     from xagent.web.models.database import get_session_local
     from xagent.web.models.task import Task
@@ -33,6 +38,13 @@ async def test_channel_callback_runs_remotely_and_returns_answer(
     )
 
     app = shared_app
+    with_file = scenario == "file"
+    with_question = scenario == "reply"
+    input_text = (
+        "e2e:files" if with_file else "e2e:ask" if with_question else "Channel question"
+    )
+    expected_text = "Which choice?" if with_question else "Shared E2E answer"
+    followup_text = "e2e:answer" if with_question else "Channel followup"
     monkeypatch.chdir(tmp_path)
     with get_session_local()() as db:
         channel = UserChannel(
@@ -45,6 +57,7 @@ async def test_channel_callback_runs_remotely_and_returns_answer(
         db.add(channel)
         db.commit()
         channel_id = channel.id
+    delivered = []
     forwarded = []
     module = importlib.import_module(f"xagent.web.channels.{platform}.bot")
     handler_type = getattr(
@@ -72,7 +85,26 @@ async def test_channel_callback_runs_remotely_and_returns_answer(
             bot.web_client = SimpleNamespace(
                 chat_postMessage=AsyncMock(return_value={"ts": "loading"}),
                 chat_update=AsyncMock(return_value={"ok": True}),
+                files_upload_v2=AsyncMock(
+                    side_effect=lambda **kwargs: delivered.append(
+                        Path(kwargs["file"]).read_bytes()
+                    )
+                ),
             )
+            if with_file:
+                import httpx
+
+                original_client = httpx.AsyncClient
+                transport = httpx.MockTransport(
+                    lambda request: httpx.Response(
+                        200, content=b"unique shared input\n"
+                    )
+                )
+                monkeypatch.setattr(
+                    module.httpx,
+                    "AsyncClient",
+                    lambda **kwargs: original_client(transport=transport, **kwargs),
+                )
             await asyncio.wait_for(
                 bot._process_event(
                     "conversation",
@@ -83,18 +115,33 @@ async def test_channel_callback_runs_remotely_and_returns_answer(
                         "channel": "D1",
                         "user": "sender",
                         "ts": "1.0",
-                        "text": "Channel question",
+                        "text": input_text,
+                        "files": [
+                            {
+                                "id": "platform-file",
+                                "name": "source.txt",
+                                "mimetype": "text/plain",
+                                "url_private_download": "https://files.slack.com/source.txt",
+                            }
+                        ]
+                        if with_file
+                        else [],
                     },
                 ),
                 30,
             )
-            assert "Shared E2E answer" in str(bot.web_client.chat_update.call_args_list)
+            assert expected_text in str(bot.web_client.chat_update.call_args_list)
         elif platform == "feishu":
             from xagent.web.channels.feishu.bot import FeishuBotInstance
 
             bot = FeishuBotInstance("test-id", "test-secret", "e2e", channel_id, "E2E")
             bot.api_client = Mock()
             bot.api_client.im.v1.message.patch.return_value.success.return_value = True
+            bot.api_client.im.v1.message_resource.get.return_value = SimpleNamespace(
+                success=lambda: True,
+                file_name="source.txt",
+                file=io.BytesIO(b"unique shared input\n"),
+            )
             bot._send_text = AsyncMock(return_value="loading")
             bot._update_text = AsyncMock()
             message = SimpleNamespace(
@@ -103,12 +150,26 @@ async def test_channel_callback_runs_remotely_and_returns_answer(
                         chat_id="chat",
                         message_id="message",
                         message_type="text",
-                        content='{"text":"Channel question"}',
+                        content=json.dumps({"text": input_text}),
                     )
                 )
             )
-            await asyncio.wait_for(bot._process_messages_batch("sender", [message]), 30)
-            assert "Shared E2E answer" in str(bot._update_text.call_args_list)
+            messages = [message]
+            if with_file:
+                messages.append(
+                    SimpleNamespace(
+                        event=SimpleNamespace(
+                            message=SimpleNamespace(
+                                chat_id="chat",
+                                message_id="attachment",
+                                message_type="file",
+                                content='{"file_key":"platform-file"}',
+                            )
+                        )
+                    )
+                )
+            await asyncio.wait_for(bot._process_messages_batch("sender", messages), 30)
+            assert expected_text in str(bot._update_text.call_args_list)
         else:
             from xagent.web.channels.telegram.bot import TelegramBotInstance
 
@@ -128,7 +189,6 @@ async def test_channel_callback_runs_remotely_and_returns_answer(
                 ),
                 download_file=download_file,
             )
-            delivered = []
 
             async def answer_document(document, **kwargs):
                 delivered.append(Path(document.path).read_bytes())
@@ -142,7 +202,7 @@ async def test_channel_callback_runs_remotely_and_returns_answer(
                 chat=SimpleNamespace(id=456),
                 answer=AsyncMock(return_value=loading),
                 answer_document=answer_document,
-                text="e2e:files" if with_file else "Channel question",
+                text=input_text,
                 caption=None,
                 document=SimpleNamespace(
                     file_id="platform-file",
@@ -158,20 +218,86 @@ async def test_channel_callback_runs_remotely_and_returns_answer(
                 video=None,
             )
             await asyncio.wait_for(bot._process_user_messages_batch(123, [message]), 30)
-            assert "Shared E2E answer" in str(loading.edit_text.call_args_list)
+            assert expected_text in str(loading.edit_text.call_args_list)
             if with_file:
                 assert delivered == [b"UNIQUE SHARED INPUT\n"]
         with get_session_local()() as db:
             tasks = db.query(Task).all()
             assert len(tasks) == 1
             task_id = tasks[0].id
-        app.wait_task(task_id)
+        first = app.wait_task(
+            task_id, status="waiting_for_user" if with_question else "completed"
+        )
+        if with_file:
+            if platform != "feishu":
+                assert delivered == [b"UNIQUE SHARED INPUT\n"]
+            else:
+                # Feishu currently returns a managed file link in its final text.
+                from xagent.web.models.uploaded_file import UploadedFile
+
+                with get_session_local()() as db:
+                    output_id = (
+                        db.query(UploadedFile)
+                        .filter_by(task_id=str(task_id), filename="derived.txt")
+                        .one()
+                        .file_id
+                    )
+                assert output_id in first["output"]
+                assert output_id in str(bot._update_text.call_args_list)
+                response = app.client.get(
+                    f"/api/files/download/{output_id}", headers=app.headers
+                )
+                assert response.status_code == 200, response.text
+                assert response.content == b"UNIQUE SHARED INPUT\n"
+        else:
+            if platform == "slack":
+                await asyncio.wait_for(
+                    bot._process_event(
+                        "conversation",
+                        {},
+                        {
+                            "type": "message",
+                            "channel_type": "im",
+                            "channel": "D1",
+                            "user": "sender",
+                            "ts": "2.0",
+                            "text": followup_text,
+                        },
+                    ),
+                    30,
+                )
+            elif platform == "feishu":
+                message.event.message.message_id = "followup"
+                message.event.message.content = json.dumps({"text": followup_text})
+                await asyncio.wait_for(
+                    bot._process_messages_batch("sender", [message]), 30
+                )
+            else:
+                message.text = followup_text
+                await asyncio.wait_for(
+                    bot._process_user_messages_batch(123, [message]), 30
+                )
+            second = app.wait_task(task_id)
+            assert second["run_id"] != first["run_id"]
+            assert "Shared E2E answer" in second["output"]
+            with get_session_local()() as db:
+                assert db.query(Task).count() == 1
         calls = [
             json.loads(line)
             for path in app.root.glob("model-*.jsonl")
             for line in path.read_text().splitlines()
         ]
         assert calls and {call["role"] for call in calls} == {"worker"}
+        if not with_file:
+            assert any(followup_text in json.dumps(call["messages"]) for call in calls)
+            replies = (
+                bot.web_client.chat_update.call_args_list
+                if platform == "slack"
+                else bot._update_text.call_args_list
+                if platform == "feishu"
+                else loading.edit_text.call_args_list
+            )
+            assert "Shared E2E answer" in str(replies[-1])
         assert forwarded
         assert all(
             event.task_id is None or str(event.task_id) == str(task_id)

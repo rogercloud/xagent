@@ -292,11 +292,21 @@ def test_a2a_cancel_reaches_running_worker(shared_app):
 
 
 @pytest.mark.parametrize(
-    "interface", ["owner", "sdk", "widget", "share", "preview", "trigger"]
+    "interface",
+    [
+        "owner",
+        "sdk",
+        "widget",
+        "share",
+        "preview",
+        "trigger",
+        "trigger_webhook",
+        "trigger_scheduled",
+    ],
 )
 def test_workforce_manager_and_child_execute_in_worker(shared_app, interface):
     app = shared_app
-    manager_id, _ = app.create_agent()
+    manager_id, _ = app.create_agent(tool_categories=["file"])
     worker_id, _ = app.create_agent("Shared child")
     for agent_id in [manager_id, worker_id]:
         response = app.client.post(
@@ -323,6 +333,18 @@ def test_workforce_manager_and_child_execute_in_worker(shared_app, interface):
     )
     assert response.status_code == 200, response.text
     workforce_id = response.json()["id"]
+    with_files = interface in {"owner", "sdk", "widget", "share", "preview"}
+    message = "e2e:delegate e2e:files" if with_files else "e2e:delegate"
+    file_ids = []
+    if interface in {"owner", "preview"}:
+        uploaded = app.client.post(
+            "/api/files/upload",
+            headers=app.headers,
+            data={"task_type": "task"},
+            files={"file": ("source.txt", b"unique shared input\n", "text/plain")},
+        )
+        assert uploaded.status_code == 200, uploaded.text
+        file_ids = [uploaded.json()["file_id"]]
     if interface == "owner":
         published = app.client.post(
             f"/api/workforces/{workforce_id}/publish", headers=app.headers
@@ -331,7 +353,7 @@ def test_workforce_manager_and_child_execute_in_worker(shared_app, interface):
         response = app.client.post(
             f"/api/workforces/{workforce_id}/runs",
             headers=app.headers,
-            json={"message": "e2e:delegate", "execution_mode": "balanced"},
+            json={"message": message, "execution_mode": "balanced", "files": file_ids},
         )
     elif interface == "preview":
         response = app.client.post(
@@ -346,7 +368,8 @@ def test_workforce_manager_and_child_execute_in_worker(shared_app, interface):
                         "assignment_instructions": "Handle the question.",
                     }
                 ],
-                "message": "e2e:delegate",
+                "message": message,
+                "files": file_ids,
                 "execution_mode": "balanced",
             },
         )
@@ -362,23 +385,91 @@ def test_workforce_manager_and_child_execute_in_worker(shared_app, interface):
                 json={"workforce_id": workforce_id, "label": "SDK"},
             )
             assert key.status_code == 200, key.text
+            uploaded = app.client.post(
+                "/v1/chat/files",
+                headers={"Authorization": f"Bearer {key.json()['full_key']}"},
+                files=[
+                    ("files", ("source.txt", b"unique shared input\n", "text/plain"))
+                ],
+            )
+            assert uploaded.status_code == 200, uploaded.text
+            file_ids = [uploaded.json()["files"][0]["file_id"]]
             response = app.client.post(
                 f"/v1/workforces/{workforce_id}/runs",
                 headers={"Authorization": f"Bearer {key.json()['full_key']}"},
-                json={"message": {"role": "user", "content": "e2e:delegate"}},
+                json={
+                    "message": {"role": "user", "content": message, "files": file_ids}
+                },
             )
-        elif interface == "trigger":
+        elif interface.startswith("trigger"):
             trigger = app.client.post(
                 f"/api/workforces/{workforce_id}/triggers",
                 headers=app.headers,
-                json={"type": "webhook", "name": "Workforce trigger"},
+                json={
+                    "type": "scheduled"
+                    if interface == "trigger_scheduled"
+                    else "webhook",
+                    "name": "Workforce trigger",
+                    **(
+                        {"config": {"interval_seconds": 3600}}
+                        if interface == "trigger_scheduled"
+                        else {}
+                    ),
+                },
             )
             assert trigger.status_code == 200, trigger.text
-            response = app.client.post(
-                f"/api/workforces/{workforce_id}/triggers/{trigger.json()['id']}/test",
-                headers=app.headers,
-                json={"payload": {"subject": "e2e:delegate"}},
-            )
+            if interface == "trigger":
+                response = app.client.post(
+                    f"/api/workforces/{workforce_id}/triggers/{trigger.json()['id']}/test",
+                    headers=app.headers,
+                    json={"payload": {"subject": "e2e:delegate"}},
+                )
+            else:
+                from datetime import datetime, timedelta, timezone
+
+                from xagent.web.models.database import get_session_local
+                from xagent.web.models.trigger import AgentTrigger, TriggerRun
+                from xagent.web.services.trigger_providers import sign_webhook_payload
+
+                config = trigger.json()
+                if interface == "trigger_webhook":
+                    payload = b'{"subject":"e2e:delegate"}'
+                    timestamp = str(int(time.time()))
+                    response = app.client.post(
+                        f"/api/triggers/callback/webhook/{config['callback_id']}",
+                        content=payload,
+                        headers={
+                            "x-xagent-timestamp": timestamp,
+                            "x-xagent-event-id": "workforce-happy",
+                            "x-xagent-signature": sign_webhook_payload(
+                                config["webhook_secret"], timestamp, payload
+                            ),
+                        },
+                    )
+                    assert response.status_code == 200, response.text
+                else:
+                    with get_session_local()() as db:
+                        row = db.get(AgentTrigger, config["id"])
+                        row.next_run_at = datetime.now(timezone.utc) - timedelta(
+                            seconds=5
+                        )
+                        row.prompt_template = "e2e:delegate"
+                        db.commit()
+                deadline = time.monotonic() + 30
+                trigger_task_id = None
+                while time.monotonic() < deadline:
+                    with get_session_local()() as db:
+                        run = (
+                            db.query(TriggerRun)
+                            .filter_by(trigger_id=config["id"])
+                            .first()
+                        )
+                        if run is not None:
+                            trigger_task_id = run.task_id
+                    if trigger_task_id:
+                        break
+                    time.sleep(0.03)
+                assert trigger_task_id, app.diagnostics()
         else:
             if interface == "widget":
                 enabled = app.client.put(
@@ -404,15 +495,120 @@ def test_workforce_manager_and_child_execute_in_worker(shared_app, interface):
                     json={"share_token": enabled.json()["share_token"]},
                 )
             assert auth.status_code == 200, auth.text
+            uploaded = app.client.post(
+                f"/api/{interface}/files/upload",
+                headers={"Authorization": f"Bearer {auth.json()['access_token']}"},
+                data={"task_type": "task"},
+                files={"file": ("source.txt", b"unique shared input\n", "text/plain")},
+            )
+            assert uploaded.status_code == 200, uploaded.text
+            file_ids = [uploaded.json()["file_id"]]
             response = app.client.post(
                 f"/api/{interface}/chat/task/create",
                 headers={"Authorization": f"Bearer {auth.json()['access_token']}"},
-                json={"title": "e2e:delegate", "description": "e2e:delegate"},
+                json={"title": message, "description": message, "files": file_ids},
             )
     assert response.status_code == (202 if interface == "sdk" else 200), response.text
     body = response.json()
-    task_id = (body["trigger_run"] if interface == "trigger" else body)["task_id"]
-    app.wait_task(task_id)
+    task_id = (
+        trigger_task_id
+        if interface in {"trigger_webhook", "trigger_scheduled"}
+        else (body["trigger_run"] if interface == "trigger" else body)["task_id"]
+    )
+    first = app.wait_task(task_id)
+    if with_files:
+        from xagent.web.models.database import get_session_local
+        from xagent.web.models.uploaded_file import UploadedFile
+
+        with get_session_local()() as db:
+            output_id = (
+                db.query(UploadedFile)
+                .filter_by(task_id=str(task_id), filename="derived.txt")
+                .one()
+                .file_id
+            )
+        assert output_id in first["output"]
+        file_token = (
+            auth.json()["access_token"]
+            if interface in {"widget", "share"}
+            else app.token
+        )
+        downloaded = app.client.get(
+            f"/api/files/public/download/{output_id}", params={"token": file_token}
+        )
+        assert downloaded.status_code == 200, downloaded.text
+        assert downloaded.content == b"UNIQUE SHARED INPUT\n"
+    if interface in {"owner", "sdk", "widget", "share", "preview"}:
+        if interface == "sdk":
+            sdk_headers = {"Authorization": f"Bearer {key.json()['full_key']}"}
+            response = app.client.post(
+                f"/v1/chat/tasks/{task_id}/messages",
+                headers=sdk_headers,
+                json={
+                    "workforce_id": workforce_id,
+                    "message": {"role": "user", "content": "e2e:ask"},
+                },
+            )
+            assert response.status_code == 202, response.text
+            waiting = app.wait_task(task_id, status="waiting_for_user")
+            assert waiting["run_id"] != first["run_id"]
+            response = app.client.post(
+                f"/v1/chat/tasks/{task_id}/reply",
+                headers=sdk_headers,
+                json={
+                    "workforce_id": workforce_id,
+                    "message": {"role": "user", "content": "e2e:answer"},
+                },
+            )
+            assert response.status_code == 202, response.text
+            app.wait_task(task_id, run_id=waiting["run_id"])
+            polled = app.client.get(f"/v1/chat/tasks/{task_id}", headers=sdk_headers)
+            assert polled.status_code == 200, polled.text
+            assert "Shared E2E answer" in polled.text
+        else:
+            from websockets.sync.client import connect
+
+            token = (
+                auth.json()["access_token"]
+                if interface in {"widget", "share"}
+                else app.token
+            )
+            ws_path = (
+                f"/api/{interface}/chat/ws/{task_id}"
+                if interface in {"widget", "share"}
+                else f"/ws/chat/{task_id}"
+            )
+            url = (
+                str(app.client.base_url).replace("http://", "ws://").rstrip("/")
+                + ws_path
+                + f"?token={token}"
+            )
+            with connect(url) as ws:
+                receive_event(ws, "historical_data_complete")
+                ws.send(
+                    json.dumps(
+                        {
+                            "type": "chat",
+                            "message": "e2e:ask",
+                            "client_message_id": "workforce-question",
+                        }
+                    )
+                )
+                receive_event(ws, "message_accepted")
+                waiting = app.wait_task(task_id, status="waiting_for_user")
+                assert waiting["run_id"] != first["run_id"]
+                ws.send(
+                    json.dumps(
+                        {
+                            "type": "chat",
+                            "message": "e2e:answer",
+                            "client_message_id": "workforce-answer",
+                        }
+                    )
+                )
+                receive_event(ws, "message_accepted")
+                receive_event(ws, "task_completed")
+                app.wait_task(task_id, run_id=waiting["run_id"])
     from xagent.web.models.database import get_session_local
     from xagent.web.models.workforce import WorkforceRun
 
@@ -420,6 +616,13 @@ def test_workforce_manager_and_child_execute_in_worker(shared_app, interface):
         run = db.query(WorkforceRun).filter_by(task_id=task_id).one()
         assert run.status == "completed"
         assert run.is_preview == (interface == "preview")
+        if interface.startswith("trigger"):
+            from xagent.web.models.trigger import TriggerRun
+
+            assert (
+                db.query(TriggerRun).filter_by(task_id=task_id).one().status
+                == "completed"
+            )
     calls = [
         json.loads(line)
         for path in app.root.glob("model-*.jsonl")
