@@ -353,6 +353,7 @@ class SharedExecutionApp:
         from xagent.web.models.task import Task
 
         deadline = time.monotonic() + timeout
+        state = None
         while time.monotonic() < deadline:
             with get_session_local()() as db:
                 task = db.get(Task, task_id)
