@@ -134,6 +134,7 @@ SANDBOX_ALLOW_LOCAL_FALLBACK_ON_CAPACITY = (
 )
 SANDBOX_NAMESPACE = "XAGENT_SANDBOX_NAMESPACE"
 SANDBOX_WORKER_ID = "XAGENT_SANDBOX_WORKER_ID"
+TASK_RUNTIME_SECRETS_TTL_SECONDS = "XAGENT_TASK_RUNTIME_SECRETS_TTL_SECONDS"
 BOXLITE_HOME_DIR = "BOXLITE_HOME_DIR"
 WEB_SEARCH_PROVIDER = "XAGENT_WEB_SEARCH_PROVIDER"
 WEB_CRAWL_TLS_IMPERSONATE = "XAGENT_WEB_CRAWL_TLS_IMPERSONATE"
@@ -805,6 +806,7 @@ def validate_task_execution_host_config() -> None:
         return
     if not get_redis_url():
         raise ValueError(f"{SHARED_TASK_EXECUTION_ENABLED} requires {REDIS_URL}")
+    get_task_runtime_secrets_ttl_seconds()
     key = get_task_runtime_secrets_encryption_key()
     if key is None:
         raise ValueError(
@@ -814,6 +816,14 @@ def validate_task_execution_host_config() -> None:
 
     Fernet(key.encode())
     get_task_event_channel_prefix()
+
+
+def get_task_runtime_secrets_ttl_seconds() -> int:
+    """Maximum lifetime of accepted connector values; default one day."""
+    value = int(os.getenv(TASK_RUNTIME_SECRETS_TTL_SECONDS, "86400"))
+    if value <= 0:
+        raise ValueError(f"{TASK_RUNTIME_SECRETS_TTL_SECONDS} must be positive")
+    return value
 
 
 def get_task_runtime_secrets_encryption_key() -> str | None:
