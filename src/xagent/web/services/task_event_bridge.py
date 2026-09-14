@@ -291,7 +291,9 @@ class TaskEventBridge:
         except (TimeoutError, RedisError, OSError):
             logger.warning("Task reply ACK could not be published")
 
-    def reply_for(self, command_id: str, task_id: int) -> CommandReply:
+    def reply_for(
+        self, command_id: str, task_id: int, *, require_ack: bool = False
+    ) -> CommandReply:
         async def reply(message: dict[str, Any]) -> None:
             route = await run_db_io_cancellation_safe(
                 lambda: _reply_route(task_id, command_id)
@@ -305,6 +307,8 @@ class TaskEventBridge:
                 increment_counter(
                     "xagent.task.reply.delivery", attributes={"outcome": "no_route"}
                 )
+                if require_ack:
+                    raise ConnectionError("Original task command route is unavailable")
                 return
             host_id, origin = route
             delivery_id = uuid4().hex
@@ -336,6 +340,8 @@ class TaskEventBridge:
                     command_id,
                     delivery_id,
                 )
+                if require_ack:
+                    raise ConnectionError("Task reply acknowledgement is unavailable")
                 return
             finally:
                 self._acks.pop(delivery_id, None)

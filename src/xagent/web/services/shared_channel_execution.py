@@ -22,6 +22,7 @@ from ...core.agent.trace import (
     TraceScope,
 )
 from ...core.execution_scope import resolve_execution_scope
+from ...core.runtime_performance import increment_counter
 from ...core.workspace import TaskWorkspace
 from ..models.database import get_session_local
 from ..models.task import Task, TaskStatus
@@ -486,11 +487,14 @@ class ChannelProgressForwarder(TraceHandler):
     def __init__(self, command: ClaimedTaskCommand, run_id: str) -> None:
         self.command = command
         self.run_id = run_id
+        self._unavailable = False
 
     async def handle_event(self, event: TraceEvent) -> None:
+        if self._unavailable:
+            return
         try:
             await get_task_event_bridge().reply_for(
-                self.command.command_id, self.command.task_id
+                self.command.command_id, self.command.task_id, require_ack=True
             )(
                 {
                     "type": "channel_trace",
@@ -498,10 +502,19 @@ class ChannelProgressForwarder(TraceHandler):
                     "trace": event.to_dict(),
                 }
             )
-        except Exception:
+        except ConnectionError:
+            self._unavailable = True
             logger.warning(
-                "Channel progress delivery unavailable task_id=%s", self.command.task_id
+                "Channel progress forwarding stopped after delivery failure task_id=%s",
+                self.command.task_id,
             )
+            increment_counter("xagent.channel.progress.unavailable")
+        except Exception:
+            self._unavailable = True
+            logger.exception(
+                "Channel progress forwarding failed task_id=%s", self.command.task_id
+            )
+            increment_counter("xagent.channel.progress.error")
 
 
 async def execute_channel_background(
