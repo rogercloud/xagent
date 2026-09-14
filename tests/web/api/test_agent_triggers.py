@@ -390,13 +390,15 @@ def test_trigger_test_run_creates_hidden_agent_task(
         if shared:
             command = db.query(TaskExecutionCommand).filter_by(task_id=task.id).one()
             assert command.status == "pending"
-            assert command.target_run_id == task.run_id
+            assert task.run_id is None
+            assert command.target_run_id == command.payload["run_id"]
+            assert command.target_run_id is not None
             assert command.payload["kind"] == "create"
             assert task.runner_id is None
         assert task.agent_id == agent_id
         assert task.source == "trigger"
         assert task.is_visible is False
-        assert task.status == TaskStatus.RUNNING
+        assert task.status == (TaskStatus.PENDING if shared else TaskStatus.RUNNING)
         assert "hello" in (task.description or "")
     finally:
         db.close()

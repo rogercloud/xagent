@@ -1296,14 +1296,16 @@ def fail_and_release_task_lease_no_commit(
         .where(Task.run_id == lease.run_id)
         .where(task_status_predicate.eq(TaskStatus.RUNNING))
         .values(
-            status=task_status_predicate.value(TaskStatus.FAILED),
-            control_state=failed_control_state,
-            state_version=func.coalesce(Task.state_version, 0) + 1,
-            error_message=error_message,
-            output=None,
-            **task_settlement_ownership_values(
-                lease.task_id, last_heartbeat_at=utc_now()
-            ),
+            {
+                "status": task_status_predicate.value(TaskStatus.FAILED),
+                "control_state": failed_control_state,
+                "state_version": func.coalesce(Task.state_version, 0) + 1,
+                "error_message": error_message,
+                "output": None,
+                **task_settlement_ownership_values(
+                    lease.task_id, last_heartbeat_at=utc_now()
+                ),
+            }
         )
     )
     result = db.execute(stmt.execution_options(synchronize_session=False))
@@ -1334,12 +1336,16 @@ def release_current_runner_task_lease(
         .where(Task.run_id == lease.run_id)
         .where(task_lease_attempt_predicate(lease))
         .values(
-            status=task_status_predicate.value(status),
-            control_state=control_state,
-            state_version=lease_state_version_case(
-                status, control_state, current_version
-            ),
-            **task_settlement_ownership_values(task_id, last_heartbeat_at=utc_now()),
+            {
+                "status": task_status_predicate.value(status),
+                "control_state": control_state,
+                "state_version": lease_state_version_case(
+                    status, control_state, current_version
+                ),
+                **task_settlement_ownership_values(
+                    task_id, last_heartbeat_at=utc_now()
+                ),
+            }
         )
     )
     if expected_run_id is not None:

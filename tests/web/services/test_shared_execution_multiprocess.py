@@ -86,7 +86,11 @@ def _execution_host(pipe, env, task_id):
         from xagent.web.models.database import configure_db, get_session_local
         from xagent.web.models.task import Task, TaskStatus
         from xagent.web.services import agent_service_manager, task_orchestrator
+        from xagent.web.services.task_command_execution import (
+            execute_durable_task_command,
+        )
         from xagent.web.services.task_command_transport import claim_task_command
+        from xagent.web.services.task_coordinator_runtime import close_task_coordinators
         from xagent.web.services.task_event_bridge import (
             start_task_event_bridge,
             stop_task_event_bridge,
@@ -96,7 +100,6 @@ def _execution_host(pipe, env, task_id):
             TaskExecutionRecoverySnapshot,
         )
         from xagent.web.services.task_lease_service import get_runner_id
-        from xagent.web.services.task_start_consumer import execute_task_start
 
         configure_db()
         bridge = await start_task_event_bridge()
@@ -149,13 +152,14 @@ def _execution_host(pipe, env, task_id):
             command = claim_task_command(db, runner_id=get_runner_id())
         try:
             if command is not None:
-                await execute_task_start(command)
+                await execute_durable_task_command(command)
                 pending = background_task_manager.running_tasks.get(task_id)
                 if pending is not None:
                     await pending
             pipe.send({"executed": command is not None})
             await asyncio.to_thread(pipe.recv)
         finally:
+            await close_task_coordinators()
             await background_task_manager.shutdown()
             await stop_task_event_bridge()
 
