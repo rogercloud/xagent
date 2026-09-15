@@ -164,18 +164,37 @@ async def test_pending_notice_does_not_complete_delivery(accepted):
 
 
 @pytest.mark.asyncio
-async def test_revoked_channel_cannot_receive_saved_answer(accepted, selected):
+@pytest.mark.parametrize("reason", ["sender_not_authorized", "owner_changed"])
+async def test_revoked_channel_cannot_receive_saved_answer(
+    accepted, selected, monkeypatch, caplog, reason
+):
     complete(accepted)
     with get_session_local()() as db:
-        db.get(UserChannel, selected.selection.channel_id).config = {
-            "allowed_users": ["someone-else"]
-        }
+        channel = db.get(UserChannel, selected.selection.channel_id)
+        if reason == "sender_not_authorized":
+            channel.config = {"allowed_users": ["someone-else"]}
+        else:
+            from xagent.web.models.user import User
+
+            owner = User(username="replacement-owner", password_hash="unused")
+            db.add(owner)
+            db.flush()
+            channel.user_id = owner.id
         db.commit()
+    counter = Mock()
+    monkeypatch.setattr(delivery, "increment_counter", counter)
     sender = AsyncMock()
     await delivery.deliver_channel_result(accepted, sender)
     sender.assert_not_awaited()
     with get_session_local()() as db:
-        assert db.get(TaskChannelDelivery, accepted).status == "discarded"
+        row = db.get(TaskChannelDelivery, accepted)
+        assert row.status == "discarded"
+        assert row.claim_token is None
+    assert f"status=discarded reason={reason}" in caplog.text
+    counter.assert_called_once_with(
+        "xagent.channel.delivery",
+        attributes={"outcome": "discarded", "error.type": reason},
+    )
 
 
 @pytest.mark.asyncio
@@ -379,7 +398,7 @@ async def test_permanent_send_failure_exhausts_budget(accepted, monkeypatch, cap
     assert "status=failed reason=delivery_error" in caplog.text
     counter.assert_any_call(
         "xagent.channel.delivery",
-        attributes={"outcome": "failed", "reason": "delivery_error"},
+        attributes={"outcome": "failed", "error.type": "delivery_error"},
     )
     with get_session_local()() as db:
         assert db.get(TaskChannelDelivery, accepted).available_at is None
@@ -400,3 +419,49 @@ def test_replaced_delivery_claim_cannot_consume_retry_budget(accepted):
         row = db.get(TaskChannelDelivery, accepted)
         assert row.claim_token == replacement.claim_token
         assert row.failure_count == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("repair", [True, False])
+async def test_unavailable_channel_retries_with_budget_and_can_recover(
+    accepted, selected, repair, monkeypatch, caplog
+):
+    complete(accepted)
+    with get_session_local()() as db:
+        db.get(UserChannel, selected.selection.channel_id).is_active = False
+        db.commit()
+    sender = AsyncMock()
+    counter = Mock()
+    monkeypatch.setattr(delivery, "increment_counter", counter)
+    await delivery.deliver_channel_result(accepted, sender)
+    await delivery.deliver_channel_result(accepted, sender)
+    sender.assert_not_awaited()
+    with get_session_local()() as db:
+        row = db.get(TaskChannelDelivery, accepted)
+        assert row.status == "pending"
+        assert row.failure_count == 1
+        assert row.available_at is not None
+        assert row.claim_token is None
+    assert "reason=configuration_unavailable" in caplog.text
+    if repair:
+        with get_session_local()() as db:
+            db.get(UserChannel, selected.selection.channel_id).is_active = True
+            db.commit()
+        expire_claim(accepted)
+        await delivery.recover_channel_results(selected.selection.channel_id, sender)
+        sender.assert_awaited_once()
+        with get_session_local()() as db:
+            assert db.get(TaskChannelDelivery, accepted).status == "delivered"
+    else:
+        for _ in range(9):
+            expire_claim(accepted)
+            await delivery.recover_channel_results(
+                selected.selection.channel_id, sender
+            )
+        with get_session_local()() as db:
+            assert db.get(TaskChannelDelivery, accepted).status == "failed"
+        sender.assert_not_awaited()
+        counter.assert_any_call(
+            "xagent.channel.delivery",
+            attributes={"outcome": "failed", "error.type": "configuration_unavailable"},
+        )
