@@ -57,6 +57,25 @@ clean up another worker's resources. Workspace files remain shared. Existing
 unscoped sandbox resources from local mode need operator cleanup after draining
 that deployment; changing an identity does not migrate those resources.
 
+The SQL metadata needs the same upgrade cleanup. Old `sandbox_info.name` and
+`sandbox_snapshot.snapshot_id` values have no worker namespace prefix. New
+stores use `<scope>::<logical-name>` keys, so normal lookups/deletes cannot reach
+those old rows; they are not automatically migrated or deleted. After draining
+all processes using the old resources and backing up the database, inspect:
+
+```sql
+SELECT id, sandbox_type, name, state FROM sandbox_info ORDER BY id;
+SELECT id, sandbox_type, snapshot_id FROM sandbox_snapshot ORDER BY id;
+```
+
+Match the records to the retired deployment's container/snapshot inventory,
+remove those physical resources, then delete only the reviewed metadata rows
+by their exact primary-key IDs using your database administration tool. Retain
+rows belonging to other deployments or current worker scopes. Do not infer
+ownership merely from the presence of `::`: legacy logical names can contain
+that separator too. Deleting metadata alone does not remove containers or
+snapshot images, and adding a prefix does not transfer resource ownership.
+
 ## Channel replies and failure recovery
 
 Accepted channel commands and final-reply destinations are committed together.
