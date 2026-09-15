@@ -271,13 +271,17 @@ async def test_preaccept_stop_preserves_resumable_task_and_files(selected, tmp_p
 
 
 @pytest.mark.asyncio
-async def test_preaccept_stop_cannot_modify_replacement(selected):
+@pytest.mark.parametrize("stop", [True, False])
+async def test_preaccept_cleanup_cannot_modify_replacement(selected, stop):
     with get_session_local()() as db:
         task = db.get(Task, selected.selection.task_id)
         task.run_id = "new-run"
         task.state_version += 1
         db.commit()
-    await selected.stop()
+    selected.origin = None
+    if stop:
+        await selected.stop()
+    await selected.close()
     with get_session_local()() as db:
         task = db.get(Task, selected.selection.task_id)
         assert task.run_id == "new-run"
@@ -465,3 +469,53 @@ async def test_unavailable_channel_retries_with_budget_and_can_recover(
             "xagent.channel.delivery",
             attributes={"outcome": "failed", "error.type": "configuration_unavailable"},
         )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["file_unavailable", "owner_changed"])
+async def test_preaccept_failure_preserves_resumable_task_and_files(
+    selected, tmp_path, monkeypatch, failure
+):
+    from sqlalchemy import text
+
+    from xagent.web.models.uploaded_file import UploadedFile
+    from xagent.web.models.user import User
+    from xagent.web.services.task_orchestrator import TaskTurnError
+
+    path = tmp_path / "input.txt"
+    path.write_text("input")
+    with get_session_local()() as db:
+        if db.get_bind().dialect.name == "sqlite":
+            db.execute(text("PRAGMA foreign_keys=ON"))
+        db.add(
+            UploadedFile(
+                task_id=selected.selection.task_id,
+                user_id=selected.selection.user_id,
+                filename=path.name,
+                storage_path=str(path),
+            )
+        )
+        if failure == "owner_changed":
+            replacement = User(username="replacement", password_hash="unused")
+            db.add(replacement)
+            db.flush()
+            db.get(UserChannel, selected.selection.channel_id).user_id = replacement.id
+        db.commit()
+    bridge = Mock(host_id="ingress")
+    bridge.register_origin.return_value = "origin"
+    monkeypatch.setattr(shared, "get_task_event_bridge", lambda: bridge)
+    payload = TaskTurnPayload(
+        "hello", file_ids=("missing",) if failure == "file_unavailable" else ()
+    )
+    with pytest.raises(TaskTurnError, match=failure):
+        await selected.execute(payload, None)
+    await selected.close()
+    await selected.close()
+    with get_session_local()() as db:
+        task = db.get(Task, selected.selection.task_id)
+        assert task.status == TaskStatus.PAUSED
+        assert task.control_state == "paused"
+        assert task.state_version == selected.selection.state_version + 1
+        assert db.query(UploadedFile).one().task_id == task.id
+        assert db.query(TaskExecutionCommand).count() == 0
+    assert path.read_text() == "input"

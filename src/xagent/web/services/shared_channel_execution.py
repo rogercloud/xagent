@@ -64,9 +64,7 @@ from .workspace_binding import canonical_workspace_base
 logger = logging.getLogger(__name__)
 
 
-def _settle_pending_selection(
-    selection: SelectedChannelTask, *, stopped: bool = False
-) -> None:
+def _settle_pending_selection(selection: SelectedChannelTask) -> None:
     if not selection.is_new_task:
         return
     with get_session_local()() as db:
@@ -79,20 +77,17 @@ def _settle_pending_selection(
             Task.runner_id.is_(None),
             ~exists(select(1).where(TaskExecutionCommand.task_id == selection.task_id)),
         )
-        if stopped:
-            # Keep the new conversation and its uploaded files resumable.
-            # The original selection fences a concurrent accepted command.
-            pending.update(
-                {
-                    Task.status: TaskStatus.PAUSED,
-                    Task.control_state: "paused",
-                    Task.run_id: str(uuid4()),
-                    Task.state_version: Task.state_version + 1,
-                },
-                synchronize_session=False,
-            )
-        else:
-            pending.delete(synchronize_session=False)
+        # Selection may already own uploaded files before START is accepted.
+        # Both stop and failed acceptance must keep the conversation resumable.
+        pending.update(
+            {
+                Task.status: TaskStatus.PAUSED,
+                Task.control_state: "paused",
+                Task.run_id: str(uuid4()),
+                Task.state_version: Task.state_version + 1,
+            },
+            synchronize_session=False,
+        )
         db.commit()
 
 
@@ -205,7 +200,7 @@ class SharedChannelTurn:
             await self.stop_task
         elif not self.accepted:
             await run_db_io_cancellation_safe(
-                lambda: _settle_pending_selection(self.selection, stopped=True)
+                lambda: _settle_pending_selection(self.selection)
             )
 
     async def close(self) -> None:
@@ -215,9 +210,7 @@ class SharedChannelTurn:
             await asyncio.gather(self.stop_task, return_exceptions=True)
         if not self.accepted:
             await run_db_io_cancellation_safe(
-                lambda: _settle_pending_selection(
-                    self.selection, stopped=self.stop_requested
-                )
+                lambda: _settle_pending_selection(self.selection)
             )
 
     async def execute(

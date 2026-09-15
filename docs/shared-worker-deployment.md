@@ -85,8 +85,9 @@ progress route disables progress forwarding for that turn after the first
 failure; it does not repeatedly delay execution. Final replies use durable
 recovery rather than the old in-memory progress route.
 
-Stopping a newly selected task before acceptance leaves it paused with its
-uploaded files, so it can be continued. It cannot modify a newer replacement run.
+Stopping a newly selected task or closing it after failed acceptance leaves it
+paused with its uploaded files, so it can be continued. Cleanup applies only to
+the original unaccepted selection; it cannot modify a newer replacement run.
 
 ## Runtime credential lifetime
 
