@@ -10,8 +10,10 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, cast
 from uuid import uuid4
 
-from sqlalchemy import or_, select, update
+from sqlalchemy import case, or_, select, update
+from sqlalchemy.orm import Session
 
+from ...core.runtime_performance import increment_counter
 from ..models.database import get_session_local
 from ..models.task import Task, TaskStatus
 from ..models.task_channel_delivery import TaskChannelDelivery
@@ -23,6 +25,7 @@ from .task_lease_service import TaskLeaseLostError
 logger = logging.getLogger(__name__)
 _DELIVERY_LEASE_SECONDS = 60
 _DELIVERY_RETRY_SECONDS = 30
+_DELIVERY_MAX_FAILURES = 10
 
 PENDING_CHANNEL_RESULT: dict[str, Any] = {
     "success": True,
@@ -115,26 +118,67 @@ def _claim(command_id: int) -> tuple[ChannelDelivery, dict[str, Any] | None] | N
     return delivery, result
 
 
-def _settle(delivery: ChannelDelivery, *, status: str = "pending") -> None:
+def _settle_no_commit(
+    db: Session,
+    delivery: ChannelDelivery,
+    *,
+    status: str = "pending",
+    failed: bool = False,
+) -> str | None:
     now = datetime.now(timezone.utc)
-    with get_session_local()() as db:
-        db.execute(
-            update(TaskChannelDelivery)
-            .where(
-                TaskChannelDelivery.command_id == delivery.command_id,
-                TaskChannelDelivery.claim_token == delivery.claim_token,
-                TaskChannelDelivery.status == "pending",
-            )
-            .values(
-                status=status,
-                claim_token=None,
-                available_at=now + timedelta(seconds=_DELIVERY_RETRY_SECONDS)
-                if status == "pending"
-                else None,
-                delivered_at=now if status == "delivered" else None,
-            )
+    retry_at = now + timedelta(seconds=_DELIVERY_RETRY_SECONDS)
+    values: dict[str, Any] = {
+        "status": status,
+        "claim_token": None,
+        "available_at": retry_at if status == "pending" else None,
+        "delivered_at": now if status == "delivered" else None,
+    }
+    if failed:
+        failures = TaskChannelDelivery.failure_count + 1
+        exhausted = failures >= _DELIVERY_MAX_FAILURES
+        values.update(
+            failure_count=failures,
+            status=case((exhausted, "failed"), else_="pending"),
+            available_at=case((exhausted, None), else_=retry_at),
         )
+    return db.execute(
+        update(TaskChannelDelivery)
+        .where(
+            TaskChannelDelivery.command_id == delivery.command_id,
+            TaskChannelDelivery.claim_token == delivery.claim_token,
+            TaskChannelDelivery.status == "pending",
+        )
+        .values(**values)
+        .returning(TaskChannelDelivery.status)
+    ).scalar_one_or_none()
+
+
+def _record_delivery_outcome(
+    delivery: ChannelDelivery, status: str | None, *, reason: str
+) -> None:
+    if status is None:
+        return
+    logger.warning(
+        "Channel delivery settled task_id=%s command_id=%s status=%s reason=%s",
+        delivery.task_id,
+        delivery.command_id,
+        status,
+        reason,
+    )
+    increment_counter(
+        "xagent.channel.delivery",
+        attributes={"outcome": status, "reason": reason},
+    )
+
+
+def _settle(
+    delivery: ChannelDelivery, *, status: str = "pending", failed: bool = False
+) -> None:
+    with get_session_local()() as db:
+        settled = _settle_no_commit(db, delivery, status=status, failed=failed)
         db.commit()
+    if failed:
+        _record_delivery_outcome(delivery, settled, reason="delivery_error")
 
 
 def _renew(delivery: ChannelDelivery) -> bool:
@@ -197,7 +241,9 @@ async def deliver_channel_result(
         # Retry only the platform send; never stage another execution command.
         if delivery is not None:
             try:
-                await run_db_io_cancellation_safe(lambda: _settle(delivery))
+                await run_db_io_cancellation_safe(
+                    lambda: _settle(delivery, failed=True)
+                )
             except Exception:
                 logger.exception(
                     "Channel delivery claim retained command_id=%s", command_id
@@ -248,7 +294,11 @@ def _pending(channel_id: int) -> list[int]:
                         ),
                     ),
                 )
-                .order_by(TaskChannelDelivery.command_id)
+                # Never let old failed destinations monopolize every batch.
+                .order_by(
+                    TaskChannelDelivery.available_at.asc().nulls_first(),
+                    TaskChannelDelivery.command_id,
+                )
                 .limit(10)
             ).scalars()
         )

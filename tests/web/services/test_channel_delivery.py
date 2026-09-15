@@ -156,6 +156,7 @@ async def test_pending_notice_does_not_complete_delivery(accepted):
     assert sender.await_args.args[1]["status"] == "accepted"
     with get_session_local()() as db:
         assert db.get(TaskChannelDelivery, accepted).status == "pending"
+        assert db.get(TaskChannelDelivery, accepted).failure_count == 0
     complete(accepted)
     expire_claim(accepted)
     await delivery.deliver_channel_result(accepted, sender)
@@ -301,3 +302,101 @@ async def test_lost_delivery_claim_cancels_inflight_sender(accepted, monkeypatch
     assert cancelled.is_set()
     with get_session_local()() as db:
         assert db.get(TaskChannelDelivery, accepted).status == "pending"
+
+
+@pytest.mark.asyncio
+async def test_failed_destinations_do_not_starve_newer_replies(
+    accepted, selected, monkeypatch
+):
+    complete(accepted)
+    ids = [accepted]
+    with get_session_local()() as db:
+        first = db.get(TaskExecutionCommand, accepted)
+        for i in range(10):
+            command = TaskExecutionCommand(
+                task_id=first.task_id,
+                actor_user_id=first.actor_user_id,
+                command_id=f"retry-fairness-{i}",
+                kind=first.kind,
+                payload=first.payload,
+                target_run_id=first.target_run_id,
+                status="completed",
+                result=first.result,
+            )
+            db.add(command)
+            db.flush()
+            ids.append(command.id)
+            db.add(
+                TaskChannelDelivery(
+                    command_id=command.id,
+                    channel_id=selected.selection.channel_id,
+                    destination={"chat_id": str(i)},
+                )
+            )
+        db.commit()
+
+    class Clock(datetime):
+        tick = datetime.now(timezone.utc)
+
+        @classmethod
+        def now(cls, tz=None):
+            return cls.tick
+
+    monkeypatch.setattr(delivery, "datetime", Clock)
+    sent = []
+
+    async def sender(record, result):
+        sent.append(record.command_id)
+        if record.command_id != ids[-1]:
+            raise ConnectionError("destination permanently refuses the reply")
+
+    await delivery.recover_channel_results(selected.selection.channel_id, sender)
+    assert ids[-1] not in sent
+    Clock.tick += timedelta(seconds=31)
+    await delivery.recover_channel_results(selected.selection.channel_id, sender)
+    # Even though the ten failures are eligible again, the fresh reply wins.
+    assert sent[10] == ids[-1]
+    with get_session_local()() as db:
+        assert db.get(TaskChannelDelivery, ids[-1]).status == "delivered"
+        assert db.query(TaskExecutionCommand).count() == 11
+
+
+@pytest.mark.asyncio
+async def test_permanent_send_failure_exhausts_budget(accepted, monkeypatch, caplog):
+    complete(accepted)
+    sender = AsyncMock(side_effect=ConnectionError("permanent refusal"))
+    counter = Mock()
+    monkeypatch.setattr(delivery, "increment_counter", counter)
+    for attempt in range(10):
+        expire_claim(accepted)
+        await delivery.deliver_channel_result(accepted, sender)
+        with get_session_local()() as db:
+            row = db.get(TaskChannelDelivery, accepted)
+            assert row.failure_count == attempt + 1
+            assert row.status == ("failed" if attempt == 9 else "pending")
+    await delivery.deliver_channel_result(accepted, sender)
+    assert sender.await_count == 10
+    assert "status=failed reason=delivery_error" in caplog.text
+    counter.assert_any_call(
+        "xagent.channel.delivery",
+        attributes={"outcome": "failed", "reason": "delivery_error"},
+    )
+    with get_session_local()() as db:
+        assert db.get(TaskChannelDelivery, accepted).available_at is None
+        assert (
+            db.get(TaskExecutionCommand, accepted).result["channel_result"]["output"]
+            == "saved answer"
+        )
+        assert db.query(TaskExecutionCommand).count() == 1
+
+
+def test_replaced_delivery_claim_cannot_consume_retry_budget(accepted):
+    complete(accepted)
+    original, _ = delivery._claim(accepted)
+    expire_claim(accepted)
+    replacement, _ = delivery._claim(accepted)
+    delivery._settle(original, failed=True)
+    with get_session_local()() as db:
+        row = db.get(TaskChannelDelivery, accepted)
+        assert row.claim_token == replacement.claim_token
+        assert row.failure_count == 0

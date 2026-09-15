@@ -25,6 +25,7 @@ class TaskChannelDelivery(Base):  # type: ignore
     status = Column(
         String(16), nullable=False, default="pending", server_default="pending"
     )
+    failure_count = Column(Integer, nullable=False, default=0, server_default="0")
     claim_token = Column(String(64), nullable=True)
     available_at = Column(DateTime(timezone=True), nullable=True)
     delivered_at = Column(DateTime(timezone=True), nullable=True)
