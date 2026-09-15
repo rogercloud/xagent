@@ -1866,19 +1866,25 @@ async def startup_event() -> None:
         if telegram_channel.enabled:
             logger.info("Initializing Telegram channel manager...")
             app.state.telegram_task = asyncio.create_task(telegram_channel.start())
-            logger.info("Telegram channel background task created successfully")
+            logger.info(
+                "Telegram channel manager scheduled; connection status follows in manager logs"
+            )
 
         feishu_channel = get_feishu_channel()
         if feishu_channel.enabled:
             logger.info("Initializing Feishu channel manager...")
             app.state.feishu_task = asyncio.create_task(feishu_channel.start())
-            logger.info("Feishu channel background task created successfully")
+            logger.info(
+                "Feishu channel manager scheduled; connection status follows in manager logs"
+            )
 
         slack_channel = get_slack_channel()
         if slack_channel.enabled:
             logger.info("Initializing Slack channel manager...")
             app.state.slack_task = asyncio.create_task(slack_channel.start())
-            logger.info("Slack channel background task created successfully")
+            logger.info(
+                "Slack channel manager scheduled; connection status follows in manager logs"
+            )
     except Exception as e:
         logger.error(f"Failed to start chat channel managers: {e}", exc_info=True)
 
