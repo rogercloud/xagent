@@ -51,6 +51,7 @@ async def test_channel_entry_submits_shared_turn_without_local_agent(
         return_value={"success": True, "status": "completed", "output": "Worker answer"}
     )
     turn.close = AsyncMock()
+    turn.deliver = AsyncMock(return_value=True)
     monkeypatch.setattr(
         module, "prepare_shared_channel_turn", AsyncMock(return_value=turn)
     )
@@ -81,7 +82,7 @@ async def test_channel_entry_submits_shared_turn_without_local_agent(
                 "text": "hello",
             },
         )
-        assert bot._send_final_text.await_args.kwargs["text"] == "Worker answer"
+        assert turn.delivery_destination["chat_id"] == "D1"
     elif platform == "feishu":
         from tests.web.test_feishu_message_queue import make_bot
 
@@ -104,7 +105,7 @@ async def test_channel_entry_submits_shared_turn_without_local_agent(
             )
         )
         await bot._process_messages_batch("sender", [message])
-        assert bot._update_text.await_args.args[-1] == "Worker answer"
+        assert turn.delivery_destination["chat_id"] == "chat"
     else:
         from tests.web.test_telegram_message_queue import make_bot
 
@@ -119,13 +120,18 @@ async def test_channel_entry_submits_shared_turn_without_local_agent(
             message_id=77, edit_text=AsyncMock(), delete=AsyncMock()
         )
         message = SimpleNamespace(
+            message_id=76,
+            message_thread_id=None,
             from_user=SimpleNamespace(id=123),
             chat=SimpleNamespace(id=456),
             answer=AsyncMock(return_value=loading),
         )
         await bot._process_user_messages_batch(123, [message])
-        assert "Worker answer" in loading.edit_text.await_args.args[0]
+        assert turn.delivery_destination["chat_id"] == 456
     assert turn.execute.await_args.args[0].transcript_message == "hello"
+    turn.deliver.assert_awaited_once()
+    assert callable(turn.deliver.await_args.args[0])
+    assert turn.deliver.await_args.kwargs == {"pending_notice": False}
     turn.close.assert_awaited_once()
     local_agent.assert_not_called()
     persist.assert_not_awaited()
