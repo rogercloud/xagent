@@ -18,7 +18,11 @@ from ..models.database import get_session_local
 from ..models.task import Task, TaskStatus
 from ..models.task_channel_delivery import TaskChannelDelivery
 from ..models.task_command import TaskExecutionCommand
-from .channel_runtime import ChannelAuthorizationError, _load_channel_owner_sync
+from .channel_runtime import (
+    ChannelAuthorizationError,
+    ChannelConfigurationError,
+    _load_channel_owner_sync,
+)
 from .db_runtime import run_db_io_cancellation_safe
 from .task_lease_service import TaskLeaseLostError
 
@@ -79,6 +83,13 @@ def _claim(command_id: int) -> tuple[ChannelDelivery, dict[str, Any] | None] | N
             select(TaskExecutionCommand).where(TaskExecutionCommand.id == command_id)
         ).scalar_one()
         channel = cast(dict[str, Any], command.payload)["channel"]
+        delivery = ChannelDelivery(
+            command_id,
+            cast(int, command.task_id),
+            cast(int, command.actor_user_id),
+            dict(row.destination),
+            token,
+        )
         try:
             owner = _load_channel_owner_sync(
                 db,
@@ -86,28 +97,24 @@ def _claim(command_id: int) -> tuple[ChannelDelivery, dict[str, Any] | None] | N
                 external_user_id=channel["external_user_id"],
             )
         except ChannelAuthorizationError:
-            db.execute(
-                update(TaskChannelDelivery)
-                .where(TaskChannelDelivery.command_id == command_id)
-                .values(status="discarded", claim_token=None)
-            )
+            status = _settle_no_commit(db, delivery, status="discarded")
             db.commit()
+            _record_delivery_outcome(delivery, status, reason="sender_not_authorized")
+            return None
+        except ChannelConfigurationError:
+            # A disabled/misconfigured channel can be repaired. Keep the reply,
+            # but use the same bounded retry budget as a failed platform send.
+            status = _settle_no_commit(db, delivery, failed=True)
+            db.commit()
+            _record_delivery_outcome(
+                delivery, status, reason="configuration_unavailable"
+            )
             return None
         if owner.user_id != command.actor_user_id:
-            db.execute(
-                update(TaskChannelDelivery)
-                .where(TaskChannelDelivery.command_id == command_id)
-                .values(status="discarded", claim_token=None)
-            )
+            status = _settle_no_commit(db, delivery, status="discarded")
             db.commit()
+            _record_delivery_outcome(delivery, status, reason="owner_changed")
             return None
-        delivery = ChannelDelivery(
-            command_id,
-            cast(int, command.task_id),
-            owner.user_id,
-            dict(row.destination),
-            token,
-        )
         run_id = str(command.target_run_id)
         db.commit()
     # The result reader owns a separate short session after the claim commits.
@@ -167,7 +174,7 @@ def _record_delivery_outcome(
     )
     increment_counter(
         "xagent.channel.delivery",
-        attributes={"outcome": status, "reason": reason},
+        attributes={"outcome": status, "error.type": reason},
     )
 
 

@@ -66,7 +66,10 @@ batch. After 10 failed delivery attempts the row becomes `failed` and automatic
 retries stop; the stored task result remains available. A warning and the
 `xagent.channel.delivery` counter record the terminal outcome. Waiting for an
 unfinished execution does not consume this budget. Channel access is checked
-again before recovery sends a stored answer.
+again before recovery sends a stored answer. Revoked sender access or changed
+ownership permanently discards the reply with a logged/counted reason. An
+unavailable channel configuration is retried within the same failure budget,
+allowing a temporarily disabled channel to recover after it is re-enabled.
 
 The guarantee is at-least-once delivery while access remains authorized and the
 platform accepts the reply before the retry budget is exhausted. If the platform receives a reply just
