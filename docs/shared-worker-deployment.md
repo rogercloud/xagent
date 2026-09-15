@@ -60,11 +60,16 @@ Accepted channel commands and final-reply destinations are committed together.
 The designated ingress checks pending final replies every 30 seconds, including
 after restart. A separate delivery claim prevents ordinary concurrent sends;
 its 60-second lease is renewed during delivery. Platform failures retry after
-30 seconds without running the Agent again. Channel access is checked again
-before recovery sends a stored answer.
+30 seconds without running the Agent again. Recovery selects the earliest eligible
+retry time, with new replies first, so failing destinations do not monopolize a
+batch. After 10 failed delivery attempts the row becomes `failed` and automatic
+retries stop; the stored task result remains available. A warning and the
+`xagent.channel.delivery` counter record the terminal outcome. Waiting for an
+unfinished execution does not consume this budget. Channel access is checked
+again before recovery sends a stored answer.
 
 The guarantee is at-least-once delivery while access remains authorized and the
-platform eventually accepts the reply. If the platform receives a reply just
+platform accepts the reply before the retry budget is exhausted. If the platform receives a reply just
 before ingress crashes or its delivery acknowledgement cannot be saved, a retry
 may repeat the reply or attachments. Platform sends and database commits cannot
 be made one transaction. Reusing the loading message where supported reduces
