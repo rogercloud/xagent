@@ -42,7 +42,6 @@ INTERACTION_PROTOCOL_MODE = "XAGENT_INTERACTION_PROTOCOL_MODE"
 INTERACTION_NATIVE_SOURCES = "XAGENT_INTERACTION_NATIVE_SOURCES"
 SHARED_TASK_EXECUTION_ENABLED = "XAGENT_SHARED_TASK_EXECUTION_ENABLED"
 TASK_EXECUTION_ROLE = "XAGENT_TASK_EXECUTION_ROLE"
-TASK_WORKER_MAX_CONCURRENT_TASKS = "XAGENT_TASK_WORKER_MAX_CONCURRENT_TASKS"
 CHANNEL_INGRESS_ENABLED = "XAGENT_CHANNEL_INGRESS_ENABLED"
 TASK_EVENT_CHANNEL_PREFIX = "XAGENT_TASK_EVENT_CHANNEL_PREFIX"
 ENCRYPTION_KEY = "ENCRYPTION_KEY"
@@ -775,11 +774,6 @@ def get_redis_url() -> str | None:
 def get_shared_task_execution_enabled() -> bool:
     """Enable durable task handoff and the shared event bridge by default."""
     return _get_bool_env(SHARED_TASK_EXECUTION_ENABLED, True)
-
-
-def get_task_worker_max_concurrent_tasks() -> int:
-    """Maximum simultaneous shared task executions per worker process."""
-    return _get_positive_int_env(TASK_WORKER_MAX_CONCURRENT_TASKS, 4)
 
 
 def get_task_execution_role() -> Literal["combined", "web", "worker"]:

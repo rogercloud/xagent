@@ -43,7 +43,6 @@ from .task_lease_service import (
     TaskLeaseHeartbeatOutcome,
     get_runner_id,
 )
-from .task_worker_capacity import current_execution_reservation
 
 logger = logging.getLogger(__name__)
 
@@ -245,9 +244,6 @@ class TaskCoordinator:
         if handle in self._children:
             return
         self._children.add(handle)
-        reservation = current_execution_reservation.get()
-        if reservation is not None:
-            reservation.track_execution(handle)
         handle.add_done_callback(self._child_done)
 
     def _child_done(self, handle: asyncio.Task[Any]) -> None:
