@@ -61,3 +61,62 @@ def test_runtime_secret_ttl_must_be_positive(monkeypatch, value):
     monkeypatch.setenv("XAGENT_TASK_RUNTIME_SECRETS_TTL_SECONDS", value)
     with pytest.raises(ValueError):
         config.get_task_runtime_secrets_ttl_seconds()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("action", ["cleanup", "idle_sweep"])
+async def test_worker_lifecycle_preserves_other_workers_live_sandbox(
+    tmp_path, monkeypatch, action
+):
+    from unittest.mock import Mock
+
+    import xagent.sandbox.docker_sandbox as docker_module
+    from tests.sandbox.test_docker_sandbox import (
+        _ClientWithCollection,
+        _labeled_container,
+        _LabelFilteredCollection,
+    )
+    from xagent.web.sandbox_manager import SandboxManager, _create_docker_service
+
+    init_db(db_url=f"sqlite:///{tmp_path / 'workers.db'}")
+    monkeypatch.setenv("XAGENT_SHARED_TASK_EXECUTION_ENABLED", "true")
+    monkeypatch.setenv("XAGENT_SANDBOX_NAMESPACE", "deployment")
+    collection = _LabelFilteredCollection()
+    client = _ClientWithCollection(collection)
+    monkeypatch.setattr(docker_module, "_create_docker_client", lambda: client)
+    managers = []
+    containers = []
+    stopped, deleted = [], []
+    for worker in ("worker-a", "worker-b"):
+        monkeypatch.setenv("XAGENT_SANDBOX_WORKER_ID", worker)
+        namespace = config.get_sandbox_worker_namespace()
+        service = _create_docker_service()
+        assert service is not None
+        managers.append(SandboxManager(service))
+        container = _labeled_container(
+            {
+                "xagent.managed": "v2",
+                "xagent.sandbox.namespace": namespace,
+                "xagent.sandbox.name": "user::1",
+            },
+            on_stop=lambda worker=worker: stopped.append(worker),
+            on_remove=lambda worker=worker: deleted.append(worker),
+        )
+        containers.append(container)
+    collection._containers = containers
+    first, second = managers
+    first._lease_providers["user::1"] = Mock()
+    assert await first.attach("user", "1")
+
+    if action == "cleanup":
+        # Startup and shutdown both use this public lifecycle entry point.
+        await second.cleanup()
+        await second.cleanup()
+        assert stopped == ["worker-b", "worker-b"]
+        assert deleted == []
+    else:
+        assert await second.sweep_idle_sandboxes(idle_ttl=0) == ["user::1"]
+        assert deleted == ["worker-b"]
+        assert stopped == []
+    assert containers[0].attrs["State"]["Status"] == "running"
+    assert first.ref_count("user", "1") == 1
