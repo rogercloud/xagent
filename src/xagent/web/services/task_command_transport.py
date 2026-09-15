@@ -45,11 +45,6 @@ from .task_command_terminal_events import (
 )
 from .task_execution_host import consumes_task_commands
 from .task_lease_service import get_runner_id
-from .task_worker_capacity import (
-    TaskExecutionReservation,
-    current_execution_reservation,
-    worker_capacity,
-)
 
 logger = logging.getLogger(__name__)
 
@@ -725,11 +720,7 @@ def _unfinished_earlier_command() -> Any:
 
 
 def _claimable_query(
-    db: Session,
-    *,
-    runner_id: str,
-    command_db_id: int | None,
-    reservation: TaskExecutionReservation | None = None,
+    db: Session, *, runner_id: str, command_db_id: int | None
 ) -> Query[Any]:
     now = _utc_now()
     query = (
@@ -749,17 +740,6 @@ def _claimable_query(
             _command_routing_predicate(runner_id, now),
         )
     )
-    if reservation is not None:
-        admitted = reservation.capacity.admitted_tasks_when_full()
-        if admitted is not None:
-            query = query.filter(
-                or_(
-                    TaskExecutionCommand.kind.in_(
-                        (TaskCommandKind.PAUSE.value, TaskCommandKind.CANCEL.value)
-                    ),
-                    TaskExecutionCommand.task_id.in_(admitted),
-                )
-            )
     if command_db_id is not None:
         query = query.filter(TaskExecutionCommand.id == command_db_id)
     return query.order_by(TaskExecutionCommand.id.asc())
@@ -770,7 +750,6 @@ def claim_task_command(
     *,
     runner_id: str | None = None,
     command_db_id: int | None = None,
-    reservation: TaskExecutionReservation | None = None,
 ) -> ClaimedTaskCommand | None:
     """Atomically claim the oldest eligible command for this worker."""
 
@@ -781,18 +760,8 @@ def claim_task_command(
         db,
         runner_id=resolved_runner_id,
         command_db_id=command_db_id,
-        reservation=reservation,
     ).first()
     if candidate is None:
-        return None
-    # MESSAGE and RESUME can restart a checkpoint, so they need a slot too.
-    # Existing local executions reuse their task's slot for live controls.
-    if (
-        reservation is not None
-        and candidate.kind
-        not in (TaskCommandKind.PAUSE.value, TaskCommandKind.CANCEL.value)
-        and not reservation.reserve(int(candidate.task_id))
-    ):
         return None
 
     now = _utc_now()
@@ -855,7 +824,6 @@ def _claim_task_command_isolated(
     *,
     runner_id: str,
     command_db_id: int | None,
-    reservation: TaskExecutionReservation | None = None,
 ) -> ClaimedTaskCommand | None:
     """Claim in a worker-owned short session and return a detached snapshot."""
 
@@ -867,7 +835,6 @@ def _claim_task_command_isolated(
             db,
             runner_id=runner_id,
             command_db_id=command_db_id,
-            reservation=reservation,
         )
 
 
@@ -1351,34 +1318,11 @@ async def dispatch_one_task_command(
     *,
     command_db_id: int | None = None,
 ) -> bool:
-    reservation = (
-        TaskExecutionReservation(worker_capacity)
-        if get_shared_task_execution_enabled()
-        else None
-    )
-    token = current_execution_reservation.set(reservation)
-    try:
-        return await _dispatch_one_task_command(
-            executor, command_db_id=command_db_id, reservation=reservation
-        )
-    finally:
-        current_execution_reservation.reset(token)
-        if reservation is not None:
-            reservation.release()
-
-
-async def _dispatch_one_task_command(
-    executor: CommandExecutor,
-    *,
-    command_db_id: int | None,
-    reservation: TaskExecutionReservation | None,
-) -> bool:
     runner_id = get_runner_id()
     command = await run_db_io_cancellation_safe(
         lambda: _claim_task_command_isolated(
             runner_id=runner_id,
             command_db_id=command_db_id,
-            reservation=reservation,
         )
     )
     if command is None:
