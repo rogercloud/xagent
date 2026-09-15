@@ -3001,3 +3001,16 @@ def test_shared_boxlite_home_is_scoped_to_worker(
         monkeypatch.setenv(BOXLITE_HOME_DIR, configured_home)
     expected_root = Path(configured_home) if configured_home else tmp_path / "boxlite"
     assert get_boxlite_home_dir() == expected_root / "worker-1"
+
+
+@pytest.mark.parametrize(
+    "value, expected",
+    [(None, 4), ("1", 1), ("12", 12), ("0", 4), ("-1", 4), ("bad", 4)],
+)
+def test_task_worker_max_concurrent_tasks(monkeypatch, value, expected):
+    from xagent import config
+
+    monkeypatch.delenv("XAGENT_TASK_WORKER_MAX_CONCURRENT_TASKS", raising=False)
+    if value is not None:
+        monkeypatch.setenv("XAGENT_TASK_WORKER_MAX_CONCURRENT_TASKS", value)
+    assert config.get_task_worker_max_concurrent_tasks() == expected
