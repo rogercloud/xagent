@@ -42,6 +42,9 @@ Every concurrent execution process using Docker or BoxLite must have its own
 stable `XAGENT_SANDBOX_WORKER_ID`, such as `worker-1` and `worker-2`. Reuse an ID
 when restarting its process, and stop the old process before reusing that ID.
 Do not copy one ID across replicas or derive it from a new random process ID.
+The ID must match `[a-z0-9][a-z0-9_-]*`: lowercase letters, digits, dashes and
+underscores, beginning with a lowercase letter or digit. Dots and uppercase
+letters are rejected, so validate generated host/pod identities before using them.
 
 Docker also requires a stable deployment `XAGENT_SANDBOX_NAMESPACE`. Container
 names, ownership labels, and SQL metadata use a scope derived from both values.
