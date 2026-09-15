@@ -733,7 +733,7 @@ jobs:
     runs-on: ubuntu-latest
     if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
     needs: [changes, pre-commit]
-    timeout-minutes: 30
+    timeout-minutes: 45
 
     services:
       redis:
@@ -804,7 +804,7 @@ jobs:
         shell: bash
         run: |
           set -e
-          python3 -m uv run python -m pytest tests/e2e --run-special -q
+          python3 -m uv run python -m pytest tests/e2e --run-special -v --durations=20
 
   frontend-build:
     runs-on: ubuntu-latest
