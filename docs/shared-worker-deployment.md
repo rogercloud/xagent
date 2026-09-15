@@ -36,6 +36,19 @@ For a deliberate single-process local deployment, set
 `XAGENT_SHARED_TASK_EXECUTION_ENABLED=false` and use the `combined` role.
 Shared execution requirements do not apply in that mode.
 
+## Worker execution capacity
+
+`XAGENT_TASK_WORKER_MAX_CONCURRENT_TASKS` limits simultaneous task executions per
+`combined` or `worker` process. It defaults to `4`; set a positive integer such as
+`1` to execute one task at a time. New starts and checkpoint resumes remain in the
+shared command queue when a worker is full, allowing other workers to claim them.
+Capacity is reserved before claiming and retained until execution and cleanup
+finish. Paused executions that retain a live background handle still occupy a slot.
+Pause/cancel commands and messages/resume controls for an admitted task continue
+to be consumed. Existing per-task command ordering and lease routing still apply.
+This limits task count; it does not guarantee equal resource usage or strict fair
+assignment. The setting does not apply when shared execution is disabled.
+
 ## Sandbox ownership
 
 Every concurrent execution process using Docker or BoxLite must have its own
