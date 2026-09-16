@@ -2972,6 +2972,8 @@ def test_shared_host_configuration(monkeypatch, role):
     monkeypatch.setenv(config.ENCRYPTION_KEY, Fernet.generate_key().decode())
     config.validate_task_execution_host_config()
     monkeypatch.setenv(config.ENCRYPTION_KEY, config.DEV_FALLBACK_ENCRYPTION_KEY)
+    config.validate_task_execution_host_config()
+    monkeypatch.delenv(config.ENCRYPTION_KEY)
     with pytest.raises(ValueError, match="private common ENCRYPTION_KEY"):
         config.validate_task_execution_host_config()
     monkeypatch.setenv(config.SHARED_TASK_EXECUTION_ENABLED, "false")
