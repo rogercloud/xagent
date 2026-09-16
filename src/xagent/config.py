@@ -812,7 +812,7 @@ def validate_task_execution_host_config() -> None:
     key = get_task_runtime_secrets_encryption_key()
     if key is None:
         raise ValueError(
-            "Shared task execution requires an explicit private common ENCRYPTION_KEY"
+            "Shared task execution requires an explicit common ENCRYPTION_KEY"
         )
     from cryptography.fernet import Fernet
 
@@ -829,13 +829,12 @@ def get_task_runtime_secrets_ttl_seconds() -> int:
 
 
 def get_task_runtime_secrets_encryption_key() -> str | None:
-    """Return an explicitly configured, non-default ENCRYPTION_KEY.
+    """Return the explicitly configured ENCRYPTION_KEY.
 
-    Single-turn connector credentials must never use the published development
-    fallback. Invalid Fernet keys are rejected by the store before any write.
+    Invalid Fernet keys are rejected by the store before any write.
     """
     key = os.getenv(ENCRYPTION_KEY)
-    if not key or key == DEV_FALLBACK_ENCRYPTION_KEY:
+    if not key:
         return None
     return key
 
