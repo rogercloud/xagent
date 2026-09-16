@@ -5,6 +5,32 @@ requests and executes accepted tasks; a `web` process only accepts requests; a
 standalone `worker` executes them. Celery workers handle background jobs and are
 not substitutes for the standalone Agent worker.
 
+## Combined process launcher
+
+Set `XAGENT_TASK_EXECUTION_ROLE=combined` and `XAGENT_WORKER_COUNT=4`, then run
+`python -m xagent.web` (or `xagent-web`) to launch one web process and four
+standalone Agent worker processes. The Docker backend uses this same entrypoint.
+Shared execution must be enabled. Redis, the database, encryption key and file
+storage configuration are inherited by every child process.
+
+The web process completes normal startup, including database migrations, before
+workers start. It serves HTTP/WebSocket and designated channel ingress without
+executing Agent tasks. Workers use the existing durable task queue and lease
+routing. The count controls processes, not task concurrency or even distribution.
+When sandboxing is enabled, configure a stable `XAGENT_SANDBOX_WORKER_ID` for this
+launcher: the web process retains that ID and workers use `<base>-worker-1`
+through `<base>-worker-N`. Use distinct base IDs for concurrent launchers sharing
+one sandbox namespace, and keep them unchanged across restarts.
+
+SIGINT or SIGTERM stops the whole group and gives children 30 seconds to shut
+down before terminating remaining processes. An unexpected child exit stops the
+other children and fails the launcher; restart the launcher to recover the group.
+An unset or empty count retains the existing single-process combined behavior.
+The count must be a positive integer and cannot be combined with `--reload`,
+`web`/`worker` roles, or disabled shared execution. Direct ASGI server invocations
+do not run this CLI launcher; use the existing separate web/worker deployment
+when managing processes externally.
+
 ## Configuration and upgrade
 
 1. Stop old application processes before upgrading the database. Back up the

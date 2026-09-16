@@ -42,6 +42,7 @@ INTERACTION_PROTOCOL_MODE = "XAGENT_INTERACTION_PROTOCOL_MODE"
 INTERACTION_NATIVE_SOURCES = "XAGENT_INTERACTION_NATIVE_SOURCES"
 SHARED_TASK_EXECUTION_ENABLED = "XAGENT_SHARED_TASK_EXECUTION_ENABLED"
 TASK_EXECUTION_ROLE = "XAGENT_TASK_EXECUTION_ROLE"
+WORKER_COUNT = "XAGENT_WORKER_COUNT"
 CHANNEL_INGRESS_ENABLED = "XAGENT_CHANNEL_INGRESS_ENABLED"
 TASK_EVENT_CHANNEL_PREFIX = "XAGENT_TASK_EVENT_CHANNEL_PREFIX"
 ENCRYPTION_KEY = "ENCRYPTION_KEY"
@@ -786,6 +787,20 @@ def get_task_execution_role() -> Literal["combined", "web", "worker"]:
     if role == "worker":
         return "worker"
     raise ValueError(f"{TASK_EXECUTION_ROLE} must be combined, web or worker")
+
+
+def get_worker_count() -> int | None:
+    """Get the opt-in number of worker processes managed by the combined CLI."""
+    value = os.getenv(WORKER_COUNT)
+    if not value:
+        return None
+    try:
+        count = int(value)
+    except ValueError:
+        raise ValueError(f"{WORKER_COUNT} must be a positive integer") from None
+    if count <= 0:
+        raise ValueError(f"{WORKER_COUNT} must be a positive integer")
+    return count
 
 
 def get_channel_ingress_enabled() -> bool:

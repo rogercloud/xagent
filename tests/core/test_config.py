@@ -3003,3 +3003,22 @@ def test_shared_boxlite_home_is_scoped_to_worker(
         monkeypatch.setenv(BOXLITE_HOME_DIR, configured_home)
     expected_root = Path(configured_home) if configured_home else tmp_path / "boxlite"
     assert get_boxlite_home_dir() == expected_root / "worker-1"
+
+
+@pytest.mark.parametrize(
+    "value,expected", [(None, None), ("", None), ("1", 1), ("4", 4)]
+)
+def test_worker_count_optional_positive_integer(monkeypatch, value, expected):
+    monkeypatch.delenv(config.WORKER_COUNT, raising=False)
+    if value is not None:
+        monkeypatch.setenv(config.WORKER_COUNT, value)
+    assert config.get_worker_count() == expected
+
+
+@pytest.mark.parametrize("value", ["0", "-1", "1.5", "invalid"])
+def test_worker_count_rejects_invalid_values(monkeypatch, value):
+    monkeypatch.setenv(config.WORKER_COUNT, value)
+    with pytest.raises(
+        ValueError, match="XAGENT_WORKER_COUNT must be a positive integer"
+    ):
+        config.get_worker_count()
