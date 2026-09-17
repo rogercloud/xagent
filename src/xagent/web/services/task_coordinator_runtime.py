@@ -14,6 +14,7 @@ from enum import Enum
 from typing import Any, Awaitable, Callable, TypeVar
 
 from sqlalchemy import select
+from sqlalchemy.exc import DBAPIError
 from sqlalchemy.orm import Session
 
 from ...config import get_task_lease_heartbeat_seconds
@@ -31,18 +32,16 @@ from .db_runtime import (
 from .task_coordinator_service import (
     TaskExecutionContext,
     TaskLease,
+    TaskLeaseRenewalState,
     acquire_task_lease_no_commit,
     lock_task_execution_no_commit,
     lock_task_lease_no_commit,
     recover_expired_idle_task_lease_no_commit,
     release_task_lease_no_commit,
-    renew_task_lease_no_commit,
+    renew_task_leases_no_commit,
 )
 from .task_lease_service import TaskLease as ExecutionLease
-from .task_lease_service import (
-    TaskLeaseHeartbeatOutcome,
-    get_runner_id,
-)
+from .task_lease_service import TaskLeaseHeartbeatOutcome, get_runner_id
 
 logger = logging.getLogger(__name__)
 
@@ -60,7 +59,7 @@ class CoordinatorState(str, Enum):
 
 
 class TaskCoordinatorRegistry:
-    """Share acquisition and one running handle across all entry adapters."""
+    """Share acquisition, batch renewals, and one running handle per task."""
 
     def __init__(self, session_factory: Callable[[], Session] | None = None):
         self.session_factory = session_factory or get_session_local()
@@ -68,6 +67,138 @@ class TaskCoordinatorRegistry:
         self.runner_id = get_runner_id()
         self._coordinators: dict[int, TaskCoordinator] = {}
         self._close_task: asyncio.Task[None] | None = None
+        self._heartbeats: dict[TaskLease, TaskCoordinator] = {}
+        self._heartbeat_wake = asyncio.Event()
+        self._heartbeat_runner: asyncio.Task[None] | None = None
+
+    def _register_heartbeat(self, coordinator: TaskCoordinator) -> None:
+        assert coordinator.lease is not None
+        coordinator._heartbeat_done = self.loop.create_future()
+        self._heartbeats[coordinator.lease] = coordinator
+        if self._heartbeat_runner is None or self._heartbeat_runner.done():
+            self._heartbeat_runner = self.loop.create_task(self._run_heartbeats())
+        self._heartbeat_wake.set()
+
+    async def _unregister_heartbeat(self, coordinator: TaskCoordinator) -> None:
+        assert coordinator.lease is not None
+        self._heartbeats.pop(coordinator.lease, None)
+        self._heartbeat_wake.set()
+        # A released owner must never have an unfinished renewal transaction.
+        if coordinator._renewal_waiter is not None:
+            await asyncio.shield(coordinator._renewal_waiter)
+        done = coordinator._heartbeat_done
+        if done is not None and not done.done():
+            done.set_result(None)
+
+    def _renew(
+        self, leases: tuple[TaskLease, ...]
+    ) -> dict[TaskLease, TaskLeaseRenewalState]:
+        try:
+            with self.session_factory() as db, db.begin():
+                states = renew_task_leases_no_commit(db, leases)
+            return states
+        except DBAPIError as error:
+            # These PostgreSQL statement failures have exited/rolled back the
+            # transaction. Do not classify ambiguous commit/network failures as
+            # a skipped row or acknowledge any success from a rolled-back batch.
+            if getattr(error.orig, "pgcode", None) in ("55P03", "57014"):
+                return {lease: TaskLeaseRenewalState.DEFERRED for lease in leases}
+            raise
+
+    def _finish_heartbeat(
+        self, coordinator: TaskCoordinator, error: BaseException | None = None
+    ) -> None:
+        assert coordinator.lease is not None
+        assert coordinator._heartbeat_done is not None
+        self._heartbeats.pop(coordinator.lease, None)
+        if error is None:
+            coordinator._heartbeat_done.set_result(None)
+        else:
+            coordinator._healthy = False
+            coordinator._heartbeat_error = error
+            coordinator._recovery_required = True
+            coordinator._heartbeat_done.set_exception(error)
+        coordinator._request_close()
+
+    async def _run_heartbeats(self) -> None:
+        next_refresh_at = self.loop.time() + get_task_lease_heartbeat_seconds()
+        try:
+            while self._heartbeats:
+                next_attempt_at = min(
+                    [next_refresh_at]
+                    + [
+                        c._retry_at
+                        for c in self._heartbeats.values()
+                        if c._retry_at is not None
+                    ]
+                )
+                delay = max(0.0, next_attempt_at - self.loop.time())
+                if delay:
+                    self._heartbeat_wake.clear()
+                    try:
+                        await asyncio.wait_for(self._heartbeat_wake.wait(), delay)
+                    except asyncio.TimeoutError:
+                        pass
+                    if self.loop.time() < next_attempt_at:
+                        continue
+                now = self.loop.time()
+                regular_refresh = now >= next_refresh_at
+                snapshot = tuple(
+                    (lease, c)
+                    for lease, c in self._heartbeats.items()
+                    if regular_refresh
+                    or (c._retry_at is not None and c._retry_at <= now)
+                )
+                if not snapshot:
+                    continue
+                waiter: asyncio.Future[None] = self.loop.create_future()
+                for _, c in snapshot:
+                    c._renewal_waiter = waiter
+                    c._retry_at = None
+                try:
+                    try:
+                        states = await run_db_io_cancellation_safe(
+                            lambda: self._renew(tuple(lease for lease, _ in snapshot))
+                        )
+                    except Exception as error:
+                        for _, c in snapshot:
+                            c._healthy = False
+                            c._heartbeat_error = error
+                            if not is_database_pool_timeout(error):
+                                self._finish_heartbeat(c, error)
+                        logger.warning(
+                            "Coordinator heartbeat batch failed", exc_info=True
+                        )
+                        # A failed connection checkout retries at normal cadence,
+                        # not the short locked-row retry cadence.
+                    else:
+                        for lease, c in snapshot:
+                            state = states[lease]
+                            if state == TaskLeaseRenewalState.DEFERRED:
+                                c._healthy = False
+                                c._retry_at = self.loop.time() + min(
+                                    1.0, get_task_lease_heartbeat_seconds() / 4
+                                )
+                            elif state == TaskLeaseRenewalState.LOST:
+                                c.state = CoordinatorState.LOST
+                                self._finish_heartbeat(c)
+                            else:
+                                c._healthy = True
+                                c._heartbeat_error = None
+                finally:
+                    for _, c in snapshot:
+                        c._renewal_waiter = None
+                    waiter.set_result(None)
+                if regular_refresh:
+                    interval = get_task_lease_heartbeat_seconds()
+                    while next_refresh_at <= self.loop.time():
+                        next_refresh_at += interval
+        except BaseException as error:
+            for c in tuple(self._heartbeats.values()):
+                self._finish_heartbeat(c, error)
+            raise
+        finally:
+            self._heartbeat_runner = None
 
     async def ensure(self, task_id: int) -> TaskCoordinator | None:
         while True:
@@ -116,6 +247,8 @@ class TaskCoordinatorRegistry:
 
     async def _close_all(self) -> None:
         await asyncio.gather(*(c.close() for c in list(self._coordinators.values())))
+        if self._heartbeat_runner is not None:
+            await drain_async_task_cancellation_safe(self._heartbeat_runner)
 
 
 class TaskCoordinator:
@@ -133,8 +266,9 @@ class TaskCoordinator:
         self._heartbeat_error: BaseException | None = None
         self._recovery_required = False
         self._released = False
-        self._stop = asyncio.Event()
-        self._heartbeat_task: asyncio.Task[None] | None = None
+        self._heartbeat_done: asyncio.Future[None] | None = None
+        self._renewal_waiter: asyncio.Future[None] | None = None
+        self._retry_at: float | None = None
         self._execution_task: asyncio.Task[None] | None = None
         self._close_task: asyncio.Task[None] | None = None
         self._command_lock = asyncio.Lock()
@@ -164,46 +298,8 @@ class TaskCoordinator:
             return
         # Shutdown may have begun while the acquisition transaction was blocked.
         if self._close_task is None and self._registry._close_task is None:
-            self._heartbeat_task = asyncio.create_task(self._heartbeat())
+            self._registry._register_heartbeat(self)
             self.state = CoordinatorState.ACTIVE
-
-    def _renew(self) -> bool:
-        assert self.lease is not None
-        with self._registry.session_factory() as db, db.begin():
-            return renew_task_lease_no_commit(db, self.lease)
-
-    async def _heartbeat(self) -> None:
-        try:
-            while not self._stop.is_set():
-                try:
-                    await asyncio.wait_for(
-                        self._stop.wait(), timeout=get_task_lease_heartbeat_seconds()
-                    )
-                    return
-                except asyncio.TimeoutError:
-                    pass
-                try:
-                    renewed = await run_db_io_cancellation_safe(self._renew)
-                except Exception as error:
-                    self._healthy = False
-                    self._heartbeat_error = error
-                    if is_database_pool_timeout(error):
-                        # No ownership verdict: retry only at the normal cadence.
-                        logger.warning("Task %s heartbeat pool timeout", self.task_id)
-                        continue
-                    raise
-                self._healthy = True
-                self._heartbeat_error = None
-                if not renewed:
-                    self.state = CoordinatorState.LOST
-                    self._request_close()
-                    return
-        except BaseException:
-            self._healthy = False
-            self._recovery_required = True
-            self._request_close()
-            logger.exception("Task %s coordinator heartbeat stopped", self.task_id)
-            raise
 
     def require_recovery(self) -> None:
         self._recovery_required = True
@@ -220,15 +316,15 @@ class TaskCoordinator:
         """Observe the owner's heartbeat without creating another renewal loop."""
         from .task_lease_service import TaskLeaseHeartbeatOutcome
 
-        assert self._heartbeat_task is not None
+        assert self._heartbeat_done is not None
         waiter = asyncio.create_task(stop.wait())
         try:
             await asyncio.wait(
-                (waiter, self._heartbeat_task), return_when=asyncio.FIRST_COMPLETED
+                (waiter, self._heartbeat_done), return_when=asyncio.FIRST_COMPLETED
             )
-            if self._heartbeat_task.done():
+            if self._heartbeat_done.done():
                 # Propagate a failed renewal rather than declaring it healthy.
-                self._heartbeat_task.result()
+                self._heartbeat_done.result()
             return TaskLeaseHeartbeatOutcome(
                 lease_lost=self.state == CoordinatorState.LOST,
                 pool_timeout=self._heartbeat_error,
@@ -259,12 +355,6 @@ class TaskCoordinator:
             async with self._command_lock:
                 if self.state != CoordinatorState.ACTIVE:
                     raise _CoordinatorClosed
-                if not self._healthy:
-                    from .task_command_transport import TaskCommandDeferred
-
-                    raise TaskCommandDeferred(
-                        "Task owner is awaiting a healthy renewal"
-                    )
                 # New executions may queue while a previous result is visible,
                 # but cannot change its run or inputs before its finalizers exit.
                 if command.kind.value in ("start", "resume_input"):
@@ -274,6 +364,12 @@ class TaskCoordinator:
                     )
                     if self.state != CoordinatorState.ACTIVE:
                         raise _CoordinatorClosed
+                if not self._healthy:
+                    from .task_command_transport import TaskCommandDeferred
+
+                    raise TaskCommandDeferred(
+                        "Task owner is awaiting a healthy renewal"
+                    )
                 token = _current_coordinator.set(self)
                 try:
                     return await execute()
@@ -486,9 +582,9 @@ class TaskCoordinator:
             if self._execution_task is not None:
                 await cancel_and_drain_async_task(self._execution_task)
             # Keep renewing while execution and its settlement are being drained.
-            self._stop.set()
-            if self._heartbeat_task is not None:
-                await asyncio.gather(self._heartbeat_task, return_exceptions=True)
+            if self._heartbeat_done is not None:
+                await self._registry._unregister_heartbeat(self)
+                await asyncio.gather(self._heartbeat_done, return_exceptions=True)
             if (
                 self.lease is not None
                 and not self._released
