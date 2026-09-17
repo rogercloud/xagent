@@ -62,6 +62,7 @@ on:
       - 'tests/web/services/test_task_lease_heartbeat_batch.py'
       - 'tests/web/services/test_task_settlement_locking.py'
       - 'tests/web/services/test_task_execution_event_store.py'
+      - 'tests/web/services/task_database_shared.py'
       - 'src/xagent/web/services/chat_history_service.py'
       - 'src/xagent/web/services/ops_signals.py'
       - 'src/xagent/core/tools/adapters/vibe/ask_user_tool.py'
@@ -189,6 +190,7 @@ jobs:
             tests/web/services/test_task_lease_heartbeat_batch.py
             tests/web/services/test_task_settlement_locking.py
             tests/web/services/test_task_execution_event_store.py
+            tests/web/services/task_database_shared.py
             src/xagent/web/services/chat_history_service.py
             src/xagent/web/services/ops_signals.py
             src/xagent/core/tools/adapters/vibe/ask_user_tool.py

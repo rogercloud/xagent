@@ -10,12 +10,10 @@ from unittest.mock import AsyncMock
 import pytest
 from sqlalchemy.exc import TimeoutError as PoolTimeout
 
+from tests.web.services.task_database_shared import engine as engine_fixture
+from tests.web.services.task_database_shared import task_id as task_id_fixture
 from tests.web.services.test_task_coordinator_service import (
     database as database_fixture,
-)
-from tests.web.services.test_task_execution_event_store import engine as engine_fixture
-from tests.web.services.test_task_execution_event_store import (
-    task_id as task_id_fixture,
 )
 from xagent.web.models.task import Task, TaskStatus
 from xagent.web.services import task_coordinator_runtime as runtime
