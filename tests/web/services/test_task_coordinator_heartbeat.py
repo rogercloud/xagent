@@ -450,10 +450,13 @@ async def test_batch_rollback_retries_at_normal_cadence_and_recovers(
         monkeypatch.setattr(registry, "_renew", renew)
         sa.event.listen(engine, "before_cursor_execute", fail_once, retval=True)
         try:
-            await until(lambda: owner._heartbeat_error is not None)
+            await until(lambda: failed and owner._renewal_waiter is None)
             failure_at = loop.time()
             assert owner.state == runtime.CoordinatorState.ACTIVE
             assert sibling.state == runtime.CoordinatorState.ACTIVE
+            assert owner._healthy and sibling._healthy
+            assert owner._heartbeat_error is None
+            assert sibling._heartbeat_error is None
             assert not owner._recovery_required
             assert not sibling._recovery_required
             assert times(factory, leases) == before
@@ -462,7 +465,7 @@ async def test_batch_rollback_retries_at_normal_cadence_and_recovers(
                 and f"sqlstate={sqlstate}" in record.getMessage()
                 for record in caplog.records
             )
-            await until(lambda: owner._healthy)
+            await until(lambda: len(attempts) >= 2 and owner._renewal_waiter is None)
             assert attempts[1] - failure_at >= 0.18
             after = times(factory, leases)
             assert all(after[tid] > before[tid] for tid in before)
@@ -537,4 +540,75 @@ async def test_unknown_commit_acknowledgement_requires_recovery(
         finally:
             sa.event.remove(factory, "after_commit", lost_ack)
     finally:
+        await registry.close()
+
+
+@pytest.mark.parametrize("health", ["healthy", "margin_exhausted", "pool_timeout"])
+async def test_rollback_before_execution_completion_uses_existing_lease_health(
+    engine, task_id, monkeypatch, health
+):
+    from xagent.web.models import database
+    from xagent.web.services import managed_task_lease as managed
+    from xagent.web.services.task_lease_service import TaskLease as ExecutionLease
+
+    monkeypatch.setattr(runtime, "get_task_lease_heartbeat_seconds", lambda: 0.1)
+    factory = sessionmaker(engine, expire_on_commit=False)
+    monkeypatch.setattr(database, "get_session_local", lambda: factory)
+    registry = runtime.TaskCoordinatorRegistry(factory)
+    failed = Event()
+
+    class RolledBack(Exception):
+        pgcode = "55P03"
+
+    error = sa.exc.OperationalError("renew", {}, RolledBack("injected rollback"))
+
+    def renew(leases):
+        failed.set()
+        raise error
+
+    monkeypatch.setattr(registry, "_renew", renew)
+    owner = await registry.ensure(task_id)
+    if health == "margin_exhausted":
+        owner._last_renewed_at -= runtime.get_task_lease_ttl_seconds()
+    previous_error = sa.exc.TimeoutError("earlier pool exhaustion")
+    if health == "pool_timeout":
+        owner._healthy = False
+        owner._heartbeat_error = previous_error
+    with factory() as db, db.begin():
+        task = db.get(Task, task_id)
+        task.status = TaskStatus.RUNNING
+        task.run_id = "finishing-run"
+    token = runtime._current_coordinator.set(owner)
+    handle = managed.start_managed_task_lease(
+        ExecutionLease(
+            task_id=task_id,
+            runner_id=owner.lease.runner_id,
+            attempt_id=owner.lease.attempt_id,
+            run_id="finishing-run",
+        )
+    )
+    try:
+        await until(lambda: failed.is_set() and owner._renewal_waiter is None)
+        assert owner.state == runtime.CoordinatorState.ACTIVE
+        if health == "healthy":
+            assert owner._healthy
+            assert owner._heartbeat_error is None
+        elif health == "pool_timeout":
+            assert owner._heartbeat_error is previous_error
+        else:
+            assert not owner._healthy
+            assert owner._heartbeat_error is error
+        # No renewal can succeed in this test. Completion must use the last
+        # acknowledged lease and the real fenced finalizer, not await a retry.
+        finalized = await handle.finalize_result(status=TaskStatus.COMPLETED)
+        assert finalized == (health == "healthy")
+        with factory() as db:
+            task = db.get(Task, task_id)
+            assert task.status == (
+                TaskStatus.COMPLETED if finalized else TaskStatus.RUNNING
+            )
+            assert task.lease_attempt_id == owner.lease.attempt_id
+    finally:
+        await handle.close()
+        runtime._current_coordinator.reset(token)
         await registry.close()

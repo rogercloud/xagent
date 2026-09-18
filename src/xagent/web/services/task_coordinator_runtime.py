@@ -164,13 +164,19 @@ class TaskCoordinatorRegistry:
                         # These PostgreSQL errors abort the transaction. Retry
                         # from a fresh transaction; an unknown commit/network
                         # outcome still requires recovery instead.
-                        retryable = is_database_pool_timeout(error) or sqlstate in (
+                        rolled_back = sqlstate in (
                             "55P03",
                             "57014",
                             "40P01",
                             "40001",
                         )
+                        retryable = rolled_back or is_database_pool_timeout(error)
                         for _, c in snapshot:
+                            # A rollback leaves the last committed lease valid.
+                            # Preserve prior health/errors while it has margin;
+                            # only an acknowledged renewal can restore health.
+                            if rolled_back and c._has_renewal_margin():
+                                continue
                             c._healthy = False
                             c._heartbeat_error = error
                             if not retryable:
@@ -200,11 +206,7 @@ class TaskCoordinatorRegistry:
                                 # A skipped lock does not invalidate the last
                                 # committed renewal. Reserve one heartbeat of
                                 # margin, and never restore health from a skip.
-                                if c._healthy and self.loop.time() >= (
-                                    c._last_renewed_at
-                                    + get_task_lease_ttl_seconds()
-                                    - get_task_lease_heartbeat_seconds()
-                                ):
+                                if c._healthy and not c._has_renewal_margin():
                                     c._healthy = False
                                     logger.warning(
                                         "Task %s heartbeat remains deferred; "
@@ -316,6 +318,13 @@ class TaskCoordinator:
         self._children: set[asyncio.Task[Any]] = set()
         self._idle_task: asyncio.Task[None] | None = None
         self._startup = asyncio.create_task(self._start())
+
+    def _has_renewal_margin(self) -> bool:
+        return self._registry.loop.time() < (
+            self._last_renewed_at
+            + get_task_lease_ttl_seconds()
+            - get_task_lease_heartbeat_seconds()
+        )
 
     def wake(self) -> None:
         self.wakeup.set()
