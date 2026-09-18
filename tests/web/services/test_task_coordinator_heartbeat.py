@@ -168,21 +168,17 @@ async def test_registry_single_connection_skips_lock_and_retries_subset(
             sa.update(Task).where(Task.id == task_id).values(updated_at=Task.updated_at)
         )
         start_batch.set()
-        await until(lambda: not blocked._healthy)
+        await until(lambda: blocked._retry_at is not None)
+        assert blocked._healthy
         assert healthy._healthy
         assert healthy._heartbeat_error is None
         assert batches[0][1] == {blocked.lease: "deferred", healthy.lease: "renewed"}
-        assert (
-            blocked.submit_execution(
-                admit=lambda *_: None, execute=AsyncMock(), settle=lambda *_: None
-            )
-            is None
-        )
         blocker.rollback()
-        await until(lambda: blocked._healthy)
-        assert any(
-            leases == (blocked.lease,) and results[blocked.lease] == "renewed"
-            for leases, results in batches
+        await until(
+            lambda: any(
+                leases == (blocked.lease,) and results[blocked.lease] == "renewed"
+                for leases, results in batches
+            )
         )
         assert blocked.state == runtime.CoordinatorState.ACTIVE
     finally:
@@ -269,8 +265,9 @@ async def test_postgresql_table_lock_defers_whole_batch(engine, owners):
     before = times(factory, leases)
     with factory() as blocker:
         blocker.execute(sa.text("LOCK TABLE tasks IN ACCESS EXCLUSIVE MODE"))
-        states = await asyncio.to_thread(registry._renew, leases)
-        assert all(state == "deferred" for state in states.values())
+        with pytest.raises(sa.exc.DBAPIError) as raised:
+            await asyncio.to_thread(registry._renew, leases)
+        assert raised.value.orig.pgcode == "55P03"
         blocker.rollback()
     assert times(factory, leases) == before
     assert all(state == "renewed" for state in registry._renew(leases).values())
@@ -296,5 +293,222 @@ async def test_batch_commit_failure_is_not_acknowledged(engine, task_id, monkeyp
             assert times(factory, (owner.lease,)) == before
         finally:
             sa.event.remove(factory, "before_commit", fail_commit)
+    finally:
+        await registry.close()
+
+
+async def test_brief_deferral_still_allows_command_and_close_release(
+    engine, task_id, monkeypatch
+):
+    if engine.dialect.name != "postgresql":
+        pytest.skip("PostgreSQL row locks")
+    monkeypatch.setattr(runtime, "get_task_lease_heartbeat_seconds", lambda: 0.2)
+    factory = sessionmaker(engine, expire_on_commit=False)
+    registry = runtime.TaskCoordinatorRegistry(factory)
+    blocker = factory()
+    try:
+        owner = await registry.ensure(task_id)
+        blocker.execute(
+            sa.update(Task).where(Task.id == task_id).values(updated_at=Task.updated_at)
+        )
+        await until(lambda: owner._retry_at is not None)
+        assert owner._healthy
+        # A control command need not acquire the locked task row itself.
+        from types import SimpleNamespace
+
+        execute = AsyncMock(return_value="applied")
+        assert (
+            await owner.execute_command(
+                SimpleNamespace(kind=SimpleNamespace(value="stop")), execute
+            )
+            == "applied"
+        )
+        blocker.rollback()
+        await owner.close()
+        with factory() as db:
+            assert db.get(Task, task_id).lease_attempt_id is None
+    finally:
+        blocker.close()
+        await registry.close()
+
+
+async def test_sustained_deferral_degrades_once_and_success_restores_admission(
+    engine, task_id, monkeypatch, caplog
+):
+    monkeypatch.setattr(runtime, "get_task_lease_heartbeat_seconds", lambda: 0.1)
+    factory = sessionmaker(engine, expire_on_commit=False)
+    registry = runtime.TaskCoordinatorRegistry(factory)
+    original = registry._renew
+    attempts = 0
+
+    def defer(leases):
+        nonlocal attempts
+        attempts += 1
+        return {lease: service.TaskLeaseRenewalState.DEFERRED for lease in leases}
+
+    monkeypatch.setattr(registry, "_renew", defer)
+    try:
+        owner = await registry.ensure(task_id)
+        await until(lambda: owner._retry_at is not None)
+        assert owner._healthy
+        owner._last_renewed_at -= runtime.get_task_lease_ttl_seconds()
+        await until(lambda: not owner._healthy)
+        assert owner.state == runtime.CoordinatorState.ACTIVE
+        assert (
+            owner.submit_execution(
+                admit=lambda *_: None, execute=AsyncMock(), settle=lambda *_: None
+            )
+            is None
+        )
+        degraded_at = attempts
+        await until(lambda: attempts >= degraded_at + 2)
+        warnings = [
+            r.getMessage()
+            for r in caplog.records
+            if "remains deferred" in r.getMessage()
+        ]
+        assert len(warnings) == 1
+        assert str(task_id) in warnings[0]
+        monkeypatch.setattr(registry, "_renew", original)
+        await until(lambda: owner._healthy)
+        handle = owner.submit_execution(
+            admit=lambda *_: None, execute=AsyncMock(), settle=lambda *_: None
+        )
+        assert handle is not None
+        await handle
+    finally:
+        await registry.close()
+
+
+@pytest.mark.parametrize("sqlstate", ["55P03", "57014", "40P01", "40001"])
+async def test_batch_rollback_retries_at_normal_cadence_and_recovers(
+    engine, task_id, monkeypatch, caplog, sqlstate
+):
+    if engine.dialect.name != "postgresql":
+        pytest.skip("PostgreSQL transaction errors")
+    monkeypatch.setattr(runtime, "get_task_lease_heartbeat_seconds", lambda: 0.2)
+    factory = sessionmaker(engine, expire_on_commit=False)
+    registry = runtime.TaskCoordinatorRegistry(factory)
+    original = registry._renew
+    attempts = []
+    failed = False
+    loop = asyncio.get_running_loop()
+
+    def fail_once(conn, cursor, statement, parameters, context, executemany):
+        nonlocal failed
+        if (
+            not failed
+            and statement.startswith("UPDATE tasks SET")
+            and "last_heartbeat_at" in statement
+        ):
+            failed = True
+            # The server aborts the real renewal transaction; it is not a
+            # simulated successful per-row result.
+            return (
+                "DO $$ BEGIN RAISE EXCEPTION 'test rollback' USING ERRCODE = '"
+                + sqlstate
+                + "'; END $$;",
+                {},
+            )
+        return statement, parameters
+
+    def renew(leases):
+        attempts.append(loop.time())
+        return original(leases)
+
+    with factory() as db, db.begin():
+        second_task = Task(user_id=db.get(Task, task_id).user_id, title="sibling")
+        db.add(second_task)
+        db.flush()
+        sibling_id = second_task.id
+    try:
+        owner = await registry.ensure(task_id)
+        sibling = await registry.ensure(sibling_id)
+        leases = (owner.lease, sibling.lease)
+        before = times(factory, leases)
+        monkeypatch.setattr(registry, "_renew", renew)
+        sa.event.listen(engine, "before_cursor_execute", fail_once, retval=True)
+        try:
+            await until(lambda: owner._heartbeat_error is not None)
+            failure_at = loop.time()
+            assert owner.state == runtime.CoordinatorState.ACTIVE
+            assert sibling.state == runtime.CoordinatorState.ACTIVE
+            assert not owner._recovery_required
+            assert not sibling._recovery_required
+            assert times(factory, leases) == before
+            assert any(
+                f"tasks=[{task_id}, {sibling_id}]" in record.getMessage()
+                and f"sqlstate={sqlstate}" in record.getMessage()
+                for record in caplog.records
+            )
+            await until(lambda: owner._healthy)
+            assert attempts[1] - failure_at >= 0.18
+            after = times(factory, leases)
+            assert all(after[tid] > before[tid] for tid in before)
+            assert owner._heartbeat_error is None
+        finally:
+            sa.event.remove(engine, "before_cursor_execute", fail_once)
+    finally:
+        await registry.close()
+
+
+async def test_subset_failure_waits_full_interval_before_next_batch(
+    engine, task_id, monkeypatch
+):
+    monkeypatch.setattr(runtime, "get_task_lease_heartbeat_seconds", lambda: 0.2)
+    factory = sessionmaker(engine, expire_on_commit=False)
+    registry = runtime.TaskCoordinatorRegistry(factory)
+    original = registry._renew
+    calls = []
+    loop = asyncio.get_running_loop()
+
+    def renew(leases):
+        calls.append(loop.time())
+        if len(calls) == 1:
+            return {lease: service.TaskLeaseRenewalState.DEFERRED for lease in leases}
+        if len(calls) == 2:
+            raise sa.exc.TimeoutError("pool exhausted on row retry")
+        return original(leases)
+
+    monkeypatch.setattr(registry, "_renew", renew)
+    try:
+        owner = await registry.ensure(task_id)
+        await until(lambda: owner._heartbeat_error is not None)
+        failed_at = loop.time()
+        assert not owner._healthy
+        assert owner._retry_at is None
+        await until(lambda: owner._healthy)
+        assert calls[2] - failed_at >= 0.18
+    finally:
+        await registry.close()
+
+
+async def test_unknown_commit_acknowledgement_requires_recovery(
+    engine, task_id, monkeypatch
+):
+    monkeypatch.setattr(runtime, "get_task_lease_heartbeat_seconds", lambda: 0.05)
+    factory = sessionmaker(engine, expire_on_commit=False)
+    registry = runtime.TaskCoordinatorRegistry(factory)
+    try:
+        owner = await registry.ensure(task_id)
+        before = times(factory, (owner.lease,))
+
+        def lost_ack(session):
+            raise sa.exc.OperationalError("COMMIT", {}, OSError("acknowledgement lost"))
+
+        sa.event.listen(factory, "after_commit", lost_ack)
+        try:
+            await until(lambda: owner.state == runtime.CoordinatorState.CLOSED)
+            assert owner._recovery_required
+            assert not owner._healthy
+            assert isinstance(
+                owner._heartbeat_done.exception(), sa.exc.OperationalError
+            )
+            # The durable write succeeded, but the owner must not guess that.
+            assert times(factory, (owner.lease,))[task_id] > before[task_id]
+            with factory() as db:
+                assert db.get(Task, task_id).lease_attempt_id == owner.lease.attempt_id
+        finally:
+            sa.event.remove(factory, "after_commit", lost_ack)
     finally:
         await registry.close()

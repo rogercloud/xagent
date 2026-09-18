@@ -15,10 +15,10 @@ from xagent.web.models.user import User
 )
 def engine(request, tmp_path):
     if request.param == "postgresql":
-        with disposable_database_factory("execution_events") as make:
-            yield make("store")
+        with disposable_database_factory("tasks") as make:
+            yield make("tasks")
     else:
-        result = sa.create_engine(f"sqlite:///{tmp_path / 'events.db'}")
+        result = sa.create_engine(f"sqlite:///{tmp_path / 'tasks.db'}")
 
         @sa.event.listens_for(result, "connect")
         def enable_foreign_keys(connection, _record):
@@ -34,7 +34,7 @@ def engine(request, tmp_path):
 def task_id(engine):
     Base.metadata.create_all(engine)
     with Session(engine) as db:
-        user = User(username="event-owner", password_hash="unused")
+        user = User(username="task-owner", password_hash="unused")
         db.add(user)
         db.flush()
         task = Task(user_id=user.id, title="Existing task", description="unchanged")

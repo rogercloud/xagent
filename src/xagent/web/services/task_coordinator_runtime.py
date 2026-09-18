@@ -17,7 +17,7 @@ from sqlalchemy import select
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.orm import Session
 
-from ...config import get_task_lease_heartbeat_seconds
+from ...config import get_task_lease_heartbeat_seconds, get_task_lease_ttl_seconds
 from ..models.database import get_session_local
 from ..models.task import Task, TaskStatus
 from ..models.task_command import TaskExecutionCommand
@@ -93,17 +93,9 @@ class TaskCoordinatorRegistry:
     def _renew(
         self, leases: tuple[TaskLease, ...]
     ) -> dict[TaskLease, TaskLeaseRenewalState]:
-        try:
-            with self.session_factory() as db, db.begin():
-                states = renew_task_leases_no_commit(db, leases)
-            return states
-        except DBAPIError as error:
-            # These PostgreSQL statement failures have exited/rolled back the
-            # transaction. Do not classify ambiguous commit/network failures as
-            # a skipped row or acknowledge any success from a rolled-back batch.
-            if getattr(error.orig, "pgcode", None) in ("55P03", "57014"):
-                return {lease: TaskLeaseRenewalState.DEFERRED for lease in leases}
-            raise
+        with self.session_factory() as db, db.begin():
+            states = renew_task_leases_no_commit(db, leases)
+        return states
 
     def _finish_heartbeat(
         self, coordinator: TaskCoordinator, error: BaseException | None = None
@@ -161,21 +153,62 @@ class TaskCoordinatorRegistry:
                             lambda: self._renew(tuple(lease for lease, _ in snapshot))
                         )
                     except Exception as error:
+                        sqlstate = (
+                            getattr(error.orig, "pgcode", None)
+                            if isinstance(error, DBAPIError)
+                            else None
+                        )
+                        # These PostgreSQL errors abort the transaction. Retry
+                        # from a fresh transaction; an unknown commit/network
+                        # outcome still requires recovery instead.
+                        retryable = is_database_pool_timeout(error) or sqlstate in (
+                            "55P03",
+                            "57014",
+                            "40P01",
+                            "40001",
+                        )
                         for _, c in snapshot:
                             c._healthy = False
                             c._heartbeat_error = error
-                            if not is_database_pool_timeout(error):
+                            if not retryable:
                                 self._finish_heartbeat(c, error)
                         logger.warning(
-                            "Coordinator heartbeat batch failed", exc_info=True
+                            "Coordinator heartbeat batch failed: tasks=%s count=%s "
+                            "error=%s sqlstate=%s retryable=%s",
+                            [lease.task_id for lease, _ in snapshot[:10]],
+                            len(snapshot),
+                            type(error).__name__,
+                            sqlstate,
+                            retryable,
+                            exc_info=True,
                         )
-                        # A failed connection checkout retries at normal cadence,
-                        # not the short locked-row retry cadence.
+                        if retryable:
+                            # A shared database failure must not be retried by
+                            # either an imminent regular tick or a row's timer.
+                            next_refresh_at = (
+                                self.loop.time() + get_task_lease_heartbeat_seconds()
+                            )
+                            for c in self._heartbeats.values():
+                                c._retry_at = None
                     else:
                         for lease, c in snapshot:
                             state = states[lease]
                             if state == TaskLeaseRenewalState.DEFERRED:
-                                c._healthy = False
+                                # A skipped lock does not invalidate the last
+                                # committed renewal. Reserve one heartbeat of
+                                # margin, and never restore health from a skip.
+                                if c._healthy and self.loop.time() >= (
+                                    c._last_renewed_at
+                                    + get_task_lease_ttl_seconds()
+                                    - get_task_lease_heartbeat_seconds()
+                                ):
+                                    c._healthy = False
+                                    logger.warning(
+                                        "Task %s heartbeat remains deferred; "
+                                        "last renewal %.3fs ago",
+                                        c.task_id,
+                                        self.loop.time() - c._last_renewed_at,
+                                    )
                                 c._retry_at = self.loop.time() + min(
                                     1.0, get_task_lease_heartbeat_seconds() / 4
                                 )
@@ -183,6 +216,9 @@ class TaskCoordinatorRegistry:
                                 c.state = CoordinatorState.LOST
                                 self._finish_heartbeat(c)
                             else:
+                                # Use dispatch time, not commit acknowledgement:
+                                # database time spent cannot extend our margin.
+                                c._last_renewed_at = now
                                 c._healthy = True
                                 c._heartbeat_error = None
                 finally:
@@ -263,6 +299,7 @@ class TaskCoordinator:
         self._waiters = 0
         self._delivered = False
         self._healthy = True
+        self._last_renewed_at = registry.loop.time()
         self._heartbeat_error: BaseException | None = None
         self._recovery_required = False
         self._released = False
