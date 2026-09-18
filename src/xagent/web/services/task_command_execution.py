@@ -91,12 +91,16 @@ from .external_task_input import (
 from .file_turn import (
     append_uploaded_files_context as _append_uploaded_files_context_to_message,
 )
-from .file_turn import bind_turn_files_no_commit
+from .file_turn import (
+    bind_turn_files_no_commit,
+)
 from .file_turn import build_uploaded_files_context as _build_uploaded_files_context
 from .file_turn import (
     normalize_attachments_for_persistence as _normalize_attachments_for_persistence,
 )
-from .file_turn import resolve_turn_file_infos
+from .file_turn import (
+    resolve_turn_file_infos,
+)
 from .managed_file_ref import (
     DurableObjectIntegrityError,
     DurableStorageOperationError,

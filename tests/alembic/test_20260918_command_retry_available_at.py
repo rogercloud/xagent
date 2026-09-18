@@ -3,6 +3,7 @@
 import importlib
 from datetime import datetime, timezone
 
+import pytest
 import sqlalchemy as sa
 from alembic.migration import MigrationContext
 from alembic.operations import Operations
@@ -60,3 +61,18 @@ def test_upgrade_preserves_processing_evidence_and_pending_delay(engine):
         assert [row[0] for row in rows[1:]] == [None, None, None]
         migration.downgrade()
         assert connection.execute(table.select().order_by(table.c.id)).all() == before
+
+
+@pytest.mark.parametrize("direction", ["upgrade", "downgrade"])
+def test_migration_skips_missing_metadata_owned_table(engine, direction):
+    migration = importlib.import_module(
+        "xagent.migrations.versions.20260918_command_retry_available_at"
+    )
+    with (
+        engine.begin() as connection,
+        Operations.context(MigrationContext.configure(connection)),
+    ):
+        before = sa.inspect(connection).get_table_names()
+        assert "task_execution_commands" not in before
+        getattr(migration, direction)()
+        assert sa.inspect(connection).get_table_names() == before

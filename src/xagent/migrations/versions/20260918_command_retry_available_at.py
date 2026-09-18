@@ -14,9 +14,13 @@ depends_on = None
 
 
 def upgrade() -> None:
+    inspector = sa.inspect(op.get_bind())
+    # Core task tables are metadata-owned and can be absent in Alembic-only runs.
+    if not inspector.has_table("task_execution_commands"):
+        return
     if any(
         column["name"] == "retry_available_at"
-        for column in sa.inspect(op.get_bind()).get_columns("task_execution_commands")
+        for column in inspector.get_columns("task_execution_commands")
     ):
         return
     op.add_column(
@@ -32,4 +36,6 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
+    if not sa.inspect(op.get_bind()).has_table("task_execution_commands"):
+        return
     op.drop_column("task_execution_commands", "retry_available_at")
