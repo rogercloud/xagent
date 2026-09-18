@@ -29,7 +29,7 @@ from ...config import (
     get_task_lease_heartbeat_seconds,
     get_task_lease_ttl_seconds,
 )
-from ..models.task import Task, TaskStatus
+from ..models.task import Task, TaskStatus, task_status_predicate
 from ..models.task_command import TaskExecutionCommand
 from ..models.user import User
 from .db_runtime import (
@@ -1405,10 +1405,22 @@ def _find_command_candidate(
 ) -> tuple[int, int, TaskCommandKind] | None:
     from ..models.database import get_session_local
 
+    runner_id = get_runner_id()
     with get_session_local()() as db:
         row = (
-            _claimable_query(db, runner_id=get_runner_id(), command_db_id=command_db_id)
-            .filter(TaskExecutionCommand.task_id.notin_(busy_task_ids))
+            _claimable_query(db, runner_id=runner_id, command_db_id=command_db_id)
+            .filter(
+                TaskExecutionCommand.task_id.notin_(busy_task_ids),
+                # A different expired RUNNING owner needs recovery before
+                # acquisition. Our own owner can still process commands:
+                # expiry alone does not revoke its immutable lease identity.
+                or_(
+                    Task.runner_id == runner_id,
+                    task_status_predicate.ne(TaskStatus.RUNNING),
+                    Task.lease_expires_at.is_(None),
+                    Task.lease_expires_at >= _utc_now(),
+                ),
+            )
             .first()
         )
         return (
@@ -1444,9 +1456,9 @@ async def dispatch_one_task_command(
         coordinator = await registry.ensure(task_id)
         if coordinator is not None and not coordinator._command_tasks:
             break
-        # An expired RUNNING owner may require recovery that is currently
-        # indeterminate. Do not let it block unrelated tasks or spend its
-        # business retry budget. The exclusion lasts only for this scan.
+        # Ownership can change after candidate selection. Skip this task
+        # without spending its business retry budget; keep the exclusion
+        # local to this scan so a later dispatch can reconsider it.
         skipped_task_ids.add(task_id)
 
     async def apply() -> bool:

@@ -2,7 +2,7 @@
 
 import asyncio
 from datetime import datetime, timedelta, timezone
-from unittest.mock import Mock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 from sqlalchemy import event
@@ -11,7 +11,7 @@ from sqlalchemy.orm import sessionmaker
 from tests.web.services.task_database_shared import engine as engine_fixture
 from tests.web.services.task_database_shared import task_id as task_id_fixture
 from xagent.web.models import database
-from xagent.web.models.task import Task
+from xagent.web.models.task import Task, TaskStatus
 from xagent.web.models.task_command import TaskExecutionCommand
 from xagent.web.services import task_command_transport as transport
 from xagent.web.services import task_coordinator_runtime as runtime
@@ -273,8 +273,9 @@ async def test_shutdown_drains_command_while_registry_retains_lease(host):
         await asyncio.gather(dispatch, return_exceptions=True)
 
 
-async def test_unrecoverable_running_owner_does_not_starve_unrelated_commands(host):
-    from xagent.web.models.task import TaskStatus
+async def test_unrecoverable_running_owner_does_not_starve_unrelated_commands(
+    host, monkeypatch
+):
 
     factory, tid, registry = host
     first_id = enqueue(host)
@@ -299,6 +300,9 @@ async def test_unrecoverable_running_owner_does_not_starve_unrelated_commands(ho
         seen.append(command.id)
         return {}
 
+    ensure = AsyncMock(wraps=registry.ensure)
+    monkeypatch.setattr(registry, "ensure", ensure)
+
     # Targeted dispatch must not consume some other command.
     assert not await transport.dispatch_one_task_command(
         execute, command_db_id=first_id
@@ -306,8 +310,101 @@ async def test_unrecoverable_running_owner_does_not_starve_unrelated_commands(ho
     assert await transport.dispatch_one_task_command(execute)
     assert seen == [other_id]
     assert not await transport.dispatch_one_task_command(execute)
+    assert all(call.args[0] != tid for call in ensure.call_args_list)
     with factory() as db:
         row = db.get(TaskExecutionCommand, first_id)
         assert row.status == "pending"
         assert (row.attempt_count, row.failure_count, row.defer_count) == (0, 0, 0)
         assert db.get(Task, tid).lease_attempt_id == "ambiguous-checkpoint-owner"
+
+
+@pytest.mark.parametrize(
+    ("status", "runner", "expired"),
+    [
+        (TaskStatus.RUNNING, "worker", True),
+        (TaskStatus.RUNNING, "retired", None),
+        (TaskStatus.RUNNING, None, None),
+        (TaskStatus.PAUSED, "retired", True),
+        (TaskStatus.WAITING_FOR_USER, "retired", True),
+    ],
+)
+async def test_candidate_filter_preserves_other_ownership_states(
+    host, status, runner, expired
+):
+    factory, tid, _ = host
+    cid = enqueue(host)
+    with factory() as db, db.begin():
+        task = db.get(Task, tid)
+        task.status = status
+        task.runner_id = runner
+        task.lease_attempt_id = "existing" if runner else None
+        task.lease_expires_at = (
+            datetime.now(timezone.utc) - timedelta(seconds=1) if expired else None
+        )
+    assert transport._find_command_candidate(cid)[0] == cid
+
+
+async def test_recovered_running_task_reenters_dispatch_without_blacklist(host):
+    from xagent.web.services.task_lease_recovery import (
+        recover_task_lease_candidate_isolated,
+    )
+    from xagent.web.services.task_lease_service import get_expired_task_lease_candidates
+
+    factory, tid, _ = host
+    cid = enqueue(host)
+    now = datetime.now(timezone.utc)
+    with factory() as db, db.begin():
+        task = db.get(Task, tid)
+        task.status = TaskStatus.RUNNING
+        task.runner_id = "retired"
+        task.lease_attempt_id = "expired-owner"
+        task.lease_expires_at = now - timedelta(seconds=1)
+    execute = AsyncMock(return_value={"applied": True})
+    assert not await transport.dispatch_one_task_command(execute)
+    with factory() as db:
+        candidates = get_expired_task_lease_candidates(db, cutoff=now, limit=1)
+    assert len(candidates) == 1
+    assert (
+        recover_task_lease_candidate_isolated(candidates[0], recovered_at=now)
+        == TaskStatus.FAILED
+    )
+    assert await transport.dispatch_one_task_command(execute, command_db_id=cid)
+    execute.assert_awaited_once()
+
+
+async def test_owner_acquisition_race_still_serves_next_candidate(host, monkeypatch):
+    factory, tid, registry = host
+    first_id = enqueue(host)
+    with factory() as db, db.begin():
+        other = Task(user_id=db.get(Task, tid).user_id, title="runnable")
+        db.add(other)
+        db.flush()
+        row = TaskExecutionCommand(
+            task_id=other.id, command_id="runnable", kind="message", payload={}
+        )
+        db.add(row)
+        db.flush()
+        other_id = row.id
+    ensure = registry.ensure
+    attempts = []
+
+    async def race_acquisition(task_id):
+        attempts.append(task_id)
+        if task_id == tid:
+            # The candidate was unowned when selected, but another process
+            # wins before this dispatcher can acquire it.
+            with factory() as db, db.begin():
+                assert owners.acquire_task_lease_no_commit(
+                    db, tid, runner_id="other-worker"
+                )
+        return await ensure(task_id)
+
+    monkeypatch.setattr(registry, "ensure", race_acquisition)
+    execute = AsyncMock(return_value={})
+    assert await transport.dispatch_one_task_command(execute)
+    assert attempts[0] == tid and len(attempts) == 2
+    assert execute.await_args.args[0].id == other_id
+    assert tid not in registry._coordinators
+    with factory() as db:
+        row = db.get(TaskExecutionCommand, first_id)
+        assert (row.status, row.attempt_count, row.defer_count) == ("pending", 0, 0)
