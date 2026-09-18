@@ -154,7 +154,10 @@ class TaskCoordinatorRegistry:
                         )
                     except Exception as error:
                         sqlstate = (
-                            getattr(error.orig, "pgcode", None)
+                            (
+                                getattr(error.orig, "sqlstate", None)
+                                or getattr(error.orig, "pgcode", None)
+                            )
                             if isinstance(error, DBAPIError)
                             else None
                         )

@@ -1,6 +1,7 @@
 """Batch owner renewals, real row locks, and shutdown transaction ordering."""
 
 import asyncio
+import os
 from dataclasses import replace
 from datetime import timedelta
 from threading import Event
@@ -10,6 +11,7 @@ import pytest
 import sqlalchemy as sa
 from sqlalchemy.orm import sessionmaker
 
+from tests.shared.postgres_disposable import psycopg2_kwargs
 from tests.web.services.task_database_shared import engine as engine_fixture
 from tests.web.services.task_database_shared import task_id as task_id_fixture
 from xagent.web.models.task import Task, TaskStatus
@@ -18,6 +20,24 @@ from xagent.web.services import task_coordinator_service as service
 
 engine = engine_fixture
 task_id = task_id_fixture
+
+
+@pytest.fixture(params=["psycopg2", "psycopg"])
+def renewal_engine(engine, request):
+    if engine.dialect.name != "postgresql" or request.param == "psycopg2":
+        yield engine
+        return
+    psycopg = pytest.importorskip("psycopg")
+    with engine.connect() as db:
+        dbname = db.scalar(sa.text("SELECT current_database()"))
+    kwargs = psycopg2_kwargs(os.environ["XAGENT_TEST_POSTGRES_URL"], dbname)
+    result = sa.create_engine(
+        "postgresql+psycopg://", creator=lambda: psycopg.connect(**kwargs)
+    )
+    try:
+        yield result
+    finally:
+        result.dispose()
 
 
 @pytest.fixture
@@ -382,8 +402,9 @@ async def test_sustained_deferral_degrades_once_and_success_restores_admission(
 
 @pytest.mark.parametrize("sqlstate", ["55P03", "57014", "40P01", "40001"])
 async def test_batch_rollback_retries_at_normal_cadence_and_recovers(
-    engine, task_id, monkeypatch, caplog, sqlstate
+    renewal_engine, task_id, monkeypatch, caplog, sqlstate
 ):
+    engine = renewal_engine
     if engine.dialect.name != "postgresql":
         pytest.skip("PostgreSQL transaction errors")
     monkeypatch.setattr(runtime, "get_task_lease_heartbeat_seconds", lambda: 0.2)
@@ -484,8 +505,9 @@ async def test_subset_failure_waits_full_interval_before_next_batch(
 
 
 async def test_unknown_commit_acknowledgement_requires_recovery(
-    engine, task_id, monkeypatch
+    renewal_engine, task_id, monkeypatch
 ):
+    engine = renewal_engine
     monkeypatch.setattr(runtime, "get_task_lease_heartbeat_seconds", lambda: 0.05)
     factory = sessionmaker(engine, expire_on_commit=False)
     registry = runtime.TaskCoordinatorRegistry(factory)
@@ -494,7 +516,11 @@ async def test_unknown_commit_acknowledgement_requires_recovery(
         before = times(factory, (owner.lease,))
 
         def lost_ack(session):
-            raise sa.exc.OperationalError("COMMIT", {}, OSError("acknowledgement lost"))
+            raise sa.exc.OperationalError(
+                "COMMIT",
+                {},
+                engine.dialect.dbapi.OperationalError("acknowledgement lost"),
+            )
 
         sa.event.listen(factory, "after_commit", lost_ack)
         try:
