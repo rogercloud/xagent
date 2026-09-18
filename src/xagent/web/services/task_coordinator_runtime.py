@@ -14,7 +14,7 @@ from enum import Enum
 from typing import Any, Awaitable, Callable, TypeVar
 
 from sqlalchemy import select
-from sqlalchemy.exc import DBAPIError
+from sqlalchemy.exc import DBAPIError, OperationalError
 from sqlalchemy.orm import Session
 
 from ...config import get_task_lease_heartbeat_seconds, get_task_lease_ttl_seconds
@@ -161,25 +161,41 @@ class TaskCoordinatorRegistry:
                             if isinstance(error, DBAPIError)
                             else None
                         )
-                        # These PostgreSQL errors abort the transaction. Retry
-                        # from a fresh transaction; an unknown commit/network
-                        # outcome still requires recovery instead.
+                        # A renewal only extends the exact existing owner.
+                        # Rollback or connection loss gives no new lease time,
+                        # but does not invalidate the last acknowledged lease.
                         rolled_back = sqlstate in (
                             "55P03",
                             "57014",
                             "40P01",
                             "40001",
                         )
-                        retryable = rolled_back or is_database_pool_timeout(error)
+                        connection_error = isinstance(error, DBAPIError) and (
+                            error.connection_invalidated
+                            or (
+                                isinstance(error, OperationalError)
+                                and sqlstate is None
+                                and (
+                                    hasattr(error.orig, "pgcode")
+                                    or hasattr(error.orig, "sqlstate")
+                                )
+                            )
+                        )
+                        retryable = (
+                            rolled_back
+                            or connection_error
+                            or is_database_pool_timeout(error)
+                        )
                         for _, c in snapshot:
-                            # A rollback leaves the last committed lease valid.
-                            # Preserve prior health/errors while it has margin;
+                            # Preserve prior health/errors while there is margin;
                             # only an acknowledged renewal can restore health.
-                            if rolled_back and c._has_renewal_margin():
+                            if (
+                                rolled_back or connection_error
+                            ) and c._has_renewal_margin():
                                 continue
                             c._healthy = False
                             c._heartbeat_error = error
-                            if not retryable:
+                            if not retryable or connection_error:
                                 self._finish_heartbeat(c, error)
                         logger.warning(
                             "Coordinator heartbeat batch failed: tasks=%s count=%s "

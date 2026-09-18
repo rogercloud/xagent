@@ -293,7 +293,17 @@ async def test_postgresql_table_lock_defers_whole_batch(engine, owners):
     assert all(state == "renewed" for state in registry._renew(leases).values())
 
 
-async def test_batch_commit_failure_is_not_acknowledged(engine, task_id, monkeypatch):
+@pytest.mark.parametrize(
+    "failure",
+    [
+        RuntimeError("commit failed"),
+        sa.exc.ProgrammingError("invalid SQL", {}, ValueError("invalid SQL")),
+        sa.exc.OperationalError("invalid SQLite SQL", {}, ValueError("invalid SQL")),
+    ],
+)
+async def test_batch_commit_failure_is_not_acknowledged(
+    engine, task_id, monkeypatch, failure
+):
     monkeypatch.setattr(runtime, "get_task_lease_heartbeat_seconds", lambda: 0.02)
     factory = sessionmaker(engine, expire_on_commit=False)
     registry = runtime.TaskCoordinatorRegistry(factory)
@@ -302,14 +312,14 @@ async def test_batch_commit_failure_is_not_acknowledged(engine, task_id, monkeyp
         before = times(factory, (owner.lease,))
 
         def fail_commit(session):
-            raise RuntimeError("commit failed")
+            raise failure
 
         sa.event.listen(factory, "before_commit", fail_commit)
         try:
             await until(lambda: owner.state == runtime.CoordinatorState.CLOSED)
             assert owner._recovery_required
             assert not owner._healthy
-            assert isinstance(owner._heartbeat_done.exception(), RuntimeError)
+            assert owner._heartbeat_done.exception() is failure
             assert times(factory, (owner.lease,)) == before
         finally:
             sa.event.remove(factory, "before_commit", fail_commit)
@@ -507,43 +517,125 @@ async def test_subset_failure_waits_full_interval_before_next_batch(
         await registry.close()
 
 
-async def test_unknown_commit_acknowledgement_requires_recovery(
-    renewal_engine, task_id, monkeypatch
+@pytest.mark.parametrize("failure_point", ["before_commit", "after_commit"])
+async def test_connection_failure_uses_each_owners_acknowledged_margin(
+    renewal_engine, task_id, monkeypatch, failure_point
 ):
     engine = renewal_engine
-    monkeypatch.setattr(runtime, "get_task_lease_heartbeat_seconds", lambda: 0.05)
+    monkeypatch.setattr(runtime, "get_task_lease_heartbeat_seconds", lambda: 0.2)
     factory = sessionmaker(engine, expire_on_commit=False)
+    with factory() as db, db.begin():
+        sibling = Task(user_id=db.get(Task, task_id).user_id, title="valid margin")
+        db.add(sibling)
+        db.flush()
+        sibling_id = sibling.id
     registry = runtime.TaskCoordinatorRegistry(factory)
-    try:
-        owner = await registry.ensure(task_id)
-        before = times(factory, (owner.lease,))
+    gate = asyncio.Event()
+    run_batches = registry._run_heartbeats
 
-        def lost_ack(session):
+    async def gated():
+        await gate.wait()
+        await run_batches()
+
+    monkeypatch.setattr(registry, "_run_heartbeats", gated)
+    failed = False
+    attempts = []
+    original = registry._renew
+
+    def renew(leases):
+        attempts.append(registry.loop.time())
+        return original(leases)
+
+    monkeypatch.setattr(registry, "_renew", renew)
+
+    def lost_connection(session):
+        nonlocal failed
+        if not failed:
+            failed = True
             raise sa.exc.OperationalError(
                 "COMMIT",
                 {},
-                engine.dialect.dbapi.OperationalError("acknowledgement lost"),
+                engine.dialect.dbapi.OperationalError("connection lost"),
+                connection_invalidated=True,
             )
 
-        sa.event.listen(factory, "after_commit", lost_ack)
+    try:
+        expired = await registry.ensure(task_id)
+        survivor = await registry.ensure(sibling_id)
+        expired._last_renewed_at -= runtime.get_task_lease_ttl_seconds()
+        acknowledged_at = survivor._last_renewed_at
+        children = [asyncio.create_task(asyncio.Event().wait()) for _ in range(2)]
+        expired.track_execution(children[0])
+        survivor.track_execution(children[1])
+        leases = (expired.lease, survivor.lease)
+        before = times(factory, leases)
+        sa.event.listen(factory, failure_point, lost_connection)
         try:
-            await until(lambda: owner.state == runtime.CoordinatorState.CLOSED)
-            assert owner._recovery_required
-            assert not owner._healthy
-            assert isinstance(
-                owner._heartbeat_done.exception(), sa.exc.OperationalError
-            )
-            # The durable write succeeded, but the owner must not guess that.
-            assert times(factory, (owner.lease,))[task_id] > before[task_id]
+            gate.set()
+            await until(lambda: failed and survivor._renewal_waiter is None)
+            failed_at = registry.loop.time()
+            await expired.close()
+            assert expired._recovery_required
+            assert children[0].cancelled()
+            assert survivor.state == runtime.CoordinatorState.ACTIVE
+            assert survivor._healthy and survivor._heartbeat_error is None
+            assert not children[1].done()
+            # Neither real durable outcome grants unacknowledged lease time.
+            assert survivor._last_renewed_at == acknowledged_at
+            after = times(factory, leases)
+            assert (after != before) == (failure_point == "after_commit")
+            await until(lambda: survivor._last_renewed_at > acknowledged_at)
+            assert attempts[1] - failed_at >= 0.18
+            assert not children[1].done()
             with factory() as db:
-                assert db.get(Task, task_id).lease_attempt_id == owner.lease.attempt_id
+                assert (
+                    db.get(Task, task_id).lease_attempt_id == expired.lease.attempt_id
+                )
+                assert (
+                    db.get(Task, sibling_id).lease_attempt_id
+                    == survivor.lease.attempt_id
+                )
         finally:
-            sa.event.remove(factory, "after_commit", lost_ack)
+            sa.event.remove(factory, failure_point, lost_connection)
+    finally:
+        gate.set()
+        await registry.close()
+
+
+async def test_postgresql_connect_error_without_invalidation_retains_margin(
+    renewal_engine, task_id, monkeypatch
+):
+    engine = renewal_engine
+    if engine.dialect.name != "postgresql":
+        pytest.skip("PostgreSQL driver connection errors")
+    monkeypatch.setattr(runtime, "get_task_lease_heartbeat_seconds", lambda: 0.1)
+    factory = sessionmaker(engine, expire_on_commit=False)
+    registry = runtime.TaskCoordinatorRegistry(factory)
+    error = sa.exc.OperationalError(
+        None, None, engine.dialect.dbapi.OperationalError("connection unavailable")
+    )
+    assert not error.connection_invalidated
+    attempted = Event()
+
+    def fail_connect(leases):
+        attempted.set()
+        raise error
+
+    monkeypatch.setattr(registry, "_renew", fail_connect)
+    try:
+        owner = await registry.ensure(task_id)
+        acknowledged_at = owner._last_renewed_at
+        await until(lambda: attempted.is_set() and owner._renewal_waiter is None)
+        assert owner.state == runtime.CoordinatorState.ACTIVE
+        assert owner._healthy and owner._heartbeat_error is None
+        assert owner._last_renewed_at == acknowledged_at
     finally:
         await registry.close()
 
 
-@pytest.mark.parametrize("health", ["healthy", "margin_exhausted", "pool_timeout"])
+@pytest.mark.parametrize(
+    "health", ["healthy", "margin_exhausted", "pool_timeout", "disconnect"]
+)
 async def test_rollback_before_execution_completion_uses_existing_lease_health(
     engine, task_id, monkeypatch, health
 ):
@@ -560,7 +652,13 @@ async def test_rollback_before_execution_completion_uses_existing_lease_health(
     class RolledBack(Exception):
         pgcode = "55P03"
 
-    error = sa.exc.OperationalError("renew", {}, RolledBack("injected rollback"))
+    error = (
+        sa.exc.OperationalError(
+            "renew", {}, OSError("connection lost"), connection_invalidated=True
+        )
+        if health == "disconnect"
+        else sa.exc.OperationalError("renew", {}, RolledBack("injected rollback"))
+    )
 
     def renew(leases):
         failed.set()
@@ -590,7 +688,7 @@ async def test_rollback_before_execution_completion_uses_existing_lease_health(
     try:
         await until(lambda: failed.is_set() and owner._renewal_waiter is None)
         assert owner.state == runtime.CoordinatorState.ACTIVE
-        if health == "healthy":
+        if health in ("healthy", "disconnect"):
             assert owner._healthy
             assert owner._heartbeat_error is None
         elif health == "pool_timeout":
@@ -601,7 +699,7 @@ async def test_rollback_before_execution_completion_uses_existing_lease_health(
         # No renewal can succeed in this test. Completion must use the last
         # acknowledged lease and the real fenced finalizer, not await a retry.
         finalized = await handle.finalize_result(status=TaskStatus.COMPLETED)
-        assert finalized == (health == "healthy")
+        assert finalized == (health in ("healthy", "disconnect"))
         with factory() as db:
             task = db.get(Task, task_id)
             assert task.status == (
