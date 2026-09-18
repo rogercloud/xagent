@@ -276,7 +276,6 @@ async def test_shutdown_drains_command_while_registry_retains_lease(host):
 async def test_unrecoverable_running_owner_does_not_starve_unrelated_commands(
     host, monkeypatch
 ):
-
     factory, tid, registry = host
     first_id = enqueue(host)
     with factory() as db:
