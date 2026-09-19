@@ -203,6 +203,7 @@ async def _start_a2a_turn(
     agent_execution_mode: str,
     text: str,
     message_id: str,
+    key_prefix: str,
     context_id: str | None,
     task_id: int | None,
 ) -> A2ATaskSnapshot:
@@ -213,6 +214,7 @@ async def _start_a2a_turn(
             agent_execution_mode=agent_execution_mode,
             text=text,
             message_id=message_id,
+            key_prefix=key_prefix,
             context_id=context_id,
             task_id=task_id,
         )
@@ -575,6 +577,7 @@ async def send_message(
         agent_execution_mode=agent_execution_mode,
         text=text,
         message_id=message_id,
+        key_prefix=key_prefix,
         context_id=context_id,
         task_id=task_id,
     )
@@ -611,6 +614,7 @@ async def stream_message(
         agent_execution_mode=agent_execution_mode,
         text=text,
         message_id=message_id,
+        key_prefix=key_prefix,
         context_id=context_id,
         task_id=task_id,
     )

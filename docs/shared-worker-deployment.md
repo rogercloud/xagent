@@ -191,11 +191,16 @@ run cannot silently reuse expired values.
 ## A2A first-message retries
 
 Shared A2A requests without `taskId` retain the original acceptance under the
-Agent, authenticated owner's stable identity, and `messageId`. Repeating the
+Agent, authenticated owner's stable identity, API key identity, and `messageId`. Repeating the
 same text and explicit `contextId` returns the original task's current state,
 including a completed or failed state, without creating another task. Reusing
 that identity with different text or explicit context returns `INVALID_ARGUMENT`.
 A new message ID represents a new input even when its text is identical.
+Different API keys have independent retry histories; rotating a key starts a new
+history. The public key prefix identifies the key; the secret is never stored in
+the receipt. If the first request omits `contextId`, a retry may include the
+server-assigned context ID returned for that task. A different context still
+conflicts; an explicitly supplied initial context must be repeated unchanged.
 
 Apply `20260919_task_input_receipts` with all old application processes stopped.
 The receipt, task, message and START command commit together. Existing inputs

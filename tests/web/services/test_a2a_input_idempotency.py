@@ -50,6 +50,7 @@ def ingress(engine, monkeypatch):
             agent_execution_mode="balanced",
             text="hello",
             message_id="message-1",
+            key_prefix="key-one",
             context_id=None,
             task_id=None,
         )
@@ -252,3 +253,44 @@ async def test_uncertain_commit_reconciles_only_durable_receipt(
     with sessions() as db:
         assert db.query(TaskInputReceipt).count() == 1
         assert db.query(TaskExecutionCommand).count() == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("text", ["hello", "different input"])
+async def test_different_key_has_independent_message_identity(ingress, text):
+    sessions, args = ingress
+    first = await task_start.start_a2a_turn(**args)
+    other = args | {"key_prefix": "key-two", "text": text}
+    second = await task_start.start_a2a_turn(**other)
+    replay = await task_start.start_a2a_turn(**other)
+    assert second.id != first.id
+    assert replay.id == second.id
+    with sessions() as db:
+        assert db.query(Task).count() == 2
+        assert db.query(TaskExecutionCommand).count() == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("initial_context", [None, "caller-context"])
+async def test_retry_with_returned_context_preserves_original_input(
+    ingress, initial_context
+):
+    sessions, args = ingress
+    args = args | {"context_id": initial_context}
+    first = await task_start.start_a2a_turn(**args)
+    returned = task_start.task_context_id(first)
+    retry = args | {"context_id": returned}
+    replay = await task_start.start_a2a_turn(**retry)
+    assert replay.id == first.id
+    for change in ({"text": "changed"}, {"context_id": "wrong-context"}):
+        with pytest.raises(task_start.TaskStartRejected, match="a2a_input_conflict"):
+            await task_start.start_a2a_turn(**(retry | change))
+    if initial_context is not None:
+        with pytest.raises(task_start.TaskStartRejected, match="a2a_input_conflict"):
+            await task_start.start_a2a_turn(**(args | {"context_id": None}))
+    with sessions() as db:
+        assert db.query(Task).count() == 1
+        db.query(Task).delete(synchronize_session=False)
+        db.commit()
+    with pytest.raises(task_start.TaskStartRejected, match="a2a_input_unavailable"):
+        await task_start.start_a2a_turn(**retry)

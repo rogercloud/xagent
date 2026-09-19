@@ -659,11 +659,11 @@ def _replay_a2a_input(
     receipt: TaskInputReceipt,
     *,
     payload_hash: str,
+    text: str,
+    context_id: str | None,
     agent_id: int,
     owner_id: int,
 ) -> A2ATaskSnapshot:
-    if receipt.payload_hash != payload_hash:
-        raise TaskStartRejected("a2a_input_conflict")
     task = db.get(Task, receipt.task_id) if receipt.task_id is not None else None
     command = (
         db.get(TaskExecutionCommand, receipt.command_db_id)
@@ -680,6 +680,12 @@ def _replay_a2a_input(
         or not command_identity_matches_task(db, task, command)
     ):
         raise TaskStartRejected("a2a_input_unavailable")
+    if receipt.payload_hash != payload_hash and not (
+        context_id is not None
+        and context_id == task_context_id(task)
+        and receipt.payload_hash == _input_hash([text, None])
+    ):
+        raise TaskStartRejected("a2a_input_conflict")
     return A2ATaskSnapshot.from_task(task)
 
 
@@ -690,6 +696,7 @@ def _prepare_a2a_turn_sync(
     agent_execution_mode: str,
     text: str,
     message_id: str,
+    key_prefix: str,
     context_id: str | None,
     task_id: int | None,
 ) -> _A2ATurnPreparation | A2ATaskSnapshot:
@@ -703,7 +710,9 @@ def _prepare_a2a_turn_sync(
             subject = _resolve_actor_subject(db, task_owner_user_id)
             if subject is None:
                 raise TaskStartRejected("a2a_input_unavailable")
-            identity_hash = _input_hash(["a2a/start/v1", subject, agent_id, message_id])
+            identity_hash = _input_hash(
+                ["a2a/start/v1", subject, agent_id, key_prefix, message_id]
+            )
             payload_hash = _input_hash([text, context_id])
             existing = db.get(TaskInputReceipt, identity_hash)
             if existing is not None:
@@ -711,6 +720,8 @@ def _prepare_a2a_turn_sync(
                     db,
                     existing,
                     payload_hash=payload_hash,
+                    text=text,
+                    context_id=context_id,
                     agent_id=agent_id,
                     owner_id=task_owner_user_id,
                 )
@@ -731,6 +742,8 @@ def _prepare_a2a_turn_sync(
                     db,
                     existing,
                     payload_hash=payload_hash,
+                    text=text,
+                    context_id=context_id,
                     agent_id=agent_id,
                     owner_id=task_owner_user_id,
                 )
@@ -780,6 +793,8 @@ def _prepare_a2a_turn_sync(
                         check,
                         saved,
                         payload_hash=payload_hash,
+                        text=text,
+                        context_id=context_id,
                         agent_id=agent_id,
                         owner_id=task_owner_user_id,
                     )
@@ -832,6 +847,7 @@ async def start_a2a_turn(
     agent_execution_mode: str,
     text: str,
     message_id: str,
+    key_prefix: str,
     context_id: str | None,
     task_id: int | None,
 ) -> A2ATaskSnapshot:
@@ -843,6 +859,7 @@ async def start_a2a_turn(
                 agent_execution_mode=agent_execution_mode,
                 text=text,
                 message_id=message_id,
+                key_prefix=key_prefix,
                 context_id=context_id,
                 task_id=task_id,
             )

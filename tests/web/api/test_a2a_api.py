@@ -1431,6 +1431,7 @@ async def test_untagged_checkpoint_is_not_resumed_without_an_exact_run() -> None
                     context_id=None,
                     text="legacy follow up",
                     message_id="msg-legacy",
+                    key_prefix="key-one",
                 )
 
         assert exc_info.value.status_code == 400
@@ -2523,6 +2524,7 @@ async def test_start_a2a_turn_cancellation_drains_atomic_create_into_scheduling(
             agent_execution_mode=execution_mode,
             text="cancelled during preparation",
             message_id="msg-cancel-prepare",
+            key_prefix="key-one",
             context_id="ctx-cancel-prepare",
             task_id=None,
         )
@@ -3542,6 +3544,10 @@ def test_shared_first_message_replay_and_conflict_use_a2a_envelope(monkeypatch, 
     second = client.post(url, headers=_bearer(full_key), json=body)
     assert first.status_code == second.status_code == 200
     assert first.json()["task"]["id"] == second.json()["task"]["id"]
+    body["message"]["contextId"] = first.json()["task"]["contextId"]
+    contextual_retry = client.post(url, headers=_bearer(full_key), json=body)
+    assert contextual_retry.status_code == 200
+    assert contextual_retry.json()["task"]["id"] == first.json()["task"]["id"]
     body["message"]["parts"] = [{"text": "changed"}]
     conflict = client.post(url, headers=_bearer(full_key), json=body)
     assert conflict.status_code == 400
@@ -3549,6 +3555,29 @@ def test_shared_first_message_replay_and_conflict_use_a2a_envelope(monkeypatch, 
     with _direct_db_session() as db:
         assert db.query(Task).filter_by(agent_id=agent_id).count() == 1
         assert db.query(TaskExecutionCommand).count() == 1
+    body["message"].pop("contextId")
+    other_key = client.post(
+        "/api/agent-api-keys",
+        headers=_admin_headers(),
+        json={"agent_id": agent_id, "label": "second integrator"},
+    )
+    assert other_key.status_code == 200, other_key.text
+    other = client.post(url, headers=_bearer(other_key.json()["full_key"]), json=body)
+    assert other.status_code == 200, other.text
+    assert other.json()["task"]["id"] != first.json()["task"]["id"]
+    other_retry = client.post(
+        url, headers=_bearer(other_key.json()["full_key"]), json=body
+    )
+    assert other_retry.json()["task"]["id"] == other.json()["task"]["id"]
+    rotated = client.post(f"/api/agents/{agent_id}/api-key", headers=_admin_headers())
+    assert rotated.status_code == 200, rotated.text
+    full_key = rotated.json()["full_key"]
+    new_request = client.post(url, headers=_bearer(full_key), json=body)
+    assert new_request.status_code == 200
+    assert new_request.json()["task"]["id"] not in {
+        first.json()["task"]["id"],
+        other.json()["task"]["id"],
+    }
     schedule.assert_not_called()
     unauthenticated = client.post(url, headers={"A2A-Version": "1.0"}, json=body)
     assert unauthenticated.status_code == 401
