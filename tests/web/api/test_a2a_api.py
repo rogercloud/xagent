@@ -3508,3 +3508,54 @@ def test_reply_timeout_reports_accepted_outcome_unknown():
     assert response.status_code == 504, response.text
     assert "Check task status" in response.json()["error"]["message"]
     assert response.json()["error"]["details"][0]["reason"] == "REPLY_OUTCOME_UNKNOWN"
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_shared_first_message_replay_and_conflict_use_a2a_envelope(monkeypatch, stream):
+    from xagent.web.services import task_event_bridge
+
+    agent_id, full_key = _create_published_agent_with_key()
+    monkeypatch.setenv("XAGENT_SHARED_TASK_EXECUTION_ENABLED", "true")
+    monkeypatch.setattr(task_event_bridge, "_bridge", MagicMock())
+    schedule = MagicMock(side_effect=AssertionError("ingress must not execute"))
+    monkeypatch.setattr("xagent.web.services.task_orchestrator._schedule_bg", schedule)
+    if stream:
+        # Keep the real admission route while avoiding a never-ending stream
+        # without a worker; streaming serialization is covered separately.
+        monkeypatch.setattr(
+            a2a_api,
+            "_task_stream_response",
+            lambda _agent_id, task: a2a_api.a2a_json_response(
+                {"task": a2a_api.task_to_a2a(task)}
+            ),
+        )
+    body = {
+        "message": {
+            "messageId": "stable-first-input",
+            "role": "ROLE_USER",
+            "parts": [{"text": "hello"}],
+        },
+        "configuration": {"returnImmediately": True},
+    }
+    url = f"/api/a2a/agents/{agent_id}/message:{'stream' if stream else 'send'}"
+    first = client.post(url, headers=_bearer(full_key), json=body)
+    second = client.post(url, headers=_bearer(full_key), json=body)
+    assert first.status_code == second.status_code == 200
+    assert first.json()["task"]["id"] == second.json()["task"]["id"]
+    body["message"]["parts"] = [{"text": "changed"}]
+    conflict = client.post(url, headers=_bearer(full_key), json=body)
+    assert conflict.status_code == 400
+    assert conflict.json()["error"]["status"] == "INVALID_ARGUMENT"
+    with _direct_db_session() as db:
+        assert db.query(Task).filter_by(agent_id=agent_id).count() == 1
+        assert db.query(TaskExecutionCommand).count() == 1
+    schedule.assert_not_called()
+    unauthenticated = client.post(url, headers={"A2A-Version": "1.0"}, json=body)
+    assert unauthenticated.status_code == 401
+    with _direct_db_session() as db:
+        db.query(Task).filter_by(agent_id=agent_id).delete(synchronize_session=False)
+        db.commit()
+    body["message"]["parts"] = [{"text": "hello"}]
+    deleted = client.post(url, headers=_bearer(full_key), json=body)
+    assert deleted.status_code == 404
+    assert deleted.json()["error"]["status"] == "NOT_FOUND"
