@@ -22,7 +22,7 @@ async def stage_channel_input_files(
     files: list[DownloadedChannelFile],
     *,
     user_id: int,
-    source: str,
+    upload_source: str,
 ) -> AsyncIterator[tuple[tuple[StagedUploadedFile, ...], list[dict[str, Any]]]]:
     staged: list[StagedUploadedFile] = []
 
@@ -37,7 +37,7 @@ async def stage_channel_input_files(
                     file_id=file_id,
                     mime_type=item.mime_type,
                     storage_key=build_upload_storage_key(user_id, file_id, item.name),
-                    upload_source=source,
+                    upload_source=upload_source,
                     execution_scope=None,
                 )
             )

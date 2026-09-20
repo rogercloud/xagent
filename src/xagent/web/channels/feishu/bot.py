@@ -573,7 +573,7 @@ class FeishuBotInstance:
                                 raise TaskTurnError("file_unavailable")
                             downloaded.append(result)
                         async with stage_channel_input_files(
-                            downloaded, user_id=owner_id, source="feishu"
+                            downloaded, user_id=owner_id, upload_source="feishu"
                         ) as (staged, infos):
                             attachments = normalize_attachments_for_persistence(infos)
                             links = " ".join(

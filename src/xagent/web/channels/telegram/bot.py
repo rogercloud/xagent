@@ -2186,7 +2186,7 @@ class TelegramBotInstance:
                                 files, Path(directory), strict=True
                             )
                             async with stage_channel_input_files(
-                                downloaded, user_id=owner_id, source="telegram"
+                                downloaded, user_id=owner_id, upload_source="telegram"
                             ) as (staged, infos):
                                 infos = [
                                     dict(info, telegram_file_id=info["source_id"])
