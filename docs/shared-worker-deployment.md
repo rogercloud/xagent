@@ -157,7 +157,9 @@ local execution retain their existing behavior.
 Feishu and Telegram retain short-window message batching. Every physical message
 in a batch gets a receipt pointing to the same START. A retry may split, reorder
 or overlap an earlier batch: accepted messages are replayed, and only unseen
-messages enter a new turn. Telegram voice identity uses the original message and
+messages enter a new turn. An earlier message whose accepted target is no longer
+available receives an error without blocking unseen messages in the same batch.
+Telegram voice identity uses the original message and
 stable file ID, so replay does not download or transcribe the voice again.
 
 Attachments are downloaded and durably staged before task selection. Their

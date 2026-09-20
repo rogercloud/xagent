@@ -150,11 +150,17 @@ class ChannelInputBatchChanged(Exception):
 
 def lookup_channel_inputs(
     incoming: tuple[ChannelInput, ...],
-) -> tuple[int, tuple[ChannelInput, ...], tuple[AcceptedChannelInput, ...]]:
+) -> tuple[
+    int,
+    tuple[ChannelInput, ...],
+    tuple[AcceptedChannelInput, ...],
+    tuple[ChannelInput, ...],
+]:
     """Partition physical inputs before file IO; replay each original command once."""
     pending: dict[str, ChannelInput] = {}
     accepted: dict[int, AcceptedChannelInput] = {}
     seen: dict[str, str] = {}
+    unavailable: list[ChannelInput] = []
     with get_session_local()() as db:
         for item in incoming:
             owner_id, identity = _identity(db, item)
@@ -168,10 +174,21 @@ def lookup_channel_inputs(
             if receipt is None:
                 pending[identity] = item
             else:
-                replay = _replay(db, receipt, item, owner_id)
-                accepted[replay.command_db_id] = replay
+                try:
+                    replay = _replay(db, receipt, item, owner_id)
+                except TaskTurnError as error:
+                    if error.reason != "input_unavailable":
+                        raise
+                    unavailable.append(item)
+                else:
+                    accepted[replay.command_db_id] = replay
         db.commit()
-    return owner_id, tuple(pending.values()), tuple(accepted.values())
+    return (
+        owner_id,
+        tuple(pending.values()),
+        tuple(accepted.values()),
+        tuple(unavailable),
+    )
 
 
 def accept_channel_input(
@@ -206,7 +223,12 @@ def accept_channel_input(
         for key, item in identities.items():
             saved = db.get(TaskInputReceipt, key)
             if saved is not None:
-                existing.append(_replay(db, saved, item, owner_id))
+                try:
+                    existing.append(_replay(db, saved, item, owner_id))
+                except TaskTurnError as error:
+                    if additional_inputs and error.reason == "input_unavailable":
+                        raise ChannelInputBatchChanged() from error
+                    raise
         if existing:
             if (
                 len(existing) == len(identities)

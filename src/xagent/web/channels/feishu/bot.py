@@ -527,9 +527,20 @@ class FeishuBotInstance:
                 inputs.append(incoming)
             proposed = tuple(inputs)
             while proposed:
-                owner_id, pending, replays = await run_db_io_cancellation_safe(
+                (
+                    owner_id,
+                    pending,
+                    replays,
+                    unavailable,
+                ) = await run_db_io_cancellation_safe(
                     lambda: lookup_channel_inputs(proposed)
                 )
+                if unavailable:
+                    await self._send_text(
+                        chat_id,
+                        "The original task for an earlier message is no longer available. "
+                        "Please send a new message if you want to repeat that request.",
+                    )
                 for replay in replays:
                     await deliver_channel_result(
                         replay.command_db_id, self._deliver_shared_result, progress=True
@@ -557,6 +568,7 @@ class FeishuBotInstance:
                 if not text and not files:
                     text = f"Received a {parts[pending[-1].message_id][3]} message."
                 get_task_event_bridge().require_ready()
+                accepted = None
                 try:
                     with TemporaryDirectory(prefix="xagent-feishu-input-") as directory:
                         downloaded = []
@@ -610,17 +622,24 @@ class FeishuBotInstance:
                                 self._save_active_tasks()
                             if cancellation is not None:
                                 raise cancellation
+                    if accepted.replayed:
+                        await deliver_channel_result(
+                            accepted.command_db_id,
+                            self._deliver_shared_result,
+                            progress=True,
+                        )
+                    else:
+                        await self._observe_shared_input(accepted.as_turn())
                 except ChannelInputBatchChanged:
                     proposed = pending
                     continue
-                if accepted.replayed:
-                    await deliver_channel_result(
+                except Exception:
+                    if accepted is None:
+                        raise
+                    logger.exception(
+                        "Feishu observation deferred for accepted command %s",
                         accepted.command_db_id,
-                        self._deliver_shared_result,
-                        progress=True,
                     )
-                else:
-                    await self._observe_shared_input(accepted.as_turn())
                 break
 
     async def _observe_shared_input(self, turn: SharedChannelTurn) -> None:

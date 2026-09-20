@@ -839,7 +839,7 @@ class SlackBotInstance:
                             {
                                 "file_id": item.file_id,
                                 "name": item.filename,
-                                "mime_type": item.mime_type,
+                                "type": item.mime_type,
                                 "size": item.file_size,
                             }
                             for item in staged

@@ -372,6 +372,15 @@ async def test_slack_files_stage_before_task_and_retry_does_not_download(
     with sessions() as db:
         uploaded = db.query(UploadedFile).one()
         command = db.query(TaskExecutionCommand).one()
+        from xagent.web.models.chat_message import TaskChatMessage
+
+        assert (
+            db.query(TaskChatMessage)
+            .filter_by(role="user")
+            .one()
+            .attachments[0]["type"]
+            == "text/plain"
+        )
         assert uploaded.task_id == command.task_id
         assert command.payload["file_ids"] == [uploaded.file_id]
 
@@ -605,7 +614,10 @@ def test_batch_receipts_survive_split_and_overlapping_retry(ingress):
     first = accept(
         incoming, additional_inputs=(second,), payload=TaskTurnPayload("hello\nsecond")
     )
-    _, pending, replays = inputs.lookup_channel_inputs((second, incoming, third, third))
+    _, pending, replays, unavailable = inputs.lookup_channel_inputs(
+        (second, incoming, third, third)
+    )
+    assert not unavailable
     assert pending == (third,)
     assert [row.command_db_id for row in replays] == [first.command_db_id]
     assert accept(second).command_db_id == first.command_db_id
@@ -818,7 +830,7 @@ def test_concurrent_overlapping_batches_accept_each_physical_input_once(ingress)
     def submit(items):
         barrier.wait(timeout=10)
         while items:
-            _, pending, _ = inputs.lookup_channel_inputs(items)
+            _, pending, _, _ = inputs.lookup_channel_inputs(items)
             if not pending:
                 return
             try:
@@ -1054,3 +1066,182 @@ async def test_telegram_stop_at_acceptance_preserves_only_current_selection(
     bot._settle_fenced_turn.assert_awaited_once()
     assert bot._settle_fenced_turn.await_args.kwargs["already_persisted"] is True
     bot._observe_shared_input.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_provider_observer_failure_does_not_reject_accepted_input(
+    provider_ingress, monkeypatch
+):
+    from unittest.mock import AsyncMock
+
+    from xagent.web.services.channel_progress import DurableChannelProgress
+    from xagent.web.services.shared_channel_execution import SharedChannelTurn
+
+    bot, message, process, sessions, platform, module = provider_ingress
+    cls = (
+        module.FeishuBotInstance if platform == "feishu" else module.TelegramBotInstance
+    )
+    bot._observe_shared_input = cls._observe_shared_input.__get__(bot)
+    monkeypatch.setattr(DurableChannelProgress, "send", AsyncMock())
+    monkeypatch.setattr(
+        SharedChannelTurn,
+        "observe",
+        AsyncMock(side_effect=ConnectionError("observer lost")),
+    )
+    monkeypatch.setattr(SharedChannelTurn, "close", AsyncMock())
+    item = message(1)
+    await process(item)
+    with sessions() as db:
+        assert db.query(TaskExecutionCommand).count() == 1
+        assert db.query(TaskChannelDelivery).one().status == "pending"
+    if platform == "telegram":
+        assert not bot.user_active_executions
+        item.answer.assert_not_awaited()
+        bot.user_preparing_executions.add(123)
+        assert bot._stop_current_conversation(123)
+        assert bot._consume_user_stop_request(123)
+    else:
+        bot._send_text.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_provider_post_commit_file_cleanup_failure_is_not_rejection(
+    provider_ingress, monkeypatch
+):
+    from contextlib import asynccontextmanager
+
+    bot, message, process, sessions, platform, module = provider_ingress
+
+    @asynccontextmanager
+    async def staging(*args, **kwargs):
+        yield (), []
+        raise ConnectionError("compensation unavailable")
+
+    monkeypatch.setattr(module, "stage_channel_input_files", staging)
+    item = message(1)
+    await process(item)
+    with sessions() as db:
+        assert db.query(TaskInputReceipt).count() == 1
+        assert db.query(TaskChannelDelivery).one().status == "pending"
+    if platform == "feishu":
+        bot._send_text.assert_not_awaited()
+    else:
+        item.answer.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_provider_unavailable_old_message_does_not_block_new_input(
+    provider_ingress,
+):
+    bot, message, process, sessions, platform, module = provider_ingress
+    old = message(1, "old")
+    await process(old)
+    with sessions() as db:
+        db.query(Task).delete(synchronize_session=False)
+        db.commit()
+    bot.active_tasks.clear()
+    bot._observe_shared_input.reset_mock()
+    fresh = message(2, "fresh")
+    await process(old, fresh)
+    with sessions() as db:
+        assert db.query(Task).one().description == "fresh"
+        assert db.query(TaskInputReceipt).count() == 2
+    bot._observe_shared_input.assert_awaited_once()
+    if platform == "feishu":
+        assert "no longer available" in bot._send_text.await_args.args[1]
+    else:
+        assert "no longer available" in old.answer.await_args.args[0]
+        fresh.answer.assert_not_awaited()
+
+
+@pytest.fixture
+def second_channel(ingress):
+    incoming, sessions = ingress
+    with sessions() as db:
+        owner = User(username="second-owner", password_hash="unused")
+        db.add(owner)
+        db.flush()
+        channel = UserChannel(
+            user_id=owner.id,
+            channel_type="slack",
+            channel_name="second",
+            config={"allowed_users": ["sender"]},
+            is_active=True,
+        )
+        db.add(channel)
+        db.commit()
+        return int(owner.id), replace(incoming, channel_id=int(channel.id))
+
+
+def test_owner_change_between_lookup_and_acceptance_rejects_input(
+    ingress, second_channel
+):
+    incoming, sessions = ingress
+    previous_owner, _ = inputs.lookup_channel_input(incoming)
+    other_owner, _ = second_channel
+    with sessions() as db:
+        db.get(UserChannel, incoming.channel_id).user_id = other_owner
+        db.commit()
+    with pytest.raises(TaskTurnError, match="owner_changed"):
+        inputs.accept_channel_input(
+            incoming,
+            owner_id=previous_owner,
+            active_task_id=None,
+            channel_name="test",
+            payload=TaskTurnPayload("hello"),
+            staged_files=(),
+            host_id="host",
+        )
+    with sessions() as db:
+        assert db.query(TaskInputReceipt).count() == db.query(Task).count() == 0
+
+
+def test_batch_cannot_accept_other_owners_channel(ingress, second_channel):
+    incoming, sessions = ingress
+    _, other = second_channel
+    with pytest.raises(TaskTurnError, match="owner_changed"):
+        accept(incoming, additional_inputs=(other,))
+    with sessions() as db:
+        assert db.query(TaskInputReceipt).count() == db.query(Task).count() == 0
+
+
+@pytest.mark.parametrize(
+    "binding", ["task_owner", "channel", "command_task", "command_actor"]
+)
+def test_replay_rejects_changed_persisted_binding(ingress, second_channel, binding):
+    incoming, sessions = ingress
+    other_owner, other = second_channel
+    first, second = accept(incoming), accept(other)
+    with sessions() as db:
+        task = db.get(Task, first.task_id)
+        command = db.get(TaskExecutionCommand, first.command_db_id)
+        if binding == "task_owner":
+            task.user_id = other_owner
+        elif binding == "channel":
+            task.channel_id = other.channel_id
+        elif binding == "command_task":
+            command.task_id = second.task_id
+        else:
+            command.actor_subject = db.get(User, other_owner).actor_subject
+        db.commit()
+    with pytest.raises(TaskTurnError, match="input_unavailable"):
+        inputs.lookup_channel_input(incoming)
+
+
+def test_raced_unavailable_alias_requests_repartition(ingress):
+    incoming, sessions = ingress
+    old = replace(incoming, message_id="old")
+    previous = accept(old)
+    with sessions() as db:
+        db.delete(db.get(Task, previous.task_id))
+        db.commit()
+    with pytest.raises(inputs.ChannelInputBatchChanged):
+        accept(incoming, additional_inputs=(old,))
+    _, pending, replayed, unavailable = inputs.lookup_channel_inputs((incoming, old))
+    assert pending == (incoming,)
+    assert not replayed
+    assert unavailable == (old,)
+    accept(pending[0])
+    with sessions() as db:
+        assert db.query(Task).count() == 1
+        assert db.query(TaskInputReceipt).count() == 2

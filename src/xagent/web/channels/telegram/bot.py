@@ -2133,9 +2133,24 @@ class TelegramBotInstance:
                     parts.setdefault(message_id, (message, text, files))
                 proposed = tuple(inputs)
                 while proposed:
-                    owner_id, pending, replays = await run_db_io_cancellation_safe(
+                    (
+                        owner_id,
+                        pending,
+                        replays,
+                        unavailable,
+                    ) = await run_db_io_cancellation_safe(
                         lambda: lookup_channel_inputs(proposed)
                     )
+                    for item in unavailable:
+                        try:
+                            await parts[item.message_id][0].answer(
+                                "The original task for this earlier message is no longer available. "
+                                "Please send a new message if you want to repeat that request."
+                            )
+                        except Exception:
+                            logger.exception(
+                                "Failed to report unavailable Telegram input"
+                            )
                     for replay in replays:
                         await deliver_channel_result(
                             replay.command_db_id,
@@ -2368,7 +2383,7 @@ class TelegramBotInstance:
         handler = None
         active = (turn.selection.task_id, turn)
         self.user_active_executions[user_id] = active
-        waiting = True
+        waiting = False
 
         async def progress_sender(
             delivery: ChannelDelivery, event: TraceEvent | None

@@ -55,6 +55,9 @@ on:
       - 'src/xagent/web/channels/feishu/bot.py'
       - 'src/xagent/web/channels/telegram/bot.py'
       - 'src/xagent/web/services/channel_input_files.py'
+      - 'src/xagent/web/services/uploaded_file_store.py'
+      - 'tests/web/test_feishu_message_queue.py'
+      - 'tests/web/test_telegram_message_queue.py'
       - 'src/xagent/web/services/channel_progress.py'
       - 'tests/web/services/test_channel_input_acceptance.py'
       - 'src/xagent/web/services/task_command_transport.py'
@@ -199,6 +202,9 @@ jobs:
             src/xagent/web/channels/feishu/bot.py
             src/xagent/web/channels/telegram/bot.py
             src/xagent/web/services/channel_input_files.py
+            src/xagent/web/services/uploaded_file_store.py
+            tests/web/test_feishu_message_queue.py
+            tests/web/test_telegram_message_queue.py
             src/xagent/web/services/channel_progress.py
             tests/web/services/test_channel_input_acceptance.py
             src/xagent/web/services/task_command_transport.py

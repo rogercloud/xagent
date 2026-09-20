@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from dataclasses import dataclass, field
+from time import monotonic
 from typing import Any, cast
 from uuid import uuid4
 
@@ -531,9 +532,11 @@ class ChannelProgressForwarder(TraceHandler):
         self.command = command
         self.run_id = run_id
         self._unavailable = False
+        self._next_route_attempt = 0.0
+        self._route_retry_delay = 1.0
 
     async def handle_event(self, event: TraceEvent) -> None:
-        if self._unavailable:
+        if self._unavailable or monotonic() < self._next_route_attempt:
             return
         try:
             await get_task_event_bridge().reply_for(
@@ -545,8 +548,13 @@ class ChannelProgressForwarder(TraceHandler):
                     "trace": event.to_dict(),
                 }
             )
+            self._next_route_attempt = 0.0
+            self._route_retry_delay = 1.0
         except TaskReplyRouteUnavailable:
-            # Ingress attaches its progress recipient after acceptance.
+            # Ingress may attach after acceptance. Retry on later traces, but
+            # do not query/log every event if ingress never installs a route.
+            self._next_route_attempt = monotonic() + self._route_retry_delay
+            self._route_retry_delay = min(self._route_retry_delay * 2, 30.0)
             return
         except ConnectionError:
             self._unavailable = True

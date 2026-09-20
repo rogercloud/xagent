@@ -55,7 +55,9 @@ async def test_channel_entry_submits_shared_turn_without_local_agent(
     )
     submit = Mock(return_value=accepted)
     monkeypatch.setattr(module, "accept_channel_input", submit)
-    monkeypatch.setattr(module, "lookup_channel_inputs", lambda items: (45, items, ()))
+    monkeypatch.setattr(
+        module, "lookup_channel_inputs", lambda items: (45, items, (), ())
+    )
     monkeypatch.setattr(module, "get_task_event_bridge", lambda: Mock(host_id="host"))
     local_agent = Mock(
         side_effect=AssertionError("Web ingress must not create an agent")
