@@ -531,16 +531,12 @@ class FeishuBotInstance:
                     owner_id,
                     pending,
                     replays,
-                    unavailable,
+                    rejected,
                 ) = await run_db_io_cancellation_safe(
                     lambda: lookup_channel_inputs(proposed)
                 )
-                if unavailable:
-                    await self._send_text(
-                        chat_id,
-                        "The original task for an earlier message is no longer available. "
-                        "Please send a new message if you want to repeat that request.",
-                    )
+                for notice in dict.fromkeys(item.message for item in rejected):
+                    await self._send_text(chat_id, notice)
                 for replay in replays:
                     await deliver_channel_result(
                         replay.command_db_id, self._deliver_shared_result, progress=True
@@ -673,9 +669,12 @@ class FeishuBotInstance:
         )
         try:
             await progress.send()
-            await turn.observe(progress)
+            result = await turn.observe(progress)
             await deliver_channel_result(
-                turn.command_db_id, self._deliver_shared_result, progress=True
+                turn.command_db_id,
+                self._deliver_shared_result,
+                progress=True,
+                pending_notice=result.get("status") == "accepted",
             )
         finally:
             await turn.close()

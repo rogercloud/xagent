@@ -205,11 +205,12 @@ def slack_ingress(ingress, monkeypatch, tmp_path):
         "observe",
         AsyncMock(return_value={"status": "accepted"}),
     )
-    monkeypatch.setattr(
-        slack,
-        "get_agent_manager",
-        Mock(side_effect=AssertionError("ingress must not create Agent")),
+    local_agent = Mock(side_effect=AssertionError("ingress must not create Agent"))
+    persist = AsyncMock(
+        side_effect=AssertionError("START acceptance owns the transcript")
     )
+    monkeypatch.setattr(slack, "get_agent_manager", local_agent)
+    monkeypatch.setattr(slack, "persist_channel_user_message", persist)
 
     def bot():
         result = slack.SlackBotInstance(
@@ -221,7 +222,9 @@ def slack_ingress(ingress, monkeypatch, tmp_path):
         result.web_client.chat_update = AsyncMock()
         return result
 
-    return bot, sessions
+    yield bot, sessions
+    local_agent.assert_not_called()
+    persist.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -280,6 +283,10 @@ async def test_slack_progress_and_final_use_persisted_message(slack_ingress):
             "text": "hello",
         },
     )
+    bot._send_final_text.assert_awaited_once()
+    assert "still being processed" in bot._send_final_text.await_args.kwargs["text"]
+    assert bot._send_final_text.await_args.kwargs["loading_ts"] == "loading-ts"
+    bot._send_final_text.reset_mock()
     with sessions() as db:
         command_id = int(db.query(TaskExecutionCommand).one().id)
         task_id = int(db.query(Task).one().id)
@@ -778,6 +785,11 @@ async def test_provider_download_failure_does_not_accept_partial_batch(
         assert db.query(TaskInputReceipt).count() == 0
         assert db.query(Task).count() == 0
     bot._observe_shared_input.assert_not_awaited()
+    if platform == "feishu":
+        bot._send_text.assert_awaited_once()
+        assert "could not be accepted" in bot._send_text.await_args.args[1]
+    else:
+        item.answer.assert_awaited_once()
 
 
 @pytest.mark.asyncio
@@ -1240,8 +1252,105 @@ def test_raced_unavailable_alias_requests_repartition(ingress):
     _, pending, replayed, unavailable = inputs.lookup_channel_inputs((incoming, old))
     assert pending == (incoming,)
     assert not replayed
-    assert unavailable == (old,)
+    assert unavailable == (inputs.RejectedChannelInput(old, "input_unavailable"),)
     accept(pending[0])
     with sessions() as db:
         assert db.query(Task).count() == 1
         assert db.query(TaskInputReceipt).count() == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("include_original", [False, True])
+async def test_provider_conflicting_old_message_does_not_block_new_input(
+    provider_ingress,
+    include_original,
+):
+    bot, message, process, sessions, platform, module = provider_ingress
+    await process(message(1, "old"))
+    bot.active_tasks.clear()
+    bot._observe_shared_input.reset_mock()
+    changed = message(1, "changed")
+    fresh = message(2, "fresh")
+    batch = [changed, fresh]
+    if include_original:
+        batch.append(message(1, "old"))
+    await process(*batch)
+    with sessions() as db:
+        assert db.query(TaskInputReceipt).count() == 2
+        assert {task.description for task in db.query(Task)} == {"old", "fresh"}
+        assert db.query(TaskExecutionCommand).count() == 2
+    bot._observe_shared_input.assert_awaited_once()
+    if platform == "feishu":
+        assert "different content" in bot._send_text.await_args.args[1]
+    else:
+        assert "different content" in changed.answer.await_args.args[0]
+        fresh.answer.assert_not_awaited()
+
+
+def test_raced_conflicting_alias_requests_repartition(ingress):
+    incoming, sessions = ingress
+    old = replace(incoming, message_id="old")
+    accept(old)
+    changed = replace(old, text="changed")
+    with pytest.raises(inputs.ChannelInputBatchChanged):
+        accept(incoming, additional_inputs=(changed,))
+    _, pending, replayed, rejected = inputs.lookup_channel_inputs((incoming, changed))
+    assert pending == (incoming,)
+    assert not replayed
+    assert rejected == (inputs.RejectedChannelInput(changed, "input_conflict"),)
+    accept(pending[0])
+    with sessions() as db:
+        assert db.query(TaskInputReceipt).count() == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("provider_ingress", ["telegram"], indirect=True)
+@pytest.mark.parametrize("control", ["switch", "stop"])
+async def test_telegram_control_during_lookup_suppresses_stale_rejection(
+    provider_ingress, monkeypatch, control
+):
+    import asyncio
+    from threading import Event
+
+    bot, message, process, sessions, platform, module = provider_ingress
+    old = message(1)
+    await process(old)
+    with sessions() as db:
+        db.query(Task).delete(synchronize_session=False)
+        db.commit()
+    bot.active_tasks.clear()
+    bot._observe_shared_input.reset_mock()
+    entered, release = Event(), Event()
+    lookup = inputs.lookup_channel_inputs
+
+    def blocked(items):
+        result = lookup(items)
+        entered.set()
+        assert release.wait(10)
+        return result
+
+    monkeypatch.setattr(module, "lookup_channel_inputs", blocked)
+    fresh = message(2)
+    processing = asyncio.create_task(process(old, fresh))
+    try:
+        assert await asyncio.to_thread(entered.wait, 10)
+        if control == "switch":
+            bot._start_new_conversation(123)
+        else:
+            bot._stop_current_conversation(123)
+    finally:
+        release.set()
+    await processing
+    old.answer.assert_not_awaited()
+    assert "wasn't sent" in fresh.answer.await_args.args[0]
+    bot._observe_shared_input.assert_not_awaited()
+    with sessions() as db:
+        assert db.query(Task).count() == 0
+        assert db.query(TaskInputReceipt).count() == 1
+
+
+def test_batch_actor_identity_failure_is_not_a_rejected_receipt(ingress, monkeypatch):
+    incoming, _ = ingress
+    monkeypatch.setattr(inputs, "_resolve_actor_subject", lambda *args: None)
+    with pytest.raises(TaskTurnError, match="input_unavailable"):
+        inputs.lookup_channel_inputs((incoming,))

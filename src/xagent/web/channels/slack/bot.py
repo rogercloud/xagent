@@ -879,9 +879,12 @@ class SlackBotInstance:
             turn = accepted.as_turn()
             progress = _DurableSlackProgress(self, accepted.command_db_id)
             await progress.send(None)
-            await turn.observe(progress)
+            result = await turn.observe(progress)
             await deliver_channel_result(
-                accepted.command_db_id, self._deliver_shared_result, progress=True
+                accepted.command_db_id,
+                self._deliver_shared_result,
+                progress=True,
+                pending_notice=result.get("status") == "accepted",
             )
         except ChannelAuthorizationError:
             await self._send_text(

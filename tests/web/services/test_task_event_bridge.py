@@ -419,6 +419,7 @@ async def test_missing_progress_route_backs_off_and_recovers(monkeypatch):
             module.TaskReplyRouteUnavailable("missing"),
             module.TaskReplyRouteUnavailable("missing"),
             None,
+            module.TaskReplyRouteUnavailable("missing again"),
             None,
         ]
     )
@@ -441,6 +442,12 @@ async def test_missing_progress_route_backs_off_and_recovers(monkeypatch):
     await forwarder.handle_event(event)
     await forwarder.handle_event(event)
     assert reply.await_count == 4
+    now = 3.5
+    await forwarder.handle_event(event)
+    assert reply.await_count == 4
+    now = 4.0
+    await forwarder.handle_event(event)
+    assert reply.await_count == 5
 
 
 @pytest.mark.asyncio

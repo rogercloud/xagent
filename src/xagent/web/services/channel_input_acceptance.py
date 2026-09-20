@@ -10,6 +10,8 @@ from typing import Any, cast
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from ...config import get_uploads_dir
+from ...core.workspace import scoped_user_root
 from ..models.database import get_session_local
 from ..models.task import Task
 from ..models.task_command import TaskExecutionCommand
@@ -148,27 +150,40 @@ class ChannelInputBatchChanged(Exception):
     """A concurrent acceptance consumed only part of the proposed batch."""
 
 
+@dataclass(frozen=True)
+class RejectedChannelInput:
+    incoming: ChannelInput
+    reason: str
+
+    @property
+    def message(self) -> str:
+        if self.reason == "input_conflict":
+            return "This earlier message was already accepted with different content. Please send a new message to make a new request."
+        return "The original task for this earlier message is no longer available. Please send a new message if you want to repeat that request."
+
+
 def lookup_channel_inputs(
     incoming: tuple[ChannelInput, ...],
 ) -> tuple[
     int,
     tuple[ChannelInput, ...],
     tuple[AcceptedChannelInput, ...],
-    tuple[ChannelInput, ...],
+    tuple[RejectedChannelInput, ...],
 ]:
     """Partition physical inputs before file IO; replay each original command once."""
     pending: dict[str, ChannelInput] = {}
     accepted: dict[int, AcceptedChannelInput] = {}
     seen: dict[str, str] = {}
-    unavailable: list[ChannelInput] = []
+    rejected: list[RejectedChannelInput] = []
     with get_session_local()() as db:
         for item in incoming:
             owner_id, identity = _identity(db, item)
             digest = item.payload_hash()
             if identity in seen:
-                if seen[identity] != digest:
+                if seen[identity] == digest:
+                    continue
+                if identity in pending:
                     raise TaskTurnError("input_conflict")
-                continue
             seen[identity] = digest
             receipt = db.get(TaskInputReceipt, identity)
             if receipt is None:
@@ -177,9 +192,9 @@ def lookup_channel_inputs(
                 try:
                     replay = _replay(db, receipt, item, owner_id)
                 except TaskTurnError as error:
-                    if error.reason != "input_unavailable":
+                    if error.reason not in {"input_unavailable", "input_conflict"}:
                         raise
-                    unavailable.append(item)
+                    rejected.append(RejectedChannelInput(item, error.reason))
                 else:
                     accepted[replay.command_db_id] = replay
         db.commit()
@@ -187,7 +202,7 @@ def lookup_channel_inputs(
         owner_id,
         tuple(pending.values()),
         tuple(accepted.values()),
-        tuple(unavailable),
+        tuple(rejected),
     )
 
 
@@ -226,7 +241,10 @@ def accept_channel_input(
                 try:
                     existing.append(_replay(db, saved, item, owner_id))
                 except TaskTurnError as error:
-                    if additional_inputs and error.reason == "input_unavailable":
+                    if additional_inputs and error.reason in {
+                        "input_unavailable",
+                        "input_conflict",
+                    }:
                         raise ChannelInputBatchChanged() from error
                     raise
         if existing:
@@ -273,6 +291,17 @@ def accept_channel_input(
                 raise TaskTurnError("file_unavailable")
             record = staged.to_record()
             setattr(record, "task_id", selection.task_id)
+            # Workers restore durable bytes inside the owner's allowed upload root;
+            # the ingress temporary download disappears when preparation finishes.
+            setattr(
+                record,
+                "storage_path",
+                str(
+                    scoped_user_root(get_uploads_dir(), owner_id)
+                    / staged.file_id
+                    / staged.filename
+                ),
+            )
             UploadedFileStore(db).add_already_durable(record)
         db.flush()
         turn = SharedChannelTurn(selection, workspace=None)

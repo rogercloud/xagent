@@ -2137,20 +2137,22 @@ class TelegramBotInstance:
                         owner_id,
                         pending,
                         replays,
-                        unavailable,
+                        rejected,
                     ) = await run_db_io_cancellation_safe(
                         lambda: lookup_channel_inputs(proposed)
                     )
-                    for item in unavailable:
+                    for item in rejected:
+                        if (
+                            self._conversation_generation(user_id) != generation
+                            or self._get_user_stop_event(user_id).is_set()
+                        ):
+                            break
                         try:
-                            await parts[item.message_id][0].answer(
-                                "The original task for this earlier message is no longer available. "
-                                "Please send a new message if you want to repeat that request."
+                            await parts[item.incoming.message_id][0].answer(
+                                item.message
                             )
                         except Exception:
-                            logger.exception(
-                                "Failed to report unavailable Telegram input"
-                            )
+                            logger.exception("Failed to report rejected Telegram input")
                     for replay in replays:
                         await deliver_channel_result(
                             replay.command_db_id,
@@ -2430,7 +2432,10 @@ class TelegramBotInstance:
                 waiting = False
             else:
                 sent = await deliver_channel_result(
-                    turn.command_db_id, self._deliver_shared_result, progress=True
+                    turn.command_db_id,
+                    self._deliver_shared_result,
+                    progress=True,
+                    pending_notice=result.get("status") == "accepted",
                 )
                 waiting = result.get("status") == "accepted" and not sent
         finally:
@@ -2631,9 +2636,11 @@ class TelegramBotInstance:
             require_delivery=True,
             shared_turn=active[1] if active is not None else None,
         )
-        if active is not None and self.user_active_executions.get(active[0]) == (
-            delivery.task_id,
-            active[1],
+        if (
+            result.get("status") != "accepted"
+            and active is not None
+            and self.user_active_executions.get(active[0])
+            == (delivery.task_id, active[1])
         ):
             self.user_active_executions.pop(active[0], None)
 
