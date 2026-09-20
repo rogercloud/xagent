@@ -269,7 +269,7 @@ def accept_channel_input(
         )
         if selection is None:
             raise TaskTurnError("busy")
-        assert isinstance(selection, SelectedChannelTask)
+        selection = cast(SelectedChannelTask, selection)
         for staged in staged_files:
             if staged.user_id != owner_id or staged.task_id is not None:
                 raise TaskTurnError("file_unavailable")
