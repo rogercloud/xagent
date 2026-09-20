@@ -237,7 +237,11 @@ class FeishuBotInstance:
                 return
 
             if get_shared_task_execution_enabled():
-                await self._process_shared_messages(open_id, messages_data)
+                groups: dict[str, list[Any]] = {}
+                for data in messages_data:
+                    groups.setdefault(str(data.event.message.chat_id), []).append(data)
+                for chat_id, group in groups.items():
+                    await self._process_shared_message_group(open_id, group)
                 return
 
             active_task_id = self.active_tasks.get(open_id)
@@ -498,145 +502,144 @@ class FeishuBotInstance:
             text = message.content.strip()
         return text, files, kind
 
-    async def _process_shared_messages(self, open_id: str, messages: list[Any]) -> None:
+    async def _process_shared_message_group(
+        self, open_id: str, group: list[Any]
+    ) -> None:
         if self.channel_id is None:
             raise ChannelConfigurationError("Channel is not configured")
-        groups: dict[str, list[Any]] = {}
-        for data in messages:
-            groups.setdefault(str(data.event.message.chat_id), []).append(data)
-        for chat_id, group in groups.items():
-            parts: dict[str, tuple[Any, str, list[dict[str, Any]], str]] = {}
-            inputs = []
-            for data in group:
-                text, files, kind = self._message_content(data)
-                message_id = str(data.event.message.message_id or "")
-                if not message_id:
-                    raise TaskTurnError("input_identity_missing")
-                incoming = ChannelInput(
-                    self.channel_id,
-                    str(open_id),
-                    "feishu",
-                    (chat_id,),
-                    message_id,
-                    json.dumps([kind, text]),
-                    tuple(item["file_key"] for item in files),
-                    {"chat_id": chat_id, "loading_message_id": None},
+        chat_id = str(group[0].event.message.chat_id)
+        parts: dict[str, tuple[Any, str, list[dict[str, Any]], str]] = {}
+        inputs = []
+        for data in group:
+            text, files, kind = self._message_content(data)
+            message_id = str(data.event.message.message_id or "")
+            if not message_id:
+                raise TaskTurnError("input_identity_missing")
+            incoming = ChannelInput(
+                self.channel_id,
+                str(open_id),
+                "feishu",
+                (chat_id,),
+                message_id,
+                json.dumps([kind, text]),
+                tuple(item["file_key"] for item in files),
+                {"chat_id": chat_id, "loading_message_id": None},
+            )
+            # Keep duplicate envelopes for conflict detection; lookup deduplicates the pending set.
+            parts.setdefault(message_id, (data, text, files, kind))
+            inputs.append(incoming)
+        proposed = tuple(inputs)
+        while proposed:
+            (
+                owner_id,
+                pending,
+                replays,
+                rejected,
+            ) = await run_db_io_cancellation_safe(
+                lambda: lookup_channel_inputs(proposed)
+            )
+            for notice in dict.fromkeys(item.message for item in rejected):
+                await self._send_text(chat_id, notice)
+            for replay in replays:
+                await deliver_channel_result(
+                    replay.command_db_id, self._deliver_shared_result, progress=True
                 )
-                # Keep duplicate envelopes for conflict detection; lookup deduplicates the pending set.
-                parts.setdefault(message_id, (data, text, files, kind))
-                inputs.append(incoming)
-            proposed = tuple(inputs)
-            while proposed:
-                (
-                    owner_id,
-                    pending,
-                    replays,
-                    rejected,
-                ) = await run_db_io_cancellation_safe(
-                    lambda: lookup_channel_inputs(proposed)
-                )
-                for notice in dict.fromkeys(item.message for item in rejected):
-                    await self._send_text(chat_id, notice)
-                for replay in replays:
-                    await deliver_channel_result(
-                        replay.command_db_id, self._deliver_shared_result, progress=True
-                    )
 
-                # Retain the old startup cutoff for inputs never accepted before.
-                def fresh(item: ChannelInput) -> bool:
-                    created = getattr(
-                        parts[item.message_id][0].event.message, "create_time", None
-                    )
-                    try:
-                        return not created or int(created) >= self.start_time
-                    except (ValueError, TypeError):
-                        return True
-
-                pending = tuple(item for item in pending if fresh(item))
-                if not pending:
-                    break
-                text = "\n".join(
-                    parts[item.message_id][1]
-                    for item in pending
-                    if parts[item.message_id][1]
+            # Retain the old startup cutoff for inputs never accepted before.
+            def fresh(item: ChannelInput) -> bool:
+                created = getattr(
+                    parts[item.message_id][0].event.message, "create_time", None
                 )
-                files = [file for item in pending for file in parts[item.message_id][2]]
-                if not text and not files:
-                    text = f"Received a {parts[pending[-1].message_id][3]} message."
-                get_task_event_bridge().require_ready()
-                accepted = None
                 try:
-                    with TemporaryDirectory(prefix="xagent-feishu-input-") as directory:
-                        downloaded = []
-                        for file in files:
-                            worker = asyncio.create_task(
-                                asyncio.to_thread(
-                                    self._download_feishu_file_sync,
-                                    file,
-                                    Path(directory),
-                                )
-                            )
-                            result = await drain_async_task_cancellation_safe(worker)
-                            if result is None:
-                                raise TaskTurnError("file_unavailable")
-                            downloaded.append(result)
-                        async with stage_channel_input_files(
-                            downloaded, user_id=owner_id, upload_source="feishu"
-                        ) as (staged, infos):
-                            attachments = normalize_attachments_for_persistence(infos)
-                            links = " ".join(
-                                f"[{info['name']}]({build_file_id_ref(info['file_id'])})"
-                                for info in infos
-                            )
-                            display = text + ("\n\n" if text and links else "") + links
-                            active = self.active_tasks.get(open_id)
-                            acceptance_task = asyncio.create_task(
-                                asyncio.to_thread(
-                                    accept_channel_input,
-                                    pending[0],
-                                    additional_inputs=pending[1:],
-                                    owner_id=owner_id,
-                                    active_task_id=int(active)
-                                    if active is not None
-                                    else None,
-                                    channel_name=self.channel_name,
-                                    payload=TaskTurnPayload(
-                                        display,
-                                        execution_message=display,
-                                        attachments=attachments or None,
-                                        file_ids=tuple(item.file_id for item in staged),
-                                    ),
-                                    staged_files=staged,
-                                    host_id=get_task_event_bridge().host_id,
-                                )
-                            )
-                            accepted, cancellation = await await_task_settlement(
-                                acceptance_task
-                            )
-                            if not accepted.replayed and accepted.selection.is_new_task:
-                                self.active_tasks[open_id] = str(accepted.task_id)
-                                self._save_active_tasks()
-                            if cancellation is not None:
-                                raise cancellation
-                    if accepted.replayed:
-                        await deliver_channel_result(
-                            accepted.command_db_id,
-                            self._deliver_shared_result,
-                            progress=True,
-                        )
-                    else:
-                        await self._observe_shared_input(accepted.as_turn())
-                except ChannelInputBatchChanged:
-                    proposed = pending
-                    continue
-                except Exception:
-                    if accepted is None:
-                        raise
-                    logger.exception(
-                        "Feishu observation deferred for accepted command %s",
-                        accepted.command_db_id,
-                    )
+                    return not created or int(created) >= self.start_time
+                except (ValueError, TypeError):
+                    return True
+
+            pending = tuple(item for item in pending if fresh(item))
+            if not pending:
                 break
+            text = "\n".join(
+                parts[item.message_id][1]
+                for item in pending
+                if parts[item.message_id][1]
+            )
+            files = [file for item in pending for file in parts[item.message_id][2]]
+            if not text and not files:
+                text = f"Received a {parts[pending[-1].message_id][3]} message."
+            get_task_event_bridge().require_ready()
+            accepted = None
+            try:
+                with TemporaryDirectory(prefix="xagent-feishu-input-") as directory:
+                    downloaded = []
+                    for file in files:
+                        worker = asyncio.create_task(
+                            asyncio.to_thread(
+                                self._download_feishu_file_sync,
+                                file,
+                                Path(directory),
+                            )
+                        )
+                        result = await drain_async_task_cancellation_safe(worker)
+                        if result is None:
+                            raise TaskTurnError("file_unavailable")
+                        downloaded.append(result)
+                    async with stage_channel_input_files(
+                        downloaded, user_id=owner_id, upload_source="feishu"
+                    ) as (staged, infos):
+                        attachments = normalize_attachments_for_persistence(infos)
+                        links = " ".join(
+                            f"[{info['name']}]({build_file_id_ref(info['file_id'])})"
+                            for info in infos
+                        )
+                        display = text + ("\n\n" if text and links else "") + links
+                        active = self.active_tasks.get(open_id)
+                        acceptance_task = asyncio.create_task(
+                            asyncio.to_thread(
+                                accept_channel_input,
+                                pending[0],
+                                additional_inputs=pending[1:],
+                                owner_id=owner_id,
+                                active_task_id=int(active)
+                                if active is not None
+                                else None,
+                                channel_name=self.channel_name,
+                                payload=TaskTurnPayload(
+                                    display,
+                                    execution_message=display,
+                                    attachments=attachments or None,
+                                    file_ids=tuple(item.file_id for item in staged),
+                                ),
+                                staged_files=staged,
+                                host_id=get_task_event_bridge().host_id,
+                            )
+                        )
+                        accepted, cancellation = await await_task_settlement(
+                            acceptance_task
+                        )
+                        if not accepted.replayed and accepted.selection.is_new_task:
+                            self.active_tasks[open_id] = str(accepted.task_id)
+                            self._save_active_tasks()
+                        if cancellation is not None:
+                            raise cancellation
+                if accepted.replayed:
+                    await deliver_channel_result(
+                        accepted.command_db_id,
+                        self._deliver_shared_result,
+                        progress=True,
+                    )
+                else:
+                    await self._observe_shared_input(accepted.as_turn())
+            except ChannelInputBatchChanged:
+                proposed = pending
+                continue
+            except Exception:
+                if accepted is None:
+                    raise
+                logger.exception(
+                    "Feishu observation deferred for accepted command %s",
+                    accepted.command_db_id,
+                )
+            break
 
     async def _observe_shared_input(self, turn: SharedChannelTurn) -> None:
         handler = None

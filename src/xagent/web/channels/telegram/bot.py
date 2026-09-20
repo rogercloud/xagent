@@ -2086,6 +2086,7 @@ class TelegramBotInstance:
         self.user_preparing_executions.add(user_id)
         self._clear_user_stop_request(user_id)
         generation = self._conversation_generation(user_id)
+        reply_message = messages[-1]
         turn = None
         asr_model = None
         try:
@@ -2097,6 +2098,7 @@ class TelegramBotInstance:
                     (message.chat.id, message.message_thread_id), []
                 ).append(message)
             for (chat_id, thread_id), group in groups.items():
+                reply_message = group[-1]
                 inputs = []
                 parts: dict[str, tuple[types.Message, str, list]] = {}
                 for message in group:
@@ -2338,9 +2340,9 @@ class TelegramBotInstance:
                     turn = None
                     break
         except ChannelAuthorizationError:
-            await messages[-1].answer("🚫 You are not authorized to use this bot.")
+            await reply_message.answer("🚫 You are not authorized to use this bot.")
         except ChannelConfigurationError:
-            await messages[-1].answer(
+            await reply_message.answer(
                 "This bot is inactive or not correctly configured."
             )
         except TaskTurnError as error:
@@ -2349,20 +2351,20 @@ class TelegramBotInstance:
                 "input_conflict": "This message was already accepted with different content. Please send a new message.",
                 "input_unavailable": "The original task is no longer available. Please send a new message.",
             }
-            await messages[-1].answer(
+            await reply_message.answer(
                 responses.get(
                     error.reason,
                     "This message could not be accepted. Please try again.",
                 )
             )
         except TelegramVoiceTranscriptionError:
-            await messages[-1].answer(
+            await reply_message.answer(
                 "I couldn't transcribe that voice message. Please try again or send the request as text."
             )
         except Exception:
             logger.exception("Error accepting Telegram input")
             if turn is None:
-                await messages[-1].answer(
+                await reply_message.answer(
                     "Sorry, an error occurred while processing your request."
                 )
         finally:

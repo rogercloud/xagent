@@ -793,6 +793,74 @@ async def test_provider_download_failure_does_not_accept_partial_batch(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("failed_group", [0, 1])
+async def test_provider_batch_error_replies_to_failed_chat(
+    provider_ingress, failed_group
+):
+    import json
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+
+    bot, message, process, sessions, platform, module = provider_ingress
+    items = [message(1), message(2)]
+    if platform == "feishu":
+        for index, item in enumerate(items):
+            item.event.message.chat_id = f"chat-{index}"
+        failed = items[failed_group].event.message
+        failed.message_type = "file"
+        failed.content = json.dumps({"file_key": "file"})
+        bot._download_feishu_file_sync = Mock(return_value=None)
+    else:
+        for index, item in enumerate(items):
+            item.chat.id = 456 + index
+        items[failed_group].document = SimpleNamespace(
+            file_id="file", file_unique_id="stable"
+        )
+
+        async def download(files, *args, **kwargs):
+            if files:
+                raise ConnectionError("download failed")
+            return []
+
+        bot._download_telegram_files = AsyncMock(side_effect=download)
+    await process(*items)
+    if platform == "feishu":
+        bot._send_text.assert_awaited_once_with(
+            f"chat-{failed_group}",
+            "This message could not be accepted. Please try again.",
+        )
+    else:
+        items[failed_group].answer.assert_awaited_once_with(
+            "Sorry, an error occurred while processing your request."
+        )
+        items[1 - failed_group].answer.assert_not_awaited()
+    # Earlier groups remain accepted; the failed group has no durable receipt.
+    with sessions() as db:
+        assert db.query(TaskInputReceipt).count() == failed_group
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("provider_ingress", ["telegram"], indirect=True)
+async def test_telegram_batch_error_replies_to_failed_topic(provider_ingress):
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+
+    bot, message, process, sessions, platform, module = provider_ingress
+    first, second = message(1), message(2)
+    first.message_thread_id = 10
+    second.message_thread_id = 20
+    first.document = SimpleNamespace(file_id="file", file_unique_id="stable")
+    bot._download_telegram_files = AsyncMock(
+        side_effect=ConnectionError("download failed")
+    )
+    await process(first, second)
+    first.answer.assert_awaited_once_with(
+        "Sorry, an error occurred while processing your request."
+    )
+    second.answer.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_telegram_stop_during_download_leaves_no_receipt(provider_ingress):
     from unittest.mock import AsyncMock
 
