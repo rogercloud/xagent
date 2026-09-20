@@ -342,7 +342,7 @@ def test_owner_change_between_lookup_and_acceptance_rejects_input(
 def test_batch_cannot_accept_other_owners_channel(ingress, second_channel):
     incoming, sessions = ingress
     _, other = second_channel
-    with pytest.raises(TaskTurnError, match="owner_changed"):
+    with pytest.raises(TaskTurnError, match="input_batch_invalid"):
         accept(incoming, additional_inputs=(other,))
     with sessions() as db:
         assert db.query(TaskInputReceipt).count() == db.query(Task).count() == 0
@@ -594,3 +594,389 @@ def test_acceptance_rejects_run_changed_after_task_selection(ingress, monkeypatc
             == 1
         )
         assert db.get(Task, first.task_id).run_id == "newer-run"
+
+
+@pytest.mark.parametrize("change", ["revoke", "deactivate", "delete"])
+def test_own_commit_recovery_preserves_acceptance_after_channel_change(
+    ingress, monkeypatch, change
+):
+    from sqlalchemy.orm import Session
+
+    incoming, sessions = ingress
+    commit = Session.commit
+
+    def uncertain_commit(db):
+        accepting = any(isinstance(row, TaskInputReceipt) for row in db.dirty)
+        commit(db)
+        if accepting:
+            with sessions() as other:
+                channel = other.get(UserChannel, incoming.channel_id)
+                if change == "revoke":
+                    channel.config = {"allowed_users": ["someone-else"]}
+                elif change == "deactivate":
+                    channel.is_active = False
+                else:
+                    other.delete(channel)
+                commit(other)
+            raise ConnectionError("commit acknowledgement lost")
+
+    monkeypatch.setattr(Session, "commit", uncertain_commit)
+    result = accept(incoming)
+    assert not result.replayed
+    assert result.selection.is_new_task
+    with sessions() as db:
+        assert db.query(TaskInputReceipt).one().command_db_id == result.command_db_id
+        assert (
+            db.get(TaskExecutionCommand, result.command_db_id).command_id
+            == result.command_id
+        )
+
+
+@pytest.mark.parametrize("items", [(), "channel", "sender", "source", "scope"])
+def test_invalid_batch_rejected_before_lookup_or_acceptance(
+    ingress, monkeypatch, items
+):
+    incoming, _ = ingress
+    if items:
+        fields = {
+            "channel": {"channel_id": incoming.channel_id + 1},
+            "sender": {"external_user_id": "another"},
+            "source": {"source": "feishu"},
+            "scope": {"scope": ("another",)},
+        }
+        batch = (incoming, replace(incoming, **fields[items]))
+    else:
+        batch = ()
+    monkeypatch.setattr(
+        inputs,
+        "_identity",
+        Mock(side_effect=AssertionError("must reject before database access")),
+    )
+    with pytest.raises(TaskTurnError, match="input_batch_invalid"):
+        inputs.lookup_channel_inputs(batch)
+    if batch:
+        with pytest.raises(TaskTurnError, match="input_batch_invalid"):
+            inputs.accept_channel_input(
+                incoming,
+                additional_inputs=batch[1:],
+                owner_id=1,
+                active_task_id=None,
+                channel_name="test",
+                payload=TaskTurnPayload("hello"),
+                staged_files=(),
+                host_id="host",
+            )
+
+
+@pytest.mark.parametrize("winner", [False, True])
+@pytest.mark.parametrize("revoke", [False, True])
+def test_failed_commit_recovery_distinguishes_other_writer(
+    ingress, monkeypatch, winner, revoke
+):
+    from sqlalchemy.orm import Session
+
+    from xagent.web.services.channel_runtime import ChannelAuthorizationError
+
+    incoming, sessions = ingress
+    commit = Session.commit
+    results = []
+    failure = ConnectionError("commit did not land")
+
+    def fail_commit(db):
+        accepting = any(isinstance(row, TaskInputReceipt) for row in db.dirty)
+        if not accepting:
+            return commit(db)
+        db.rollback()
+        monkeypatch.setattr(Session, "commit", commit)
+        if winner:
+            results.append(accept(incoming))
+        if revoke:
+            with sessions() as other:
+                other.get(UserChannel, incoming.channel_id).config = {
+                    "allowed_users": ["someone-else"]
+                }
+                commit(other)
+        raise failure
+
+    monkeypatch.setattr(Session, "commit", fail_commit)
+    if not winner:
+        with pytest.raises(ConnectionError) as error:
+            accept(incoming)
+        assert error.value is failure
+    elif revoke:
+        with pytest.raises(ChannelAuthorizationError):
+            accept(incoming)
+    else:
+        recovered = accept(incoming)
+        assert recovered.replayed
+        assert recovered.command_id == results[0].command_id
+    with sessions() as db:
+        assert db.query(TaskInputReceipt).count() == int(winner)
+
+
+@pytest.mark.parametrize("binding", ["other_owner", "bound_task"])
+def test_staged_attachment_rejects_invalid_ownership(
+    ingress, second_channel, binding, tmp_path
+):
+    from xagent.web.models.uploaded_file import UploadedFile
+    from xagent.web.services.uploaded_file_store import StagedUploadedFile
+
+    incoming, sessions = ingress
+    owner, _ = inputs.lookup_channel_input(incoming)
+    other_owner, _ = second_channel
+    staged = StagedUploadedFile(
+        "file",
+        other_owner if binding == "other_owner" else owner,
+        123 if binding == "bound_task" else None,
+        "input.txt",
+        str(tmp_path / "input.txt"),
+        "local",
+        "key",
+        None,
+        "checksum",
+        None,
+        None,
+        None,
+        "text/plain",
+        8,
+    )
+    with pytest.raises(TaskTurnError, match="file_unavailable"):
+        accept(incoming, staged_files=(staged,))
+    with sessions() as db:
+        assert (
+            db.query(Task).count()
+            == db.query(TaskInputReceipt).count()
+            == db.query(UploadedFile).count()
+            == 0
+        )
+
+
+@pytest.mark.parametrize("part", ["subject", "sender", "source", "scope", "channel"])
+def test_input_namespace_separates_physical_messages(ingress, part):
+    from uuid import uuid4
+
+    incoming, sessions = ingress
+    first = accept(incoming)
+    if part == "subject":
+        with sessions() as db:
+            db.get(User, first.user_id).actor_subject = str(uuid4())
+            db.commit()
+        distinct = incoming
+    elif part == "sender":
+        with sessions() as db:
+            db.get(UserChannel, incoming.channel_id).config = {
+                "allowed_users": ["sender", "another"]
+            }
+            db.commit()
+        distinct = replace(incoming, external_user_id="another")
+    elif part == "source":
+        distinct = replace(incoming, source="feishu")
+    elif part == "scope":
+        distinct = replace(incoming, scope=("team", "other-chat"))
+    else:
+        with sessions() as db:
+            channel = UserChannel(
+                user_id=first.user_id,
+                channel_type="slack",
+                channel_name="same-owner",
+                config={"allowed_users": ["sender"]},
+                is_active=True,
+            )
+            db.add(channel)
+            db.commit()
+            distinct = replace(incoming, channel_id=int(channel.id))
+    second = accept(distinct)
+    assert not second.replayed
+    assert second.command_id != first.command_id
+    with sessions() as db:
+        assert db.query(TaskInputReceipt).count() == 2
+
+
+@pytest.mark.parametrize("part", ["attachments", "destination"])
+def test_unchanged_text_with_changed_payload_conflicts(ingress, part):
+    incoming, sessions = ingress
+    first = accept(incoming)
+    changed = (
+        replace(incoming, source_file_ids=("different-file",))
+        if part == "attachments"
+        else replace(incoming, destination={"chat_id": "other-chat"})
+    )
+    with pytest.raises(TaskTurnError, match="input_conflict"):
+        accept(changed)
+    with sessions() as db:
+        assert db.query(TaskExecutionCommand).one().command_id == first.command_id
+
+
+def test_lookup_persists_legacy_actor_subject(ingress):
+    incoming, sessions = ingress
+    with sessions() as db:
+        owner_id = db.get(UserChannel, incoming.channel_id).user_id
+        db.get(User, owner_id).actor_subject = None
+        db.commit()
+    owner, replay = inputs.lookup_channel_input(incoming)
+    assert owner == owner_id
+    assert replay is None
+    with sessions() as db:
+        assert db.get(User, owner_id).actor_subject is not None
+        assert db.query(Task).count() == db.query(TaskInputReceipt).count() == 0
+
+
+@pytest.mark.parametrize("mode", ["new_selection", "running", "claim_denied"])
+def test_prepare_no_commit_preserves_callers_transaction(ingress, monkeypatch, mode):
+    from xagent.web.models.task import TaskStatus
+    from xagent.web.services import channel_runtime
+
+    incoming, sessions = ingress
+    previous = accept(incoming)
+    with sessions() as db:
+        db.get(Task, previous.task_id).status = (
+            TaskStatus.RUNNING if mode == "running" else TaskStatus.COMPLETED
+        )
+        db.commit()
+    if mode == "claim_denied":
+        monkeypatch.setattr(
+            channel_runtime, "acquire_task_lease_no_commit", lambda *a, **k: None
+        )
+    with sessions() as db:
+        marker = User(username="caller-transaction", password_hash="unused")
+        db.add(marker)
+        db.flush()
+        marker_id = marker.id
+        result = channel_runtime.prepare_channel_task_no_commit(
+            db,
+            channel_id=incoming.channel_id,
+            external_user_id=incoming.external_user_id,
+            active_task_id=None if mode == "new_selection" else previous.task_id,
+            text="next",
+            channel_name="test",
+            expected_owner_user_id=previous.user_id,
+            defer_execution=mode != "claim_denied",
+        )
+        assert (result is None) == (mode != "new_selection")
+        assert db.in_transaction()
+        assert db.get(User, marker_id) is marker
+        db.rollback()
+    with sessions() as db:
+        assert db.query(User).filter_by(username="caller-transaction").first() is None
+        assert db.query(Task).count() == 1
+
+
+def test_busy_acceptance_leaves_original_turn_unchanged(ingress):
+    from xagent.web.models.task import TaskStatus
+
+    incoming, sessions = ingress
+    first = accept(incoming)
+    with sessions() as db:
+        db.get(Task, first.task_id).status = TaskStatus.RUNNING
+        db.commit()
+    with pytest.raises(TaskTurnError, match="busy"):
+        accept(replace(incoming, message_id="next"), active_task_id=first.task_id)
+    with sessions() as db:
+        assert (
+            db.query(TaskInputReceipt).count()
+            == db.query(TaskExecutionCommand).count()
+            == 1
+        )
+        assert db.get(Task, first.task_id).status == TaskStatus.RUNNING
+
+
+@pytest.mark.parametrize("batch", [False, True])
+def test_unrelated_integrity_error_is_not_a_retry(ingress, monkeypatch, batch):
+    import sqlite3
+
+    from sqlalchemy.exc import IntegrityError
+    from sqlalchemy.orm import Session
+
+    incoming, sessions = ingress
+    flush = Session.flush
+    failure = IntegrityError(
+        "INSERT",
+        {},
+        sqlite3.IntegrityError(
+            "NOT NULL constraint failed: task_input_receipts.payload_hash"
+        ),
+    )
+
+    def fail(db, *args, **kwargs):
+        if any(isinstance(row, TaskInputReceipt) for row in db.new):
+            raise failure
+        return flush(db, *args, **kwargs)
+
+    monkeypatch.setattr(Session, "flush", fail)
+    with pytest.raises(IntegrityError) as error:
+        accept(
+            incoming,
+            additional_inputs=(replace(incoming, message_id="other"),) if batch else (),
+        )
+    assert error.value is failure
+    with sessions() as db:
+        assert db.query(TaskInputReceipt).count() == 0
+
+
+def test_receipt_duplicate_repartition_preserves_database_cause(ingress, monkeypatch):
+    from sqlalchemy.exc import IntegrityError
+    from sqlalchemy.orm import Session
+
+    incoming, _ = ingress
+    flush = Session.flush
+    raced = False
+    failures = []
+
+    def race(db, *args, **kwargs):
+        nonlocal raced
+        receipts = [row for row in db.new if isinstance(row, TaskInputReceipt)]
+        if receipts and not raced:
+            raced = True
+            db.rollback()
+            accept(incoming)
+            db.add_all(receipts)
+            try:
+                return flush(db, *args, **kwargs)
+            except IntegrityError as error:
+                failures.append(error)
+                raise
+        return flush(db, *args, **kwargs)
+
+    monkeypatch.setattr(Session, "flush", race)
+    with pytest.raises(inputs.ChannelInputBatchChanged) as error:
+        accept(incoming, additional_inputs=(replace(incoming, message_id="next"),))
+    assert len(failures) == 1
+    assert error.value.__cause__ is failures[0]
+
+
+def test_batch_lookup_rejects_owner_change_during_resolution(
+    ingress, second_channel, monkeypatch
+):
+    incoming, _ = ingress
+    other_owner, _ = second_channel
+    identity = inputs._identity
+
+    def change_owner(db, item):
+        owner, key = identity(db, item)
+        return (other_owner if item.message_id == "next" else owner), key
+
+    monkeypatch.setattr(inputs, "_identity", change_owner)
+    with pytest.raises(TaskTurnError, match="owner_changed"):
+        inputs.lookup_channel_inputs((incoming, replace(incoming, message_id="next")))
+
+
+@pytest.mark.parametrize(
+    "error_name,constraint,expected",
+    [
+        ("UniqueViolation", "task_input_receipts_pkey", True),
+        ("UniqueViolation", "other_table_pkey", False),
+        ("NotNullViolation", "task_input_receipts_pkey", False),
+    ],
+)
+def test_psycopg3_receipt_conflict_classification(error_name, constraint, expected):
+    from psycopg import errors
+    from psycopg.pq import DiagnosticField
+    from sqlalchemy.exc import IntegrityError
+
+    original = getattr(errors, error_name)(
+        "database constraint failure",
+        info={DiagnosticField.CONSTRAINT_NAME: constraint.encode()},
+    )
+    assert (
+        inputs._is_receipt_duplicate(IntegrityError("INSERT", {}, original)) is expected
+    )

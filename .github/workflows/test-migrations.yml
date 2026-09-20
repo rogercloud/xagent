@@ -47,6 +47,9 @@ on:
       - 'tests/web/services/test_task_coordinator_heartbeat.py'
       - 'tests/web/services/test_shared_channel_execution.py'
       - 'src/xagent/web/services/shared_channel_execution.py'
+      - 'src/xagent/web/services/uploaded_file_store.py'
+      - 'src/xagent/core/workspace.py'
+      - 'src/xagent/web/models/task_channel_delivery.py'
       - 'src/xagent/web/services/channel_input_acceptance.py'
       - 'tests/web/services/test_channel_input_acceptance.py'
       - 'src/xagent/web/services/channel_runtime.py'
@@ -184,6 +187,9 @@ jobs:
             tests/web/services/test_task_coordinator_heartbeat.py
             tests/web/services/test_shared_channel_execution.py
             src/xagent/web/services/shared_channel_execution.py
+            src/xagent/web/services/uploaded_file_store.py
+            src/xagent/core/workspace.py
+            src/xagent/web/models/task_channel_delivery.py
             src/xagent/web/services/channel_input_acceptance.py
             tests/web/services/test_channel_input_acceptance.py
             src/xagent/web/services/channel_runtime.py

@@ -89,6 +89,9 @@ def test_oauth_lifecycle_changes_run_real_postgresql_fence_tests(
 @pytest.mark.parametrize(
     "source_path",
     [
+        "src/xagent/web/services/uploaded_file_store.py",
+        "src/xagent/core/workspace.py",
+        "src/xagent/web/models/task_channel_delivery.py",
         "src/xagent/web/services/channel_input_acceptance.py",
         "src/xagent/web/services/channel_runtime.py",
         "src/xagent/web/services/shared_channel_execution.py",

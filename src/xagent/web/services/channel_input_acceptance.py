@@ -131,7 +131,7 @@ def lookup_channel_input(
         result = (
             _replay(db, receipt, incoming, owner_id) if receipt is not None else None
         )
-        # Legacy owner subject initialization belongs to this short transaction.
+        # Persist legacy owner subject initialization after a successful lookup.
         db.commit()
         return owner_id, result
 
@@ -146,6 +146,34 @@ class RejectedChannelInput:
     reason: str
 
 
+def _validate_batch(incoming: tuple[ChannelInput, ...]) -> None:
+    if not incoming:
+        raise TaskTurnError("input_batch_invalid")
+    first = incoming[0]
+    if any(
+        item.channel_id != first.channel_id
+        or item.external_user_id != first.external_user_id
+        or item.source != first.source
+        or item.scope != first.scope
+        for item in incoming[1:]
+    ):
+        raise TaskTurnError("input_batch_invalid")
+
+
+def _is_receipt_duplicate(error: IntegrityError) -> bool:
+    # PostgreSQL names the primary key; SQLite names its column.
+    original = error.orig
+    sqlstate = getattr(original, "sqlstate", None) or getattr(original, "pgcode", None)
+    if sqlstate == "23505":
+        return (
+            getattr(getattr(original, "diag", None), "constraint_name", None)
+            == "task_input_receipts_pkey"
+        )
+    return (
+        str(original) == "UNIQUE constraint failed: task_input_receipts.identity_hash"
+    )
+
+
 def lookup_channel_inputs(
     incoming: tuple[ChannelInput, ...],
 ) -> tuple[
@@ -155,13 +183,19 @@ def lookup_channel_inputs(
     tuple[RejectedChannelInput, ...],
 ]:
     """Partition physical inputs before file IO; replay each original command once."""
+    _validate_batch(incoming)
+    owner_id: int | None = None
     pending: dict[str, ChannelInput] = {}
     accepted: dict[int, AcceptedChannelInput] = {}
     seen: dict[str, str] = {}
     rejected: list[RejectedChannelInput] = []
     with get_session_local()() as db:
         for item in incoming:
-            owner_id, identity = _identity(db, item)
+            item_owner, identity = _identity(db, item)
+            if owner_id is None:
+                owner_id = item_owner
+            elif item_owner != owner_id:
+                raise TaskTurnError("owner_changed")
             digest = item.payload_hash()
             if identity in seen:
                 if seen[identity] == digest:
@@ -183,7 +217,7 @@ def lookup_channel_inputs(
                     accepted[replay.command_db_id] = replay
         db.commit()
     return (
-        owner_id,
+        cast(int, owner_id),
         tuple(pending.values()),
         tuple(accepted.values()),
         tuple(rejected),
@@ -203,6 +237,7 @@ def accept_channel_input(
     agent_id: int | None = None,
 ) -> AcceptedChannelInput:
     """Commit receipt, selection, files, transcript, START and reply mapping once."""
+    _validate_batch((incoming, *additional_inputs))
     with get_session_local()() as db:
         current_owner_id, identity = _identity(db, incoming)
         if current_owner_id != owner_id:
@@ -238,6 +273,7 @@ def accept_channel_input(
             ):
                 return existing[0]
             raise ChannelInputBatchChanged()
+        # Consistent acquisition order avoids deadlocks across overlapping batches.
         receipts = [
             TaskInputReceipt(
                 identity_hash=key, payload_hash=identities[key].payload_hash()
@@ -247,14 +283,17 @@ def accept_channel_input(
         db.add_all(receipts)
         try:
             db.flush()
-        except IntegrityError:
+        except IntegrityError as error:
             db.rollback()
-            current_owner_id, _ = _identity(db, incoming)
+            if not _is_receipt_duplicate(error):
+                raise
             if additional_inputs:
-                raise ChannelInputBatchChanged() from None
+                raise ChannelInputBatchChanged() from error
             saved = db.get(TaskInputReceipt, identity)
             if saved is None:
                 raise
+            # A competing request accepted this input; normal replay authorization applies.
+            current_owner_id, _ = _identity(db, incoming)
             return _replay(db, saved, incoming, current_owner_id)
         selection = prepare_channel_task_no_commit(
             db,
@@ -275,8 +314,7 @@ def accept_channel_input(
                 raise TaskTurnError("file_unavailable")
             record = staged.to_record()
             setattr(record, "task_id", selection.task_id)
-            # Workers restore durable bytes inside the owner's allowed upload root;
-            # the ingress temporary download disappears when preparation finishes.
+            # Persist a stable worker cache path, independent of the staging path.
             setattr(
                 record,
                 "storage_path",
@@ -301,17 +339,29 @@ def accept_channel_input(
         except Exception:
             db.close()
             with get_session_local()() as check:
-                current_owner_id, _ = _identity(check, incoming)
                 saved = check.get(TaskInputReceipt, identity)
                 if saved is None:
                     raise
-                recovered = _replay(check, saved, incoming, current_owner_id)
-                if recovered.command_id != turn.command_id:
+                command = (
+                    check.get(TaskExecutionCommand, saved.command_db_id)
+                    if saved.command_db_id is not None
+                    else None
+                )
+                own_commit = (
+                    saved.task_id == selection.task_id
+                    and saved.command_db_id == command_id
+                    and command is not None
+                    and command.command_id == turn.command_id
+                )
+                if not own_commit:
+                    # Another attempt won; confirming our commit grants no replay authority.
+                    current_owner_id, _ = _identity(check, incoming)
+                    recovered = _replay(check, saved, incoming, current_owner_id)
                     if additional_inputs:
                         raise ChannelInputBatchChanged()
                     return recovered
-                # Our own commit succeeded. Preserve its selection so ingress
-                # installs the new conversation mapping just as on a known commit.
+                # Confirm our durable acceptance without converting later channel
+                # changes into a rejection. Keep the original selection/result.
         return AcceptedChannelInput(
             selection.task_id,
             command_id,
