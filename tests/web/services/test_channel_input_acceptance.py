@@ -1,0 +1,598 @@
+"""Stable provider inputs cannot select a new task on retry."""
+
+from dataclasses import replace
+from unittest.mock import Mock
+
+import pytest
+from sqlalchemy.orm import sessionmaker
+
+from tests.web.services.task_database_shared import engine as engine_fixture
+from xagent.web.models.database import Base
+from xagent.web.models.task import Task
+from xagent.web.models.task_channel_delivery import TaskChannelDelivery
+from xagent.web.models.task_command import TaskExecutionCommand
+from xagent.web.models.task_input_receipt import TaskInputReceipt
+from xagent.web.models.user import User
+from xagent.web.models.user_channel import UserChannel
+from xagent.web.services import channel_input_acceptance as inputs
+from xagent.web.services import task_event_bridge
+from xagent.web.services.task_orchestrator import TaskTurnError, TaskTurnPayload
+
+engine = engine_fixture
+
+
+@pytest.fixture
+def ingress(engine, monkeypatch):
+    Base.metadata.create_all(engine)
+    sessions = sessionmaker(bind=engine)
+    monkeypatch.setenv("XAGENT_SHARED_TASK_EXECUTION_ENABLED", "true")
+    monkeypatch.setattr(inputs, "get_session_local", lambda: sessions)
+    monkeypatch.setattr(task_event_bridge, "_bridge", Mock(host_id="ingress"))
+    with sessions() as db:
+        owner = User(username="owner", password_hash="unused")
+        db.add(owner)
+        db.flush()
+        channel = UserChannel(
+            user_id=owner.id,
+            channel_type="slack",
+            channel_name="test",
+            config={"allowed_users": ["sender"]},
+            is_active=True,
+        )
+        db.add(channel)
+        db.commit()
+        incoming = inputs.ChannelInput(
+            int(channel.id),
+            "sender",
+            "slack",
+            ("team", "chat"),
+            "123.456",
+            "hello",
+            (),
+            {"chat_id": "chat", "thread_ts": "123.456", "loading_ts": None},
+        )
+    yield incoming, sessions
+    Base.metadata.drop_all(engine)
+
+
+def accept(incoming, **changes):
+    owner, _ = inputs.lookup_channel_input(incoming)
+    return inputs.accept_channel_input(
+        incoming,
+        **(
+            dict(
+                owner_id=owner,
+                active_task_id=None,
+                channel_name="test",
+                payload=TaskTurnPayload(incoming.text),
+                staged_files=(),
+                host_id="host",
+            )
+            | changes
+        ),
+    )
+
+
+def test_duplicate_uses_original_task_and_delivery(ingress):
+    incoming, sessions = ingress
+    first = accept(incoming)
+    replay = accept(incoming, active_task_id=-1)
+    assert replay.replayed
+    assert (replay.task_id, replay.command_db_id) == (
+        first.task_id,
+        first.command_db_id,
+    )
+    with sessions() as db:
+        assert db.query(Task).count() == 1
+        assert db.query(TaskExecutionCommand).count() == 1
+        assert db.query(TaskChannelDelivery).count() == 1
+        assert db.query(TaskInputReceipt).count() == 1
+
+
+def test_content_conflict_and_distinct_identity(ingress):
+    incoming, _ = ingress
+    first = accept(incoming)
+    with pytest.raises(TaskTurnError, match="input_conflict"):
+        accept(replace(incoming, text="changed"))
+    second = accept(replace(incoming, message_id="different"))
+    assert second.task_id != first.task_id
+
+
+def test_failed_start_rolls_back_receipt_and_new_task(ingress, monkeypatch):
+    incoming, sessions = ingress
+    monkeypatch.setattr(
+        inputs,
+        "accept_channel_turn_no_commit",
+        Mock(side_effect=RuntimeError("failed START")),
+    )
+    with pytest.raises(RuntimeError, match="failed START"):
+        accept(incoming)
+    with sessions() as db:
+        assert db.query(Task).count() == 0
+        assert db.query(TaskInputReceipt).count() == 0
+
+
+def test_deleted_target_does_not_resurrect(ingress):
+    incoming, sessions = ingress
+    accept(incoming)
+    with sessions() as db:
+        db.query(Task).delete(synchronize_session=False)
+        db.commit()
+    with pytest.raises(TaskTurnError, match="input_unavailable"):
+        accept(incoming)
+
+
+def test_simultaneous_acceptance_has_one_winner(ingress):
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Barrier
+
+    incoming, sessions = ingress
+    owner, _ = inputs.lookup_channel_input(incoming)
+    barrier = Barrier(2)
+
+    def submit():
+        barrier.wait(timeout=10)
+        return inputs.accept_channel_input(
+            incoming,
+            owner_id=owner,
+            active_task_id=None,
+            channel_name="test",
+            payload=TaskTurnPayload("hello"),
+            staged_files=(),
+            host_id="host",
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        futures = [pool.submit(submit) for _ in range(2)]
+        results = [future.result(timeout=20) for future in futures]
+    assert sorted(result.replayed for result in results) == [False, True]
+    assert len({result.command_db_id for result in results}) == 1
+    with sessions() as db:
+        assert db.query(Task).count() == db.query(TaskInputReceipt).count() == 1
+
+
+def test_replay_rechecks_sender_authorization(ingress):
+    from xagent.web.services.channel_runtime import ChannelAuthorizationError
+
+    incoming, sessions = ingress
+    accept(incoming)
+    with sessions() as db:
+        db.get(UserChannel, incoming.channel_id).config = {
+            "allowed_users": ["someone-else"]
+        }
+        db.commit()
+    with pytest.raises(ChannelAuthorizationError):
+        inputs.lookup_channel_input(incoming)
+
+
+def test_commit_acknowledgement_loss_replays_saved_input(ingress, monkeypatch):
+    from sqlalchemy.orm import Session
+
+    incoming, sessions = ingress
+    original = Session.commit
+
+    def commit(db):
+        accepted = any(isinstance(item, TaskInputReceipt) for item in db.dirty)
+        original(db)
+        if accepted:
+            raise ConnectionError("commit acknowledgement lost")
+
+    monkeypatch.setattr(Session, "commit", commit)
+    saved = accept(incoming)
+    assert not saved.replayed
+    assert saved.selection.is_new_task
+    with sessions() as db:
+        assert db.query(TaskExecutionCommand).count() == 1
+
+
+@pytest.fixture
+def slack_ingress(ingress, monkeypatch, tmp_path):
+    from unittest.mock import AsyncMock
+
+    from xagent.web.channels.slack import bot as slack
+    from xagent.web.services import (
+        channel_delivery,
+        shared_channel_execution,
+        uploaded_file_store,
+    )
+
+    incoming, sessions = ingress
+    for module in (channel_delivery, shared_channel_execution, uploaded_file_store):
+        monkeypatch.setattr(module, "get_session_local", lambda: sessions)
+    monkeypatch.setattr(slack, "get_storage_root", lambda: tmp_path)
+    monkeypatch.setattr(
+        shared_channel_execution.SharedChannelTurn,
+        "observe",
+        AsyncMock(return_value={"status": "accepted"}),
+    )
+    monkeypatch.setattr(
+        slack,
+        "get_agent_manager",
+        Mock(side_effect=AssertionError("ingress must not create Agent")),
+    )
+
+    def bot():
+        result = slack.SlackBotInstance(
+            "token", None, "test", channel_id=incoming.channel_id, bot_user_id="bot"
+        )
+        result._send_text = AsyncMock(return_value="loading-ts")
+        result._send_final_text = AsyncMock()
+        result._save_active_tasks = Mock()
+        result.web_client.chat_update = AsyncMock()
+        return result
+
+    return bot, sessions
+
+
+@pytest.mark.asyncio
+async def test_slack_two_envelopes_and_restart_reuse_loading_and_task(slack_ingress):
+    make_bot, sessions = slack_ingress
+    envelope = {"team_id": "team"}
+    event = {
+        "type": "app_mention",
+        "user": "sender",
+        "channel": "chat",
+        "ts": "1.0",
+        "text": "<@bot> hello",
+    }
+    first = make_bot()
+    await first._process_event("conversation", envelope, event)
+    first._send_text.assert_awaited_once()
+    second = make_bot()
+    second.active_tasks["conversation"] = -123
+    await second._process_event(
+        "conversation",
+        envelope | {"event_id": "different"},
+        event | {"type": "message", "client_msg_id": "client-id", "text": "hello"},
+    )
+    second._send_text.assert_not_awaited()
+    assert second.active_tasks["conversation"] == -123
+    with sessions() as db:
+        assert db.query(TaskExecutionCommand).count() == 1
+        assert db.query(Task).count() == 1
+        assert (
+            db.query(TaskChannelDelivery).one().destination["loading_ts"]
+            == "loading-ts"
+        )
+
+
+@pytest.mark.asyncio
+async def test_slack_progress_and_final_use_persisted_message(slack_ingress):
+    from xagent.core.agent.trace import (
+        TraceAction,
+        TraceCategory,
+        TraceEvent,
+        TraceEventType,
+        TraceScope,
+    )
+    from xagent.web.channels.slack.bot import _DurableSlackProgress
+
+    make_bot, sessions = slack_ingress
+    bot = make_bot()
+    await bot._process_event(
+        "conversation",
+        {"team_id": "team"},
+        {
+            "type": "message",
+            "user": "sender",
+            "channel": "chat",
+            "ts": "1.0",
+            "text": "hello",
+        },
+    )
+    with sessions() as db:
+        command_id = int(db.query(TaskExecutionCommand).one().id)
+        task_id = int(db.query(Task).one().id)
+    event = TraceEvent(
+        TraceEventType(TraceScope.TASK, TraceAction.START, TraceCategory.TOOL),
+        task_id=str(task_id),
+        data={"tool_name": "search"},
+    )
+    observer = _DurableSlackProgress(bot, command_id)
+    await observer.handle_event(event)
+    assert bot.web_client.chat_update.await_args.kwargs["ts"] == "loading-ts"
+    with sessions() as db:
+        command = db.get(TaskExecutionCommand, command_id)
+        command.status = "completed"
+        command.result = {
+            "channel_result": {
+                "success": True,
+                "status": "completed",
+                "output": "answer",
+            }
+        }
+        db.commit()
+    await observer.handle_event(event)
+    bot._send_final_text.assert_awaited_once_with(
+        channel_id="chat", thread_ts="1.0", loading_ts="loading-ts", text="answer"
+    )
+    await observer.handle_event(event)
+    assert bot.web_client.chat_update.await_count == 1
+    bot._send_text.assert_awaited_once()
+    bot._send_final_text.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_slack_files_stage_before_task_and_retry_does_not_download(
+    slack_ingress, tmp_path, monkeypatch
+):
+    from unittest.mock import AsyncMock
+
+    from xagent.web.channels.slack import bot as slack
+    from xagent.web.models.uploaded_file import UploadedFile
+    from xagent.web.services.channel_runtime import DownloadedChannelFile
+    from xagent.web.services.uploaded_file_store import StagedUploadedFile
+
+    make_bot, sessions = slack_ingress
+    bot = make_bot()
+    source = tmp_path / "input.txt"
+    source.write_text("contents")
+
+    async def download(*args):
+        with sessions() as db:
+            assert db.query(Task).count() == 0
+        return DownloadedChannelFile("input.txt", source, "text/plain", 8, "F1")
+
+    bot._download_slack_file = AsyncMock(side_effect=download)
+
+    def stage(**kwargs):
+        return StagedUploadedFile(
+            kwargs["file_id"],
+            kwargs["user_id"],
+            None,
+            "input.txt",
+            str(source),
+            "local",
+            kwargs["storage_key"],
+            None,
+            "checksum",
+            None,
+            None,
+            None,
+            "text/plain",
+            8,
+            "slack",
+        )
+
+    monkeypatch.setattr(slack, "stage_uploaded_file_from_local_path", stage)
+    event = {
+        "type": "message",
+        "user": "sender",
+        "channel": "chat",
+        "ts": "1.0",
+        "files": [{"id": "F1", "url_private": "old"}],
+    }
+    await bot._process_event("conversation", {"team_id": "team"}, event)
+    await bot._process_event(
+        "conversation",
+        {"team_id": "team"},
+        event | {"files": [{"id": "F1", "url_private": "new"}]},
+    )
+    bot._download_slack_file.assert_awaited_once()
+    with sessions() as db:
+        uploaded = db.query(UploadedFile).one()
+        command = db.query(TaskExecutionCommand).one()
+        assert uploaded.task_id == command.task_id
+        assert command.payload["file_ids"] == [uploaded.file_id]
+
+
+def test_attachment_metadata_rolls_back_with_start(ingress, tmp_path, monkeypatch):
+    from xagent.web.models.uploaded_file import UploadedFile
+    from xagent.web.services.uploaded_file_store import StagedUploadedFile
+
+    incoming, sessions = ingress
+    owner, _ = inputs.lookup_channel_input(incoming)
+    staged = StagedUploadedFile(
+        "file",
+        owner,
+        None,
+        "input.txt",
+        str(tmp_path / "input.txt"),
+        "local",
+        "key",
+        None,
+        "checksum",
+        None,
+        None,
+        None,
+        "text/plain",
+        8,
+    )
+    monkeypatch.setattr(
+        inputs,
+        "accept_channel_turn_no_commit",
+        Mock(side_effect=RuntimeError("failed START")),
+    )
+    with pytest.raises(RuntimeError, match="failed START"):
+        accept(incoming, staged_files=(staged,))
+    with sessions() as db:
+        assert (
+            db.query(UploadedFile).count()
+            == db.query(Task).count()
+            == db.query(TaskInputReceipt).count()
+            == 0
+        )
+
+
+@pytest.mark.asyncio
+async def test_final_waits_for_loading_claim_and_never_restarts_execution(
+    slack_ingress,
+):
+    import asyncio
+    from unittest.mock import AsyncMock
+
+    from xagent.web.channels.slack.bot import _DurableSlackProgress
+
+    make_bot, sessions = slack_ingress
+    bot = make_bot()
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    async def send(*args, **kwargs):
+        entered.set()
+        await release.wait()
+        return "persisted-loading"
+
+    bot._send_text = AsyncMock(side_effect=send)
+    processing = asyncio.create_task(
+        bot._process_event(
+            "conversation",
+            {"team_id": "team"},
+            {
+                "type": "message",
+                "user": "sender",
+                "channel": "chat",
+                "ts": "1.0",
+                "text": "hello",
+            },
+        )
+    )
+    try:
+        await asyncio.wait_for(entered.wait(), 10)
+        with sessions() as db:
+            command = db.query(TaskExecutionCommand).one()
+            command_id = int(command.id)
+            command.status = "completed"
+            command.result = {
+                "channel_result": {
+                    "success": True,
+                    "status": "completed",
+                    "output": "answer",
+                }
+            }
+            db.commit()
+        await _DurableSlackProgress(bot, command_id).send(None)
+        bot._send_final_text.assert_not_awaited()
+    finally:
+        release.set()
+        await processing
+    bot._send_text.assert_awaited_once()
+    bot._send_final_text.assert_awaited_once()
+    assert bot._send_final_text.await_args.kwargs["loading_ts"] == "persisted-loading"
+    with sessions() as db:
+        assert db.query(TaskExecutionCommand).count() == 1
+        assert db.query(TaskChannelDelivery).one().status == "delivered"
+
+
+@pytest.mark.asyncio
+async def test_observer_attaches_to_original_command_without_new_start(
+    ingress, monkeypatch
+):
+    from unittest.mock import AsyncMock
+
+    from xagent.web.services import shared_channel_execution as shared
+
+    incoming, sessions = ingress
+    saved = accept(incoming)
+    monkeypatch.setattr(shared, "get_session_local", lambda: sessions)
+    monkeypatch.setattr(shared, "notify_task_command_dispatcher", Mock())
+    monkeypatch.setattr(
+        shared.SharedChannelTurn,
+        "wait_result",
+        AsyncMock(return_value={"status": "accepted"}),
+    )
+    task_event_bridge._bridge.register_origin.return_value = "new-origin"
+    turn = saved.as_turn()
+    try:
+        await turn.observe(None)
+        with sessions() as db:
+            command = db.query(TaskExecutionCommand).one()
+            assert command.command_id == saved.command_id
+            assert command.reply_origin == "new-origin"
+            assert command.reply_host_id == "ingress"
+    finally:
+        await turn.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("chat", ["C1", "D1"])
+@pytest.mark.parametrize("completion", ["lost_ack", "cancel"])
+async def test_slack_late_acceptance_preserves_followup_conversation(
+    slack_ingress, monkeypatch, chat, completion
+):
+    import asyncio
+    import threading
+
+    from sqlalchemy.orm import Session
+
+    from xagent.web.channels.slack import bot as slack
+    from xagent.web.models.task import TaskStatus
+
+    make_bot, sessions = slack_ingress
+    bot = make_bot()
+    bot._save_active_tasks = slack.SlackBotInstance._save_active_tasks.__get__(bot)
+    original = Session.commit
+
+    def commit(db):
+        accepted = any(isinstance(item, TaskInputReceipt) for item in db.dirty)
+        original(db)
+        if accepted:
+            raise ConnectionError("commit acknowledgement lost")
+
+    if completion == "lost_ack":
+        monkeypatch.setattr(Session, "commit", commit)
+    else:
+        entered, release = threading.Event(), threading.Event()
+        original_accept = slack.accept_channel_input
+
+        def accept(*args, **kwargs):
+            result = original_accept(*args, **kwargs)
+            entered.set()
+            assert release.wait(10)
+            return result
+
+        monkeypatch.setattr(slack, "accept_channel_input", accept)
+    event = {
+        "type": "app_mention",
+        "user": "sender",
+        "channel": chat,
+        "ts": "1.0",
+        "text": "hello",
+    }
+    envelope = {"team_id": "team", "event": event}
+    await bot.handle_events_api_payload(envelope)
+    if completion == "cancel":
+        assert await asyncio.to_thread(entered.wait, 10)
+        worker = next(iter(bot.event_tasks.values()))
+        stopping = asyncio.create_task(bot.stop())
+        try:
+            async with asyncio.timeout(5):
+                while not worker.cancelling():
+                    await asyncio.sleep(0)
+        finally:
+            release.set()
+            await stopping
+        assert worker.cancelled()
+    else:
+        await asyncio.gather(*list(bot.event_tasks.values()))
+    # Restart reads the association persisted before cancellation was propagated.
+    bot = make_bot()
+    key = bot._conversation_key(envelope, event)
+    with sessions() as db:
+        task = db.query(Task).one()
+        task_id = int(task.id)
+        assert bot.active_tasks[key] == task_id
+        command = db.query(TaskExecutionCommand).one()
+        command.status = "completed"
+        command.result = {
+            "channel_result": {
+                "success": True,
+                "status": "completed",
+                "output": "answer",
+            }
+        }
+        task.status = TaskStatus.COMPLETED
+        task.run_id = command.target_run_id
+        db.commit()
+    followup = event | {"type": "message", "ts": "2.0", "text": "continue"}
+    if chat == "C1":
+        followup["thread_ts"] = "1.0"
+    await bot.handle_events_api_payload(envelope | {"event": followup})
+    await asyncio.gather(*list(bot.event_tasks.values()))
+    with sessions() as db:
+        assert db.query(Task).count() == 1
+        commands = (
+            db.query(TaskExecutionCommand).order_by(TaskExecutionCommand.id).all()
+        )
+        assert len(commands) == 2
+        assert commands[1].task_id == task_id
+        assert commands[1].payload["message"] == "continue"

@@ -145,6 +145,21 @@ snapshot images, and adding a prefix does not transfer resource ownership.
 
 ## Channel replies and failure recovery
 
+Shared Slack text and file inputs use durable receipts scoped to the authorized
+owner, configured channel, Slack workspace, conversation, sender and message
+timestamp. Repeated `app_mention` / `message` deliveries reuse the original
+accepted task and START, including after ingress restarts. Changed text, file
+IDs or reply context for the same identity is rejected; send a new message to
+request new work. Deleted targets remain unavailable. Control commands and
+local execution retain their existing behavior; Feishu and Telegram provider
+identity integration is separate.
+
+Attachments are downloaded and durably staged before task selection. Their
+metadata, task, transcript, START and reply destination commit atomically.
+Slack progress uses the same delivery claim as the final reply: the loading
+message is created after acceptance and its timestamp is persisted for reuse.
+Lost platform acknowledgements can still repeat a send, as described below.
+
 Accepted channel commands and final-reply destinations are committed together.
 The designated ingress checks pending final replies every 30 seconds, including
 after restart. A separate delivery claim prevents ordinary concurrent sends;

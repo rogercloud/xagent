@@ -31,7 +31,7 @@ async def test_other_web_replicas_do_not_load_or_connect_bots(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("platform", ["feishu", "slack", "telegram"])
+@pytest.mark.parametrize("platform", ["feishu", "telegram"])
 async def test_channel_entry_submits_shared_turn_without_local_agent(
     monkeypatch, platform
 ):
@@ -63,27 +63,7 @@ async def test_channel_entry_submits_shared_turn_without_local_agent(
         side_effect=AssertionError("START acceptance owns the transcript")
     )
     monkeypatch.setattr(module, "persist_channel_user_message", persist)
-    if platform == "slack":
-        from tests.web.test_slack_channel import make_bot
-
-        bot = make_bot()
-        bot._save_active_tasks = Mock()
-        bot._send_text = AsyncMock(return_value="loading")
-        bot._send_final_text = AsyncMock()
-        await bot._process_event(
-            "conversation",
-            {},
-            {
-                "type": "message",
-                "channel_type": "im",
-                "channel": "D1",
-                "user": "sender",
-                "ts": "1.0",
-                "text": "hello",
-            },
-        )
-        assert turn.delivery_destination["chat_id"] == "D1"
-    elif platform == "feishu":
+    if platform == "feishu":
         from tests.web.test_feishu_message_queue import make_bot
 
         bot = make_bot()
