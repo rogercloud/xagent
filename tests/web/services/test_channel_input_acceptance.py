@@ -360,6 +360,12 @@ def test_replay_rejects_changed_persisted_binding(ingress, second_channel, bindi
         command = db.get(TaskExecutionCommand, first.command_db_id)
         if binding == "task_owner":
             task.user_id = other_owner
+            other_subject = db.get(User, other_owner).actor_subject
+            command.task_owner_user_id = other_owner
+            command.task_owner_subject = other_subject
+            command.actor_user_id = other_owner
+            command.actor_subject = other_subject
+            assert inputs.command_identity_matches_task(db, task, command)
         elif binding == "channel":
             task.channel_id = other.channel_id
         elif binding == "command_task":
