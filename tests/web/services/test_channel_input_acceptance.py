@@ -596,3 +596,461 @@ async def test_slack_late_acceptance_preserves_followup_conversation(
         assert len(commands) == 2
         assert commands[1].task_id == task_id
         assert commands[1].payload["message"] == "continue"
+
+
+def test_batch_receipts_survive_split_and_overlapping_retry(ingress):
+    incoming, sessions = ingress
+    second = replace(incoming, message_id="2", text="second")
+    third = replace(incoming, message_id="3", text="third")
+    first = accept(
+        incoming, additional_inputs=(second,), payload=TaskTurnPayload("hello\nsecond")
+    )
+    _, pending, replays = inputs.lookup_channel_inputs((second, incoming, third, third))
+    assert pending == (third,)
+    assert [row.command_db_id for row in replays] == [first.command_db_id]
+    assert accept(second).command_db_id == first.command_db_id
+    with pytest.raises(inputs.ChannelInputBatchChanged):
+        accept(second, additional_inputs=(third,))
+    with sessions() as db:
+        assert db.query(TaskInputReceipt).count() == 2
+        assert db.query(TaskExecutionCommand).count() == 1
+
+
+def test_batch_failure_rolls_back_every_alias(ingress, monkeypatch):
+    incoming, sessions = ingress
+    second = replace(incoming, message_id="2")
+    monkeypatch.setattr(
+        inputs,
+        "accept_channel_turn_no_commit",
+        Mock(side_effect=RuntimeError("failed")),
+    )
+    with pytest.raises(RuntimeError):
+        accept(incoming, additional_inputs=(second,))
+    with sessions() as db:
+        assert db.query(TaskInputReceipt).count() == db.query(Task).count() == 0
+
+
+@pytest.fixture(params=["feishu", "telegram"])
+def provider_ingress(ingress, monkeypatch, request):
+    """Exercise adapters against the real receipt transaction, without a network."""
+    import importlib
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+
+    incoming, sessions = ingress
+    platform = request.param
+    module = importlib.import_module(f"xagent.web.channels.{platform}.bot")
+    factory = importlib.import_module(
+        f"tests.web.test_{platform}_message_queue"
+    ).make_bot
+    bot = factory()
+    sender = "sender" if platform == "feishu" else 123
+    with sessions() as db:
+        channel = db.get(UserChannel, incoming.channel_id)
+        channel.channel_type = platform
+        channel.config = {"allowed_users": [str(sender)]}
+        db.commit()
+    bot.channel_id = incoming.channel_id
+    bot.channel_name = "test"
+    bot.active_tasks = {}
+    bot._active_tasks_unsaved = False
+    bot._save_active_tasks = Mock(return_value=True)
+    bot._observe_shared_input = AsyncMock()
+    bot._send_text = AsyncMock(return_value="loading")
+    bot.start_time = 1000
+    bot.bot = Mock()
+    monkeypatch.setattr(module, "deliver_channel_result", AsyncMock(return_value=False))
+    monkeypatch.setattr(
+        module,
+        "get_agent_manager",
+        Mock(side_effect=AssertionError("No local executor")),
+    )
+
+    def message(identity, text="hello", voice=None):
+        if platform == "feishu":
+            import json
+
+            return SimpleNamespace(
+                event=SimpleNamespace(
+                    message=SimpleNamespace(
+                        chat_id="chat",
+                        message_id=str(identity),
+                        message_type="text",
+                        content=json.dumps({"text": text}),
+                        create_time="2000",
+                    )
+                )
+            )
+        return SimpleNamespace(
+            message_id=identity,
+            text=text,
+            caption=None,
+            document=None,
+            photo=None,
+            audio=None,
+            video=None,
+            voice=voice,
+            message_thread_id=None,
+            reply_to_message=None,
+            chat=SimpleNamespace(id=456),
+            answer=AsyncMock(),
+        )
+
+    async def process(*messages):
+        if platform == "feishu":
+            await bot._process_messages_batch(sender, list(messages))
+        else:
+            await bot._process_user_messages_batch(sender, list(messages))
+
+    return bot, message, process, sessions, platform, module
+
+
+@pytest.mark.asyncio
+async def test_provider_retry_repartition_only_accepts_new_messages(provider_ingress):
+    bot, message, process, sessions, platform, module = provider_ingress
+    a, b, c = message(1, "A"), message(2, "B"), message(3, "C")
+    await process(a, b)
+    with sessions() as db:
+        first = db.query(TaskExecutionCommand).one()
+        first_id = first.id
+        assert db.query(TaskInputReceipt).count() == 2
+    # A restarted/switching ingress must not associate a replay with a new task.
+    bot.active_tasks.clear()
+    bot._save_active_tasks.reset_mock()
+    await process(b, a, b)
+    assert not bot.active_tasks
+    bot._save_active_tasks.assert_not_called()
+    await process(b, c)
+    with sessions() as db:
+        assert db.query(TaskInputReceipt).count() == 3
+        commands = db.query(TaskExecutionCommand).all()
+        assert len(commands) == 2
+        receipts = db.query(TaskInputReceipt).all()
+        assert sum(r.command_db_id == first_id for r in receipts) == 2
+        assert db.query(TaskChannelDelivery).count() == 2
+    assert bot._observe_shared_input.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_provider_content_conflict_cannot_create_another_turn(provider_ingress):
+    bot, message, process, sessions, platform, module = provider_ingress
+    await process(message(1))
+    bot.active_tasks.clear()
+    await process(message(1, "changed"))
+    with sessions() as db:
+        assert db.query(TaskExecutionCommand).count() == 1
+    assert bot._observe_shared_input.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_provider_download_failure_does_not_accept_partial_batch(
+    provider_ingress, monkeypatch
+):
+    import json
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+
+    bot, message, process, sessions, platform, module = provider_ingress
+    item = message(2)
+    if platform == "feishu":
+        item.event.message.message_type = "file"
+        item.event.message.content = json.dumps({"file_key": "file"})
+        bot._download_feishu_file_sync = Mock(return_value=None)
+    else:
+        item.document = SimpleNamespace(file_id="file", file_unique_id="stable")
+        bot._download_telegram_files = AsyncMock(
+            side_effect=ConnectionError("download failed")
+        )
+    await process(message(1), item)
+    with sessions() as db:
+        assert db.query(TaskInputReceipt).count() == 0
+        assert db.query(Task).count() == 0
+    bot._observe_shared_input.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_telegram_stop_during_download_leaves_no_receipt(provider_ingress):
+    from unittest.mock import AsyncMock
+
+    bot, message, process, sessions, platform, module = provider_ingress
+    if platform != "telegram":
+        return
+
+    async def download(*args, **kwargs):
+        bot.user_conversation_generations[123] = 1
+        return []
+
+    bot._download_telegram_files = AsyncMock(side_effect=download)
+    await process(message(1))
+    with sessions() as db:
+        assert db.query(TaskInputReceipt).count() == 0
+    assert not bot.active_tasks
+    bot._observe_shared_input.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_feishu_old_accepted_message_replays_but_old_new_input_is_skipped(
+    provider_ingress,
+):
+    bot, message, process, sessions, platform, module = provider_ingress
+    if platform != "feishu":
+        return
+    a = message(1)
+    await process(a)
+    bot.start_time = 3000
+    bot.active_tasks.clear()
+    await process(a, message(2))
+    with sessions() as db:
+        assert db.query(TaskInputReceipt).count() == 1
+    assert not bot.active_tasks
+    assert module.deliver_channel_result.await_count == 1
+
+
+def test_concurrent_overlapping_batches_accept_each_physical_input_once(ingress):
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Barrier
+
+    incoming, sessions = ingress
+    owner, _ = inputs.lookup_channel_input(incoming)
+    a, b, c = (replace(incoming, message_id=str(i), text=str(i)) for i in range(3))
+    barrier = Barrier(2)
+
+    def submit(items):
+        barrier.wait(timeout=10)
+        while items:
+            _, pending, _ = inputs.lookup_channel_inputs(items)
+            if not pending:
+                return
+            try:
+                inputs.accept_channel_input(
+                    pending[0],
+                    additional_inputs=pending[1:],
+                    owner_id=owner,
+                    active_task_id=None,
+                    channel_name="test",
+                    payload=TaskTurnPayload("\n".join(i.text for i in pending)),
+                    staged_files=(),
+                    host_id="host",
+                )
+                return
+            except inputs.ChannelInputBatchChanged:
+                items = pending
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        futures = [pool.submit(submit, items) for items in [(a, b), (c, b)]]
+        for future in futures:
+            future.result(timeout=20)
+    with sessions() as db:
+        assert db.query(TaskInputReceipt).count() == 3
+        assert db.query(TaskExecutionCommand).count() == 2
+
+
+@pytest.mark.asyncio
+async def test_provider_cancel_after_commit_keeps_original_selection(
+    provider_ingress, monkeypatch
+):
+    import asyncio
+    from threading import Event
+
+    bot, message, process, sessions, platform, module = provider_ingress
+    entered, release = Event(), Event()
+    original = inputs.accept_channel_input
+
+    def blocked(*args, **kwargs):
+        result = original(*args, **kwargs)
+        entered.set()
+        assert release.wait(10)
+        return result
+
+    monkeypatch.setattr(module, "accept_channel_input", blocked)
+    worker = asyncio.create_task(process(message(1)))
+    try:
+        assert await asyncio.to_thread(entered.wait, 10)
+        worker.cancel()
+    finally:
+        release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await worker
+    with sessions() as db:
+        task = db.query(Task).one()
+        sender = "sender" if platform == "feishu" else 123
+        assert int(bot.active_tasks[sender]) == task.id
+    bot._save_active_tasks.assert_called_once()
+    bot._observe_shared_input.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_telegram_voice_retry_skips_download_and_transcription(
+    provider_ingress, monkeypatch, tmp_path
+):
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+
+    from xagent.web.models.uploaded_file import UploadedFile
+    from xagent.web.services import channel_input_files
+    from xagent.web.services.channel_runtime import DownloadedChannelFile
+    from xagent.web.services.uploaded_file_store import StagedUploadedFile
+
+    bot, message, process, sessions, platform, module = provider_ingress
+    if platform != "telegram":
+        return
+    source = tmp_path / "voice.ogg"
+    source.write_bytes(b"audio")
+    bot._download_telegram_files = AsyncMock(
+        return_value=[
+            DownloadedChannelFile("voice.ogg", source, "audio/ogg", 5, "voice")
+        ]
+    )
+    asr = SimpleNamespace(
+        transcribe=AsyncMock(return_value=SimpleNamespace(text="transcribed")),
+        aclose=AsyncMock(),
+    )
+    bot._resolve_voice_asr_model_isolated = Mock(return_value=asr)
+    bot.voice_transcription_timeout_seconds = 2
+
+    def stage(**kw):
+        return StagedUploadedFile(
+            kw["file_id"],
+            kw["user_id"],
+            None,
+            "voice.ogg",
+            str(source),
+            "local",
+            kw["storage_key"],
+            None,
+            "checksum",
+            None,
+            None,
+            None,
+            "audio/ogg",
+            5,
+            "telegram",
+        )
+
+    monkeypatch.setattr(
+        channel_input_files, "stage_uploaded_file_from_local_path", stage
+    )
+    monkeypatch.setattr(channel_input_files, "compensate_staged_uploaded_files", Mock())
+    voice = SimpleNamespace(file_id="voice", file_unique_id="stable")
+    await process(message(1, "", voice))
+    bot.active_tasks.clear()
+    await process(
+        message(1, "", SimpleNamespace(file_id="renewed", file_unique_id="stable"))
+    )
+    bot._download_telegram_files.assert_awaited_once()
+    asr.transcribe.assert_awaited_once()
+    asr.aclose.assert_awaited_once()
+    with sessions() as db:
+        command = db.query(TaskExecutionCommand).one()
+        assert "transcribed" in command.payload["message"]
+        assert command.payload["file_ids"] == [db.query(UploadedFile).one().file_id]
+
+
+@pytest.mark.asyncio
+async def test_provider_progress_reuses_persisted_loading_message(
+    provider_ingress, monkeypatch
+):
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+
+    from xagent.web.services import channel_delivery
+    from xagent.web.services.shared_channel_execution import SharedChannelTurn
+
+    bot, message, process, sessions, platform, module = provider_ingress
+    monkeypatch.setattr(channel_delivery, "get_session_local", lambda: sessions)
+    from xagent.web.services import shared_channel_execution
+
+    monkeypatch.setattr(shared_channel_execution, "get_session_local", lambda: sessions)
+    monkeypatch.setattr(
+        module, "deliver_channel_result", channel_delivery.deliver_channel_result
+    )
+    if platform == "telegram":
+        # Restore real observation but keep the bridge wait controlled.
+        bot._observe_shared_input = (
+            module.TelegramBotInstance._observe_shared_input.__get__(bot)
+        )
+    else:
+        bot._observe_shared_input = (
+            module.FeishuBotInstance._observe_shared_input.__get__(bot)
+        )
+
+    async def observe(turn, handler):
+        await handler.send()
+        with sessions() as db:
+            command = db.get(TaskExecutionCommand, turn.command_db_id)
+            command.status = "completed"
+            command.result = {
+                "channel_result": {
+                    "success": True,
+                    "status": "completed",
+                    "output": "answer",
+                }
+            }
+            db.commit()
+        return {"success": True, "status": "completed", "output": "answer"}
+
+    monkeypatch.setattr(SharedChannelTurn, "observe", observe)
+    final_destinations = []
+
+    async def final(delivery, result):
+        final_destinations.append(dict(delivery.destination))
+
+    bot._deliver_shared_result = final
+    item = message(1)
+    if platform == "telegram":
+        item.answer = AsyncMock(
+            return_value=SimpleNamespace(message_id=99, delete=AsyncMock())
+        )
+    await process(item)
+    with sessions() as db:
+        delivery = db.query(TaskChannelDelivery).one()
+        assert delivery.status == "delivered"
+        assert delivery.destination["loading_message_id"] == (
+            99 if platform == "telegram" else "loading"
+        )
+    assert len(final_destinations) == 1
+    if platform == "telegram":
+        item.answer.assert_awaited_once()
+    else:
+        bot._send_text.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("switch", [False, True])
+async def test_telegram_stop_at_acceptance_preserves_only_current_selection(
+    provider_ingress, monkeypatch, switch
+):
+    import asyncio
+    from threading import Event
+    from unittest.mock import AsyncMock
+
+    bot, message, process, sessions, platform, module = provider_ingress
+    if platform != "telegram":
+        return
+    entered, release = Event(), Event()
+    original = inputs.accept_channel_input
+
+    def blocked(*args, **kwargs):
+        result = original(*args, **kwargs)
+        entered.set()
+        assert release.wait(10)
+        return result
+
+    monkeypatch.setattr(module, "accept_channel_input", blocked)
+    bot._settle_fenced_turn = AsyncMock()
+    worker = asyncio.create_task(process(message(1)))
+    try:
+        assert await asyncio.to_thread(entered.wait, 10)
+        if switch:
+            bot._start_new_conversation(123)
+        else:
+            bot._stop_current_conversation(123)
+    finally:
+        release.set()
+    await worker
+    with sessions() as db:
+        task = db.query(Task).one()
+        assert bot.active_tasks[123] == (-1 if switch else task.id)
+    bot._settle_fenced_turn.assert_awaited_once()
+    assert bot._settle_fenced_turn.await_args.kwargs["already_persisted"] is True
+    bot._observe_shared_input.assert_not_awaited()

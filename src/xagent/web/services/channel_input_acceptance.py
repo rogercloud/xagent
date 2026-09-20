@@ -144,6 +144,36 @@ def lookup_channel_input(
         return owner_id, result
 
 
+class ChannelInputBatchChanged(Exception):
+    """A concurrent acceptance consumed only part of the proposed batch."""
+
+
+def lookup_channel_inputs(
+    incoming: tuple[ChannelInput, ...],
+) -> tuple[int, tuple[ChannelInput, ...], tuple[AcceptedChannelInput, ...]]:
+    """Partition physical inputs before file IO; replay each original command once."""
+    pending: dict[str, ChannelInput] = {}
+    accepted: dict[int, AcceptedChannelInput] = {}
+    seen: dict[str, str] = {}
+    with get_session_local()() as db:
+        for item in incoming:
+            owner_id, identity = _identity(db, item)
+            digest = item.payload_hash()
+            if identity in seen:
+                if seen[identity] != digest:
+                    raise TaskTurnError("input_conflict")
+                continue
+            seen[identity] = digest
+            receipt = db.get(TaskInputReceipt, identity)
+            if receipt is None:
+                pending[identity] = item
+            else:
+                replay = _replay(db, receipt, item, owner_id)
+                accepted[replay.command_db_id] = replay
+        db.commit()
+    return owner_id, tuple(pending.values()), tuple(accepted.values())
+
+
 def accept_channel_input(
     incoming: ChannelInput,
     *,
@@ -153,28 +183,55 @@ def accept_channel_input(
     payload: TaskTurnPayload,
     staged_files: tuple[StagedUploadedFile, ...],
     host_id: str,
+    additional_inputs: tuple[ChannelInput, ...] = (),
+    agent_id: int | None = None,
 ) -> AcceptedChannelInput:
     """Commit receipt, selection, files, transcript, START and reply mapping once."""
     with get_session_local()() as db:
         current_owner_id, identity = _identity(db, incoming)
         if current_owner_id != owner_id:
             raise TaskTurnError("owner_changed")
-        existing = db.get(TaskInputReceipt, identity)
-        if existing is not None:
-            return _replay(db, existing, incoming, owner_id)
-        receipt = TaskInputReceipt(
-            identity_hash=identity, payload_hash=incoming.payload_hash()
-        )
-        db.add(receipt)
+        identities = {identity: incoming}
+        for item in additional_inputs:
+            item_owner, item_identity = _identity(db, item)
+            if item_owner != owner_id:
+                raise TaskTurnError("owner_changed")
+            if (
+                item_identity in identities
+                and identities[item_identity].payload_hash() != item.payload_hash()
+            ):
+                raise TaskTurnError("input_conflict")
+            identities[item_identity] = item
+        existing = []
+        for key, item in identities.items():
+            saved = db.get(TaskInputReceipt, key)
+            if saved is not None:
+                existing.append(_replay(db, saved, item, owner_id))
+        if existing:
+            if (
+                len(existing) == len(identities)
+                and len({row.command_db_id for row in existing}) == 1
+            ):
+                return existing[0]
+            raise ChannelInputBatchChanged()
+        receipts = [
+            TaskInputReceipt(
+                identity_hash=key, payload_hash=identities[key].payload_hash()
+            )
+            for key in sorted(identities)
+        ]
+        db.add_all(receipts)
         try:
             db.flush()
         except IntegrityError:
             db.rollback()
             current_owner_id, _ = _identity(db, incoming)
-            existing = db.get(TaskInputReceipt, identity)
-            if existing is None:
+            if additional_inputs:
+                raise ChannelInputBatchChanged() from None
+            saved = db.get(TaskInputReceipt, identity)
+            if saved is None:
                 raise
-            return _replay(db, existing, incoming, current_owner_id)
+            return _replay(db, saved, incoming, current_owner_id)
         selection = prepare_channel_task_no_commit(
             db,
             channel_id=incoming.channel_id,
@@ -184,6 +241,7 @@ def accept_channel_input(
             channel_name=channel_name,
             expected_owner_user_id=owner_id,
             defer_execution=True,
+            agent_id=agent_id,
         )
         if selection is None:
             raise TaskTurnError("busy")
@@ -196,10 +254,13 @@ def accept_channel_input(
             UploadedFileStore(db).add_already_durable(record)
         db.flush()
         turn = SharedChannelTurn(selection, workspace=None)
-        turn.delivery_destination = dict(incoming.destination)
+        turn.delivery_destination = dict(
+            (additional_inputs[-1] if additional_inputs else incoming).destination
+        )
         command_id = accept_channel_turn_no_commit(db, turn, payload, host_id)
-        receipt.task_id = selection.task_id
-        receipt.command_db_id = command_id
+        for receipt in receipts:
+            receipt.task_id = selection.task_id
+            receipt.command_db_id = command_id
         try:
             db.commit()
         except Exception:
@@ -211,6 +272,8 @@ def accept_channel_input(
                     raise
                 recovered = _replay(check, saved, incoming, current_owner_id)
                 if recovered.command_id != turn.command_id:
+                    if additional_inputs:
+                        raise ChannelInputBatchChanged()
                     return recovered
                 # Our own commit succeeded. Preserve its selection so ingress
                 # installs the new conversation mapping just as on a known commit.

@@ -26,7 +26,7 @@ from ....config import (
     get_slack_app_token,
     get_storage_root,
 )
-from ....core.agent.trace import TraceEvent, TraceHandler
+from ....core.agent.trace import TraceEvent
 from ....core.file_ref import build_file_id_ref
 from ....core.file_storage.keys import build_upload_storage_key
 from ...models.task import TaskStatus
@@ -41,6 +41,7 @@ from ...services.channel_input_acceptance import (
     accept_channel_input,
     lookup_channel_input,
 )
+from ...services.channel_progress import DurableChannelProgress
 from ...services.channel_runtime import (
     ChannelAuthorizationError,
     ChannelConfigurationError,
@@ -167,42 +168,31 @@ def _payload_team_id(payload: dict[str, Any]) -> str | None:
     return None
 
 
-class _DurableSlackProgress(TraceHandler):
-    """Serialize progress and final sends using the existing delivery claim."""
-
+class _DurableSlackProgress(DurableChannelProgress):
     def __init__(self, bot: SlackBotInstance, command_id: int) -> None:
         self.bot = bot
-        self.command_id = command_id
         self.handler: SlackTraceHandler | None = None
+        super().__init__(command_id, self._send_progress, bot._deliver_shared_result)
 
-    async def handle_event(self, event: TraceEvent) -> None:
-        await self.send(event)
-
-    async def send(self, event: TraceEvent | None) -> None:
-        async def sender(delivery: ChannelDelivery, result: dict[str, Any]) -> None:
-            if result.get("status") != "accepted":
-                await self.bot._deliver_shared_result(delivery, result)
-                return
-            destination = delivery.destination
-            if not destination["loading_ts"]:
-                destination["loading_ts"] = await self.bot._send_text(
+    async def _send_progress(
+        self, delivery: ChannelDelivery, event: TraceEvent | None
+    ) -> None:
+        destination = delivery.destination
+        if not destination["loading_ts"]:
+            destination["loading_ts"] = await self.bot._send_text(
+                destination["chat_id"],
+                "Got it, I'm working on this now.\n_I'll update this message as I make progress._",
+                thread_ts=destination["thread_ts"],
+            )
+        if event is not None and destination["loading_ts"]:
+            if self.handler is None:
+                self.handler = SlackTraceHandler(
+                    delivery.task_id,
+                    self.bot.web_client,
                     destination["chat_id"],
-                    "Got it, I'm working on this now.\n_I'll update this message as I make progress._",
-                    thread_ts=destination["thread_ts"],
+                    destination["loading_ts"],
                 )
-            if event is not None and destination["loading_ts"]:
-                if self.handler is None:
-                    self.handler = SlackTraceHandler(
-                        delivery.task_id,
-                        self.bot.web_client,
-                        destination["chat_id"],
-                        destination["loading_ts"],
-                    )
-                await self.handler.handle_event(event)
-
-        await deliver_channel_result(
-            self.command_id, sender, pending_notice=True, progress=True
-        )
+            await self.handler.handle_event(event)
 
 
 class SlackBotInstance:

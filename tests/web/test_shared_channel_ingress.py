@@ -38,23 +38,25 @@ async def test_channel_entry_submits_shared_turn_without_local_agent(
     from types import SimpleNamespace
     from unittest.mock import Mock
 
+    from xagent.web.services.channel_input_acceptance import AcceptedChannelInput
     from xagent.web.services.channel_runtime import SelectedChannelTask
-    from xagent.web.services.shared_channel_execution import SharedChannelTurn
 
     monkeypatch.setenv("XAGENT_SHARED_TASK_EXECUTION_ENABLED", "true")
     monkeypatch.setenv("XAGENT_TASK_EXECUTION_ROLE", "web")
     module = importlib.import_module(f"xagent.web.channels.{platform}.bot")
-    turn = SharedChannelTurn(
-        SelectedChannelTask(5, 45, True, 7, "sender", None, 0), SimpleNamespace()
+    accepted = AcceptedChannelInput(
+        5,
+        6,
+        "command",
+        "run",
+        45,
+        False,
+        SelectedChannelTask(5, 45, True, 7, "sender", None, 0),
     )
-    turn.execute = AsyncMock(
-        return_value={"success": True, "status": "completed", "output": "Worker answer"}
-    )
-    turn.close = AsyncMock()
-    turn.deliver = AsyncMock(return_value=True)
-    monkeypatch.setattr(
-        module, "prepare_shared_channel_turn", AsyncMock(return_value=turn)
-    )
+    submit = Mock(return_value=accepted)
+    monkeypatch.setattr(module, "accept_channel_input", submit)
+    monkeypatch.setattr(module, "lookup_channel_inputs", lambda items: (45, items, ()))
+    monkeypatch.setattr(module, "get_task_event_bridge", lambda: Mock(host_id="host"))
     local_agent = Mock(
         side_effect=AssertionError("Web ingress must not create an agent")
     )
@@ -72,6 +74,7 @@ async def test_channel_entry_submits_shared_turn_without_local_agent(
         bot.active_tasks = {}
         bot.api_client = object()
         bot._save_active_tasks = Mock()
+        bot._observe_shared_input = AsyncMock()
         bot._send_text = AsyncMock(return_value="loading")
         bot._update_text = AsyncMock()
         message = SimpleNamespace(
@@ -85,7 +88,7 @@ async def test_channel_entry_submits_shared_turn_without_local_agent(
             )
         )
         await bot._process_messages_batch("sender", [message])
-        assert turn.delivery_destination["chat_id"] == "chat"
+        assert submit.call_args.args[0].destination["chat_id"] == "chat"
     else:
         from tests.web.test_telegram_message_queue import make_bot
 
@@ -95,11 +98,13 @@ async def test_channel_entry_submits_shared_turn_without_local_agent(
         bot.active_tasks = {}
         bot.bot = object()
         bot._save_active_tasks = Mock()
+        bot._observe_shared_input = AsyncMock()
         bot._extract_message_content = AsyncMock(return_value=("hello", []))
         loading = SimpleNamespace(
             message_id=77, edit_text=AsyncMock(), delete=AsyncMock()
         )
         message = SimpleNamespace(
+            voice=None,
             message_id=76,
             message_thread_id=None,
             from_user=SimpleNamespace(id=123),
@@ -107,11 +112,8 @@ async def test_channel_entry_submits_shared_turn_without_local_agent(
             answer=AsyncMock(return_value=loading),
         )
         await bot._process_user_messages_batch(123, [message])
-        assert turn.delivery_destination["chat_id"] == 456
-    assert turn.execute.await_args.args[0].transcript_message == "hello"
-    turn.deliver.assert_awaited_once()
-    assert callable(turn.deliver.await_args.args[0])
-    assert turn.deliver.await_args.kwargs == {"pending_notice": False}
-    turn.close.assert_awaited_once()
+        assert submit.call_args.args[0].destination["chat_id"] == 456
+    assert submit.call_args.kwargs["payload"].transcript_message == "hello"
+    bot._observe_shared_input.assert_awaited_once()
     local_agent.assert_not_called()
     persist.assert_not_awaited()

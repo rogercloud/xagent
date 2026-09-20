@@ -52,6 +52,10 @@ on:
       - 'src/xagent/web/services/channel_delivery.py'
       - 'src/xagent/web/services/task_event_bridge.py'
       - 'src/xagent/web/channels/slack/bot.py'
+      - 'src/xagent/web/channels/feishu/bot.py'
+      - 'src/xagent/web/channels/telegram/bot.py'
+      - 'src/xagent/web/services/channel_input_files.py'
+      - 'src/xagent/web/services/channel_progress.py'
       - 'tests/web/services/test_channel_input_acceptance.py'
       - 'src/xagent/web/services/task_command_transport.py'
       - 'tests/web/services/test_task_command_transport.py'
@@ -192,6 +196,10 @@ jobs:
             src/xagent/web/services/channel_delivery.py
             src/xagent/web/services/task_event_bridge.py
             src/xagent/web/channels/slack/bot.py
+            src/xagent/web/channels/feishu/bot.py
+            src/xagent/web/channels/telegram/bot.py
+            src/xagent/web/services/channel_input_files.py
+            src/xagent/web/services/channel_progress.py
             tests/web/services/test_channel_input_acceptance.py
             src/xagent/web/services/task_command_transport.py
             tests/web/services/test_task_command_transport.py
