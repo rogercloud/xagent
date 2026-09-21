@@ -853,7 +853,7 @@ class SlackBotInstance:
                         raise cancellation
             turn = accepted.as_turn()
 
-            async def send_progress(text: str | None) -> None:
+            async def send_progress(update: str | None) -> None:
                 async def send(delivery: ChannelDelivery, _: TraceEvent | None) -> None:
                     destination = delivery.destination
                     if not destination["loading_ts"]:
@@ -865,9 +865,9 @@ class SlackBotInstance:
                         )
                         if not destination["loading_ts"]:
                             raise RuntimeError("Slack loading message has no timestamp")
-                    if text is not None:
+                    if update is not None:
                         await self._update_mrkdwn(
-                            destination["chat_id"], destination["loading_ts"], text
+                            destination["chat_id"], destination["loading_ts"], update
                         )
 
                 await DurableChannelProgress(
