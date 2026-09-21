@@ -139,13 +139,15 @@ def _settle_no_commit(
     *,
     status: str = "pending",
     failed: bool = False,
+    retry_only: bool = False,
 ) -> str | None:
     now = datetime.now(timezone.utc)
     retry_at = now + timedelta(seconds=_DELIVERY_RETRY_SECONDS)
     values: dict[str, Any] = {
         "destination": delivery.destination,
         "status": status,
-        "claim_token": None,
+        # Keep the token as a retry fence: progress bypasses only unclaimed delays.
+        "claim_token": delivery.claim_token if retry_only else None,
         "available_at": retry_at if status == "pending" else None,
         "delivered_at": now if status == "delivered" else None,
     }
@@ -188,10 +190,16 @@ def _record_delivery_outcome(
 
 
 def _settle(
-    delivery: ChannelDelivery, *, status: str = "pending", failed: bool = False
+    delivery: ChannelDelivery,
+    *,
+    status: str = "pending",
+    failed: bool = False,
+    retry_only: bool = False,
 ) -> None:
     with get_session_local()() as db:
-        settled = _settle_no_commit(db, delivery, status=status, failed=failed)
+        settled = _settle_no_commit(
+            db, delivery, status=status, failed=failed, retry_only=retry_only
+        )
         db.commit()
     if failed:
         _record_delivery_outcome(delivery, settled, reason="delivery_error")
@@ -227,6 +235,7 @@ async def deliver_channel_result(
     delivery = None
     heartbeat = None
     sending: asyncio.Future[None] | None = None
+    progress_pending = False
     try:
         claimed = await run_db_io_cancellation_safe(
             lambda: _claim(command_id, progress=progress)
@@ -234,6 +243,7 @@ async def deliver_channel_result(
         if claimed is None:
             return False
         delivery, result = claimed
+        progress_pending = progress and result is None
         if result is None and not pending_notice:
             await run_db_io_cancellation_safe(lambda: _settle(delivery))
             return False
@@ -264,7 +274,11 @@ async def deliver_channel_result(
         if delivery is not None:
             try:
                 await run_db_io_cancellation_safe(
-                    lambda: _settle(delivery, failed=True)
+                    lambda: (
+                        _settle(delivery, retry_only=True)
+                        if progress_pending
+                        else _settle(delivery, failed=True)
+                    )
                 )
             except Exception:
                 logger.exception(

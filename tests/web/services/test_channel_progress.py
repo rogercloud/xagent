@@ -102,7 +102,7 @@ async def test_progress_respects_failed_send_backoff(accepted):
     await observer.send()
     progress.assert_awaited_once()
     with get_session_local()() as db:
-        assert db.get(TaskChannelDelivery, accepted).failure_count == 1
+        assert db.get(TaskChannelDelivery, accepted).failure_count == 0
     expire_claim(accepted)
     await observer.send()
     assert progress.await_count == 2
@@ -121,3 +121,40 @@ def test_stale_progress_claim_cannot_overwrite_loading_destination(accepted):
         row = db.get(TaskChannelDelivery, accepted)
         assert row.destination["loading_message_id"] == "current"
         assert row.claim_token is None
+
+
+@pytest.mark.asyncio
+async def test_progress_failures_preserve_final_delivery_budget(accepted, selected):
+    progress = AsyncMock(side_effect=ConnectionError("progress unavailable"))
+    final = AsyncMock()
+    observer = DurableChannelProgress(accepted, progress, final)
+    for _ in range(12):
+        expire_claim(accepted)
+        await observer.send()
+        await observer.send()
+    assert progress.await_count == 12
+    with get_session_local()() as db:
+        row = db.get(TaskChannelDelivery, accepted)
+        assert row.status == "pending"
+        assert row.failure_count == 0
+    complete(accepted)
+    expire_claim(accepted)
+    await delivery.recover_channel_results(selected.selection.channel_id, final)
+    final.assert_awaited_once()
+    with get_session_local()() as db:
+        assert db.get(TaskChannelDelivery, accepted).status == "delivered"
+
+
+@pytest.mark.asyncio
+async def test_final_failure_via_progress_uses_final_retry_budget(accepted):
+    complete(accepted)
+    final = AsyncMock(side_effect=ConnectionError("final unavailable"))
+    observer = DurableChannelProgress(accepted, AsyncMock(), final)
+    for _ in range(10):
+        expire_claim(accepted)
+        await observer.send()
+    assert final.await_count == 10
+    with get_session_local()() as db:
+        row = db.get(TaskChannelDelivery, accepted)
+        assert row.status == "failed"
+        assert row.failure_count == 10

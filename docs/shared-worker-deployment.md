@@ -264,7 +264,9 @@ delivery claim. Progress callbacks update `delivery.destination` with platform
 loading-message identifiers; settlement persists them under the claim token so
 later observers and final recovery reuse that destination. An active claim blocks
 both kinds of send. Progress can bypass a pending poll delay when no send has
-failed, but respects failed-send backoff. Platform sends remain at least once
+failed, but respects failed-send backoff. Progress-send failures defer further
+sends without consuming the final reply retry budget; final-send failures retain
+the bounded retry budget. Platform sends remain at least once
 when acknowledgement or destination persistence is uncertain.
 
 Worker progress with no reply route retries on subsequent trace events with an
