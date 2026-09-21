@@ -604,12 +604,14 @@ def test_acceptance_rejects_run_changed_after_task_selection(ingress, monkeypatc
 
 @pytest.mark.parametrize("change", ["revoke", "deactivate", "delete"])
 def test_own_commit_recovery_preserves_acceptance_after_channel_change(
-    ingress, monkeypatch, change
+    ingress, monkeypatch, change, caplog
 ):
     from sqlalchemy.orm import Session
 
     incoming, sessions = ingress
     commit = Session.commit
+    counter = Mock()
+    monkeypatch.setattr(inputs, "increment_counter", counter)
 
     def uncertain_commit(db):
         accepting = any(isinstance(row, TaskInputReceipt) for row in db.dirty)
@@ -628,6 +630,8 @@ def test_own_commit_recovery_preserves_acceptance_after_channel_change(
 
     monkeypatch.setattr(Session, "commit", uncertain_commit)
     result = accept(incoming)
+    counter.assert_called_once_with("xagent.channel.acceptance.commit_recovered")
+    assert "Channel acceptance recovered after uncertain commit" in caplog.text
     assert not result.replayed
     assert result.selection.is_new_task
     with sessions() as db:
@@ -677,7 +681,7 @@ def test_invalid_batch_rejected_before_lookup_or_acceptance(
 @pytest.mark.parametrize("winner", [False, True])
 @pytest.mark.parametrize("revoke", [False, True])
 def test_failed_commit_recovery_distinguishes_other_writer(
-    ingress, monkeypatch, winner, revoke
+    ingress, monkeypatch, winner, revoke, caplog
 ):
     from sqlalchemy.orm import Session
 
@@ -687,6 +691,8 @@ def test_failed_commit_recovery_distinguishes_other_writer(
     commit = Session.commit
     results = []
     failure = ConnectionError("commit did not land")
+    counter = Mock()
+    monkeypatch.setattr(inputs, "increment_counter", counter)
 
     def fail_commit(db):
         accepting = any(isinstance(row, TaskInputReceipt) for row in db.dirty)
@@ -716,6 +722,11 @@ def test_failed_commit_recovery_distinguishes_other_writer(
         recovered = accept(incoming)
         assert recovered.replayed
         assert recovered.command_id == results[0].command_id
+    if winner and not revoke:
+        counter.assert_called_once_with("xagent.channel.acceptance.competing_commit")
+        assert "Channel input recovery found competing acceptance" in caplog.text
+    else:
+        counter.assert_not_called()
     with sessions() as db:
         assert db.query(TaskInputReceipt).count() == int(winner)
 
@@ -986,3 +997,63 @@ def test_psycopg3_receipt_conflict_classification(error_name, constraint, expect
     assert (
         inputs._is_receipt_duplicate(IntegrityError("INSERT", {}, original)) is expected
     )
+
+
+@pytest.mark.parametrize("race", ["conflict", "unavailable"])
+def test_batch_commit_recovery_repartitions_remaining_input(ingress, monkeypatch, race):
+    from sqlalchemy.orm import Session
+
+    incoming, sessions = ingress
+    remaining = replace(incoming, message_id="remaining")
+    commit = Session.commit
+    failure = ConnectionError("commit did not land")
+
+    def fail_commit(db):
+        if not any(isinstance(row, TaskInputReceipt) for row in db.dirty):
+            return commit(db)
+        db.rollback()
+        monkeypatch.setattr(Session, "commit", commit)
+        winner = accept(
+            replace(incoming, text="edited") if race == "conflict" else incoming
+        )
+        if race == "unavailable":
+            with sessions() as other:
+                other.delete(other.get(Task, winner.task_id))
+                commit(other)
+        raise failure
+
+    monkeypatch.setattr(Session, "commit", fail_commit)
+    with pytest.raises(inputs.ChannelInputBatchChanged) as error:
+        accept(incoming, additional_inputs=(remaining,))
+    assert error.value.__cause__ is failure
+    _, pending, replayed, rejected = inputs.lookup_channel_inputs((incoming, remaining))
+    assert pending == (remaining,)
+    assert not replayed
+    assert rejected == (inputs.RejectedChannelInput(incoming, "input_" + race),)
+    accepted = accept(pending[0])
+    with sessions() as db:
+        assert db.query(TaskInputReceipt).count() == 2
+        assert db.get(TaskExecutionCommand, accepted.command_db_id) is not None
+
+
+def test_receipts_are_inserted_in_identity_order(ingress):
+    from sqlalchemy import event
+
+    incoming, sessions = ingress
+    items = [replace(incoming, message_id=str(i)) for i in range(3)]
+    with sessions() as db:
+        keyed = [(inputs._identity(db, item)[1], item) for item in items]
+        engine = db.get_bind()
+    keyed.sort(reverse=True)
+    inserted = []
+
+    def observe(connection, cursor, statement, parameters, context, executemany):
+        if statement.lstrip().startswith("INSERT INTO task_input_receipts"):
+            inserted.extend(row["identity_hash"] for row in context.compiled_parameters)
+
+    event.listen(engine, "before_cursor_execute", observe)
+    try:
+        accept(keyed[0][1], additional_inputs=tuple(item for _, item in keyed[1:]))
+    finally:
+        event.remove(engine, "before_cursor_execute", observe)
+    assert inserted == sorted(key for key, _ in keyed)

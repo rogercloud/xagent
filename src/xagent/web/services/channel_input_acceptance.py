@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 from dataclasses import dataclass
 from typing import Any, cast
 
@@ -11,6 +12,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from ...config import get_uploads_dir
+from ...core.runtime_performance import increment_counter
 from ...core.workspace import scoped_user_root
 from ..models.database import get_session_local
 from ..models.task import Task
@@ -28,6 +30,8 @@ from .task_command_transport import (
 )
 from .task_orchestrator import TaskTurnError, TaskTurnPayload
 from .uploaded_file_store import StagedUploadedFile, UploadedFileStore
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -336,7 +340,7 @@ def accept_channel_input(
             receipt.command_db_id = command_id
         try:
             db.commit()
-        except Exception:
+        except Exception as error:
             db.close()
             with get_session_local()() as check:
                 saved = check.get(TaskInputReceipt, identity)
@@ -356,12 +360,22 @@ def accept_channel_input(
                 if not own_commit:
                     # Another attempt won; confirming our commit grants no replay authority.
                     current_owner_id, _ = _identity(check, incoming)
-                    recovered = _replay(check, saved, incoming, current_owner_id)
+                    logger.warning(
+                        "Channel input recovery found competing acceptance command_db_id=%s",
+                        saved.command_db_id,
+                    )
+                    increment_counter("xagent.channel.acceptance.competing_commit")
                     if additional_inputs:
-                        raise ChannelInputBatchChanged()
-                    return recovered
+                        raise ChannelInputBatchChanged() from error
+                    return _replay(check, saved, incoming, current_owner_id)
                 # Confirm our durable acceptance without converting later channel
                 # changes into a rejection. Keep the original selection/result.
+                logger.warning(
+                    "Channel acceptance recovered after uncertain commit task_id=%s command_id=%s",
+                    selection.task_id,
+                    turn.command_id,
+                )
+                increment_counter("xagent.channel.acceptance.commit_recovered")
         return AcceptedChannelInput(
             selection.task_id,
             command_id,
