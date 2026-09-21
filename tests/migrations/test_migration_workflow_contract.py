@@ -97,6 +97,7 @@ def test_oauth_lifecycle_changes_run_real_postgresql_fence_tests(
         "src/xagent/web/services/channel_progress.py",
         "src/xagent/web/services/task_event_bridge.py",
         "tests/web/services/test_channel_progress.py",
+        "tests/web/services/channel_delivery_shared.py",
         "tests/web/services/test_channel_delivery.py",
         "tests/web/services/test_task_event_bridge.py",
         "src/xagent/web/services/channel_runtime.py",

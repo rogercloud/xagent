@@ -8,15 +8,15 @@ from unittest.mock import AsyncMock, Mock
 
 import pytest
 
-from tests.web.services.test_channel_delivery import accepted as accepted
-from tests.web.services.test_channel_delivery import (
+from tests.web.services.channel_delivery_shared import accepted as accepted
+from tests.web.services.channel_delivery_shared import (
     complete,
+)
+from tests.web.services.channel_delivery_shared import database_url as database_url
+from tests.web.services.channel_delivery_shared import (
     expire_claim,
 )
-from tests.web.services.test_shared_channel_execution import (
-    database_url as database_url,
-)
-from tests.web.services.test_shared_channel_execution import selected as selected
+from tests.web.services.channel_delivery_shared import selected as selected
 from xagent.web.models.database import get_session_local
 from xagent.web.models.task_channel_delivery import TaskChannelDelivery
 from xagent.web.models.task_command import TaskExecutionCommand
