@@ -39,7 +39,7 @@ async def test_progress_persists_loading_destination_for_final_recovery(
     observer = DurableChannelProgress(accepted, progress, final)
     await observer.send()
     event = Mock()
-    await observer.handle_event(event)
+    await observer.send(event)
     assert progress.await_count == 2
     assert progress.await_args.args[1] is event
     assert seen[1]["loading_message_id"] == "created-loading"
@@ -49,7 +49,6 @@ async def test_progress_persists_loading_destination_for_final_recovery(
         assert row.status == "pending" and row.claim_token is None
         assert row.failure_count == 0
     complete(accepted)
-    expire_claim(accepted)
     await delivery.recover_channel_results(selected.selection.channel_id, final)
     await observer.send()
     final.assert_awaited_once()
@@ -62,7 +61,8 @@ async def test_progress_persists_loading_destination_for_final_recovery(
 
 
 @pytest.mark.asyncio
-async def test_final_and_progress_cannot_overtake_loading_send(accepted):
+@pytest.mark.parametrize("plain_final", [False, True])
+async def test_final_and_progress_cannot_overtake_loading_send(accepted, plain_final):
     entered, release = asyncio.Event(), asyncio.Event()
 
     async def send_loading(record, event):
@@ -84,7 +84,10 @@ async def test_final_and_progress_cannot_overtake_loading_send(accepted):
     finally:
         release.set()
         await pending
-    await observer.send()
+    if plain_final:
+        assert await delivery.deliver_channel_result(accepted, final)
+    else:
+        await observer.send()
     final.assert_awaited_once()
     assert (
         final.await_args.args[0].destination["loading_message_id"] == "created-loading"
@@ -158,3 +161,54 @@ async def test_final_failure_via_progress_uses_final_retry_budget(accepted):
         row = db.get(TaskChannelDelivery, accepted)
         assert row.status == "failed"
         assert row.failure_count == 10
+
+
+@pytest.mark.asyncio
+async def test_successful_progress_allows_immediate_plain_final(accepted):
+    final = AsyncMock()
+    observer = DurableChannelProgress(accepted, AsyncMock(), final)
+    await observer.send()
+    complete(accepted)
+    assert await delivery.deliver_channel_result(accepted, final)
+    await observer.send()
+    final.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("pending_notice", [False, True])
+async def test_plain_pending_delivery_keeps_poll_delay(accepted, pending_notice):
+    sender = AsyncMock()
+    await delivery.deliver_channel_result(
+        accepted, sender, pending_notice=pending_notice
+    )
+    await delivery.deliver_channel_result(
+        accepted, sender, pending_notice=pending_notice
+    )
+    assert sender.await_count == int(pending_notice)
+    with get_session_local()() as db:
+        row = db.get(TaskChannelDelivery, accepted)
+        assert row.available_at is not None
+        assert row.claim_token is None
+
+
+def test_durable_sender_has_no_raw_trace_handler_entrypoint():
+    from xagent.core.agent.trace import TraceHandler
+
+    sender = DurableChannelProgress(1, AsyncMock(), AsyncMock())
+    assert not isinstance(sender, TraceHandler)
+    assert not hasattr(sender, "handle_event")
+
+
+@pytest.mark.asyncio
+async def test_final_still_waits_for_failed_progress_backoff(accepted):
+    final = AsyncMock()
+    observer = DurableChannelProgress(
+        accepted, AsyncMock(side_effect=ConnectionError("platform unavailable")), final
+    )
+    await observer.send()
+    complete(accepted)
+    assert not await delivery.deliver_channel_result(accepted, final)
+    final.assert_not_awaited()
+    expire_claim(accepted)
+    assert await delivery.deliver_channel_result(accepted, final)
+    final.assert_awaited_once()

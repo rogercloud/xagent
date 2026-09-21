@@ -49,7 +49,7 @@ from .task_command_transport import (
     notify_task_command_dispatcher,
     stage_task_command,
 )
-from .task_event_bridge import TaskReplyRouteUnavailable, get_task_event_bridge
+from .task_event_bridge import get_task_event_bridge
 from .task_lease_service import TaskLease, TaskLeaseLostError
 from .task_orchestrator import (
     TaskTurnError,
@@ -262,6 +262,8 @@ class SharedChannelTurn:
                 db.commit()
 
         await run_db_io_cancellation_safe(attach)
+        # Acceptance may still be queued; wake dispatch rather than waiting for
+        # its idle poll. Reply routing itself reads the updated row on each send.
         notify_task_command_dispatcher()
         return await self.wait_result()
 
@@ -549,16 +551,13 @@ class ChannelProgressForwarder(TraceHandler):
             )
             self._next_route_attempt = 0.0
             self._route_retry_delay = 1.0
-        except TaskReplyRouteUnavailable:
-            # Ingress may attach after acceptance. Retry on later traces, but
-            # do not query/log every event if ingress never installs a route.
+        except ConnectionError:
+            # A route can be absent, closed, or on a dead ingress host. Re-read
+            # it on later traces so a replacement observer can receive progress.
             self._next_route_attempt = monotonic() + self._route_retry_delay
             self._route_retry_delay = min(self._route_retry_delay * 2, 30.0)
-            return
-        except ConnectionError:
-            self._unavailable = True
             logger.warning(
-                "Channel progress forwarding stopped after delivery failure task_id=%s",
+                "Channel progress forwarding deferred after delivery failure task_id=%s",
                 self.command.task_id,
             )
             increment_counter("xagent.channel.progress.unavailable")

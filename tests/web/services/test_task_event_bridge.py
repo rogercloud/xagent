@@ -364,7 +364,7 @@ async def test_reply_without_route_is_observable_without_publishing(
     assert "no origin route task_id=42 command_id=command-1" in caplog.text
     assert "private reply content" not in caplog.text
     assert not bridge._acks
-    with pytest.raises(module.TaskReplyRouteUnavailable):
+    with pytest.raises(ConnectionError):
         await bridge.reply_for("command-1", 42, require_ack=True)(
             {"content": "private"}
         )
@@ -372,7 +372,7 @@ async def test_reply_without_route_is_observable_without_publishing(
 
 
 @pytest.mark.asyncio
-async def test_progress_requires_ack_and_stops_after_first_failure(bridge, monkeypatch):
+async def test_progress_requires_ack_and_backs_off_after_failure(bridge, monkeypatch):
     from xagent.web.services import shared_channel_execution as shared
 
     monkeypatch.setattr(module, "_reply_route", lambda *args: ("web", "origin"))
@@ -420,10 +420,10 @@ async def test_missing_progress_route_backs_off_and_recovers(monkeypatch):
     monkeypatch.setattr(shared, "monotonic", lambda: now)
     reply = AsyncMock(
         side_effect=[
-            module.TaskReplyRouteUnavailable("missing"),
-            module.TaskReplyRouteUnavailable("missing"),
+            ConnectionError("missing"),
+            ConnectionError("missing"),
             None,
-            module.TaskReplyRouteUnavailable("missing again"),
+            ConnectionError("missing again"),
             None,
         ]
     )
@@ -460,7 +460,7 @@ async def test_missing_progress_route_retry_delay_is_capped(monkeypatch):
 
     now = 0.0
     monkeypatch.setattr(shared, "monotonic", lambda: now)
-    reply = AsyncMock(side_effect=module.TaskReplyRouteUnavailable("missing"))
+    reply = AsyncMock(side_effect=ConnectionError("missing"))
     bridge = Mock()
     bridge.reply_for.return_value = reply
     monkeypatch.setattr(shared, "get_task_event_bridge", lambda: bridge)
@@ -471,3 +471,82 @@ async def test_missing_progress_route_retry_delay_is_capped(monkeypatch):
         for _ in range(100):
             await forwarder.handle_event(Mock())
     assert reply.await_count == 8
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["closed_origin", "ack_timeout", "publish_error"])
+async def test_progress_recovers_after_observer_route_replacement(
+    bridge, monkeypatch, failure
+):
+    from xagent.web.services import shared_channel_execution as shared
+
+    now = 0.0
+    monkeypatch.setattr(shared, "monotonic", lambda: now)
+    bridge.ready.set()
+    receiver = AsyncMock()
+    original = bridge.register_origin(42, "command", receiver)
+    route = [bridge.host_id, original]
+    monkeypatch.setattr(module, "_reply_route", lambda *_: tuple(route))
+    monkeypatch.setattr(shared, "get_task_event_bridge", lambda: bridge)
+    publications = []
+
+    async def publish(channel, body):
+        message = json.loads(body)
+        if message["kind"] == "reply":
+            publications.append(message["origin"])
+            if message["origin"] == original:
+                if failure == "ack_timeout":
+                    return
+                if failure == "publish_error":
+                    raise OSError("transport unavailable")
+            await bridge._deliver_reply(message)
+        else:
+            await bridge._receive(message)
+
+    monkeypatch.setattr(bridge, "_publish", publish)
+    turn = shared.SharedChannelTurn(
+        Mock(task_id=42),
+        workspace=None,
+        command_id="command",
+        run_id="run",
+        accepted=True,
+    )
+    turn.origin = original
+    await turn.close()
+    forwarder = shared.ChannelProgressForwarder(
+        Mock(command_id="command", task_id=42), "run"
+    )
+    event = Mock()
+    event.to_dict.return_value = {"event": "progress"}
+    try:
+        await forwarder.handle_event(event)
+        replacement = bridge.register_origin(42, "command", receiver)
+        route[1] = replacement
+        for _ in range(10):
+            await forwarder.handle_event(event)
+        receiver.assert_not_awaited()
+        now = 1.0
+        await forwarder.handle_event(event)
+        receiver.assert_awaited_once()
+        assert publications == [original, replacement]
+        # A successful new route resumes normal forwarding immediately.
+        await forwarder.handle_event(event)
+        assert receiver.await_count == 2
+    finally:
+        await bridge.close()
+
+
+@pytest.mark.asyncio
+async def test_unexpected_progress_error_still_disables_forwarder(monkeypatch):
+    from xagent.web.services import shared_channel_execution as shared
+
+    reply = AsyncMock(side_effect=ValueError("invalid event"))
+    bridge = Mock()
+    bridge.reply_for.return_value = reply
+    monkeypatch.setattr(shared, "get_task_event_bridge", lambda: bridge)
+    forwarder = shared.ChannelProgressForwarder(
+        Mock(command_id="command", task_id=42), "run"
+    )
+    await forwarder.handle_event(Mock())
+    await forwarder.handle_event(Mock())
+    reply.assert_awaited_once()

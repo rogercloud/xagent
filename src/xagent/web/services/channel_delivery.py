@@ -140,6 +140,7 @@ def _settle_no_commit(
     status: str = "pending",
     failed: bool = False,
     retry_only: bool = False,
+    progress_sent: bool = False,
 ) -> str | None:
     now = datetime.now(timezone.utc)
     retry_at = now + timedelta(seconds=_DELIVERY_RETRY_SECONDS)
@@ -148,7 +149,7 @@ def _settle_no_commit(
         "status": status,
         # Keep the token as a retry fence: progress bypasses only unclaimed delays.
         "claim_token": delivery.claim_token if retry_only else None,
-        "available_at": retry_at if status == "pending" else None,
+        "available_at": retry_at if status == "pending" and not progress_sent else None,
         "delivered_at": now if status == "delivered" else None,
     }
     if failed:
@@ -195,10 +196,16 @@ def _settle(
     status: str = "pending",
     failed: bool = False,
     retry_only: bool = False,
+    progress_sent: bool = False,
 ) -> None:
     with get_session_local()() as db:
         settled = _settle_no_commit(
-            db, delivery, status=status, failed=failed, retry_only=retry_only
+            db,
+            delivery,
+            status=status,
+            failed=failed,
+            retry_only=retry_only,
+            progress_sent=progress_sent,
         )
         db.commit()
     if failed:
@@ -265,7 +272,13 @@ async def deliver_channel_result(
             await heartbeat
         await sending
         status = "delivered" if result is not None else "pending"
-        await run_db_io_cancellation_safe(lambda: _settle(delivery, status=status))
+        await run_db_io_cancellation_safe(
+            lambda: (
+                _settle(delivery, progress_sent=True)
+                if progress_pending
+                else _settle(delivery, status=status)
+            )
+        )
         return result is not None
     except Exception:
         logger.exception("Channel result delivery deferred command_id=%s", command_id)
