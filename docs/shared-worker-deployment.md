@@ -246,5 +246,33 @@ primary-key conflicts trigger repartition; unrelated integrity failures propagat
 user-facing `TaskTurnError`.
 
 This foundation does not yet switch Slack, Feishu, or Telegram to receipt-based
-input acceptance. Existing channel paths remain active; provider integration and
-progress observation are separate follow-up changes.
+input acceptance. Existing channel paths remain active; provider integration
+remains a separate follow-up change.
+
+
+### Accepted channel command observation and progress
+
+An accepted input can construct a `SharedChannelTurn` using `as_turn()` and call
+`observe()` to attach a reply route and wait for the existing command. Observation
+does not create another START, transcript message, or receipt. The existing
+`execute()` entry point continues to accept new work and uses the same result wait.
+The caller closes the observer to release its local event route. Reply timeout
+returns the accepted/pending result; final delivery can recover independently.
+
+`DurableChannelProgress` sends progress and final replies through the existing
+delivery claim. Progress callbacks update `delivery.destination` with platform
+loading-message identifiers; settlement persists them under the claim token so
+later observers and final recovery reuse that destination. An active claim blocks
+both kinds of send. Progress can bypass a pending poll delay when no send has
+failed, but respects failed-send backoff. Platform sends remain at least once
+when acknowledgement or destination persistence is uncertain.
+
+Worker progress with no reply route retries on subsequent trace events with an
+exponential delay from one to thirty seconds, reset after successful delivery.
+Already emitted progress is not replayed. Other connection failures retain the
+existing behavior of disabling that progress forwarder.
+
+Commit recovery counts an observed competing receipt before checking current
+authorization. A competing batch requests repartition immediately, consistently
+with receipt conflicts during flush; the next lookup must still authorize the
+caller. Single-message replay also retains its authorization checks.
