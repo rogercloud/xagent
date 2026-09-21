@@ -141,7 +141,7 @@ def lookup_channel_input(
 
 
 class ChannelInputBatchChanged(Exception):
-    """A concurrent acceptance consumed only part of the proposed batch."""
+    """The batch no longer matches durable state; re-run the partition lookup."""
 
 
 @dataclass(frozen=True)
@@ -351,6 +351,7 @@ def accept_channel_input(
                     if saved.command_db_id is not None
                     else None
                 )
+                # SQLite can reuse rolled-back row IDs; also match the command UUID.
                 own_commit = (
                     saved.task_id == selection.task_id
                     and saved.command_db_id == command_id
