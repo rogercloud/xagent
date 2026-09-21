@@ -559,7 +559,8 @@ class ChannelProgressForwarder(TraceHandler):
                         await asyncio.shield(self._sending)
                 except TimeoutError:
                     logger.warning(
-                        "Channel progress drain timed out task_id=%s",
+                        "Channel progress drain timed out; abandoning remaining "
+                        "progress, final reply delivery remains independent task_id=%s",
                         self.command.task_id,
                     )
         finally:
