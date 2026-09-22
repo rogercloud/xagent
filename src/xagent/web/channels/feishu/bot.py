@@ -368,7 +368,18 @@ class FeishuBotInstance(BatchChannelControl[str]):
             is_new_task = selected_task.is_new_task
             if is_new_task:
                 self.active_tasks[open_id] = str(task_id)
-                self._save_active_tasks()
+                if not self._save_active_tasks():
+                    if active_task_id is None:
+                        self.active_tasks.pop(open_id, None)
+                    else:
+                        self.active_tasks[open_id] = active_task_id
+                    if managed_lease is not None:
+                        await managed_lease.finalize_result(status=TaskStatus.PAUSED)
+                    await self._send_text(
+                        chat_id,
+                        "I couldn't save the new conversation. Your request wasn't started. Please try again.",
+                    )
+                    return
 
             if shared_turn is None:
                 setup_snapshot = await run_db_io_cancellation_safe(

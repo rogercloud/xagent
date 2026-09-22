@@ -495,3 +495,71 @@ async def test_stop_before_shared_start_acceptance(bot, monkeypatch):
     assert not turn.accepted
     assert bot._update_text.await_args.args[2] == INTERRUPTED_USER_MESSAGE
     assert all("error" not in call.args[1] for call in bot._send_text.await_args_list)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("shared", [False, True])
+@pytest.mark.parametrize("previous", [None, "-1"])
+async def test_new_task_save_failure_prevents_execution(
+    bot, monkeypatch, shared, previous
+):
+    from xagent.web.models.task import TaskStatus
+
+    bot.active_tasks = {} if previous is None else {"sender": previous}
+    assert bot._save_active_tasks()
+    monkeypatch.setattr(module, "get_shared_task_execution_enabled", lambda: shared)
+    lease = SimpleNamespace(
+        finalize_result=AsyncMock(return_value=True), close=AsyncMock()
+    )
+    turn = SharedChannelTurn(
+        SelectedChannelTask(5, 99, True, 7, "sender", None, 0), None
+    )
+    turn.execute = AsyncMock()
+    turn.stop = AsyncMock()
+    turn.close = AsyncMock()
+    monkeypatch.setattr(
+        module, "prepare_shared_channel_turn", AsyncMock(return_value=turn)
+    )
+    monkeypatch.setattr(
+        module,
+        "prepare_channel_task",
+        AsyncMock(
+            return_value=SimpleNamespace(
+                task_id=99, user_id=5, is_new_task=True, managed_lease=lease
+            )
+        ),
+    )
+    manager = Mock()
+    monkeypatch.setattr(module, "get_agent_manager", lambda: manager)
+    with monkeypatch.context() as failed_write:
+        failed_write.setattr(
+            module.os, "replace", Mock(side_effect=OSError("disk unavailable"))
+        )
+        bot._handle_message_sync(message("request"))
+        await asyncio.wait_for(bot.user_message_tasks["sender"], 2)
+    expected = {} if previous is None else {"sender": previous}
+    assert bot.active_tasks == expected
+    assert bot._load_active_tasks() == expected
+    turn.execute.assert_not_awaited()
+    manager.get_agent_for_task.assert_not_called()
+    if shared:
+        turn.close.assert_awaited_once()
+    else:
+        lease.finalize_result.assert_awaited_once_with(status=TaskStatus.PAUSED)
+        lease.close.assert_awaited_once()
+    bot._send_text.assert_awaited_once()
+    assert "try again" in bot._send_text.await_args.args[1]
+
+    if shared:
+
+        async def execute(*args):
+            assert bot._load_active_tasks() == {"sender": "99"}
+            turn.accepted = True
+            return {"success": True, "status": "completed", "output": "answer"}
+
+        turn.execute.side_effect = execute
+        turn.deliver = AsyncMock(return_value=True)
+        bot._handle_message_sync(message("retry", "retry"))
+        await asyncio.wait_for(bot.user_message_tasks["sender"], 2)
+        turn.execute.assert_awaited_once()
+        turn.deliver.assert_awaited_once()
