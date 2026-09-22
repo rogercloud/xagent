@@ -117,6 +117,11 @@ def ingress(engine, monkeypatch, tmp_path):
         bot.channel_name = "test"
         bot.active_tasks_file = tmp_path / "active.json"
         bot.active_tasks = bot._load_active_tasks()
+        bot._stop_lock = None
+        bot._stop_loop = None
+        bot._ingress_stopped = False
+        bot.ws_client = None
+        bot._ping_task = None
         bot.api_client = Mock()
         bot._send_text = AsyncMock(return_value="loading")
         bot._update_text = AsyncMock()
@@ -245,7 +250,7 @@ async def test_attachment_failure_has_no_acceptance(ingress):
         assert db.query(Task).count() == 0
         assert db.query(TaskInputReceipt).count() == 0
         assert db.query(TaskExecutionCommand).count() == 0
-    assert "couldn't download" in bot._send_text.await_args.args[1]
+    assert "were not accepted" in bot._send_text.await_args.args[1]
 
 
 @pytest.mark.asyncio
@@ -420,8 +425,9 @@ async def test_new_does_not_restore_or_send_old_receipt(ingress):
 
 
 @pytest.mark.asyncio
-async def test_cancel_during_commit_drains_and_stops_accepted_turn(
-    ingress, monkeypatch
+@pytest.mark.parametrize("command", [None, "/stop", "/new"])
+async def test_cancel_during_commit_respects_explicit_controls(
+    ingress, monkeypatch, command
 ):
     import threading
 
@@ -440,6 +446,8 @@ async def test_cancel_during_commit_drains_and_stops_accepted_turn(
     task = asyncio.create_task(bot._process_messages_batch("sender", [message()]))
     try:
         assert await asyncio.to_thread(entered.wait, 5)
+        if command is not None:
+            await bot._handle_control("sender", message(command), command)
         task.cancel()
         await asyncio.sleep(0)
         assert not task.done()
@@ -449,10 +457,13 @@ async def test_cancel_during_commit_drains_and_stops_accepted_turn(
         await task
     with sessions() as db:
         assert db.query(TaskInputReceipt).count() == 1
-        assert {row.kind for row in db.query(TaskExecutionCommand)} == {
-            "start",
-            "pause",
-        }
+        assert {row.kind for row in db.query(TaskExecutionCommand)} == (
+            {"start", "pause"} if command is not None else {"start"}
+        )
+        assert db.query(TaskChannelDelivery).one().status == (
+            "discarded" if command == "/new" else "pending"
+        )
+    assert bot.active_tasks["sender"] == ("-1" if command == "/new" else "1")
     assert not bot.user_preparing_executions
     assert not bot.user_active_executions
 
@@ -518,7 +529,7 @@ async def test_historical_replay_keeps_newer_pending_turn_controllable(
 
 
 @pytest.mark.asyncio
-async def test_cancel_during_save_warning_stops_owned_accepted_turn(ingress):
+async def test_cancel_during_save_warning_preserves_owned_accepted_turn(ingress):
     make, sessions, observe = ingress
     bot = make()
     bot._save_active_tasks = Mock(return_value=False)
@@ -540,10 +551,9 @@ async def test_cancel_during_save_warning_stops_owned_accepted_turn(ingress):
         assert db.query(TaskInputReceipt).count() == 1
         assert {row.kind for row in db.query(TaskExecutionCommand)} == {
             "start",
-            "pause",
         }
     observe.assert_not_awaited()
-    assert not bot.user_active_executions
+    assert bot.user_active_executions["sender"][1].accepted
     assert not bot.user_preparing_executions
 
 
@@ -565,3 +575,153 @@ async def test_observation_failure_keeps_accepted_turn_controllable(ingress):
             db.query(TaskExecutionCommand).filter_by(kind="pause").one().target_run_id
             == turn.run_id
         )
+
+
+@pytest.mark.asyncio
+async def test_shutdown_detaches_observer_and_recovery_delivers(ingress):
+    make, sessions, observe = ingress
+    bot = make()
+    complete = observe.side_effect
+    entered = asyncio.Event()
+
+    async def blocked(handler):
+        entered.set()
+        await asyncio.Future()
+
+    observe.side_effect = blocked
+    bot._handle_message_sync(message())
+    await asyncio.wait_for(entered.wait(), 5)
+    turn = bot.user_active_executions["sender"][1]
+    await asyncio.wait_for(bot.stop(), 5)
+    assert not bot.user_message_tasks
+    assert not bot.user_active_executions
+    with sessions() as db:
+        assert [row.kind for row in db.query(TaskExecutionCommand)] == ["start"]
+        assert db.query(TaskChannelDelivery).one().status == "pending"
+    await complete(SimpleNamespace(task_id=turn.selection.task_id))
+    restarted = make()
+    await channel_delivery.recover_channel_results(
+        restarted.channel_id, restarted._deliver_shared_result
+    )
+    with sessions() as db:
+        assert db.query(TaskChannelDelivery).one().status == "delivered"
+
+
+@pytest.mark.asyncio
+async def test_observation_failure_recovers_without_false_error(ingress):
+    from sqlalchemy.exc import OperationalError
+
+    make, sessions, observe = ingress
+    bot = make()
+    complete = observe.side_effect
+    observe.side_effect = OperationalError("attach", {}, Exception("temporary outage"))
+    await run(bot, message())
+    turn = bot.user_active_executions["sender"][1]
+    assert all("Sorry" not in call.args[1] for call in bot._send_text.await_args_list)
+    with sessions() as db:
+        assert db.query(TaskChannelDelivery).one().status == "pending"
+    await complete(SimpleNamespace(task_id=turn.selection.task_id))
+    await channel_delivery.recover_channel_results(
+        bot.channel_id, bot._deliver_shared_result
+    )
+    with sessions() as db:
+        assert db.query(TaskChannelDelivery).one().status == "delivered"
+
+
+@pytest.mark.asyncio
+async def test_replay_observation_failure_does_not_block_new_input(ingress):
+    from sqlalchemy.exc import OperationalError
+
+    make, sessions, observe = ingress
+    bot = make()
+    complete = observe.side_effect
+    await run(bot, message("original", "old"))
+    attempts = []
+
+    async def fail_once(handler):
+        attempts.append(handler)
+        if len(attempts) == 1:
+            raise OperationalError("attach", {}, Exception("temporary outage"))
+        return await complete(handler)
+
+    observe.side_effect = fail_once
+    await run(bot, message("original", "old"), message("new", "new"))
+    with sessions() as db:
+        assert db.query(TaskInputReceipt).count() == 2
+        assert db.query(TaskExecutionCommand).filter_by(kind="start").count() == 2
+    assert len(attempts) == 2
+    assert all("Sorry" not in call.args[1] for call in bot._send_text.await_args_list)
+
+
+@pytest.mark.asyncio
+async def test_repartition_does_not_repeat_rejection_notice(ingress, monkeypatch):
+    make, sessions, _ = ingress
+    bot = make()
+    await run(bot, message("original", "old"))
+    original = module.accept_channel_input
+    attempts = []
+
+    def accept(*args, **kwargs):
+        attempts.append(1)
+        if len(attempts) == 1:
+            raise inputs.ChannelInputBatchChanged()
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(module, "accept_channel_input", accept)
+    await run(bot, message("changed", "old"), message("new", "new"))
+    assert (
+        sum(
+            "different content" in call.args[1]
+            for call in bot._send_text.await_args_list
+        )
+        == 1
+    )
+    with sessions() as db:
+        assert db.query(TaskInputReceipt).count() == 2
+    assert len(attempts) == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("file_key", ["", "unavailable"])
+async def test_attachment_failure_is_atomic_within_chat_group(ingress, file_key):
+    make, sessions, _ = ingress
+    bot = make()
+    bot._download_feishu_file_sync = Mock(return_value=None)
+    await run(
+        bot,
+        message("explain attachment", "text", "chat-a"),
+        message(file_key, "file", "chat-a", "file"),
+        message("independent", "good", "chat-b"),
+    )
+    with sessions() as db:
+        assert db.query(TaskInputReceipt).count() == 1
+        command = db.query(TaskExecutionCommand).filter_by(kind="start").one()
+        assert command.payload["message"] == "independent"
+        assert db.query(TaskChannelDelivery).one().destination["chat_id"] == "chat-b"
+    assert any(
+        call.args[0] == "chat-a" and "were not accepted" in call.args[1]
+        for call in bot._send_text.await_args_list
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("command", ["/stop", "/new"])
+async def test_control_during_rejection_notice_stops_later_notices(ingress, command):
+    make, sessions, _ = ingress
+    bot = make()
+    await run(bot, message("A", "a"), message("B", "b"))
+    original_send = bot._send_text
+    notices = []
+
+    async def send(chat, text):
+        if "different content" in text:
+            notices.append(text)
+            if len(notices) == 1:
+                await bot._handle_control("sender", message(command), command)
+        return await original_send(chat, text)
+
+    bot._send_text = send
+    await run(bot, message("changed A", "a"), message("changed B", "b"))
+    assert len(notices) == 1
+    with sessions() as db:
+        assert db.query(TaskInputReceipt).count() == 2

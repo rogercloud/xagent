@@ -353,171 +353,202 @@ class FeishuBotInstance(BatchChannelControl[str]):
             for chat_id, group in groupby(
                 messages, key=lambda item: item.event.message.chat_id
             ):
-                raw = list(group)
-                incoming = tuple(self._shared_input(open_id, item) for item in raw)
-                files = {
-                    str(item.event.message.message_id): self._message_content(
-                        item.event.message
-                    )[1]
-                    for item in raw
-                }
-                observed: set[int] = set()
-                while not stopped():
-                    (
-                        owner_id,
-                        pending,
-                        replays,
-                        rejected,
-                    ) = await run_db_io_cancellation_safe(
-                        lambda: lookup_channel_inputs(incoming)
-                    )
-                    if stopped():
-                        return
-                    for rejection in rejected:
-                        await self._send_text(
-                            chat_id, self._input_error_message(rejection.reason)
+                if stopped():
+                    return
+                try:
+                    raw = list(group)
+                    incoming = tuple(self._shared_input(open_id, item) for item in raw)
+                    files = {
+                        str(item.event.message.message_id): self._message_content(
+                            item.event.message
+                        )[1]
+                        for item in raw
+                    }
+                    observed: set[int] = set()
+                    notified_rejections: set[tuple[str, str]] = set()
+                    while not stopped():
+                        (
+                            owner_id,
+                            pending,
+                            replays,
+                            rejected,
+                        ) = await run_db_io_cancellation_safe(
+                            lambda: lookup_channel_inputs(incoming)
                         )
-                    for accepted in replays:
                         if stopped():
                             return
-                        if accepted.command_db_id not in observed:
-                            observed.add(accepted.command_db_id)
-                            await self._observe_shared_input(
-                                open_id, accepted, generation
-                            )
-                    if not pending or stopped():
-                        break
-                    get_task_event_bridge().require_ready()
-                    staged: list[StagedUploadedFile] = []
-                    try:
-                        with TemporaryDirectory(
-                            prefix="xagent-feishu-input-"
-                        ) as staging_dir:
-                            for item in pending:
-                                for file_info in files[item.message_id]:
-                                    downloaded = (
-                                        await drain_async_task_cancellation_safe(
-                                            asyncio.create_task(
-                                                asyncio.to_thread(
-                                                    self._download_feishu_file_sync,
-                                                    file_info,
-                                                    Path(staging_dir),
+                        for rejection in rejected:
+                            if stopped():
+                                return
+                            key = (rejection.incoming.message_id, rejection.reason)
+                            if key not in notified_rejections:
+                                await self._send_text(
+                                    chat_id, self._input_error_message(rejection.reason)
+                                )
+                                notified_rejections.add(key)
+                        for accepted in replays:
+                            if stopped():
+                                return
+                            if accepted.command_db_id not in observed:
+                                observed.add(accepted.command_db_id)
+                                await self._observe_shared_input(
+                                    open_id, accepted, generation
+                                )
+                        if not pending or stopped():
+                            break
+                        get_task_event_bridge().require_ready()
+                        staged: list[StagedUploadedFile] = []
+                        try:
+                            with TemporaryDirectory(
+                                prefix="xagent-feishu-input-"
+                            ) as staging_dir:
+                                for item in pending:
+                                    for file_info in files[item.message_id]:
+                                        downloaded = (
+                                            await drain_async_task_cancellation_safe(
+                                                asyncio.create_task(
+                                                    asyncio.to_thread(
+                                                        self._download_feishu_file_sync,
+                                                        file_info,
+                                                        Path(staging_dir),
+                                                    )
                                                 )
                                             )
                                         )
-                                    )
-                                    if downloaded is None:
-                                        raise TaskTurnError("file_unavailable")
-                                    if stopped():
-                                        return
-                                    file_id = str(uuid4())
-                                    (
-                                        uploaded,
-                                        cancellation,
-                                    ) = await await_task_settlement(
-                                        asyncio.create_task(
-                                            asyncio.to_thread(
-                                                stage_uploaded_file_from_local_path,
-                                                local_path=downloaded.path,
-                                                user_id=owner_id,
-                                                filename=downloaded.name,
-                                                file_id=file_id,
-                                                mime_type=downloaded.mime_type,
-                                                storage_key=build_upload_storage_key(
-                                                    owner_id, file_id, downloaded.name
-                                                ),
-                                                upload_source="feishu",
-                                                execution_scope=None,
+                                        if downloaded is None:
+                                            raise TaskTurnError("file_unavailable")
+                                        if stopped():
+                                            return
+                                        file_id = str(uuid4())
+                                        (
+                                            uploaded,
+                                            cancellation,
+                                        ) = await await_task_settlement(
+                                            asyncio.create_task(
+                                                asyncio.to_thread(
+                                                    stage_uploaded_file_from_local_path,
+                                                    local_path=downloaded.path,
+                                                    user_id=owner_id,
+                                                    filename=downloaded.name,
+                                                    file_id=file_id,
+                                                    mime_type=downloaded.mime_type,
+                                                    storage_key=build_upload_storage_key(
+                                                        owner_id,
+                                                        file_id,
+                                                        downloaded.name,
+                                                    ),
+                                                    upload_source="feishu",
+                                                    execution_scope=None,
+                                                )
                                             )
                                         )
-                                    )
-                                    staged.append(uploaded)
-                                    if cancellation is not None:
-                                        raise cancellation
-                                    if stopped():
-                                        return
-                            attachments = normalize_attachments_for_persistence(
-                                [
-                                    {
-                                        "file_id": item.file_id,
-                                        "name": item.filename,
-                                        "type": item.mime_type,
-                                        "size": item.file_size,
-                                    }
+                                        staged.append(uploaded)
+                                        if cancellation is not None:
+                                            raise cancellation
+                                        if stopped():
+                                            return
+                                attachments = normalize_attachments_for_persistence(
+                                    [
+                                        {
+                                            "file_id": item.file_id,
+                                            "name": item.filename,
+                                            "type": item.mime_type,
+                                            "size": item.file_size,
+                                        }
+                                        for item in staged
+                                    ]
+                                )
+                                text = "\n".join(
+                                    item.text for item in pending if item.text
+                                )
+                                links = " ".join(
+                                    f"[{item.filename}]({build_file_id_ref(item.file_id)})"
                                     for item in staged
-                                ]
-                            )
-                            text = "\n".join(item.text for item in pending if item.text)
-                            links = " ".join(
-                                f"[{item.filename}]({build_file_id_ref(item.file_id)})"
-                                for item in staged
-                            )
-                            if links:
-                                text = f"{text}\n\n{links}" if text else links
-                            if stopped():
-                                return
-                            active_task_id = self.active_tasks.get(open_id)
-                            accepted, cancellation = await await_task_settlement(
-                                asyncio.create_task(
-                                    asyncio.to_thread(
-                                        accept_channel_input,
-                                        pending[0],
-                                        additional_inputs=pending[1:],
-                                        owner_id=owner_id,
-                                        active_task_id=int(active_task_id)
-                                        if active_task_id is not None
-                                        else None,
-                                        channel_name=self.channel_name,
-                                        payload=TaskTurnPayload(
-                                            text,
-                                            execution_message=text,
-                                            attachments=attachments or None,
-                                            file_ids=tuple(
-                                                item.file_id for item in staged
+                                )
+                                if links:
+                                    text = f"{text}\n\n{links}" if text else links
+                                if stopped():
+                                    return
+                                active_task_id = self.active_tasks.get(open_id)
+                                accepted, cancellation = await await_task_settlement(
+                                    asyncio.create_task(
+                                        asyncio.to_thread(
+                                            accept_channel_input,
+                                            pending[0],
+                                            additional_inputs=pending[1:],
+                                            owner_id=owner_id,
+                                            active_task_id=int(active_task_id)
+                                            if active_task_id is not None
+                                            else None,
+                                            channel_name=self.channel_name,
+                                            payload=TaskTurnPayload(
+                                                text,
+                                                execution_message=text,
+                                                attachments=attachments or None,
+                                                file_ids=tuple(
+                                                    item.file_id for item in staged
+                                                ),
                                             ),
-                                        ),
-                                        staged_files=tuple(staged),
-                                        host_id=get_task_event_bridge().host_id,
+                                            staged_files=tuple(staged),
+                                            host_id=get_task_event_bridge().host_id,
+                                        )
                                     )
                                 )
-                            )
-                            # Inspect late commits before propagating cancellation:
-                            # /new must never restore an older task selection.
-                            saved = True
-                            if (
-                                self._conversation_generation(open_id) == generation
-                                and not accepted.replayed
-                                and accepted.selection.is_new_task
-                            ):
-                                self.active_tasks[open_id] = str(accepted.task_id)
-                                saved = self._save_active_tasks()
-                            if stopped() or cancellation is not None:
-                                turn = accepted.as_turn()
-                                turn.discard_output = (
-                                    self._conversation_generation(open_id) != generation
-                                )
-                                await drain_async_task_cancellation_safe(
-                                    asyncio.create_task(turn.stop())
-                                )
+                                # Inspect late commits before propagating cancellation:
+                                # /new must never restore an older task selection.
+                                saved = True
+                                if (
+                                    self._conversation_generation(open_id) == generation
+                                    and not accepted.replayed
+                                    and accepted.selection.is_new_task
+                                ):
+                                    self.active_tasks[open_id] = str(accepted.task_id)
+                                    saved = self._save_active_tasks()
+                                if stopped():
+                                    turn = accepted.as_turn()
+                                    turn.discard_output = (
+                                        self._conversation_generation(open_id)
+                                        != generation
+                                    )
+                                    await drain_async_task_cancellation_safe(
+                                        asyncio.create_task(turn.stop())
+                                    )
                                 if cancellation is not None:
                                     raise cancellation
-                                return
-                            await self._observe_shared_input(
-                                open_id,
-                                accepted,
-                                generation,
-                                save_failure_chat=chat_id if not saved else None,
-                            )
-                            break
-                    except ChannelInputBatchChanged:
-                        # A competing acceptance changed the partition. Reload
-                        # all physical inputs; never replay a new START ourselves.
-                        continue
-                    finally:
-                        if staged:
-                            await run_db_io_cancellation_safe(
-                                lambda: compensate_staged_uploaded_files(tuple(staged))
-                            )
+                                if stopped():
+                                    return
+                                await self._observe_shared_input(
+                                    open_id,
+                                    accepted,
+                                    generation,
+                                    save_failure_chat=chat_id if not saved else None,
+                                )
+                                break
+                        except ChannelInputBatchChanged:
+                            # A competing acceptance changed the partition. Reload
+                            # all physical inputs; never replay a new START ourselves.
+                            # Compensate this attempt's unused uploads below, then
+                            # download only still-pending inputs again. Keeping files
+                            # across repartition would require separate ownership.
+                            continue
+                        finally:
+                            if staged:
+                                await run_db_io_cancellation_safe(
+                                    lambda: compensate_staged_uploaded_files(
+                                        tuple(staged)
+                                    )
+                                )
+                except TaskTurnError as error:
+                    if error.reason != "file_unavailable":
+                        raise
+                    if stopped():
+                        return
+                    await self._send_text(
+                        chat_id,
+                        "I couldn't process the attached Feishu file(s). "
+                        "New messages in this group were not accepted. "
+                        "Please resend them together.",
+                    )
         except ChannelAuthorizationError:
             await self._send_text(chat_id, "🚫 You are not authorized to use this bot.")
         except ChannelConfigurationError:
@@ -649,9 +680,14 @@ class FeishuBotInstance(BatchChannelControl[str]):
                 result.get("status") == "accepted" and not delivered and current()
             )
         except asyncio.CancelledError:
-            retained = False
-            turn.request_stop()
+            # Ending an ingress observer does not cancel durable worker work.
+            # Explicit controls request their own stop; close drains that request.
             raise
+        except Exception:
+            logger.exception(
+                "Error observing accepted Feishu input command_id=%s",
+                accepted.command_db_id,
+            )
         finally:
             if self.user_active_trace_handlers.get(open_id) is handler:
                 self.user_active_trace_handlers.pop(open_id, None)
