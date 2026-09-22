@@ -428,10 +428,10 @@ class TelegramBotInstance(BatchChannelControl[int]):
     ) -> bool:
         if not get_shared_task_execution_enabled() or task_id is None or task_id <= 0:
             return True
-        assert self.channel_id is not None
+        channel_id = cast(int, self.channel_id)
         try:
             await discard_channel_task_results(
-                channel_id=self.channel_id,
+                channel_id=channel_id,
                 external_user_id=str(user_id),
                 task_id=task_id,
             )

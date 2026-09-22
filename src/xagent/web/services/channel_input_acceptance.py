@@ -328,8 +328,7 @@ def accept_channel_input(
         if selection.is_new_task and (
             task_title is not None or task_description is not None
         ):
-            task = db.get(Task, selection.task_id)
-            assert task is not None
+            task = cast(Task, db.get(Task, selection.task_id))
             if task_title is not None:
                 setattr(task, "title", task_title)
             if task_description is not None:
