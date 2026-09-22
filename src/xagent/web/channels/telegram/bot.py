@@ -1744,16 +1744,19 @@ class TelegramBotInstance(BatchChannelControl[int]):
                                 display = self._display_message_for_user(
                                     text, bool(staged)
                                 )
-                                voice_files = [
-                                    attachments[i]
-                                    for i, file in enumerate(downloaded)
-                                    if file.source_id in voice_ids
-                                ]
-                                links = " ".join(
-                                    f"[{file.filename}]({build_file_id_ref(file.file_id)})"
-                                    for i, file in enumerate(staged)
-                                    if downloaded[i].source_id not in voice_ids
-                                )
+                                voice_files = []
+                                file_links = []
+                                for downloaded_file, staged_file, chip in zip(
+                                    downloaded, staged, attachments, strict=True
+                                ):
+                                    if downloaded_file.source_id in voice_ids:
+                                        voice_files.append(chip)
+                                    else:
+                                        file_links.append(
+                                            f"[{staged_file.filename}]"
+                                            f"({build_file_id_ref(staged_file.file_id)})"
+                                        )
+                                links = " ".join(file_links)
                                 execution = (
                                     f"{text}\n\n{links}"
                                     if text and links
