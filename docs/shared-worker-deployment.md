@@ -311,3 +311,19 @@ Commit recovery counts an observed competing receipt before checking current
 authorization. A competing batch requests repartition immediately, consistently
 with receipt conflicts during flush; the next lookup must still authorize the
 caller. Single-message replay also retains its authorization checks.
+
+
+### Feishu and Telegram batch controls
+
+Feishu and Telegram collect ordinary messages into short batches and continue
+processing messages received while the preceding batch runs. Control commands
+are handled outside that queue. Feishu supports `/start`, `/help`, `/new`,
+`/stop` and `/pause`; state-changing commands authorize the sender before acting.
+`/stop` clears pending input and requests a pause while retaining the current
+task. `/new` saves a new-conversation selection before clearing queued input and
+stopping the old turn; late preparation cannot restore the previous selection.
+Telegram retains its existing task-switching, agent selection and voice behavior.
+
+These controls retain the existing per-user conversation scope and active-task
+file formats. They do not add cross-chat isolation or durable pending-input
+storage. Platform sends already in flight may complete after a control command.
