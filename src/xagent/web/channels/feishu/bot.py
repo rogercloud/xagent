@@ -307,8 +307,9 @@ class FeishuBotInstance(BatchChannelControl[str]):
     def _message_content(message: Any) -> tuple[str, list[dict[str, Any]]]:
         text = ""
         files = []
+        content_str = getattr(message, "content", None) or ""
         try:
-            content = json.loads(message.content)
+            content = json.loads(content_str)
             if message.message_type == "text":
                 text = content.get("text", "").strip()
             elif message.message_type in ("image", "audio", "media", "file"):
@@ -326,7 +327,7 @@ class FeishuBotInstance(BatchChannelControl[str]):
             else:
                 text = f"Please process this {message.message_type}."
         except (ValueError, AttributeError, TypeError):
-            text = message.content.strip()
+            text = content_str.strip()
         if not text and not files:
             text = f"Received a {message.message_type} message."
         return text, files

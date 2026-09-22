@@ -136,6 +136,24 @@ async def run(bot, *messages):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("missing", [False, True], ids=["null", "missing"])
+async def test_empty_content_does_not_abort_batch(ingress, missing):
+    make, sessions, observe = ingress
+    bot = make()
+    empty = message(identity="empty")
+    if missing:
+        del empty.event.message.content
+    else:
+        empty.event.message.content = None
+    await run(bot, empty, message("valid text", "valid"))
+    with sessions() as db:
+        assert db.query(TaskInputReceipt).count() == 2
+        command = db.query(TaskExecutionCommand).filter_by(kind="start").one()
+        assert command.payload["message"] == "Received a text message.\nvalid text"
+    observe.assert_awaited_once()
+
+
+@pytest.mark.asyncio
 async def test_batch_retries_after_restart_reuse_one_command_and_loading(ingress):
     make, sessions, observe = ingress
     first = make()
