@@ -29,11 +29,11 @@ class FeishuTraceHandler(TraceHandler):
         )
         self.current_text = ""
         self.cancelled = False
-        self.discard_output = False
 
     def cancel(self, *, discard_output: bool = True) -> None:
         self.cancelled = True
-        self.discard_output = discard_output
+        # The shared cancel signature is retained; Feishu final replies use
+        # the bot's conversation generation instead of trace-handler state.
 
     async def handle_event(self, event: TraceEvent) -> None:
         try:

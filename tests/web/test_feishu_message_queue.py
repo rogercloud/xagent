@@ -23,6 +23,7 @@ def make_bot() -> FeishuBotInstance:
     bot._initialize_batch_control()
     bot.user_active_trace_handlers = {}
     bot.control_tasks = set()
+    bot.control_queues = {}
     bot.control_locks = {}
     bot._accepting = True
     bot._ingress_stopped = False
@@ -45,6 +46,7 @@ async def test_error_after_prepare_settles_preclaimed_task_instead_of_orphaning_
     bot._initialize_batch_control()
     bot.user_active_trace_handlers = {}
     bot.control_tasks = set()
+    bot.control_queues = {}
     bot.control_locks = {}
     bot.channel_id = 1
     bot.channel_name = "Feishu prepare failure"
@@ -129,6 +131,7 @@ async def test_channel_failure_suppresses_stale_error_after_exact_settlement_rej
     bot._initialize_batch_control()
     bot.user_active_trace_handlers = {}
     bot.control_tasks = set()
+    bot.control_queues = {}
     bot.control_locks = {}
     bot.channel_id = 1
     bot.channel_name = "Feishu exact settlement"
@@ -305,6 +308,7 @@ async def test_successful_channel_turn_persists_user_before_exact_assistant_sett
     bot._initialize_batch_control()
     bot.user_active_trace_handlers = {}
     bot.control_tasks = set()
+    bot.control_queues = {}
     bot.control_locks = {}
     bot.channel_id = 1
     bot.channel_name = "Feishu history"

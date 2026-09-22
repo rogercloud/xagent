@@ -322,7 +322,14 @@ are handled outside that queue. Feishu supports `/start`, `/help`, `/new`,
 `/stop` clears pending input and requests a pause while retaining the current
 task. `/new` saves a new-conversation selection before clearing queued input and
 stopping the old turn; late preparation cannot restore the previous selection.
-Telegram retains its existing task-switching, agent selection and voice behavior.
+Messages arriving while a Feishu control command is being authorized wait until
+that command finishes; they are then queued in arrival order. A command clears
+only earlier pending input. If a new-conversation selection is saved but cleanup
+of previous replies fails, Feishu reports that the new conversation is selected.
+
+Telegram retains its task-switching, agent selection and voice behavior. Both
+channels also signal a preparing request when a retained previous shared turn
+accepts a stop; previously Telegram could miss that newer preparation.
 
 These controls retain the existing per-user conversation scope and active-task
 file formats. They do not add cross-chat isolation or durable pending-input

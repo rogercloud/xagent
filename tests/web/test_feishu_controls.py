@@ -35,6 +35,7 @@ def bot(monkeypatch, tmp_path):
     instance._initialize_batch_control()
     instance.user_active_trace_handlers = {}
     instance.control_tasks = set()
+    instance.control_queues = {}
     instance.control_locks = {}
     instance._accepting = True
     instance.start_time = 0
@@ -191,7 +192,7 @@ async def test_control_reaches_running_shared_turn(bot, monkeypatch, command):
     await asyncio.wait_for(task, 2)
     turn.request_stop.assert_called_once()
     assert handler.cancelled
-    assert handler.discard_output == (command == "/new")
+    assert turn.discard_output == (command == "/new")
     if command == "/new":
         turn.deliver.assert_not_awaited()
         turn.discard_delivery.assert_awaited_once()
@@ -222,7 +223,12 @@ async def test_stop_after_shared_reply_timeout_retains_control(
     )
     await bot._process_messages_batch("sender", [message("another request")])
     await control(bot, "/stop")
-    turn.request_stop.assert_called_once()
+    if status == "accepted":
+        turn.request_stop.assert_called_once()
+    else:
+        turn.request_stop.assert_not_called()
+        assert not bot.user_active_executions
+        assert bot._send_text.await_args.args[1] == "No active run to stop."
 
 
 @pytest.mark.asyncio
@@ -236,10 +242,14 @@ async def test_shutdown_drains_authorizing_command(bot, monkeypatch):
     monkeypatch.setattr(module, "authorize_channel_sender", authorize)
     bot._handle_message_sync(message("/new"))
     await asyncio.wait_for(entered.wait(), 2)
+    bot._handle_message_sync(message("after command", "after"))
+    assert bot.control_queues["sender"]
     bot._accepting = False
     await asyncio.wait_for(bot._drain_user_message_tasks(), 2)
     assert bot.active_tasks["sender"] == "45"
     assert not bot.control_tasks
+    assert not bot.control_queues
+    assert not bot.user_message_queues
 
 
 @pytest.mark.asyncio
@@ -347,11 +357,12 @@ async def test_new_conversation_suppresses_remaining_shared_reply_chunks(bot):
     delivery = SimpleNamespace(
         destination={"chat_id": "chat", "loading_message_id": "loading"}
     )
-    await bot._deliver_shared_result(
-        delivery,
-        {"success": True, "status": "completed", "output": "a" * 5000},
-        is_current=lambda: current,
-    )
+    with pytest.raises(module.ChannelDeliveryDiscarded):
+        await bot._deliver_shared_result(
+            delivery,
+            {"success": True, "status": "completed", "output": "a" * 5000},
+            is_current=lambda: current,
+        )
     bot._update_text.assert_awaited_once()
     bot._send_text.assert_not_awaited()
 
@@ -367,9 +378,10 @@ async def test_new_conversation_fences_recovered_reply_chunks(bot):
         task_id=45,
         destination={"chat_id": "chat", "loading_message_id": "loading"},
     )
-    await bot._deliver_shared_result(
-        delivery, {"success": True, "status": "completed", "output": "a" * 5000}
-    )
+    with pytest.raises(module.ChannelDeliveryDiscarded):
+        await bot._deliver_shared_result(
+            delivery, {"success": True, "status": "completed", "output": "a" * 5000}
+        )
     bot._update_text.assert_awaited_once()
     assert bot._send_text.await_count == 1
     assert "a" * 1000 not in bot._send_text.await_args.args[1]
@@ -413,7 +425,11 @@ async def test_new_conversation_blocks_final_update_fallback(bot, shared):
         await control(bot, "/new")
     finally:
         release.set()
-    await asyncio.wait_for(sending, 2)
+    if shared:
+        with pytest.raises(module.ChannelDeliveryDiscarded):
+            await asyncio.wait_for(sending, 2)
+    else:
+        await asyncio.wait_for(sending, 2)
     assert bot._send_text.await_count == 1
     assert bot._send_text.await_args.args[1] != "old answer"
 
@@ -563,3 +579,108 @@ async def test_new_task_save_failure_prevents_execution(
         await asyncio.wait_for(bot.user_message_tasks["sender"], 2)
         turn.execute.assert_awaited_once()
         turn.deliver.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("command", ["/new", "/stop"])
+@pytest.mark.parametrize("authorized", [False, True])
+async def test_message_after_authorizing_control_waits_and_is_preserved(
+    bot, monkeypatch, command, authorized
+):
+    entered, release, processed = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    observed = []
+
+    async def authorize(**kwargs):
+        entered.set()
+        await release.wait()
+        if not authorized:
+            raise ChannelAuthorizationError()
+
+    async def process(user, messages):
+        observed.append(
+            (
+                bot.active_tasks[user],
+                [json.loads(m.event.message.content)["text"] for m in messages],
+            )
+        )
+        processed.set()
+
+    monkeypatch.setattr(module, "authorize_channel_sender", authorize)
+    bot._process_messages_batch = process
+    bot._handle_message_sync(message(command))
+    # Both callbacks may run before either scheduled task starts.
+    bot._handle_message_sync(message("new request", "following"))
+    await asyncio.wait_for(entered.wait(), 2)
+    await asyncio.sleep(0)
+    assert not processed.is_set()
+    assert not bot.user_message_queues
+    release.set()
+    await asyncio.wait_for(processed.wait(), 2)
+    assert observed == [
+        ("-1" if authorized and command == "/new" else "45", ["new request"])
+    ]
+    await bot._drain_user_message_tasks()
+    assert not bot.control_queues
+
+
+@pytest.mark.asyncio
+async def test_controls_keep_boundaries_between_multiple_commands(bot, monkeypatch):
+    entered, release, second, finish = (asyncio.Event() for _ in range(4))
+    calls = 0
+
+    async def authorize(**kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            entered.set()
+            await release.wait()
+        else:
+            second.set()
+            await finish.wait()
+
+    monkeypatch.setattr(module, "authorize_channel_sender", authorize)
+    bot.queue_flush_delay_seconds = 60
+    bot._handle_message_sync(message("/new"))
+    await entered.wait()
+    bot._handle_message_sync(message("between", "between"))
+    bot._handle_message_sync(message("/stop", "stop"))
+    bot._handle_message_sync(message("after", "after"))
+    release.set()
+    await second.wait()
+    assert [
+        json.loads(m.event.message.content)["text"]
+        for m in bot.user_message_queues["sender"]
+    ] == ["between"]
+    finish.set()
+    await asyncio.gather(*list(bot.control_tasks))
+    assert [
+        json.loads(m.event.message.content)["text"]
+        for m in bot.user_message_queues["sender"]
+    ] == ["after"]
+    await bot._drain_user_message_tasks()
+
+
+@pytest.mark.asyncio
+async def test_new_cleanup_failure_reports_committed_selection(bot, monkeypatch):
+    monkeypatch.setattr(
+        module,
+        "discard_channel_task_results",
+        AsyncMock(side_effect=RuntimeError("db unavailable")),
+    )
+    await control(bot, "/new")
+    assert bot._load_active_tasks() == {"sender": "-1"}
+    assert "new conversation is selected" in bot._send_text.await_args.args[1]
+    assert "couldn't finish cleaning" in bot._send_text.await_args.args[1]
+
+
+@pytest.mark.asyncio
+async def test_control_failure_reports_safe_error(bot, monkeypatch):
+    monkeypatch.setattr(
+        module,
+        "authorize_channel_sender",
+        AsyncMock(side_effect=RuntimeError("private database details")),
+    )
+    await control(bot, "/stop")
+    bot._send_text.assert_awaited_once()
+    assert "try again" in bot._send_text.await_args.args[1]
+    assert "private" not in bot._send_text.await_args.args[1]

@@ -48,6 +48,10 @@ class ChannelDelivery:
     external_user_id: str
 
 
+class ChannelDeliveryDiscarded(Exception):
+    """The sender intentionally suppressed an abandoned conversation reply."""
+
+
 ChannelSender = Callable[[ChannelDelivery, dict[str, Any]], Awaitable[None]]
 
 
@@ -272,7 +276,13 @@ async def deliver_channel_result(
         )
         if heartbeat in done:
             await heartbeat
-        await sending
+        try:
+            await sending
+        except ChannelDeliveryDiscarded:
+            await run_db_io_cancellation_safe(
+                lambda: _settle(delivery, status="discarded")
+            )
+            return False
         status = "delivered" if result is not None else "pending"
         await run_db_io_cancellation_safe(
             lambda: (

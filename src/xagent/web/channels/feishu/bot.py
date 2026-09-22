@@ -2,6 +2,7 @@ import asyncio
 import json
 import logging
 import os
+from collections import deque
 from contextlib import suppress
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional, cast
@@ -21,6 +22,7 @@ from ...models.task import TaskStatus
 from ...services.agent_service_manager import get_agent_manager
 from ...services.channel_delivery import (
     ChannelDelivery,
+    ChannelDeliveryDiscarded,
     discard_channel_task_results,
     recover_channel_results,
 )
@@ -91,6 +93,7 @@ class FeishuBotInstance(BatchChannelControl[str]):
         self._initialize_batch_control()
         self.user_active_trace_handlers: dict[str, FeishuTraceHandler] = {}
         self.control_tasks: set[asyncio.Task] = set()
+        self.control_queues: dict[str, deque[tuple[Any, str | None]]] = {}
         self.control_locks: dict[str, asyncio.Lock] = {}
         self._ping_task: asyncio.Task | None = None
         self._accepting = True
@@ -175,11 +178,19 @@ class FeishuBotInstance(BatchChannelControl[str]):
                             and int(previous) > 0
                             and self.channel_id is not None
                         ):
-                            await discard_channel_task_results(
-                                channel_id=self.channel_id,
-                                external_user_id=open_id,
-                                task_id=int(previous),
-                            )
+                            try:
+                                await discard_channel_task_results(
+                                    channel_id=self.channel_id,
+                                    external_user_id=open_id,
+                                    task_id=int(previous),
+                                )
+                            except Exception:
+                                logger.exception("Failed to discard old Feishu replies")
+                                await self._send_text(
+                                    chat_id,
+                                    "The new conversation is selected, but I couldn't finish cleaning up the previous replies. You can send your new request.",
+                                )
+                                return
                         reply = "Started a new task. Please describe your request."
                 else:
                     stopped = self._stop_current_conversation(open_id)
@@ -197,6 +208,9 @@ class FeishuBotInstance(BatchChannelControl[str]):
             )
         except Exception:
             logger.exception("Failed to handle Feishu control command")
+            await self._send_text(
+                chat_id, "I couldn't complete that command. Please try again."
+            )
 
     def _handle_message_sync(self, data: Any) -> None:
         if not self._accepting:
@@ -222,14 +236,31 @@ class FeishuBotInstance(BatchChannelControl[str]):
             open_id = event.sender.sender_id.open_id
 
             command = self._control_command(data)
-            if command is not None:
-                task = loop.create_task(self._handle_control(open_id, data, command))
-                self.control_tasks.add(task)
-                task.add_done_callback(self.control_tasks.discard)
+            if command is not None or open_id in self.control_queues:
+                if open_id not in self.control_queues:
+                    self.control_queues[open_id] = deque()
+                    task = loop.create_task(self._process_control_queue(open_id))
+                    self.control_tasks.add(task)
+                    task.add_done_callback(self.control_tasks.discard)
+                self.control_queues[open_id].append((data, command))
                 return
             self._enqueue_user_message(open_id, data)
         else:
             logger.error("No running event loop to schedule Feishu message processing")
+
+    async def _process_control_queue(self, open_id: str) -> None:
+        # Serialize authorization and following inputs, never the execution itself.
+        # Later messages cannot enter the old queue while a command awaits the DB.
+        queue = self.control_queues[open_id]
+        try:
+            while queue and self._accepting:
+                data, command = queue.popleft()
+                if command is None:
+                    self._enqueue_user_message(open_id, data)
+                else:
+                    await self._handle_control(open_id, data, command)
+        finally:
+            self.control_queues.pop(open_id, None)
 
     async def _process_queued_batch(self, open_id: str, messages: list[Any]) -> None:
         await self._process_messages_batch(open_id, messages)
@@ -517,19 +548,24 @@ class FeishuBotInstance(BatchChannelControl[str]):
                 async def deliver_current(
                     delivery: ChannelDelivery, result: dict[str, Any]
                 ) -> None:
-                    if self._conversation_generation(open_id) == generation:
-                        await self._deliver_shared_result(
-                            delivery,
-                            result,
-                            is_current=lambda: self._conversation_generation(open_id)
-                            == generation,
-                        )
+                    if self._conversation_generation(open_id) != generation:
+                        raise ChannelDeliveryDiscarded
+                    await self._deliver_shared_result(
+                        delivery,
+                        result,
+                        is_current=lambda: self._conversation_generation(open_id)
+                        == generation,
+                    )
 
                 delivered = await shared_turn.deliver(
                     deliver_current,
                     pending_notice=result.get("status") == "accepted",
                 )
-                awaiting_shared_delivery = not delivered
+                awaiting_shared_delivery = (
+                    result.get("status") == "accepted"
+                    and not delivered
+                    and self._conversation_generation(open_id) == generation
+                )
                 return
             else:
                 local_service: Any = agent_service
@@ -665,7 +701,7 @@ class FeishuBotInstance(BatchChannelControl[str]):
         if is_current is None:
             selected_task = self.active_tasks.get(delivery.external_user_id)
             if selected_task is not None and selected_task != str(delivery.task_id):
-                return
+                raise ChannelDeliveryDiscarded
             generation = self._conversation_generation(delivery.external_user_id)
 
             def is_current() -> bool:
@@ -675,7 +711,7 @@ class FeishuBotInstance(BatchChannelControl[str]):
                 )
 
         if not is_current():
-            return
+            raise ChannelDeliveryDiscarded
         projection = project_execution_result_for_channel(result)
         chat_id = delivery.destination["chat_id"]
         loading_id = delivery.destination["loading_message_id"]
@@ -693,9 +729,11 @@ class FeishuBotInstance(BatchChannelControl[str]):
             )
         elif not await self._send_text(chat_id, chunks[0]):
             raise ConnectionError("Feishu final message was not accepted")
+        if not is_current():
+            raise ChannelDeliveryDiscarded
         for chunk in chunks[1:]:
             if not is_current():
-                return
+                raise ChannelDeliveryDiscarded
             if not await self._send_text(chat_id, chunk):
                 raise ConnectionError("Feishu final message was not accepted")
 
@@ -967,6 +1005,7 @@ class FeishuBotInstance(BatchChannelControl[str]):
             self.user_message_tasks.clear()
             self.user_message_queues.clear()
             self.control_tasks.clear()
+            self.control_queues.clear()
             self.control_locks.clear()
             self.user_active_executions.clear()
             self.user_active_trace_handlers.clear()

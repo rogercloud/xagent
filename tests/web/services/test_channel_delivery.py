@@ -612,3 +612,28 @@ async def test_feishu_new_fences_already_claimed_recovery(
     bot._update_text.assert_not_awaited()
     with get_session_local()() as db:
         assert db.get(TaskChannelDelivery, accepted).status == "discarded"
+
+
+@pytest.mark.asyncio
+async def test_feishu_recovery_records_abandoned_reply_as_discarded(accepted, selected):
+    from xagent.web.channels.feishu.bot import FeishuBotInstance
+
+    complete(accepted)
+    bot = object.__new__(FeishuBotInstance)
+    bot._initialize_batch_control()
+    bot.active_tasks = {selected.selection.external_user_id: "-1"}
+    bot._send_text = AsyncMock()
+    bot._update_text = AsyncMock()
+    assert not await delivery.deliver_channel_result(
+        accepted, bot._deliver_shared_result
+    )
+    bot._send_text.assert_not_awaited()
+    bot._update_text.assert_not_awaited()
+    with get_session_local()() as db:
+        row = db.get(TaskChannelDelivery, accepted)
+        assert row.status == "discarded"
+        assert row.delivered_at is None
+        assert row.failure_count == 0
+    retry = AsyncMock()
+    await delivery.recover_channel_results(selected.selection.channel_id, retry)
+    retry.assert_not_awaited()
