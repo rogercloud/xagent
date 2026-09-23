@@ -3665,6 +3665,8 @@ def test_message_send_reports_unknown_without_closing_interaction():
     schedule.assert_not_awaited()
     db = _direct_db_session()
     try:
+        # Transitional pre-producer behavior; R1 must replace this restoration.
+        assert db.get(Task, task_id).status == TaskStatus.PAUSED
         assert (
             db.query(TaskInteractionRequest)
             .filter(TaskInteractionRequest.id == row_id)

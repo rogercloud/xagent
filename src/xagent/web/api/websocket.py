@@ -124,6 +124,7 @@ from ..services.task_command_transport import (
     TaskCommandTaskMissing,
     dispatch_task_command_promptly,
     enqueue_task_command,
+    existing_task_command_payload_matches,
 )
 
 # The v1 SSE endpoint imports this shared predicate from this module.
@@ -1559,29 +1560,18 @@ def _enqueue_websocket_task_command_sync(
             ):
                 payload_matches = existing_delivery.payload_matches
                 if existing_delivery.outcome_unknown:
-                    from ..models.task_command import TaskExecutionCommand
-
-                    original_command = (
-                        db.query(TaskExecutionCommand.id)
-                        .filter(
-                            TaskExecutionCommand.task_id == task_id,
-                            TaskExecutionCommand.command_id == command_id,
-                        )
-                        .first()
+                    # Preparation can deduplicate or skip attachment IDs.
+                    # Compare with the original command when it still exists.
+                    original_matches = existing_task_command_payload_matches(
+                        db,
+                        task_id=task_id,
+                        command_id=command_id,
+                        actor_user_id=actor_user_id,
+                        kind=kind,
+                        payload=payload,
                     )
-                    if original_command is not None:
-                        # Preparation can deduplicate or skip attachment IDs.
-                        # Compare retries with the original command payload,
-                        # not the normalized delivery attachments.
-                        original = enqueue_task_command(
-                            db,
-                            task_id=task_id,
-                            actor_user_id=actor_user_id,
-                            command_id=command_id,
-                            kind=kind,
-                            payload=payload,
-                        )
-                        payload_matches = original.payload_matches
+                    if original_matches is not None:
+                        payload_matches = original_matches
                 return EnqueuedTaskCommand(
                     command_id=0,
                     client_command_id=command_id,
