@@ -253,8 +253,81 @@ class ExecutionRegistry:
             request_interrupt=request_interrupt,
             reason=reason,
         )
+        self._emit_message_posted(
+            execution_id,
+            result,
+            message=message,
+            execution_message=execution_message,
+            display_message=display_message,
+            files=files,
+            turn_id=turn_id,
+            request_interrupt=request_interrupt,
+        )
+        return result
+
+    async def settle_injection_against_checkpoint(
+        self,
+        execution_id: str,
+        message: str | None = None,
+        *,
+        execution_message: str | None = None,
+        display_message: str | None = None,
+        files: list[dict[str, Any]] | None = None,
+        turn_id: str,
+    ) -> UserMessageInjectionResult:
+        """Route to ``AgentRunner.settle_injection_against_checkpoint``;
+        emits ``execution.message_posted`` on the same terms as
+        ``post_user_message``."""
         handle = self.get(execution_id)
-        if handle is not None and result.context is not None:
+        if handle is None:
+            return UserMessageInjectionResult(
+                context=None,
+                outcome=UserMessageInjectionOutcome.NOT_POSTED,
+            )
+        handle.updated_at = _utcnow()
+        result = await handle.runner.settle_injection_against_checkpoint(
+            execution_id,
+            message,
+            execution_message=execution_message,
+            display_message=display_message,
+            files=files,
+            turn_id=turn_id,
+        )
+        self._emit_message_posted(
+            execution_id,
+            result,
+            message=message,
+            execution_message=execution_message,
+            display_message=display_message,
+            files=files,
+            turn_id=turn_id,
+            request_interrupt=False,
+        )
+        return result
+
+    def _emit_message_posted(
+        self,
+        execution_id: str,
+        result: UserMessageInjectionResult,
+        *,
+        message: str | None,
+        execution_message: str | None,
+        display_message: str | None,
+        files: list[dict[str, Any]] | None,
+        turn_id: str | None,
+        request_interrupt: bool,
+    ) -> None:
+        handle = self.get(execution_id)
+        # Only a durable, applied turn is a "message posted" event.
+        # ``OUTCOME_UNKNOWN`` has a non-``None`` context too (see
+        # ``UserMessageInjectionOutcome``'s docstring) but was explicitly
+        # NOT applied to it -- emitting this event for it would tell
+        # listeners a message landed when it is, by definition, unknown
+        # whether it did.
+        if handle is not None and result.outcome in (
+            UserMessageInjectionOutcome.POSTED_FRESH,
+            UserMessageInjectionOutcome.POSTED_REPLAY,
+        ):
             resolved_execution_message = (
                 execution_message if execution_message is not None else message
             )
@@ -273,7 +346,6 @@ class ExecutionRegistry:
                     "request_interrupt": request_interrupt,
                 },
             )
-        return result
 
     def _on_task_done(
         self,

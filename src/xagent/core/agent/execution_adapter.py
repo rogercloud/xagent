@@ -229,6 +229,33 @@ class AgentExecutionAdapter:
         )
         return result.outcome
 
+    async def settle_injection_against_checkpoint(
+        self,
+        execution_id: str,
+        message: str | None = None,
+        *,
+        execution_message: str | None = None,
+        display_message: str | None = None,
+        files: list[dict[str, Any]] | None = None,
+        turn_id: str,
+    ) -> UserMessageInjectionOutcome:
+        if self.registry.get(execution_id) is None:
+            runner, execution_type = self._build_runner()
+            self.registry.register(
+                execution_id,
+                runner,
+                metadata=self._execution_metadata(execution_type=execution_type),
+            )
+        result = await self.registry.settle_injection_against_checkpoint(
+            execution_id,
+            message,
+            execution_message=execution_message,
+            display_message=display_message,
+            files=files,
+            turn_id=turn_id,
+        )
+        return result.outcome
+
     def cancel(self, execution_id: str, reason: str | None = None) -> bool:
         return self.registry.cancel(execution_id, reason=reason)
 

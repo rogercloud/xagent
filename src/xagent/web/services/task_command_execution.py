@@ -1335,7 +1335,14 @@ async def handle_task_message(
     suppress_delivery_ack = bool(message_data.get("_durable_ack_sent"))
     delivery_finished = False
     delivery_dispatched = False
+    # Confirmed injection only (POSTED_FRESH/POSTED_REPLAY): the turn is
+    # durably in the checkpoint, so a later failure must not mark it FAILED.
     delivery_injected = False
+    # The live injection came back OUTCOME_UNKNOWN: it may or may not have
+    # committed. If the resume hand-off that would settle it never gets
+    # registered, the failure path below must still leave the row terminal
+    # without inviting a resend (see ``finish_delivery_failure``).
+    delivery_outcome_unknown = False
     delivery_claimed = False
     delivery_failure_persist_attempted = False
     delivery_failure_pool_timeout = False
@@ -1388,12 +1395,21 @@ async def handle_task_message(
             # exception reaches another handler layer, that layer must not
             # issue the same write again against the exhausted pool.
             delivery_failure_persist_attempted = True
+            # An unknown injection outcome is not evidence the turn was NOT
+            # applied, so it must not become FAILED (that tells a same-id
+            # retry to resend under a new id, possibly applying it twice).
+            # With no registered resume owner left to settle it, DISPATCHED
+            # is the "do not resend" terminal -- at most once, outcome
+            # unknown -- rather than a PENDING row nothing would ever settle.
+            failure_status = (
+                DELIVERY_DISPATCHED if delivery_outcome_unknown else DELIVERY_FAILED
+            )
             try:
                 await run_db_io_cancellation_safe(
                     lambda: mark_user_message_delivery_sync(
                         task_id,
                         turn_id,
-                        DELIVERY_FAILED,
+                        failure_status,
                     )
                 )
             except Exception as delivery_error:
@@ -1409,6 +1425,13 @@ async def handle_task_message(
                 )
         if delivery_dispatched:
             await finish_delivery(True)
+        elif delivery_outcome_unknown:
+            await finish_delivery(
+                False,
+                client_error_message(ClientErrorCode.MESSAGE_OUTCOME_UNKNOWN),
+                error_code=ClientErrorCode.MESSAGE_OUTCOME_UNKNOWN.value,
+                rejection_outcome="outcome_unknown",
+            )
         else:
             await finish_delivery(
                 False,
@@ -1852,14 +1875,40 @@ async def handle_task_message(
                                     ClientErrorCode.TASK_CHECKPOINT_UNREADABLE
                                 )
                                 return
-                    delivery_injected = bool(posted)
-                    if not posted:
-                        logger.warning(
-                            "Agent execution %s had no exact live lease or "
-                            "checkpoint; deferring the durable user message "
-                            "until the resume owner is ready",
-                            task_id,
-                        )
+                    # ``OUTCOME_UNKNOWN`` is truthy (see
+                    # ``UserMessageInjectionOutcome``'s docstring) but is
+                    # explicitly NOT a confirmed delivery: the persist
+                    # write raised and the read-back taken to disambiguate
+                    # it could not itself confirm or rule out the write.
+                    # It must be handed to the resume owner exactly like
+                    # ``NOT_POSTED`` below -- re-injecting with the same
+                    # ``turn_id`` there is idempotent, and if that is still
+                    # unknown the owner settles it against the checkpoint
+                    # its resume rebuilds from (``settle_unknown_injection``)
+                    # -- never treated as an already-dispatched delivery.
+                    posted_confirmed = posted in (
+                        UserMessageInjectionOutcome.POSTED_FRESH,
+                        UserMessageInjectionOutcome.POSTED_REPLAY,
+                    )
+                    delivery_injected = posted_confirmed
+                    delivery_outcome_unknown = (
+                        posted is UserMessageInjectionOutcome.OUTCOME_UNKNOWN
+                    )
+                    if not posted_confirmed:
+                        if posted is UserMessageInjectionOutcome.OUTCOME_UNKNOWN:
+                            logger.warning(
+                                "Agent execution %s injection outcome is "
+                                "unknown; deferring the durable user message "
+                                "until the resume owner can retry it",
+                                task_id,
+                            )
+                        else:
+                            logger.warning(
+                                "Agent execution %s had no exact live lease or "
+                                "checkpoint; deferring the durable user message "
+                                "until the resume owner is ready",
+                                task_id,
+                            )
                     handoff_snapshot = await task_execution_controller.transition(
                         task_id,
                         TaskControlState.RESUME_REQUESTED,
@@ -1899,7 +1948,7 @@ async def handle_task_message(
                             resolved_execution_scope=resolved_execution_scope,
                             pending_user_message=(
                                 None
-                                if posted
+                                if posted_confirmed
                                 else {
                                     "execution_message": user_message_for_llm,
                                     "display_message": display_user_message,
@@ -1914,10 +1963,10 @@ async def handle_task_message(
                                 }
                             ),
                             delivery_turn_id=turn_id,
-                            delivery_already_dispatched=bool(posted),
+                            delivery_already_dispatched=posted_confirmed,
                             delivery_notifier=(
                                 None
-                                if posted or suppress_delivery_ack
+                                if posted_confirmed or suppress_delivery_ack
                                 else make_delivery_notifier(reply, client_message_id)
                             ),
                         )
@@ -1937,7 +1986,10 @@ async def handle_task_message(
                         run_id=handoff_snapshot.run_id,
                     )
                     handoff_registered = True
-                    if posted:
+                    # From here the registered resume owner settles an
+                    # unknown outcome; this handler must not write it.
+                    delivery_outcome_unknown = False
+                    if posted_confirmed:
                         # Registration completes the local resume handoff.
                         # The delivery marker is a best-effort projection and
                         # must not reject a turn that is already resumable.
@@ -2038,7 +2090,16 @@ async def handle_task_message(
                         )
                     raise
 
-                if posted:
+                # ``OUTCOME_UNKNOWN`` is NOT settled here: it took the same
+                # branch as ``NOT_POSTED`` above (``posted_confirmed`` is
+                # false for both), so ``pending_user_message`` and a
+                # ``delivery_notifier`` were handed to the resume owner
+                # instead. That background resume re-injects, settles a
+                # still-unknown outcome against its checkpoint, moves the
+                # delivery row to a terminal state, and replies to the
+                # client -- with ``outcome_unknown`` if it still cannot be
+                # determined -- through that notifier; nothing to do here.
+                if posted_confirmed:
                     await finish_delivery(True)
                 return
             elif task_uses_live_control:

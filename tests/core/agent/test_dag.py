@@ -50,6 +50,7 @@ from xagent.core.agent.pattern.dag.plan_generator import (
 )
 from xagent.core.agent.pattern.react import ReActPattern
 from xagent.core.agent.pattern.react.react import ToolCallRecord
+from xagent.core.agent.runner import UserMessageInjectionOutcome
 from xagent.core.memory.core import MemoryNote as StoredMemoryNote
 from xagent.core.memory.core import MemoryResponse
 from xagent.core.model.chat.types import ChunkType, StreamChunk
@@ -3034,6 +3035,107 @@ async def test_dag_pattern_executes_independent_ready_steps_concurrently() -> No
         "step_4": "Task 4 done",
         "step_5": "Task 5 done",
     }
+
+
+class BlockingOnceCheckpointStore:
+    """Records every checkpoint like ``TracerCheckpointStore`` above, but
+    blocks the FIRST write until released -- used to hold the context's
+    write lock open (``PatternRuntime.checkpoint`` takes it for the whole
+    snapshot -> persist -> confirm sequence) while a concurrent injection
+    is attempted, so a real DAG run can prove the lock does not deadlock
+    against a concurrent ``AgentRunner.inject_user_message`` (R1 deadlock
+    guard, design doc S7 risk 2)."""
+
+    def __init__(self) -> None:
+        self.by_execution_id: dict[str, dict[str, Any]] = {}
+        self.checkpoints: list[dict[str, Any]] = []
+        self.entered = asyncio.Event()
+        self.release = asyncio.Event()
+        self._blocked_once = False
+
+    async def checkpoint(self, **payload: Any) -> None:
+        if not self._blocked_once:
+            self._blocked_once = True
+            self.entered.set()
+            await self.release.wait()
+        self.by_execution_id[str(payload["execution_id"])] = dict(payload)
+        self.checkpoints.append(dict(payload))
+
+    async def load_latest_checkpoint(self, execution_id: str) -> dict[str, Any] | None:
+        payload = self.by_execution_id.get(execution_id)
+        return dict(payload) if payload is not None else None
+
+
+@pytest.mark.asyncio
+async def test_dag_checkpoint_and_concurrent_injection_do_not_deadlock() -> None:
+    """R1 deadlock guard: a real DAG run with two concurrent steps takes
+    the context's write lock for its ``dag_before_ready_batch`` checkpoint.
+    An ``AgentRunner.inject_user_message`` call arriving on the same
+    context while that write is in flight must wait for the lock rather
+    than deadlock (``asyncio.wait_for`` timeouts below would fail the test
+    on a hang), and once both complete, the DAG's own next checkpoint must
+    already contain the injected message -- proving the injection was not
+    silently lost to a stale pre-checkpoint snapshot."""
+    tracer = BlockingOnceCheckpointStore()
+    execution_id = "dag-inject-race"
+    context = ExecutionContext(execution_id=execution_id)
+    runner = AgentRunner(agent=Agent(name="writer", patterns=[]), tracer=tracer)
+    runner.context_manager.set_context(context)
+
+    llm = ConcurrentStepLLM()
+    pattern = DAGPattern(
+        lambda **_: build_plan(
+            PlanStep(id="step_1", task="Task 1"),
+            PlanStep(id="step_2", task="Task 2"),
+        ),
+        max_concurrency=2,
+    )
+
+    run_task = asyncio.create_task(
+        pattern.run(
+            context=context,
+            tools=[],
+            llm=llm,
+            runtime=PatternRuntime(tracer=tracer, execution_id=execution_id),
+        )
+    )
+    try:
+        # The DAG's "dag_before_ready_batch" checkpoint is now blocked
+        # inside the store, holding the context's write lock.
+        await asyncio.wait_for(tracer.entered.wait(), timeout=5)
+
+        inject_task = asyncio.create_task(
+            runner.inject_user_message(
+                execution_id, "Use metric units.", request_interrupt=False
+            )
+        )
+        try:
+            await asyncio.sleep(0.05)
+            # Waiting on the lock, not deadlocked and not skipped either.
+            assert not inject_task.done()
+
+            tracer.release.set()
+            llm.release.set()
+
+            inject_result = await asyncio.wait_for(inject_task, timeout=10)
+        finally:
+            if not inject_task.done():
+                inject_task.cancel()
+
+        result = await asyncio.wait_for(run_task, timeout=10)
+    finally:
+        if not run_task.done():
+            run_task.cancel()
+
+    assert inject_result.outcome is UserMessageInjectionOutcome.POSTED_FRESH
+    assert result["success"] is True
+
+    last_checkpoint = tracer.checkpoints[-1]
+    last_messages = last_checkpoint["context"]["messages"]
+    assert any(
+        message["role"] == "user" and message["content"] == "Use metric units."
+        for message in last_messages
+    )
 
 
 @pytest.mark.asyncio

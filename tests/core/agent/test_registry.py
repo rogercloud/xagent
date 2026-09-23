@@ -227,6 +227,52 @@ async def test_registry_emits_lifecycle_and_message_events(
 
 
 @pytest.mark.asyncio
+async def test_registry_does_not_emit_message_posted_for_outcome_unknown(
+    tmp_path: Path,
+) -> None:
+    """``OUTCOME_UNKNOWN`` has a non-``None`` context (see
+    ``UserMessageInjectionOutcome``'s docstring) but was explicitly NOT
+    applied to it. ``execution.message_posted`` must only fire for a
+    durably-applied turn (``POSTED_FRESH``/``POSTED_REPLAY``), never for
+    an outcome whose delivery is, by definition, unconfirmed."""
+    tracer = TracerCheckpointStore()
+    execution_id = "exec-unknown-event"
+    registry = ExecutionRegistry()
+    events: list[dict[str, Any]] = []
+    registry.subscribe(events.append)
+    agent = Agent(name="writer", patterns=[])
+    runner = AgentRunner(
+        agent=agent,
+        tracer=tracer,
+        workspace_manager=FakeWorkspaceManager(tmp_path),
+    )
+    agent.patterns = [InterruptingPattern(runner, execution_id)]
+
+    handle = registry.start(runner, execution_id=execution_id, task="Calculate 6*7")
+    await handle.task
+
+    unknown_context = ExecutionContext(execution_id=execution_id)
+
+    async def fake_inject_user_message(*_args: Any, **_kwargs: Any) -> Any:
+        from xagent.core.agent.runner import UserMessageInjectionResult
+
+        return UserMessageInjectionResult(
+            context=unknown_context,
+            outcome=UserMessageInjectionOutcome.OUTCOME_UNKNOWN,
+        )
+
+    runner.inject_user_message = fake_inject_user_message  # type: ignore[method-assign]
+
+    result = await registry.post_user_message(
+        execution_id, "Reply", request_interrupt=False
+    )
+
+    assert result.outcome is UserMessageInjectionOutcome.OUTCOME_UNKNOWN
+    event_types = [event["type"] for event in events]
+    assert "execution.message_posted" not in event_types
+
+
+@pytest.mark.asyncio
 async def test_registry_logs_async_subscriber_failures(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

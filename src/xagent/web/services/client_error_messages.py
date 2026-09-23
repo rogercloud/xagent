@@ -58,6 +58,7 @@ class ClientErrorCode(StrEnum):
     AUTHENTICATION_REQUIRED = "authentication_required"
     TASK_ACCESS_DENIED = "task_access_denied"
     INVALID_MESSAGE = "invalid_message"
+    MESSAGE_OUTCOME_UNKNOWN = "message_outcome_unknown"
 
 
 def client_error_message(code: ClientErrorCode) -> str:
@@ -114,6 +115,15 @@ def client_error_message(code: ClientErrorCode) -> str:
         ),
         ClientErrorCode.TASK_ACCESS_DENIED: "You do not have access to this task.",
         ClientErrorCode.INVALID_MESSAGE: "The message format is invalid.",
+        # Deliberately not the same wording as MESSAGE_ACCEPTANCE_PENDING:
+        # that message tells the client to retry, but retrying with the
+        # same id here would just replay the dispatched delivery and come
+        # back "accepted" -- which would misrepresent an outcome that is,
+        # and stays, genuinely unconfirmed.
+        ClientErrorCode.MESSAGE_OUTCOME_UNKNOWN: (
+            "The message may or may not have been applied. Check the "
+            "conversation before sending it again."
+        ),
     }[code]
 
 

@@ -1,14 +1,15 @@
 from __future__ import annotations
 
+import asyncio
 import copy
 import json
 import logging
-from collections import Counter
+from collections import Counter, deque
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from enum import Enum
 from functools import lru_cache
-from typing import Any, Literal
+from typing import Any, Literal, cast
 from uuid import uuid4
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -459,6 +460,232 @@ def tool_evidence_state(context: Any) -> EvidenceState:
     )
 
 
+# Private ``__dict__`` key under which ``context_write_lock`` caches the
+# per-context checkpoint write gate. Not a dataclass field on purpose: it
+# must never appear in ``to_dict()``, ``__eq__`` or ``__repr__``, and
+# ``ExecutionContext.__deepcopy__``/``__copy__`` deliberately drop it so a
+# copied context always gets its own independent gate (see their
+# docstrings) instead of sharing, or crashing on, the original's.
+_CHECKPOINT_WRITE_LOCK_ATTR = "_checkpoint_write_lock"
+
+
+class _ContextGate:
+    """Shared/exclusive gate serializing checkpoint writes for one context.
+
+    ``PatternRuntime.checkpoint`` acquires SHARED: concurrent pattern
+    checkpoints for the same context (e.g. two DAG steps racing their own
+    checkpoints) run in parallel among themselves, exactly as they did on
+    base before this gate existed. ``AgentRunner.inject_user_message``
+    acquires EXCLUSIVE around its whole snapshot -> persist -> confirm
+    sequence, so an injection can never interleave with, or be
+    interleaved by, any in-flight pattern checkpoint for the same context.
+
+    Writer preference: once an exclusive acquire is waiting, new shared
+    acquires block behind it too, so a steady stream of pattern
+    checkpoints cannot starve a pending injection. An in-flight shared
+    holder is still allowed to finish -- the exclusive acquire waits for
+    it -- but no *new* shared acquire can jump the queue once a writer is
+    waiting.
+
+    ``acquire``/``release``/``locked``/``async with gate:`` are the
+    EXCLUSIVE mode, kept API-compatible with the plain ``asyncio.Lock``
+    this gate replaces so existing callers and tests that only ever used
+    the exclusive path (including the cross-event-loop rebind tests)
+    keep working unchanged. ``gate.shared()`` returns a separate async
+    context manager for the shared mode.
+
+    Wakeup invariant (what makes this free of lost wakeups): a waiter only
+    parks while its own predicate is false -- EXCLUSIVE waits for
+    ``not _exclusive_held and _shared_count == 0``, SHARED waits for
+    ``not _exclusive_held and _exclusive_waiting == 0`` -- and EVERY state
+    transition that can turn either predicate true wakes ALL parked
+    waiters, which then re-check. There are exactly three such
+    transitions: an exclusive ``release`` (held -> not held), the last
+    ``release_shared`` (shared count -> 0), and an exclusive attempt that
+    leaves ``acquire`` WITHOUT acquiring (cancellation) and so drops
+    ``_exclusive_waiting`` to 0. (An exclusive attempt that does acquire
+    also decrements it, but sets ``_exclusive_held`` in the same
+    synchronous step, so the shared predicate stays false and nothing
+    needs waking.) Because wakeups are broadcast rather than handed to a
+    single waiter, a woken waiter that is cancelled before it runs never
+    swallows a grant somebody else needed: every other waiter parked at
+    that moment was woken too. The rest (incrementing ``_shared_count``
+    or ``_exclusive_waiting``, setting ``_exclusive_held``) can only turn
+    predicates false and need no wakeup. Keep this invariant when
+    changing any of the methods below.
+
+    Deliberately not built on ``asyncio.Condition``: ``release`` and
+    ``release_shared`` must stay synchronous (``asyncio.Lock``-compatible
+    ``release()``), which ``Condition.notify_all`` -- it requires holding
+    the condition's lock, i.e. an ``await`` -- cannot provide, and before
+    Python 3.13 ``Condition.wait`` itself could drop a ``notify`` whose
+    woken task was cancelled at the same time (the very bug class this
+    invariant rules out).
+    """
+
+    def __init__(self) -> None:
+        self._shared_count = 0
+        self._exclusive_held = False
+        self._exclusive_waiting = 0
+        self._waiters: "deque[asyncio.Future[None]]" = deque()
+
+    def locked(self) -> bool:
+        return self._exclusive_held or self._shared_count > 0
+
+    def _wake_waiters(self) -> None:
+        # Single-threaded event loop: nothing runs between here and the
+        # caller's next await, so a plain wake-all-and-recheck is race
+        # free. Waiters that lost the race simply go back to waiting.
+        waiters, self._waiters = self._waiters, deque()
+        for fut in waiters:
+            if not fut.done():
+                fut.set_result(None)
+
+    async def _wait(self) -> None:
+        fut = asyncio.get_running_loop().create_future()
+        self._waiters.append(fut)
+        try:
+            await fut
+        finally:
+            try:
+                self._waiters.remove(fut)
+            except ValueError:
+                pass
+
+    async def acquire(self) -> None:
+        """Acquire EXCLUSIVE: waits for all shared holders and any other
+        exclusive holder, and blocks new shared acquires while waiting."""
+        self._exclusive_waiting += 1
+        acquired = False
+        try:
+            while self._exclusive_held or self._shared_count > 0:
+                await self._wait()
+            acquired = True
+        finally:
+            self._exclusive_waiting -= 1
+            if not acquired and self._exclusive_waiting == 0:
+                # Abandoned (cancelled) without acquiring, and no other
+                # writer is waiting any more: shared waiters that parked
+                # only because this attempt was pending may now proceed,
+                # and nothing else would ever wake them. See the wakeup
+                # invariant in the class docstring.
+                self._wake_waiters()
+        # No await between the loop's final predicate check and here, so
+        # nothing can have taken the gate in between.
+        self._exclusive_held = True
+
+    def release(self) -> None:
+        if not self._exclusive_held:
+            raise RuntimeError("release() called on an unlocked gate")
+        self._exclusive_held = False
+        self._wake_waiters()
+
+    async def __aenter__(self) -> "_ContextGate":
+        await self.acquire()
+        return self
+
+    async def __aexit__(self, *exc_info: Any) -> None:
+        self.release()
+
+    async def acquire_shared(self) -> None:
+        while self._exclusive_held or self._exclusive_waiting > 0:
+            await self._wait()
+        self._shared_count += 1
+
+    def release_shared(self) -> None:
+        if self._shared_count <= 0:
+            raise RuntimeError("release_shared() called with no shared holders")
+        self._shared_count -= 1
+        if self._shared_count == 0:
+            self._wake_waiters()
+
+    def shared(self) -> "_SharedGateContext":
+        return _SharedGateContext(self)
+
+
+class _SharedGateContext:
+    """Async context manager for ``_ContextGate``'s SHARED mode."""
+
+    def __init__(self, gate: _ContextGate) -> None:
+        self._gate = gate
+
+    async def __aenter__(self) -> _ContextGate:
+        await self._gate.acquire_shared()
+        return self._gate
+
+    async def __aexit__(self, *exc_info: Any) -> None:
+        self._gate.release_shared()
+
+
+def context_write_lock(context: Any) -> _ContextGate:
+    """Return the per-context gate serializing checkpoint writes.
+
+    Both ``PatternRuntime.checkpoint`` (SHARED) and
+    ``AgentRunner.inject_user_message`` (EXCLUSIVE) take this gate around
+    the whole snapshot -> persist -> confirm sequence -- see
+    ``_ContextGate`` for what each mode allows to run concurrently.
+
+    The gate is cached on ``context.__dict__[_CHECKPOINT_WRITE_LOCK_ATTR]``
+    alongside the event loop it was created on. The internal waiters are
+    plain ``asyncio.Future`` objects bound to the loop that created them,
+    so a context reused across loops (chiefly: the same singleton-backed
+    context object surviving across independently loop-scoped tests)
+    needs a fresh gate rather than one bound to a now-dead loop:
+
+    - loop unchanged: return the cached gate.
+    - loop changed and the cached gate is not currently held: rebind by
+      handing back a brand-new gate for the new loop.
+    - loop changed and the cached gate IS currently held (shared or
+      exclusive): this would mean two event loops are writing checkpoints
+      for the same context at the same time, which the design does not
+      support. Raise loudly instead of silently handing out a gate that
+      would not actually serialize against the in-flight write on the
+      other loop.
+
+    If ``context`` has no ``__dict__`` at all (a minimal test double, never
+    a real ``ExecutionContext``), a gate cannot be cached on it, so a new
+    gate is returned on every call -- equivalent to not locking. Real
+    ``ExecutionContext`` instances always have ``__dict__`` and always go
+    through the caching path above.
+    """
+    target_dict = getattr(context, "__dict__", None)
+    if target_dict is None:
+        return _ContextGate()
+
+    loop = asyncio.get_running_loop()
+    cached = target_dict.get(_CHECKPOINT_WRITE_LOCK_ATTR)
+    if cached is not None:
+        cached_loop, cached_gate = cached
+        if cached_loop is loop:
+            return cast(_ContextGate, cached_gate)
+        if cached_gate.locked():
+            raise RuntimeError("execution context written from two event loops")
+    gate = _ContextGate()
+    target_dict[_CHECKPOINT_WRITE_LOCK_ATTR] = (loop, gate)
+    return gate
+
+
+def serialize_message(message: Message) -> dict[str, Any]:
+    """Durable ``dict`` shape for one ``Message``, as written into a
+    checkpoint's ``context.messages``. Extracted out of ``to_dict()`` so an
+    injection candidate snapshot (``context.to_dict()`` plus one appended
+    message) and a live snapshot serialize a given message identically.
+    """
+    return {
+        "role": message.role,
+        "content": message.content,
+        "timestamp": message.timestamp.isoformat(),
+        "metadata": message.metadata,
+        "tool_calls": message.tool_calls,
+        "tool_call_id": message.tool_call_id,
+        "hidden": message.hidden,
+        "output_tokens": message.output_tokens,
+        "context_refs": [
+            reference.durable_dict() for reference in message.context_refs
+        ],
+    }
+
+
 @dataclass
 class ExecutionContext:
     """Execution state plus pluggable runtime components."""
@@ -477,6 +704,38 @@ class ExecutionContext:
     def __post_init__(self) -> None:
         self.components.setdefault("workspace", WorkspaceComponent())
         self.components.setdefault("memory", MemoryComponent())
+
+    def __deepcopy__(self, memo: dict[int, Any]) -> "ExecutionContext":
+        # Never deep-copy the cached ``(loop, gate)`` pair from
+        # ``context_write_lock``: the cached event loop is not
+        # deepcopyable at all (``copy.deepcopy`` cannot pickle a running
+        # loop), and even if it could be, a copy sharing the original's
+        # gate (or getting a deep-copied, dead one) would defeat the
+        # write-serialization invariant. Dropping the key means the copy
+        # simply has none cached yet -- ``context_write_lock(copy)`` mints
+        # an independent one on first use, exactly like a context that was
+        # never locked.
+        cls = self.__class__
+        new = cls.__new__(cls)
+        memo[id(self)] = new
+        for key, value in self.__dict__.items():
+            if key == _CHECKPOINT_WRITE_LOCK_ATTR:
+                continue
+            setattr(new, key, copy.deepcopy(value, memo))
+        return new
+
+    def __copy__(self) -> "ExecutionContext":
+        # Same rationale as ``__deepcopy__``: a shallow copy must not carry
+        # over the write lock either, or two objects would serialize
+        # against the same lock while callers reasonably assume the copy is
+        # independent.
+        cls = self.__class__
+        new = cls.__new__(cls)
+        for key, value in self.__dict__.items():
+            if key == _CHECKPOINT_WRITE_LOCK_ATTR:
+                continue
+            setattr(new, key, value)
+        return new
 
     def get_component(self, name: str) -> ExecutionComponent | None:
         return self.components.get(name)
@@ -524,6 +783,20 @@ class ExecutionContext:
 
     def add_message(self, role: str, content: str, **kwargs: Any) -> Message:
         message = Message(role=role, content=content, **kwargs)
+        self.messages.append(message)
+        return message
+
+    def append_message(self, message: Message) -> Message:
+        """Append an already-constructed ``Message`` unchanged.
+
+        Unlike ``add_message``, which builds a fresh ``Message`` (and a
+        fresh timestamp) from raw role/content, this appends the exact
+        object the caller passes in. Used by injection: the candidate
+        checkpoint snapshot serializes this same ``Message`` via
+        ``serialize_message`` before persistence is confirmed, and once
+        confirmed the live context gets the identical object rather than a
+        re-built one with a slightly later timestamp.
+        """
         self.messages.append(message)
         return message
 
@@ -1315,22 +1588,7 @@ class ExecutionContext:
             "components": {
                 name: component.to_dict() for name, component in self.components.items()
             },
-            "messages": [
-                {
-                    "role": message.role,
-                    "content": message.content,
-                    "timestamp": message.timestamp.isoformat(),
-                    "metadata": message.metadata,
-                    "tool_calls": message.tool_calls,
-                    "tool_call_id": message.tool_call_id,
-                    "hidden": message.hidden,
-                    "output_tokens": message.output_tokens,
-                    "context_refs": [
-                        reference.durable_dict() for reference in message.context_refs
-                    ],
-                }
-                for message in self.messages
-            ],
+            "messages": [serialize_message(message) for message in self.messages],
             "system_prompt": self.system_prompt,
             "metadata": snapshot_container(self.metadata),
             # A sibling of ``metadata``, deliberately not a member of it:

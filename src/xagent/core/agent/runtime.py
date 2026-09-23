@@ -43,6 +43,7 @@ from .context.execution import (
     LLM_COMPACT_CONTEXT_WINDOW_UNKNOWN_KEY,
     LLM_COMPACT_TOKENIZER_UNAVAILABLE_KEY,
     CompactResult,
+    context_write_lock,
     derive_compact_threshold,
 )
 from .result import normalize_tool_failure_code, tool_result_succeeded
@@ -890,17 +891,30 @@ class PatternRuntime:
         status: str | None = None,
         metadata: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        payload = self._build_checkpoint_payload(
-            label=label,
-            context=context,
-            pattern=pattern,
-            status=status,
-            metadata=metadata,
-        )
-        self.last_checkpoint = payload
-        self.checkpoints.append(payload)
-        await self._emit_checkpoint(payload)
-        return payload
+        # Snapshot, write and confirm all happen under the context's
+        # write-lock gate, acquired here in SHARED mode: this handler
+        # (including the store I/O in ``_emit_checkpoint`` below) DOES run
+        # inside the region, but so can another concurrent pattern
+        # checkpoint for the same context -- SHARED holders never
+        # serialize against each other, only against an
+        # ``AgentRunner.inject_user_message`` EXCLUSIVE acquire, which
+        # waits for every in-flight SHARED holder and blocks new ones
+        # while it waits. See ``context_write_lock``/``_ContextGate`` for
+        # the full invariant. Callbacks and pause still stay outside this
+        # method entirely (no nested acquisition, no reentrant deadlock):
+        # it only snapshots, persists and records.
+        async with context_write_lock(context).shared():
+            payload = self._build_checkpoint_payload(
+                label=label,
+                context=context,
+                pattern=pattern,
+                status=status,
+                metadata=metadata,
+            )
+            self.last_checkpoint = payload
+            self.checkpoints.append(payload)
+            await self._emit_checkpoint(payload)
+            return payload
 
     async def send_message(
         self,

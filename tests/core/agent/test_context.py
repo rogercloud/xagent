@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import copy
 import json
 import logging
@@ -3215,3 +3216,364 @@ def test_execution_context_to_dict_is_unaffected_by_later_mutation() -> None:
     context.metadata["nested"]["inner"] = "after"
 
     assert snapshot["metadata"] == before
+
+
+# --- R1: per-context checkpoint write lock (context_write_lock) ---------
+
+
+async def test_context_write_lock_survives_deepcopy_and_copy_without_sharing() -> None:
+    """Neither ``copy.deepcopy`` nor ``copy.copy`` may carry over the
+    cached ``(loop, lock)`` pair: the ``asyncio.Lock`` binds a
+    ``contextvars.Context`` that plain ``deepcopy`` cannot pickle, and even
+    a successful copy sharing the original's lock would defeat the R1
+    write-serialization invariant. Both must instead come away with no
+    lock cached at all, so the next ``context_write_lock`` call on the
+    copy mints an independent one.
+    """
+    context = ExecutionContext(execution_id="exec-deepcopy-lock")
+    # Populate the lock cache before copying.
+    lock = execution_module.context_write_lock(context)
+    assert "_checkpoint_write_lock" in context.__dict__
+
+    before_dict = context.to_dict()
+
+    deep_copied = copy.deepcopy(context)
+    shallow_copied = copy.copy(context)
+
+    # ``to_dict`` is unaffected by the lock's presence, byte-for-byte.
+    assert context.to_dict() == before_dict
+
+    for copied in (deep_copied, shallow_copied):
+        assert "_checkpoint_write_lock" not in copied.__dict__
+        assert copied.to_dict() == before_dict
+        # dataclass-generated eq/repr only ever look at declared fields,
+        # so the private lock attribute cannot affect either.
+        assert copied == context
+        assert repr(copied) == repr(context)
+        copied_lock = execution_module.context_write_lock(copied)
+        assert copied_lock is not lock
+
+
+async def test_context_write_lock_deepcopy_while_held_succeeds() -> None:
+    """Deep-copying a context whose write lock is actively held (e.g. a
+    checkpoint write in flight) must succeed -- and must not try to pickle
+    the held lock at all, since that would raise
+    ``TypeError: cannot pickle '_contextvars.Context' object``.
+    """
+    context = ExecutionContext(execution_id="exec-deepcopy-held")
+    lock = execution_module.context_write_lock(context)
+
+    async with lock:
+        copied = copy.deepcopy(context)
+
+    assert "_checkpoint_write_lock" not in copied.__dict__
+    assert copied == context
+
+
+def test_context_write_lock_rebinds_across_event_loops_when_idle() -> None:
+    """A context reused across independently loop-scoped callers (chiefly
+    tests, where each ``asyncio.run``/test gets its own loop) must not hand
+    back a lock bound to a now-dead loop: it must silently mint a fresh one
+    for the new loop, as long as the cached lock is not currently held.
+    """
+    context = ExecutionContext(execution_id="exec-cross-loop-idle")
+
+    async def acquire_once() -> asyncio.Lock:
+        lock = execution_module.context_write_lock(context)
+        async with lock:
+            pass
+        return lock
+
+    first_loop = asyncio.new_event_loop()
+    try:
+        first_lock = first_loop.run_until_complete(acquire_once())
+    finally:
+        first_loop.close()
+
+    second_loop = asyncio.new_event_loop()
+    try:
+        second_lock = second_loop.run_until_complete(acquire_once())
+    finally:
+        second_loop.close()
+
+    assert first_lock is not second_lock
+
+
+def test_context_write_lock_raises_when_held_across_event_loops() -> None:
+    """If the cached lock IS currently held when a different loop asks for
+    it, two event loops would be writing checkpoints for the same context
+    concurrently -- unsupported by design. This must raise loudly rather
+    than silently hand out a lock that would not actually serialize
+    against the in-flight write on the other loop.
+    """
+    context = ExecutionContext(execution_id="exec-cross-loop-held")
+
+    holder_loop = asyncio.new_event_loop()
+    other_loop = asyncio.new_event_loop()
+    try:
+
+        async def acquire_and_hold() -> asyncio.Lock:
+            lock = execution_module.context_write_lock(context)
+            await lock.acquire()
+            return lock
+
+        held_lock = holder_loop.run_until_complete(acquire_and_hold())
+
+        async def try_from_other_loop() -> None:
+            execution_module.context_write_lock(context)
+
+        with pytest.raises(RuntimeError, match="two event loops"):
+            other_loop.run_until_complete(try_from_other_loop())
+
+        async def release(lock: asyncio.Lock) -> None:
+            lock.release()
+
+        holder_loop.run_until_complete(release(held_lock))
+    finally:
+        holder_loop.close()
+        other_loop.close()
+
+
+# --- R1: _ContextGate shared/exclusive wakeup correctness ---------------
+
+
+async def _drain_loop(rounds: int = 10) -> None:
+    for _ in range(rounds):
+        await asyncio.sleep(0)
+
+
+async def _finish_or_fail(task: asyncio.Task, what: str) -> None:
+    try:
+        await asyncio.wait_for(asyncio.shield(task), timeout=1.0)
+    except asyncio.TimeoutError:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        pytest.fail(f"{what} was stranded: lost wakeup")
+
+
+async def test_context_gate_shared_waiter_not_stranded_when_woken_writer_is_cancelled() -> (
+    None
+):
+    """Regression for the reproduced lost wakeup: E1 holds EXCLUSIVE; a
+    SHARED waiter R parks behind it, then an EXCLUSIVE waiter W2 parks
+    after R. E1's release wakes both; R runs first, still sees W2 counted
+    as waiting and re-parks; W2 is then cancelled after its future
+    already has a result but before it ever ran. W2's abandonment must
+    wake R, or the gate sits idle with R parked forever.
+    """
+    gate = execution_module._ContextGate()
+    await gate.acquire()
+    log: list[str] = []
+
+    async def reader() -> None:
+        async with gate.shared():
+            log.append("R")
+
+    r = asyncio.create_task(reader())
+    await _drain_loop(2)
+
+    async def writer() -> None:
+        await gate.acquire()
+        gate.release()
+        log.append("W2")
+
+    w2 = asyncio.create_task(writer())
+    await _drain_loop(2)
+    assert gate._exclusive_waiting == 1
+    assert len(gate._waiters) == 2
+
+    gate.release()
+    # W2's future now has a result, but W2 has not run yet.
+    w2.cancel()
+
+    await _finish_or_fail(r, "shared waiter")
+    with pytest.raises(asyncio.CancelledError):
+        await w2
+    assert log == ["R"]
+    assert not gate.locked()
+    assert gate._exclusive_waiting == 0
+    assert not gate._waiters
+
+
+async def test_context_gate_shared_waiter_cancelled_after_wake_does_not_block_others() -> (
+    None
+):
+    gate = execution_module._ContextGate()
+    await gate.acquire()
+    acquired: list[str] = []
+
+    async def reader(name: str) -> None:
+        async with gate.shared():
+            acquired.append(name)
+
+    r1 = asyncio.create_task(reader("r1"))
+    r2 = asyncio.create_task(reader("r2"))
+    await _drain_loop(2)
+    gate.release()
+    # r1 is woken but cancelled before it runs.
+    r1.cancel()
+
+    await _finish_or_fail(r2, "second shared waiter")
+    with pytest.raises(asyncio.CancelledError):
+        await r1
+    assert acquired == ["r2"]
+    assert not gate.locked()
+    # The gate is fully usable afterwards in both modes.
+    await asyncio.wait_for(gate.acquire(), timeout=1.0)
+    gate.release()
+
+
+async def test_context_gate_exclusive_waiter_cancelled_while_shared_held_releases_new_readers() -> (
+    None
+):
+    """A pending writer blocks new SHARED acquires (writer preference);
+    if that writer is cancelled while a SHARED holder is still in, the
+    readers it was holding back must proceed right away rather than wait
+    for an unrelated later release."""
+    gate = execution_module._ContextGate()
+    await gate.acquire_shared()
+
+    writer = asyncio.create_task(gate.acquire())
+    await _drain_loop(2)
+    assert gate._exclusive_waiting == 1
+
+    late_reader_in = asyncio.Event()
+
+    async def late_reader() -> None:
+        async with gate.shared():
+            late_reader_in.set()
+
+    late = asyncio.create_task(late_reader())
+    await _drain_loop(3)
+    assert not late_reader_in.is_set()
+
+    writer.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await writer
+    await _finish_or_fail(late, "reader held back by a cancelled writer")
+    assert gate._exclusive_waiting == 0
+    # The original shared holder is still in; releasing it leaves the
+    # gate idle.
+    gate.release_shared()
+    assert not gate.locked()
+
+
+async def test_context_gate_exclusive_waiter_cancelled_after_wake_hands_on_to_next_writer() -> (
+    None
+):
+    gate = execution_module._ContextGate()
+    await gate.acquire_shared()
+    order: list[str] = []
+
+    async def writer(name: str) -> None:
+        await gate.acquire()
+        order.append(name)
+        gate.release()
+
+    w1 = asyncio.create_task(writer("w1"))
+    w2 = asyncio.create_task(writer("w2"))
+    await _drain_loop(2)
+    gate.release_shared()
+    # w1's future already has a result; cancel it before it runs.
+    w1.cancel()
+
+    await _finish_or_fail(w2, "second writer")
+    with pytest.raises(asyncio.CancelledError):
+        await w1
+    assert order == ["w2"]
+    assert not gate.locked()
+    assert gate._exclusive_waiting == 0
+
+
+async def test_context_gate_writer_preference_blocks_new_readers_until_writer_done() -> (
+    None
+):
+    gate = execution_module._ContextGate()
+    await gate.acquire_shared()
+    events: list[str] = []
+
+    async def writer() -> None:
+        await gate.acquire()
+        events.append("writer-in")
+        await asyncio.sleep(0)
+        events.append("writer-out")
+        gate.release()
+
+    async def reader() -> None:
+        async with gate.shared():
+            events.append("reader")
+
+    w = asyncio.create_task(writer())
+    await _drain_loop(2)
+    r = asyncio.create_task(reader())
+    await _drain_loop(3)
+    # The new reader arrived while a writer was waiting: it must not jump
+    # ahead of that writer even though only SHARED is currently held.
+    assert events == []
+
+    gate.release_shared()
+    await _finish_or_fail(w, "writer")
+    await _finish_or_fail(r, "reader behind writer")
+    assert events == ["writer-in", "writer-out", "reader"]
+    assert not gate.locked()
+
+
+async def test_context_gate_two_writers_serialize() -> None:
+    gate = execution_module._ContextGate()
+    inside = 0
+    max_inside = 0
+
+    async def writer() -> None:
+        nonlocal inside, max_inside
+        async with gate:
+            inside += 1
+            max_inside = max(max_inside, inside)
+            await asyncio.sleep(0)
+            await asyncio.sleep(0)
+            inside -= 1
+
+    tasks = [asyncio.create_task(writer()) for _ in range(2)]
+    for task in tasks:
+        await _finish_or_fail(task, "writer")
+    assert max_inside == 1
+    assert not gate.locked()
+
+
+async def test_context_gate_readers_run_concurrently_again_after_writers_finish() -> (
+    None
+):
+    """No starvation of SHARED once writers are gone: after a burst of
+    writers drains, a batch of readers must all get in -- and together,
+    since SHARED holders never serialize among themselves."""
+    gate = execution_module._ContextGate()
+    await gate.acquire()
+    writers = [asyncio.create_task(gate.acquire()) for _ in range(2)]
+    await _drain_loop(2)
+
+    readers_in = 0
+    peak_readers = 0
+    all_in = asyncio.Event()
+
+    async def reader() -> None:
+        nonlocal readers_in, peak_readers
+        async with gate.shared():
+            readers_in += 1
+            peak_readers = max(peak_readers, readers_in)
+            if readers_in == 3:
+                all_in.set()
+            await asyncio.wait_for(all_in.wait(), timeout=1.0)
+            readers_in -= 1
+
+    readers = [asyncio.create_task(reader()) for _ in range(3)]
+    await _drain_loop(3)
+    assert readers_in == 0
+
+    gate.release()
+    for writer in writers:
+        await _finish_or_fail(writer, "queued writer")
+        gate.release()
+    for task in readers:
+        await _finish_or_fail(task, "reader after writers")
+    assert peak_readers == 3
+    assert not gate.locked()

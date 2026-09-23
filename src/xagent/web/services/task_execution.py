@@ -43,6 +43,8 @@ from pathlib import Path
 from typing import (
     TYPE_CHECKING,
     Any,
+    Awaitable,
+    Callable,
     Dict,
     List,
     Literal,
@@ -61,9 +63,13 @@ from ...config import (
 )
 from ...core.agent.checkpoint import (
     CheckpointAccessRefusedError,
+    CheckpointReadError,
     CheckpointUnavailableError,
 )
-from ...core.agent.runner import UserMessageInjectionOutcome
+from ...core.agent.runner import (
+    InjectionSettleRefusedError,
+    UserMessageInjectionOutcome,
+)
 from ...core.execution_scope import (
     EXECUTION_SCOPE_NOT_PROVIDED,
     ExecutionScope,
@@ -2442,6 +2448,78 @@ def _settle_resumed_task_lease(
     return settle_task_lease_isolated(lease, error_message=error_message)
 
 
+async def settle_unknown_injection(
+    *,
+    task_id: int,
+    turn_id: str | None,
+    settle: Callable[[], Awaitable[Any]],
+) -> tuple[Any, bool]:
+    """Settle an injection that came back ``OUTCOME_UNKNOWN``.
+
+    Only for a resume owner: it holds the task lease, the previous run has
+    drained, and the resume it is about to start rebuilds the execution
+    context from the latest checkpoint. That checkpoint -- not the stale
+    registered context, which an unknown outcome never touches -- is what
+    the resumed agent will see, so ``settle`` (the caller's
+    ``AgentService.settle_injection_against_checkpoint`` call for the same
+    message and ``turn_id``) deduplicates against exactly that durable
+    state, without installing anything into the process-wide context
+    registry. Returns ``(outcome, settled_prior_commit)``:
+
+    - ``POSTED_REPLAY`` / ``True``: the turn IS in the checkpoint -- an
+      earlier attempt committed it and only its confirmation was lost. The
+      flag lets the caller treat it as its own write (e.g. for closing the
+      interaction it answered), not as someone else's replay.
+    - ``POSTED_FRESH``: it was absent and has now been persisted.
+    - ``NOT_POSTED``: there is no checkpoint at all, so nothing ever
+      committed; the caller's existing not-posted handling applies.
+    - ``OUTCOME_UNKNOWN``: still undeterminable -- no ``turn_id`` to
+      settle by, the checkpoint read failed, the runner refused (a run is
+      active), or the new write's confirmation was unknown again. The
+      caller must neither fail the input (that invites a duplicate) nor
+      leave it without an owner or terminal state.
+
+    A definite rejection (the read succeeded without the turn and the new
+    write provably did not commit) propagates as the exception it is: that
+    is positive evidence the input was not applied.
+    """
+    if not (isinstance(turn_id, str) and turn_id.strip()):
+        # The unknown attempt ran under a generated turn id nobody kept, so
+        # nothing can be deduplicated against it; a re-post would risk a
+        # second copy under a different id.
+        logger.warning(
+            "injection for task %s returned outcome_unknown without a turn id; "
+            "it cannot be settled and stays unknown",
+            task_id,
+        )
+        return UserMessageInjectionOutcome.OUTCOME_UNKNOWN, False
+    logger.warning(
+        "injection for task %s turn %s returned outcome_unknown; settling it "
+        "against the checkpoint the resume will run from",
+        task_id,
+        turn_id,
+    )
+    try:
+        settled = await settle()
+    except (CheckpointReadError, InjectionSettleRefusedError):
+        logger.warning(
+            "could not settle the unknown injection for task %s turn %s; the "
+            "outcome stays unknown",
+            task_id,
+            turn_id,
+            exc_info=True,
+        )
+        return UserMessageInjectionOutcome.OUTCOME_UNKNOWN, False
+    if settled is UserMessageInjectionOutcome.OUTCOME_UNKNOWN:
+        logger.warning(
+            "unknown injection for task %s turn %s could not be settled; "
+            "handling it as at most once, outcome unknown",
+            task_id,
+            turn_id,
+        )
+    return settled, settled is UserMessageInjectionOutcome.POSTED_REPLAY
+
+
 async def execute_resume_background(
     task_id: int,
     agent_service: Any,
@@ -2691,6 +2769,33 @@ async def execute_resume_background(
         # not allowed to run the resume.
         if pending_user_message is not None:
             assert lease_heartbeat_task is not None
+            # Bound to a plain local, not read from the enclosing scope
+            # inside the closure below: a narrowing ``assert`` on an
+            # enclosing-scope variable does not apply inside a nested
+            # closure (mypy cannot see across it), so the closure would
+            # otherwise still see the un-narrowed ``Task | None`` type.
+            heartbeat_task = lease_heartbeat_task
+
+            deferred_message: Dict[str, Any] = pending_user_message
+
+            async def _settle_deferred_message() -> Any:
+                return await run_while_task_lease_owned(
+                    agent_service.settle_injection_against_checkpoint(
+                        str(task_id),
+                        execution_message=deferred_message.get("execution_message"),
+                        display_message=deferred_message.get("display_message"),
+                        files=deferred_message.get("files"),
+                        turn_id=deferred_message.get("turn_id"),
+                    ),
+                    heartbeat_task,
+                )
+
+            # True once this resume owner proved, against the durable
+            # checkpoint, that an attempt of THIS delivery committed the
+            # turn whose confirmation came back unknown -- i.e. the
+            # message answered the interaction observed before injection,
+            # even though the settling call itself reports a replay.
+            settled_prior_commit = False
             with bind_task_lease_context(lease):
                 posted = await run_while_task_lease_owned(
                     agent_service.post_user_message(
@@ -2702,8 +2807,14 @@ async def execute_resume_background(
                         request_interrupt=False,
                         reason="deferred websocket user message",
                     ),
-                    lease_heartbeat_task,
+                    heartbeat_task,
                 )
+                if posted is UserMessageInjectionOutcome.OUTCOME_UNKNOWN:
+                    posted, settled_prior_commit = await settle_unknown_injection(
+                        task_id=task_id,
+                        turn_id=pending_user_message.get("turn_id"),
+                        settle=_settle_deferred_message,
+                    )
             if not posted:
                 raise RuntimeError(
                     "The user message was saved, but no resumable execution "
@@ -2744,7 +2855,10 @@ async def execute_resume_background(
             # its own. See task_interaction_close's module docstring for
             # the rule, the other sites, and why the v1 reply resume-input
             # path needs no guard at all.
-            if posted is UserMessageInjectionOutcome.POSTED_FRESH:
+            if (
+                posted is UserMessageInjectionOutcome.POSTED_FRESH
+                or settled_prior_commit
+            ):
                 try:
                     await run_db_io_cancellation_safe(
                         lambda: close_legacy_resume_interaction_sync(
@@ -2776,6 +2890,16 @@ async def execute_resume_background(
                         close_run_id,
                     )
             if delivery_turn_id is not None:
+                # Marked DISPATCHED even when ``posted`` is still
+                # ``OUTCOME_UNKNOWN`` after settling above: at that point
+                # neither the injection nor the checkpoint read could say
+                # whether the turn committed, and "at most once, outcome
+                # unknown" rules out both FAILED (it invites a resend under
+                # a new id, which could apply the message twice) and
+                # leaving the row PENDING (nothing would ever settle it, so
+                # the MESSAGE command would defer forever). DISPATCHED is
+                # the "do not resend" terminal the command settles on; the
+                # client is told the truth through the ack below.
                 try:
                     await run_db_io_cancellation_safe(
                         lambda: mark_user_message_delivery_sync(
@@ -2804,7 +2928,23 @@ async def execute_resume_background(
                         task_id,
                         delivery_turn_id,
                     )
-            await notify_deferred_delivery(True)
+            if posted is UserMessageInjectionOutcome.OUTCOME_UNKNOWN:
+                # The resume proceeds unconditionally below regardless: this
+                # run already holds the lease and is RESUME_REQUESTED, and
+                # aborting here would leave the task hung rather than undo
+                # anything. It rebuilds from the latest checkpoint, so the
+                # agent sees the message iff it committed -- at most once.
+                # Only the client-facing acknowledgement changes, to the
+                # truth -- whether the message actually landed is genuinely
+                # unconfirmed.
+                await notify_deferred_delivery(
+                    False,
+                    client_error_message(ClientErrorCode.MESSAGE_OUTCOME_UNKNOWN),
+                    error_code=ClientErrorCode.MESSAGE_OUTCOME_UNKNOWN,
+                    rejection_outcome="outcome_unknown",
+                )
+            else:
+                await notify_deferred_delivery(True)
 
         # Resume is now durable: lease acquisition committed RUNNING. Do not
         # announce it earlier from the WebSocket request handler.

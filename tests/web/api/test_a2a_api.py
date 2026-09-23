@@ -5,6 +5,7 @@ import logging
 import sqlite3
 from datetime import UTC, datetime, timedelta
 from threading import Event, get_ident
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -979,6 +980,179 @@ def test_message_send_closes_the_legacy_resume_interaction_row_on_successful_inj
         assert row.terminal_reason == "answered_via_legacy_resume"
         refreshed = db.query(Task).filter(Task.id == task_id).one()
         assert refreshed.interaction_protocol_version is None
+    finally:
+        db.close()
+
+
+def _seed_outcome_unknown_a2a_task(suffix: str) -> tuple[int, str, int, int]:
+    agent_id, full_key = _create_published_agent_with_key()
+    db = _direct_db_session()
+    try:
+        owner_id = int(db.query(Agent).filter(Agent.id == agent_id).one().user_id)
+        task = Task(
+            user_id=owner_id,
+            title=f"legacy resume close outcome unknown {suffix}",
+            status=TaskStatus.PAUSED,
+            control_state=TaskControlState.PAUSED.value,
+            run_id=f"run-outcome-unknown-{suffix}",
+            agent_id=agent_id,
+            source="a2a",
+            is_visible=False,
+            agent_config={"a2a_context_id": f"ctx-outcome-unknown-{suffix}"},
+            interaction_protocol_version=1,
+        )
+        db.add(task)
+        db.commit()
+        db.refresh(task)
+        task_id = int(task.id)
+        row_id = _seed_active_interaction_row(
+            db,
+            task_id=task_id,
+            run_id=f"run-outcome-unknown-{suffix}",
+            idempotency_key=f"outcome-unknown-q1-{suffix}",
+        )
+    finally:
+        db.close()
+    return agent_id, full_key, task_id, row_id
+
+
+def _send_outcome_unknown_a2a_reply(
+    *,
+    agent_id: int,
+    full_key: str,
+    task_id: int,
+    message_id: str,
+    settle_outcome: UserMessageInjectionOutcome,
+) -> tuple[Any, MagicMock, AsyncMock]:
+    agent_service = MagicMock()
+    agent_service.post_user_message = AsyncMock(
+        return_value=UserMessageInjectionOutcome.OUTCOME_UNKNOWN
+    )
+    agent_service.settle_injection_against_checkpoint = AsyncMock(
+        return_value=settle_outcome
+    )
+    agent_manager = MagicMock()
+    agent_manager.get_agent_for_task = AsyncMock(return_value=agent_service)
+    schedule = AsyncMock()
+    with (
+        patch(
+            "xagent.web.services.agent_service_manager.get_agent_manager",
+            return_value=agent_manager,
+        ),
+        patch("xagent.web.services.task_resume._schedule_waiting_a2a_resume", schedule),
+    ):
+        response = client.post(
+            f"/api/a2a/agents/{agent_id}/message:send",
+            headers=_bearer(full_key),
+            json={
+                "message": {
+                    "messageId": message_id,
+                    "taskId": task_id,
+                    "role": "ROLE_USER",
+                    "parts": [{"text": "unconfirmed write"}],
+                },
+                "configuration": {"returnImmediately": True},
+            },
+        )
+    return response, agent_service, schedule
+
+
+def _assert_settle_repost(
+    agent_service: MagicMock, task_id: int, message_id: str
+) -> None:
+    # The unknown post is never re-posted; it is settled once, through the
+    # dedicated checkpoint-settle call, for the very same message and turn.
+    agent_service.post_user_message.assert_awaited_once()
+    agent_service.settle_injection_against_checkpoint.assert_awaited_once()
+    posted = agent_service.post_user_message.await_args
+    settled = agent_service.settle_injection_against_checkpoint.await_args
+    assert settled.args == (str(task_id),)
+    assert settled.kwargs["turn_id"] == posted.kwargs["turn_id"]
+    assert settled.kwargs["turn_id"] == f"a2a:{task_id}:{message_id}"
+    assert settled.kwargs["execution_message"] == posted.kwargs["execution_message"]
+    assert settled.kwargs["display_message"] == posted.kwargs["display_message"]
+
+
+def test_message_send_injection_outcome_unknown_schedules_resume_and_reports_unknown() -> (
+    None
+):
+    """Non-shared ``message:send`` (no coordinator, ``preacquired_lease``
+    None) whose injection stays ``OUTCOME_UNKNOWN`` even after settling it
+    against the checkpoint: the task must NOT be stranded -- the resume is
+    still scheduled and owns the exact lease -- and must NOT bounce back to
+    an input-required status (a fresh reply could then land twice); the
+    client gets the honest ``reply_outcome_unknown`` (504), and the legacy
+    interaction row is not retired for an unconfirmed delivery."""
+    agent_id, full_key, task_id, row_id = _seed_outcome_unknown_a2a_task("still")
+    response, agent_service, schedule = _send_outcome_unknown_a2a_reply(
+        agent_id=agent_id,
+        full_key=full_key,
+        task_id=task_id,
+        message_id="msg-outcome-unknown",
+        settle_outcome=UserMessageInjectionOutcome.OUTCOME_UNKNOWN,
+    )
+
+    assert response.status_code == 504, response.text
+    assert response.json()["error"]["details"][0]["reason"] == "REPLY_OUTCOME_UNKNOWN"
+    _assert_settle_repost(agent_service, task_id, "msg-outcome-unknown")
+    schedule.assert_awaited_once()
+    scheduled_lease = schedule.await_args.kwargs["task_lease"]
+    db = _direct_db_session()
+    try:
+        row = (
+            db.query(TaskInteractionRequest)
+            .filter(TaskInteractionRequest.id == row_id)
+            .one()
+        )
+        assert row.status == "active"
+        refreshed = db.query(Task).filter(Task.id == task_id).one()
+        # Owned by the scheduled resume, not left ownerless or re-opened.
+        assert refreshed.status == TaskStatus.RUNNING
+        assert refreshed.runner_id == scheduled_lease.runner_id
+        assert refreshed.run_id == scheduled_lease.run_id
+    finally:
+        db.close()
+
+
+@pytest.mark.parametrize(
+    "settle_outcome",
+    [
+        UserMessageInjectionOutcome.POSTED_REPLAY,
+        UserMessageInjectionOutcome.POSTED_FRESH,
+    ],
+    ids=["present-in-checkpoint", "absent-persisted-now"],
+)
+def test_message_send_injection_outcome_unknown_settled_succeeds(
+    settle_outcome: UserMessageInjectionOutcome,
+) -> None:
+    """The settle finds the turn in the checkpoint (REPLAY: the first
+    write did commit) or proves it absent and persists it now (FRESH).
+    Either way the reply is a normal success -- resume scheduled, 200 --
+    and, since it was THIS reply's write that answered the interaction
+    observed before injection, the row is retired."""
+    suffix = f"settled-{settle_outcome.value}"
+    agent_id, full_key, task_id, row_id = _seed_outcome_unknown_a2a_task(suffix)
+    message_id = f"msg-outcome-{suffix}"
+    response, agent_service, schedule = _send_outcome_unknown_a2a_reply(
+        agent_id=agent_id,
+        full_key=full_key,
+        task_id=task_id,
+        message_id=message_id,
+        settle_outcome=settle_outcome,
+    )
+
+    assert response.status_code == 200, response.text
+    _assert_settle_repost(agent_service, task_id, message_id)
+    schedule.assert_awaited_once()
+    db = _direct_db_session()
+    try:
+        row = (
+            db.query(TaskInteractionRequest)
+            .filter(TaskInteractionRequest.id == row_id)
+            .one()
+        )
+        assert row.status == "terminated"
+        assert row.terminal_reason == "answered_via_legacy_resume"
     finally:
         db.close()
 

@@ -10,7 +10,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from dataclasses import dataclass
-from typing import Any, assert_never
+from typing import Any, assert_never, cast
 from uuid import uuid4
 
 from sqlalchemy import func
@@ -75,6 +75,86 @@ class TaskResumeNotResumableError(Exception):
 
 class TaskResumeRetryableError(CheckpointUnavailableError):
     """A temporary read failed before injection and its lease was restored."""
+
+
+class _InjectionOutcomeUnknown(Exception):
+    """Internal-only signal that ``inject_user_message`` returned
+    ``OUTCOME_UNKNOWN`` in shared mode (``preacquired_lease`` set).
+
+    Raised inside the injection closures of ``resume_a2a_task`` and
+    ``resume_task_reply`` purely to reuse their existing
+    ``except BaseException`` handling, which hands recovery to the task
+    coordinator and reports ``TaskResumeOutcomeUnknownError`` without
+    restoring the prelease to ``WAITING_FOR_USER`` -- an unknown outcome
+    may already be durably committed, and admitting a fresh reply on top
+    of that risks a second answer landing under a different turn id.
+    Never escapes either function.
+
+    Non-shared mode has no coordinator to recover the task, so it never
+    raises this: it settles the outcome against the checkpoint its resume
+    runs from (``_settle_reply_injection_outcome_unknown``), keeps
+    scheduling that resume either way so the task always has an owner,
+    and only then reports ``TaskResumeOutcomeUnknownError`` if the
+    outcome is still unknown.
+    """
+
+    def __init__(self, identifier: str | None = None) -> None:
+        self.identifier = identifier
+        super().__init__("inject_user_message returned OUTCOME_UNKNOWN")
+
+
+def _raise_if_injection_outcome_unknown(
+    posted: UserMessageInjectionOutcome, identifier: str | None
+) -> None:
+    """Shared-mode half of both ``resume_a2a_task`` and
+    ``resume_task_reply``'s injection closures -- see
+    ``_InjectionOutcomeUnknown``. Must run before any ``bool(posted)``
+    check: that call is truthy for ``OUTCOME_UNKNOWN`` too, so the
+    distinction would otherwise be lost right there.
+    """
+    if posted is UserMessageInjectionOutcome.OUTCOME_UNKNOWN:
+        raise _InjectionOutcomeUnknown(identifier)
+
+
+async def _settle_reply_injection_outcome_unknown(
+    agent_service: Any,
+    *,
+    task_id: int,
+    post_kwargs: dict[str, Any],
+) -> tuple[UserMessageInjectionOutcome, bool]:
+    """Non-shared-mode half: settle an ``OUTCOME_UNKNOWN`` reply injection
+    while this call still holds the exact prelease and no run is active.
+
+    Delegates to ``task_execution.settle_unknown_injection`` -- the same
+    resolution the deferred WebSocket path applies -- settling the
+    identical message (same ``turn_id``) from ``post_kwargs`` through
+    ``AgentService.settle_injection_against_checkpoint``, against the
+    checkpoint the resume about to be scheduled rebuilds from. Returns the
+    settled outcome and whether it proved an earlier attempt of this reply
+    committed the turn.
+    """
+
+    async def settle() -> UserMessageInjectionOutcome:
+        return cast(
+            UserMessageInjectionOutcome,
+            await agent_service.settle_injection_against_checkpoint(
+                str(task_id),
+                execution_message=post_kwargs.get("execution_message"),
+                display_message=post_kwargs.get("display_message"),
+                files=post_kwargs.get("files"),
+                turn_id=post_kwargs.get("turn_id"),
+            ),
+        )
+
+    (
+        settled,
+        settled_prior_commit,
+    ) = await task_execution_service.settle_unknown_injection(
+        task_id=task_id,
+        turn_id=post_kwargs.get("turn_id"),
+        settle=settle,
+    )
+    return cast(UserMessageInjectionOutcome, settled), settled_prior_commit
 
 
 @dataclass(frozen=True)
@@ -511,7 +591,9 @@ async def resume_a2a_task(
         else:
             assert_never(active_interaction_read)
 
-        async def inject_user_message() -> tuple[Any, UserMessageInjectionOutcome]:
+        async def inject_user_message() -> tuple[
+            Any, UserMessageInjectionOutcome, bool
+        ]:
             nonlocal injection_started
             from .agent_service_manager import get_agent_manager
 
@@ -521,18 +603,32 @@ async def resume_a2a_task(
                 task_owner_user_id=task_owner_user_id,
             )
             injection_started = True
-            posted = await agent_service.post_user_message(
-                str(task_id),
-                execution_message=text,
-                display_message=text,
-                turn_id=f"a2a:{task_id}:{message_id}",
-                request_interrupt=False,
-                reason="A2A input-required response",
-            )
-            return agent_service, posted
+            post_kwargs: dict[str, Any] = {
+                "execution_message": text,
+                "display_message": text,
+                "turn_id": f"a2a:{task_id}:{message_id}",
+                "request_interrupt": False,
+                "reason": "A2A input-required response",
+            }
+            posted = await agent_service.post_user_message(str(task_id), **post_kwargs)
+            settled_prior_commit = False
+            if preacquired_lease is not None:
+                _raise_if_injection_outcome_unknown(posted, message_id)
+            elif posted is UserMessageInjectionOutcome.OUTCOME_UNKNOWN:
+                (
+                    posted,
+                    settled_prior_commit,
+                ) = await _settle_reply_injection_outcome_unknown(
+                    agent_service, task_id=task_id, post_kwargs=post_kwargs
+                )
+            return agent_service, posted, settled_prior_commit
 
         with bind_task_lease_context(task_lease):
-            agent_service, posted = await run_while_task_lease_owned(
+            (
+                agent_service,
+                posted,
+                settled_prior_commit,
+            ) = await run_while_task_lease_owned(
                 inject_user_message(),
                 heartbeat_task,
             )
@@ -550,9 +646,14 @@ async def resume_a2a_task(
                 )
             raise TaskResumeNotResumableError
 
+        # A replay that settled this reply's own earlier unknown write
+        # answered the interaction read above, exactly like a fresh write.
+        close_outcome = (
+            UserMessageInjectionOutcome.POSTED_FRESH if settled_prior_commit else posted
+        )
         updated = await run_db_io_cancellation_safe(
             lambda: _update_a2a_resume_input_sync(
-                task_lease, text, active_interaction_id, posted
+                task_lease, text, active_interaction_id, close_outcome
             )
         )
         if not updated:
@@ -570,6 +671,12 @@ async def resume_a2a_task(
             resumable_status=resumable_status,
         )
         ownership_transferred = True
+        if posted is UserMessageInjectionOutcome.OUTCOME_UNKNOWN:
+            # Non-shared only (shared mode raised inside the closure). The
+            # scheduled resume owns the task and rebuilds from the latest
+            # checkpoint, so the agent sees this reply at most once; the
+            # caller is told honestly that it could not be confirmed.
+            raise TaskResumeOutcomeUnknownError(message_id)
     except CheckpointReadError as exc:
         if preacquired_lease is not None and message_posted:
             from .task_coordinator_runtime import current_task_coordinator
@@ -779,7 +886,10 @@ async def _restore_reply_prelease_isolated(task_lease: TaskLease) -> bool:
 
 
 def _update_reply_input_sync(
-    task_lease: TaskLease, text: str, interaction_id: int | None
+    task_lease: TaskLease,
+    text: str,
+    interaction_id: int | None,
+    injection_outcome: UserMessageInjectionOutcome,
 ) -> bool:
     """Persist the reply's input only while the exact prelease remains current.
 
@@ -788,6 +898,14 @@ def _update_reply_input_sync(
     function's session does not open until after the injection has already
     committed. See ``task_interaction_close``'s module docstring for why
     the read has to precede the injection.
+
+    ``injection_outcome`` is the caller's own ``post_user_message`` report,
+    mirroring ``_update_a2a_resume_input_sync``: only a fresh write (not a
+    replayed turn id, and never ``OUTCOME_UNKNOWN``, which non-shared mode
+    does reach here with -- see ``_InjectionOutcomeUnknown``) may retire
+    the legacy interaction, for the same reason that site gates on it. A
+    replay that settled the caller's own earlier unknown write is passed in
+    as ``POSTED_FRESH`` by the caller.
     """
     SessionLocal = get_session_local()
     with SessionLocal() as db:
@@ -828,12 +946,13 @@ def _update_reply_input_sync(
         # means.
         assert task_lease.run_id is not None
         if interaction_requests_table_exists(db):
-            close_legacy_resume_interaction(
-                db,
-                task_id=task_lease.task_id,
-                run_id=task_lease.run_id,
-                interaction_id=interaction_id,
-            )
+            if injection_outcome is UserMessageInjectionOutcome.POSTED_FRESH:
+                close_legacy_resume_interaction(
+                    db,
+                    task_id=task_lease.task_id,
+                    run_id=task_lease.run_id,
+                    interaction_id=interaction_id,
+                )
         db.commit()
         return True
 
@@ -1006,7 +1125,9 @@ async def resume_task_reply(
         else:
             assert_never(active_interaction_read)
 
-        async def inject_user_message() -> tuple[Any, bool]:
+        async def inject_user_message() -> tuple[
+            Any, UserMessageInjectionOutcome, bool
+        ]:
             nonlocal injection_started
             agent_service = (
                 await agent_runtime_service.get_agent_manager().get_agent_for_task(
@@ -1016,18 +1137,33 @@ async def resume_task_reply(
                 )
             )
             injection_started = True
-            posted = await agent_service.post_user_message(
-                str(task_id),
-                execution_message=ctx.text,
-                display_message=ctx.text,
-                turn_id=turn_id or f"v1:reply:{task_id}:{uuid4()}",
-                request_interrupt=False,
-                reason="V1 interaction response",
-            )
-            return agent_service, bool(posted)
+            # Resolved once so a settle re-post below reuses the same turn.
+            post_kwargs: dict[str, Any] = {
+                "execution_message": ctx.text,
+                "display_message": ctx.text,
+                "turn_id": turn_id or f"v1:reply:{task_id}:{uuid4()}",
+                "request_interrupt": False,
+                "reason": "V1 interaction response",
+            }
+            posted = await agent_service.post_user_message(str(task_id), **post_kwargs)
+            settled_prior_commit = False
+            if preacquired_lease is not None:
+                _raise_if_injection_outcome_unknown(posted, turn_id)
+            elif posted is UserMessageInjectionOutcome.OUTCOME_UNKNOWN:
+                (
+                    posted,
+                    settled_prior_commit,
+                ) = await _settle_reply_injection_outcome_unknown(
+                    agent_service, task_id=task_id, post_kwargs=post_kwargs
+                )
+            return agent_service, posted, settled_prior_commit
 
         with bind_task_lease_context(task_lease):
-            agent_service, posted = await run_while_task_lease_owned(
+            (
+                agent_service,
+                posted,
+                settled_prior_commit,
+            ) = await run_while_task_lease_owned(
                 inject_user_message(),
                 heartbeat_task,
             )
@@ -1045,9 +1181,14 @@ async def resume_task_reply(
                 )
             raise TaskResumeNotResumableError
 
+        # A replay that settled this reply's own earlier unknown write
+        # answered the interaction read above, exactly like a fresh write.
+        close_outcome = (
+            UserMessageInjectionOutcome.POSTED_FRESH if settled_prior_commit else posted
+        )
         updated = await run_db_io_cancellation_safe(
             lambda: _update_reply_input_sync(
-                task_lease, ctx.text, active_interaction_id
+                task_lease, ctx.text, active_interaction_id, close_outcome
             )
         )
         if not updated:
@@ -1064,6 +1205,12 @@ async def resume_task_reply(
             heartbeat_task=heartbeat_task,
         )
         ownership_transferred = True
+        if posted is UserMessageInjectionOutcome.OUTCOME_UNKNOWN:
+            # Non-shared only (shared mode raised inside the closure). The
+            # scheduled resume owns the task and rebuilds from the latest
+            # checkpoint, so the agent sees this reply at most once; the
+            # caller is told honestly that it could not be confirmed.
+            raise TaskResumeOutcomeUnknownError(turn_id)
     except CheckpointReadError as exc:
         if preacquired_lease is not None and message_posted:
             from .task_coordinator_runtime import current_task_coordinator

@@ -17,6 +17,7 @@ from sqlalchemy.orm import sessionmaker
 
 from tests.shared.postgres_disposable import disposable_database_factory
 from tests.web.services.coordinator_command_shared import claim_task_command
+from xagent.core.agent.runner import UserMessageInjectionOutcome
 from xagent.web.models.agent import Agent
 from xagent.web.models.database import Base, get_engine, get_session_local, init_db
 from xagent.web.models.task import Task, TaskStatus
@@ -350,6 +351,50 @@ async def test_unknown_reply_returns_original_identity_without_reinjection(
             task = db.get(Task, ctx.task_id)
             assert task.status == TaskStatus.RUNNING
             assert task.lease_attempt_id is not None
+            assert db.query(TaskExecutionCommand).count() == 1
+    finally:
+        if not request.done():
+            request.cancel()
+        await asyncio.gather(request, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_reply_outcome_unknown_from_injection_is_reported_unknown(
+    host, monkeypatch
+):
+    """R1: ``AgentRunner.inject_user_message`` itself (not a downstream DB
+    failure, unlike the sibling test above) can return ``OUTCOME_UNKNOWN``
+    when a write's confirmation could not be read back. In shared mode
+    this must surface the same ``TaskResumeOutcomeUnknownError`` /
+    "unknown" outcome as the DB-failure cases -- never silently resolved
+    as accepted, since ``OUTCOME_UNKNOWN`` is truthy and a careless
+    ``bool(posted)`` check would do exactly that."""
+    ctx = waiting_task(host)
+    post = AsyncMock(return_value=UserMessageInjectionOutcome.OUTCOME_UNKNOWN)
+    manager = SimpleNamespace(
+        get_agent_for_task=AsyncMock(
+            return_value=SimpleNamespace(post_user_message=post)
+        )
+    )
+    monkeypatch.setattr(
+        task_resume.agent_runtime_service, "get_agent_manager", lambda: manager
+    )
+    request = asyncio.create_task(task_resume.resume_task_reply(ctx))
+    try:
+        await eventually(lambda: _has_pending(ctx.task_id))
+        command = await claim(ctx.task_id)
+        await task_command_execution.execute_durable_task_command(command)
+        with pytest.raises(task_resume.TaskResumeOutcomeUnknownError) as unknown:
+            await asyncio.wait_for(request, 10)
+        assert unknown.value.command_id == ctx.command_id
+        assert (
+            task_resume_command._read_reply_outcome(command.id)["outcome"] == "unknown"
+        )
+        post.assert_awaited_once()
+        # No successor command was enqueued for this outcome: the same
+        # one-command state as the DB-failure sibling test above -- an
+        # unconfirmed injection must not spawn a retry command of its own.
+        with get_session_local()() as db:
             assert db.query(TaskExecutionCommand).count() == 1
     finally:
         if not request.done():

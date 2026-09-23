@@ -86,6 +86,22 @@ class ContextManager:
             self._contexts[context.execution_id] = context
         return context
 
+    def set_context_if_absent(self, context: ExecutionContext) -> ExecutionContext:
+        """Install ``context`` unless one is already registered for its id.
+
+        Used by cold-start injection so two concurrent injections that both
+        find no live context and both rebuild one from the same checkpoint
+        converge on a single registered object -- and therefore a single
+        ``context_write_lock`` -- instead of each installing its own object
+        with a lock the other knows nothing about.
+        """
+        with self._lock:
+            existing = self._contexts.get(context.execution_id)
+            if existing is not None:
+                return existing
+            self._contexts[context.execution_id] = context
+        return context
+
     def remove_context(self, execution_id: str) -> None:
         with self._lock:
             self._contexts.pop(execution_id, None)

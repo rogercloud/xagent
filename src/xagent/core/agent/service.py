@@ -370,6 +370,35 @@ class AgentService:
             ),
         )
 
+    async def settle_injection_against_checkpoint(
+        self,
+        execution_id: str,
+        message: str | None = None,
+        *,
+        execution_message: str | None = None,
+        display_message: str | None = None,
+        files: list[dict[str, Any]] | None = None,
+        turn_id: str,
+    ) -> "UserMessageInjectionOutcome":
+        """Settle an earlier ``OUTCOME_UNKNOWN`` post of ``turn_id`` against
+        the latest durable checkpoint without touching any registered
+        context -- see ``AgentRunner.settle_injection_against_checkpoint``
+        for the outcomes and the preconditions (resume owner holding the
+        lease, no run active)."""
+        if self._execution_adapter is None:
+            self._execution_adapter = self._build_execution_adapter()
+        return cast(
+            "UserMessageInjectionOutcome",
+            await self._execution_adapter.settle_injection_against_checkpoint(
+                execution_id,
+                message,
+                execution_message=execution_message,
+                display_message=display_message,
+                files=files,
+                turn_id=turn_id,
+            ),
+        )
+
     async def resume_execution_by_id(
         self,
         execution_id: str,

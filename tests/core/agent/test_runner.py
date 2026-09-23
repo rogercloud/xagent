@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 from dataclasses import dataclass
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock
 
@@ -19,12 +21,14 @@ from xagent.core.agent import runtime as runtime_module
 from xagent.core.agent.attachments import build_image_context_references
 from xagent.core.agent.checkpoint import (
     CheckpointCorruptError,
+    CheckpointPersistenceError,
     CheckpointUnavailableError,
 )
 from xagent.core.agent.context.execution import (
     COMPACT_THRESHOLD_SOURCE_CONTEXT_WINDOW,
     COMPACT_THRESHOLD_SOURCE_DEFAULT,
     TOOL_EVIDENCE_REMOVED_METADATA_KEY,
+    context_write_lock,
     tool_evidence_state,
 )
 from xagent.core.agent.language import (
@@ -32,7 +36,12 @@ from xagent.core.agent.language import (
     OUTPUT_LANGUAGE_SOURCE_METADATA_KEY,
     reset_output_language_to_request_context,
 )
-from xagent.core.agent.runner import AgentRunner, UserMessageInjectionOutcome
+from xagent.core.agent.runner import (
+    AgentRunner,
+    ExecutionControl,
+    InjectionSettleRefusedError,
+    UserMessageInjectionOutcome,
+)
 from xagent.core.agent.runtime import LLMCallInterrupted
 from xagent.core.task_runtime import PREFERRED_INPUT_MODALITIES_METADATA_KEY
 
@@ -290,8 +299,10 @@ class InterruptingPattern:
 class TracerCheckpointStore:
     def __init__(self) -> None:
         self.by_execution_id: dict[str, dict[str, Any]] = {}
+        self.write_calls = 0
 
     async def checkpoint(self, **payload: Any) -> None:
+        self.write_calls += 1
         self.by_execution_id[str(payload["execution_id"])] = dict(payload)
 
     async def load_latest_checkpoint(self, execution_id: str) -> dict[str, Any] | None:
@@ -327,10 +338,15 @@ def test_user_message_injection_outcome_truthiness_contract() -> None:
     assert not UserMessageInjectionOutcome.NOT_POSTED
     assert UserMessageInjectionOutcome.POSTED_FRESH
     assert UserMessageInjectionOutcome.POSTED_REPLAY
+    # OUTCOME_UNKNOWN is deliberately truthy too (R1): an unmodified
+    # ``bool(posted)`` caller must treat "write outcome undetermined" the
+    # same as a real post -- the safe direction when the write might
+    # already be committed. See the enum's docstring.
+    assert UserMessageInjectionOutcome.OUTCOME_UNKNOWN
 
 
 def test_user_message_injection_outcome_member_set_has_not_drifted() -> None:
-    """A fourth member added here falls through the ``is
+    """A fifth member added here falls through the ``is
     UserMessageInjectionOutcome.POSTED_FRESH`` guards in ``a2a.py`` and
     ``websocket.py`` silently -- see ``task_interaction_close.py`` for what
     that means for an interaction row left open. The three guard sites are
@@ -347,6 +363,7 @@ def test_user_message_injection_outcome_member_set_has_not_drifted() -> None:
         "NOT_POSTED",
         "POSTED_FRESH",
         "POSTED_REPLAY",
+        "OUTCOME_UNKNOWN",
     }
 
 
@@ -411,6 +428,200 @@ class FlakyOnceCheckpointStore:
             raise CheckpointUnavailableError("transient")
         payload = self.by_execution_id.get(execution_id)
         return dict(payload) if payload is not None else None
+
+
+class WriteFailsOnceStore:
+    """The first checkpoint write raises WITHOUT storing anything, so a
+    read-back correctly reports the turn as absent; every write after that
+    succeeds normally. Models a transient write failure distinct from
+    ``FlakyOnceCheckpointStore`` above, which fails the baseline *read*
+    instead -- this one fails the write itself, exercising the R1
+    read-back disambiguation path rather than the pre-write baseline path.
+    """
+
+    def __init__(self) -> None:
+        self.by_execution_id: dict[str, dict[str, Any]] = {}
+        self.write_calls = 0
+
+    async def checkpoint(self, **payload: Any) -> None:
+        self.write_calls += 1
+        if self.write_calls == 1:
+            raise CheckpointPersistenceError("transient write failure")
+        self.by_execution_id[str(payload["execution_id"])] = dict(payload)
+
+    async def load_latest_checkpoint(self, execution_id: str) -> dict[str, Any] | None:
+        payload = self.by_execution_id.get(execution_id)
+        return dict(payload) if payload is not None else None
+
+
+class CommitAckLostStore:
+    """Durably commits the payload, then raises -- models "the write
+    succeeded but the confirmation was lost" (e.g. a downstream trace
+    handler failing after the database commit already landed). A
+    read-back must find the just-committed turn.
+    """
+
+    def __init__(self) -> None:
+        self.by_execution_id: dict[str, dict[str, Any]] = {}
+        self.write_calls = 0
+
+    async def checkpoint(self, **payload: Any) -> None:
+        self.write_calls += 1
+        self.by_execution_id[str(payload["execution_id"])] = dict(payload)
+        raise CheckpointPersistenceError("commit acknowledgement lost")
+
+    async def load_latest_checkpoint(self, execution_id: str) -> dict[str, Any] | None:
+        payload = self.by_execution_id.get(execution_id)
+        return dict(payload) if payload is not None else None
+
+
+class ReadBackFailingStore:
+    """While ``fail`` is True, both the checkpoint write and the
+    ``load_latest_checkpoint`` read (used for the injection's read-back,
+    and for any baseline read that is not shortcut by a cached checkpoint)
+    fail -- an infrastructure outage that prevents both. Flipping ``fail``
+    off models the store recovering, e.g. for a retry.
+    """
+
+    def __init__(self) -> None:
+        self.by_execution_id: dict[str, dict[str, Any]] = {}
+        self.fail = True
+        self.write_calls = 0
+        self.read_calls = 0
+
+    async def checkpoint(self, **payload: Any) -> None:
+        self.write_calls += 1
+        if self.fail:
+            raise CheckpointPersistenceError("write refused")
+        self.by_execution_id[str(payload["execution_id"])] = dict(payload)
+
+    async def load_latest_checkpoint(self, execution_id: str) -> dict[str, Any] | None:
+        self.read_calls += 1
+        if self.fail:
+            raise CheckpointUnavailableError("read-back unavailable")
+        payload = self.by_execution_id.get(execution_id)
+        return dict(payload) if payload is not None else None
+
+
+class MalformedReadBackStore:
+    """``load_latest_checkpoint`` returns a non-``None``, non-``dict``
+    payload -- the malformed-read case ``_confirm_injected_turn`` must
+    report as ``"unknown"`` (cannot tell whether the write committed),
+    never ``"absent"`` (which would incorrectly claim the write is
+    confirmed to not have happened)."""
+
+    async def load_latest_checkpoint(self, execution_id: str) -> Any:
+        del execution_id
+        return "not-a-checkpoint-dict"
+
+
+@pytest.mark.asyncio
+async def test_confirm_injected_turn_treats_non_dict_payload_as_unknown(
+    tmp_path: Path,
+) -> None:
+    runner = AgentRunner(
+        agent=Agent(name="writer", patterns=[]),
+        tracer=MalformedReadBackStore(),
+        workspace_manager=FakeWorkspaceManager(tmp_path),
+    )
+
+    verdict = await runner._confirm_injected_turn(
+        "exec-malformed-readback", "turn-1", "Hello"
+    )
+
+    assert verdict == "unknown"
+
+
+@pytest.mark.asyncio
+async def test_confirm_injected_turn_treats_none_payload_as_absent(
+    tmp_path: Path,
+) -> None:
+    runner = AgentRunner(
+        agent=Agent(name="writer", patterns=[]),
+        tracer=TracerCheckpointStore(),
+        workspace_manager=FakeWorkspaceManager(tmp_path),
+    )
+
+    verdict = await runner._confirm_injected_turn(
+        "exec-no-checkpoint", "turn-1", "Hello"
+    )
+
+    assert verdict == "absent"
+
+
+class BlockingCheckpointStore:
+    """Checkpoint writer that blocks until released, for tests that need
+    to observe state while a write is in flight (and holding the context's
+    write lock, since the write happens inside it).
+
+    ``entered`` is set as soon as a write call starts (before it blocks),
+    so a test can wait for "the write has begun" without a race. ``release``
+    must be set for the blocked write to proceed. ``fail_mode``:
+
+    - ``"none"``: commits normally once released.
+    - ``"raise_before_commit"``: raises without storing -- the write never
+      happened, so a read-back must report "absent".
+    - ``"commit_then_raise"``: stores the payload (so a read-back sees it)
+      and then raises -- "committed, confirmation lost".
+    """
+
+    def __init__(
+        self,
+        entered: asyncio.Event | None = None,
+        release: asyncio.Event | None = None,
+        fail_mode: str = "none",
+    ) -> None:
+        self.entered = entered if entered is not None else asyncio.Event()
+        self.release = release if release is not None else asyncio.Event()
+        self.fail_mode = fail_mode
+        self.by_execution_id: dict[str, dict[str, Any]] = {}
+        self.write_calls = 0
+
+    async def checkpoint(self, **payload: Any) -> None:
+        self.write_calls += 1
+        self.entered.set()
+        await self.release.wait()
+        if self.fail_mode == "raise_before_commit":
+            raise CheckpointPersistenceError("blocked write refused")
+        self.by_execution_id[str(payload["execution_id"])] = dict(payload)
+        if self.fail_mode == "commit_then_raise":
+            raise CheckpointPersistenceError("commit acknowledgement lost")
+
+    async def load_latest_checkpoint(self, execution_id: str) -> dict[str, Any] | None:
+        payload = self.by_execution_id.get(execution_id)
+        return dict(payload) if payload is not None else None
+
+
+class BlockingReadCheckpointStore:
+    """Checkpoint store whose ``load_latest_checkpoint`` blocks until
+    released, so two concurrent cold-start injections can be forced to
+    both reach the point where they have read the same seed checkpoint
+    and are about to race on installing a context for it -- deterministic
+    interleaving instead of hoping ``asyncio.gather`` happens to schedule
+    it that way. ``entered`` counts how many callers are currently
+    blocked in the read so a test can wait for "both are racing" without
+    a sleep-based guess. Writes are instant and recorded normally.
+    """
+
+    def __init__(self, seed_payload: dict[str, Any]) -> None:
+        self.seed_payload = seed_payload
+        self.entered = 0
+        self.both_entered = asyncio.Event()
+        self.release = asyncio.Event()
+        self.by_execution_id: dict[str, dict[str, Any]] = {}
+        self.write_calls = 0
+
+    async def load_latest_checkpoint(self, execution_id: str) -> dict[str, Any] | None:
+        del execution_id
+        self.entered += 1
+        if self.entered >= 2:
+            self.both_entered.set()
+        await self.release.wait()
+        return dict(self.seed_payload)
+
+    async def checkpoint(self, **payload: Any) -> None:
+        self.write_calls += 1
+        self.by_execution_id[str(payload["execution_id"])] = dict(payload)
 
 
 @pytest.mark.asyncio
@@ -491,6 +702,1353 @@ async def test_inject_rejection_leaves_no_dedupe_residue() -> None:
     assert result.outcome is UserMessageInjectionOutcome.POSTED_FRESH
     assert len(context.messages) == 1
     assert tracer.by_execution_id["exec-residue"]["context"]["messages"]
+
+
+# --- R1: candidate snapshot + write lock + read-back on failure ----------
+
+
+@pytest.mark.asyncio
+async def test_inject_persist_failure_leaves_no_residue_and_retry_is_fresh(
+    tmp_path: Path,
+) -> None:
+    """The reverse of the probe this design fixes: a write failure whose
+    read-back finds the turn genuinely absent must raise with zero
+    residue, and a retry of the same turn must actually write (not find a
+    ghost confirmation) -- ending with exactly one copy of the turn."""
+    tracer = WriteFailsOnceStore()
+    runner = AgentRunner(
+        agent=Agent(name="writer", patterns=[]),
+        tracer=tracer,
+        workspace_manager=FakeWorkspaceManager(tmp_path),
+    )
+    context = ExecutionContext(execution_id="exec-write-fail-once")
+    runner.context_manager.set_context(context)
+
+    with pytest.raises(CheckpointPersistenceError):
+        await runner.inject_user_message(
+            "exec-write-fail-once",
+            "Hello",
+            turn_id="turn-1",
+            request_interrupt=False,
+        )
+    assert context.messages == []
+    assert tracer.write_calls == 1
+
+    result = await runner.inject_user_message(
+        "exec-write-fail-once",
+        "Hello",
+        turn_id="turn-1",
+        request_interrupt=False,
+    )
+
+    assert result.outcome is UserMessageInjectionOutcome.POSTED_FRESH
+    assert tracer.write_calls == 2
+    live_matches = [
+        message
+        for message in result.context.messages
+        if message.role == "user" and message.metadata.get("turn_id") == "turn-1"
+    ]
+    assert len(live_matches) == 1
+    stored_matches = [
+        message
+        for message in tracer.by_execution_id["exec-write-fail-once"]["context"][
+            "messages"
+        ]
+        if message.get("metadata", {}).get("turn_id") == "turn-1"
+    ]
+    assert len(stored_matches) == 1
+
+
+@pytest.mark.asyncio
+async def test_live_pattern_cannot_observe_injection_before_persist_confirms(
+    tmp_path: Path,
+) -> None:
+    tracer = BlockingCheckpointStore()
+    runner = AgentRunner(
+        agent=Agent(name="writer", patterns=[]),
+        tracer=tracer,
+        workspace_manager=FakeWorkspaceManager(tmp_path),
+    )
+    context = ExecutionContext(execution_id="exec-visibility")
+    runner.context_manager.set_context(context)
+
+    inject_task = asyncio.create_task(
+        runner.inject_user_message("exec-visibility", "Hello", request_interrupt=False)
+    )
+    try:
+        await asyncio.wait_for(tracer.entered.wait(), timeout=5)
+        assert context.messages == []
+
+        tracer.release.set()
+        result = await asyncio.wait_for(inject_task, timeout=5)
+    finally:
+        if not inject_task.done():
+            inject_task.cancel()
+
+    assert result.outcome is UserMessageInjectionOutcome.POSTED_FRESH
+    assert [message.content for message in context.messages] == ["Hello"]
+
+
+@pytest.mark.asyncio
+async def test_pattern_checkpoint_waits_for_inflight_injection(
+    tmp_path: Path,
+) -> None:
+    tracer = BlockingCheckpointStore()
+    runner = AgentRunner(
+        agent=Agent(name="writer", patterns=[]),
+        tracer=tracer,
+        workspace_manager=FakeWorkspaceManager(tmp_path),
+    )
+    context = ExecutionContext(execution_id="exec-checkpoint-waits")
+    runner.context_manager.set_context(context)
+
+    inject_task = asyncio.create_task(
+        runner.inject_user_message(
+            "exec-checkpoint-waits", "Hello", request_interrupt=False
+        )
+    )
+    try:
+        await asyncio.wait_for(tracer.entered.wait(), timeout=5)
+        assert tracer.write_calls == 1
+
+        pattern_runtime = PatternRuntime(
+            execution_id="exec-checkpoint-waits", tracer=tracer
+        )
+        checkpoint_task = asyncio.create_task(
+            pattern_runtime.checkpoint(
+                "step",
+                context=context,
+                pattern=FakePattern({"success": True}),
+            )
+        )
+        try:
+            await asyncio.sleep(0.05)
+            # Still waiting on the context's write lock -- must not have
+            # reached the store at all yet.
+            assert tracer.write_calls == 1
+
+            tracer.release.set()
+            inject_result = await asyncio.wait_for(inject_task, timeout=5)
+            payload = await asyncio.wait_for(checkpoint_task, timeout=5)
+        finally:
+            if not checkpoint_task.done():
+                checkpoint_task.cancel()
+    finally:
+        if not inject_task.done():
+            inject_task.cancel()
+
+    assert inject_result.outcome is UserMessageInjectionOutcome.POSTED_FRESH
+    payload_messages = payload["context"]["messages"]
+    assert any(message["content"] == "Hello" for message in payload_messages)
+
+
+@pytest.mark.asyncio
+async def test_injection_waits_for_inflight_pattern_checkpoint(
+    tmp_path: Path,
+) -> None:
+    """The reverse ordering of the previous test: a pattern checkpoint
+    blocks first, an injection arrives while it's in flight, and once both
+    complete the latest checkpoint must contain both the pattern's own
+    message and the injected one -- an injection built from a stale
+    pre-checkpoint snapshot must never overwrite the pattern's write."""
+    tracer = BlockingCheckpointStore()
+    runner = AgentRunner(
+        agent=Agent(name="writer", patterns=[]),
+        tracer=tracer,
+        workspace_manager=FakeWorkspaceManager(tmp_path),
+    )
+    context = ExecutionContext(execution_id="exec-reverse-order")
+    context.add_assistant_message("Pattern output")
+    runner.context_manager.set_context(context)
+
+    pattern_runtime = PatternRuntime(execution_id="exec-reverse-order", tracer=tracer)
+    checkpoint_task = asyncio.create_task(
+        pattern_runtime.checkpoint(
+            "step", context=context, pattern=FakePattern({"success": True})
+        )
+    )
+    try:
+        await asyncio.wait_for(tracer.entered.wait(), timeout=5)
+        assert tracer.write_calls == 1
+
+        inject_task = asyncio.create_task(
+            runner.inject_user_message(
+                "exec-reverse-order", "Hello", request_interrupt=False
+            )
+        )
+        try:
+            await asyncio.sleep(0.05)
+            # Injection is waiting on the lock the pattern checkpoint
+            # holds -- must not have reached the store yet.
+            assert tracer.write_calls == 1
+
+            tracer.release.set()
+            await asyncio.wait_for(checkpoint_task, timeout=5)
+            inject_result = await asyncio.wait_for(inject_task, timeout=5)
+        finally:
+            if not inject_task.done():
+                inject_task.cancel()
+    finally:
+        if not checkpoint_task.done():
+            checkpoint_task.cancel()
+
+    assert inject_result.outcome is UserMessageInjectionOutcome.POSTED_FRESH
+    final_messages = tracer.by_execution_id["exec-reverse-order"]["context"]["messages"]
+    assert any(
+        message["role"] == "assistant" and message["content"] == "Pattern output"
+        for message in final_messages
+    )
+    assert any(
+        message["role"] == "user" and message["content"] == "Hello"
+        for message in final_messages
+    )
+
+
+class _OverlapCountingBlockingStore:
+    """Like ``BlockingCheckpointStore`` but tracks how many ``checkpoint``
+    calls are in flight at once, so a test can assert two SHARED holders
+    were genuinely concurrent (both entered the store before either
+    returned) rather than merely both eventually completing."""
+
+    def __init__(self) -> None:
+        self.in_flight = 0
+        self.max_in_flight = 0
+        self.both_entered = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def checkpoint(self, **payload: Any) -> None:
+        del payload
+        self.in_flight += 1
+        self.max_in_flight = max(self.max_in_flight, self.in_flight)
+        if self.in_flight >= 2:
+            self.both_entered.set()
+        await self.release.wait()
+        self.in_flight -= 1
+
+    async def load_latest_checkpoint(self, execution_id: str) -> dict[str, Any] | None:
+        del execution_id
+        return None
+
+
+@pytest.mark.asyncio
+async def test_two_concurrent_pattern_checkpoints_on_one_context_overlap() -> None:
+    """SHARED holders must run in parallel with each other: two pattern
+    checkpoints for the same context both enter the store before either
+    returns, exactly as on base (pre-gate) behavior."""
+    tracer = _OverlapCountingBlockingStore()
+    context = ExecutionContext(execution_id="exec-shared-overlap")
+    runtime_a = PatternRuntime(execution_id="exec-shared-overlap", tracer=tracer)
+    runtime_b = PatternRuntime(execution_id="exec-shared-overlap", tracer=tracer)
+
+    task_a = asyncio.create_task(
+        runtime_a.checkpoint("step-a", context=context, pattern=FakePattern({}))
+    )
+    task_b = asyncio.create_task(
+        runtime_b.checkpoint("step-b", context=context, pattern=FakePattern({}))
+    )
+    try:
+        await asyncio.wait_for(tracer.both_entered.wait(), timeout=5)
+        assert tracer.max_in_flight == 2
+        tracer.release.set()
+        await asyncio.wait_for(asyncio.gather(task_a, task_b), timeout=5)
+    finally:
+        if not task_a.done():
+            task_a.cancel()
+        if not task_b.done():
+            task_b.cancel()
+
+
+@pytest.mark.asyncio
+async def test_concurrent_same_turn_injections_write_once(tmp_path: Path) -> None:
+    """Uses a blocking store to force true interleaving rather than
+    hoping ``asyncio.gather`` happens to schedule it that way: the first
+    injection is held INSIDE the store, still holding the exclusive
+    write-lock, while the second is started. The second must not reach
+    the store at all (its dedupe check, run only after it acquires the
+    now-held lock, must find the first's write once that commits) --
+    exactly the race the lock and the in-lock dedupe check exist to
+    prevent."""
+    tracer = BlockingCheckpointStore()
+    runner = AgentRunner(
+        agent=Agent(name="writer", patterns=[]),
+        tracer=tracer,
+        workspace_manager=FakeWorkspaceManager(tmp_path),
+    )
+    context = ExecutionContext(execution_id="exec-concurrent-same-turn")
+    runner.context_manager.set_context(context)
+
+    first_task = asyncio.create_task(
+        runner.inject_user_message(
+            "exec-concurrent-same-turn",
+            "Hello",
+            turn_id="turn-x",
+            request_interrupt=False,
+        )
+    )
+    try:
+        await asyncio.wait_for(tracer.entered.wait(), timeout=5)
+        assert tracer.write_calls == 1
+
+        second_task = asyncio.create_task(
+            runner.inject_user_message(
+                "exec-concurrent-same-turn",
+                "Hello",
+                turn_id="turn-x",
+                request_interrupt=False,
+            )
+        )
+        try:
+            # The first call is still blocked inside the store, holding
+            # the exclusive lock. The second must be stuck waiting for
+            # that lock -- it must not have reached the store (its dedupe
+            # check runs only once it holds the lock).
+            await asyncio.sleep(0.05)
+            assert not second_task.done()
+            assert tracer.write_calls == 1
+
+            tracer.release.set()
+            results = await asyncio.wait_for(
+                asyncio.gather(first_task, second_task), timeout=5
+            )
+        finally:
+            if not second_task.done():
+                second_task.cancel()
+    finally:
+        if not first_task.done():
+            first_task.cancel()
+
+    outcomes = {result.outcome for result in results}
+    assert outcomes == {
+        UserMessageInjectionOutcome.POSTED_FRESH,
+        UserMessageInjectionOutcome.POSTED_REPLAY,
+    }
+    assert tracer.write_calls == 1
+    matches = [
+        message
+        for message in context.messages
+        if message.role == "user" and message.metadata.get("turn_id") == "turn-x"
+    ]
+    assert len(matches) == 1
+
+
+@pytest.mark.asyncio
+async def test_concurrent_cold_start_injections_share_one_context(
+    tmp_path: Path,
+) -> None:
+    """Uses a blocking read store to force both cold starts to genuinely
+    race at the ``set_context_if_absent`` seam: both are held inside the
+    checkpoint read, each having independently rebuilt an
+    ``ExecutionContext`` from the same seed, until both have entered --
+    only then are they released to race on installing one. Without
+    ``set_context_if_absent`` (i.e. with a bare ``set_context``), each
+    would instead install its OWN object, and the two injections would
+    end up on two different, mutually oblivious contexts (and therefore
+    two different write locks) instead of converging on one."""
+    execution_id = "exec-concurrent-cold-start"
+    seed_context = ExecutionContext(execution_id=execution_id)
+    seed_context.add_user_message("Original task")
+    seed_payload = {
+        "type": "checkpoint",
+        "execution_id": execution_id,
+        "pattern": "FakePattern",
+        "label": "waiting_for_user",
+        "status": "waiting_for_user",
+        "context": seed_context.to_dict(),
+        "pattern_state": {},
+        "metadata": {},
+    }
+    tracer = BlockingReadCheckpointStore(seed_payload)
+    runner = AgentRunner(
+        agent=Agent(name="writer", patterns=[]),
+        tracer=tracer,
+        workspace_manager=FakeWorkspaceManager(tmp_path),
+    )
+
+    first_task = asyncio.create_task(
+        runner.inject_user_message(
+            execution_id, "First follow-up", turn_id="turn-a", request_interrupt=False
+        )
+    )
+    second_task = asyncio.create_task(
+        runner.inject_user_message(
+            execution_id, "Second follow-up", turn_id="turn-b", request_interrupt=False
+        )
+    )
+    try:
+        await asyncio.wait_for(tracer.both_entered.wait(), timeout=5)
+        tracer.release.set()
+        results = await asyncio.wait_for(
+            asyncio.gather(first_task, second_task), timeout=5
+        )
+    finally:
+        if not first_task.done():
+            first_task.cancel()
+        if not second_task.done():
+            second_task.cancel()
+
+    assert results[0].context is results[1].context
+    contents = [
+        message.content
+        for message in results[0].context.messages
+        if message.role == "user"
+    ]
+    assert "First follow-up" in contents
+    assert "Second follow-up" in contents
+    # Both writes landed serialized through the one shared context's lock,
+    # not raced onto two independent (and therefore corrupting) objects.
+    assert tracer.write_calls == 2
+
+
+@pytest.mark.asyncio
+async def test_inject_cancelled_mid_persist_does_not_apply(tmp_path: Path) -> None:
+    tracer = BlockingCheckpointStore()
+    runner = AgentRunner(
+        agent=Agent(name="writer", patterns=[]),
+        tracer=tracer,
+        workspace_manager=FakeWorkspaceManager(tmp_path),
+    )
+    context = ExecutionContext(execution_id="exec-cancel-mid-persist")
+    runner.context_manager.set_context(context)
+
+    task = asyncio.create_task(
+        runner.inject_user_message(
+            "exec-cancel-mid-persist",
+            "Hello",
+            turn_id="turn-cancel",
+            request_interrupt=False,
+        )
+    )
+    await asyncio.wait_for(tracer.entered.wait(), timeout=5)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    # Cancelled before the blocked store call ever committed: zero residue.
+    assert context.messages == []
+    assert "exec-cancel-mid-persist" not in tracer.by_execution_id
+
+    # Let the store accept writes again and retry the same turn.
+    tracer.release.set()
+    result = await runner.inject_user_message(
+        "exec-cancel-mid-persist",
+        "Hello",
+        turn_id="turn-cancel",
+        request_interrupt=False,
+    )
+
+    assert result.outcome is UserMessageInjectionOutcome.POSTED_FRESH
+    matches = [
+        message
+        for message in result.context.messages
+        if message.role == "user" and message.metadata.get("turn_id") == "turn-cancel"
+    ]
+    assert len(matches) == 1
+
+
+class CommitThenHangOnceStore:
+    """The first ``checkpoint`` call stores the payload (so it genuinely
+    committed) and then hangs indefinitely -- distinct from
+    ``BlockingCheckpointStore``, whose ``entered`` fires BEFORE the store
+    commits. Used to model "cancelled strictly after the write landed":
+    the caller cancels while the coroutine is stuck past the commit, so
+    ``inject_user_message`` never gets a chance to run its own confirm
+    logic at all (cancellation is re-raised immediately, per its
+    docstring) even though the store already durably has the turn. Every
+    call after the first commits and returns immediately, so a retry
+    proceeds normally.
+    """
+
+    def __init__(self) -> None:
+        self.by_execution_id: dict[str, dict[str, Any]] = {}
+        self.write_calls = 0
+        self.committed = asyncio.Event()
+        self.hang_forever = asyncio.Event()
+
+    async def checkpoint(self, **payload: Any) -> None:
+        self.write_calls += 1
+        self.by_execution_id[str(payload["execution_id"])] = dict(payload)
+        if self.write_calls == 1:
+            self.committed.set()
+            await self.hang_forever.wait()
+
+    async def load_latest_checkpoint(self, execution_id: str) -> dict[str, Any] | None:
+        payload = self.by_execution_id.get(execution_id)
+        return dict(payload) if payload is not None else None
+
+
+@pytest.mark.asyncio
+async def test_inject_cancelled_after_commit_then_retry_yields_fresh_once(
+    tmp_path: Path,
+) -> None:
+    """Finding P: cancellation strictly AFTER the write already committed
+    to the store (not before, like the sibling test above). The cancelled
+    call's own outcome is undefined (it never returns -- cancellation
+    propagates), and nothing was applied to the live context either way.
+    A retry with the SAME turn_id must still converge on exactly one
+    committed message -- POSTED_FRESH exactly once, no duplicate -- since
+    the live context (what the retry's dedupe check reads) never saw the
+    cancelled attempt's write."""
+    tracer = CommitThenHangOnceStore()
+    runner = AgentRunner(
+        agent=Agent(name="writer", patterns=[]),
+        tracer=tracer,
+        workspace_manager=FakeWorkspaceManager(tmp_path),
+    )
+    context = ExecutionContext(execution_id="exec-cancel-after-commit")
+    runner.context_manager.set_context(context)
+
+    task = asyncio.create_task(
+        runner.inject_user_message(
+            "exec-cancel-after-commit",
+            "Hello",
+            turn_id="turn-cancel-after-commit",
+            request_interrupt=False,
+        )
+    )
+    await asyncio.wait_for(tracer.committed.wait(), timeout=5)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    # The store DID commit the cancelled attempt's candidate, but it was
+    # never applied to the live context -- the linearization point (only
+    # reached after a successful, uncancelled persist) never ran.
+    assert context.messages == []
+    stored_payload = tracer.by_execution_id["exec-cancel-after-commit"]
+    stored_user_messages = [
+        message
+        for message in stored_payload["context"]["messages"]
+        if message["role"] == "user"
+    ]
+    assert len(stored_user_messages) == 1
+
+    result = await runner.inject_user_message(
+        "exec-cancel-after-commit",
+        "Hello",
+        turn_id="turn-cancel-after-commit",
+        request_interrupt=False,
+    )
+
+    assert result.outcome is UserMessageInjectionOutcome.POSTED_FRESH
+    assert tracer.write_calls == 2
+    matches = [
+        message
+        for message in result.context.messages
+        if message.role == "user"
+        and message.metadata.get("turn_id") == "turn-cancel-after-commit"
+    ]
+    assert len(matches) == 1
+    final_stored_user_messages = [
+        message
+        for message in tracer.by_execution_id["exec-cancel-after-commit"]["context"][
+            "messages"
+        ]
+        if message["role"] == "user"
+    ]
+    assert len(final_stored_user_messages) == 1
+
+
+@pytest.mark.asyncio
+async def test_inject_commit_ack_lost_is_confirmed_by_read_back(
+    tmp_path: Path,
+) -> None:
+    tracer = CommitAckLostStore()
+    dispatched: list[dict[str, Any]] = []
+
+    class _RecordingCallback:
+        async def on_user_message_posted(self, **kwargs: Any) -> None:
+            dispatched.append(kwargs)
+
+    runner = AgentRunner(
+        agent=Agent(name="writer", patterns=[]),
+        tracer=tracer,
+        callbacks=[_RecordingCallback()],
+        workspace_manager=FakeWorkspaceManager(tmp_path),
+    )
+    context = ExecutionContext(execution_id="exec-ack-lost")
+    runner.context_manager.set_context(context)
+    runner.pause = MagicMock(return_value=True)
+
+    result = await runner.inject_user_message(
+        "exec-ack-lost", "Hello", request_interrupt=True
+    )
+
+    assert result.outcome is UserMessageInjectionOutcome.POSTED_FRESH
+    assert [
+        message.content for message in result.context.messages if message.role == "user"
+    ] == ["Hello"]
+    assert len(dispatched) == 1
+    runner.pause.assert_called_once()
+
+
+class _FakePatternWithState:
+    def __init__(self, state: dict[str, Any]) -> None:
+        self._state = state
+
+    def get_state(self) -> dict[str, Any]:
+        return self._state
+
+
+@pytest.mark.asyncio
+async def test_inject_watermark_repersist_does_not_regress_concurrent_checkpoint(
+    tmp_path: Path,
+) -> None:
+    """A pattern checkpoint that lands during ``on_user_message_posted``
+    (the callback runs OUTSIDE the injection's exclusive lock, so a
+    SHARED-mode pattern checkpoint can genuinely interleave with it) must
+    not be clobbered by the watermark re-persist that follows it: the
+    watermark write's baseline must be re-resolved AFTER the callback
+    runs, not reused from before it, or it would silently overwrite the
+    newer pattern_state with the stale pre-callback one."""
+    from xagent.core.agent.tracing import TRACE_WATERMARK_KEY
+
+    tracer = TracerCheckpointStore()
+    execution_id = "exec-watermark-baseline"
+    pattern_runtime = PatternRuntime(execution_id=execution_id, tracer=tracer)
+
+    class _WatermarkAdvancingCallback:
+        async def on_user_message_posted(self, **kwargs: Any) -> None:
+            context = kwargs["context"]
+            # A pattern checkpoint lands concurrently with this callback,
+            # advancing the runtime's cached baseline with fresh
+            # pattern_state.
+            await pattern_runtime.checkpoint(
+                "concurrent-step",
+                context=context,
+                pattern=_FakePatternWithState({"progress": "fresh-from-callback"}),
+            )
+            context.metadata[TRACE_WATERMARK_KEY] = "watermark-after-callback"
+
+    runner = AgentRunner(
+        agent=Agent(name="writer", patterns=[]),
+        tracer=tracer,
+        callbacks=[_WatermarkAdvancingCallback()],
+        workspace_manager=FakeWorkspaceManager(tmp_path),
+    )
+    context = ExecutionContext(execution_id=execution_id)
+    runner.context_manager.set_context(context)
+    runner._active_controls[execution_id] = ExecutionControl(
+        runtime=pattern_runtime, task=None
+    )
+    runner.pause = MagicMock(return_value=True)
+
+    result = await runner.inject_user_message(
+        execution_id, "Hello", request_interrupt=True
+    )
+
+    assert result.outcome is UserMessageInjectionOutcome.POSTED_FRESH
+    final_payload = tracer.by_execution_id[execution_id]
+    assert final_payload["label"] == "user_message_trace_watermark"
+    assert final_payload["pattern_state"] == {"progress": "fresh-from-callback"}
+
+
+@pytest.mark.asyncio
+async def test_inject_unconfirmable_write_returns_outcome_unknown(
+    tmp_path: Path,
+) -> None:
+    tracer = ReadBackFailingStore()
+    runner = AgentRunner(
+        agent=Agent(name="writer", patterns=[]),
+        tracer=tracer,
+        workspace_manager=FakeWorkspaceManager(tmp_path),
+    )
+    context = ExecutionContext(execution_id="exec-unknown-outcome")
+    runner.context_manager.set_context(context)
+    # Cache a baseline on an active control so the pre-write baseline read
+    # (which would itself fail while ``tracer.fail`` is True) is skipped --
+    # isolating the assertion to the write-then-read-back failure this test
+    # actually targets.
+    baseline_checkpoint = {
+        "type": "checkpoint",
+        "execution_id": "exec-unknown-outcome",
+        "context": context.to_dict(),
+    }
+    runner._active_controls["exec-unknown-outcome"] = ExecutionControl(
+        runtime=SimpleNamespace(last_checkpoint=baseline_checkpoint),
+        task=None,
+    )
+    runner.pause = MagicMock(return_value=True)
+
+    result = await runner.inject_user_message(
+        "exec-unknown-outcome",
+        "Hello",
+        turn_id="turn-unknown",
+        request_interrupt=True,
+    )
+
+    assert result.outcome is UserMessageInjectionOutcome.OUTCOME_UNKNOWN
+    assert result.context is context
+    assert context.messages == []
+    runner.pause.assert_called_once()
+
+    tracer.fail = False
+    retry = await runner.inject_user_message(
+        "exec-unknown-outcome",
+        "Hello",
+        turn_id="turn-unknown",
+        request_interrupt=False,
+    )
+
+    assert retry.outcome is UserMessageInjectionOutcome.POSTED_FRESH
+    matches = [
+        message
+        for message in retry.context.messages
+        if message.role == "user" and message.metadata.get("turn_id") == "turn-unknown"
+    ]
+    assert len(matches) == 1
+
+
+class IntermittentUnknownStore:
+    """The first ``fail_count`` checkpoint writes raise, and the read-back
+    used to disambiguate them also fails for that same window -- modeling
+    a store outage that recovers after a bounded number of attempts.
+    Drives the bounded-retry coverage for finding A: with
+    ``fail_count`` below ``AgentRunner._INJECTION_UNKNOWN_RETRY_ATTEMPTS``
+    the store recovers mid-retry and the injection converges to
+    ``POSTED_FRESH``; with ``fail_count`` at or above it, every attempt is
+    exhausted and the injection reports ``OUTCOME_UNKNOWN``.
+    """
+
+    def __init__(self, fail_count: int) -> None:
+        self.fail_count = fail_count
+        self.write_calls = 0
+        self.read_calls = 0
+        self.by_execution_id: dict[str, dict[str, Any]] = {}
+
+    async def checkpoint(self, **payload: Any) -> None:
+        self.write_calls += 1
+        if self.write_calls <= self.fail_count:
+            raise CheckpointPersistenceError("transient store outage")
+        self.by_execution_id[str(payload["execution_id"])] = dict(payload)
+
+    async def load_latest_checkpoint(self, execution_id: str) -> dict[str, Any] | None:
+        self.read_calls += 1
+        if self.write_calls <= self.fail_count:
+            raise CheckpointUnavailableError("transient store outage")
+        payload = self.by_execution_id.get(execution_id)
+        return dict(payload) if payload is not None else None
+
+
+def _cache_injection_baseline(
+    runner: AgentRunner, execution_id: str, context: Any
+) -> None:
+    """Seed ``_active_controls`` with a cached baseline so
+    ``_resolve_injection_baseline`` short-circuits to it instead of
+    calling into a deliberately-failing store for the pre-write baseline
+    read -- isolating these tests to the write/read-back retry behavior
+    they actually target, same trick as
+    ``test_inject_unconfirmable_write_returns_outcome_unknown`` above."""
+    baseline_checkpoint = {
+        "type": "checkpoint",
+        "execution_id": execution_id,
+        "context": context.to_dict(),
+    }
+    runner._active_controls[execution_id] = ExecutionControl(
+        runtime=SimpleNamespace(last_checkpoint=baseline_checkpoint),
+        task=None,
+    )
+
+
+@pytest.mark.asyncio
+async def test_inject_bounded_retry_converges_to_posted_fresh(
+    tmp_path: Path,
+) -> None:
+    """The store fails once (write raises, read-back also fails -- a
+    genuine ``unknown`` verdict) and then recovers: the retry inside
+    ``inject_user_message`` must pick this up on its next attempt and
+    report ``POSTED_FRESH`` rather than giving up after the first
+    ambiguous failure."""
+    tracer = IntermittentUnknownStore(fail_count=1)
+    runner = AgentRunner(
+        agent=Agent(name="writer", patterns=[]),
+        tracer=tracer,
+        workspace_manager=FakeWorkspaceManager(tmp_path),
+    )
+    context = ExecutionContext(execution_id="exec-retry-converges")
+    runner.context_manager.set_context(context)
+    _cache_injection_baseline(runner, "exec-retry-converges", context)
+    runner.pause = MagicMock(return_value=True)
+
+    result = await runner.inject_user_message(
+        "exec-retry-converges",
+        "Hello",
+        turn_id="turn-retry-converges",
+        request_interrupt=True,
+    )
+
+    assert result.outcome is UserMessageInjectionOutcome.POSTED_FRESH
+    assert tracer.write_calls == 2
+    matches = [
+        message
+        for message in result.context.messages
+        if message.role == "user"
+        and message.metadata.get("turn_id") == "turn-retry-converges"
+    ]
+    assert len(matches) == 1
+    runner.pause.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_inject_bounded_retry_exhausted_reports_unknown(
+    tmp_path: Path,
+) -> None:
+    """Every attempt in the bounded retry ends ``unknown``: the injection
+    must give up and report ``OUTCOME_UNKNOWN`` after exactly
+    ``AgentRunner._INJECTION_UNKNOWN_RETRY_ATTEMPTS`` write attempts, not
+    fewer (giving up too early) and not more (retrying unboundedly)."""
+    tracer = IntermittentUnknownStore(
+        fail_count=AgentRunner._INJECTION_UNKNOWN_RETRY_ATTEMPTS
+    )
+    runner = AgentRunner(
+        agent=Agent(name="writer", patterns=[]),
+        tracer=tracer,
+        workspace_manager=FakeWorkspaceManager(tmp_path),
+    )
+    context = ExecutionContext(execution_id="exec-retry-exhausted")
+    runner.context_manager.set_context(context)
+    _cache_injection_baseline(runner, "exec-retry-exhausted", context)
+    runner.pause = MagicMock(return_value=True)
+
+    result = await runner.inject_user_message(
+        "exec-retry-exhausted",
+        "Hello",
+        turn_id="turn-retry-exhausted",
+        request_interrupt=True,
+    )
+
+    assert result.outcome is UserMessageInjectionOutcome.OUTCOME_UNKNOWN
+    assert tracer.write_calls == AgentRunner._INJECTION_UNKNOWN_RETRY_ATTEMPTS
+    assert context.messages == []
+    runner.pause.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_inject_retry_backoff_sleeps_with_write_lock_released(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The bounded retry's backoff must not hold the EXCLUSIVE gate: a
+    pattern checkpoint for the same context has to be able to land while
+    a flaky store is being retried, and the retry must still converge."""
+    import xagent.core.agent.runner as runner_module
+
+    tracer = IntermittentUnknownStore(fail_count=1)
+    runner = AgentRunner(
+        agent=Agent(name="writer", patterns=[]),
+        tracer=tracer,
+        workspace_manager=FakeWorkspaceManager(tmp_path),
+    )
+    context = ExecutionContext(execution_id="exec-backoff-unlocked")
+    runner.context_manager.set_context(context)
+    _cache_injection_baseline(runner, "exec-backoff-unlocked", context)
+    runner.pause = MagicMock(return_value=True)
+
+    real_sleep = asyncio.sleep
+    lock_held_during_backoff: list[bool] = []
+
+    async def recording_sleep(delay: float, *args: Any, **kwargs: Any) -> Any:
+        lock_held_during_backoff.append(context_write_lock(context).locked())
+        return await real_sleep(0)
+
+    monkeypatch.setattr(runner_module.asyncio, "sleep", recording_sleep)
+
+    result = await runner.inject_user_message(
+        "exec-backoff-unlocked",
+        "Hello",
+        turn_id="turn-backoff-unlocked",
+        request_interrupt=False,
+    )
+
+    assert result.outcome is UserMessageInjectionOutcome.POSTED_FRESH
+    assert lock_held_during_backoff == [False]
+    assert tracer.write_calls == 2
+
+
+@pytest.mark.asyncio
+async def test_inject_retry_recognizes_turn_applied_while_lock_released(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Because the lock is released for the backoff, a concurrent same-turn
+    injection can confirm the turn in between; the next attempt must
+    re-run the dedupe check and report REPLAY instead of writing again."""
+    import xagent.core.agent.runner as runner_module
+
+    tracer = IntermittentUnknownStore(fail_count=1)
+    runner = AgentRunner(
+        agent=Agent(name="writer", patterns=[]),
+        tracer=tracer,
+        workspace_manager=FakeWorkspaceManager(tmp_path),
+    )
+    context = ExecutionContext(execution_id="exec-backoff-replay")
+    runner.context_manager.set_context(context)
+    _cache_injection_baseline(runner, "exec-backoff-replay", context)
+    runner.pause = MagicMock(return_value=True)
+
+    real_sleep = asyncio.sleep
+
+    async def sleep_with_concurrent_apply(
+        delay: float, *args: Any, **kwargs: Any
+    ) -> Any:
+        context.add_user_message("Hello", metadata={"turn_id": "turn-backoff-replay"})
+        return await real_sleep(0)
+
+    monkeypatch.setattr(runner_module.asyncio, "sleep", sleep_with_concurrent_apply)
+
+    result = await runner.inject_user_message(
+        "exec-backoff-replay",
+        "Hello",
+        turn_id="turn-backoff-replay",
+        request_interrupt=False,
+    )
+
+    assert result.outcome is UserMessageInjectionOutcome.POSTED_REPLAY
+    assert tracer.write_calls == 1
+    assert [m.metadata.get("turn_id") for m in context.messages] == [
+        "turn-backoff-replay"
+    ]
+
+
+class FirstReadOnlyStore:
+    """Only the very first read (the pre-write baseline) succeeds; every
+    write commits and then raises, and every later read fails."""
+
+    def __init__(self) -> None:
+        self.read_calls = 0
+        self.write_calls = 0
+        self.by_execution_id: dict[str, dict[str, Any]] = {}
+
+    async def checkpoint(self, **payload: Any) -> None:
+        self.write_calls += 1
+        self.by_execution_id[str(payload["execution_id"])] = dict(payload)
+        raise CheckpointPersistenceError("ack lost")
+
+    async def load_latest_checkpoint(self, execution_id: str) -> dict[str, Any] | None:
+        self.read_calls += 1
+        if self.read_calls > 1:
+            raise CheckpointUnavailableError("read unavailable")
+        payload = self.by_execution_id.get(execution_id)
+        return dict(payload) if payload is not None else None
+
+
+@pytest.mark.asyncio
+async def test_inject_retry_baseline_read_failure_after_possible_commit_is_unknown(
+    tmp_path: Path,
+) -> None:
+    """Once an attempt may have committed, a retry whose baseline re-read
+    fails must report OUTCOME_UNKNOWN -- never propagate the read error,
+    which every caller interprets as "nothing was injected"."""
+    tracer = FirstReadOnlyStore()
+    runner = AgentRunner(
+        agent=Agent(name="writer", patterns=[]),
+        tracer=tracer,
+        workspace_manager=FakeWorkspaceManager(tmp_path),
+    )
+    context = ExecutionContext(execution_id="exec-retry-baseline-read")
+    runner.context_manager.set_context(context)
+    runner.pause = MagicMock(return_value=True)
+
+    result = await runner.inject_user_message(
+        "exec-retry-baseline-read",
+        "Hello",
+        turn_id="turn-retry-baseline-read",
+        request_interrupt=False,
+    )
+
+    assert result.outcome is UserMessageInjectionOutcome.OUTCOME_UNKNOWN
+    assert tracer.write_calls == 1
+    assert context.messages == []
+
+
+class CommitThenUnreadableStore:
+    """While ``fail`` is True every write durably commits and THEN raises,
+    and every read fails -- so the injection's read-back cannot tell that
+    the write landed and reports ``OUTCOME_UNKNOWN`` although the turn IS
+    durable. With ``commit_while_failing=False`` the failing writes store
+    nothing instead (the turn is genuinely absent)."""
+
+    def __init__(self, *, commit_while_failing: bool) -> None:
+        self.commit_while_failing = commit_while_failing
+        self.fail = True
+        self.write_calls = 0
+        self.by_execution_id: dict[str, dict[str, Any]] = {}
+
+    async def checkpoint(self, **payload: Any) -> None:
+        self.write_calls += 1
+        if self.fail:
+            if self.commit_while_failing:
+                self.by_execution_id[str(payload["execution_id"])] = dict(payload)
+            raise CheckpointPersistenceError("ack lost")
+        self.by_execution_id[str(payload["execution_id"])] = dict(payload)
+
+    async def load_latest_checkpoint(self, execution_id: str) -> dict[str, Any] | None:
+        if self.fail:
+            raise CheckpointUnavailableError("read unavailable")
+        payload = self.by_execution_id.get(execution_id)
+        return dict(payload) if payload is not None else None
+
+
+async def _inject_until_unknown(
+    runner: AgentRunner, execution_id: str, turn_id: str
+) -> ExecutionContext:
+    context = ExecutionContext(execution_id=execution_id)
+    runner.context_manager.set_context(context)
+    _cache_injection_baseline(runner, execution_id, context)
+    runner.pause = MagicMock(return_value=True)
+    result = await runner.inject_user_message(
+        execution_id, "Hello", turn_id=turn_id, request_interrupt=False
+    )
+    assert result.outcome is UserMessageInjectionOutcome.OUTCOME_UNKNOWN
+    assert context.messages == []
+    # The run that owned this context is over by the time a resume owner
+    # settles the unknown outcome.
+    runner._active_controls.pop(execution_id)
+    return context
+
+
+def _settle_runner(tmp_path: Path, tracer: Any) -> AgentRunner:
+    runner = AgentRunner(
+        agent=Agent(name="writer", patterns=[]),
+        tracer=tracer,
+        workspace_manager=FakeWorkspaceManager(tmp_path),
+    )
+    runner.pause = MagicMock(return_value=True)
+    return runner
+
+
+def _durable_turn_ids(tracer: Any, execution_id: str) -> list[Any]:
+    messages = tracer.by_execution_id[execution_id]["context"]["messages"]
+    return [m["metadata"].get("turn_id") for m in messages if m["role"] == "user"]
+
+
+@pytest.mark.asyncio
+async def test_settle_replays_turn_committed_under_unknown(tmp_path: Path) -> None:
+    tracer = CommitThenUnreadableStore(commit_while_failing=True)
+    runner = _settle_runner(tmp_path, tracer)
+    stale = await _inject_until_unknown(runner, "exec-settle-found", "turn-rb")
+    tracer.fail = False
+    writes_before = tracer.write_calls
+
+    # A plain retry would dedupe against the stale registered context,
+    # which never saw the turn; the settle dedupes against the durable
+    # checkpoint, which did.
+    result = await runner.settle_injection_against_checkpoint(
+        "exec-settle-found", "Hello", turn_id="turn-rb"
+    )
+
+    assert result.outcome is UserMessageInjectionOutcome.POSTED_REPLAY
+    assert tracer.write_calls == writes_before
+    assert result.context is not None and result.context is not stale
+    assert [m.metadata.get("turn_id") for m in result.context.messages] == ["turn-rb"]
+    # Detached: the registry still holds the very same (stale) object.
+    assert runner.context_manager.get_context("exec-settle-found") is stale
+    assert stale.messages == []
+    runner.pause.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_settle_persists_turn_absent_under_unknown(tmp_path: Path) -> None:
+    tracer = CommitThenUnreadableStore(commit_while_failing=False)
+    runner = _settle_runner(tmp_path, tracer)
+    # Seed a durable checkpoint the settle can read.
+    tracer.fail = False
+    seed = ExecutionContext(execution_id="exec-settle-absent")
+    await tracer.checkpoint(
+        type="checkpoint", execution_id="exec-settle-absent", context=seed.to_dict()
+    )
+    tracer.fail = True
+    stale = await _inject_until_unknown(runner, "exec-settle-absent", "turn-ra")
+    tracer.fail = False
+    callback = MagicMock()
+    runner.callbacks = [SimpleNamespace(on_user_message_posted=callback)]
+
+    result = await runner.settle_injection_against_checkpoint(
+        "exec-settle-absent",
+        execution_message="Hello",
+        display_message="Hi",
+        turn_id="turn-ra",
+    )
+
+    assert result.outcome is UserMessageInjectionOutcome.POSTED_FRESH
+    assert _durable_turn_ids(tracer, "exec-settle-absent") == ["turn-ra"]
+    durable = tracer.by_execution_id["exec-settle-absent"]["context"]
+    assert durable["messages"][-1]["metadata"]["display_message"] == "Hi"
+    # The trace is handed to the resume's catch-up via the pending marker;
+    # nothing live is notified.
+    assert durable["metadata"]["_pending_user_message_trace_turn_id"] == "turn-ra"
+    callback.assert_not_called()
+    runner.pause.assert_not_called()
+    assert runner.context_manager.get_context("exec-settle-absent") is stale
+    assert stale.messages == []
+
+
+class CommitThenLoseAckStore:
+    """Reads always work; the first write durably commits and then raises
+    (the ack is lost), later writes succeed."""
+
+    def __init__(self) -> None:
+        self.write_calls = 0
+        self.read_calls = 0
+        self.by_execution_id: dict[str, dict[str, Any]] = {}
+
+    async def checkpoint(self, **payload: Any) -> None:
+        self.write_calls += 1
+        self.by_execution_id[str(payload["execution_id"])] = dict(payload)
+        if self.write_calls == 1:
+            raise CheckpointPersistenceError("ack lost")
+
+    async def load_latest_checkpoint(self, execution_id: str) -> dict[str, Any] | None:
+        self.read_calls += 1
+        payload = self.by_execution_id.get(execution_id)
+        return dict(payload) if payload is not None else None
+
+
+@pytest.mark.asyncio
+async def test_settle_write_error_confirmed_by_read_back_is_posted_fresh(
+    tmp_path: Path,
+) -> None:
+    """The "found" branch: the settle's own write raises, the read-back
+    sees the turn committed, so it is reported POSTED_FRESH with no second
+    write."""
+    tracer = CommitThenLoseAckStore()
+    tracer.by_execution_id["exec-settle-readback"] = {
+        "type": "checkpoint",
+        "execution_id": "exec-settle-readback",
+        "context": ExecutionContext(execution_id="exec-settle-readback").to_dict(),
+    }
+    runner = _settle_runner(tmp_path, tracer)
+
+    result = await runner.settle_injection_against_checkpoint(
+        "exec-settle-readback", "Hello", turn_id="turn-readback"
+    )
+
+    assert result.outcome is UserMessageInjectionOutcome.POSTED_FRESH
+    assert tracer.write_calls == 1
+    # Pre-write read + read-back.
+    assert tracer.read_calls == 2
+    assert _durable_turn_ids(tracer, "exec-settle-readback") == ["turn-readback"]
+    assert runner.context_manager.get_context("exec-settle-readback") is None
+
+
+@pytest.mark.asyncio
+async def test_settle_without_checkpoint_ignores_stale_context(
+    tmp_path: Path,
+) -> None:
+    tracer = TracerCheckpointStore()
+    runner = _settle_runner(tmp_path, tracer)
+    stale = ExecutionContext(execution_id="exec-settle-none")
+    stale.add_user_message("older turn", metadata={"turn_id": "turn-old"})
+    runner.context_manager.set_context(stale)
+    try:
+        result = await runner.settle_injection_against_checkpoint(
+            "exec-settle-none", "Hello", turn_id="turn-new"
+        )
+
+        assert result.outcome is UserMessageInjectionOutcome.NOT_POSTED
+        assert result.context is None
+        assert tracer.write_calls == 0
+        assert runner.context_manager.get_context("exec-settle-none") is stale
+        assert [m.metadata.get("turn_id") for m in stale.messages] == ["turn-old"]
+    finally:
+        runner.context_manager.remove_context("exec-settle-none")
+
+
+class PatternCheckpointRacingStore:
+    """The settle's first write commits and loses its ack, and the
+    read-back fails (``unknown``). Meanwhile a pattern checkpoint of the
+    REGISTERED context -- as another runner's still-running pattern would
+    take it -- is queued on that object's gate; it must not run inside the
+    settle's attempt, and lands in the backoff between attempts."""
+
+    def __init__(self, live: ExecutionContext) -> None:
+        self.live = live
+        self.labels: list[str] = []
+        self.by_execution_id: dict[str, dict[str, Any]] = {}
+        self.pattern_task: asyncio.Task[None] | None = None
+        self.pattern_interleaved = False
+        self.fail_next_read = False
+
+    async def _pattern_checkpoint(self) -> None:
+        async with context_write_lock(self.live).shared():
+            self.labels.append("pattern_step")
+            self.by_execution_id[self.live.execution_id] = {
+                "type": "checkpoint",
+                "label": "pattern_step",
+                "execution_id": self.live.execution_id,
+                "context": self.live.to_dict(),
+            }
+
+    async def checkpoint(self, **payload: Any) -> None:
+        self.labels.append(str(payload.get("label")))
+        self.by_execution_id[str(payload["execution_id"])] = dict(payload)
+        if self.pattern_task is None:
+            self.pattern_task = asyncio.create_task(self._pattern_checkpoint())
+            for _ in range(3):
+                await asyncio.sleep(0)
+            self.pattern_interleaved = "pattern_step" in self.labels
+            self.fail_next_read = True
+            raise CheckpointPersistenceError("ack lost")
+
+    async def load_latest_checkpoint(self, execution_id: str) -> dict[str, Any] | None:
+        if self.fail_next_read:
+            self.fail_next_read = False
+            raise CheckpointUnavailableError("read-back unavailable")
+        payload = self.by_execution_id.get(execution_id)
+        return dict(payload) if payload is not None else None
+
+
+@pytest.mark.asyncio
+async def test_settle_pattern_checkpoint_between_retries_keeps_one_copy(
+    tmp_path: Path,
+) -> None:
+    execution_id = "exec-settle-race"
+    live = ExecutionContext(execution_id=execution_id)
+    live.add_message("assistant", "step done")
+    tracer = PatternCheckpointRacingStore(live)
+    tracer.by_execution_id[execution_id] = {
+        "type": "checkpoint",
+        "execution_id": execution_id,
+        "context": ExecutionContext(execution_id=execution_id).to_dict(),
+    }
+    runner = _settle_runner(tmp_path, tracer)
+    runner.context_manager.set_context(live)
+    try:
+        result = await runner.settle_injection_against_checkpoint(
+            execution_id, "Hello", turn_id="turn-race"
+        )
+        assert tracer.pattern_task is not None
+        await tracer.pattern_task
+
+        assert result.outcome is UserMessageInjectionOutcome.POSTED_FRESH
+        # Serialized by the registered context's gate: the pattern write
+        # could not run inside the settle's attempt ...
+        assert tracer.pattern_interleaved is False
+        # ... and landed between the two attempts, which re-read it.
+        assert tracer.labels == [
+            "user_message_injected",
+            "pattern_step",
+            "user_message_injected",
+        ]
+        durable = tracer.by_execution_id[execution_id]["context"]["messages"]
+        assert [(m["role"], m["content"]) for m in durable] == [
+            ("assistant", "step done"),
+            ("user", "Hello"),
+        ]
+        assert _durable_turn_ids(tracer, execution_id) == ["turn-race"]
+        assert runner.context_manager.get_context(execution_id) is live
+        assert [m.role for m in live.messages] == ["assistant"]
+    finally:
+        runner.context_manager.remove_context(execution_id)
+
+
+@pytest.mark.asyncio
+async def test_settle_refused_while_a_run_is_active(tmp_path: Path) -> None:
+    tracer = CommitThenLoseAckStore()
+    runner = _settle_runner(tmp_path, tracer)
+    context = ExecutionContext(execution_id="exec-settle-active")
+    _cache_injection_baseline(runner, "exec-settle-active", context)
+
+    with pytest.raises(InjectionSettleRefusedError):
+        await runner.settle_injection_against_checkpoint(
+            "exec-settle-active", "Hello", turn_id="turn-active"
+        )
+
+    assert tracer.read_calls == 0
+    assert tracer.write_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_settle_requires_turn_id(tmp_path: Path) -> None:
+    tracer = CommitThenLoseAckStore()
+    runner = _settle_runner(tmp_path, tracer)
+
+    with pytest.raises(ValueError, match="turn_id"):
+        await runner.settle_injection_against_checkpoint(
+            "exec-settle-no-turn", "Hello", turn_id="  "
+        )
+
+    assert tracer.read_calls == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("registered", [True, False], ids=["stale", "none"])
+async def test_settle_never_changes_registered_context_identity(
+    tmp_path: Path, registered: bool
+) -> None:
+    execution_id = f"exec-settle-identity-{registered}"
+    tracer = TracerCheckpointStore()
+    tracer.by_execution_id[execution_id] = {
+        "type": "checkpoint",
+        "execution_id": execution_id,
+        "context": ExecutionContext(execution_id=execution_id).to_dict(),
+    }
+    runner = _settle_runner(tmp_path, tracer)
+    stale = ExecutionContext(execution_id=execution_id) if registered else None
+    if stale is not None:
+        runner.context_manager.set_context(stale)
+    try:
+        result = await runner.settle_injection_against_checkpoint(
+            execution_id, "Hello", turn_id="turn-identity"
+        )
+
+        assert result.outcome is UserMessageInjectionOutcome.POSTED_FRESH
+        assert runner.context_manager.get_context(execution_id) is stale
+        assert result.context is not stale
+        assert _durable_turn_ids(tracer, execution_id) == ["turn-identity"]
+    finally:
+        runner.context_manager.remove_context(execution_id)
+
+
+def test_context_write_lock_rebinds_across_event_loops() -> None:
+    """Companion to the ``test_context.py`` coverage of the same function,
+    kept here too per the R1 test plan: a lock idle when a different loop
+    asks for it is rebound silently; a lock held across loops raises."""
+    context = ExecutionContext(execution_id="exec-cross-loop-runner")
+
+    async def acquire_once() -> asyncio.Lock:
+        lock = context_write_lock(context)
+        async with lock:
+            pass
+        return lock
+
+    first_loop = asyncio.new_event_loop()
+    try:
+        first_lock = first_loop.run_until_complete(acquire_once())
+    finally:
+        first_loop.close()
+
+    second_loop = asyncio.new_event_loop()
+    try:
+        second_lock = second_loop.run_until_complete(acquire_once())
+    finally:
+        second_loop.close()
+
+    assert first_lock is not second_lock
+
+    third_loop = asyncio.new_event_loop()
+    fourth_loop = asyncio.new_event_loop()
+    try:
+
+        async def acquire_and_hold() -> asyncio.Lock:
+            lock = context_write_lock(context)
+            await lock.acquire()
+            return lock
+
+        held_lock = third_loop.run_until_complete(acquire_and_hold())
+
+        async def try_rebind() -> None:
+            context_write_lock(context)
+
+        with pytest.raises(RuntimeError, match="two event loops"):
+            fourth_loop.run_until_complete(try_rebind())
+
+        async def release(lock: asyncio.Lock) -> None:
+            lock.release()
+
+        third_loop.run_until_complete(release(held_lock))
+    finally:
+        third_loop.close()
+        fourth_loop.close()
 
 
 @pytest.mark.asyncio
