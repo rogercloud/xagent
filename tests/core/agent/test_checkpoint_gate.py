@@ -212,8 +212,9 @@ async def test_context_copies_and_serialization_do_not_share_active_gate() -> No
             assert copied == context
             copied_gate = context_checkpoint_gate(copied)
             assert copied_gate is not gate
-            async with copied_gate.exclusive():
-                pass
+            async with asyncio.timeout(2):
+                async with copied_gate.exclusive():
+                    pass
         assert shallow.metadata is context.metadata
         assert deep.metadata is not context.metadata
         assert deep.metadata["nested"] is not context.metadata["nested"]
