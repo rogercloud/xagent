@@ -26,6 +26,7 @@ from ..workspace import WorkspaceManager
 from .attachments import build_image_context_references
 from .checkpoint import (
     CheckpointCorruptError,
+    CheckpointPersistenceError,
     read_latest_checkpoint_payload,
 )
 from .context import ContextManager, ExecutionContext
@@ -107,6 +108,10 @@ class UserMessageInjectionOutcome(str, Enum):
     POSTED_FRESH = "posted_fresh"
     POSTED_REPLAY = "posted_replay"
     OUTCOME_UNKNOWN = "outcome_unknown"
+
+
+class UserMessageInjectionRejectedError(CheckpointPersistenceError):
+    """A failed candidate write was read back and its turn is definitely absent."""
 
 
 class InjectionSettleRefusedError(RuntimeError):
@@ -1029,12 +1034,12 @@ class AgentRunner:
             )
         except asyncio.CancelledError:
             raise
-        except Exception:
+        except Exception as exc:
             verdict = await self._confirm_injected_turn(
                 execution_id, message.metadata["turn_id"], message.content
             )
             if verdict == "absent":
-                raise
+                raise UserMessageInjectionRejectedError(str(exc)) from exc
             if verdict == "unknown":
                 return UserMessageInjectionOutcome.OUTCOME_UNKNOWN
         return UserMessageInjectionOutcome.POSTED_FRESH

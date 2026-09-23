@@ -1557,11 +1557,36 @@ def _enqueue_websocket_task_command_sync(
                 and not existing_delivery.pending
                 and (not payload.get("files") or existing_delivery.outcome_unknown)
             ):
+                payload_matches = existing_delivery.payload_matches
+                if existing_delivery.outcome_unknown:
+                    from ..models.task_command import TaskExecutionCommand
+
+                    original_command = (
+                        db.query(TaskExecutionCommand.id)
+                        .filter(
+                            TaskExecutionCommand.task_id == task_id,
+                            TaskExecutionCommand.command_id == command_id,
+                        )
+                        .first()
+                    )
+                    if original_command is not None:
+                        # Preparation can deduplicate or skip attachment IDs.
+                        # Compare retries with the original command payload,
+                        # not the normalized delivery attachments.
+                        original = enqueue_task_command(
+                            db,
+                            task_id=task_id,
+                            actor_user_id=actor_user_id,
+                            command_id=command_id,
+                            kind=kind,
+                            payload=payload,
+                        )
+                        payload_matches = original.payload_matches
                 return EnqueuedTaskCommand(
                     command_id=0,
                     client_command_id=command_id,
                     created=False,
-                    payload_matches=existing_delivery.payload_matches,
+                    payload_matches=payload_matches,
                     status=(
                         DELIVERY_OUTCOME_UNKNOWN
                         if existing_delivery.outcome_unknown

@@ -43,6 +43,7 @@ from xagent.core.agent.runner import (
     ExecutionControl,
     InjectionSettleRefusedError,
     UserMessageInjectionOutcome,
+    UserMessageInjectionRejectedError,
 )
 from xagent.core.execution_scope import (
     ExecutionScope,
@@ -103,6 +104,7 @@ from xagent.web.services.task_interaction_close import (
 )
 from xagent.web.services.task_lease_service import (
     TaskLease,
+    TaskLeaseHeartbeatOutcome,
     current_task_lease,
     get_runner_id,
 )
@@ -6001,3 +6003,304 @@ async def test_unknown_marker_failure_cannot_be_promoted_to_completed(
     assert statuses == [DELIVERY_OUTCOME_UNKNOWN, DELIVERY_OUTCOME_UNKNOWN]
     assert _delivery_status(db_session, turn_id) == DELIVERY_OUTCOME_UNKNOWN
     assert _delivery_acks(ws)[0]["rejection_outcome"] == "outcome_unknown"
+
+
+class _CommittedInjectionStore:
+    """Commit, then block so the caller can cancel before receiving a result."""
+
+    def __init__(self):
+        self.payload = None
+        self.committed = asyncio.Event()
+
+    async def checkpoint(self, **payload):
+        self.payload = payload
+        self.committed.set()
+        await asyncio.Event().wait()
+
+    async def load_latest_checkpoint(self, execution_id):
+        return self.payload
+
+
+def _runner_for_cancelled_injection(task_id, store):
+    execution_id = str(task_id)
+    runner = AgentRunner(agent=Agent(name="writer", patterns=[]), tracer=store)
+    context = ExecutionContext(execution_id=execution_id)
+    runner.context_manager.set_context(context)
+    runner._active_controls[execution_id] = ExecutionControl(
+        runtime=SimpleNamespace(last_checkpoint={"context": context.to_dict()}),
+        task=None,
+    )
+    return runner, context
+
+
+@pytest.mark.asyncio
+async def test_deferred_committed_write_cancellation_preserves_unknown(db_session):
+    owner, task, turn_id = _seed_deferred_delivery(db_session, "cancelled-write")
+    store = _CommittedInjectionStore()
+    runner, context = _runner_for_cancelled_injection(task.id, store)
+
+    async def post(execution_id, **kwargs):
+        return (await runner.post_user_message(execution_id, **kwargs)).outcome
+
+    agent = MagicMock(post_user_message=AsyncMock(side_effect=post))
+    operation = asyncio.create_task(
+        _run_deferred_unknown_resume(
+            db_session,
+            owner=owner,
+            task=task,
+            turn_id=turn_id,
+            agent=agent,
+        )
+    )
+    try:
+        await asyncio.wait_for(store.committed.wait(), 5)
+        operation.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await operation
+        assert store.payload["context"]["messages"][0]["metadata"]["turn_id"] == turn_id
+        assert context.messages == []
+        assert _delivery_status(db_session, turn_id) == DELIVERY_OUTCOME_UNKNOWN
+        agent.resume_execution_by_id.assert_not_awaited()
+    finally:
+        operation.cancel()
+        await asyncio.gather(operation, return_exceptions=True)
+        runner.context_manager.remove_context(str(task.id))
+
+
+@pytest.mark.asyncio
+async def test_deferred_committed_write_lease_loss_preserves_unknown(db_session):
+    owner, task, turn_id = _seed_deferred_delivery(db_session, "lease-lost-write")
+    store = _CommittedInjectionStore()
+    runner, context = _runner_for_cancelled_injection(task.id, store)
+
+    async def post(execution_id, **kwargs):
+        return (await runner.post_user_message(execution_id, **kwargs)).outcome
+
+    async def lose_lease(*args, **kwargs):
+        await store.committed.wait()
+        return TaskLeaseHeartbeatOutcome(lease_lost=True)
+
+    agent = MagicMock(post_user_message=AsyncMock(side_effect=post))
+    try:
+        with patch.object(
+            task_execution_service, "run_task_lease_heartbeat", side_effect=lose_lease
+        ):
+            await asyncio.wait_for(
+                _run_deferred_unknown_resume(
+                    db_session,
+                    owner=owner,
+                    task=task,
+                    turn_id=turn_id,
+                    agent=agent,
+                ),
+                5,
+            )
+        assert store.payload["context"]["messages"][0]["metadata"]["turn_id"] == turn_id
+        assert context.messages == []
+        assert _delivery_status(db_session, turn_id) == DELIVERY_OUTCOME_UNKNOWN
+        agent.resume_execution_by_id.assert_not_awaited()
+    finally:
+        runner.context_manager.remove_context(str(task.id))
+
+
+@pytest.mark.asyncio
+async def test_live_committed_write_cancellation_preserves_unknown(
+    db_session, live_task_lease
+):
+    owner = _user(db_session, "cancel-live-owner")
+    task = _task(db_session, owner.id, status=TaskStatus.RUNNING)
+    task.runner_id = "cancel-live-runner"
+    task.run_id = "cancel-live-run"
+    db_session.commit()
+    live_task_lease(db_session, task)
+    turn_id = "cancel-live-turn"
+    store = _CommittedInjectionStore()
+    runner, context = _runner_for_cancelled_injection(task.id, store)
+
+    async def post(execution_id, **kwargs):
+        return (await runner.post_user_message(execution_id, **kwargs)).outcome
+
+    agent = MagicMock(post_user_message=AsyncMock(side_effect=post))
+    agent.supports_live_control.return_value = True
+    agent.get_dag_pattern.return_value = None
+    bg_mgr = MagicMock()
+    bg_mgr.try_reserve_resume.return_value = ResumeReservationOutcome.RESERVED
+    bg_mgr.running_tasks.get.return_value = None
+    reply = AsyncMock()
+    with (
+        patch(
+            "xagent.web.services.agent_service_manager.get_agent_manager",
+            return_value=MagicMock(get_agent_for_task=AsyncMock(return_value=agent)),
+        ),
+        patch("xagent.web.services.task_execution.background_task_manager", bg_mgr),
+    ):
+        operation = asyncio.create_task(
+            handle_task_message(
+                reply,
+                int(task.id),
+                {
+                    "message": "guidance",
+                    "client_message_id": turn_id,
+                    "user": owner,
+                    "files": [],
+                },
+            )
+        )
+        try:
+            await asyncio.wait_for(store.committed.wait(), 5)
+            operation.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await operation
+            assert _delivery_status(db_session, turn_id) == DELIVERY_OUTCOME_UNKNOWN
+            assert context.messages == []
+            ack = reply.await_args.args[0]
+            assert ack["rejection_outcome"] == "outcome_unknown"
+            assert not ack.get("retry_with_new_id")
+            bg_mgr.register_reserved_resume.assert_not_called()
+            bg_mgr.release_resume_reservation.assert_called_with(int(task.id))
+        finally:
+            operation.cancel()
+            await asyncio.gather(operation, return_exceptions=True)
+            runner.context_manager.remove_context(str(task.id))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "settle",
+    [
+        UserMessageInjectionOutcome.NOT_POSTED,
+        UserMessageInjectionRejectedError("confirmed absent"),
+    ],
+)
+async def test_definite_nonapplication_clears_prior_unknown(db_session, settle):
+    owner, task, turn_id = _seed_deferred_delivery(db_session, "definite-rejection")
+    agent, ws, observed, _ = await _run_deferred_unknown_resume(
+        db_session,
+        owner=owner,
+        task=task,
+        turn_id=turn_id,
+        prior_unknown=True,
+        settle=settle,
+    )
+    assert observed == []
+    assert _delivery_status(db_session, turn_id) == DELIVERY_FAILED
+    ack = _delivery_acks(ws)[0]
+    assert ack["rejection_outcome"] == "not_accepted"
+    assert ack["retry_with_new_id"] is True
+    agent.post_user_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_durable_unknown_notifies_origin_without_client_resend(db_session):
+    owner, task, turn_id = _seed_deferred_delivery(db_session, "durable-origin")
+    # A registered background owner has already settled the original command.
+    row = (
+        db_session.query(TaskChatMessage)
+        .filter(TaskChatMessage.turn_id == turn_id)
+        .one()
+    )
+    row.delivery_status = DELIVERY_OUTCOME_UNKNOWN
+    db_session.commit()
+    command = ClaimedTaskCommand(
+        id=1,
+        task_id=int(task.id),
+        actor_user_id=int(owner.id),
+        command_id=turn_id,
+        kind=TaskCommandKind.MESSAGE,
+        payload={
+            "type": "chat_message",
+            "message": "Deferred guidance",
+            "client_message_id": turn_id,
+            "files": [],
+        },
+        target_run_id=None,
+        attempt_count=2,
+    )
+    origin = SimpleNamespace()
+    websocket_api._command_origins.register(turn_id, origin, int(task.id))
+    try:
+        with (
+            patch.object(
+                websocket_api.manager, "is_connection_registered", return_value=True
+            ),
+            patch.object(
+                websocket_api.manager, "send_personal_message", new=AsyncMock()
+            ) as send,
+            patch.object(
+                websocket_api.manager, "broadcast_to_task", new=AsyncMock()
+            ) as broadcast,
+        ):
+            result = await command_execution_service._execute_and_report_task_command(
+                command
+            )
+        assert result["delivery_outcome"] == DELIVERY_OUTCOME_UNKNOWN
+        send.assert_awaited_once()
+        ack, recipient = send.await_args.args
+        assert recipient is origin
+        assert ack["type"] == "message_rejected"
+        assert ack["error_code"] == "message_outcome_unknown"
+        assert ack["rejection_outcome"] == "outcome_unknown"
+        assert not ack.get("retry_with_new_id")
+        broadcast.assert_not_awaited()
+        assert not websocket_api._command_origins.has(turn_id, int(task.id))
+    finally:
+        websocket_api._command_origins.discard_command(turn_id, int(task.id))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "original_files",
+    [
+        [{"file_id": "file-a"}, {"file_id": "file-a"}],
+        [{"file_id": "file-a"}, {"file_id": "missing-file"}],
+    ],
+)
+@pytest.mark.parametrize("conflicting_retry", [False, True])
+async def test_unknown_retry_compares_original_command_before_normalized_attachments(
+    db_session,
+    original_files,
+    conflicting_retry,
+):
+    owner, task, turn_id = _seed_deferred_delivery(db_session, "normalized-retry")
+    payload = {
+        "message": "Deferred guidance",
+        "files": original_files,
+        "client_message_id": turn_id,
+    }
+    enqueued = websocket_api._enqueue_websocket_task_command_sync(
+        task_id=int(task.id),
+        actor_user_id=int(owner.id),
+        actor_is_admin=False,
+        command_id=turn_id,
+        kind=TaskCommandKind.MESSAGE,
+        payload=payload,
+        allow_missing_task=False,
+    )
+    assert enqueued.created
+    # Preparation persists only resolved, deduplicated attachment IDs.
+    row = (
+        db_session.query(TaskChatMessage)
+        .filter(TaskChatMessage.turn_id == turn_id)
+        .one()
+    )
+    row.attachments = [{"file_id": "file-a"}]
+    row.delivery_status = DELIVERY_OUTCOME_UNKNOWN
+    db_session.commit()
+    retry = dict(payload, user=owner)
+    if conflicting_retry:
+        retry["files"] = [{"file_id": "different-file"}]
+    ws = MagicMock(send_personal_message=AsyncMock())
+    with (
+        patch.object(websocket_api, "manager", ws),
+        patch.object(
+            websocket_api, "dispatch_task_command_promptly", new=AsyncMock()
+        ) as dispatch,
+    ):
+        await websocket_api.handle_chat_message(MagicMock(), int(task.id), retry)
+    ack = _delivery_acks(ws)[0]
+    assert ack["rejection_outcome"] == (
+        "not_accepted" if conflicting_retry else "outcome_unknown"
+    )
+    assert bool(ack.get("retry_with_new_id")) is conflicting_retry
+    assert _delivery_status(db_session, turn_id) == DELIVERY_OUTCOME_UNKNOWN
+    dispatch.assert_not_awaited()

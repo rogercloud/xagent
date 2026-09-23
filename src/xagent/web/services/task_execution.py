@@ -69,6 +69,7 @@ from ...core.agent.checkpoint import (
 from ...core.agent.runner import (
     InjectionSettleRefusedError,
     UserMessageInjectionOutcome,
+    UserMessageInjectionRejectedError,
 )
 from ...core.execution_scope import (
     EXECUTION_SCOPE_NOT_PROVIDED,
@@ -2480,9 +2481,8 @@ async def settle_unknown_injection(
       caller must neither fail the input (that invites a duplicate) nor
       leave it without an owner or terminal state.
 
-    A definite rejection (the read succeeded without the turn and the new
-    write provably did not commit) propagates as the exception it is: that
-    is positive evidence the input was not applied.
+    A confirmed-absent candidate write also becomes NOT_POSTED; arbitrary
+    settlement exceptions do not establish non-application.
     """
     if not (isinstance(turn_id, str) and turn_id.strip()):
         # The unknown attempt ran under a generated turn id nobody kept, so
@@ -2502,6 +2502,8 @@ async def settle_unknown_injection(
     )
     try:
         settled = await settle()
+    except UserMessageInjectionRejectedError:
+        return UserMessageInjectionOutcome.NOT_POSTED, False
     except (CheckpointReadError, InjectionSettleRefusedError):
         logger.warning(
             "could not settle the unknown injection for task %s turn %s; the "
@@ -2813,20 +2815,27 @@ async def execute_resume_background(
             with bind_task_lease_context(lease):
                 posted = UserMessageInjectionOutcome.OUTCOME_UNKNOWN
                 if not injection_outcome_unknown:
-                    posted = await run_while_task_lease_owned(
-                        agent_service.post_user_message(
-                            str(task_id),
-                            execution_message=pending_user_message.get(
-                                "execution_message"
+                    try:
+                        posted = await run_while_task_lease_owned(
+                            agent_service.post_user_message(
+                                str(task_id),
+                                execution_message=pending_user_message.get(
+                                    "execution_message"
+                                ),
+                                display_message=pending_user_message.get(
+                                    "display_message"
+                                ),
+                                files=pending_user_message.get("files"),
+                                turn_id=pending_user_message.get("turn_id"),
+                                request_interrupt=False,
+                                reason="deferred websocket user message",
                             ),
-                            display_message=pending_user_message.get("display_message"),
-                            files=pending_user_message.get("files"),
-                            turn_id=pending_user_message.get("turn_id"),
-                            request_interrupt=False,
-                            reason="deferred websocket user message",
-                        ),
-                        heartbeat_task,
-                    )
+                            heartbeat_task,
+                        )
+                    except (asyncio.CancelledError, TaskLeaseLostError):
+                        # The guarded operation may commit before it is cancelled.
+                        injection_outcome_unknown = True
+                        raise
                 if posted is UserMessageInjectionOutcome.OUTCOME_UNKNOWN:
                     injection_outcome_unknown = True
                     posted, settled_prior_commit = await settle_unknown_injection(
@@ -2834,11 +2843,9 @@ async def execute_resume_background(
                         turn_id=pending_user_message.get("turn_id"),
                         settle=_settle_deferred_message,
                     )
-            if posted in {
-                UserMessageInjectionOutcome.POSTED_FRESH,
-                UserMessageInjectionOutcome.POSTED_REPLAY,
-            }:
-                injection_outcome_unknown = False
+            injection_outcome_unknown = (
+                posted is UserMessageInjectionOutcome.OUTCOME_UNKNOWN
+            )
             if not posted:
                 raise RuntimeError(
                     "The user message was saved, but no resumable execution "
@@ -3188,6 +3195,8 @@ async def execute_resume_background(
             "Task %s resume execution cancelled after lease ownership loss",
             task_id,
         )
+        if injection_outcome_unknown and await mark_deferred_delivery_failed():
+            await notify_deferred_delivery(False)
         return
     except asyncio.CancelledError:
         settlement_error = "resume execution cancelled"

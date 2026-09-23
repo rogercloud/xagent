@@ -41,6 +41,7 @@ from xagent.core.agent.runner import (
     ExecutionControl,
     InjectionSettleRefusedError,
     UserMessageInjectionOutcome,
+    UserMessageInjectionRejectedError,
 )
 from xagent.core.agent.runtime import LLMCallInterrupted
 from xagent.core.task_runtime import PREFERRED_INPUT_MODALITIES_METADATA_KEY
@@ -724,7 +725,7 @@ async def test_inject_persist_failure_leaves_no_residue_and_retry_is_fresh(
     context = ExecutionContext(execution_id="exec-write-fail-once")
     runner.context_manager.set_context(context)
 
-    with pytest.raises(CheckpointPersistenceError):
+    with pytest.raises(UserMessageInjectionRejectedError):
         await runner.inject_user_message(
             "exec-write-fail-once",
             "Hello",

@@ -11,11 +11,13 @@ model one.
 
 from __future__ import annotations
 
-
 import pytest
 
 from xagent.core.agent import Agent, AgentRunner, ExecutionContext
-from xagent.core.agent.checkpoint import CheckpointPersistenceError, TraceCheckpointStore
+from xagent.core.agent.checkpoint import (
+    CheckpointPersistenceError,
+    TraceCheckpointStore,
+)
 from xagent.core.agent.runner import UserMessageInjectionOutcome
 from xagent.core.agent.trace import TraceEvent, TraceHandler, Tracer
 from xagent.web.models.database import Base, get_db, get_engine, init_db
@@ -124,9 +126,7 @@ async def test_commit_ack_lost_is_confirmed_by_a_real_sqlite_read_back(
 
     assert result.outcome is UserMessageInjectionOutcome.POSTED_FRESH
     assert [
-        message.content
-        for message in result.context.messages
-        if message.role == "user"
+        message.content for message in result.context.messages if message.role == "user"
     ] == ["Hello from a real checkpoint store"]
 
     # The row this test cares about really is in the database, independent

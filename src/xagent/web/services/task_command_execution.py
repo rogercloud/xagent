@@ -1854,6 +1854,10 @@ async def handle_task_message(
                                     request_interrupt=True,
                                     reason="new websocket user message",
                                 )
+                            except asyncio.CancelledError:
+                                # A cancelled checkpoint write may already have committed.
+                                delivery_outcome_unknown = True
+                                raise
                             except CheckpointUnavailableError:
                                 # Fold into the existing not-posted path
                                 # below: the durable message is deferred to
@@ -2493,6 +2497,13 @@ async def handle_task_message(
             await finish_delivery_failure(client_safe_error_message(e))
             raise
 
+    except asyncio.CancelledError:
+        if delivery_outcome_unknown:
+            await finish_delivery_failure(
+                client_error_message(ClientErrorCode.MESSAGE_OUTCOME_UNKNOWN),
+                error_code=ClientErrorCode.MESSAGE_OUTCOME_UNKNOWN.value,
+            )
+        raise
     except ClientVisiblePermissionError as e:
         log_client_facing_failure(e, "Message permission error: %s")
         message = client_error_message(e.error_code)
@@ -3547,6 +3558,17 @@ async def _execute_durable_task_command(
                 f"Message {command.command_id} is waiting for runtime injection"
             )
         if delivery_status == DELIVERY_OUTCOME_UNKNOWN:
+            # The ingress ack only accepted the command into the inbox. Report
+            # the terminal delivery outcome before its personal route is retired.
+            await send_message_delivery(
+                reply,
+                client_message_id=command.command_id,
+                turn_id=command.command_id,
+                accepted=False,
+                message=client_error_message(ClientErrorCode.MESSAGE_OUTCOME_UNKNOWN),
+                error_code=ClientErrorCode.MESSAGE_OUTCOME_UNKNOWN.value,
+                rejection_outcome="outcome_unknown",
+            )
             return {
                 "task_id": command.task_id,
                 "command_id": command.command_id,
