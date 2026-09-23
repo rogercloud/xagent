@@ -68,6 +68,7 @@ from xagent.web.services import task_orchestrator
 from xagent.web.services.chat_history_service import (
     DELIVERY_DISPATCHED,
     DELIVERY_FAILED,
+    DELIVERY_OUTCOME_UNKNOWN,
     DELIVERY_PENDING,
 )
 from xagent.web.services.managed_file_ref import (
@@ -2379,6 +2380,7 @@ async def test_live_injection_outcome_unknown_is_handed_to_resume_owner(
     assert pending_user_message is not None
     assert pending_user_message["execution_message"] == "Unconfirmed write"
     assert pending_user_message["turn_id"] == "outcome-unknown-turn"
+    assert pending_user_message["injection_outcome_unknown"] is True
     assert (
         resume_background_mock.call_args.kwargs["delivery_already_dispatched"] is False
     )
@@ -2405,7 +2407,11 @@ async def test_live_injection_outcome_unknown_is_handed_to_resume_owner(
 @pytest.mark.parametrize(
     ("posted", "expected_status", "expected_rejection"),
     [
-        (UserMessageInjectionOutcome.OUTCOME_UNKNOWN, "dispatched", "outcome_unknown"),
+        (
+            UserMessageInjectionOutcome.OUTCOME_UNKNOWN,
+            "outcome_unknown",
+            "outcome_unknown",
+        ),
         # Control: nothing was injected, so FAILED / not_accepted is honest.
         (UserMessageInjectionOutcome.NOT_POSTED, "failed", "not_accepted"),
     ],
@@ -2423,7 +2429,7 @@ async def test_live_injection_handoff_failure_leaves_delivery_terminal(
     registered, so no resume owner exists. An ``OUTCOME_UNKNOWN`` must not
     be written FAILED (no positive evidence it was not applied -- that
     would invite a duplicate under a new id) nor left PENDING (nothing
-    would ever settle it): it becomes DISPATCHED and the client is told
+    would ever settle it): it becomes OUTCOME_UNKNOWN and the client is told
     ``outcome_unknown`` without a resend invitation."""
     owner = _user(db_session, f"handoff-failure-{posted.value or 'none'}-owner")
     task = _task(db_session, owner.id, status=TaskStatus.RUNNING)
@@ -4519,6 +4525,9 @@ async def _run_deferred_unknown_resume(
     turn_id: str,
     settle: Any = None,
     agent: Any = None,
+    prior_unknown: bool = False,
+    resumed_turn_id: str | None = None,
+    resume_error: Exception | None = None,
 ) -> tuple[Any, MagicMock, list[str], MagicMock]:
     """Run ``execute_resume_background`` whose first deferred injection
     returns ``OUTCOME_UNKNOWN`` and whose
@@ -4534,6 +4543,8 @@ async def _run_deferred_unknown_resume(
     async def resume_execution_by_id(execution_id: str) -> dict[str, Any]:
         del execution_id
         observed_during_resume.append(_delivery_status(db_session, turn_id))
+        if resume_error is not None:
+            raise resume_error
         return {
             "status": "completed",
             "success": True,
@@ -4541,7 +4552,10 @@ async def _run_deferred_unknown_resume(
             "agent_result": {
                 "context": SimpleNamespace(
                     messages=[
-                        SimpleNamespace(role="user", metadata={"turn_id": turn_id})
+                        SimpleNamespace(
+                            role="user",
+                            metadata={"turn_id": resumed_turn_id or turn_id},
+                        )
                     ]
                 )
             },
@@ -4578,6 +4592,7 @@ async def _run_deferred_unknown_resume(
                 "files": [],
                 "turn_id": turn_id,
                 "interaction_id": 4242,
+                "injection_outcome_unknown": prior_unknown,
             },
             delivery_turn_id=turn_id,
             delivery_notifier=make_delivery_notifier(
@@ -4646,13 +4661,10 @@ async def test_deferred_injection_outcome_unknown_settles_against_checkpoint(
 
 
 @pytest.mark.asyncio
-async def test_deferred_injection_outcome_unknown_definitely_rejected_is_failed(
+async def test_deferred_injection_settlement_error_keeps_unknown(
     db_session,
 ) -> None:
-    """F2, absent + rejected: the settle re-post read the checkpoint (no
-    turn) and its own write provably did not commit -- positive evidence
-    the input was not applied, so FAILED / ``not_accepted`` with a
-    resend invitation is honest here, and the resume does not run."""
+    """An exception from settlement alone is not proof the original turn failed."""
     owner, task, turn_id = _seed_deferred_delivery(db_session, "rejected")
 
     agent, ws_manager, observed, _close = await _run_deferred_unknown_resume(
@@ -4667,11 +4679,11 @@ async def test_deferred_injection_outcome_unknown_definitely_rejected_is_failed(
     assert observed == []
     acks = _delivery_acks(ws_manager)
     assert [ack["type"] for ack in acks] == ["message_rejected"]
-    assert acks[0]["rejection_outcome"] == "not_accepted"
-    assert acks[0]["retry_with_new_id"] is True
-    assert _delivery_status(db_session, turn_id) == DELIVERY_FAILED
-    with pytest.raises(TaskCommandRejected):
-        await _settle_message_command(owner, task, turn_id)
+    assert acks[0]["rejection_outcome"] == "outcome_unknown"
+    assert not acks[0].get("retry_with_new_id")
+    assert _delivery_status(db_session, turn_id) == DELIVERY_OUTCOME_UNKNOWN
+    result = await _settle_message_command(owner, task, turn_id)
+    assert result["delivery_outcome"] == DELIVERY_OUTCOME_UNKNOWN
 
 
 @pytest.mark.asyncio
@@ -4683,26 +4695,25 @@ async def test_deferred_injection_outcome_unknown_definitely_rejected_is_failed(
     ],
     ids=["still-unknown", "checkpoint-unreadable"],
 )
-async def test_deferred_injection_outcome_unknown_unsettleable_is_dispatched_unknown(
+async def test_deferred_injection_unknown_is_durable_after_completion(
     db_session,
     settle: Any,
 ) -> None:
-    """F2, undeterminable: even the checkpoint-based settle cannot tell.
-    The delivery must still become terminal before the agent runs --
-    DISPATCHED, the "do not resend" state (never FAILED, which would invite
-    a duplicate, and never left PENDING, which strands the MESSAGE command
-    in "still being applied") -- the client is told ``outcome_unknown``
-    without a resend invitation, the command settles, and the resume
-    proceeds from the checkpoint (at most once)."""
+    """Completing an old checkpoint cannot prove the uncertain input was consumed."""
     suffix = "still" if isinstance(settle, UserMessageInjectionOutcome) else "unread"
     owner, task, turn_id = _seed_deferred_delivery(db_session, suffix)
 
     agent, ws_manager, observed, close_mock = await _run_deferred_unknown_resume(
-        db_session, owner=owner, task=task, turn_id=turn_id, settle=settle
+        db_session,
+        owner=owner,
+        task=task,
+        turn_id=turn_id,
+        settle=settle,
+        resumed_turn_id="older-turn",
     )
 
     _assert_settle_repost_used_checkpoint(agent, turn_id)
-    assert observed == [DELIVERY_DISPATCHED]
+    assert observed == [DELIVERY_OUTCOME_UNKNOWN]
     acks = _delivery_acks(ws_manager)
     assert [ack["type"] for ack in acks] == ["message_rejected"]
     assert acks[0]["error_code"] == "message_outcome_unknown"
@@ -4710,7 +4721,26 @@ async def test_deferred_injection_outcome_unknown_unsettleable_is_dispatched_unk
     assert not acks[0].get("retry_with_new_id")
     close_mock.assert_not_called()
     result = await _settle_message_command(owner, task, turn_id)
-    assert result["command_id"] == turn_id
+    assert result["delivery_outcome"] == DELIVERY_OUTCOME_UNKNOWN
+    assert _delivery_status(db_session, turn_id) == DELIVERY_OUTCOME_UNKNOWN
+
+    retry_manager = MagicMock(
+        send_personal_message=AsyncMock(), broadcast_to_task=AsyncMock()
+    )
+    with patch("xagent.web.api.websocket.manager", retry_manager):
+        await handle_task_message(
+            _make_command_reply(MagicMock()),
+            int(task.id),
+            {
+                "message": "Deferred guidance",
+                "client_message_id": turn_id,
+                "files": [],
+                "user": owner,
+            },
+        )
+    retry_ack = _delivery_acks(retry_manager)[0]
+    assert retry_ack["rejection_outcome"] == "outcome_unknown"
+    assert not retry_ack.get("retry_with_new_id")
 
 
 @pytest.mark.asyncio
@@ -5799,3 +5829,175 @@ async def test_a_durable_integrity_fault_is_answered_as_corruption_not_an_outage
         if entry.name == logger_name
         and "Durable storage unavailable" in entry.getMessage()
     ], "an integrity fault emitted an outage warning -- the arms are misordered"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "failure",
+    [
+        CheckpointUnavailableError("read failed"),
+        RuntimeError("settlement failed"),
+        asyncio.CancelledError(),
+    ],
+)
+async def test_unknown_handoff_never_reposts_or_invites_resend(db_session, failure):
+    owner, task, turn_id = _seed_deferred_delivery(db_session, "handoff-read")
+    if isinstance(failure, asyncio.CancelledError):
+        with pytest.raises(asyncio.CancelledError):
+            await _run_deferred_unknown_resume(
+                db_session,
+                owner=owner,
+                task=task,
+                turn_id=turn_id,
+                prior_unknown=True,
+                settle=failure,
+            )
+        assert _delivery_status(db_session, turn_id) == DELIVERY_OUTCOME_UNKNOWN
+        return
+    agent, ws, _observed, _close = await _run_deferred_unknown_resume(
+        db_session,
+        owner=owner,
+        task=task,
+        turn_id=turn_id,
+        prior_unknown=True,
+        settle=failure,
+        resumed_turn_id="older-turn",
+    )
+    agent.post_user_message.assert_not_awaited()
+    agent.settle_injection_against_checkpoint.assert_awaited_once()
+    assert _delivery_status(db_session, turn_id) == DELIVERY_OUTCOME_UNKNOWN
+    for ack in _delivery_acks(ws):
+        assert ack["rejection_outcome"] == "outcome_unknown"
+        assert not ack.get("retry_with_new_id")
+
+
+@pytest.mark.asyncio
+async def test_live_committed_unknown_handoff_read_failure_real_runner(db_session):
+    owner, task, turn_id = _seed_deferred_delivery(db_session, "live-unknown")
+    execution_id = str(task.id)
+    store = _CommitThenUnreadableCheckpointStore()
+    runner = AgentRunner(agent=Agent(name="writer", patterns=[]), tracer=store)
+    context = ExecutionContext(execution_id=execution_id)
+    runner.context_manager.set_context(context)
+    runner._active_controls[execution_id] = ExecutionControl(
+        runtime=SimpleNamespace(last_checkpoint={"context": context.to_dict()}),
+        task=None,
+    )
+    try:
+        initial = await runner.inject_user_message(
+            execution_id,
+            "Deferred guidance",
+            turn_id=turn_id,
+            request_interrupt=False,
+        )
+        assert initial.outcome is UserMessageInjectionOutcome.OUTCOME_UNKNOWN
+        assert (
+            store.by_execution_id[execution_id]["context"]["messages"][0]["metadata"][
+                "turn_id"
+            ]
+            == turn_id
+        )
+        assert context.messages == []
+        runner._active_controls.pop(execution_id)
+
+        async def settle(execution_id, **kwargs):
+            return (
+                await runner.settle_injection_against_checkpoint(execution_id, **kwargs)
+            ).outcome
+
+        agent = MagicMock(
+            post_user_message=AsyncMock(
+                side_effect=AssertionError("must settle directly")
+            ),
+            settle_injection_against_checkpoint=AsyncMock(side_effect=settle),
+        )
+        _, ws, observed, _ = await _run_deferred_unknown_resume(
+            db_session,
+            owner=owner,
+            task=task,
+            turn_id=turn_id,
+            agent=agent,
+            prior_unknown=True,
+            resumed_turn_id="older-turn",
+        )
+        assert observed == [DELIVERY_OUTCOME_UNKNOWN]
+        assert _delivery_status(db_session, turn_id) == DELIVERY_OUTCOME_UNKNOWN
+        assert _delivery_acks(ws)[0]["rejection_outcome"] == "outcome_unknown"
+        assert store.write_calls == 1
+        agent.post_user_message.assert_not_awaited()
+    finally:
+        runner.context_manager.remove_context(execution_id)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("message", "files", "stored_content"),
+    [
+        ("Deferred guidance", [], "Deferred guidance"),
+        ("Deferred guidance", [{"file_id": "original-file"}], "Deferred guidance"),
+        ("", [{"file_id": "original-file"}], "Uploaded file(s)"),
+    ],
+)
+async def test_websocket_retry_preserves_unknown_delivery(
+    db_session, message, files, stored_content
+):
+    from xagent.web.api.websocket import handle_chat_message
+
+    owner, task, turn_id = _seed_deferred_delivery(db_session, "websocket-unknown")
+    row = (
+        db_session.query(TaskChatMessage)
+        .filter(TaskChatMessage.turn_id == turn_id)
+        .one()
+    )
+    row.delivery_status = DELIVERY_OUTCOME_UNKNOWN
+    row.attachments = files
+    row.content = stored_content
+    db_session.commit()
+    ws = MagicMock(send_personal_message=AsyncMock())
+    with patch("xagent.web.api.websocket.manager", ws):
+        await handle_chat_message(
+            MagicMock(),
+            int(task.id),
+            {
+                "message": message,
+                "files": files,
+                "client_message_id": turn_id,
+                "user": owner,
+            },
+        )
+    ack = _delivery_acks(ws)[0]
+    assert ack["rejection_outcome"] == "outcome_unknown"
+    assert not ack.get("retry_with_new_id")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("resume_error", [None, RuntimeError("resume failed")])
+async def test_unknown_marker_failure_cannot_be_promoted_to_completed(
+    db_session, resume_error
+):
+    owner, task, turn_id = _seed_deferred_delivery(db_session, "unknown-marker-failure")
+    original = task_execution_service.mark_user_message_delivery_sync
+    statuses = []
+
+    def mark(task_id, turn_id, status):
+        statuses.append(status)
+        if len(statuses) == 1:
+            raise RuntimeError("temporary marker failure")
+        return original(task_id, turn_id, status)
+
+    with patch.object(
+        task_execution_service, "mark_user_message_delivery_sync", side_effect=mark
+    ):
+        _, ws, observed, _ = await _run_deferred_unknown_resume(
+            db_session,
+            owner=owner,
+            task=task,
+            turn_id=turn_id,
+            settle=UserMessageInjectionOutcome.OUTCOME_UNKNOWN,
+            resumed_turn_id="older-turn",
+            resume_error=resume_error,
+        )
+    assert observed == [DELIVERY_PENDING]
+    assert statuses == [DELIVERY_OUTCOME_UNKNOWN, DELIVERY_OUTCOME_UNKNOWN]
+    assert _delivery_status(db_session, turn_id) == DELIVERY_OUTCOME_UNKNOWN
+    assert _delivery_acks(ws)[0]["rejection_outcome"] == "outcome_unknown"

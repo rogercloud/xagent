@@ -65,6 +65,7 @@ from .chat_history_service import (
     DELIVERY_COMPLETED,
     DELIVERY_DISPATCHED,
     DELIVERY_FAILED,
+    DELIVERY_OUTCOME_UNKNOWN,
     DELIVERY_PENDING,
     UserMessageDeliveryClaim,
     claim_user_message_delivery_no_commit,
@@ -598,6 +599,7 @@ class _UserMessageDeliverySnapshot:
     payload_matches: bool
     failed: bool
     pending: bool
+    outcome_unknown: bool = False
 
 
 class _TaskCommandCommitOutcomeUnknown(RuntimeError):
@@ -612,6 +614,7 @@ def _snapshot_user_message_delivery(
         payload_matches=bool(claim.payload_matches),
         failed=bool(claim.failed),
         pending=bool(claim.pending),
+        outcome_unknown=bool(claim.outcome_unknown),
     )
 
 
@@ -1395,14 +1398,11 @@ async def handle_task_message(
             # exception reaches another handler layer, that layer must not
             # issue the same write again against the exhausted pool.
             delivery_failure_persist_attempted = True
-            # An unknown injection outcome is not evidence the turn was NOT
-            # applied, so it must not become FAILED (that tells a same-id
-            # retry to resend under a new id, possibly applying it twice).
-            # With no registered resume owner left to settle it, DISPATCHED
-            # is the "do not resend" terminal -- at most once, outcome
-            # unknown -- rather than a PENDING row nothing would ever settle.
+            # Preserve uncertainty durably; neither failure nor success is proven.
             failure_status = (
-                DELIVERY_DISPATCHED if delivery_outcome_unknown else DELIVERY_FAILED
+                DELIVERY_OUTCOME_UNKNOWN
+                if delivery_outcome_unknown
+                else DELIVERY_FAILED
             )
             try:
                 await run_db_io_cancellation_safe(
@@ -1516,6 +1516,13 @@ async def handle_task_message(
                 error_code=ClientErrorCode.MESSAGE_DELIVERY_FAILED.value,
                 retry_with_new_id=True,
                 rejection_outcome="not_accepted",
+            )
+        elif claim.outcome_unknown:
+            await finish_delivery(
+                False,
+                client_error_message(ClientErrorCode.MESSAGE_OUTCOME_UNKNOWN),
+                error_code=ClientErrorCode.MESSAGE_OUTCOME_UNKNOWN.value,
+                rejection_outcome="outcome_unknown",
             )
         elif claim.pending:
             await finish_delivery(
@@ -1954,6 +1961,7 @@ async def handle_task_message(
                                     "display_message": display_user_message,
                                     "files": display_file_refs,
                                     "turn_id": turn_id,
+                                    "injection_outcome_unknown": delivery_outcome_unknown,
                                     # The pre-injection observation, carried
                                     # rather than re-read: the deferred path
                                     # injects later still, so a read there
@@ -2090,15 +2098,8 @@ async def handle_task_message(
                         )
                     raise
 
-                # ``OUTCOME_UNKNOWN`` is NOT settled here: it took the same
-                # branch as ``NOT_POSTED`` above (``posted_confirmed`` is
-                # false for both), so ``pending_user_message`` and a
-                # ``delivery_notifier`` were handed to the resume owner
-                # instead. That background resume re-injects, settles a
-                # still-unknown outcome against its checkpoint, moves the
-                # delivery row to a terminal state, and replies to the
-                # client -- with ``outcome_unknown`` if it still cannot be
-                # determined -- through that notifier; nothing to do here.
+                # The resume owner settles unconfirmed input after the old run
+                # drains, then persists and reports its delivery outcome.
                 if posted_confirmed:
                     await finish_delivery(True)
                 return
@@ -3545,6 +3546,13 @@ async def _execute_durable_task_command(
             raise ClientVisibleTaskCommandDeferred(
                 f"Message {command.command_id} is waiting for runtime injection"
             )
+        if delivery_status == DELIVERY_OUTCOME_UNKNOWN:
+            return {
+                "task_id": command.task_id,
+                "command_id": command.command_id,
+                "kind": command.kind.value,
+                "delivery_outcome": DELIVERY_OUTCOME_UNKNOWN,
+            }
         if delivery_status == DELIVERY_FAILED:
             raise TaskCommandRejected(
                 f"Message {command.command_id} could not be applied"

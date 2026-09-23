@@ -109,6 +109,7 @@ from .chat_history_service import (
     DELIVERY_COMPLETED,
     DELIVERY_DISPATCHED,
     DELIVERY_FAILED,
+    DELIVERY_OUTCOME_UNKNOWN,
     mark_user_message_delivery_sync,
 )
 from .client_error_messages import (
@@ -2583,6 +2584,9 @@ async def execute_resume_background(
     task_agent_id: int | None = None
     agent_name: str | None = None
     agent_logo_url: str | None = None
+    injection_outcome_unknown = bool(
+        pending_user_message and pending_user_message.get("injection_outcome_unknown")
+    )
     delivery_was_dispatched = delivery_already_dispatched
     control_event_state: dict[str, Any] = {}
 
@@ -2594,6 +2598,12 @@ async def execute_resume_background(
         retry_with_new_id: bool = False,
         rejection_outcome: Literal["not_accepted", "outcome_unknown"] | None = None,
     ) -> None:
+        if injection_outcome_unknown:
+            accepted = False
+            message = client_error_message(ClientErrorCode.MESSAGE_OUTCOME_UNKNOWN)
+            error_code = ClientErrorCode.MESSAGE_OUTCOME_UNKNOWN
+            retry_with_new_id = False
+            rejection_outcome = "outcome_unknown"
         if delivery_notifier is None:
             return
         try:
@@ -2624,7 +2634,9 @@ async def execute_resume_background(
                 lambda: mark_user_message_delivery_sync(
                     task_id,
                     delivery_turn_id,
-                    DELIVERY_FAILED,
+                    DELIVERY_OUTCOME_UNKNOWN
+                    if injection_outcome_unknown
+                    else DELIVERY_FAILED,
                 )
             )
             return True
@@ -2716,7 +2728,9 @@ async def execute_resume_background(
                         lambda: mark_user_message_delivery_sync(
                             task_id,
                             delivery_turn_id,
-                            DELIVERY_FAILED,
+                            DELIVERY_OUTCOME_UNKNOWN
+                            if injection_outcome_unknown
+                            else DELIVERY_FAILED,
                         )
                     )
                     await notify_deferred_delivery(
@@ -2797,30 +2811,40 @@ async def execute_resume_background(
             # even though the settling call itself reports a replay.
             settled_prior_commit = False
             with bind_task_lease_context(lease):
-                posted = await run_while_task_lease_owned(
-                    agent_service.post_user_message(
-                        str(task_id),
-                        execution_message=pending_user_message.get("execution_message"),
-                        display_message=pending_user_message.get("display_message"),
-                        files=pending_user_message.get("files"),
-                        turn_id=pending_user_message.get("turn_id"),
-                        request_interrupt=False,
-                        reason="deferred websocket user message",
-                    ),
-                    heartbeat_task,
-                )
+                posted = UserMessageInjectionOutcome.OUTCOME_UNKNOWN
+                if not injection_outcome_unknown:
+                    posted = await run_while_task_lease_owned(
+                        agent_service.post_user_message(
+                            str(task_id),
+                            execution_message=pending_user_message.get(
+                                "execution_message"
+                            ),
+                            display_message=pending_user_message.get("display_message"),
+                            files=pending_user_message.get("files"),
+                            turn_id=pending_user_message.get("turn_id"),
+                            request_interrupt=False,
+                            reason="deferred websocket user message",
+                        ),
+                        heartbeat_task,
+                    )
                 if posted is UserMessageInjectionOutcome.OUTCOME_UNKNOWN:
+                    injection_outcome_unknown = True
                     posted, settled_prior_commit = await settle_unknown_injection(
                         task_id=task_id,
                         turn_id=pending_user_message.get("turn_id"),
                         settle=_settle_deferred_message,
                     )
+            if posted in {
+                UserMessageInjectionOutcome.POSTED_FRESH,
+                UserMessageInjectionOutcome.POSTED_REPLAY,
+            }:
+                injection_outcome_unknown = False
             if not posted:
                 raise RuntimeError(
                     "The user message was saved, but no resumable execution "
                     "checkpoint became available."
                 )
-            delivery_was_dispatched = True
+            delivery_was_dispatched = not injection_outcome_unknown
             # Unconditional and not nested inside the delivery_turn_id branch
             # below: retiring this run's active interaction row and clearing
             # the task's protocol marker has nothing to do with whether a
@@ -2890,22 +2914,15 @@ async def execute_resume_background(
                         close_run_id,
                     )
             if delivery_turn_id is not None:
-                # Marked DISPATCHED even when ``posted`` is still
-                # ``OUTCOME_UNKNOWN`` after settling above: at that point
-                # neither the injection nor the checkpoint read could say
-                # whether the turn committed, and "at most once, outcome
-                # unknown" rules out both FAILED (it invites a resend under
-                # a new id, which could apply the message twice) and
-                # leaving the row PENDING (nothing would ever settle it, so
-                # the MESSAGE command would defer forever). DISPATCHED is
-                # the "do not resend" terminal the command settles on; the
-                # client is told the truth through the ack below.
+                # Task completion cannot prove an uncertain message was consumed.
                 try:
                     await run_db_io_cancellation_safe(
                         lambda: mark_user_message_delivery_sync(
                             task_id,
                             delivery_turn_id,
-                            DELIVERY_DISPATCHED,
+                            DELIVERY_OUTCOME_UNKNOWN
+                            if injection_outcome_unknown
+                            else DELIVERY_DISPATCHED,
                         )
                     )
                 except Exception:
@@ -2928,6 +2945,8 @@ async def execute_resume_background(
                         task_id,
                         delivery_turn_id,
                     )
+                else:
+                    delivery_was_dispatched = True
             if posted is UserMessageInjectionOutcome.OUTCOME_UNKNOWN:
                 # The resume proceeds unconditionally below regardless: this
                 # run already holds the lease and is RESUME_REQUESTED, and
@@ -3113,7 +3132,9 @@ async def execute_resume_background(
                 lambda: mark_user_message_delivery_sync(
                     task_id,
                     delivery_turn_id,
-                    DELIVERY_COMPLETED,
+                    DELIVERY_OUTCOME_UNKNOWN
+                    if injection_outcome_unknown
+                    else DELIVERY_COMPLETED,
                 )
             )
 

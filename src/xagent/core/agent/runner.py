@@ -26,7 +26,6 @@ from ..workspace import WorkspaceManager
 from .attachments import build_image_context_references
 from .checkpoint import (
     CheckpointCorruptError,
-    CheckpointReadError,
     read_latest_checkpoint_payload,
 )
 from .context import ContextManager, ExecutionContext
@@ -136,15 +135,6 @@ class UserMessageInjectionResult:
 
 class AgentRunner:
     """Execute an agent by materializing an execution context and invoking patterns."""
-
-    # Total attempts ``inject_user_message`` makes at persisting one
-    # candidate before giving up and reporting ``OUTCOME_UNKNOWN``: the
-    # first attempt plus this many retries triggered by an ambiguous
-    # (persist-write-exception, read-back-also-inconclusive) failure.
-    _INJECTION_UNKNOWN_RETRY_ATTEMPTS = 3
-    # Backoff between retries, multiplied by the (1-based) retry index so
-    # it increases slightly on each additional attempt.
-    _INJECTION_UNKNOWN_RETRY_BACKOFF_SECONDS = 0.05
 
     def __init__(
         self,
@@ -828,134 +818,26 @@ class AgentRunner:
             metadata["turn_id"] = requested_turn_id
         tid = self._ensure_user_message_turn_id(metadata)
 
-        outcome = UserMessageInjectionOutcome.POSTED_FRESH
         added: Any = None
-
-        # Snapshot, write and confirm the candidate all happen under the
-        # context's write lock -- see ``context_write_lock`` for the
-        # invariant this protects: live pattern code must never observe
-        # this message before its persist is confirmed, and a concurrent
-        # ``PatternRuntime.checkpoint`` for the same context must never
-        # interleave with this write. Callbacks and ``pause`` stay OUTSIDE
-        # the lock (below), so this block never dispatches one.
-        #
-        # Bounded retry for a persist-write exception whose read-back
-        # confirmation itself cannot disambiguate ("unknown"): the write
-        # may actually have committed, so dropping straight to
-        # OUTCOME_UNKNOWN on the very first ambiguous failure needlessly
-        # loses the message on a merely flaky store. Content is idempotent
-        # by turn_id -- ``_find_replayed_turn``/``_confirm_injected_turn``
-        # both match on (turn_id, content) -- so retrying the same
-        # candidate is always safe: it either lands once or is recognized
-        # as already landed. Only if every attempt's confirmation comes
-        # back "unknown" is OUTCOME_UNKNOWN reported.
-        #
-        # Each attempt takes the EXCLUSIVE lock on its own and the backoff
-        # sleep runs with it released, so a slow retry never stalls every
-        # pattern checkpoint for this context through the sleep. Because
-        # the lock is dropped in between, every attempt re-runs the dedupe
-        # check and rebuilds its baseline and candidate from the CURRENT
-        # live context: a same-turn injection may have committed, or a
-        # pattern checkpoint may have landed, while it was released.
-        #
-        # Residual risk: the store calls inside one attempt carry no
-        # timeout of their own (no existing config helper bounds a single
-        # checkpoint write/read here), so a hung store still holds the
-        # EXCLUSIVE lock -- and blocks this context's pattern checkpoints
-        # -- for as long as that one call hangs. Lease loss still cancels
-        # the whole injection through ``run_while_task_lease_owned``.
-        for attempt in range(self._INJECTION_UNKNOWN_RETRY_ATTEMPTS):
-            if attempt > 0:
-                await asyncio.sleep(
-                    self._INJECTION_UNKNOWN_RETRY_BACKOFF_SECONDS * attempt
+        async with context_write_lock(context):
+            if self._find_replayed_turn(context, tid, resolved_execution_message):
+                outcome = UserMessageInjectionOutcome.POSTED_REPLAY
+            else:
+                baseline = await self._resolve_injection_baseline(
+                    execution_id, cold_start_checkpoint
                 )
-            async with context_write_lock(context):
-                # Waiting for the lock may have let a same-turn injection
-                # that was already in flight commit, so the dedupe check has
-                # to run here, not before acquiring the lock. On a retry it
-                # runs against ``tid`` even for a generated id (harmless:
-                # nothing else can have applied that id) so every retry
-                # re-checks the live context it is about to snapshot.
-                if (
-                    requested_turn_id is not None or attempt > 0
-                ) and self._find_replayed_turn(
-                    context, tid, resolved_execution_message
-                ):
-                    outcome = UserMessageInjectionOutcome.POSTED_REPLAY
-                    break
-                try:
-                    checkpoint_baseline = await self._resolve_injection_baseline(
-                        execution_id, cold_start_checkpoint if attempt == 0 else None
-                    )
-                except CheckpointReadError:
-                    if attempt == 0:
-                        # Nothing written yet: propagate with zero residue
-                        # (see ``_resolve_injection_baseline``).
-                        raise
-                    # An earlier attempt of THIS injection may already have
-                    # committed, so a failed re-read must not surface as
-                    # "not injected" (callers read a read error that way);
-                    # it leaves this attempt unknown, like its predecessor.
-                    outcome = UserMessageInjectionOutcome.OUTCOME_UNKNOWN
-                    continue
                 new_message = Message(
                     role="user",
                     content=resolved_execution_message,
                     metadata=metadata,
                     context_refs=build_image_context_references(files),
                 )
-                # Candidate is a snapshot + the new message, not the live
-                # context -- the live context is not touched until the
-                # write below is confirmed (see the exception handling).
-                candidate = context.to_dict()
-                candidate["messages"].append(serialize_message(new_message))
-                self._pending_marker_into(candidate["metadata"], new_message)
-                try:
-                    # Persist BEFORE applying to the live context or
-                    # emitting the trace, so the message is durable even if
-                    # the trace dispatch fails -- the resume path's catch-up
-                    # logic in TraceEventCallback.on_run_start will replay
-                    # the marked turn.
-                    await self._persist_injected_context(
-                        execution_id=execution_id,
-                        context_payload=candidate,
-                        label="user_message_injected",
-                        baseline=checkpoint_baseline,
-                    )
-                except asyncio.CancelledError:
-                    # Cancellation carries no outcome for the caller, and
-                    # the persisted store may or may not have committed
-                    # before the cancellation landed -- do not guess. Never
-                    # applied to the live context either way, and never
-                    # retried.
-                    raise
-                except Exception:
-                    verdict = await self._confirm_injected_turn(
-                        execution_id, tid, resolved_execution_message
-                    )
-                    if verdict == "absent":
-                        # Definitely not committed: re-raise with zero
-                        # residue, exactly like a rejected attempt today.
-                        # Not retried -- a confirmed absence is a genuine
-                        # rejection, not an ambiguity a retry could
-                        # resolve.
-                        raise
-                    if verdict == "unknown":
-                        # Whether it committed cannot be determined from
-                        # this attempt alone. Try again (after releasing
-                        # the lock for the backoff) unless attempts are
-                        # exhausted.
-                        outcome = UserMessageInjectionOutcome.OUTCOME_UNKNOWN
-                        continue
-                    # verdict == "found": committed, only the confirmation
-                    # was lost. Apply as POSTED_FRESH below.
-                # Linearization point: only now, still holding the lock,
-                # does the message become visible to live pattern code
-                # reading ``context.messages``.
-                outcome = UserMessageInjectionOutcome.POSTED_FRESH
-                added = context.append_message(new_message)
-                self._pending_marker_into(context.metadata, new_message)
-                break
+                outcome = await self._persist_message_candidate(
+                    execution_id, context, new_message, baseline
+                )
+                if outcome is UserMessageInjectionOutcome.POSTED_FRESH:
+                    added = context.append_message(new_message)
+                    self._pending_marker_into(context.metadata, new_message)
 
         if outcome is not UserMessageInjectionOutcome.POSTED_FRESH:
             if request_interrupt:
@@ -1048,48 +930,12 @@ class AgentRunner:
         files: list[dict[str, Any]] | None = None,
         turn_id: str,
     ) -> UserMessageInjectionResult:
-        """Settle an earlier ``OUTCOME_UNKNOWN`` injection of ``turn_id``
-        against the latest durable checkpoint, WITHOUT touching the
-        ``ContextManager``.
+        """Resolve an uncertain turn using durable state, without changing live state.
 
-        ``OUTCOME_UNKNOWN`` is never applied to the registered context, so
-        that object cannot say whether the turn committed; the latest
-        checkpoint -- the state the caller's subsequent ``resume`` rebuilds
-        from anyway -- can. Each attempt reads it, rebuilds a DETACHED
-        ``ExecutionContext`` from it, and:
-
-        - the turn is there with the same content -> ``POSTED_REPLAY`` (an
-          earlier attempt committed; only its confirmation was lost);
-        - it is absent -> persists a candidate (the detached context plus
-          the message and its pending-trace marker) merged onto that same
-          checkpoint, disambiguating a write exception by read-back exactly
-          like ``inject_user_message``: ``"found"`` -> ``POSTED_FRESH``,
-          ``"absent"`` -> the write exception propagates, ``"unknown"`` ->
-          retried (bounded), then ``OUTCOME_UNKNOWN``;
-        - there is no checkpoint at all -> ``NOT_POSTED`` (nothing ever
-          committed); a stale registered context is ignored and left as is.
-
-        No callback, trace watermark persist or ``pause`` runs: nothing is
-        live to show the message to. The durable pending marker hands the
-        trace to the resume's catch-up (``TraceEventCallback.on_run_start``).
-        ``result.context`` is the detached object, never a registered one.
-
-        Preconditions: the caller holds the execution's lease, no run of it
-        is active (enforced here for this runner, see
-        ``InjectionSettleRefusedError``), and no other injection of it is in
-        flight.
-
-        Serialization: every attempt's read -> dedupe -> write -> confirm
-        runs under the EXCLUSIVE ``context_write_lock`` of whatever context
-        is registered for ``execution_id`` at that moment (the detached
-        object's own gate would serialize against nothing). The
-        ``ContextManager`` is process-wide while ``_active_controls`` is
-        per-runner, so a pattern still checkpointing through that object
-        from another runner cannot interleave with this write and have its
-        state regressed by it. Residual (R3) caveat: a writer holding a
-        DIFFERENT object for the same execution -- one replaced in, or never
-        installed into, the registry, or another process -- is not
-        serialized by that gate; only the lease preconditions exclude it.
+        The caller must hold the execution lease and drain the previous run.
+        Use the registered context's gate to exclude its checkpoints, but rebuild
+        a detached context: the cached context never includes unconfirmed input.
+        No callbacks or interrupts run; resume replays the pending trace marker.
         """
         resolved_execution_message = (
             execution_message if execution_message is not None else message
@@ -1120,90 +966,78 @@ class AgentRunner:
         if files is not None:
             metadata["files"] = files
 
-        outcome = UserMessageInjectionOutcome.OUTCOME_UNKNOWN
-        detached: ExecutionContext | None = None
-        for attempt in range(self._INJECTION_UNKNOWN_RETRY_ATTEMPTS):
-            if attempt > 0:
-                await asyncio.sleep(
-                    self._INJECTION_UNKNOWN_RETRY_BACKOFF_SECONDS * attempt
-                )
-            # Checked on every attempt, not only up front: a run may have
-            # started on this runner while the gate was released for the
-            # backoff.
-            if execution_id in self._active_controls:
-                raise InjectionSettleRefusedError(
-                    f"cannot settle an injection for {execution_id} while a "
-                    "run of it is active on this runner"
-                )
-            registered = self.context_manager.get_context(execution_id)
-            gate: Any = (
-                context_write_lock(registered)
-                if registered is not None
-                else contextlib.nullcontext()
+        if execution_id in self._active_controls:
+            raise InjectionSettleRefusedError(
+                f"cannot settle an injection for {execution_id} while a "
+                "run of it is active on this runner"
             )
-            async with gate:
-                try:
-                    checkpoint = await self._load_latest_checkpoint(execution_id)
-                except CheckpointReadError:
-                    if attempt == 0:
-                        # Nothing written yet: the caller's outcome is as
-                        # unknown as before, with zero residue.
-                        raise
-                    # An earlier attempt of THIS call may have committed.
-                    outcome = UserMessageInjectionOutcome.OUTCOME_UNKNOWN
-                    continue
-                if checkpoint is None:
-                    if attempt == 0:
-                        return UserMessageInjectionResult(
-                            context=None,
-                            outcome=UserMessageInjectionOutcome.NOT_POSTED,
-                        )
-                    # Our own earlier attempt may have committed; a missing
-                    # checkpoint now cannot rule that out.
-                    outcome = UserMessageInjectionOutcome.OUTCOME_UNKNOWN
-                    continue
-                if not isinstance(checkpoint.get("context"), dict):
-                    raise CheckpointCorruptError(
-                        "Stored checkpoint carries no execution context to restore."
-                    )
-                detached = ExecutionContext.from_dict(checkpoint["context"])
-                if self._find_replayed_turn(detached, tid, resolved_execution_message):
-                    outcome = UserMessageInjectionOutcome.POSTED_REPLAY
-                    break
+        registered = self.context_manager.get_context(execution_id)
+        gate: Any = (
+            context_write_lock(registered)
+            if registered is not None
+            else contextlib.nullcontext()
+        )
+        async with gate:
+            checkpoint = await self._load_latest_checkpoint(execution_id)
+            if checkpoint is None:
+                return UserMessageInjectionResult(
+                    context=None, outcome=UserMessageInjectionOutcome.NOT_POSTED
+                )
+            if not isinstance(checkpoint.get("context"), dict):
+                raise CheckpointCorruptError(
+                    "Stored checkpoint carries no execution context to restore."
+                )
+            detached = ExecutionContext.from_dict(checkpoint["context"])
+            if self._find_replayed_turn(detached, tid, resolved_execution_message):
+                outcome = UserMessageInjectionOutcome.POSTED_REPLAY
+            else:
                 new_message = Message(
                     role="user",
                     content=resolved_execution_message,
                     metadata=metadata,
                     context_refs=build_image_context_references(files),
                 )
-                candidate = detached.to_dict()
-                candidate["messages"].append(serialize_message(new_message))
-                self._pending_marker_into(candidate["metadata"], new_message)
-                try:
-                    await self._persist_injected_context(
-                        execution_id=execution_id,
-                        context_payload=candidate,
-                        label="user_message_injected",
-                        baseline=checkpoint,
-                    )
-                except asyncio.CancelledError:
-                    raise
-                except Exception:
-                    verdict = await self._confirm_injected_turn(
-                        execution_id, tid, resolved_execution_message
-                    )
-                    if verdict == "absent":
-                        raise
-                    if verdict == "unknown":
-                        outcome = UserMessageInjectionOutcome.OUTCOME_UNKNOWN
-                        continue
-                    # "found": committed, only the confirmation was lost.
-                detached.append_message(new_message)
-                self._pending_marker_into(detached.metadata, new_message)
-                outcome = UserMessageInjectionOutcome.POSTED_FRESH
-                break
-
+                outcome = await self._persist_message_candidate(
+                    execution_id, detached, new_message, checkpoint
+                )
+                if outcome is UserMessageInjectionOutcome.POSTED_FRESH:
+                    detached.append_message(new_message)
+                    self._pending_marker_into(detached.metadata, new_message)
         return UserMessageInjectionResult(context=detached, outcome=outcome)
+
+    async def _persist_message_candidate(
+        self,
+        execution_id: str,
+        context: ExecutionContext,
+        message: Message,
+        baseline: dict[str, Any] | None,
+    ) -> UserMessageInjectionOutcome:
+        """Write once under the caller's gate; never expose an uncertain write.
+
+        An ambiguous failure is settled after the live run drains, using the
+        durable checkpoint rather than repeatedly writing the stale live context.
+        """
+        candidate = context.to_dict()
+        candidate["messages"].append(serialize_message(message))
+        self._pending_marker_into(candidate["metadata"], message)
+        try:
+            await self._persist_injected_context(
+                execution_id=execution_id,
+                context_payload=candidate,
+                label="user_message_injected",
+                baseline=baseline,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            verdict = await self._confirm_injected_turn(
+                execution_id, message.metadata["turn_id"], message.content
+            )
+            if verdict == "absent":
+                raise
+            if verdict == "unknown":
+                return UserMessageInjectionOutcome.OUTCOME_UNKNOWN
+        return UserMessageInjectionOutcome.POSTED_FRESH
 
     @staticmethod
     def _read_trace_watermark(context: ExecutionContext) -> str | None:

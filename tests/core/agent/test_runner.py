@@ -1399,15 +1399,7 @@ async def test_inject_unconfirmable_write_returns_outcome_unknown(
 
 
 class IntermittentUnknownStore:
-    """The first ``fail_count`` checkpoint writes raise, and the read-back
-    used to disambiguate them also fails for that same window -- modeling
-    a store outage that recovers after a bounded number of attempts.
-    Drives the bounded-retry coverage for finding A: with
-    ``fail_count`` below ``AgentRunner._INJECTION_UNKNOWN_RETRY_ATTEMPTS``
-    the store recovers mid-retry and the injection converges to
-    ``POSTED_FRESH``; with ``fail_count`` at or above it, every attempt is
-    exhausted and the injection reports ``OUTCOME_UNKNOWN``.
-    """
+    """Checkpoint writes and reads are unavailable for the first fail_count writes."""
 
     def __init__(self, fail_count: int) -> None:
         self.fail_count = fail_count
@@ -1435,7 +1427,7 @@ def _cache_injection_baseline(
     """Seed ``_active_controls`` with a cached baseline so
     ``_resolve_injection_baseline`` short-circuits to it instead of
     calling into a deliberately-failing store for the pre-write baseline
-    read -- isolating these tests to the write/read-back retry behavior
+    read -- isolating these tests to the write/read-back behavior
     they actually target, same trick as
     ``test_inject_unconfirmable_write_returns_outcome_unknown`` above."""
     baseline_checkpoint = {
@@ -1450,163 +1442,29 @@ def _cache_injection_baseline(
 
 
 @pytest.mark.asyncio
-async def test_inject_bounded_retry_converges_to_posted_fresh(
+async def test_inject_unknown_returns_without_rewriting_live_snapshot(
     tmp_path: Path,
 ) -> None:
-    """The store fails once (write raises, read-back also fails -- a
-    genuine ``unknown`` verdict) and then recovers: the retry inside
-    ``inject_user_message`` must pick this up on its next attempt and
-    report ``POSTED_FRESH`` rather than giving up after the first
-    ambiguous failure."""
     tracer = IntermittentUnknownStore(fail_count=1)
     runner = AgentRunner(
         agent=Agent(name="writer", patterns=[]),
         tracer=tracer,
         workspace_manager=FakeWorkspaceManager(tmp_path),
     )
-    context = ExecutionContext(execution_id="exec-retry-converges")
+    context = ExecutionContext(execution_id="exec-no-retry")
     runner.context_manager.set_context(context)
-    _cache_injection_baseline(runner, "exec-retry-converges", context)
+    _cache_injection_baseline(runner, context.execution_id, context)
     runner.pause = MagicMock(return_value=True)
 
     result = await runner.inject_user_message(
-        "exec-retry-converges",
-        "Hello",
-        turn_id="turn-retry-converges",
-        request_interrupt=True,
-    )
-
-    assert result.outcome is UserMessageInjectionOutcome.POSTED_FRESH
-    assert tracer.write_calls == 2
-    matches = [
-        message
-        for message in result.context.messages
-        if message.role == "user"
-        and message.metadata.get("turn_id") == "turn-retry-converges"
-    ]
-    assert len(matches) == 1
-    runner.pause.assert_called_once()
-
-
-@pytest.mark.asyncio
-async def test_inject_bounded_retry_exhausted_reports_unknown(
-    tmp_path: Path,
-) -> None:
-    """Every attempt in the bounded retry ends ``unknown``: the injection
-    must give up and report ``OUTCOME_UNKNOWN`` after exactly
-    ``AgentRunner._INJECTION_UNKNOWN_RETRY_ATTEMPTS`` write attempts, not
-    fewer (giving up too early) and not more (retrying unboundedly)."""
-    tracer = IntermittentUnknownStore(
-        fail_count=AgentRunner._INJECTION_UNKNOWN_RETRY_ATTEMPTS
-    )
-    runner = AgentRunner(
-        agent=Agent(name="writer", patterns=[]),
-        tracer=tracer,
-        workspace_manager=FakeWorkspaceManager(tmp_path),
-    )
-    context = ExecutionContext(execution_id="exec-retry-exhausted")
-    runner.context_manager.set_context(context)
-    _cache_injection_baseline(runner, "exec-retry-exhausted", context)
-    runner.pause = MagicMock(return_value=True)
-
-    result = await runner.inject_user_message(
-        "exec-retry-exhausted",
-        "Hello",
-        turn_id="turn-retry-exhausted",
-        request_interrupt=True,
+        context.execution_id, "Hello", turn_id="turn-no-retry", request_interrupt=True
     )
 
     assert result.outcome is UserMessageInjectionOutcome.OUTCOME_UNKNOWN
-    assert tracer.write_calls == AgentRunner._INJECTION_UNKNOWN_RETRY_ATTEMPTS
-    assert context.messages == []
-    runner.pause.assert_called_once()
-
-
-@pytest.mark.asyncio
-async def test_inject_retry_backoff_sleeps_with_write_lock_released(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """The bounded retry's backoff must not hold the EXCLUSIVE gate: a
-    pattern checkpoint for the same context has to be able to land while
-    a flaky store is being retried, and the retry must still converge."""
-    import xagent.core.agent.runner as runner_module
-
-    tracer = IntermittentUnknownStore(fail_count=1)
-    runner = AgentRunner(
-        agent=Agent(name="writer", patterns=[]),
-        tracer=tracer,
-        workspace_manager=FakeWorkspaceManager(tmp_path),
-    )
-    context = ExecutionContext(execution_id="exec-backoff-unlocked")
-    runner.context_manager.set_context(context)
-    _cache_injection_baseline(runner, "exec-backoff-unlocked", context)
-    runner.pause = MagicMock(return_value=True)
-
-    real_sleep = asyncio.sleep
-    lock_held_during_backoff: list[bool] = []
-
-    async def recording_sleep(delay: float, *args: Any, **kwargs: Any) -> Any:
-        lock_held_during_backoff.append(context_write_lock(context).locked())
-        return await real_sleep(0)
-
-    monkeypatch.setattr(runner_module.asyncio, "sleep", recording_sleep)
-
-    result = await runner.inject_user_message(
-        "exec-backoff-unlocked",
-        "Hello",
-        turn_id="turn-backoff-unlocked",
-        request_interrupt=False,
-    )
-
-    assert result.outcome is UserMessageInjectionOutcome.POSTED_FRESH
-    assert lock_held_during_backoff == [False]
-    assert tracer.write_calls == 2
-
-
-@pytest.mark.asyncio
-async def test_inject_retry_recognizes_turn_applied_while_lock_released(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Because the lock is released for the backoff, a concurrent same-turn
-    injection can confirm the turn in between; the next attempt must
-    re-run the dedupe check and report REPLAY instead of writing again."""
-    import xagent.core.agent.runner as runner_module
-
-    tracer = IntermittentUnknownStore(fail_count=1)
-    runner = AgentRunner(
-        agent=Agent(name="writer", patterns=[]),
-        tracer=tracer,
-        workspace_manager=FakeWorkspaceManager(tmp_path),
-    )
-    context = ExecutionContext(execution_id="exec-backoff-replay")
-    runner.context_manager.set_context(context)
-    _cache_injection_baseline(runner, "exec-backoff-replay", context)
-    runner.pause = MagicMock(return_value=True)
-
-    real_sleep = asyncio.sleep
-
-    async def sleep_with_concurrent_apply(
-        delay: float, *args: Any, **kwargs: Any
-    ) -> Any:
-        context.add_user_message("Hello", metadata={"turn_id": "turn-backoff-replay"})
-        return await real_sleep(0)
-
-    monkeypatch.setattr(runner_module.asyncio, "sleep", sleep_with_concurrent_apply)
-
-    result = await runner.inject_user_message(
-        "exec-backoff-replay",
-        "Hello",
-        turn_id="turn-backoff-replay",
-        request_interrupt=False,
-    )
-
-    assert result.outcome is UserMessageInjectionOutcome.POSTED_REPLAY
     assert tracer.write_calls == 1
-    assert [m.metadata.get("turn_id") for m in context.messages] == [
-        "turn-backoff-replay"
-    ]
+    assert context.messages == []
+    assert not context_write_lock(context).locked()
+    runner.pause.assert_called_once()
 
 
 class FirstReadOnlyStore:
@@ -1632,12 +1490,10 @@ class FirstReadOnlyStore:
 
 
 @pytest.mark.asyncio
-async def test_inject_retry_baseline_read_failure_after_possible_commit_is_unknown(
+async def test_inject_readback_failure_after_possible_commit_is_unknown(
     tmp_path: Path,
 ) -> None:
-    """Once an attempt may have committed, a retry whose baseline re-read
-    fails must report OUTCOME_UNKNOWN -- never propagate the read error,
-    which every caller interprets as "nothing was injected"."""
+    """A failed readback after a possible commit must not imply rejection."""
     tracer = FirstReadOnlyStore()
     runner = AgentRunner(
         agent=Agent(name="writer", patterns=[]),
@@ -1858,7 +1714,7 @@ class PatternCheckpointRacingStore:
     read-back fails (``unknown``). Meanwhile a pattern checkpoint of the
     REGISTERED context -- as another runner's still-running pattern would
     take it -- is queued on that object's gate; it must not run inside the
-    settle's attempt, and lands in the backoff between attempts."""
+    settle's attempt, and lands only after confirmation finishes."""
 
     def __init__(self, live: ExecutionContext) -> None:
         self.live = live
@@ -1898,7 +1754,7 @@ class PatternCheckpointRacingStore:
 
 
 @pytest.mark.asyncio
-async def test_settle_pattern_checkpoint_between_retries_keeps_one_copy(
+async def test_settle_gate_excludes_pattern_checkpoint_until_confirmation(
     tmp_path: Path,
 ) -> None:
     execution_id = "exec-settle-race"
@@ -1919,22 +1775,9 @@ async def test_settle_pattern_checkpoint_between_retries_keeps_one_copy(
         assert tracer.pattern_task is not None
         await tracer.pattern_task
 
-        assert result.outcome is UserMessageInjectionOutcome.POSTED_FRESH
-        # Serialized by the registered context's gate: the pattern write
-        # could not run inside the settle's attempt ...
+        assert result.outcome is UserMessageInjectionOutcome.OUTCOME_UNKNOWN
         assert tracer.pattern_interleaved is False
-        # ... and landed between the two attempts, which re-read it.
-        assert tracer.labels == [
-            "user_message_injected",
-            "pattern_step",
-            "user_message_injected",
-        ]
-        durable = tracer.by_execution_id[execution_id]["context"]["messages"]
-        assert [(m["role"], m["content"]) for m in durable] == [
-            ("assistant", "step done"),
-            ("user", "Hello"),
-        ]
-        assert _durable_turn_ids(tracer, execution_id) == ["turn-race"]
+        assert tracer.labels == ["user_message_injected", "pattern_step"]
         assert runner.context_manager.get_context(execution_id) is live
         assert [m.role for m in live.messages] == ["assistant"]
     finally:
