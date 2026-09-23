@@ -242,8 +242,11 @@ def test_no_delivery_producer_can_bypass_the_client_safe_message() -> None:
 
     # These are deliberate exact baselines. If a producer is added or removed,
     # inspect the changed site and bump the corresponding count in this test.
-    assert result.producers == 30, (
-        f"expected exactly 30 producers, matched {result.producers}; "
+    # R1 adds unknown-result receipts at ingress, handoff, and settlement.
+    # Both notifier branches are scanned: fixed unknown text and unchanged
+    # forwarding of the message vetted at each wrapper call site.
+    assert result.producers == 37, (
+        f"expected exactly 37 producers, matched {result.producers}; "
         "review the changed sites and bump deliberately"
     )
     # #1658 removed ``_resync_client_to_running_task``'s stale-client ``error``

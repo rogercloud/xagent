@@ -2600,23 +2600,29 @@ async def execute_resume_background(
         retry_with_new_id: bool = False,
         rejection_outcome: Literal["not_accepted", "outcome_unknown"] | None = None,
     ) -> None:
-        if injection_outcome_unknown:
-            accepted = False
-            message = client_error_message(ClientErrorCode.MESSAGE_OUTCOME_UNKNOWN)
-            error_code = ClientErrorCode.MESSAGE_OUTCOME_UNKNOWN
-            retry_with_new_id = False
-            rejection_outcome = "outcome_unknown"
         if delivery_notifier is None:
             return
         try:
-            await delivery_notifier(
-                turn_id=delivery_turn_id,
-                accepted=accepted,
-                message=message,
-                error_code=error_code.value if error_code is not None else None,
-                retry_with_new_id=retry_with_new_id,
-                rejection_outcome=rejection_outcome,
-            )
+            if injection_outcome_unknown:
+                await delivery_notifier(
+                    turn_id=delivery_turn_id,
+                    accepted=False,
+                    message=client_error_message(
+                        ClientErrorCode.MESSAGE_OUTCOME_UNKNOWN
+                    ),
+                    error_code=ClientErrorCode.MESSAGE_OUTCOME_UNKNOWN.value,
+                    retry_with_new_id=False,
+                    rejection_outcome="outcome_unknown",
+                )
+            else:
+                await delivery_notifier(
+                    turn_id=delivery_turn_id,
+                    accepted=accepted,
+                    message=message,
+                    error_code=error_code.value if error_code is not None else None,
+                    retry_with_new_id=retry_with_new_id,
+                    rejection_outcome=rejection_outcome,
+                )
         except Exception:
             # Delivery state is durable; a disconnected client will retry the
             # same id and recover the result from that state.
