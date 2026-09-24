@@ -27,9 +27,8 @@ from sqlalchemy.orm import Session
 from ...config import get_default_task_execution_mode, get_shared_task_execution_enabled
 from ...core.agent.checkpoint import CheckpointReadError, CheckpointUnavailableError
 from ...core.agent.runner import (
-    UserMessageInjectionConflictError,
     UserMessageInjectionOutcome,
-    UserMessageInjectionRejectedError,
+    track_user_message_injection,
 )
 from ...core.execution_scope import (
     EXECUTION_SCOPE_NOT_PROVIDED,
@@ -43,7 +42,6 @@ from ..models.task import Task, TaskStatus
 from ..models.uploaded_file import UploadedFile
 from ..models.user import User
 from . import task_execution as task_execution_service
-from .llm_utils import AutoModelUnavailableError
 from .task_execution import (
     ClientVisibleError,
     ClientVisibleValidationError,
@@ -1856,60 +1854,52 @@ async def handle_task_message(
                     posted = UserMessageInjectionOutcome.NOT_POSTED
                     if live_task_lease is not None:
                         with bind_task_lease_context(live_task_lease):
-                            delivery_outcome_unknown = True
-                            try:
-                                posted = await agent_service.post_user_message(
-                                    str(task_id),
-                                    execution_message=user_message_for_llm,
-                                    display_message=display_user_message,
-                                    files=display_file_refs,
-                                    turn_id=turn_id,
-                                    request_interrupt=True,
-                                    reason="new websocket user message",
-                                )
-                            except CheckpointUnavailableError:
-                                delivery_outcome_unknown = False
-                                # Fold into the existing not-posted path
-                                # below: the durable message is deferred to
-                                # the resume owner instead of injected live,
-                                # exactly as when there was no exact lease
-                                # or checkpoint to inject into. Distinct
-                                # from corrupt/refused, which are not
-                                # retryable by simply deferring.
-                                posted = UserMessageInjectionOutcome.NOT_POSTED
-                            except CheckpointReadError:
-                                delivery_outcome_unknown = False
-                                # Corrupt and refused reach here today. The
-                                # base class is deliberate: a read failure
-                                # that is not the retryable-by-deferring
-                                # unavailable case must reject the claimed
-                                # delivery rather than escape this handler
-                                # and orphan it. Use finish_delivery_failure,
-                                # not finish_delivery, so the row is actually
-                                # persisted DELIVERY_FAILED -- otherwise it
-                                # stays DELIVERY_PENDING forever and a retry
-                                # with the same client_message_id loops on
-                                # "still being applied".
-                                task_execution_service.background_task_manager.release_resume_reservation(
-                                    task_id
-                                )
-                                await answer_durable_turn_failure(
-                                    ClientErrorCode.TASK_CHECKPOINT_UNREADABLE
-                                )
-                                return
-                            except Exception as exc:
-                                # Classify acceptance here; outer handlers own
-                                # logging and the audience-specific response.
-                                delivery_outcome_unknown = not isinstance(
-                                    exc,
-                                    (
-                                        UserMessageInjectionRejectedError,
-                                        UserMessageInjectionConflictError,
-                                        AutoModelUnavailableError,
-                                        DurableStorageOperationError,
-                                    ),
-                                )
-                                raise
+                            with track_user_message_injection() as attempt:
+                                try:
+                                    posted = await agent_service.post_user_message(
+                                        str(task_id),
+                                        execution_message=user_message_for_llm,
+                                        display_message=display_user_message,
+                                        files=display_file_refs,
+                                        turn_id=turn_id,
+                                        request_interrupt=True,
+                                        reason="new websocket user message",
+                                    )
+                                except CheckpointUnavailableError:
+                                    delivery_outcome_unknown = False
+                                    # Fold into the existing not-posted path
+                                    # below: the durable message is deferred to
+                                    # the resume owner instead of injected live,
+                                    # exactly as when there was no exact lease
+                                    # or checkpoint to inject into. Distinct
+                                    # from corrupt/refused, which are not
+                                    # retryable by simply deferring.
+                                    posted = UserMessageInjectionOutcome.NOT_POSTED
+                                except CheckpointReadError:
+                                    delivery_outcome_unknown = False
+                                    # Corrupt and refused reach here today. The
+                                    # base class is deliberate: a read failure
+                                    # that is not the retryable-by-deferring
+                                    # unavailable case must reject the claimed
+                                    # delivery rather than escape this handler
+                                    # and orphan it. Use finish_delivery_failure,
+                                    # not finish_delivery, so the row is actually
+                                    # persisted DELIVERY_FAILED -- otherwise it
+                                    # stays DELIVERY_PENDING forever and a retry
+                                    # with the same client_message_id loops on
+                                    # "still being applied".
+                                    task_execution_service.background_task_manager.release_resume_reservation(
+                                        task_id
+                                    )
+                                    await answer_durable_turn_failure(
+                                        ClientErrorCode.TASK_CHECKPOINT_UNREADABLE
+                                    )
+                                    return
+                                finally:
+                                    delivery_outcome_unknown = (
+                                        attempt.outcome
+                                        is not UserMessageInjectionOutcome.NOT_POSTED
+                                    )
                     delivery_outcome_unknown = (
                         posted is UserMessageInjectionOutcome.OUTCOME_UNKNOWN
                     )

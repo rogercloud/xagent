@@ -61,13 +61,11 @@ from ...config import (
 )
 from ...core.agent.checkpoint import (
     CheckpointAccessRefusedError,
-    CheckpointReadError,
     CheckpointUnavailableError,
 )
 from ...core.agent.runner import (
-    UserMessageInjectionConflictError,
     UserMessageInjectionOutcome,
-    UserMessageInjectionRejectedError,
+    track_user_message_injection,
 )
 from ...core.execution_scope import (
     EXECUTION_SCOPE_NOT_PROVIDED,
@@ -1621,7 +1619,9 @@ def _finalize_task_execution_result_isolated(
                     "ignoring the late result",
                     task_id,
                 )
-            elif result.get("status") == "waiting_for_user":
+            elif result.get("status") == "waiting_for_user" and not result.get(
+                "injection_outcome_unknown"
+            ):
                 next_control_state = (
                     TaskControlState.RESUME_REQUESTED
                     if task_updated.control_state
@@ -1643,7 +1643,13 @@ def _finalize_task_execution_result_isolated(
                 metadata_committed = True
                 terminal_state_committed = True
                 waiting_for_control = True
-            elif result.get("status") == "interrupted":
+            elif (
+                result.get("injection_outcome_unknown")
+                and (
+                    result.get("success", False)
+                    or result.get("status") == "waiting_for_user"
+                )
+            ) or result.get("status") == "interrupted":
                 next_control_state = (
                     TaskControlState.RESUME_REQUESTED
                     if task_updated.control_state
@@ -1661,8 +1667,6 @@ def _finalize_task_execution_result_isolated(
                     task_updated,
                     task_updated.status,
                 )
-                finalize_db.commit()
-                metadata_committed = True
                 terminal_state_committed = True
                 waiting_for_control = True
             elif task_updated.status not in {
@@ -1701,7 +1705,12 @@ def _finalize_task_execution_result_isolated(
                 terminal_state_committed = True
 
             final_task_status = task_updated.status.value
-            if not waiting_for_control:
+            preserve_unknown_result = (
+                bool(result.get("injection_outcome_unknown"))
+                and bool(result.get("success", False))
+                and task_updated.status == TaskStatus.PAUSED
+            )
+            if not waiting_for_control or preserve_unknown_result:
                 if task_user_id is None:
                     raise ValueError(
                         f"Task {task_id}: cannot persist assistant message "
@@ -1724,6 +1733,7 @@ def _finalize_task_execution_result_isolated(
                     "output",
                     history_content
                     if task_updated.status == TaskStatus.COMPLETED
+                    or (preserve_unknown_result and result.get("success", False))
                     else None,
                 )
                 persist_assistant_message_no_commit(
@@ -1744,6 +1754,9 @@ def _finalize_task_execution_result_isolated(
                 metadata_committed = True
                 terminal_state_committed = True
 
+            if waiting_for_control:
+                finalize_db.commit()
+                metadata_committed = True
             broadcast_meta = {
                 "id": int(task_updated.id),
                 "title": task_updated.title,
@@ -2390,7 +2403,11 @@ def _finalize_resumed_task(
                 finalized["agent_name"] = cast(Any, agent.name)
                 finalized["agent_logo_url"] = cast(Any, agent.logo_url)
 
-        if status == "waiting_for_user":
+        if result.get("injection_outcome_unknown") and (
+            success or status in {"waiting_for_user", "interrupted"}
+        ):
+            final_task_status = TaskStatus.PAUSED
+        elif status == "waiting_for_user":
             final_task_status = TaskStatus.WAITING_FOR_USER
         elif status == "interrupted":
             final_task_status = TaskStatus.PAUSED
@@ -2474,7 +2491,6 @@ def _settle_resumed_task_lease(
     lease: TaskLease,
     *,
     error_message: str | None,
-    injection_outcome_unknown: bool = False,
 ) -> bool:
     """Delegate resume cleanup to the shared run/runner-fenced lifecycle."""
     from .task_orchestrator import settle_task_lease_isolated
@@ -2482,7 +2498,6 @@ def _settle_resumed_task_lease(
     return settle_task_lease_isolated(
         lease,
         error_message=error_message,
-        injection_outcome_unknown=injection_outcome_unknown,
     )
 
 
@@ -2762,35 +2777,29 @@ async def execute_resume_background(
         # not allowed to run the resume.
         if pending_user_message is not None:
             assert lease_heartbeat_task is not None
-            delivery_outcome_unknown = True
-            try:
-                with bind_task_lease_context(lease):
-                    posted = await run_while_task_lease_owned(
-                        agent_service.post_user_message(
-                            str(task_id),
-                            execution_message=pending_user_message.get(
-                                "execution_message"
+            with track_user_message_injection() as attempt:
+                try:
+                    with bind_task_lease_context(lease):
+                        posted = await run_while_task_lease_owned(
+                            agent_service.post_user_message(
+                                str(task_id),
+                                execution_message=pending_user_message.get(
+                                    "execution_message"
+                                ),
+                                display_message=pending_user_message.get(
+                                    "display_message"
+                                ),
+                                files=pending_user_message.get("files"),
+                                turn_id=pending_user_message.get("turn_id"),
+                                request_interrupt=False,
+                                reason="deferred websocket user message",
                             ),
-                            display_message=pending_user_message.get("display_message"),
-                            files=pending_user_message.get("files"),
-                            turn_id=pending_user_message.get("turn_id"),
-                            request_interrupt=False,
-                            reason="deferred websocket user message",
-                        ),
-                        lease_heartbeat_task,
+                            lease_heartbeat_task,
+                        )
+                finally:
+                    delivery_outcome_unknown = (
+                        attempt.outcome is not UserMessageInjectionOutcome.NOT_POSTED
                     )
-            except TaskLeaseLostError:
-                # The guard cancelled/drained the writer; this is not proof
-                # that its checkpoint failed to commit.
-                raise
-            except (
-                CheckpointReadError,
-                UserMessageInjectionRejectedError,
-                UserMessageInjectionConflictError,
-                AutoModelUnavailableError,
-            ):
-                delivery_outcome_unknown = False
-                raise
             delivery_outcome_unknown = (
                 posted is UserMessageInjectionOutcome.OUTCOME_UNKNOWN
             )
@@ -3076,7 +3085,7 @@ async def execute_resume_background(
                 )
             )
 
-        if status in {"interrupted", "waiting_for_user"}:
+        if final_status in {TaskStatus.PAUSED.value, TaskStatus.WAITING_FOR_USER.value}:
             await publish_task_event(
                 create_stream_event(
                     "task_info",
@@ -3416,13 +3425,17 @@ async def execute_resume_background(
                     and not defer_db_cleanup_to_ttl_recovery
                 ):
                     try:
-                        settled = await run_db_io_cancellation_safe(
-                            lambda: _settle_resumed_task_lease(
-                                lease,
-                                error_message=settlement_error,
-                                injection_outcome_unknown=delivery_outcome_unknown,
+                        if delivery_outcome_unknown:
+                            from .task_orchestrator import pause_unknown_task_lease
+
+                            settled = await pause_unknown_task_lease(lease)
+                        else:
+                            settled = await run_db_io_cancellation_safe(
+                                lambda: _settle_resumed_task_lease(
+                                    lease,
+                                    error_message=settlement_error,
+                                )
                             )
-                        )
                         if settled:
                             lease_released = True
                             if broadcast_error_message is not None:

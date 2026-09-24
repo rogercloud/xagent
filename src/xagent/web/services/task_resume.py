@@ -17,9 +17,8 @@ from sqlalchemy import func
 
 from ...core.agent.checkpoint import CheckpointReadError, CheckpointUnavailableError
 from ...core.agent.runner import (
-    UserMessageInjectionConflictError,
     UserMessageInjectionOutcome,
-    UserMessageInjectionRejectedError,
+    track_user_message_injection,
 )
 from ..models.database import get_session_local
 from ..models.task import Task, TaskStatus
@@ -30,7 +29,6 @@ from .db_runtime import (
     drain_async_task_cancellation_safe,
     run_db_io_cancellation_safe,
 )
-from .llm_utils import AutoModelUnavailableError
 from .task_execution_controller import TaskControlState
 from .task_interaction_close import (
     ActiveInteractionAbsent,
@@ -485,13 +483,9 @@ async def resume_a2a_task(
             )
             return False
         if injection_unknown:
-            from .task_orchestrator import settle_task_lease_isolated
+            from .task_orchestrator import pause_unknown_task_lease
 
-            return await run_db_io_cancellation_safe(
-                lambda: settle_task_lease_isolated(
-                    task_lease, injection_outcome_unknown=True
-                )
-            )
+            return await pause_unknown_task_lease(task_lease)
         return await _restore_a2a_resume_prelease_isolated(
             task_lease,
             status=resumable_status,
@@ -549,7 +543,6 @@ async def resume_a2a_task(
             assert_never(active_interaction_read)
 
         async def inject_user_message() -> tuple[Any, UserMessageInjectionOutcome]:
-            nonlocal injection_unknown
             from .agent_service_manager import get_agent_manager
 
             agent_service = await get_agent_manager().get_agent_for_task(
@@ -557,34 +550,35 @@ async def resume_a2a_task(
                 None,
                 task_owner_user_id=task_owner_user_id,
             )
-            injection_unknown = True
-            try:
-                posted = await agent_service.post_user_message(
-                    str(task_id),
-                    execution_message=text,
-                    display_message=text,
-                    turn_id=f"a2a:{task_id}:{message_id}",
-                    request_interrupt=False,
-                    reason="A2A input-required response",
-                )
-            except (
-                CheckpointReadError,
-                UserMessageInjectionRejectedError,
-                UserMessageInjectionConflictError,
-                AutoModelUnavailableError,
-            ):
-                injection_unknown = False
-                raise
-            injection_unknown = posted is UserMessageInjectionOutcome.OUTCOME_UNKNOWN
-            if posted is UserMessageInjectionOutcome.OUTCOME_UNKNOWN:
-                raise TaskResumeOutcomeUnknownError(message_id)
+            posted = await agent_service.post_user_message(
+                str(task_id),
+                execution_message=text,
+                display_message=text,
+                turn_id=f"a2a:{task_id}:{message_id}",
+                request_interrupt=False,
+                reason="A2A input-required response",
+            )
             return agent_service, posted
 
-        with bind_task_lease_context(task_lease):
-            agent_service, posted = await run_while_task_lease_owned(
-                inject_user_message(),
-                heartbeat_task,
-            )
+        with (
+            bind_task_lease_context(task_lease),
+            track_user_message_injection() as attempt,
+        ):
+            try:
+                agent_service, posted = await run_while_task_lease_owned(
+                    inject_user_message(),
+                    heartbeat_task,
+                )
+            finally:
+                # The guard must finish its handoff before acceptance can be
+                # treated as a normal return, including cancellation as its
+                # child completes.
+                injection_unknown = (
+                    attempt.outcome is not UserMessageInjectionOutcome.NOT_POSTED
+                )
+        injection_unknown = posted is UserMessageInjectionOutcome.OUTCOME_UNKNOWN
+        if injection_unknown:
+            raise TaskResumeOutcomeUnknownError(message_id)
 
         message_posted = bool(posted)
         if not posted:
@@ -627,6 +621,8 @@ async def resume_a2a_task(
             coordinator = current_task_coordinator(task_id)
             assert coordinator is not None
             coordinator.require_recovery()
+            if not isinstance(exc, (Exception, asyncio.CancelledError)):
+                raise
             raise TaskResumeOutcomeUnknownError(message_id) from exc
         # Ownership was never transferred, so restore the exact prelease
         # to the prior input-required status exactly like the absent-
@@ -657,11 +653,15 @@ async def resume_a2a_task(
             coordinator.require_recovery()
             await stop_task_lease_heartbeat(heartbeat_task, heartbeat_stop)
             prelease_cleanup_done = True
+            if not isinstance(exc, (Exception, asyncio.CancelledError)):
+                raise
             raise TaskResumeOutcomeUnknownError(message_id) from exc
         if not ownership_transferred and not prelease_cleanup_done:
             cleanup_task = asyncio.create_task(stop_and_restore_prelease())
             await drain_async_task_cancellation_safe(cleanup_task)
         if injection_unknown:
+            if not isinstance(exc, (Exception, asyncio.CancelledError)):
+                raise
             raise TaskResumeOutcomeUnknownError(message_id) from exc
         raise
     finally:
@@ -1023,13 +1023,9 @@ async def resume_task_reply(
             )
             return False
         if injection_unknown:
-            from .task_orchestrator import settle_task_lease_isolated
+            from .task_orchestrator import pause_unknown_task_lease
 
-            return await run_db_io_cancellation_safe(
-                lambda: settle_task_lease_isolated(
-                    task_lease, injection_outcome_unknown=True
-                )
-            )
+            return await pause_unknown_task_lease(task_lease)
         return await _restore_reply_prelease_isolated(task_lease)
 
     try:
@@ -1074,8 +1070,7 @@ async def resume_task_reply(
         else:
             assert_never(active_interaction_read)
 
-        async def inject_user_message() -> tuple[Any, bool]:
-            nonlocal injection_unknown
+        async def inject_user_message() -> tuple[Any, UserMessageInjectionOutcome]:
             agent_service = (
                 await agent_runtime_service.get_agent_manager().get_agent_for_task(
                     task_id,
@@ -1083,34 +1078,35 @@ async def resume_task_reply(
                     task_owner_user_id=ctx.task_owner_user_id,
                 )
             )
-            injection_unknown = True
-            try:
-                posted = await agent_service.post_user_message(
-                    str(task_id),
-                    execution_message=ctx.text,
-                    display_message=ctx.text,
-                    turn_id=turn_id,
-                    request_interrupt=False,
-                    reason="V1 interaction response",
-                )
-            except (
-                CheckpointReadError,
-                UserMessageInjectionRejectedError,
-                UserMessageInjectionConflictError,
-                AutoModelUnavailableError,
-            ):
-                injection_unknown = False
-                raise
-            injection_unknown = posted is UserMessageInjectionOutcome.OUTCOME_UNKNOWN
-            if posted is UserMessageInjectionOutcome.OUTCOME_UNKNOWN:
-                raise TaskResumeOutcomeUnknownError(turn_id)
-            return agent_service, bool(posted)
-
-        with bind_task_lease_context(task_lease):
-            agent_service, posted = await run_while_task_lease_owned(
-                inject_user_message(),
-                heartbeat_task,
+            posted = await agent_service.post_user_message(
+                str(task_id),
+                execution_message=ctx.text,
+                display_message=ctx.text,
+                turn_id=turn_id,
+                request_interrupt=False,
+                reason="V1 interaction response",
             )
+            return agent_service, posted
+
+        with (
+            bind_task_lease_context(task_lease),
+            track_user_message_injection() as attempt,
+        ):
+            try:
+                agent_service, posted = await run_while_task_lease_owned(
+                    inject_user_message(),
+                    heartbeat_task,
+                )
+            finally:
+                # The guard must finish its handoff before acceptance can be
+                # treated as a normal return, including cancellation as its
+                # child completes.
+                injection_unknown = (
+                    attempt.outcome is not UserMessageInjectionOutcome.NOT_POSTED
+                )
+        injection_unknown = posted is UserMessageInjectionOutcome.OUTCOME_UNKNOWN
+        if injection_unknown:
+            raise TaskResumeOutcomeUnknownError(turn_id)
 
         message_posted = bool(posted)
         if not posted:
@@ -1152,6 +1148,8 @@ async def resume_task_reply(
             coordinator = current_task_coordinator(task_id)
             assert coordinator is not None
             coordinator.require_recovery()
+            if not isinstance(exc, (Exception, asyncio.CancelledError)):
+                raise
             raise TaskResumeOutcomeUnknownError(turn_id) from exc
         if not ownership_transferred and not prelease_cleanup_done:
             cleanup_task = asyncio.create_task(stop_and_restore_prelease())
@@ -1176,11 +1174,15 @@ async def resume_task_reply(
             coordinator.require_recovery()
             await stop_task_lease_heartbeat(heartbeat_task, heartbeat_stop)
             prelease_cleanup_done = True
+            if not isinstance(exc, (Exception, asyncio.CancelledError)):
+                raise
             raise TaskResumeOutcomeUnknownError(turn_id) from exc
         if not ownership_transferred and not prelease_cleanup_done:
             cleanup_task = asyncio.create_task(stop_and_restore_prelease())
             await drain_async_task_cancellation_safe(cleanup_task)
         if injection_unknown:
+            if not isinstance(exc, (Exception, asyncio.CancelledError)):
+                raise
             raise TaskResumeOutcomeUnknownError(turn_id) from exc
         raise
     finally:

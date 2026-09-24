@@ -33,7 +33,6 @@ from xagent.web.services import task_command_execution as command_execution_serv
 from xagent.web.services import task_execution as task_execution_service
 from xagent.web.services.client_error_messages import (
     ClientErrorCode,
-    client_error_message,
 )
 from xagent.web.services.mcp_runtime import (
     MCPBuiltinOAuthActorPolicyRequiredError,
@@ -2368,11 +2367,9 @@ async def test_chat_validation_redacts_both_the_ack_and_the_broadcast(
 
     rejected = [p for p in personal if p.get("type") == "message_rejected"]
     assert len(rejected) == 1
-    assert rejected[0]["message"] == client_error_message(
-        ClientErrorCode.MESSAGE_OUTCOME_UNKNOWN
-    )
-    assert rejected[0]["error_code"] == "message_outcome_unknown"
-    assert rejected[0]["rejection_outcome"] == "outcome_unknown"
+    assert rejected[0]["message"] == task_execution_service.CLIENT_SAFE_VALIDATION_ERROR
+    assert rejected[0]["error_code"] == "message_processing_failed"
+    assert rejected[0]["rejection_outcome"] == "not_accepted"
     assert not rejected[0].get("retry_with_new_id")
     task_errors = [b for b in broadcast if b.get("type") == "agent_error"]
     assert task_errors and task_errors[0]["message"] == (
@@ -2487,19 +2484,9 @@ async def test_runtime_error_is_redacted_and_coded_for_every_audience(
             "client_message_id": "runtime-boundary",
             "turn_id": "runtime-boundary",
             "timestamp": rejected[0]["timestamp"],
-            "message": (
-                task_execution_service.CLIENT_SAFE_VALIDATION_ERROR
-                if definitely_rejected
-                else client_error_message(ClientErrorCode.MESSAGE_OUTCOME_UNKNOWN)
-            ),
-            "error_code": (
-                "message_processing_failed"
-                if definitely_rejected
-                else "message_outcome_unknown"
-            ),
-            "rejection_outcome": (
-                "not_accepted" if definitely_rejected else "outcome_unknown"
-            ),
+            "message": task_execution_service.CLIENT_SAFE_VALIDATION_ERROR,
+            "error_code": "message_processing_failed",
+            "rejection_outcome": "not_accepted",
         }
     ]
 
@@ -3206,8 +3193,8 @@ async def test_live_chat_runtime_error_sends_one_safe_rejection(
     assert SECRET not in repr(personal)
     safe_rejections = [p for p in personal if p.get("type") == "message_rejected"]
     assert len(safe_rejections) == 1, safe_rejections
-    assert safe_rejections[0]["error_code"] == "message_outcome_unknown"
-    assert safe_rejections[0]["rejection_outcome"] == "outcome_unknown"
+    assert safe_rejections[0]["error_code"] == "message_processing_failed"
+    assert safe_rejections[0]["rejection_outcome"] == "not_accepted"
     assert not safe_rejections[0].get("retry_with_new_id")
 
 

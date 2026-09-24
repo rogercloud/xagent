@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import inspect
 import logging
+from collections.abc import Iterator
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, replace
 from enum import Enum
 from pathlib import Path
@@ -75,14 +78,46 @@ class UserMessageInjectionOutcome(str, Enum):
     established. It must be handled explicitly before testing truthiness,
     without treating it as permission to inject again.
 
-    An unknown write fences this context until explicit resume reloads durable
-    state. Further inputs conservatively return OUTCOME_UNKNOWN without writing.
+    An unknown write fences this context until an explicit deferred input or
+    resume reloads durable state after the old run has ended.
     """
 
     NOT_POSTED = ""
     POSTED_FRESH = "posted_fresh"
     POSTED_REPLAY = "posted_replay"
     OUTCOME_UNKNOWN = "outcome_unknown"
+
+
+@dataclass
+class UserMessageInjectionAttempt:
+    """Acceptance evidence shared with the lease guard's child task.
+
+    This is scoped to one delivery, not a durable receipt or an execution flag.
+    The runner records it before any post-acceptance callbacks can fail.
+    """
+
+    outcome: UserMessageInjectionOutcome = UserMessageInjectionOutcome.NOT_POSTED
+
+
+_injection_attempt: ContextVar[UserMessageInjectionAttempt | None] = ContextVar(
+    "user_message_injection_attempt", default=None
+)
+
+
+@contextmanager
+def track_user_message_injection() -> Iterator[UserMessageInjectionAttempt]:
+    attempt = UserMessageInjectionAttempt()
+    token = _injection_attempt.set(attempt)
+    try:
+        yield attempt
+    finally:
+        _injection_attempt.reset(token)
+
+
+def _record_injection_outcome(outcome: UserMessageInjectionOutcome) -> None:
+    attempt = _injection_attempt.get()
+    if attempt is not None:
+        attempt.outcome = outcome
 
 
 @dataclass(frozen=True)
@@ -311,15 +346,15 @@ class AgentRunner:
         # call carries; finer units (DAG steps) override it with their own goal.
         goal_token = enter_goal(task)
 
-        await self._dispatch_callback(
-            "on_run_start",
-            runner=self,
-            context=context,
-            resume=resume,
-            checkpoint=checkpoint,
-        )
-
         try:
+            await self._dispatch_callback(
+                "on_run_start",
+                runner=self,
+                context=context,
+                resume=resume,
+                checkpoint=checkpoint,
+            )
+
             patterns = list(getattr(self.agent, "patterns", []))
             if not patterns:
                 result = {
@@ -360,9 +395,6 @@ class AgentRunner:
                             "execution_id": execution_id,
                             "context": context,
                             "pattern": pattern.__class__.__name__,
-                            "injection_outcome_unknown": context_checkpoint_gate(
-                                context
-                            ).injection_uncertain,
                         }
                         await self._finish_run(context, normalized)
                         return normalized
@@ -513,6 +545,10 @@ class AgentRunner:
             await self._finish_run(context, result)
             return result
         finally:
+            # Closing admission is synchronous, including cancellation/error exits.
+            # An injection already holding the gate may finish; later live inputs
+            # must use the deferred owner, which drains that gate before reloading.
+            context_checkpoint_gate(context).run_finishing = True
             runtime.discard_inline_file_streams()
             self._active_controls.pop(execution_id, None)
             exit_goal(goal_token)
@@ -582,162 +618,192 @@ class AgentRunner:
         request_interrupt: bool = True,
         reason: str | None = None,
     ) -> UserMessageInjectionResult:
-        context = self.context_manager.get_context(execution_id)
-        cold_start_checkpoint: dict[str, Any] | None = None
-        if context is None:
-            checkpoint = await self._load_latest_checkpoint(execution_id)
-            if checkpoint is None:
-                return UserMessageInjectionResult(
-                    context=None,
-                    outcome=UserMessageInjectionOutcome.NOT_POSTED,
-                )
-            if not isinstance(checkpoint.get("context"), dict):
-                raise CheckpointCorruptError(
-                    "Stored checkpoint carries no execution context to restore."
-                )
-            cold_start_checkpoint = checkpoint
-            reset_output_language_to_request_context(checkpoint)
-            context = ExecutionContext.from_dict(checkpoint["context"])
-            warn_restored_compact_threshold(context, getattr(self.agent, "llm", None))
-            context = self.context_manager.set_context_if_absent(context)
-
-        # Display-vs-execution split: ``execution_message`` is the prompt
-        # the agent runtime sees (may be enriched with file refs / system
-        # context); ``display_message`` is what the chat bubble should
-        # show. Both fall back to ``message`` for legacy callers.
-        resolved_execution_message = (
-            execution_message if execution_message is not None else message
-        )
-        if resolved_execution_message is None:
-            raise ValueError(
-                "inject_user_message requires message or execution_message"
-            )
-        if display_message is None and message is None:
-            raise ValueError(
-                "inject_user_message requires display_message when "
-                "execution_message is provided without legacy message"
-            )
-        resolved_display_message = (
-            display_message if display_message is not None else message
-        )
-        requested_turn_id = turn_id.strip() if turn_id and turn_id.strip() else None
-        gate = context_checkpoint_gate(context)
-        async with gate.exclusive():
-            if gate.injection_uncertain:
-                return UserMessageInjectionResult(
-                    context=context, outcome=UserMessageInjectionOutcome.OUTCOME_UNKNOWN
-                )
-            if request_interrupt and gate.run_finishing:
-                return UserMessageInjectionResult(
-                    context=context, outcome=UserMessageInjectionOutcome.NOT_POSTED
-                )
-            if requested_turn_id is not None:
-                for existing in context.messages:
-                    existing_metadata = getattr(existing, "metadata", None)
-                    if (
-                        getattr(existing, "role", None) != "user"
-                        or not isinstance(existing_metadata, dict)
-                        or existing_metadata.get("turn_id") != requested_turn_id
-                    ):
-                        continue
-                    if existing.content != resolved_execution_message:
-                        raise UserMessageInjectionConflictError(
-                            "turn_id is already associated with a different user message"
-                        )
-                    if request_interrupt:
-                        self.pause(execution_id, reason=reason or "new user message")
+        while True:
+            context = self.context_manager.get_context(execution_id)
+            cold_start_checkpoint: dict[str, Any] | None = None
+            if context is None:
+                checkpoint = await self._load_latest_checkpoint(execution_id)
+                if checkpoint is None:
                     return UserMessageInjectionResult(
-                        context=context,
-                        outcome=UserMessageInjectionOutcome.POSTED_REPLAY,
+                        context=None,
+                        outcome=UserMessageInjectionOutcome.NOT_POSTED,
                     )
-
-            # Resolve the checkpoint-merge baseline before any context mutation
-            # below (add_user_message, pending marker) so a failed read leaves
-            # zero residue instead of an in-memory message that was never
-            # durably confirmed -- a retry after the failure must actually
-            # persist, not find a ghost confirmation from the rejected attempt.
-            # A live runtime's cached checkpoint wins over a fresh read; the
-            # cold-start read above (if this call triggered one) is reused
-            # instead of reading the same window twice.
-            control = self._active_controls.get(execution_id)
-            checkpoint_baseline: dict[str, Any] | None
-            if control is not None and control.runtime.last_checkpoint is not None:
-                checkpoint_baseline = control.runtime.last_checkpoint
-            elif cold_start_checkpoint is not None:
-                checkpoint_baseline = cold_start_checkpoint
-            else:
-                checkpoint_baseline = await self._load_latest_checkpoint(execution_id)
-
-            # Attach files + display text to the new Message so they survive
-            # checkpoint round-trips: Message.metadata is serialized by
-            # ExecutionContext. The on_user_message_posted callback reads
-            # display_message back from metadata so the chat bubble shows the
-            # user-typed text rather than the LLM-augmented prompt.
-            metadata: dict[str, Any] = {"display_message": resolved_display_message}
-            if files is not None:
-                metadata["files"] = files
-            metadata["turn_id"] = requested_turn_id or str(uuid4())
-
-            # Only messages and top-level metadata are mutated below; components
-            # and existing messages are read-only during checkpoint serialization.
-            candidate = replace(
-                context,
-                messages=list(context.messages),
-                metadata=dict(context.metadata),
-            )
-            added = candidate.add_user_message(
-                resolved_execution_message,
-                metadata=metadata,
-                context_refs=build_image_context_references(files),
-            )
-            # Set a "this turn is waiting to be traced" pending marker before
-            # we persist. The resume catch-up logic uses this to disambiguate
-            # an old checkpoint that pre-dates this PR (no watermark, no
-            # pending marker — should NOT replay history) from a checkpoint
-            # that crashed mid-emit (pending marker present — replay this
-            # specific turn). Without this, ``_emit_untraced_user_messages``
-            # would treat any missing-watermark checkpoint as "everything
-            # untraced" and re-render historical user messages on resume.
-            self._set_pending_user_message_marker(candidate, added)
-            # Persist BEFORE emitting the trace so the message is durable even
-            # if the trace dispatch fails — the resume path's catch-up logic
-            # in TraceEventCallback.on_run_start will replay the marked turn.
-            try:
-                await self._persist_injected_context(
-                    execution_id=execution_id,
-                    context=candidate,
-                    label="user_message_injected",
-                    baseline=checkpoint_baseline,
+                if not isinstance(checkpoint.get("context"), dict):
+                    raise CheckpointCorruptError(
+                        "Stored checkpoint carries no execution context to restore."
+                    )
+                cold_start_checkpoint = checkpoint
+                reset_output_language_to_request_context(checkpoint)
+                context = ExecutionContext.from_dict(checkpoint["context"])
+                warn_restored_compact_threshold(
+                    context, getattr(self.agent, "llm", None)
                 )
-            except BaseException as exc:
-                # A cancellation can arrive after storage committed. Block stale
-                # checkpoints before releasing the gate even when propagating it.
-                confirmed = None
-                # Mark before read-back too: its await can itself be cancelled.
-                gate.injection_uncertain = True
-                try:
-                    if isinstance(exc, Exception):
-                        confirmed = await self._confirm_injected_turn(
-                            execution_id,
-                            metadata["turn_id"],
-                            resolved_execution_message,
-                        )
-                finally:
-                    if confirmed is not None:
-                        gate.injection_uncertain = False
-                    else:
-                        self.pause(execution_id, reason="injection outcome unknown")
-                if confirmed is False:
-                    raise UserMessageInjectionRejectedError(str(exc)) from exc
-                if confirmed is not True:
-                    if not isinstance(exc, Exception):
-                        raise
+                context = self.context_manager.set_context_if_absent(context)
+
+            # Display-vs-execution split: ``execution_message`` is the prompt
+            # the agent runtime sees (may be enriched with file refs / system
+            # context); ``display_message`` is what the chat bubble should
+            # show. Both fall back to ``message`` for legacy callers.
+            resolved_execution_message = (
+                execution_message if execution_message is not None else message
+            )
+            if resolved_execution_message is None:
+                raise ValueError(
+                    "inject_user_message requires message or execution_message"
+                )
+            if display_message is None and message is None:
+                raise ValueError(
+                    "inject_user_message requires display_message when "
+                    "execution_message is provided without legacy message"
+                )
+            resolved_display_message = (
+                display_message if display_message is not None else message
+            )
+            requested_turn_id = turn_id.strip() if turn_id and turn_id.strip() else None
+            gate = context_checkpoint_gate(context)
+            async with gate.exclusive():
+                if self.context_manager.get_context(execution_id) is not context:
+                    continue
+                if gate.injection_uncertain:
+                    if (
+                        not request_interrupt
+                        and execution_id not in self._active_controls
+                    ):
+                        # The exclusive gate has drained the old writer. Keep the
+                        # old object fenced for callbacks still holding a reference.
+                        self.context_manager.remove_context(execution_id)
+                        continue
+                    _record_injection_outcome(
+                        UserMessageInjectionOutcome.OUTCOME_UNKNOWN
+                    )
                     return UserMessageInjectionResult(
                         context=context,
                         outcome=UserMessageInjectionOutcome.OUTCOME_UNKNOWN,
                     )
-            context.messages.append(added)
-            self._set_pending_user_message_marker(context, added)
+                if request_interrupt and gate.run_finishing:
+                    return UserMessageInjectionResult(
+                        context=context, outcome=UserMessageInjectionOutcome.NOT_POSTED
+                    )
+                if requested_turn_id is not None:
+                    for existing in context.messages:
+                        existing_metadata = getattr(existing, "metadata", None)
+                        if (
+                            getattr(existing, "role", None) != "user"
+                            or not isinstance(existing_metadata, dict)
+                            or existing_metadata.get("turn_id") != requested_turn_id
+                        ):
+                            continue
+                        if existing.content != resolved_execution_message:
+                            raise UserMessageInjectionConflictError(
+                                "turn_id is already associated with a different user message"
+                            )
+                        if request_interrupt:
+                            self.pause(
+                                execution_id, reason=reason or "new user message"
+                            )
+                        _record_injection_outcome(
+                            UserMessageInjectionOutcome.POSTED_REPLAY
+                        )
+                        return UserMessageInjectionResult(
+                            context=context,
+                            outcome=UserMessageInjectionOutcome.POSTED_REPLAY,
+                        )
+
+                # Resolve the checkpoint-merge baseline before any context mutation
+                # below (add_user_message, pending marker) so a failed read leaves
+                # zero residue instead of an in-memory message that was never
+                # durably confirmed -- a retry after the failure must actually
+                # persist, not find a ghost confirmation from the rejected attempt.
+                # A live runtime's cached checkpoint wins over a fresh read; the
+                # cold-start read above (if this call triggered one) is reused
+                # instead of reading the same window twice.
+                control = self._active_controls.get(execution_id)
+                checkpoint_baseline: dict[str, Any] | None
+                if control is not None and control.runtime.last_checkpoint is not None:
+                    checkpoint_baseline = control.runtime.last_checkpoint
+                elif cold_start_checkpoint is not None:
+                    checkpoint_baseline = cold_start_checkpoint
+                else:
+                    checkpoint_baseline = await self._load_latest_checkpoint(
+                        execution_id
+                    )
+
+                # Attach files + display text to the new Message so they survive
+                # checkpoint round-trips: Message.metadata is serialized by
+                # ExecutionContext. The on_user_message_posted callback reads
+                # display_message back from metadata so the chat bubble shows the
+                # user-typed text rather than the LLM-augmented prompt.
+                metadata: dict[str, Any] = {"display_message": resolved_display_message}
+                if files is not None:
+                    metadata["files"] = files
+                metadata["turn_id"] = requested_turn_id or str(uuid4())
+
+                # Only messages and top-level metadata are mutated below; components
+                # and existing messages are read-only during checkpoint serialization.
+                candidate = replace(
+                    context,
+                    messages=list(context.messages),
+                    metadata=dict(context.metadata),
+                )
+                added = candidate.add_user_message(
+                    resolved_execution_message,
+                    metadata=metadata,
+                    context_refs=build_image_context_references(files),
+                )
+                # Set a "this turn is waiting to be traced" pending marker before
+                # we persist. The resume catch-up logic uses this to disambiguate
+                # an old checkpoint that pre-dates this PR (no watermark, no
+                # pending marker — should NOT replay history) from a checkpoint
+                # that crashed mid-emit (pending marker present — replay this
+                # specific turn). Without this, ``_emit_untraced_user_messages``
+                # would treat any missing-watermark checkpoint as "everything
+                # untraced" and re-render historical user messages on resume.
+                self._set_pending_user_message_marker(candidate, added)
+                # Persist BEFORE emitting the trace so the message is durable even
+                # if the trace dispatch fails — the resume path's catch-up logic
+                # in TraceEventCallback.on_run_start will replay the marked turn.
+                _record_injection_outcome(UserMessageInjectionOutcome.OUTCOME_UNKNOWN)
+                try:
+                    await self._persist_injected_context(
+                        execution_id=execution_id,
+                        context=candidate,
+                        label="user_message_injected",
+                        baseline=checkpoint_baseline,
+                    )
+                except BaseException as exc:
+                    # A cancellation can arrive after storage committed. Block stale
+                    # checkpoints before releasing the gate even when propagating it.
+                    confirmed = None
+                    # Mark before read-back too: its await can itself be cancelled.
+                    gate.injection_uncertain = True
+                    try:
+                        if isinstance(exc, Exception):
+                            confirmed = await self._confirm_injected_turn(
+                                execution_id,
+                                metadata["turn_id"],
+                                resolved_execution_message,
+                            )
+                    finally:
+                        if confirmed is not None:
+                            gate.injection_uncertain = False
+                        else:
+                            self.pause(execution_id, reason="injection outcome unknown")
+                    if confirmed is False:
+                        _record_injection_outcome(
+                            UserMessageInjectionOutcome.NOT_POSTED
+                        )
+                        raise UserMessageInjectionRejectedError(str(exc)) from exc
+                    if confirmed is not True:
+                        if not isinstance(exc, Exception):
+                            raise
+                        return UserMessageInjectionResult(
+                            context=context,
+                            outcome=UserMessageInjectionOutcome.OUTCOME_UNKNOWN,
+                        )
+                _record_injection_outcome(UserMessageInjectionOutcome.POSTED_FRESH)
+                context.messages.append(added)
+                self._set_pending_user_message_marker(context, added)
+            break
         # Preserve callback-before-interrupt ordering on success, but never
         # skip the interruption when tracing or watermark persistence cancels.
         try:
@@ -1456,13 +1522,7 @@ class AgentRunner:
         gate = context_checkpoint_gate(context)
         async with gate.shared():
             gate.run_finishing = True
-            if gate.injection_uncertain:
-                result.update(
-                    success=False,
-                    status="interrupted",
-                    error="Injection outcome unknown",
-                    injection_outcome_unknown=True,
-                )
+            result["injection_outcome_unknown"] = gate.injection_uncertain
         await self._dispatch_callback(
             "on_run_end", runner=self, context=context, result=result
         )

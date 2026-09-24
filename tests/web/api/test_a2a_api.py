@@ -1717,7 +1717,8 @@ def test_prelease_restore_from_a_cancelled_acquisition_leaves_marker_untouched()
         db.close()
 
 
-def test_unclassified_injection_exception_pauses_with_unknown_identity() -> None:
+@pytest.mark.parametrize("after_write", [False, True])
+def test_injection_exception_classification_uses_actual_acceptance(after_write) -> None:
     agent_id, full_key = _create_published_agent_with_key()
     db = _direct_db_session()
     try:
@@ -1739,9 +1740,40 @@ def test_unclassified_injection_exception_pauses_with_unknown_identity() -> None
         db.close()
 
     agent_service = MagicMock()
-    agent_service.post_user_message = AsyncMock(
-        side_effect=RuntimeError("checkpoint callback failed")
+    from types import SimpleNamespace
+
+    from xagent.core.agent.context import ContextManager
+    from xagent.core.agent.runner import AgentRunner
+
+    manager = ContextManager()
+    manager.remove_context(str(task_id))
+    tracer = SimpleNamespace(
+        load_latest_checkpoint=AsyncMock(
+            return_value={
+                "context": {"execution_id": str(task_id), "created_at": "invalid-time"}
+            }
+        ),
+        checkpoint=AsyncMock(),
     )
+    runner = AgentRunner(
+        SimpleNamespace(llm=None), tracer=tracer, context_manager=manager
+    )
+
+    if after_write:
+        from xagent.core.agent.registry import ExecutionRegistry
+
+        manager.create_context(str(task_id)).add_user_message("original")
+        tracer.load_latest_checkpoint.return_value = None
+        registry = ExecutionRegistry()
+        registry.register(str(task_id), runner)
+        token = registry.subscribe(lambda _: registry.unsubscribe(token))
+
+    async def inject(execution_id, **kwargs):
+        if after_write:
+            return (await registry.post_user_message(execution_id, **kwargs)).outcome
+        return (await runner.inject_user_message(execution_id, **kwargs)).outcome
+
+    agent_service.post_user_message = AsyncMock(side_effect=inject)
     agent_manager = MagicMock()
     agent_manager.get_agent_for_task = AsyncMock(return_value=agent_service)
     with patch(
@@ -1762,11 +1794,8 @@ def test_unclassified_injection_exception_pauses_with_unknown_identity() -> None
             },
         )
 
-    assert response.status_code == 504
-    assert (
-        response.json()["error"]["details"][0]["metadata"]["commandId"]
-        == "msg-resume-error"
-    )
+    assert response.status_code == (504 if after_write else 500)
+    assert tracer.checkpoint.await_count == (1 if after_write else 0)
     agent_service.post_user_message.assert_awaited_once_with(
         str(task_id),
         execution_message="retry safely",
@@ -1778,7 +1807,9 @@ def test_unclassified_injection_exception_pauses_with_unknown_identity() -> None
     db = _direct_db_session()
     try:
         recovered = db.query(Task).filter(Task.id == task_id).one()
-        assert recovered.status == TaskStatus.PAUSED
+        assert recovered.status == (
+            TaskStatus.PAUSED if after_write else TaskStatus.WAITING_FOR_USER
+        )
         assert recovered.runner_id is None
     finally:
         db.close()
@@ -3646,8 +3677,34 @@ def test_message_send_reports_unknown_without_closing_interaction(cancelled):
             return_value=UserMessageInjectionOutcome.OUTCOME_UNKNOWN
         )
     )
-    if cancelled:
-        agent.post_user_message.side_effect = asyncio.CancelledError()
+    from types import SimpleNamespace
+
+    from xagent.core.agent.context import ContextManager
+    from xagent.core.agent.runner import AgentRunner
+
+    manager = ContextManager()
+    manager.remove_context(str(task_id))
+    context = manager.create_context(str(task_id))
+    context.add_user_message("original")
+    tracer = SimpleNamespace(
+        load_latest_checkpoint=AsyncMock(return_value=None), checkpoint=AsyncMock()
+    )
+    runner = AgentRunner(
+        SimpleNamespace(llm=None), tracer=tracer, context_manager=manager
+    )
+
+    async def failed_write(**payload):
+        tracer.load_latest_checkpoint.side_effect = RuntimeError("read unavailable")
+        if cancelled:
+            raise asyncio.CancelledError()
+        raise RuntimeError("lost acknowledgement")
+
+    tracer.checkpoint.side_effect = failed_write
+
+    async def inject(execution_id, **kwargs):
+        return (await runner.inject_user_message(execution_id, **kwargs)).outcome
+
+    agent.post_user_message.side_effect = inject
     with (
         patch(
             "xagent.web.services.agent_service_manager.get_agent_manager",

@@ -1157,10 +1157,34 @@ def test_reply_reports_unknown_without_closing_interaction(mock_start_task, fail
         task_id, run_id="unknown-protocol", idempotency_key="unknown-question"
     )
     post = AsyncMock(return_value=UserMessageInjectionOutcome.OUTCOME_UNKNOWN)
-    if failure == "cancelled":
-        post.side_effect = asyncio.CancelledError()
-    elif failure == "exception":
-        post.side_effect = RuntimeError("unclassified injection failure")
+    from types import SimpleNamespace
+
+    from xagent.core.agent.context import ContextManager
+    from xagent.core.agent.runner import AgentRunner
+
+    manager = ContextManager()
+    manager.remove_context(str(task_id))
+    context = manager.create_context(str(task_id))
+    context.add_user_message("original")
+    tracer = SimpleNamespace(
+        load_latest_checkpoint=AsyncMock(return_value=None), checkpoint=AsyncMock()
+    )
+    runner = AgentRunner(
+        SimpleNamespace(llm=None), tracer=tracer, context_manager=manager
+    )
+
+    async def failed_write(**payload):
+        tracer.load_latest_checkpoint.side_effect = RuntimeError("read unavailable")
+        if failure == "cancelled":
+            raise asyncio.CancelledError()
+        raise RuntimeError("lost acknowledgement")
+
+    tracer.checkpoint.side_effect = failed_write
+
+    async def inject(execution_id, **kwargs):
+        return (await runner.inject_user_message(execution_id, **kwargs)).outcome
+
+    post.side_effect = inject
     agent_patch, _agent = _patch_agent_service(post)
     with (
         agent_patch,

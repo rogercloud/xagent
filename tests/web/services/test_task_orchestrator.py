@@ -4561,9 +4561,10 @@ def test_acceptance_snapshot_stages_no_execution_lease(db_session, commit):
     )
 
 
-def test_unknown_settlement_flushes_workforce_projection(db_session):
+@pytest.mark.asyncio
+async def test_unknown_settlement_flushes_workforce_projection(db_session):
     from xagent.web.services.task_execution import _acquire_resume_task_lease
-    from xagent.web.services.task_orchestrator import settle_task_lease_isolated
+    from xagent.web.services.task_orchestrator import pause_unknown_task_lease
 
     user = _create_user(db_session)
     manager = Agent(user_id=user.id, name="unknown projection manager")
@@ -4593,7 +4594,7 @@ def test_unknown_settlement_flushes_workforce_projection(db_session):
     db_session.commit()
     lease = _acquire_resume_task_lease(int(task.id), int(user.id), None)
     assert lease is not None
-    assert settle_task_lease_isolated(lease, injection_outcome_unknown=True)
+    assert await pause_unknown_task_lease(lease)
     db_session.expire_all()
     assert db_session.get(Task, task.id).status == TaskStatus.PAUSED
     assert db_session.get(WorkforceRun, run.id).status == "paused"

@@ -99,6 +99,7 @@ from .mcp_runtime import (
 )
 from .task_command_transport import ClaimedTaskCommand
 from .task_execution_controller import (
+    TaskControlSnapshot,
     TaskControlState,
     apply_task_control_transition,
     task_execution_controller,
@@ -1615,11 +1616,56 @@ def _get_agent_manager() -> Any:
     return get_agent_manager()
 
 
+async def pause_unknown_task_lease(lease: TaskLease) -> bool:
+    """Commit an unknown-input pause before publishing its fenced snapshot."""
+    from ..models.database import get_session_local
+    from .task_events import publish_task_event
+    from .workforce_runtime import sync_workforce_run_status
+
+    def settle() -> tuple[bool, TaskControlSnapshot | None]:
+        with get_session_local()() as db:
+            if not lock_task_lease_for_settlement_no_commit(db, lease):
+                return False, None
+            task = db.query(Task).filter(Task.id == lease.task_id).one()
+            snapshot = None
+            if task.status == TaskStatus.RUNNING:
+                snapshot = apply_task_control_transition(
+                    task,
+                    TaskControlState.PAUSED,
+                    status=TaskStatus.PAUSED,
+                    expected_run_id=lease.run_id,
+                )
+                sync_workforce_run_status(db, task, TaskStatus.PAUSED)
+                db.flush()
+            settled = finish_turn(db, lease.task_id, task_lease=lease)
+            return settled, snapshot if settled else None
+
+    settled, snapshot = await run_db_io_cancellation_safe(settle)
+    if snapshot is not None:
+        try:
+            await publish_task_event(
+                {
+                    "type": "task_paused",
+                    "task_id": lease.task_id,
+                    "message": "Input outcome unknown; execution paused",
+                    "timestamp": datetime.now(timezone.utc).timestamp(),
+                    **snapshot.as_dict(),
+                },
+                lease.task_id,
+            )
+        except Exception:
+            logger.warning(
+                "Unknown-input pause committed but broadcast failed for task %s",
+                lease.task_id,
+                exc_info=True,
+            )
+    return settled
+
+
 def settle_task_lease_isolated(
     lease: TaskLease,
     *,
     error_message: str | None = None,
-    injection_outcome_unknown: bool = False,
     client_error_message: str = CLIENT_SAFE_TASK_FAILURE,
     client_message_type: str = TASK_FAILURE_MESSAGE_TYPE,
 ) -> bool:
@@ -1648,22 +1694,6 @@ def settle_task_lease_isolated(
     SessionLocal = get_session_local()
     with SessionLocal() as settle_db:
         try:
-            if injection_outcome_unknown:
-                # The writer has drained. Keep existing terminal/control results;
-                # only the exact still-running attempt needs to be paused.
-                if not lock_task_lease_for_settlement_no_commit(settle_db, lease):
-                    return False
-                task = settle_db.query(Task).filter(Task.id == lease.task_id).one()
-                if task.status == TaskStatus.RUNNING:
-                    apply_task_control_transition(
-                        task,
-                        TaskControlState.PAUSED,
-                        status=TaskStatus.PAUSED,
-                        expected_run_id=lease.run_id,
-                    )
-                    sync_workforce_run_status(settle_db, task, TaskStatus.PAUSED)
-                    settle_db.flush()
-                return finish_turn(settle_db, lease.task_id, task_lease=lease)
             if error_message is not None:
                 failed = fail_and_release_task_lease_no_commit(
                     settle_db,

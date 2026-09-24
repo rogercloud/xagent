@@ -5642,14 +5642,38 @@ async def test_unknown_retry_during_task_deletion_does_not_enqueue(db_session):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("failure", ["unknown", "cancelled", "exception"])
+@pytest.mark.parametrize(
+    "failure", ["unknown", "cancelled", "exception", "callback_cancelled"]
+)
 async def test_deferred_unknown_pauses_without_resuming(db_session, failure):
     owner, task, turn_id = _seed_deferred_delivery(db_session, "pause-unknown")
     post = AsyncMock(return_value=UserMessageInjectionOutcome.OUTCOME_UNKNOWN)
-    if failure == "cancelled":
-        post.side_effect = asyncio.CancelledError()
-    elif failure == "exception":
-        post.side_effect = RuntimeError("unclassified injection failure")
+    store = _CommittedInjectionStore()
+    runner, context = _runner_for_cancelled_injection(task.id, store)
+
+    async def failed_write(**payload):
+        if failure == "callback_cancelled":
+            store.payload = payload
+            return
+        if failure == "cancelled":
+            raise asyncio.CancelledError()
+        store.load_latest_checkpoint = AsyncMock(
+            side_effect=RuntimeError("read unavailable")
+        )
+        raise RuntimeError("lost ack")
+
+    store.checkpoint = failed_write
+    if failure == "callback_cancelled":
+
+        async def callback(**kwargs):
+            raise asyncio.CancelledError()
+
+        runner.callbacks = [SimpleNamespace(on_user_message_posted=callback)]
+
+    async def inject(execution_id, **kwargs):
+        return (await runner.inject_user_message(execution_id, **kwargs)).outcome
+
+    post.side_effect = inject
     agent = MagicMock(post_user_message=post, resume_execution_by_id=AsyncMock())
     notify = AsyncMock()
     with patch.object(
@@ -5661,12 +5685,13 @@ async def test_deferred_unknown_pauses_without_resuming(db_session, failure):
             task_owner_user_id=int(owner.id),
             pending_user_message={
                 "execution_message": "Deferred guidance",
+                "display_message": "Deferred guidance",
                 "turn_id": turn_id,
             },
             delivery_turn_id=turn_id,
             delivery_notifier=notify,
         )
-        if failure == "cancelled":
+        if failure in {"cancelled", "callback_cancelled"}:
             with pytest.raises(asyncio.CancelledError):
                 await operation
         else:
@@ -5680,9 +5705,10 @@ async def test_deferred_unknown_pauses_without_resuming(db_session, failure):
     assert not notify.await_args.kwargs["retry_with_new_id"]
 
 
+@pytest.mark.asyncio
 @pytest.mark.parametrize("prior_status", [TaskStatus.RUNNING, TaskStatus.FAILED])
-def test_uncertain_settlement_preserves_terminal_result(db_session, prior_status):
-    from xagent.web.services.task_orchestrator import settle_task_lease_isolated
+async def test_uncertain_settlement_preserves_terminal_result(db_session, prior_status):
+    from xagent.web.services.task_orchestrator import pause_unknown_task_lease
 
     owner = _user(db_session, "unknown-settle-owner")
     task = _task(db_session, owner.id, status=TaskStatus.PAUSED)
@@ -5697,7 +5723,7 @@ def test_uncertain_settlement_preserves_terminal_result(db_session, prior_status
         task.error_message = "explicit cancellation"
         task.agent_config = {"a2a_state": "TASK_STATE_CANCELED"}
     db_session.commit()
-    assert settle_task_lease_isolated(lease, injection_outcome_unknown=True)
+    assert await pause_unknown_task_lease(lease)
     db_session.refresh(task)
     assert task.status == (
         TaskStatus.PAUSED if prior_status == TaskStatus.RUNNING else TaskStatus.FAILED
@@ -5741,8 +5767,9 @@ def _runner_for_cancelled_injection(task_id, store):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("cancel_at", ["write", "callback"])
 async def test_live_committed_write_cancellation_preserves_unknown(
-    db_session, live_task_lease
+    db_session, live_task_lease, cancel_at
 ):
     owner = _user(db_session, "cancel-live-owner")
     task = _task(db_session, owner.id, status=TaskStatus.RUNNING)
@@ -5753,6 +5780,17 @@ async def test_live_committed_write_cancellation_preserves_unknown(
     turn_id = "cancel-live-turn"
     store = _CommittedInjectionStore()
     runner, context = _runner_for_cancelled_injection(task.id, store)
+    if cancel_at == "callback":
+
+        async def write(**payload):
+            store.payload = payload
+
+        async def callback(**kwargs):
+            store.committed.set()
+            await asyncio.Event().wait()
+
+        store.checkpoint = write
+        runner.callbacks = [SimpleNamespace(on_user_message_posted=callback)]
 
     async def post(execution_id, **kwargs):
         return (await runner.post_user_message(execution_id, **kwargs)).outcome
@@ -5789,7 +5827,7 @@ async def test_live_committed_write_cancellation_preserves_unknown(
             with pytest.raises(asyncio.CancelledError):
                 await operation
             assert _delivery_status(db_session, turn_id) == DELIVERY_OUTCOME_UNKNOWN
-            assert context.messages == []
+            assert len(context.messages) == (1 if cancel_at == "callback" else 0)
             ack = reply.await_args.args[0]
             assert ack["rejection_outcome"] == "outcome_unknown"
             assert not ack.get("retry_with_new_id")

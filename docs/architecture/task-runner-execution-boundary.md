@@ -122,3 +122,29 @@ execution outcome is unknown. The existing generic retry behavior must not be
 assumed safe for START when wiring the future consumer. Process roles, producer
 migration, consumer admission, cross-process events and credentials remain
 subsequent work.
+
+## Uncertain input delivery
+
+The injection checkpoint is the acceptance boundary. Reading or preparing a
+message can fail before any write; such a failure is not an unknown write.
+After a write starts, a failed acknowledgement requires an authoritative
+read-back. If acceptance cannot be determined, the existing delivery receipt
+records `outcome_unknown` and the owned execution pauses. There is no automatic
+reinjection or execution restart. Already generated answers remain in history;
+a genuine execution failure retains its original diagnostic.
+
+The runtime records acceptance separately from later tracing and notification
+work, so an exception after a confirmed write cannot mean “not accepted”.
+Cancellation before a write and cancellation during a write have different
+acceptance outcomes. The old context remains fenced against stale checkpoint
+writes. Once its execution has exited, an explicit deferred input or resume
+loads durable state again.
+
+A reply timeout can also mean that an accepted command is still queued or being
+processed. It is not evidence of a failed injection. For shared execution,
+clients can repeat the same request identity to observe the existing command;
+they must not automatically create a new identity to resend the input. A2A's
+shared `commandId` identifies the internal deterministic command, whereas its
+nonshared error correlates with the original `messageId`. Nonshared SDK replies
+return a correlation ID, not a new durable deduplication guarantee. Check task
+state before deciding whether to resume or send new input.

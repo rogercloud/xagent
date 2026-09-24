@@ -7,7 +7,11 @@ from unittest.mock import AsyncMock
 import pytest
 
 from xagent.core.agent.context import ContextManager
-from xagent.core.agent.runner import AgentRunner, UserMessageInjectionOutcome
+from xagent.core.agent.runner import (
+    AgentRunner,
+    UserMessageInjectionOutcome,
+    UserMessageInjectionRejectedError,
+)
 from xagent.core.agent.runtime import ExecutionInterrupted, PatternRuntime
 
 
@@ -58,7 +62,7 @@ async def test_candidate_is_invisible_until_persisted(live):
 async def test_confirmed_failed_write_leaves_no_ghost(live):
     runner, context, tracer = live
     tracer.checkpoint.side_effect = RuntimeError("write failed")
-    with pytest.raises(RuntimeError, match="write failed"):
+    with pytest.raises(UserMessageInjectionRejectedError, match="write failed"):
         await runner.inject_user_message("atomic", "new", turn_id="turn")
     assert [m.content for m in context.messages] == ["original"]
     tracer.checkpoint.side_effect = None
@@ -161,11 +165,7 @@ async def test_cancelled_uncertain_injection_blocks_stale_writes(live, cancel_at
         await asyncio.Event().wait()
 
     async def write(**payload):
-        if cancel_at == "write":
-            await block()
-        else:
-            tracer.load_latest_checkpoint.side_effect = lambda _: block()
-            raise RuntimeError("uncertain")
+        await block()
 
     # AsyncMock's side_effect must itself await the suspended read.
     async def read(_):
@@ -375,9 +375,9 @@ async def test_run_completion_waits_for_in_flight_injection(live):
         drain.set()
         assert (await injection).outcome is UserMessageInjectionOutcome.OUTCOME_UNKNOWN
         result = await operation
-        assert result["status"] == "interrupted"
+        assert result.get("status") != "interrupted"
         assert result["injection_outcome_unknown"] is True
-        assert not result["success"]
+        assert result["success"]
         assert result["output"] == "prior output"
         assert [
             m.content for m in runner.context_manager.get_context("atomic").messages
@@ -421,3 +421,176 @@ async def test_live_input_after_result_publication_defers_until_old_run_finishes
     finally:
         finish.set()
         await asyncio.gather(operation, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_explicit_new_input_reloads_uncertain_idle_context(live):
+    from xagent.core.agent.context.execution import context_checkpoint_gate
+
+    runner, old_context, tracer = live
+    durable = None
+
+    async def write(**payload):
+        nonlocal durable
+        durable = payload
+        tracer.load_latest_checkpoint.side_effect = RuntimeError("unavailable")
+        raise RuntimeError("lost ack")
+
+    tracer.checkpoint.side_effect = write
+    first = await runner.inject_user_message(
+        "atomic", "first", turn_id="first", request_interrupt=False
+    )
+    assert first.outcome is UserMessageInjectionOutcome.OUTCOME_UNKNOWN
+    tracer.load_latest_checkpoint.side_effect = None
+    tracer.load_latest_checkpoint.return_value = durable
+    tracer.checkpoint.side_effect = None
+    second = await runner.inject_user_message(
+        "atomic", "second", turn_id="second", request_interrupt=False
+    )
+    assert second.outcome is UserMessageInjectionOutcome.POSTED_FRESH
+    assert second.context is not old_context
+    assert [m.content for m in second.context.messages] == [
+        "original",
+        "first",
+        "second",
+    ]
+    assert context_checkpoint_gate(old_context).injection_uncertain
+    assert tracer.checkpoint.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_confirmed_readback_does_not_leave_transient_unknown_result(live):
+    from xagent.core.agent.context.execution import context_checkpoint_gate
+
+    runner, context, tracer = live
+    started, interrupt, reading, release = (asyncio.Event() for _ in range(4))
+    payload = None
+
+    class Pattern:
+        async def run(self, **kwargs):
+            started.set()
+            await interrupt.wait()
+            raise ExecutionInterrupted("user pause")
+
+    runner.agent.patterns = [Pattern()]
+    operation = asyncio.create_task(
+        runner.run(
+            "original", execution_id="atomic", checkpoint={"context": context.to_dict()}
+        )
+    )
+    await started.wait()
+
+    async def read(_):
+        reading.set()
+        await release.wait()
+        return payload
+
+    async def write(**candidate):
+        nonlocal payload
+        payload = candidate
+        tracer.load_latest_checkpoint.side_effect = read
+        raise RuntimeError("lost ack")
+
+    tracer.checkpoint.side_effect = write
+    injection = asyncio.create_task(
+        runner.inject_user_message("atomic", "new", turn_id="new")
+    )
+    try:
+        await reading.wait()
+        interrupt.set()
+        gate = context_checkpoint_gate(runner.context_manager.get_context("atomic"))
+
+        async def finalizer_waiting():
+            while not gate._waiters:
+                await asyncio.sleep(0)
+
+        await asyncio.wait_for(finalizer_waiting(), 2)
+        release.set()
+        assert (await injection).outcome is UserMessageInjectionOutcome.POSTED_FRESH
+        assert (await operation)["injection_outcome_unknown"] is False
+    finally:
+        release.set()
+        interrupt.set()
+        await asyncio.gather(operation, injection, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_exceptional_run_exit_closes_live_admission(live):
+    from xagent.core.agent.checkpoint import CheckpointPersistenceError
+
+    runner, context, tracer = live
+
+    class Pattern:
+        async def run(self, **kwargs):
+            raise CheckpointPersistenceError("failed checkpoint")
+
+    runner.agent.patterns = [Pattern()]
+    with pytest.raises(CheckpointPersistenceError):
+        await runner.run(
+            "original", execution_id="atomic", checkpoint={"context": context.to_dict()}
+        )
+    posted = await runner.inject_user_message("atomic", "late", turn_id="late")
+    assert posted.outcome is UserMessageInjectionOutcome.NOT_POSTED
+    tracer.checkpoint.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_acceptance_evidence_survives_postwrite_registry_error(live):
+    from xagent.core.agent.registry import ExecutionRegistry
+    from xagent.core.agent.runner import track_user_message_injection
+
+    runner, context, tracer = live
+    registry = ExecutionRegistry()
+    registry.register("atomic", runner)
+    token = registry.subscribe(lambda _: registry.unsubscribe(token))
+    with track_user_message_injection() as attempt:
+        with pytest.raises(RuntimeError, match="dictionary changed"):
+            await registry.post_user_message("atomic", "new", turn_id="new")
+    assert attempt.outcome is UserMessageInjectionOutcome.POSTED_FRESH
+    assert context.messages[-1].content == "new"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("after_write", [False, True])
+async def test_cancellation_evidence_comes_from_write_boundary(live, after_write):
+    from xagent.core.agent.runner import track_user_message_injection
+
+    runner, context, tracer = live
+    entered = asyncio.Event()
+
+    async def blocked(*args, **kwargs):
+        entered.set()
+        await asyncio.Event().wait()
+
+    if after_write:
+        tracer.checkpoint.side_effect = blocked
+    else:
+        tracer.load_latest_checkpoint.side_effect = blocked
+    with track_user_message_injection() as attempt:
+        operation = asyncio.create_task(
+            runner.inject_user_message("atomic", "new", turn_id="new")
+        )
+        await entered.wait()
+        operation.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await operation
+    assert attempt.outcome is (
+        UserMessageInjectionOutcome.OUTCOME_UNKNOWN
+        if after_write
+        else UserMessageInjectionOutcome.NOT_POSTED
+    )
+
+
+@pytest.mark.asyncio
+async def test_write_only_checkpoint_wrapper_cannot_claim_authoritative_absence(live):
+    from xagent.core.agent.checkpoint import (
+        CheckpointUnavailableError,
+        TraceCheckpointStore,
+    )
+
+    runner, context, tracer = live
+    backend = SimpleNamespace(checkpoint=AsyncMock())
+    runner.tracer = TraceCheckpointStore(backend)
+    with pytest.raises(CheckpointUnavailableError, match="no readable backend"):
+        await runner.inject_user_message("atomic", "new", turn_id="new")
+    backend.checkpoint.assert_not_awaited()
