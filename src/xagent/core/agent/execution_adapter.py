@@ -198,6 +198,31 @@ class AgentExecutionAdapter:
             execution_id=execution_id,
         )
 
+    async def settle_injection_against_checkpoint(
+        self,
+        execution_id: str,
+        *,
+        execution_message: str,
+        display_message: str,
+        turn_id: str,
+        files: list[dict[str, Any]] | None = None,
+    ) -> UserMessageInjectionOutcome:
+        if self.registry.get(execution_id) is None:
+            runner, execution_type = self._build_runner()
+            self.registry.register(
+                execution_id,
+                runner,
+                metadata=self._execution_metadata(execution_type=execution_type),
+            )
+        result = await self.registry.settle_injection_against_checkpoint(
+            execution_id,
+            execution_message=execution_message,
+            display_message=display_message,
+            turn_id=turn_id,
+            files=files,
+        )
+        return result.outcome
+
     async def post_user_message(
         self,
         execution_id: str,

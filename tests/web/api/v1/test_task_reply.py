@@ -301,6 +301,7 @@ def test_reply_turn_id_is_never_reused_across_retries(mock_start_task):
     db = _direct_db_session()
     try:
         task = db.query(Task).filter(Task.id == task_id).one()
+        task.pending_injection = None  # Simulate the completed resume handoff.
         task.status = TaskStatus.WAITING_FOR_USER
         task.control_state = TaskControlState.WAITING_FOR_USER.value
         task.run_id = "run-original"
@@ -1172,11 +1173,15 @@ def test_reply_reports_unknown_without_closing_interaction(mock_start_task):
     assert response.status_code == 504, response.text
     assert response.json()["error"]["code"] == "reply_outcome_unknown"
     post.assert_awaited_once()
-    schedule.assert_not_awaited()
+    schedule.assert_awaited_once()
     db = _direct_db_session()
     try:
-        # Transitional pre-producer behavior; R1 must replace this restoration.
-        assert db.get(Task, task_id).status == TaskStatus.WAITING_FOR_USER
+        assert (
+            schedule.call_args.kwargs["trusted_task_source"]
+            == db.get(Task, task_id).source
+        )
+        assert db.get(Task, task_id).status == TaskStatus.RUNNING
+        assert db.get(Task, task_id).pending_injection is not None
         assert (
             db.query(TaskInteractionRequest)
             .filter(TaskInteractionRequest.id == row_id)

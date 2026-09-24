@@ -122,6 +122,8 @@ def _admit_reply(
                 ).hex
                 continue
             return int(existing.id)
+        if task.pending_injection is not None:
+            raise TaskResumeBusyError
         if ctx.status != TaskStatus.WAITING_FOR_USER and source == "sdk":
             if ctx.status == TaskStatus.RUNNING:
                 raise TaskResumeBusyError
@@ -307,6 +309,10 @@ def _handoff(
             raise TaskCommandRejected(
                 "Reply identity changed", reason="identity_changed"
             )
+        if task.pending_injection is not None:
+            raise TaskCommandRejected(
+                "Earlier input requires settlement", reason="state_changed"
+            )
         if (
             task.run_id != payload.run_id
             or task.status != TaskStatus(payload.prior_status)
@@ -433,6 +439,7 @@ async def _execute_resume_input(command: ClaimedTaskCommand) -> SettledTaskComma
                     text=payload.text,
                     message_id=payload.message_id,
                     preacquired_lease=lease,
+                    reply_command_id=command.command_id,
                 )
             outcome = "accepted"
         except TaskResumeOutcomeUnknownError:

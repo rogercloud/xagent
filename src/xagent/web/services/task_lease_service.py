@@ -924,7 +924,10 @@ def acquire_task_lease_no_commit(
         )
     stmt = update(Task).where(Task.id == task_id, owner_predicate).values(**values)
     if new_run:
-        stmt = stmt.where(task_status_predicate.ne(TaskStatus.RUNNING))
+        stmt = stmt.where(
+            task_status_predicate.ne(TaskStatus.RUNNING),
+            Task.pending_injection.is_(None),
+        )
     if expected_run_id is not None:
         stmt = stmt.where(Task.run_id == expected_run_id)
     if expected_status is not None:
@@ -1294,6 +1297,7 @@ def fail_and_release_task_lease_no_commit(
         .where(Task.runner_id == lease.runner_id)
         .where(task_lease_attempt_predicate(lease))
         .where(Task.run_id == lease.run_id)
+        .where(Task.pending_injection.is_(None))
         .where(task_status_predicate.eq(TaskStatus.RUNNING))
         .values(
             {

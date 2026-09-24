@@ -20,7 +20,7 @@ from typing import (
     cast,
 )
 
-from sqlalchemy import func, or_, update
+from sqlalchemy import case, func, or_, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -1826,7 +1826,9 @@ async def handle_task_message(
                     # Three branches, not a two-way isinstance fold, so
                     # Unavailable stays visible on its own line.
                     if isinstance(active_interaction_read, ActiveInteractionFound):
-                        active_interaction_id = active_interaction_read.interaction_id
+                        active_interaction_id: int | None = (
+                            active_interaction_read.interaction_id
+                        )
                     elif isinstance(active_interaction_read, ActiveInteractionAbsent):
                         active_interaction_id = None
                     elif isinstance(
@@ -1847,8 +1849,12 @@ async def handle_task_message(
                     if live_task_lease is not None:
                         with bind_task_lease_context(live_task_lease):
                             try:
-                                posted = await agent_service.post_user_message(
-                                    str(task_id),
+                                from .task_injection import post_journaled_message
+
+                                posted = await post_journaled_message(
+                                    agent_service,
+                                    live_task_lease,
+                                    interaction_id=active_interaction_id,
                                     execution_message=user_message_for_llm,
                                     display_message=display_user_message,
                                     files=display_file_refs,
@@ -1885,17 +1891,10 @@ async def handle_task_message(
                                 )
                                 return
                     if posted is UserMessageInjectionOutcome.OUTCOME_UNKNOWN:
+                        # The resume owner drains the old run and settles the
+                        # durable journal before executing any new input.
                         delivery_outcome_unknown = True
-                        task_execution_service.background_task_manager.release_resume_reservation(
-                            task_id
-                        )
-                        await finish_delivery_failure(
-                            client_error_message(
-                                ClientErrorCode.MESSAGE_OUTCOME_UNKNOWN
-                            ),
-                            error_code=ClientErrorCode.MESSAGE_OUTCOME_UNKNOWN.value,
-                        )
-                        return
+                        posted = UserMessageInjectionOutcome.NOT_POSTED
                     delivery_injected = bool(posted)
                     if not posted:
                         logger.warning(
@@ -1960,6 +1959,7 @@ async def handle_task_message(
                             ),
                             delivery_turn_id=turn_id,
                             delivery_already_dispatched=bool(posted),
+                            delivery_outcome_unknown=delivery_outcome_unknown,
                             delivery_notifier=(
                                 None
                                 if posted or suppress_delivery_ack
@@ -2075,6 +2075,24 @@ async def handle_task_message(
                                     close_run_id,
                                 )
                 except BaseException:
+                    if live_task_lease is not None and not handoff_registered:
+                        from .task_injection import load_pending_injection
+
+                        try:
+                            pending = await load_pending_injection(live_task_lease)
+                            delivery_outcome_unknown = (
+                                pending is not None and pending.turn_id == turn_id
+                            )
+                        except Exception:
+                            delivery_outcome_unknown = True
+                        if delivery_outcome_unknown:
+                            from .task_coordinator_runtime import (
+                                current_task_coordinator,
+                            )
+
+                            coordinator = current_task_coordinator(task_id)
+                            if coordinator is not None:
+                                coordinator.require_recovery()
                     if bg_task is not None and not handoff_registered:
                         bg_task.cancel()
                     if not handoff_registered:
@@ -2550,8 +2568,9 @@ def _apply_pause_requested_isolated(
     task_id: int,
     *,
     expected_run_id: str | None,
+    pending_only: bool = False,
 ) -> bool:
-    """Persist PAUSE_REQUESTED for the exact RUNNING run in a short Session."""
+    """Pause the exact run, including recovery waiting without a live runner."""
 
     SessionLocal = get_session_local()
     with SessionLocal() as db:
@@ -2564,10 +2583,21 @@ def _apply_pause_requested_isolated(
             # RUNNING rows that predate run ids.
             values["run_id"] = str(uuid.uuid4())
 
-        statement = update(Task).where(
-            Task.id == task_id,
-            Task.status == TaskStatus.RUNNING,
-        )
+        statement = update(Task).where(Task.id == task_id)
+        if pending_only:
+            statement = statement.where(
+                Task.status.in_((TaskStatus.RUNNING, TaskStatus.PAUSED)),
+                Task.pending_injection.is_not(None),
+            )
+            values["control_state"] = case(
+                (
+                    Task.status == TaskStatus.RUNNING,
+                    TaskControlState.PAUSE_REQUESTED.value,
+                ),
+                else_=TaskControlState.PAUSED.value,
+            )
+        else:
+            statement = statement.where(Task.status == TaskStatus.RUNNING)
         statement = (
             statement.where(Task.run_id.is_(None))
             if expected_run_id is None
@@ -2577,6 +2607,13 @@ def _apply_pause_requested_isolated(
             statement.values(**values).execution_options(synchronize_session=False)
         )
         if int(getattr(result, "rowcount", 0) or 0) == 1:
+            paused = db.get(Task, task_id)
+            if paused is not None and paused.pending_injection:
+                setattr(
+                    paused,
+                    "pending_injection",
+                    {**paused.pending_injection, "auto_resume": False},
+                )
             db.commit()
             return True
 
@@ -2622,6 +2659,26 @@ async def pause_task(reply: CommandReply, task_id: int, message_data: dict) -> N
         task_fields = task_setup_snapshot.task
         task_owner_user_id = int(task_fields.user_id)
         expected_run_id = task_fields.run_id
+        pending_paused = await run_db_io_cancellation_safe(
+            lambda: _apply_pause_requested_isolated(
+                task_id, expected_run_id=expected_run_id, pending_only=True
+            )
+        )
+        running = task_execution_service.background_task_manager.running_tasks.get(
+            task_id
+        )
+        if pending_paused and (running is None or running.done()):
+            _mark_task_pause_accepted(task_id)
+            await publish_task_event(
+                {
+                    "type": "task_pause_requested",
+                    "task_id": task_id,
+                    "message": "Task pause requested",
+                    "timestamp": datetime.now(timezone.utc).timestamp(),
+                },
+                task_id,
+            )
+            return
         # Off-turn: on an agent-cache hit this only locates the already-
         # running agent's existing workspace/sandbox to pause it. On a miss,
         # get_agent_for_task below builds a fresh agent from this value,
@@ -2665,7 +2722,7 @@ async def pause_task(reply: CommandReply, task_id: int, message_data: dict) -> N
         if hasattr(agent_service, "pause_execution"):
             logger.info("Agent supports pause_execution, calling it...")
             pause_result = await agent_service.pause_execution()
-            if pause_result is False:
+            if pause_result is False and not pending_paused:
                 running = (
                     task_execution_service.background_task_manager.running_tasks.get(
                         task_id
@@ -2700,7 +2757,7 @@ async def pause_task(reply: CommandReply, task_id: int, message_data: dict) -> N
                 logger.warning("%s for task %s", pause_failure, task_id)
                 return
             logger.info("Agent pause_execution completed")
-            pause_applied = await run_db_io_cancellation_safe(
+            pause_applied = pending_paused or await run_db_io_cancellation_safe(
                 lambda: _apply_pause_requested_isolated(
                     task_id,
                     expected_run_id=expected_run_id,
@@ -3226,6 +3283,7 @@ async def resume_task(
                     # serialises commands per task, so a PROCESSING resume
                     # blocks the cancel from being claimed at all.
                     expected_state_version=task_fields.state_version,
+                    resume_pending_input=True,
                 )
             except StaleTaskStateVersionError as exc:
                 # Only the version fence lands here. A rotated run raises the

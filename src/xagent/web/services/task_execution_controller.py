@@ -110,6 +110,7 @@ def apply_task_control_transition(
     new_run: bool = False,
     expected_run_id: str | None = None,
     expected_state_version: int | None = None,
+    resume_pending_input: bool = False,
 ) -> TaskControlSnapshot:
     """Mutate one ORM task with a monotonic control-state transition.
 
@@ -151,6 +152,16 @@ def apply_task_control_transition(
             Task.control_state: control_state.value,
             Task.state_version: func.coalesce(Task.state_version, 0) + 1,
         }
+        if resume_pending_input and task.pending_injection:
+            values[Task.pending_injection] = {
+                **task.pending_injection,
+                "auto_resume": True,
+            }
+        if control_state == TaskControlState.PAUSE_REQUESTED and task.pending_injection:
+            values[Task.pending_injection] = {
+                **task.pending_injection,
+                "auto_resume": False,
+            }
         if status is not None:
             values[Task.status] = status
         if current_run_id != getattr(task, "run_id", None):
@@ -209,6 +220,7 @@ def transition_task_control_state_sync(
     new_run: bool = False,
     expected_run_id: str | None = None,
     expected_state_version: int | None = None,
+    resume_pending_input: bool = False,
 ) -> TaskControlSnapshot:
     from ..models.database import get_session_local
 
@@ -224,6 +236,7 @@ def transition_task_control_state_sync(
             new_run=new_run,
             expected_run_id=expected_run_id,
             expected_state_version=expected_state_version,
+            resume_pending_input=resume_pending_input,
         )
         db.commit()
         return snapshot
@@ -339,6 +352,7 @@ class TaskExecutionController:
         new_run: bool = False,
         expected_run_id: str | None = None,
         expected_state_version: int | None = None,
+        resume_pending_input: bool = False,
     ) -> TaskControlSnapshot:
         """Apply one control transition, optionally fenced on an exact row.
 
@@ -361,6 +375,7 @@ class TaskExecutionController:
             new_run=new_run,
             expected_run_id=expected_run_id,
             expected_state_version=expected_state_version,
+            resume_pending_input=resume_pending_input,
         )
 
     async def snapshot(self, task_id: int) -> TaskControlSnapshot | None:

@@ -1553,25 +1553,39 @@ def _enqueue_websocket_task_command_sync(
                 ),
                 turn_id=command_id,
             )
+            # Resolve replay identity before deciding whether new input is allowed.
+            # The command keeps the raw attachment payload; preparation may have
+            # deduplicated or skipped IDs in the delivery receipt.
+            original_matches = existing_task_command_payload_matches(
+                db,
+                task_id=task_id,
+                command_id=command_id,
+                actor_user_id=actor_user_id,
+                kind=kind,
+                payload=payload,
+            )
+            outcome_unknown = existing_delivery is not None and (
+                existing_delivery.outcome_unknown
+                or (
+                    existing_delivery.pending
+                    and task.pending_injection is not None
+                    and task.pending_injection["turn_id"] == command_id
+                )
+            )
             if (
                 existing_delivery is not None
-                and not existing_delivery.pending
-                and (not payload.get("files") or existing_delivery.outcome_unknown)
+                and (not existing_delivery.pending or outcome_unknown)
+                and (
+                    original_matches is not None
+                    or not payload.get("files")
+                    or outcome_unknown
+                )
             ):
-                payload_matches = existing_delivery.payload_matches
-                if existing_delivery.outcome_unknown:
-                    # Preparation can deduplicate or skip attachment IDs.
-                    # Compare with the original command when it still exists.
-                    original_matches = existing_task_command_payload_matches(
-                        db,
-                        task_id=task_id,
-                        command_id=command_id,
-                        actor_user_id=actor_user_id,
-                        kind=kind,
-                        payload=payload,
-                    )
-                    if original_matches is not None:
-                        payload_matches = original_matches
+                payload_matches = (
+                    original_matches
+                    if original_matches is not None
+                    else existing_delivery.payload_matches
+                )
                 return EnqueuedTaskCommand(
                     command_id=0,
                     client_command_id=command_id,
@@ -1579,11 +1593,22 @@ def _enqueue_websocket_task_command_sync(
                     payload_matches=payload_matches,
                     status=(
                         DELIVERY_OUTCOME_UNKNOWN
-                        if existing_delivery.outcome_unknown
+                        if outcome_unknown
                         else DELIVERY_FAILED
                         if existing_delivery.failed
                         else DELIVERY_COMPLETED
                     ),
+                )
+            # Existing commands and legacy receipts retain the established
+            # idempotent preparation path. Only genuinely new input is busy.
+            if (
+                task.pending_injection is not None
+                and original_matches is None
+                and existing_delivery is None
+            ):
+                raise ClientVisibleValidationError(
+                    "Task has an unresolved input",
+                    error_code=ClientErrorCode.TASK_BUSY,
                 )
         try:
             result = enqueue_task_command(

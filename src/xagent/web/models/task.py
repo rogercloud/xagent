@@ -235,6 +235,12 @@ class Task(Base):  # type: ignore
     __table_args__ = (
         Index("ix_tasks_agent_id_source", "agent_id", "source"),
         Index(
+            "ix_tasks_pending_injection",
+            "id",
+            sqlite_where=text("pending_injection IS NOT NULL"),
+            postgresql_where=text("pending_injection IS NOT NULL"),
+        ),
+        Index(
             "ix_tasks_status_lease_expires_at",
             "status",
             "lease_expires_at",
@@ -480,6 +486,8 @@ class Task(Base):  # type: ignore
     agent_type = Column(
         String(20), default=AgentType.STANDARD.value, nullable=True
     )  # SQLite compatible
+    # Exact-run input journal, retained until checkpoint settlement and resume.
+    pending_injection = Column(JSON(none_as_null=True), nullable=True)
     agent_config = Column(JSON, nullable=True)  # Agent-specific configuration
     connector_runtime_selected_refs = Column(JSON, nullable=True, default=list)
 

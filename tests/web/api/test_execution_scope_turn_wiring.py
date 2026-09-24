@@ -145,7 +145,14 @@ def _bg_patches(db: Any) -> list[Any]:
 
 class _Patches:
     def __init__(self, patches: list[Any]) -> None:
-        self._patches = patches
+        # These scope/lifecycle unit tests have no pending input journal.
+        self._patches = [
+            patch(
+                "xagent.web.services.task_injection.load_pending_injection",
+                new=AsyncMock(return_value=None),
+            ),
+            *patches,
+        ]
 
     def __enter__(self) -> None:
         for p in self._patches:
@@ -1405,7 +1412,9 @@ def _fake_acquire_with_prior_status(lease: TaskLease, prior_status: TaskStatus):
         expected_run_id_arg: str | None,
         *,
         prior_status_out: list[Any] | None = None,
+        recover_pending: bool = False,
     ) -> TaskLease:
+        assert not recover_pending
         if prior_status_out is not None:
             prior_status_out.append(prior_status)
         return lease

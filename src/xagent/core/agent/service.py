@@ -342,6 +342,28 @@ class AgentService:
     def supports_live_control(self) -> bool:
         return True
 
+    async def settle_injection_against_checkpoint(
+        self,
+        execution_id: str,
+        *,
+        execution_message: str,
+        display_message: str,
+        turn_id: str,
+        files: list[dict[str, Any]] | None = None,
+    ) -> "UserMessageInjectionOutcome":
+        if self._execution_adapter is None:
+            self._execution_adapter = self._build_execution_adapter()
+        return cast(
+            "UserMessageInjectionOutcome",
+            await self._execution_adapter.settle_injection_against_checkpoint(
+                execution_id,
+                execution_message=execution_message,
+                display_message=display_message,
+                turn_id=turn_id,
+                files=files,
+            ),
+        )
+
     async def post_user_message(
         self,
         execution_id: str,

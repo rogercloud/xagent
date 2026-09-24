@@ -913,6 +913,13 @@ class PatternRuntime:
             else nullcontext()
         )
         async with gate:
+            if (
+                isinstance(context, ExecutionContext)
+                and context_checkpoint_gate(context).injection_uncertain
+            ):
+                raise CheckpointPersistenceError(
+                    "An uncertain injection requires checkpoint read-back before further writes."
+                )
             payload = self._build_checkpoint_payload(
                 label=label,
                 context=context,

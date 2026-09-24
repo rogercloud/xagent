@@ -88,6 +88,7 @@ from .task_lease_service import (
 
 if TYPE_CHECKING:
     from .task_setup_snapshot import TaskSetupSnapshot
+
 from ...core.file_storage.keys import (
     build_task_output_storage_key,
 )
@@ -1600,6 +1601,10 @@ def _finalize_task_execution_result_isolated(
         final_task_status = pre_run_status.value
 
         if task_updated is not None:
+            if task_updated.pending_injection is not None:
+                # A journaled input owns the next turn. The old pattern may
+                # have failed its now-blocked checkpoint while draining.
+                result = {**result, "status": "interrupted", "success": False}
             task_agent_config: dict[str, Any] = (
                 task_updated.agent_config
                 if isinstance(task_updated.agent_config, dict)
@@ -2207,6 +2212,7 @@ def _acquire_resume_task_lease(
     expected_run_id: str | None,
     *,
     prior_status_out: list[TaskStatus] | None = None,
+    recover_pending: bool = False,
 ) -> TaskLease | None:
     """Validate and claim a resume lease in one worker transaction.
 
@@ -2238,6 +2244,19 @@ def _acquire_resume_task_lease(
             db,
             task_id,
             expected_run_id=expected_run_id,
+            claim_predicates=(
+                Task.pending_injection.is_not(None),
+                Task.pending_injection["auto_resume"].as_boolean().is_(True),
+                Task.pending_injection["run_id"].as_string() == expected_run_id,
+                Task.status == TaskStatus.PAUSED,
+            )
+            if recover_pending
+            else (
+                or_(
+                    Task.pending_injection.is_(None),
+                    Task.pending_injection["auto_resume"].as_boolean().is_(True),
+                ),
+            ),
         )
         if lease is None:
             db.commit()
@@ -2500,6 +2519,8 @@ async def execute_resume_background(
     # value", never "this task has no source": the runner's overlay ignores a
     # None and keeps whatever the checkpoint carries.
     trusted_task_source: str | None = None,
+    recover_pending_injection: bool = False,
+    delivery_outcome_unknown: bool = False,
 ) -> None:
     """Resume an agent execution after an interrupt/user-message checkpoint.
 
@@ -2541,7 +2562,6 @@ async def execute_resume_background(
     task_agent_id: int | None = None
     agent_name: str | None = None
     agent_logo_url: str | None = None
-    delivery_outcome_unknown = False
     delivery_was_dispatched = delivery_already_dispatched
     control_event_state: dict[str, Any] = {}
 
@@ -2594,7 +2614,7 @@ async def execute_resume_background(
             await run_db_io_cancellation_safe(
                 lambda: mark_user_message_delivery_sync(
                     task_id,
-                    delivery_turn_id,
+                    cast(str, delivery_turn_id),
                     DELIVERY_OUTCOME_UNKNOWN
                     if delivery_outcome_unknown
                     else DELIVERY_FAILED,
@@ -2672,6 +2692,7 @@ async def execute_resume_background(
                     task_owner_user_id,
                     expected_run_id,
                     prior_status_out=prior_status_box,
+                    recover_pending=recover_pending_injection,
                 ),
                 lambda acquired: _settle_resumed_task_lease(
                     acquired,
@@ -2685,13 +2706,7 @@ async def execute_resume_background(
                     "Task %s resume skipped; another runner owns the lease", task_id
                 )
                 if delivery_turn_id is not None and not delivery_was_dispatched:
-                    await run_db_io_cancellation_safe(
-                        lambda: mark_user_message_delivery_sync(
-                            task_id,
-                            delivery_turn_id,
-                            DELIVERY_FAILED,
-                        )
-                    )
+                    await mark_deferred_delivery_failed()
                     await notify_deferred_delivery(
                         False,
                         client_error_message(ClientErrorCode.MESSAGE_DELIVERY_FAILED),
@@ -2740,24 +2755,70 @@ async def execute_resume_background(
         # Acquire the execution lease first: otherwise a non-owner worker could
         # persist the injection and acknowledge it, then discover that it is
         # not allowed to run the resume.
+        from .task_injection import (
+            load_pending_injection,
+            post_journaled_message,
+            settle_journaled_message,
+        )
+
+        journal = await load_pending_injection(lease)
+        if journal is not None:
+            # Both restart recovery and the live handoff enter here only
+            # after the previous execution drains and the exact lease is held.
+            pending_user_message = journal.model_dump()
+            delivery_turn_id = journal.turn_id
+            delivery_was_dispatched = False
         if pending_user_message is not None:
             assert lease_heartbeat_task is not None
             with bind_task_lease_context(lease):
-                posted = await run_while_task_lease_owned(
-                    agent_service.post_user_message(
-                        str(task_id),
-                        execution_message=pending_user_message.get("execution_message"),
-                        display_message=pending_user_message.get("display_message"),
-                        files=pending_user_message.get("files"),
-                        turn_id=pending_user_message.get("turn_id"),
-                        request_interrupt=False,
-                        reason="deferred websocket user message",
-                    ),
-                    lease_heartbeat_task,
-                )
+                if journal is not None:
+                    posted = await run_while_task_lease_owned(
+                        settle_journaled_message(agent_service, lease, journal),
+                        lease_heartbeat_task,
+                    )
+                else:
+                    posted = await run_while_task_lease_owned(
+                        post_journaled_message(
+                            agent_service,
+                            lease,
+                            interaction_id=pending_user_message.get("interaction_id"),
+                            execution_message=pending_user_message["execution_message"],
+                            display_message=pending_user_message["display_message"],
+                            files=pending_user_message.get("files"),
+                            turn_id=pending_user_message["turn_id"],
+                            request_interrupt=False,
+                            reason="deferred websocket user message",
+                        ),
+                        lease_heartbeat_task,
+                    )
+            if (
+                posted is UserMessageInjectionOutcome.OUTCOME_UNKNOWN
+                and journal is None
+            ):
+                journal = await load_pending_injection(lease)
+                if journal is not None:
+                    with bind_task_lease_context(lease):
+                        posted = await run_while_task_lease_owned(
+                            settle_journaled_message(agent_service, lease, journal),
+                            lease_heartbeat_task,
+                        )
             if posted is UserMessageInjectionOutcome.OUTCOME_UNKNOWN:
                 delivery_outcome_unknown = True
-                raise RuntimeError("The user message injection outcome is unknown")
+                defer_db_cleanup_to_ttl_recovery = True
+                from .task_coordinator_runtime import current_task_coordinator
+
+                coordinator = current_task_coordinator(task_id)
+                if coordinator is not None:
+                    coordinator.require_recovery()
+                await mark_deferred_delivery_failed()
+                await notify_deferred_delivery(
+                    False,
+                    client_error_message(ClientErrorCode.MESSAGE_OUTCOME_UNKNOWN),
+                    error_code=ClientErrorCode.MESSAGE_OUTCOME_UNKNOWN,
+                    rejection_outcome="outcome_unknown",
+                )
+                return
+            delivery_outcome_unknown = False
             if not posted:
                 raise RuntimeError(
                     "The user message was saved, but no resumable execution "
@@ -2834,7 +2895,7 @@ async def execute_resume_background(
                     await run_db_io_cancellation_safe(
                         lambda: mark_user_message_delivery_sync(
                             task_id,
-                            delivery_turn_id,
+                            cast(str, delivery_turn_id),
                             DELIVERY_DISPATCHED,
                         )
                     )
@@ -2843,7 +2904,7 @@ async def execute_resume_background(
                         "delivery marker failed after deferred message seal "
                         "for task %s turn %s",
                         task_id,
-                        delivery_turn_id,
+                        cast(str, delivery_turn_id),
                         exc_info=True,
                     )
                 except asyncio.CancelledError:
@@ -2856,9 +2917,8 @@ async def execute_resume_background(
                         "delivery marker was cancelled after deferred message "
                         "seal for task %s turn %s; continuing resume",
                         task_id,
-                        delivery_turn_id,
+                        cast(str, delivery_turn_id),
                     )
-            await notify_deferred_delivery(True)
 
         # Resume is now durable: lease acquisition committed RUNNING. Do not
         # announce it earlier from the WebSocket request handler.
@@ -2894,6 +2954,28 @@ async def execute_resume_background(
             )
             resume_tracker = None
 
+        resume_kwargs: dict[str, Any] = {
+            "metadata": {"task_source": trusted_task_source, "run_id": lease.run_id}
+        }
+        if pending_user_message is not None:
+            from .task_injection import complete_injection
+
+            async def on_resume_ready(context: Any) -> None:
+                assert pending_user_message is not None
+                turn = pending_user_message["turn_id"]
+                # The actual resume must have restored this input before its
+                # journal is retired. A failed second read retains recovery.
+                if not any(
+                    m.role == "user" and m.metadata.get("turn_id") == turn
+                    for m in context.messages
+                ):
+                    raise RuntimeError("Resume checkpoint is missing the pending input")
+                await run_db_io_cancellation_safe(
+                    lambda: complete_injection(lease, turn)
+                )
+                await notify_deferred_delivery(True)
+
+            resume_kwargs["on_resume_ready"] = on_resume_ready
         assert lease_heartbeat_task is not None
         with (
             UserContext(task_owner_user_id),
@@ -2901,13 +2983,7 @@ async def execute_resume_background(
             bind_task_lease_context(lease),
         ):
             result = await run_while_task_lease_owned(
-                agent_service.resume_execution_by_id(
-                    str(task_id),
-                    metadata={
-                        "task_source": trusted_task_source,
-                        "run_id": lease.run_id,
-                    },
-                ),
+                agent_service.resume_execution_by_id(str(task_id), **resume_kwargs),
                 lease_heartbeat_task,
             )
 
@@ -3032,7 +3108,7 @@ async def execute_resume_background(
             await run_db_io_cancellation_safe(
                 lambda: mark_user_message_delivery_sync(
                     task_id,
-                    delivery_turn_id,
+                    cast(str, delivery_turn_id),
                     DELIVERY_COMPLETED,
                 )
             )
@@ -3089,6 +3165,22 @@ async def execute_resume_background(
         )
         return
     except asyncio.CancelledError:
+        if lease is not None:
+            from .task_injection import load_pending_injection
+
+            try:
+                delivery_outcome_unknown = delivery_outcome_unknown or (
+                    await load_pending_injection(lease) is not None
+                )
+            except Exception:
+                delivery_outcome_unknown = True
+            defer_db_cleanup_to_ttl_recovery = delivery_outcome_unknown
+            if delivery_outcome_unknown:
+                from .task_coordinator_runtime import current_task_coordinator
+
+                coordinator = current_task_coordinator(task_id)
+                if coordinator is not None:
+                    coordinator.require_recovery()
         settlement_error = "resume execution cancelled"
         logger.info(f"V2 resume background task {task_id} cancelled")
         if delivery_turn_id is not None and not delivery_was_dispatched:
@@ -3103,6 +3195,33 @@ async def execute_resume_background(
         raise
     except Exception as e:
         error_message = str(e)
+        if lease is None and delivery_outcome_unknown:
+            await mark_deferred_delivery_failed()
+            await notify_deferred_delivery(False)
+            return
+        if lease is not None and not lease_released and not is_database_pool_timeout(e):
+            from .task_injection import load_pending_injection
+
+            try:
+                journal_remains = await load_pending_injection(lease) is not None
+            except Exception:
+                journal_remains = True
+            if journal_remains:
+                delivery_outcome_unknown = True
+                defer_db_cleanup_to_ttl_recovery = True
+                from .task_coordinator_runtime import current_task_coordinator
+
+                coordinator = current_task_coordinator(task_id)
+                if coordinator is not None:
+                    coordinator.require_recovery()
+                await mark_deferred_delivery_failed()
+                await notify_deferred_delivery(
+                    False,
+                    client_error_message(ClientErrorCode.MESSAGE_OUTCOME_UNKNOWN),
+                    error_code=ClientErrorCode.MESSAGE_OUTCOME_UNKNOWN,
+                    rejection_outcome="outcome_unknown",
+                )
+                return
         if is_database_pool_timeout(e):
             # The failed operation already waited on an exhausted checkout.
             # Any delivery/status/settlement write here would immediately

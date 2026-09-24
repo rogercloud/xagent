@@ -58,6 +58,8 @@ from xagent.web.services import task_command_execution as command_execution_serv
 from xagent.web.services import task_execution as task_execution_service
 from xagent.web.services import task_orchestrator
 from xagent.web.services.chat_history_service import (
+    DELIVERY_COMPLETED,
+    DELIVERY_DISPATCHED,
     DELIVERY_FAILED,
     DELIVERY_OUTCOME_UNKNOWN,
     DELIVERY_PENDING,
@@ -2986,7 +2988,7 @@ async def test_live_control_delivery_failure_pool_timeout_is_not_retried(
     live_task_lease,
     db_session,
 ) -> None:
-    """One failed DELIVERY_FAILED checkout still produces one rejection ack."""
+    """One failed unknown-delivery checkout still produces one rejection ack."""
     owner = _user(db_session, "pool-timeout-owner")
     task = _task(db_session, owner.id, status=TaskStatus.RUNNING)
     task.runner_id = "pool-timeout-runner"
@@ -3037,7 +3039,7 @@ async def test_live_control_delivery_failure_pool_timeout_is_not_retried(
         )
 
     mark_delivery.assert_called_once_with(
-        int(task.id), "live-control-pool-timeout", DELIVERY_FAILED
+        int(task.id), "live-control-pool-timeout", DELIVERY_OUTCOME_UNKNOWN
     )
     error_payload_reader.assert_not_called()
     rejected = [
@@ -3048,8 +3050,10 @@ async def test_live_control_delivery_failure_pool_timeout_is_not_retried(
     assert len(rejected) == 1
     assert rejected[0]["client_message_id"] == "live-control-pool-timeout"
     assert "inject failed" not in repr(rejected[0])
-    assert rejected[0]["message"] == task_execution_service.CLIENT_SAFE_VALIDATION_ERROR
-    assert rejected[0]["error_code"] == "message_processing_failed"
+    assert rejected[0]["message"] == command_execution_service.client_error_message(
+        command_execution_service.ClientErrorCode.MESSAGE_OUTCOME_UNKNOWN
+    )
+    assert rejected[0]["error_code"] == "message_outcome_unknown"
     assert rejected[0]["rejection_outcome"] == "outcome_unknown"
 
 
@@ -4231,6 +4235,9 @@ async def test_deferred_injection_failure_rejects_before_any_acceptance(
     agent = MagicMock(
         post_user_message=AsyncMock(side_effect=post_user_message),
         resume_execution_by_id=AsyncMock(),
+        settle_injection_against_checkpoint=AsyncMock(
+            return_value=UserMessageInjectionOutcome.OUTCOME_UNKNOWN
+        ),
     )
     ws_manager = MagicMock(
         broadcast_to_task=AsyncMock(),
@@ -4285,8 +4292,10 @@ async def test_deferred_injection_failure_rejects_before_any_acceptance(
         DELIVERY_OUTCOME_UNKNOWN if unknown else DELIVERY_FAILED
     )
 
-    # Characterize the existing cleanup, not the target R1 unknown lifecycle.
-    assert db_session.get(Task, int(task.id)).status == TaskStatus.FAILED
+    assert db_session.get(Task, int(task.id)).status == (
+        TaskStatus.RUNNING if unknown else TaskStatus.FAILED
+    )
+    assert (db_session.get(Task, int(task.id)).pending_injection is not None) is unknown
 
 
 @pytest.mark.asyncio
@@ -4328,6 +4337,12 @@ async def test_deferred_injection_marker_failure_does_not_abort_resume(
             }
         ),
     )
+
+    async def resume_ready(_execution_id, **kwargs):
+        await kwargs["on_resume_ready"](context)
+        return agent.resume_execution_by_id.return_value
+
+    agent.resume_execution_by_id.side_effect = resume_ready
     ws_manager = MagicMock(
         broadcast_to_task=AsyncMock(),
         send_personal_message=AsyncMock(),
@@ -4370,7 +4385,7 @@ async def test_deferred_injection_marker_failure_does_not_abort_resume(
         command_execution_service.DELIVERY_DISPATCHED,
     )
     agent.resume_execution_by_id.assert_awaited_once_with(
-        str(task.id), metadata={"task_source": None, "run_id": ANY}
+        str(task.id), metadata={"task_source": None, "run_id": ANY}, on_resume_ready=ANY
     )
     accepted = [
         call.args[0]
@@ -4421,6 +4436,12 @@ async def test_deferred_injection_marker_cancellation_does_not_abort_resume(
             }
         ),
     )
+
+    async def resume_ready(_execution_id, **kwargs):
+        await kwargs["on_resume_ready"](context)
+        return agent.resume_execution_by_id.return_value
+
+    agent.resume_execution_by_id.side_effect = resume_ready
     ws_manager = MagicMock(
         broadcast_to_task=AsyncMock(),
         send_personal_message=AsyncMock(),
@@ -4463,7 +4484,7 @@ async def test_deferred_injection_marker_cancellation_does_not_abort_resume(
         command_execution_service.DELIVERY_DISPATCHED,
     )
     agent.resume_execution_by_id.assert_awaited_once_with(
-        str(task.id), metadata={"task_source": None, "run_id": ANY}
+        str(task.id), metadata={"task_source": None, "run_id": ANY}, on_resume_ready=ANY
     )
     accepted = [
         call.args[0]
@@ -4516,6 +4537,12 @@ async def test_deferred_injection_close_failure_does_not_abort_resume(
             }
         ),
     )
+
+    async def resume_ready(_execution_id, **kwargs):
+        await kwargs["on_resume_ready"](context)
+        return agent.resume_execution_by_id.return_value
+
+    agent.resume_execution_by_id.side_effect = resume_ready
     ws_manager = MagicMock(
         broadcast_to_task=AsyncMock(),
         send_personal_message=AsyncMock(),
@@ -4569,7 +4596,7 @@ async def test_deferred_injection_close_failure_does_not_abort_resume(
         )
 
     agent.resume_execution_by_id.assert_awaited_once_with(
-        str(task.id), metadata={"task_source": None, "run_id": ANY}
+        str(task.id), metadata={"task_source": None, "run_id": ANY}, on_resume_ready=ANY
     )
     assert len(observed_close_calls) == 1
     called_task_id, called_run_id, live_run_id = observed_close_calls[0]
@@ -4626,6 +4653,12 @@ async def test_deferred_injection_closes_the_row_the_online_handler_observed(
             }
         ),
     )
+
+    async def resume_ready(_execution_id, **kwargs):
+        await kwargs["on_resume_ready"](context)
+        return agent.resume_execution_by_id.return_value
+
+    agent.resume_execution_by_id.side_effect = resume_ready
     ws_manager = MagicMock(
         broadcast_to_task=AsyncMock(),
         send_personal_message=AsyncMock(),
@@ -4668,7 +4701,7 @@ async def test_deferred_injection_closes_the_row_the_online_handler_observed(
 
     read_mock.assert_not_called()
     agent.resume_execution_by_id.assert_awaited_once_with(
-        str(task.id), metadata={"task_source": None, "run_id": ANY}
+        str(task.id), metadata={"task_source": None, "run_id": ANY}, on_resume_ready=ANY
     )
     db_session.refresh(task)
     assert task.status == TaskStatus.COMPLETED
@@ -4738,6 +4771,12 @@ async def test_deferred_injection_skips_the_close_on_a_replayed_turn_id(
             }
         ),
     )
+
+    async def resume_ready(_execution_id, **kwargs):
+        await kwargs["on_resume_ready"](context)
+        return agent.resume_execution_by_id.return_value
+
+    agent.resume_execution_by_id.side_effect = resume_ready
     ws_manager = MagicMock(
         broadcast_to_task=AsyncMock(),
         send_personal_message=AsyncMock(),
@@ -4780,7 +4819,7 @@ async def test_deferred_injection_skips_the_close_on_a_replayed_turn_id(
 
     read_mock.assert_not_called()
     agent.resume_execution_by_id.assert_awaited_once_with(
-        str(task.id), metadata={"task_source": None, "run_id": ANY}
+        str(task.id), metadata={"task_source": None, "run_id": ANY}, on_resume_ready=ANY
     )
     db_session.refresh(task)
     assert task.status == TaskStatus.COMPLETED
@@ -4830,6 +4869,12 @@ async def test_deferred_injection_close_cancellation_does_not_abort_resume(
             }
         ),
     )
+
+    async def resume_ready(_execution_id, **kwargs):
+        await kwargs["on_resume_ready"](context)
+        return agent.resume_execution_by_id.return_value
+
+    agent.resume_execution_by_id.side_effect = resume_ready
     ws_manager = MagicMock(
         broadcast_to_task=AsyncMock(),
         send_personal_message=AsyncMock(),
@@ -4878,7 +4923,7 @@ async def test_deferred_injection_close_cancellation_does_not_abort_resume(
         )
 
     agent.resume_execution_by_id.assert_awaited_once_with(
-        str(task.id), metadata={"task_source": None, "run_id": ANY}
+        str(task.id), metadata={"task_source": None, "run_id": ANY}, on_resume_ready=ANY
     )
     assert len(observed_close_calls) == 1
     called_task_id, called_run_id, live_run_id = observed_close_calls[0]
@@ -5291,8 +5336,9 @@ def _delivery_status(db_session: Session, turn_id: str) -> str:
         ("", [{"file_id": "original-file"}], "Uploaded file(s)"),
     ],
 )
+@pytest.mark.parametrize("pending_journal", [False, True])
 async def test_websocket_retry_preserves_unknown_delivery(
-    db_session, message, files, stored_content
+    db_session, message, files, stored_content, pending_journal
 ):
     from xagent.web.api.websocket import handle_chat_message
 
@@ -5302,7 +5348,21 @@ async def test_websocket_retry_preserves_unknown_delivery(
         .filter(TaskChatMessage.turn_id == turn_id)
         .one()
     )
-    row.delivery_status = DELIVERY_OUTCOME_UNKNOWN
+    row.delivery_status = (
+        DELIVERY_PENDING if pending_journal else DELIVERY_OUTCOME_UNKNOWN
+    )
+    if pending_journal:
+        from xagent.web.services.task_injection import PendingInjection
+
+        task.run_id = "journal-run"
+        task.pending_injection = PendingInjection(
+            run_id=task.run_id,
+            owner_id=owner.id,
+            turn_id=turn_id,
+            execution_message=stored_content,
+            display_message=stored_content,
+            files=files,
+        ).model_dump(mode="json")
     row.attachments = files
     row.content = stored_content
     db_session.commit()
@@ -5396,10 +5456,12 @@ async def test_durable_unknown_notifies_origin_without_client_resend(db_session)
     ],
 )
 @pytest.mark.parametrize("conflicting_retry", [False, True])
+@pytest.mark.parametrize("pending_journal", [False, True])
 async def test_unknown_retry_compares_original_command_before_normalized_attachments(
     db_session,
     original_files,
     conflicting_retry,
+    pending_journal,
 ):
     owner, task, turn_id = _seed_deferred_delivery(db_session, "normalized-retry")
     payload = {
@@ -5424,7 +5486,21 @@ async def test_unknown_retry_compares_original_command_before_normalized_attachm
         .one()
     )
     row.attachments = [{"file_id": "file-a"}]
-    row.delivery_status = DELIVERY_OUTCOME_UNKNOWN
+    row.delivery_status = (
+        DELIVERY_PENDING if pending_journal else DELIVERY_OUTCOME_UNKNOWN
+    )
+    if pending_journal:
+        from xagent.web.services.task_injection import PendingInjection
+
+        task.run_id = "journal-run"
+        task.pending_injection = PendingInjection(
+            run_id=task.run_id,
+            owner_id=owner.id,
+            turn_id=turn_id,
+            execution_message="Deferred guidance",
+            display_message="Deferred guidance",
+            files=row.attachments,
+        ).model_dump(mode="json")
     db_session.commit()
     retry = dict(payload, user=owner)
     if conflicting_retry:
@@ -5442,7 +5518,9 @@ async def test_unknown_retry_compares_original_command_before_normalized_attachm
         "not_accepted" if conflicting_retry else "outcome_unknown"
     )
     assert bool(ack.get("retry_with_new_id")) is conflicting_retry
-    assert _delivery_status(db_session, turn_id) == DELIVERY_OUTCOME_UNKNOWN
+    assert _delivery_status(db_session, turn_id) == (
+        DELIVERY_PENDING if pending_journal else DELIVERY_OUTCOME_UNKNOWN
+    )
     dispatch.assert_not_awaited()
 
 
@@ -5500,20 +5578,101 @@ async def test_live_injection_outcome_unknown_is_not_acknowledged_or_reposted(
         )
 
     close_mock.assert_not_called()
-    bg_mgr.register_reserved_resume.assert_not_called()
-    bg_mgr.release_resume_reservation.assert_called_once_with(int(task.id))
-    resume_background_mock.assert_not_called()
-    ack = _delivery_acks(ws_manager)[0]
-    assert ack["type"] == "message_rejected"
-    assert ack["error_code"] == "message_outcome_unknown"
-    assert ack["rejection_outcome"] == "outcome_unknown"
-    assert not ack.get("retry_with_new_id")
+    bg_mgr.register_reserved_resume.assert_called_once()
+    bg_mgr.release_resume_reservation.assert_not_called()
+    await asyncio.sleep(0)
+    resume_background_mock.assert_awaited_once()
+    assert resume_background_mock.call_args.kwargs["delivery_outcome_unknown"] is True
     assert (
-        _delivery_status(db_session, "outcome-unknown-turn") == DELIVERY_OUTCOME_UNKNOWN
+        resume_background_mock.call_args.kwargs["pending_user_message"]["turn_id"]
+        == "outcome-unknown-turn"
+    )
+    assert _delivery_acks(ws_manager) == []  # Settlement owns the eventual receipt.
+    db_session.expire_all()
+    assert _delivery_status(db_session, "outcome-unknown-turn") == DELIVERY_PENDING
+    assert (
+        db_session.get(Task, int(task.id)).pending_injection["turn_id"]
+        == "outcome-unknown-turn"
     )
 
-    # Live injection still has no task handoff until R1 enables the producer.
-    assert db_session.get(Task, int(task.id)).status == TaskStatus.RUNNING
+
+@pytest.mark.asyncio
+async def test_live_input_blocked_by_another_journal_is_definitely_rejected(
+    live_task_lease,
+    db_session,
+) -> None:
+    owner = _user(db_session, "outcome-unknown-owner")
+    task = _task(db_session, owner.id, status=TaskStatus.RUNNING)
+    task.runner_id = "outcome-unknown-runner"
+    task.run_id = "outcome-unknown-run"
+    db_session.commit()
+    live_task_lease(db_session, task)
+    from xagent.web.services.task_injection import PendingInjection
+
+    task.pending_injection = PendingInjection(
+        run_id=task.run_id,
+        owner_id=owner.id,
+        turn_id="earlier-input",
+        execution_message="original",
+        display_message="original",
+        files=None,
+        interaction_id=None,
+    ).model_dump(mode="json")
+    db_session.commit()
+
+    agent = MagicMock()
+    agent.supports_live_control.return_value = True
+    agent.get_dag_pattern.return_value = None
+    agent.post_user_message = AsyncMock(
+        return_value=UserMessageInjectionOutcome.OUTCOME_UNKNOWN
+    )
+    ws_manager = MagicMock(
+        broadcast_to_task=AsyncMock(),
+        send_personal_message=AsyncMock(),
+    )
+    bg_mgr = MagicMock()
+    bg_mgr.try_reserve_resume.return_value = ResumeReservationOutcome.RESERVED
+    bg_mgr.running_tasks.get.return_value = None
+    resume_background_mock = AsyncMock()
+
+    with (
+        patch(
+            "xagent.web.services.agent_service_manager.get_agent_manager",
+            return_value=MagicMock(get_agent_for_task=AsyncMock(return_value=agent)),
+        ),
+        patch("xagent.web.api.websocket.manager", ws_manager),
+        patch("xagent.web.services.task_execution.background_task_manager", bg_mgr),
+        patch(
+            "xagent.web.services.task_execution.execute_resume_background",
+            resume_background_mock,
+        ),
+        patch(
+            "xagent.web.services.task_command_execution.close_legacy_resume_interaction_sync",
+        ) as close_mock,
+    ):
+        await handle_task_message(
+            _make_command_reply(MagicMock()),
+            int(task.id),
+            {
+                "message": "Unconfirmed write",
+                "client_message_id": "outcome-unknown-turn",
+                "user": owner,
+                "files": [],
+            },
+        )
+
+    close_mock.assert_not_called()
+    agent.post_user_message.assert_not_awaited()
+    bg_mgr.register_reserved_resume.assert_not_called()
+    rejected = _delivery_acks(ws_manager)
+    assert len(rejected) == 1
+    assert rejected[0]["rejection_outcome"] == "not_accepted"
+    db_session.expire_all()
+    assert _delivery_status(db_session, "outcome-unknown-turn") == DELIVERY_FAILED
+    assert (
+        db_session.get(Task, int(task.id)).pending_injection["turn_id"]
+        == "earlier-input"
+    )
 
 
 def _delivery_acks(ws_manager: MagicMock) -> list[dict[str, Any]]:
@@ -5631,3 +5790,114 @@ async def test_unknown_retry_during_task_deletion_does_not_enqueue(db_session):
     assert ack["rejection_outcome"] == "outcome_unknown"
     assert not ack.get("retry_with_new_id")
     dispatch.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_websocket_new_id_stays_rejected_while_original_input_is_unsettled(
+    db_session,
+):
+    from xagent.web.services.task_injection import PendingInjection
+
+    owner, task, turn_id = _seed_deferred_delivery(db_session, "journal-new-id")
+    task.run_id = "journal-run"
+    task.pending_injection = PendingInjection(
+        run_id=task.run_id,
+        owner_id=owner.id,
+        turn_id=turn_id,
+        execution_message="Deferred guidance",
+        display_message="Deferred guidance",
+    ).model_dump(mode="json")
+    db_session.commit()
+    ws = MagicMock(send_personal_message=AsyncMock())
+    with (
+        patch.object(websocket_api, "manager", ws),
+        patch.object(
+            websocket_api, "dispatch_task_command_promptly", new=AsyncMock()
+        ) as dispatch,
+    ):
+        await websocket_api.handle_chat_message(
+            MagicMock(),
+            int(task.id),
+            {
+                "user": owner,
+                "message": "different",
+                "files": [],
+                "client_message_id": "new-id",
+            },
+        )
+    ack = _delivery_acks(ws)[0]
+    assert ack["rejection_outcome"] == "not_accepted"
+    assert ack["error_code"] == "task_busy"
+    dispatch.assert_not_awaited()
+    assert _delivery_status(db_session, turn_id) == DELIVERY_PENDING
+    assert db_session.get(Task, int(task.id)).pending_injection["turn_id"] == turn_id
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("delivery_status", "journal_turn", "conflicting", "expected"),
+    [
+        (DELIVERY_DISPATCHED, "original", False, "message_accepted"),
+        (DELIVERY_DISPATCHED, "later", False, "message_accepted"),
+        (DELIVERY_COMPLETED, "later", False, "message_accepted"),
+        (DELIVERY_FAILED, "later", False, "message_rejected"),
+        (DELIVERY_DISPATCHED, "original", True, "message_rejected"),
+    ],
+)
+async def test_websocket_replays_existing_attachment_receipt_before_new_input_admission(
+    db_session, delivery_status, journal_turn, conflicting, expected
+):
+    from xagent.web.services.task_injection import PendingInjection
+
+    owner, task, turn_id = _seed_deferred_delivery(db_session, "accepted-replay")
+    payload = {
+        "message": "Deferred guidance",
+        "files": [{"file_id": "file-a"}, {"file_id": "file-a"}],
+        "client_message_id": turn_id,
+    }
+    enqueued = websocket_api._enqueue_websocket_task_command_sync(
+        task_id=int(task.id),
+        actor_user_id=int(owner.id),
+        actor_is_admin=False,
+        command_id=turn_id,
+        kind=TaskCommandKind.MESSAGE,
+        payload=payload,
+        allow_missing_task=False,
+    )
+    assert enqueued.created
+    row = db_session.query(TaskChatMessage).filter_by(turn_id=turn_id).one()
+    row.delivery_status = delivery_status
+    row.attachments = [{"file_id": "file-a"}]
+    task.run_id = "journal-run"
+    task.pending_injection = PendingInjection(
+        run_id=task.run_id,
+        owner_id=owner.id,
+        turn_id=turn_id if journal_turn == "original" else "later-input",
+        execution_message="Deferred guidance",
+        display_message="Deferred guidance",
+        files=row.attachments,
+    ).model_dump(mode="json")
+    db_session.commit()
+    journal_before = dict(task.pending_injection)
+    command_count = db_session.query(TaskExecutionCommand).count()
+    retry = dict(payload, user=owner)
+    if conflicting:
+        retry["files"] = [{"file_id": "different"}]
+    ws = MagicMock(send_personal_message=AsyncMock())
+    with (
+        patch.object(websocket_api, "manager", ws),
+        patch.object(
+            websocket_api, "dispatch_task_command_promptly", new=AsyncMock()
+        ) as dispatch,
+    ):
+        await websocket_api.handle_chat_message(MagicMock(), int(task.id), retry)
+    ack = _delivery_acks(ws)[0]
+    assert ack["type"] == expected
+    if conflicting:
+        assert ack["error_code"] == "message_id_conflict"
+    elif delivery_status == DELIVERY_FAILED:
+        assert ack["error_code"] == "message_delivery_failed"
+    dispatch.assert_not_awaited()
+    assert _delivery_status(db_session, turn_id) == delivery_status
+    assert db_session.get(Task, int(task.id)).pending_injection == journal_before
+    assert db_session.query(TaskExecutionCommand).count() == command_count

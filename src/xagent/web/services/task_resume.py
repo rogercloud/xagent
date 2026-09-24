@@ -206,6 +206,7 @@ def _acquire_a2a_resume_prelease_sync(
                 Task.id == task_id,
                 Task.agent_id == agent_id,
                 Task.source == "a2a",
+                Task.pending_injection.is_(None),
                 Task.status == resumable_status,
                 Task.control_state.in_(resumable_control_states),
             )
@@ -398,6 +399,7 @@ async def resume_a2a_task(
     text: str,
     message_id: str,
     preacquired_lease: TaskLease | None = None,
+    reply_command_id: str | None = None,
 ) -> bool:
     if resumable_status not in {
         TaskStatus.PAUSED,
@@ -545,16 +547,19 @@ async def resume_a2a_task(
                 task_owner_user_id=task_owner_user_id,
             )
             injection_started = True
-            posted = await agent_service.post_user_message(
-                str(task_id),
+            from .task_injection import post_journaled_message
+
+            posted = await post_journaled_message(
+                agent_service,
+                task_lease,
                 execution_message=text,
                 display_message=text,
                 turn_id=f"a2a:{task_id}:{message_id}",
+                reply_command_id=reply_command_id,
                 request_interrupt=False,
                 reason="A2A input-required response",
+                interaction_id=active_interaction_id,
             )
-            if posted is UserMessageInjectionOutcome.OUTCOME_UNKNOWN:
-                raise TaskResumeOutcomeUnknownError(message_id)
             return agent_service, posted
 
         with bind_task_lease_context(task_lease):
@@ -562,6 +567,20 @@ async def resume_a2a_task(
                 inject_user_message(),
                 heartbeat_task,
             )
+
+        if posted is UserMessageInjectionOutcome.OUTCOME_UNKNOWN:
+            await _schedule_waiting_a2a_resume(
+                task_id=task_id,
+                agent_service=agent_service,
+                task_owner_user_id=task_owner_user_id,
+                task_lease=task_lease,
+                heartbeat_stop=heartbeat_stop,
+                heartbeat_task=heartbeat_task,
+                resumable_status=resumable_status,
+                trusted_task_source=trusted_task_source,
+            )
+            ownership_transferred = True
+            raise TaskResumeOutcomeUnknownError(message_id)
 
         message_posted = bool(posted)
         if not posted:
@@ -622,6 +641,28 @@ async def resume_a2a_task(
                 raise TaskResumeRetryableError(str(exc)) from exc
         raise
     except BaseException as exc:
+        if (
+            injection_started
+            and not ownership_transferred
+            and not prelease_cleanup_done
+        ):
+            from .task_injection import load_pending_injection
+
+            try:
+                pending = await load_pending_injection(task_lease) is not None
+            except Exception:
+                pending = True
+            if pending:
+                from .task_coordinator_runtime import current_task_coordinator
+
+                coordinator = current_task_coordinator(task_id)
+                if coordinator is not None:
+                    coordinator.require_recovery()
+                await stop_task_lease_heartbeat(heartbeat_task, heartbeat_stop)
+                prelease_cleanup_done = True
+                if isinstance(exc, asyncio.CancelledError):
+                    raise
+                raise TaskResumeOutcomeUnknownError() from exc
         if (
             preacquired_lease is not None
             and injection_started
@@ -702,6 +743,7 @@ def _acquire_reply_prelease_sync(
                 Task.id == task_id,
                 Task.agent_id == agent_id,
                 Task.source == "sdk",
+                Task.pending_injection.is_(None),
                 Task.status == TaskStatus.WAITING_FOR_USER,
                 Task.control_state.in_(_RESUMABLE_CONTROL_STATES),
             )
@@ -1041,7 +1083,7 @@ async def resume_task_reply(
         else:
             assert_never(active_interaction_read)
 
-        async def inject_user_message() -> tuple[Any, bool]:
+        async def inject_user_message() -> tuple[Any, UserMessageInjectionOutcome]:
             nonlocal injection_started
             agent_service = (
                 await agent_runtime_service.get_agent_manager().get_agent_for_task(
@@ -1051,23 +1093,39 @@ async def resume_task_reply(
                 )
             )
             injection_started = True
-            posted = await agent_service.post_user_message(
-                str(task_id),
+            from .task_injection import post_journaled_message
+
+            posted = await post_journaled_message(
+                agent_service,
+                task_lease,
                 execution_message=ctx.text,
                 display_message=ctx.text,
                 turn_id=turn_id or f"v1:reply:{task_id}:{uuid4()}",
+                reply_command_id=turn_id if preacquired_lease is not None else None,
                 request_interrupt=False,
                 reason="V1 interaction response",
+                interaction_id=active_interaction_id,
             )
-            if posted is UserMessageInjectionOutcome.OUTCOME_UNKNOWN:
-                raise TaskResumeOutcomeUnknownError(turn_id)
-            return agent_service, bool(posted)
+            return agent_service, posted
 
         with bind_task_lease_context(task_lease):
             agent_service, posted = await run_while_task_lease_owned(
                 inject_user_message(),
                 heartbeat_task,
             )
+
+        if posted is UserMessageInjectionOutcome.OUTCOME_UNKNOWN:
+            await _schedule_waiting_reply_resume(
+                task_id=task_id,
+                agent_service=agent_service,
+                task_owner_user_id=ctx.task_owner_user_id,
+                task_lease=task_lease,
+                heartbeat_stop=heartbeat_stop,
+                heartbeat_task=heartbeat_task,
+                trusted_task_source=trusted_task_source,
+            )
+            ownership_transferred = True
+            raise TaskResumeOutcomeUnknownError(turn_id)
 
         message_posted = bool(posted)
         if not posted:
@@ -1121,6 +1179,28 @@ async def resume_task_reply(
             raise TaskResumeRetryableError(str(exc)) from exc
         raise
     except BaseException as exc:
+        if (
+            injection_started
+            and not ownership_transferred
+            and not prelease_cleanup_done
+        ):
+            from .task_injection import load_pending_injection
+
+            try:
+                pending = await load_pending_injection(task_lease) is not None
+            except Exception:
+                pending = True
+            if pending:
+                from .task_coordinator_runtime import current_task_coordinator
+
+                coordinator = current_task_coordinator(task_id)
+                if coordinator is not None:
+                    coordinator.require_recovery()
+                await stop_task_lease_heartbeat(heartbeat_task, heartbeat_stop)
+                prelease_cleanup_done = True
+                if isinstance(exc, asyncio.CancelledError):
+                    raise
+                raise TaskResumeOutcomeUnknownError() from exc
         if (
             preacquired_lease is not None
             and injection_started

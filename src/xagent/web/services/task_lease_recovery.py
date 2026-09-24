@@ -67,6 +67,10 @@ def recover_task_lease_candidate_no_commit(
     next_status = (
         TaskStatus.PAUSED
         if verdict is CheckpointRecoveryVerdict.RECOVERABLE
+        or db.query(Task.pending_injection)
+        .filter(Task.id == candidate.task_id)
+        .scalar()
+        is not None
         else TaskStatus.FAILED
     )
     task_error = None if next_status == TaskStatus.PAUSED else TASK_LEASE_EXPIRED_ERROR
@@ -324,6 +328,7 @@ async def run_task_lease_recovery_loop(
     """Continuously recover expired leases while the backend process is alive."""
 
     secret_cursor: int | None = None
+    injection_cursor = 0
     while True:
         try:
             recovered = await recover_expired_task_leases_until_cutoff(
@@ -332,6 +337,12 @@ async def run_task_lease_recovery_loop(
             )
             if recovered:
                 logger.info("Recovered %s expired task lease(s)", recovered)
+            from .task_injection import recover_pending_injections
+
+            injection_cursor = await recover_pending_injections(
+                after_id=injection_cursor,
+                batch_size=batch_size,
+            )
             from ...config import get_shared_task_execution_enabled
 
             if get_shared_task_execution_enabled():

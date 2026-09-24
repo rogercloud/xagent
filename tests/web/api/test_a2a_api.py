@@ -744,7 +744,7 @@ def test_follow_up_infers_context_for_input_required_task() -> None:
         db.close()
 
 
-def test_checkpoint_resume_schedule_failure_exactly_restores_waiting_task() -> None:
+def test_checkpoint_resume_schedule_failure_preserves_pending_input() -> None:
     agent_id, full_key = _create_published_agent_with_key()
     db = _direct_db_session()
     try:
@@ -812,16 +812,19 @@ def test_checkpoint_resume_schedule_failure_exactly_restores_waiting_task() -> N
             },
         )
 
-    assert response.status_code == 500
+    assert response.status_code == 504
     assert scheduled_lease["lease"] is not None
     db = _direct_db_session()
     try:
         restored = db.query(Task).filter(Task.id == task_id).one()
-        assert restored.status == TaskStatus.WAITING_FOR_USER
-        assert restored.control_state == TaskControlState.WAITING_FOR_USER.value
+        assert restored.status == TaskStatus.RUNNING
+        assert (
+            restored.pending_injection["turn_id"]
+            == f"a2a:{task_id}:msg-schedule-failure"
+        )
         assert restored.run_id == "run-a"
-        assert restored.runner_id is None
-        assert restored.lease_expires_at is None
+        assert restored.runner_id is not None
+        assert restored.lease_expires_at is not None
     finally:
         db.close()
 
@@ -1202,15 +1205,15 @@ def test_message_send_reads_the_interaction_row_before_injecting(
 
 
 @pytest.mark.asyncio
-async def test_a2a_handover_restores_input_required_on_unreadable_checkpoint() -> None:
-    """The A2A handover carries the pre-claim status into the resume.
+async def test_a2a_handover_keeps_journal_on_unreadable_resume_checkpoint() -> None:
+    """The A2A handover keeps input fenced when the second read fails.
 
     The prelease claims the task out of WAITING_FOR_USER and commits RUNNING
     before handing the lease to ``execute_resume_background``, which therefore
     never runs the acquisition that captures a prior status. The status travels
     only as the ``preacquired_prior_status`` kwarg, so drive the real path
     across the handover: a checkpoint the resume cannot read must land the row
-    back on WAITING_FOR_USER under its original run, not on a terminal FAILED.
+    in recovery under its original run, without admitting a duplicate reply.
     """
 
     agent_id, _full_key = _create_published_agent_with_key()
@@ -1239,6 +1242,9 @@ async def test_a2a_handover_restores_input_required_on_unreadable_checkpoint() -
 
     agent_service = MagicMock()
     agent_service.post_user_message = AsyncMock(
+        return_value=UserMessageInjectionOutcome.POSTED_FRESH
+    )
+    agent_service.settle_injection_against_checkpoint = AsyncMock(
         return_value=UserMessageInjectionOutcome.POSTED_FRESH
     )
     agent_service.resume_execution_by_id = AsyncMock(
@@ -1293,11 +1299,11 @@ async def test_a2a_handover_restores_input_required_on_unreadable_checkpoint() -
     db = _direct_db_session()
     try:
         restored = db.query(Task).filter(Task.id == task_id).one()
-        assert restored.status == TaskStatus.WAITING_FOR_USER
-        assert restored.control_state == TaskControlState.WAITING_FOR_USER.value
+        assert restored.status == TaskStatus.RUNNING
+        assert restored.pending_injection["turn_id"] == f"a2a:{task_id}:msg-handover"
         assert restored.run_id == "run-handover"
-        assert restored.runner_id is None
-        assert restored.lease_expires_at is None
+        assert restored.runner_id is not None
+        assert restored.lease_expires_at is not None
         assert restored.error_message is None
     finally:
         db.close()
@@ -1717,7 +1723,7 @@ def test_prelease_restore_from_a_cancelled_acquisition_leaves_marker_untouched()
         db.close()
 
 
-def test_checkpoint_resume_exception_restores_input_required_status() -> None:
+def test_unclassified_injection_exception_retains_recovery() -> None:
     agent_id, full_key = _create_published_agent_with_key()
     db = _direct_db_session()
     try:
@@ -1762,7 +1768,7 @@ def test_checkpoint_resume_exception_restores_input_required_status() -> None:
             },
         )
 
-    assert response.status_code == 500
+    assert response.status_code == 504
     agent_service.post_user_message.assert_awaited_once_with(
         str(task_id),
         execution_message="retry safely",
@@ -1774,7 +1780,8 @@ def test_checkpoint_resume_exception_restores_input_required_status() -> None:
     db = _direct_db_session()
     try:
         recovered = db.query(Task).filter(Task.id == task_id).one()
-        assert recovered.status == TaskStatus.WAITING_FOR_USER
+        assert recovered.status == TaskStatus.RUNNING
+        assert recovered.pending_injection is not None
     finally:
         db.close()
 
@@ -3666,11 +3673,15 @@ def test_message_send_reports_unknown_without_closing_interaction():
     assert response.status_code == 504, response.text
     assert response.json()["error"]["details"][0]["reason"] == "REPLY_OUTCOME_UNKNOWN"
     agent.post_user_message.assert_awaited_once()
-    schedule.assert_not_awaited()
+    schedule.assert_awaited_once()
     db = _direct_db_session()
     try:
-        # Transitional pre-producer behavior; R1 must replace this restoration.
-        assert db.get(Task, task_id).status == TaskStatus.PAUSED
+        assert (
+            schedule.call_args.kwargs["trusted_task_source"]
+            == db.get(Task, task_id).source
+        )
+        assert db.get(Task, task_id).status == TaskStatus.RUNNING
+        assert db.get(Task, task_id).pending_injection is not None
         assert (
             db.query(TaskInteractionRequest)
             .filter(TaskInteractionRequest.id == row_id)

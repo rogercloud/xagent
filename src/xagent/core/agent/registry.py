@@ -247,6 +247,28 @@ class ExecutionRegistry:
             reason=reason,
         )
 
+    async def settle_injection_against_checkpoint(
+        self,
+        execution_id: str,
+        *,
+        execution_message: str,
+        display_message: str,
+        turn_id: str,
+        files: list[dict[str, Any]] | None = None,
+    ) -> UserMessageInjectionResult:
+        handle = self.get(execution_id)
+        if handle is None:
+            return UserMessageInjectionResult(
+                None, UserMessageInjectionOutcome.NOT_POSTED
+            )
+        return await handle.runner.settle_injection_against_checkpoint(
+            execution_id,
+            execution_message=execution_message,
+            display_message=display_message,
+            turn_id=turn_id,
+            files=files,
+        )
+
     async def post_user_message(
         self,
         execution_id: str,

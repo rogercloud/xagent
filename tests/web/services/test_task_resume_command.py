@@ -329,6 +329,10 @@ async def test_a2a_retries_checkpoint_read_failure_with_same_message_id(
     with get_session_local()() as db:
         assert db.query(TaskExecutionCommand).count() == 2
         assert (
+            db.get(Task, reply.task_id).pending_injection["reply_command_id"]
+            == second.command_id
+        )
+        assert (
             db.get(TaskExecutionCommand, original_id).target_state_version
             == original_version
         )

@@ -98,6 +98,9 @@ EXPECTED_RESUME_PARAMETERS: list[tuple[str, Any]] = [
     # downstream keyword set below still binds unchanged; the downstream
     # should start passing it once it has an authoritative row to read.
     ("trusted_task_source", None),
+    # Optional recovery flags preserve the existing downstream call shape.
+    ("recover_pending_injection", False),
+    ("delivery_outcome_unknown", False),
 ]
 
 EXPECTED_EXECUTE_PARAMETERS: list[tuple[str, Any]] = [

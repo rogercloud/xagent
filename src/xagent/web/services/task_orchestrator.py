@@ -1119,6 +1119,7 @@ def reserve_task_start_no_commit(
             Task.id == task_id,
             Task.user_id == task_owner_user_id,
             Task.status.in_(statuses),
+            Task.pending_injection.is_(None),
             ~pending_start,
         )
         .update({Task.updated_at: Task.updated_at}, synchronize_session=False)
@@ -1195,6 +1196,7 @@ def _accept_turn_no_commit(
                 Task.id == task_id,
                 Task.user_id == task_owner_user_id,
                 status_filter,
+                Task.pending_injection.is_(None),
                 *predicates,
             )
             .update(values, synchronize_session=False)
@@ -1770,6 +1772,13 @@ def finish_turn(
             task_id,
         )
         return False
+
+    if fresh.pending_injection is not None and task_lease is not None:
+        from .task_lease_service import release_task_lease_no_commit
+
+        release_task_lease_no_commit(bg_db, task_lease, status=TaskStatus.PAUSED)
+        bg_db.commit()
+        return False  # No terminal failure while an accepted input is unsettled.
 
     def commit_terminal(status: TaskStatus, *, changed: bool = True) -> bool:
         if get_shared_task_execution_enabled() and status in (

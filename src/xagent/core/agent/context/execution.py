@@ -486,6 +486,7 @@ class _ContextCheckpointGate:
     """
 
     def __init__(self) -> None:
+        self.injection_uncertain = False
         self._shared = 0
         self._exclusive = False
         self._writers_waiting = 0
