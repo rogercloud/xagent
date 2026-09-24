@@ -352,8 +352,12 @@ async def test_unknown_reply_returns_original_identity_without_reinjection(
         post.assert_awaited_once()
         with get_session_local()() as db:
             task = db.get(Task, ctx.task_id)
-            assert task.status == TaskStatus.RUNNING
-            assert task.lease_attempt_id is not None
+            if failure == "after_post":
+                assert task.status == TaskStatus.RUNNING
+                assert task.lease_attempt_id is not None
+            else:
+                assert task.status == TaskStatus.PAUSED
+                assert task.lease_attempt_id is None
             assert db.query(TaskExecutionCommand).count() == 1
     finally:
         if not request.done():

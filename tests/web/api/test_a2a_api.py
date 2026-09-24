@@ -1717,7 +1717,7 @@ def test_prelease_restore_from_a_cancelled_acquisition_leaves_marker_untouched()
         db.close()
 
 
-def test_checkpoint_resume_exception_restores_input_required_status() -> None:
+def test_unclassified_injection_exception_pauses_with_unknown_identity() -> None:
     agent_id, full_key = _create_published_agent_with_key()
     db = _direct_db_session()
     try:
@@ -1762,7 +1762,11 @@ def test_checkpoint_resume_exception_restores_input_required_status() -> None:
             },
         )
 
-    assert response.status_code == 500
+    assert response.status_code == 504
+    assert (
+        response.json()["error"]["details"][0]["metadata"]["commandId"]
+        == "msg-resume-error"
+    )
     agent_service.post_user_message.assert_awaited_once_with(
         str(task_id),
         execution_message="retry safely",
@@ -1774,7 +1778,8 @@ def test_checkpoint_resume_exception_restores_input_required_status() -> None:
     db = _direct_db_session()
     try:
         recovered = db.query(Task).filter(Task.id == task_id).one()
-        assert recovered.status == TaskStatus.WAITING_FOR_USER
+        assert recovered.status == TaskStatus.PAUSED
+        assert recovered.runner_id is None
     finally:
         db.close()
 
@@ -3633,13 +3638,16 @@ def _seed_outcome_unknown_a2a_task(suffix: str) -> tuple[int, str, int, int]:
     return agent_id, full_key, task_id, row_id
 
 
-def test_message_send_reports_unknown_without_closing_interaction():
+@pytest.mark.parametrize("cancelled", [False, True])
+def test_message_send_reports_unknown_without_closing_interaction(cancelled):
     agent_id, full_key, task_id, row_id = _seed_outcome_unknown_a2a_task("protocol")
     agent = MagicMock(
         post_user_message=AsyncMock(
             return_value=UserMessageInjectionOutcome.OUTCOME_UNKNOWN
         )
     )
+    if cancelled:
+        agent.post_user_message.side_effect = asyncio.CancelledError()
     with (
         patch(
             "xagent.web.services.agent_service_manager.get_agent_manager",
@@ -3665,11 +3673,14 @@ def test_message_send_reports_unknown_without_closing_interaction():
         )
     assert response.status_code == 504, response.text
     assert response.json()["error"]["details"][0]["reason"] == "REPLY_OUTCOME_UNKNOWN"
+    assert (
+        response.json()["error"]["details"][0]["metadata"]["commandId"]
+        == "unknown-reply"
+    )
     agent.post_user_message.assert_awaited_once()
     schedule.assert_not_awaited()
     db = _direct_db_session()
     try:
-        # Transitional pre-producer behavior; R1 must replace this restoration.
         assert db.get(Task, task_id).status == TaskStatus.PAUSED
         assert (
             db.query(TaskInteractionRequest)

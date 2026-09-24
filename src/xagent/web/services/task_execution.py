@@ -61,9 +61,14 @@ from ...config import (
 )
 from ...core.agent.checkpoint import (
     CheckpointAccessRefusedError,
+    CheckpointReadError,
     CheckpointUnavailableError,
 )
-from ...core.agent.runner import UserMessageInjectionOutcome
+from ...core.agent.runner import (
+    UserMessageInjectionConflictError,
+    UserMessageInjectionOutcome,
+    UserMessageInjectionRejectedError,
+)
 from ...core.execution_scope import (
     EXECUTION_SCOPE_NOT_PROVIDED,
     ExecutionScope,
@@ -88,6 +93,7 @@ from .task_lease_service import (
 
 if TYPE_CHECKING:
     from .task_setup_snapshot import TaskSetupSnapshot
+
 from ...core.file_storage.keys import (
     build_task_output_storage_key,
 )
@@ -1605,7 +1611,10 @@ def _finalize_task_execution_result_isolated(
                 if isinstance(task_updated.agent_config, dict)
                 else {}
             )
-            if task_agent_config.get("a2a_state") == "TASK_STATE_CANCELED":
+            if task_agent_config.get("a2a_state") == "TASK_STATE_CANCELED" or (
+                result.get("injection_outcome_unknown")
+                and task_updated.status == TaskStatus.FAILED
+            ):
                 waiting_for_control = True
                 logger.info(
                     "Task %s was canceled while execution was in flight; "
@@ -2347,6 +2356,12 @@ def _finalize_resumed_task(
         if task is None:
             finalized["late_result"] = True
             return finalized
+        if result.get("injection_outcome_unknown") and task.status == TaskStatus.FAILED:
+            # Explicit cancellation/failure already owns the terminal result.
+            release_task_lease_no_commit(db, task_lease, status=TaskStatus.FAILED)
+            db.commit()
+            finalized["late_result"] = True
+            return finalized
 
         (
             normalized_outputs,
@@ -2459,11 +2474,16 @@ def _settle_resumed_task_lease(
     lease: TaskLease,
     *,
     error_message: str | None,
+    injection_outcome_unknown: bool = False,
 ) -> bool:
     """Delegate resume cleanup to the shared run/runner-fenced lifecycle."""
     from .task_orchestrator import settle_task_lease_isolated
 
-    return settle_task_lease_isolated(lease, error_message=error_message)
+    return settle_task_lease_isolated(
+        lease,
+        error_message=error_message,
+        injection_outcome_unknown=injection_outcome_unknown,
+    )
 
 
 async def execute_resume_background(
@@ -2742,19 +2762,38 @@ async def execute_resume_background(
         # not allowed to run the resume.
         if pending_user_message is not None:
             assert lease_heartbeat_task is not None
-            with bind_task_lease_context(lease):
-                posted = await run_while_task_lease_owned(
-                    agent_service.post_user_message(
-                        str(task_id),
-                        execution_message=pending_user_message.get("execution_message"),
-                        display_message=pending_user_message.get("display_message"),
-                        files=pending_user_message.get("files"),
-                        turn_id=pending_user_message.get("turn_id"),
-                        request_interrupt=False,
-                        reason="deferred websocket user message",
-                    ),
-                    lease_heartbeat_task,
-                )
+            delivery_outcome_unknown = True
+            try:
+                with bind_task_lease_context(lease):
+                    posted = await run_while_task_lease_owned(
+                        agent_service.post_user_message(
+                            str(task_id),
+                            execution_message=pending_user_message.get(
+                                "execution_message"
+                            ),
+                            display_message=pending_user_message.get("display_message"),
+                            files=pending_user_message.get("files"),
+                            turn_id=pending_user_message.get("turn_id"),
+                            request_interrupt=False,
+                            reason="deferred websocket user message",
+                        ),
+                        lease_heartbeat_task,
+                    )
+            except TaskLeaseLostError:
+                # The guard cancelled/drained the writer; this is not proof
+                # that its checkpoint failed to commit.
+                raise
+            except (
+                CheckpointReadError,
+                UserMessageInjectionRejectedError,
+                UserMessageInjectionConflictError,
+                AutoModelUnavailableError,
+            ):
+                delivery_outcome_unknown = False
+                raise
+            delivery_outcome_unknown = (
+                posted is UserMessageInjectionOutcome.OUTCOME_UNKNOWN
+            )
             if posted is UserMessageInjectionOutcome.OUTCOME_UNKNOWN:
                 delivery_outcome_unknown = True
                 raise RuntimeError("The user message injection outcome is unknown")
@@ -3082,6 +3121,9 @@ async def execute_resume_background(
             task_id,
         )
     except TaskLeaseLostError:
+        if delivery_outcome_unknown:
+            if await mark_deferred_delivery_failed():
+                await notify_deferred_delivery(False)
         defer_db_cleanup_to_ttl_recovery = lease is not None and not lease_released
         logger.warning(
             "Task %s resume execution cancelled after lease ownership loss",
@@ -3126,6 +3168,9 @@ async def execute_resume_background(
             # otherwise left reclaimable when no lease was acquired). Do not
             # emit the generic FAILED/task_error payload below.
             return
+        elif delivery_outcome_unknown:
+            if await mark_deferred_delivery_failed():
+                await notify_deferred_delivery(False)
         elif (
             isinstance(e, (CheckpointUnavailableError, CheckpointAccessRefusedError))
             and lease is not None
@@ -3375,6 +3420,7 @@ async def execute_resume_background(
                             lambda: _settle_resumed_task_lease(
                                 lease,
                                 error_message=settlement_error,
+                                injection_outcome_unknown=delivery_outcome_unknown,
                             )
                         )
                         if settled:

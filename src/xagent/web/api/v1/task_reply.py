@@ -114,6 +114,8 @@ async def reply_to_task(
         raise V1ApiError(
             V1ErrorCode.REPLY_OUTCOME_UNKNOWN,
             504,
+            message="Reply was accepted but its outcome is unknown. "
+            "Check task status; do not resend automatically.",
             details={
                 "accepted": True,
                 "task_id": task_id,

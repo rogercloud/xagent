@@ -26,7 +26,11 @@ from sqlalchemy.orm import Session
 
 from ...config import get_default_task_execution_mode, get_shared_task_execution_enabled
 from ...core.agent.checkpoint import CheckpointReadError, CheckpointUnavailableError
-from ...core.agent.runner import UserMessageInjectionOutcome
+from ...core.agent.runner import (
+    UserMessageInjectionConflictError,
+    UserMessageInjectionOutcome,
+    UserMessageInjectionRejectedError,
+)
 from ...core.execution_scope import (
     EXECUTION_SCOPE_NOT_PROVIDED,
     resolve_execution_scope,
@@ -39,6 +43,7 @@ from ..models.task import Task, TaskStatus
 from ..models.uploaded_file import UploadedFile
 from ..models.user import User
 from . import task_execution as task_execution_service
+from .llm_utils import AutoModelUnavailableError
 from .task_execution import (
     ClientVisibleError,
     ClientVisibleValidationError,
@@ -78,7 +83,11 @@ from .client_error_messages import (
     ClientErrorCode,
     client_error_message,
 )
-from .db_runtime import is_database_pool_timeout, run_db_io_cancellation_safe
+from .db_runtime import (
+    drain_async_task_cancellation_safe,
+    is_database_pool_timeout,
+    run_db_io_cancellation_safe,
+)
 from .external_task_cancel import (
     EXTERNAL_CANCEL_BROADCAST_REJECTION_REASONS,
     EXTERNAL_COMMAND_SCOPE,
@@ -1825,6 +1834,7 @@ async def handle_task_message(
                     # check (see active_interaction_id_sync's docstring).
                     # Three branches, not a two-way isinstance fold, so
                     # Unavailable stays visible on its own line.
+                    active_interaction_id: int | None
                     if isinstance(active_interaction_read, ActiveInteractionFound):
                         active_interaction_id = active_interaction_read.interaction_id
                     elif isinstance(active_interaction_read, ActiveInteractionAbsent):
@@ -1846,6 +1856,7 @@ async def handle_task_message(
                     posted = UserMessageInjectionOutcome.NOT_POSTED
                     if live_task_lease is not None:
                         with bind_task_lease_context(live_task_lease):
+                            delivery_outcome_unknown = True
                             try:
                                 posted = await agent_service.post_user_message(
                                     str(task_id),
@@ -1857,6 +1868,7 @@ async def handle_task_message(
                                     reason="new websocket user message",
                                 )
                             except CheckpointUnavailableError:
+                                delivery_outcome_unknown = False
                                 # Fold into the existing not-posted path
                                 # below: the durable message is deferred to
                                 # the resume owner instead of injected live,
@@ -1866,6 +1878,7 @@ async def handle_task_message(
                                 # retryable by simply deferring.
                                 posted = UserMessageInjectionOutcome.NOT_POSTED
                             except CheckpointReadError:
+                                delivery_outcome_unknown = False
                                 # Corrupt and refused reach here today. The
                                 # base class is deliberate: a read failure
                                 # that is not the retryable-by-deferring
@@ -1884,6 +1897,18 @@ async def handle_task_message(
                                     ClientErrorCode.TASK_CHECKPOINT_UNREADABLE
                                 )
                                 return
+                            except (
+                                UserMessageInjectionRejectedError,
+                                UserMessageInjectionConflictError,
+                                AutoModelUnavailableError,
+                                DurableObjectIntegrityError,
+                                DurableStorageOperationError,
+                            ):
+                                delivery_outcome_unknown = False
+                                raise
+                    delivery_outcome_unknown = (
+                        posted is UserMessageInjectionOutcome.OUTCOME_UNKNOWN
+                    )
                     if posted is UserMessageInjectionOutcome.OUTCOME_UNKNOWN:
                         delivery_outcome_unknown = True
                         task_execution_service.background_task_manager.release_resume_reservation(
@@ -2476,6 +2501,19 @@ async def handle_task_message(
             await finish_delivery_failure(client_safe_error_message(e))
             raise
 
+    except asyncio.CancelledError:
+        if delivery_outcome_unknown:
+            task_execution_service.background_task_manager.release_resume_reservation(
+                task_id
+            )
+            cleanup = asyncio.create_task(
+                finish_delivery_failure(
+                    client_error_message(ClientErrorCode.MESSAGE_OUTCOME_UNKNOWN),
+                    error_code=ClientErrorCode.MESSAGE_OUTCOME_UNKNOWN.value,
+                )
+            )
+            await drain_async_task_cancellation_safe(cleanup)
+        raise
     except ClientVisiblePermissionError as e:
         log_client_facing_failure(e, "Message permission error: %s")
         message = client_error_message(e.error_code)

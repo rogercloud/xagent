@@ -1146,16 +1146,21 @@ def test_reply_timeout_reports_accepted_outcome_unknown():
         "task_id": task_id,
         "command_id": "original-reply",
     }
-    assert "same command_id" in response.json()["error"]["message"]
+    assert "do not resend automatically" in response.json()["error"]["message"]
 
 
-def test_reply_reports_unknown_without_closing_interaction(mock_start_task):
+@pytest.mark.parametrize("failure", ["unknown", "cancelled", "exception"])
+def test_reply_reports_unknown_without_closing_interaction(mock_start_task, failure):
     agent_id, full_key = _create_agent_with_key()
     task_id = _create_waiting_task(full_key, agent_id, run_id="unknown-protocol")
     row_id = _seed_active_interaction_row(
         task_id, run_id="unknown-protocol", idempotency_key="unknown-question"
     )
     post = AsyncMock(return_value=UserMessageInjectionOutcome.OUTCOME_UNKNOWN)
+    if failure == "cancelled":
+        post.side_effect = asyncio.CancelledError()
+    elif failure == "exception":
+        post.side_effect = RuntimeError("unclassified injection failure")
     agent_patch, _agent = _patch_agent_service(post)
     with (
         agent_patch,
@@ -1172,11 +1177,14 @@ def test_reply_reports_unknown_without_closing_interaction(mock_start_task):
     assert response.status_code == 504, response.text
     assert response.json()["error"]["code"] == "reply_outcome_unknown"
     post.assert_awaited_once()
+    assert (
+        response.json()["error"]["details"]["command_id"]
+        == post.await_args.kwargs["turn_id"]
+    )
     schedule.assert_not_awaited()
     db = _direct_db_session()
     try:
-        # Transitional pre-producer behavior; R1 must replace this restoration.
-        assert db.get(Task, task_id).status == TaskStatus.WAITING_FOR_USER
+        assert db.get(Task, task_id).status == TaskStatus.PAUSED
         assert (
             db.query(TaskInteractionRequest)
             .filter(TaskInteractionRequest.id == row_id)

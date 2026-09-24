@@ -913,6 +913,13 @@ class PatternRuntime:
             else nullcontext()
         )
         async with gate:
+            if (
+                isinstance(context, ExecutionContext)
+                and context_checkpoint_gate(context).injection_uncertain
+            ):
+                raise ExecutionInterrupted(
+                    "Injection outcome unknown; explicit resume must reload the checkpoint."
+                )
             payload = self._build_checkpoint_payload(
                 label=label,
                 context=context,

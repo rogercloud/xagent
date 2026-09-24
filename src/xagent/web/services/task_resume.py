@@ -16,7 +16,11 @@ from uuid import uuid4
 from sqlalchemy import func
 
 from ...core.agent.checkpoint import CheckpointReadError, CheckpointUnavailableError
-from ...core.agent.runner import UserMessageInjectionOutcome
+from ...core.agent.runner import (
+    UserMessageInjectionConflictError,
+    UserMessageInjectionOutcome,
+    UserMessageInjectionRejectedError,
+)
 from ..models.database import get_session_local
 from ..models.task import Task, TaskStatus
 from . import agent_service_manager as agent_runtime_service
@@ -26,6 +30,7 @@ from .db_runtime import (
     drain_async_task_cancellation_safe,
     run_db_io_cancellation_safe,
 )
+from .llm_utils import AutoModelUnavailableError
 from .task_execution_controller import TaskControlState
 from .task_interaction_close import (
     ActiveInteractionAbsent,
@@ -447,7 +452,7 @@ async def resume_a2a_task(
     )
     ownership_transferred = False
     message_posted = False
-    injection_started = False
+    injection_unknown = False
     prelease_cleanup_done = False
 
     async def stop_and_restore_prelease() -> bool:
@@ -479,6 +484,14 @@ async def resume_a2a_task(
                 outcome.pool_timeout is not None,
             )
             return False
+        if injection_unknown:
+            from .task_orchestrator import settle_task_lease_isolated
+
+            return await run_db_io_cancellation_safe(
+                lambda: settle_task_lease_isolated(
+                    task_lease, injection_outcome_unknown=True
+                )
+            )
         return await _restore_a2a_resume_prelease_isolated(
             task_lease,
             status=resumable_status,
@@ -536,7 +549,7 @@ async def resume_a2a_task(
             assert_never(active_interaction_read)
 
         async def inject_user_message() -> tuple[Any, UserMessageInjectionOutcome]:
-            nonlocal injection_started
+            nonlocal injection_unknown
             from .agent_service_manager import get_agent_manager
 
             agent_service = await get_agent_manager().get_agent_for_task(
@@ -544,15 +557,25 @@ async def resume_a2a_task(
                 None,
                 task_owner_user_id=task_owner_user_id,
             )
-            injection_started = True
-            posted = await agent_service.post_user_message(
-                str(task_id),
-                execution_message=text,
-                display_message=text,
-                turn_id=f"a2a:{task_id}:{message_id}",
-                request_interrupt=False,
-                reason="A2A input-required response",
-            )
+            injection_unknown = True
+            try:
+                posted = await agent_service.post_user_message(
+                    str(task_id),
+                    execution_message=text,
+                    display_message=text,
+                    turn_id=f"a2a:{task_id}:{message_id}",
+                    request_interrupt=False,
+                    reason="A2A input-required response",
+                )
+            except (
+                CheckpointReadError,
+                UserMessageInjectionRejectedError,
+                UserMessageInjectionConflictError,
+                AutoModelUnavailableError,
+            ):
+                injection_unknown = False
+                raise
+            injection_unknown = posted is UserMessageInjectionOutcome.OUTCOME_UNKNOWN
             if posted is UserMessageInjectionOutcome.OUTCOME_UNKNOWN:
                 raise TaskResumeOutcomeUnknownError(message_id)
             return agent_service, posted
@@ -624,9 +647,8 @@ async def resume_a2a_task(
     except BaseException as exc:
         if (
             preacquired_lease is not None
-            and injection_started
+            and message_posted
             and not ownership_transferred
-            and not prelease_cleanup_done
         ):
             from .task_coordinator_runtime import current_task_coordinator
 
@@ -639,6 +661,8 @@ async def resume_a2a_task(
         if not ownership_transferred and not prelease_cleanup_done:
             cleanup_task = asyncio.create_task(stop_and_restore_prelease())
             await drain_async_task_cancellation_safe(cleanup_task)
+        if injection_unknown:
+            raise TaskResumeOutcomeUnknownError(message_id) from exc
         raise
     finally:
         if not ownership_transferred and not prelease_cleanup_done:
@@ -968,7 +992,8 @@ async def resume_task_reply(
     )
     ownership_transferred = False
     message_posted = False
-    injection_started = False
+    turn_id = turn_id or f"v1:reply:{task_id}:{uuid4()}"
+    injection_unknown = False
     prelease_cleanup_done = False
 
     async def stop_and_restore_prelease() -> bool:
@@ -997,6 +1022,14 @@ async def resume_task_reply(
                 outcome.pool_timeout is not None,
             )
             return False
+        if injection_unknown:
+            from .task_orchestrator import settle_task_lease_isolated
+
+            return await run_db_io_cancellation_safe(
+                lambda: settle_task_lease_isolated(
+                    task_lease, injection_outcome_unknown=True
+                )
+            )
         return await _restore_reply_prelease_isolated(task_lease)
 
     try:
@@ -1042,7 +1075,7 @@ async def resume_task_reply(
             assert_never(active_interaction_read)
 
         async def inject_user_message() -> tuple[Any, bool]:
-            nonlocal injection_started
+            nonlocal injection_unknown
             agent_service = (
                 await agent_runtime_service.get_agent_manager().get_agent_for_task(
                     task_id,
@@ -1050,15 +1083,25 @@ async def resume_task_reply(
                     task_owner_user_id=ctx.task_owner_user_id,
                 )
             )
-            injection_started = True
-            posted = await agent_service.post_user_message(
-                str(task_id),
-                execution_message=ctx.text,
-                display_message=ctx.text,
-                turn_id=turn_id or f"v1:reply:{task_id}:{uuid4()}",
-                request_interrupt=False,
-                reason="V1 interaction response",
-            )
+            injection_unknown = True
+            try:
+                posted = await agent_service.post_user_message(
+                    str(task_id),
+                    execution_message=ctx.text,
+                    display_message=ctx.text,
+                    turn_id=turn_id,
+                    request_interrupt=False,
+                    reason="V1 interaction response",
+                )
+            except (
+                CheckpointReadError,
+                UserMessageInjectionRejectedError,
+                UserMessageInjectionConflictError,
+                AutoModelUnavailableError,
+            ):
+                injection_unknown = False
+                raise
+            injection_unknown = posted is UserMessageInjectionOutcome.OUTCOME_UNKNOWN
             if posted is UserMessageInjectionOutcome.OUTCOME_UNKNOWN:
                 raise TaskResumeOutcomeUnknownError(turn_id)
             return agent_service, bool(posted)
@@ -1123,12 +1166,9 @@ async def resume_task_reply(
     except BaseException as exc:
         if (
             preacquired_lease is not None
-            and injection_started
+            and message_posted
             and not ownership_transferred
-            and not prelease_cleanup_done
         ):
-            # Injection was accepted, but its projection/scheduling did not
-            # settle. Do not restore WAITING or admit a fresh reply.
             from .task_coordinator_runtime import current_task_coordinator
 
             coordinator = current_task_coordinator(task_id)
@@ -1140,6 +1180,8 @@ async def resume_task_reply(
         if not ownership_transferred and not prelease_cleanup_done:
             cleanup_task = asyncio.create_task(stop_and_restore_prelease())
             await drain_async_task_cancellation_safe(cleanup_task)
+        if injection_unknown:
+            raise TaskResumeOutcomeUnknownError(turn_id) from exc
         raise
     finally:
         if not ownership_transferred and not prelease_cleanup_done:

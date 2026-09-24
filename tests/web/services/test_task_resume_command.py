@@ -619,3 +619,38 @@ async def test_reply_timeout_retains_accepted_command_for_later_execution(
             await claim_task_command(db, runner_id="worker-1", command_db_id=command_id)
             is None
         )
+
+
+@pytest.mark.parametrize("source", ["sdk", "a2a"])
+async def test_unknown_reply_is_settled_paused_and_replayed(reply, monkeypatch, source):
+    from types import SimpleNamespace
+
+    from xagent.core.agent.runner import UserMessageInjectionOutcome
+
+    with get_session_local()() as db:
+        db.get(Task, reply.task_id).source = source
+        db.commit()
+    post = AsyncMock(return_value=UserMessageInjectionOutcome.OUTCOME_UNKNOWN)
+    manager = SimpleNamespace(
+        get_agent_for_task=AsyncMock(
+            return_value=SimpleNamespace(post_user_message=post)
+        )
+    )
+    monkeypatch.setattr(
+        task_resume.agent_runtime_service, "get_agent_manager", lambda: manager
+    )
+    schedule = AsyncMock()
+    monkeypatch.setattr(task_resume, "_schedule_waiting_reply_resume", schedule)
+    monkeypatch.setattr(task_resume, "_schedule_waiting_a2a_resume", schedule)
+    command_id = module._admit_reply(reply, source, "message", "unknown-reply")
+    with get_session_local()() as db:
+        command = await claim_task_command(
+            db, runner_id="worker-1", command_db_id=command_id
+        )
+    await execute_durable_task_command(command)
+    assert module._read_reply_outcome(command_id)["outcome"] == "unknown"
+    assert module._admit_reply(reply, source, "message", "unknown-reply") == command_id
+    with get_session_local()() as db:
+        assert db.get(Task, reply.task_id).status == TaskStatus.PAUSED
+    schedule.assert_not_awaited()
+    post.assert_awaited_once()

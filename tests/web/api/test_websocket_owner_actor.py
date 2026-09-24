@@ -35,7 +35,10 @@ from xagent.core.agent.checkpoint import (
     CheckpointCorruptError,
     CheckpointUnavailableError,
 )
-from xagent.core.agent.runner import UserMessageInjectionOutcome
+from xagent.core.agent.runner import (
+    UserMessageInjectionOutcome,
+    UserMessageInjectionRejectedError,
+)
 from xagent.core.execution_scope import (
     ExecutionScope,
 )
@@ -2996,7 +2999,9 @@ async def test_live_control_delivery_failure_pool_timeout_is_not_retried(
     agent = MagicMock()
     agent.supports_live_control.return_value = True
     agent.get_dag_pattern.return_value = None
-    agent.post_user_message = AsyncMock(side_effect=RuntimeError("inject failed"))
+    agent.post_user_message = AsyncMock(
+        side_effect=UserMessageInjectionRejectedError("inject failed")
+    )
     mgr = MagicMock(get_agent_for_task=AsyncMock(return_value=agent))
     ws_manager = MagicMock(
         broadcast_to_task=AsyncMock(),
@@ -3067,7 +3072,9 @@ async def test_delivery_failure_persistence_drains_before_cancellation(
     agent = MagicMock()
     agent.supports_live_control.return_value = True
     agent.get_dag_pattern.return_value = None
-    agent.post_user_message = AsyncMock(side_effect=RuntimeError("inject failed"))
+    agent.post_user_message = AsyncMock(
+        side_effect=UserMessageInjectionRejectedError("inject failed")
+    )
     agent_manager = MagicMock(get_agent_for_task=AsyncMock(return_value=agent))
     ws_manager = MagicMock(
         broadcast_to_task=AsyncMock(),
@@ -4285,8 +4292,9 @@ async def test_deferred_injection_failure_rejects_before_any_acceptance(
         DELIVERY_OUTCOME_UNKNOWN if unknown else DELIVERY_FAILED
     )
 
-    # Characterize the existing cleanup, not the target R1 unknown lifecycle.
-    assert db_session.get(Task, int(task.id)).status == TaskStatus.FAILED
+    assert db_session.get(Task, int(task.id)).status == (
+        TaskStatus.PAUSED if unknown else TaskStatus.FAILED
+    )
 
 
 @pytest.mark.asyncio
@@ -5631,3 +5639,223 @@ async def test_unknown_retry_during_task_deletion_does_not_enqueue(db_session):
     assert ack["rejection_outcome"] == "outcome_unknown"
     assert not ack.get("retry_with_new_id")
     dispatch.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["unknown", "cancelled", "exception"])
+async def test_deferred_unknown_pauses_without_resuming(db_session, failure):
+    owner, task, turn_id = _seed_deferred_delivery(db_session, "pause-unknown")
+    post = AsyncMock(return_value=UserMessageInjectionOutcome.OUTCOME_UNKNOWN)
+    if failure == "cancelled":
+        post.side_effect = asyncio.CancelledError()
+    elif failure == "exception":
+        post.side_effect = RuntimeError("unclassified injection failure")
+    agent = MagicMock(post_user_message=post, resume_execution_by_id=AsyncMock())
+    notify = AsyncMock()
+    with patch.object(
+        task_execution_service.background_task_manager, "promote_resume_task"
+    ):
+        operation = execute_resume_background(
+            task_id=int(task.id),
+            agent_service=agent,
+            task_owner_user_id=int(owner.id),
+            pending_user_message={
+                "execution_message": "Deferred guidance",
+                "turn_id": turn_id,
+            },
+            delivery_turn_id=turn_id,
+            delivery_notifier=notify,
+        )
+        if failure == "cancelled":
+            with pytest.raises(asyncio.CancelledError):
+                await operation
+        else:
+            await operation
+    assert _delivery_status(db_session, turn_id) == DELIVERY_OUTCOME_UNKNOWN
+    db_session.refresh(task)
+    assert task.status == TaskStatus.PAUSED
+    assert task.runner_id is None
+    agent.resume_execution_by_id.assert_not_awaited()
+    assert notify.await_args.kwargs["error_code"] == "message_outcome_unknown"
+    assert not notify.await_args.kwargs["retry_with_new_id"]
+
+
+@pytest.mark.parametrize("prior_status", [TaskStatus.RUNNING, TaskStatus.FAILED])
+def test_uncertain_settlement_preserves_terminal_result(db_session, prior_status):
+    from xagent.web.services.task_orchestrator import settle_task_lease_isolated
+
+    owner = _user(db_session, "unknown-settle-owner")
+    task = _task(db_session, owner.id, status=TaskStatus.PAUSED)
+    lease = task_execution_service._acquire_resume_task_lease(
+        int(task.id), int(owner.id), None
+    )
+    assert lease is not None
+    db_session.refresh(task)
+    task.status = prior_status
+    task.control_state = prior_status.value
+    if prior_status == TaskStatus.FAILED:
+        task.error_message = "explicit cancellation"
+        task.agent_config = {"a2a_state": "TASK_STATE_CANCELED"}
+    db_session.commit()
+    assert settle_task_lease_isolated(lease, injection_outcome_unknown=True)
+    db_session.refresh(task)
+    assert task.status == (
+        TaskStatus.PAUSED if prior_status == TaskStatus.RUNNING else TaskStatus.FAILED
+    )
+    assert task.runner_id is None
+    if prior_status == TaskStatus.FAILED:
+        assert task.error_message == "explicit cancellation"
+
+
+class _CommittedInjectionStore:
+    """Commit, then block so the caller can cancel before receiving a result."""
+
+    def __init__(self):
+        self.payload = None
+        self.committed = asyncio.Event()
+
+    async def checkpoint(self, **payload):
+        self.payload = payload
+        self.committed.set()
+        await asyncio.Event().wait()
+
+    async def load_latest_checkpoint(self, execution_id):
+        return self.payload
+
+
+def _runner_for_cancelled_injection(task_id, store):
+    from xagent.core.agent.agent import Agent
+    from xagent.core.agent.context import ExecutionContext
+    from xagent.core.agent.runner import AgentRunner, ExecutionControl
+    from xagent.core.agent.runtime import PatternRuntime
+
+    execution_id = str(task_id)
+    runner = AgentRunner(agent=Agent(name="writer", patterns=[]), tracer=store)
+    context = ExecutionContext(execution_id=execution_id)
+    runner.context_manager.set_context(context)
+    runner._active_controls[execution_id] = ExecutionControl(
+        runtime=PatternRuntime(execution_id=execution_id, tracer=store),
+        task=None,
+    )
+    return runner, context
+
+
+@pytest.mark.asyncio
+async def test_live_committed_write_cancellation_preserves_unknown(
+    db_session, live_task_lease
+):
+    owner = _user(db_session, "cancel-live-owner")
+    task = _task(db_session, owner.id, status=TaskStatus.RUNNING)
+    task.runner_id = "cancel-live-runner"
+    task.run_id = "cancel-live-run"
+    db_session.commit()
+    live_task_lease(db_session, task)
+    turn_id = "cancel-live-turn"
+    store = _CommittedInjectionStore()
+    runner, context = _runner_for_cancelled_injection(task.id, store)
+
+    async def post(execution_id, **kwargs):
+        return (await runner.post_user_message(execution_id, **kwargs)).outcome
+
+    agent = MagicMock(post_user_message=AsyncMock(side_effect=post))
+    agent.supports_live_control.return_value = True
+    agent.get_dag_pattern.return_value = None
+    bg_mgr = MagicMock()
+    bg_mgr.try_reserve_resume.return_value = ResumeReservationOutcome.RESERVED
+    bg_mgr.running_tasks.get.return_value = None
+    reply = AsyncMock()
+    with (
+        patch(
+            "xagent.web.services.agent_service_manager.get_agent_manager",
+            return_value=MagicMock(get_agent_for_task=AsyncMock(return_value=agent)),
+        ),
+        patch("xagent.web.services.task_execution.background_task_manager", bg_mgr),
+    ):
+        operation = asyncio.create_task(
+            handle_task_message(
+                reply,
+                int(task.id),
+                {
+                    "message": "guidance",
+                    "client_message_id": turn_id,
+                    "user": owner,
+                    "files": [],
+                },
+            )
+        )
+        try:
+            await asyncio.wait_for(store.committed.wait(), 5)
+            operation.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await operation
+            assert _delivery_status(db_session, turn_id) == DELIVERY_OUTCOME_UNKNOWN
+            assert context.messages == []
+            ack = reply.await_args.args[0]
+            assert ack["rejection_outcome"] == "outcome_unknown"
+            assert not ack.get("retry_with_new_id")
+            bg_mgr.register_reserved_resume.assert_not_called()
+            bg_mgr.release_resume_reservation.assert_called_with(int(task.id))
+        finally:
+            operation.cancel()
+            await asyncio.gather(operation, return_exceptions=True)
+            runner.context_manager.remove_context(str(task.id))
+
+
+@pytest.mark.asyncio
+async def test_deferred_lease_loss_keeps_committed_write_unknown(db_session):
+    from xagent.web.services.task_lease_service import TaskLeaseHeartbeatOutcome
+
+    owner, task, turn_id = _seed_deferred_delivery(db_session, "lease-loss")
+    store = _CommittedInjectionStore()
+    runner, context = _runner_for_cancelled_injection(task.id, store)
+
+    async def post(execution_id, **kwargs):
+        return (await runner.post_user_message(execution_id, **kwargs)).outcome
+
+    async def lose_lease(*args):
+        await asyncio.wait_for(store.committed.wait(), 3)
+        db_session.refresh(task)
+        task.runner_id = "replacement-owner"
+        db_session.commit()
+        return TaskLeaseHeartbeatOutcome(lease_lost=True)
+
+    agent = MagicMock(
+        post_user_message=AsyncMock(side_effect=post),
+        resume_execution_by_id=AsyncMock(),
+    )
+    notify = AsyncMock()
+    try:
+        with (
+            patch.object(
+                task_execution_service,
+                "run_task_lease_heartbeat",
+                side_effect=lose_lease,
+            ),
+            patch.object(
+                task_execution_service.background_task_manager, "promote_resume_task"
+            ),
+        ):
+            await asyncio.wait_for(
+                execute_resume_background(
+                    task_id=int(task.id),
+                    agent_service=agent,
+                    task_owner_user_id=int(owner.id),
+                    pending_user_message={
+                        "execution_message": "Deferred guidance",
+                        "display_message": "Deferred guidance",
+                        "turn_id": turn_id,
+                    },
+                    delivery_turn_id=turn_id,
+                    delivery_notifier=notify,
+                ),
+                5,
+            )
+        assert context.messages == []
+        assert _delivery_status(db_session, turn_id) == DELIVERY_OUTCOME_UNKNOWN
+        db_session.refresh(task)
+        assert task.runner_id == "replacement-owner"
+        assert task.status == TaskStatus.RUNNING
+        agent.resume_execution_by_id.assert_not_awaited()
+        assert notify.await_args.kwargs["rejection_outcome"] == "outcome_unknown"
+    finally:
+        runner.context_manager.remove_context(str(task.id))
