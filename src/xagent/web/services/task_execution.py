@@ -327,6 +327,10 @@ class ClientVisibleValidationError(ClientVisibleError, ValueError):
     """A validation failure whose text is safe to show the sender."""
 
 
+class _DeferredInjectionRejectedRetryableError(RuntimeError):
+    """A fenced execution wrote nothing for the deferred message."""
+
+
 def client_safe_error_message(
     error: BaseException,
     *,
@@ -1600,6 +1604,9 @@ def _finalize_task_execution_result_isolated(
 
         waiting_for_control = False
         terminal_state_committed = False
+        # Only a pause transition owns this transaction. Canceled, failed and
+        # already-paused tasks ignore the late result and roll back its files.
+        pause_commit_pending = False
         final_control_snapshot: TaskControlSnapshot | None = None
         final_task_status = pre_run_status.value
 
@@ -1669,6 +1676,7 @@ def _finalize_task_execution_result_isolated(
                 )
                 terminal_state_committed = True
                 waiting_for_control = True
+                pause_commit_pending = True
             elif task_updated.status not in {
                 TaskStatus.PAUSED,
                 TaskStatus.WAITING_FOR_USER,
@@ -1754,7 +1762,7 @@ def _finalize_task_execution_result_isolated(
                 metadata_committed = True
                 terminal_state_committed = True
 
-            if waiting_for_control:
+            if pause_commit_pending and not metadata_committed:
                 finalize_db.commit()
                 metadata_committed = True
             broadcast_meta = {
@@ -2552,6 +2560,8 @@ async def execute_resume_background(
     settlement_error: str | None = None
     broadcast_error_message: str | None = None
     defer_db_cleanup_to_ttl_recovery = False
+    # A fenced rejection keeps the uncertain run paused instead of failing it.
+    pause_rejected_lease = False
     # The status this task held before a lease claim flipped it to RUNNING;
     # the checkpoint-unavailable/refused recovery path below restores to
     # this instead of a terminal FAILED. Captured at acquisition when this
@@ -2797,12 +2807,17 @@ async def execute_resume_background(
                             lease_heartbeat_task,
                         )
                 finally:
-                    delivery_outcome_unknown = (
-                        attempt.outcome is not UserMessageInjectionOutcome.NOT_POSTED
-                    )
+                    delivery_outcome_unknown = attempt.outcome not in {
+                        UserMessageInjectionOutcome.NOT_POSTED,
+                        UserMessageInjectionOutcome.REJECTED_RETRYABLE,
+                    }
             delivery_outcome_unknown = (
                 posted is UserMessageInjectionOutcome.OUTCOME_UNKNOWN
             )
+            if posted is UserMessageInjectionOutcome.REJECTED_RETRYABLE:
+                raise _DeferredInjectionRejectedRetryableError(
+                    "The user message was not accepted by a fenced execution"
+                )
             if posted is UserMessageInjectionOutcome.OUTCOME_UNKNOWN:
                 delivery_outcome_unknown = True
                 raise RuntimeError("The user message injection outcome is unknown")
@@ -3180,6 +3195,23 @@ async def execute_resume_background(
         elif delivery_outcome_unknown:
             if await mark_deferred_delivery_failed():
                 await notify_deferred_delivery(False)
+        elif isinstance(e, _DeferredInjectionRejectedRetryableError):
+            # Nothing was written, but an earlier input is still uncertain.
+            # Keep the task paused for the user instead of failing or resuming.
+            pause_rejected_lease = True
+            logger.warning(
+                "Task %s deferred message rejected by a fenced execution",
+                task_id,
+            )
+            if delivery_turn_id is not None and not delivery_was_dispatched:
+                if await mark_deferred_delivery_failed():
+                    await notify_deferred_delivery(
+                        False,
+                        client_error_message(ClientErrorCode.MESSAGE_DELIVERY_FAILED),
+                        error_code=ClientErrorCode.MESSAGE_DELIVERY_FAILED,
+                        retry_with_new_id=True,
+                        rejection_outcome="not_accepted",
+                    )
         elif (
             isinstance(e, (CheckpointUnavailableError, CheckpointAccessRefusedError))
             and lease is not None
@@ -3425,7 +3457,7 @@ async def execute_resume_background(
                     and not defer_db_cleanup_to_ttl_recovery
                 ):
                     try:
-                        if delivery_outcome_unknown:
+                        if delivery_outcome_unknown or pause_rejected_lease:
                             from .task_orchestrator import pause_unknown_task_lease
 
                             settled = await pause_unknown_task_lease(lease)

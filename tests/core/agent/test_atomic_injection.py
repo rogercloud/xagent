@@ -459,6 +459,50 @@ async def test_explicit_new_input_reloads_uncertain_idle_context(live):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("active_run", [False, True])
+async def test_fenced_context_rejects_later_input_without_writing(live, active_run):
+    from xagent.core.agent.context.execution import context_checkpoint_gate
+    from xagent.core.agent.runner import track_user_message_injection
+
+    runner, context, tracer = live
+
+    async def write(**payload):
+        tracer.load_latest_checkpoint.side_effect = RuntimeError("unavailable")
+        raise RuntimeError("lost ack")
+
+    tracer.checkpoint.side_effect = write
+    first = await runner.inject_user_message("atomic", "first", turn_id="first")
+    assert first.outcome is UserMessageInjectionOutcome.OUTCOME_UNKNOWN
+    assert context_checkpoint_gate(context).injection_uncertain
+    tracer.load_latest_checkpoint.side_effect = None
+    tracer.checkpoint.side_effect = None
+    if active_run:
+        runner._active_controls["atomic"] = SimpleNamespace(
+            runtime=SimpleNamespace(last_checkpoint=None)
+        )
+
+    with track_user_message_injection() as attempt:
+        second = await runner.inject_user_message(
+            "atomic",
+            "second",
+            turn_id="second",
+            # A live interrupt is fenced even when no run is active; a deferred
+            # input is fenced only while the old execution still runs.
+            request_interrupt=not active_run,
+        )
+
+    assert second.outcome is UserMessageInjectionOutcome.REJECTED_RETRYABLE
+    assert attempt.outcome is UserMessageInjectionOutcome.REJECTED_RETRYABLE
+    # Truthy so that no caller mistakes it for a deferrable NOT_POSTED.
+    assert second.outcome
+    assert second.context is context
+    assert runner.context_manager.get_context("atomic") is context
+    assert [m.content for m in context.messages] == ["original"]
+    assert context_checkpoint_gate(context).injection_uncertain
+    assert tracer.checkpoint.await_count == 1
+
+
+@pytest.mark.asyncio
 async def test_confirmed_readback_does_not_leave_transient_unknown_result(live):
     from xagent.core.agent.context.execution import context_checkpoint_gate
 

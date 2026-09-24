@@ -247,8 +247,9 @@ def test_no_delivery_producer_can_bypass_the_client_safe_message() -> None:
     # inspect the changed site and bump the corresponding count in this test.
     # Cancellation during live injection now persists and sends an unknown
     # acknowledgement through finish_delivery_failure's safe message builder.
-    assert result.producers == 37, (
-        f"expected exactly 37 producers, matched {result.producers}; "
+    # A fenced-run rejection adds one live and one deferred delivery-failed ack.
+    assert result.producers == 39, (
+        f"expected exactly 39 producers, matched {result.producers}; "
         "review the changed sites and bump deliberately"
     )
     # #1658 removed ``_resync_client_to_running_task``'s stale-client ``error``

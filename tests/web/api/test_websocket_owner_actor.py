@@ -4210,6 +4210,88 @@ async def test_resume_failure_rejection_redacts_exception_text(db_session) -> No
 
 
 @pytest.mark.asyncio
+async def test_deferred_injection_rejected_by_fence_pauses_without_resuming(
+    db_session,
+) -> None:
+    from xagent.core.agent.runner import _record_injection_outcome
+
+    owner = _user(db_session, "owner")
+    task = _task(db_session, owner.id, status=TaskStatus.PAUSED)
+    db_session.add(
+        TaskChatMessage(
+            task_id=int(task.id),
+            user_id=int(owner.id),
+            role="user",
+            content="Deferred guidance",
+            message_type="user_message",
+            turn_id="deferred-fenced-reject",
+            delivery_status=DELIVERY_PENDING,
+        )
+    )
+    db_session.commit()
+
+    async def post_user_message(*_args, **_kwargs):
+        _record_injection_outcome(UserMessageInjectionOutcome.REJECTED_RETRYABLE)
+        return UserMessageInjectionOutcome.REJECTED_RETRYABLE
+
+    agent = MagicMock(
+        post_user_message=AsyncMock(side_effect=post_user_message),
+        resume_execution_by_id=AsyncMock(),
+    )
+    ws_manager = MagicMock(
+        broadcast_to_task=AsyncMock(),
+        send_personal_message=AsyncMock(),
+    )
+
+    with (
+        patch("xagent.web.api.websocket.manager", ws_manager),
+        patch(
+            "xagent.web.services.task_execution.background_task_manager.promote_resume_task"
+        ),
+    ):
+        await execute_resume_background(
+            task_id=int(task.id),
+            agent_service=agent,
+            task_owner_user_id=int(owner.id),
+            pending_user_message={
+                "execution_message": "Deferred guidance",
+                "display_message": "Deferred guidance",
+                "files": [],
+                "turn_id": "deferred-fenced-reject",
+            },
+            delivery_turn_id="deferred-fenced-reject",
+            delivery_notifier=make_delivery_notifier(
+                _make_command_reply(MagicMock()), "deferred-fenced-reject"
+            ),
+        )
+
+    delivery_events = [
+        call.args[0]
+        for call in ws_manager.send_personal_message.call_args_list
+        if call.args[0].get("type") in {"message_accepted", "message_rejected"}
+    ]
+    assert [event["type"] for event in delivery_events] == ["message_rejected"]
+    assert delivery_events[0]["retry_with_new_id"] is True
+    assert delivery_events[0]["rejection_outcome"] == "not_accepted"
+    assert delivery_events[0]["error_code"] == "message_delivery_failed"
+    agent.resume_execution_by_id.assert_not_awaited()
+    db_session.expire_all()
+    delivery = (
+        db_session.query(TaskChatMessage)
+        .filter(TaskChatMessage.turn_id == "deferred-fenced-reject")
+        .one()
+    )
+    assert delivery.delivery_status == DELIVERY_FAILED
+    task_row = db_session.get(Task, int(task.id))
+    assert task_row.status == TaskStatus.PAUSED
+    assert task_row.runner_id is None
+    assert not any(
+        call.args[0].get("type") == "task_error"
+        for call in ws_manager.broadcast_to_task.call_args_list
+    )
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("unknown", [False, True])
 async def test_deferred_injection_failure_rejects_before_any_acceptance(
     db_session,
@@ -5521,6 +5603,83 @@ async def test_live_injection_outcome_unknown_is_not_acknowledged_or_reposted(
     )
 
     # Live injection still has no task handoff until R1 enables the producer.
+    assert db_session.get(Task, int(task.id)).status == TaskStatus.RUNNING
+
+
+@pytest.mark.asyncio
+async def test_live_injection_rejected_by_fence_is_retryable_not_unknown(
+    live_task_lease,
+    db_session,
+) -> None:
+    from xagent.core.agent.runner import _record_injection_outcome
+
+    owner = _user(db_session, "fenced-reject-owner")
+    task = _task(db_session, owner.id, status=TaskStatus.RUNNING)
+    task.runner_id = "fenced-reject-runner"
+    task.run_id = "fenced-reject-run"
+    db_session.commit()
+    live_task_lease(db_session, task)
+
+    async def post_user_message(*_args, **_kwargs):
+        # Mirror the runner: the attempt evidence carries the same outcome.
+        _record_injection_outcome(UserMessageInjectionOutcome.REJECTED_RETRYABLE)
+        return UserMessageInjectionOutcome.REJECTED_RETRYABLE
+
+    agent = MagicMock()
+    agent.supports_live_control.return_value = True
+    agent.get_dag_pattern.return_value = None
+    agent.post_user_message = AsyncMock(side_effect=post_user_message)
+    ws_manager = MagicMock(
+        broadcast_to_task=AsyncMock(),
+        send_personal_message=AsyncMock(),
+    )
+    bg_mgr = MagicMock()
+    bg_mgr.try_reserve_resume.return_value = ResumeReservationOutcome.RESERVED
+    bg_mgr.running_tasks.get.return_value = None
+    resume_background_mock = AsyncMock()
+
+    with (
+        patch(
+            "xagent.web.services.agent_service_manager.get_agent_manager",
+            return_value=MagicMock(get_agent_for_task=AsyncMock(return_value=agent)),
+        ),
+        patch("xagent.web.api.websocket.manager", ws_manager),
+        patch("xagent.web.services.task_execution.background_task_manager", bg_mgr),
+        patch(
+            "xagent.web.services.task_execution.execute_resume_background",
+            resume_background_mock,
+        ),
+        patch(
+            "xagent.web.services.task_command_execution.close_legacy_resume_interaction_sync",
+        ) as close_mock,
+    ):
+        await handle_task_message(
+            _make_command_reply(MagicMock()),
+            int(task.id),
+            {
+                "message": "Fenced input",
+                "client_message_id": "fenced-reject-turn",
+                "user": owner,
+                "files": [],
+            },
+        )
+
+    close_mock.assert_not_called()
+    bg_mgr.register_reserved_resume.assert_not_called()
+    bg_mgr.release_resume_reservation.assert_called_once_with(int(task.id))
+    resume_background_mock.assert_not_called()
+    acks = _delivery_acks(ws_manager)
+    assert len(acks) == 1
+    ack = acks[0]
+    assert ack["type"] == "message_rejected"
+    assert ack["error_code"] == "message_delivery_failed"
+    assert ack["rejection_outcome"] == "not_accepted"
+    assert ack["retry_with_new_id"] is True
+    assert _delivery_status(db_session, "fenced-reject-turn") == DELIVERY_FAILED
+    assert not any(
+        call.args[0].get("type") in {"task_error", "error"}
+        for call in ws_manager.broadcast_to_task.call_args_list
+    )
     assert db_session.get(Task, int(task.id)).status == TaskStatus.RUNNING
 
 

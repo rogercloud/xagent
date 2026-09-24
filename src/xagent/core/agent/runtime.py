@@ -917,6 +917,8 @@ class PatternRuntime:
                 isinstance(context, ExecutionContext)
                 and context_checkpoint_gate(context).injection_uncertain
             ):
+                # Tool steps after the fence may re-run on explicit resume; see
+                # docs/architecture/task-runner-execution-boundary.md.
                 raise ExecutionInterrupted(
                     "Injection outcome unknown; explicit resume must reload the checkpoint."
                 )

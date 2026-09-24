@@ -80,12 +80,17 @@ class UserMessageInjectionOutcome(str, Enum):
 
     An unknown write fences this context until an explicit deferred input or
     resume reloads durable state after the old run has ended.
+    REJECTED_RETRYABLE is returned while that fence is up: this attempt wrote
+    nothing, so the message was not accepted and may be resent under a new
+    id. Unlike NOT_POSTED it must not be deferred, since deferral resumes the
+    fenced run. It is truthy, so handle it before any truthiness test.
     """
 
     NOT_POSTED = ""
     POSTED_FRESH = "posted_fresh"
     POSTED_REPLAY = "posted_replay"
     OUTCOME_UNKNOWN = "outcome_unknown"
+    REJECTED_RETRYABLE = "rejected_retryable"
 
 
 @dataclass
@@ -673,12 +678,14 @@ class AgentRunner:
                         # old object fenced for callbacks still holding a reference.
                         self.context_manager.remove_context(execution_id)
                         continue
+                    # An earlier write is uncertain, but this attempt writes
+                    # nothing: its own outcome is a known rejection.
                     _record_injection_outcome(
-                        UserMessageInjectionOutcome.OUTCOME_UNKNOWN
+                        UserMessageInjectionOutcome.REJECTED_RETRYABLE
                     )
                     return UserMessageInjectionResult(
                         context=context,
-                        outcome=UserMessageInjectionOutcome.OUTCOME_UNKNOWN,
+                        outcome=UserMessageInjectionOutcome.REJECTED_RETRYABLE,
                     )
                 if request_interrupt and gate.run_finishing:
                     return UserMessageInjectionResult(

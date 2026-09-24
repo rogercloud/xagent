@@ -1391,6 +1391,7 @@ async def handle_task_message(
         message: str,
         *,
         error_code: str | None = None,
+        retry_with_new_id: bool = False,
     ) -> bool:
         """Reject pre-dispatch failures; never confuse persistence with delivery."""
 
@@ -1442,14 +1443,14 @@ async def handle_task_message(
                 rejection_outcome="outcome_unknown",
             )
         else:
+            rejection_unknown = delivery_failure_pool_timeout or delivery_injected
             await finish_delivery(
                 False,
                 message,
                 error_code=error_code,
+                retry_with_new_id=retry_with_new_id and not rejection_unknown,
                 rejection_outcome=(
-                    "outcome_unknown"
-                    if delivery_failure_pool_timeout or delivery_injected
-                    else "not_accepted"
+                    "outcome_unknown" if rejection_unknown else "not_accepted"
                 ),
             )
         return not delivery_failure_pool_timeout
@@ -1896,13 +1897,27 @@ async def handle_task_message(
                                     )
                                     return
                                 finally:
-                                    delivery_outcome_unknown = (
-                                        attempt.outcome
-                                        is not UserMessageInjectionOutcome.NOT_POSTED
-                                    )
+                                    delivery_outcome_unknown = attempt.outcome not in {
+                                        UserMessageInjectionOutcome.NOT_POSTED,
+                                        UserMessageInjectionOutcome.REJECTED_RETRYABLE,
+                                    }
                     delivery_outcome_unknown = (
                         posted is UserMessageInjectionOutcome.OUTCOME_UNKNOWN
                     )
+                    if posted is UserMessageInjectionOutcome.REJECTED_RETRYABLE:
+                        # A fenced run wrote nothing. Deferring would resume the
+                        # run, so reject it and let the sender retry with a new id.
+                        task_execution_service.background_task_manager.release_resume_reservation(
+                            task_id
+                        )
+                        await finish_delivery_failure(
+                            client_error_message(
+                                ClientErrorCode.MESSAGE_DELIVERY_FAILED
+                            ),
+                            error_code=ClientErrorCode.MESSAGE_DELIVERY_FAILED.value,
+                            retry_with_new_id=True,
+                        )
+                        return
                     if posted is UserMessageInjectionOutcome.OUTCOME_UNKNOWN:
                         delivery_outcome_unknown = True
                         task_execution_service.background_task_manager.release_resume_reservation(

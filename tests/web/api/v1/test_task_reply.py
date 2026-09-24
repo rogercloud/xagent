@@ -1149,6 +1149,46 @@ def test_reply_timeout_reports_accepted_outcome_unknown():
     assert "do not resend automatically" in response.json()["error"]["message"]
 
 
+def test_reply_fenced_rejection_restores_waiting_without_resuming(mock_start_task):
+    agent_id, full_key = _create_agent_with_key()
+    task_id = _create_waiting_task(full_key, agent_id, run_id="fenced-protocol")
+    row_id = _seed_active_interaction_row(
+        task_id, run_id="fenced-protocol", idempotency_key="fenced-question"
+    )
+    post = AsyncMock(return_value=UserMessageInjectionOutcome.REJECTED_RETRYABLE)
+    agent_patch, _agent = _patch_agent_service(post)
+    with (
+        agent_patch,
+        patch(
+            "xagent.web.services.task_resume._schedule_waiting_reply_resume",
+            new=AsyncMock(),
+        ) as schedule,
+    ):
+        response = client.post(
+            f"/v1/chat/tasks/{task_id}/reply",
+            headers=_bearer(full_key),
+            json=_reply_body(agent_id),
+        )
+    assert response.status_code == 409, response.text
+    assert response.json()["error"]["code"] == "task_busy"
+    post.assert_awaited_once()
+    schedule.assert_not_awaited()
+    db = _direct_db_session()
+    try:
+        task = db.get(Task, task_id)
+        assert task.status == TaskStatus.WAITING_FOR_USER
+        assert task.runner_id is None
+        assert (
+            db.query(TaskInteractionRequest)
+            .filter(TaskInteractionRequest.id == row_id)
+            .one()
+            .status
+            == "active"
+        )
+    finally:
+        db.close()
+
+
 @pytest.mark.parametrize("failure", ["unknown", "cancelled", "exception"])
 def test_reply_reports_unknown_without_closing_interaction(mock_start_task, failure):
     agent_id, full_key = _create_agent_with_key()

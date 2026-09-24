@@ -140,6 +140,24 @@ acceptance outcomes. The old context remains fenced against stale checkpoint
 writes. Once its execution has exited, an explicit deferred input or resume
 loads durable state again.
 
+While that fence is up, a later input that would have to write into the fenced
+context (a live message that interrupts the run, or any input while the old
+execution is still active) writes nothing and returns `rejected_retryable`.
+Its own outcome is known: it was not accepted. The WebSocket delivery is
+recorded as failed and the sender is told to resend under a new id; A2A and
+SDK replies restore their prelease and report the task as busy. It is never
+deferred and never schedules a resume, because either would restart the
+fenced run without the user's decision. Only the original uncertain write is
+reported as `outcome_unknown`.
+
+The fence also rejects every later checkpoint of the old run, including the
+ones taken after tool steps. Tool calls that complete between the uncertain
+write and the stop therefore leave no durable record, and an explicit resume
+reloads the earlier checkpoint and may run them again. Tools with external
+side effects can repeat. This is an accepted cost of the at-most-once input
+contract; a per-step intent log together with tool side-effect classification
+is the intended remedy.
+
 A reply timeout can also mean that an accepted command is still queued or being
 processed. It is not evidence of a failed injection. For shared execution,
 clients can repeat the same request identity to observe the existing command;

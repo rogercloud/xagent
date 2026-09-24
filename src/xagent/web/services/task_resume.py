@@ -573,12 +573,22 @@ async def resume_a2a_task(
                 # The guard must finish its handoff before acceptance can be
                 # treated as a normal return, including cancellation as its
                 # child completes.
-                injection_unknown = (
-                    attempt.outcome is not UserMessageInjectionOutcome.NOT_POSTED
-                )
+                injection_unknown = attempt.outcome not in {
+                    UserMessageInjectionOutcome.NOT_POSTED,
+                    UserMessageInjectionOutcome.REJECTED_RETRYABLE,
+                }
         injection_unknown = posted is UserMessageInjectionOutcome.OUTCOME_UNKNOWN
         if injection_unknown:
             raise TaskResumeOutcomeUnknownError(message_id)
+        if posted is UserMessageInjectionOutcome.REJECTED_RETRYABLE:
+            # A fenced execution wrote nothing. Restore the prelease like any
+            # confirmed rejection, but never resume the fenced run.
+            cleanup_task = asyncio.create_task(stop_and_restore_prelease())
+            if not await drain_async_task_cancellation_safe(cleanup_task):
+                raise TaskLeaseLostError(
+                    f"Task {task_id} lease changed before A2A rejection"
+                )
+            raise TaskResumeBusyError
 
         message_posted = bool(posted)
         if not posted:
@@ -1101,12 +1111,22 @@ async def resume_task_reply(
                 # The guard must finish its handoff before acceptance can be
                 # treated as a normal return, including cancellation as its
                 # child completes.
-                injection_unknown = (
-                    attempt.outcome is not UserMessageInjectionOutcome.NOT_POSTED
-                )
+                injection_unknown = attempt.outcome not in {
+                    UserMessageInjectionOutcome.NOT_POSTED,
+                    UserMessageInjectionOutcome.REJECTED_RETRYABLE,
+                }
         injection_unknown = posted is UserMessageInjectionOutcome.OUTCOME_UNKNOWN
         if injection_unknown:
             raise TaskResumeOutcomeUnknownError(turn_id)
+        if posted is UserMessageInjectionOutcome.REJECTED_RETRYABLE:
+            # A fenced execution wrote nothing. Restore the prelease like any
+            # confirmed rejection, but never resume the fenced run.
+            cleanup_task = asyncio.create_task(stop_and_restore_prelease())
+            if not await drain_async_task_cancellation_safe(cleanup_task):
+                raise TaskLeaseLostError(
+                    f"Task {task_id} lease changed before reply rejection"
+                )
+            raise TaskResumeBusyError
 
         message_posted = bool(posted)
         if not posted:

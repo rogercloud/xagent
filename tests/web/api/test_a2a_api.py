@@ -3669,6 +3669,60 @@ def _seed_outcome_unknown_a2a_task(suffix: str) -> tuple[int, str, int, int]:
     return agent_id, full_key, task_id, row_id
 
 
+def test_message_send_fenced_rejection_restores_prelease_without_resuming():
+    agent_id, full_key, task_id, row_id = _seed_outcome_unknown_a2a_task("fenced")
+    agent = MagicMock(
+        post_user_message=AsyncMock(
+            return_value=UserMessageInjectionOutcome.REJECTED_RETRYABLE
+        )
+    )
+    with (
+        patch(
+            "xagent.web.services.agent_service_manager.get_agent_manager",
+            return_value=MagicMock(get_agent_for_task=AsyncMock(return_value=agent)),
+        ),
+        patch(
+            "xagent.web.services.task_resume._schedule_waiting_a2a_resume",
+            new=AsyncMock(),
+        ) as schedule,
+    ):
+        response = client.post(
+            f"/api/a2a/agents/{agent_id}/message:send",
+            headers=_bearer(full_key),
+            json={
+                "message": {
+                    "messageId": "fenced-reply",
+                    "taskId": task_id,
+                    "role": "ROLE_USER",
+                    "parts": [{"text": "fenced reply"}],
+                },
+                "configuration": {"returnImmediately": True},
+            },
+        )
+    assert response.status_code == 400, response.text
+    error = response.json()["error"]
+    assert error["details"][0]["reason"] == "UNSUPPORTED_OPERATION"
+    assert error["message"] == (
+        "Task is currently running and cannot accept a new message."
+    )
+    agent.post_user_message.assert_awaited_once()
+    schedule.assert_not_awaited()
+    db = _direct_db_session()
+    try:
+        task = db.get(Task, task_id)
+        assert task.status == TaskStatus.PAUSED
+        assert task.runner_id is None
+        assert (
+            db.query(TaskInteractionRequest)
+            .filter(TaskInteractionRequest.id == row_id)
+            .one()
+            .status
+            == "active"
+        )
+    finally:
+        db.close()
+
+
 @pytest.mark.parametrize("cancelled", [False, True])
 def test_message_send_reports_unknown_without_closing_interaction(cancelled):
     agent_id, full_key, task_id, row_id = _seed_outcome_unknown_a2a_task("protocol")
