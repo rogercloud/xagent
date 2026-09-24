@@ -1897,14 +1897,18 @@ async def handle_task_message(
                                     ClientErrorCode.TASK_CHECKPOINT_UNREADABLE
                                 )
                                 return
-                            except (
-                                UserMessageInjectionRejectedError,
-                                UserMessageInjectionConflictError,
-                                AutoModelUnavailableError,
-                                DurableObjectIntegrityError,
-                                DurableStorageOperationError,
-                            ):
-                                delivery_outcome_unknown = False
+                            except Exception as exc:
+                                # Classify acceptance here; outer handlers own
+                                # logging and the audience-specific response.
+                                delivery_outcome_unknown = not isinstance(
+                                    exc,
+                                    (
+                                        UserMessageInjectionRejectedError,
+                                        UserMessageInjectionConflictError,
+                                        AutoModelUnavailableError,
+                                        DurableStorageOperationError,
+                                    ),
+                                )
                                 raise
                     delivery_outcome_unknown = (
                         posted is UserMessageInjectionOutcome.OUTCOME_UNKNOWN
