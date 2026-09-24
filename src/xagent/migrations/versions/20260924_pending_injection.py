@@ -11,6 +11,9 @@ depends_on = None
 
 def upgrade() -> None:
     inspector = sa.inspect(op.get_bind())
+    # Core tables are metadata-owned and may be absent in Alembic-only runs.
+    if not inspector.has_table("tasks"):
+        return
     if "pending_injection" not in {c["name"] for c in inspector.get_columns("tasks")}:
         op.add_column(
             "tasks",
@@ -29,5 +32,7 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
+    if not sa.inspect(op.get_bind()).has_table("tasks"):
+        return
     op.drop_index("ix_tasks_pending_injection", table_name="tasks")
     op.drop_column("tasks", "pending_injection")

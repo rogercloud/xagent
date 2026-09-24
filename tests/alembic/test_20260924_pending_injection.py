@@ -33,3 +33,16 @@ def test_pending_input_upgrade_preserves_old_tasks(engine):
         }
         migration.downgrade()
         assert connection.execute(table.select()).all() == [(7,)]
+
+
+def test_pending_input_migration_without_tasks_table(engine):
+    migration = importlib.import_module(
+        "xagent.migrations.versions.20260924_pending_injection"
+    )
+    with (
+        engine.begin() as connection,
+        Operations.context(MigrationContext.configure(connection)),
+    ):
+        migration.upgrade()
+        migration.downgrade()
+        assert not sa.inspect(connection).has_table("tasks")
