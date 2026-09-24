@@ -143,12 +143,40 @@ loads durable state again.
 While that fence is up, a later input that would have to write into the fenced
 context (a live message that interrupts the run, or any input while the old
 execution is still active) writes nothing and returns `rejected_retryable`.
-Its own outcome is known: it was not accepted. The WebSocket delivery is
-recorded as failed and the sender is told to resend under a new id; A2A and
-SDK replies restore their prelease and report the task as busy. It is never
-deferred and never schedules a resume, because either would restart the
-fenced run without the user's decision. Only the original uncertain write is
-reported as `outcome_unknown`.
+Its own outcome is known: it was not accepted. It is never deferred and never
+schedules a resume, because either would restart the fenced run without the
+user's decision. Only the original uncertain write is reported as
+`outcome_unknown`.
+
+`classify_injection` in `core.agent.runner` is the single place that turns an
+attempt into an `InjectionDisposition`. It reads the recorded attempt
+evidence, the returned outcome, and any escaped error or cancellation.
+Recorded acceptance wins over a later error. A read-back that proves the
+write absent (`UserMessageInjectionRejectedError`) is not accepted in the
+same way as a fenced rejection, but it lifts the fence. Each entry point only
+maps the disposition:
+
+| Disposition | WebSocket live | Deferred | A2A / SDK | Shared command |
+| --- | --- | --- | --- | --- |
+| `accepted` | dispatched | dispatched, resume | scheduled | `accepted` |
+| `defer` | deferred resume | fails (no checkpoint) | not resumable | `not_resumable` |
+| `not_accepted_retryable` | delivery failed, resend with a new id; no task failure | delivery failed, resend with a new id; task paused if fenced, else restored | prelease restored; error carries `retryWithNewId` / `retry_with_new_id` | `busy` with `retry_with_new_id` |
+| `unknown` | `outcome_unknown` | `outcome_unknown`, paused | outcome unknown | `unknown` |
+| `failed_before_write` | existing error handling | existing | existing | existing |
+
+When a cancellation or lease loss lands after acceptance, the delivery is
+still recorded as dispatched and the interruption then follows its normal
+handling; it is never paused as an unknown input. A shared reply that was not
+accepted keeps its stored answer: repeating the same A2A `messageId` or SDK
+`command_id` replays "not accepted, resend with a new id" without a second
+injection.
+
+An explicit cancel (A2A `tasks/cancel`, an external cancel, or task deletion,
+all through `BackgroundTaskManager.cancel_task`) wins over the unknown-input
+pause. The manager records that intent before it cancels, so a deferred
+resume whose delivery is `outcome_unknown` settles as FAILED (cancelled), and
+the delivery stays `outcome_unknown` and is never resendable. Other
+cancellations, such as shutdown or lease loss, keep the pause.
 
 The fence also rejects every later checkpoint of the old run, including the
 ones taken after tool steps. Tool calls that complete between the uncertain

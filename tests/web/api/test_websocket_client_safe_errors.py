@@ -2468,17 +2468,34 @@ async def test_runtime_error_is_redacted_and_coded_for_every_audience(
         )
 
     broadcast = [c.args[0] for c in ws_manager.broadcast_to_task.await_args_list]
-    assert broadcast, "the task-wide notification must still go out"
     assert SECRET not in repr(broadcast), broadcast
+    personal = [c.args[0] for c in ws_manager.send_personal_message.await_args_list]
+    assert SECRET not in repr(personal), personal
+    rejected = [p for p in personal if p.get("type") == "message_rejected"]
+    if definitely_rejected:
+        # Proven absent: only this input failed, so the running task is not
+        # reported as failed and the sender may resend under a new id.
+        assert not [b for b in broadcast if b.get("type") == "agent_error"]
+        assert rejected == [
+            {
+                "type": "message_rejected",
+                "client_message_id": "runtime-boundary",
+                "turn_id": "runtime-boundary",
+                "timestamp": rejected[0]["timestamp"],
+                "message": rejected[0]["message"],
+                "error_code": "message_delivery_failed",
+                "retry_with_new_id": True,
+                "rejection_outcome": "not_accepted",
+            }
+        ]
+        return
+    assert broadcast, "the task-wide notification must still go out"
     task_errors = [b for b in broadcast if b.get("type") == "agent_error"]
     assert task_errors and task_errors[0]["message"] == (
         websocket_api.CLIENT_SAFE_TASK_FAILURE
     )
     assert task_errors[0]["error_code"] == "task_execution_failed"
 
-    personal = [c.args[0] for c in ws_manager.send_personal_message.await_args_list]
-    assert SECRET not in repr(personal), personal
-    rejected = [p for p in personal if p.get("type") == "message_rejected"]
     assert rejected == [
         {
             "type": "message_rejected",

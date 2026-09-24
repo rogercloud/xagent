@@ -17,7 +17,9 @@ from sqlalchemy import func
 
 from ...core.agent.checkpoint import CheckpointReadError, CheckpointUnavailableError
 from ...core.agent.runner import (
+    InjectionDisposition,
     UserMessageInjectionOutcome,
+    classify_injection,
     track_user_message_injection,
 )
 from ..models.database import get_session_local
@@ -66,6 +68,15 @@ class TaskResumeOutcomeUnknownError(Exception):
 
 class TaskResumeBusyError(Exception):
     """Another execution owns the task or has already claimed its resume."""
+
+
+class TaskResumeNotAcceptedError(TaskResumeBusyError):
+    """The reply was provably not written; resend it under a new identity.
+
+    Raised for ``InjectionDisposition.NOT_ACCEPTED_RETRYABLE`` after the
+    prelease was restored (or retained for TTL recovery). It subclasses the
+    busy error so a caller that does not know it still answers "not applied".
+    """
 
 
 class TaskResumeNotWaitingError(Exception):
@@ -542,6 +553,8 @@ async def resume_a2a_task(
         else:
             assert_never(active_interaction_read)
 
+        injected_agent_service: Any = None
+
         async def inject_user_message() -> tuple[Any, UserMessageInjectionOutcome]:
             from .agent_service_manager import get_agent_manager
 
@@ -550,6 +563,8 @@ async def resume_a2a_task(
                 None,
                 task_owner_user_id=task_owner_user_id,
             )
+            nonlocal injected_agent_service
+            injected_agent_service = agent_service
             posted = await agent_service.post_user_message(
                 str(task_id),
                 execution_message=text,
@@ -560,6 +575,7 @@ async def resume_a2a_task(
             )
             return agent_service, posted
 
+        posted = UserMessageInjectionOutcome.NOT_POSTED
         with (
             bind_task_lease_context(task_lease),
             track_user_message_injection() as attempt,
@@ -569,29 +585,56 @@ async def resume_a2a_task(
                     inject_user_message(),
                     heartbeat_task,
                 )
-            finally:
-                # The guard must finish its handoff before acceptance can be
-                # treated as a normal return, including cancellation as its
-                # child completes.
-                injection_unknown = attempt.outcome not in {
-                    UserMessageInjectionOutcome.NOT_POSTED,
-                    UserMessageInjectionOutcome.REJECTED_RETRYABLE,
-                }
-        injection_unknown = posted is UserMessageInjectionOutcome.OUTCOME_UNKNOWN
+            except BaseException as injection_error:
+                # The guard finishes its handoff before this runs, so the
+                # attempt evidence is final even when cancellation raced the
+                # child's completion.
+                disposition = classify_injection(attempt.outcome, error=injection_error)
+                if (
+                    disposition is InjectionDisposition.ACCEPTED
+                    and isinstance(injection_error, Exception)
+                    and not isinstance(injection_error, TaskLeaseLostError)
+                    and injected_agent_service is not None
+                ):
+                    # The turn is durable; only a later projection (such as
+                    # the registry event) failed. Continue as accepted.
+                    logger.warning(
+                        "post-acceptance injection error for A2A reply on task %s",
+                        task_id,
+                        exc_info=True,
+                    )
+                    agent_service = injected_agent_service
+                    posted = attempt.outcome
+                elif not (
+                    disposition is InjectionDisposition.NOT_ACCEPTED_RETRYABLE
+                    and isinstance(injection_error, Exception)
+                ):
+                    injection_unknown = disposition is InjectionDisposition.UNKNOWN
+                    # Accepted before a cancellation or lease loss: the
+                    # handlers below treat it as posted, never as unknown.
+                    message_posted = disposition is InjectionDisposition.ACCEPTED
+                    raise
+            else:
+                disposition = classify_injection(attempt.outcome, posted=posted)
+        injection_unknown = disposition is InjectionDisposition.UNKNOWN
         if injection_unknown:
             raise TaskResumeOutcomeUnknownError(message_id)
-        if posted is UserMessageInjectionOutcome.REJECTED_RETRYABLE:
-            # A fenced execution wrote nothing. Restore the prelease like any
-            # confirmed rejection, but never resume the fenced run.
+        if disposition is InjectionDisposition.NOT_ACCEPTED_RETRYABLE:
+            # Nothing was written (a fenced run, or a read-back that proved
+            # absence). Restore the prelease, never resume a fenced run, and
+            # tell the caller to resend under a new identity. The disposition
+            # is known even if the restore fails and TTL recovery must run.
             cleanup_task = asyncio.create_task(stop_and_restore_prelease())
             if not await drain_async_task_cancellation_safe(cleanup_task):
-                raise TaskLeaseLostError(
-                    f"Task {task_id} lease changed before A2A rejection"
+                logger.error(
+                    "A2A reply for task %s was not accepted, but its prelease "
+                    "could not be restored; retained for TTL recovery",
+                    task_id,
                 )
-            raise TaskResumeBusyError
+            raise TaskResumeNotAcceptedError
 
-        message_posted = bool(posted)
-        if not posted:
+        message_posted = disposition is InjectionDisposition.ACCEPTED
+        if disposition is InjectionDisposition.DEFER:
             # Untagged or otherwise unreadable legacy checkpoints are never
             # resumed under a fabricated run or transcript fallback. Release
             # the exact prelease back to the prior input-required state and
@@ -1080,6 +1123,8 @@ async def resume_task_reply(
         else:
             assert_never(active_interaction_read)
 
+        injected_agent_service: Any = None
+
         async def inject_user_message() -> tuple[Any, UserMessageInjectionOutcome]:
             agent_service = (
                 await agent_runtime_service.get_agent_manager().get_agent_for_task(
@@ -1088,6 +1133,8 @@ async def resume_task_reply(
                     task_owner_user_id=ctx.task_owner_user_id,
                 )
             )
+            nonlocal injected_agent_service
+            injected_agent_service = agent_service
             posted = await agent_service.post_user_message(
                 str(task_id),
                 execution_message=ctx.text,
@@ -1098,6 +1145,7 @@ async def resume_task_reply(
             )
             return agent_service, posted
 
+        posted = UserMessageInjectionOutcome.NOT_POSTED
         with (
             bind_task_lease_context(task_lease),
             track_user_message_injection() as attempt,
@@ -1107,29 +1155,56 @@ async def resume_task_reply(
                     inject_user_message(),
                     heartbeat_task,
                 )
-            finally:
-                # The guard must finish its handoff before acceptance can be
-                # treated as a normal return, including cancellation as its
-                # child completes.
-                injection_unknown = attempt.outcome not in {
-                    UserMessageInjectionOutcome.NOT_POSTED,
-                    UserMessageInjectionOutcome.REJECTED_RETRYABLE,
-                }
-        injection_unknown = posted is UserMessageInjectionOutcome.OUTCOME_UNKNOWN
+            except BaseException as injection_error:
+                # The guard finishes its handoff before this runs, so the
+                # attempt evidence is final even when cancellation raced the
+                # child's completion.
+                disposition = classify_injection(attempt.outcome, error=injection_error)
+                if (
+                    disposition is InjectionDisposition.ACCEPTED
+                    and isinstance(injection_error, Exception)
+                    and not isinstance(injection_error, TaskLeaseLostError)
+                    and injected_agent_service is not None
+                ):
+                    # The turn is durable; only a later projection (such as
+                    # the registry event) failed. Continue as accepted.
+                    logger.warning(
+                        "post-acceptance injection error for SDK reply on task %s",
+                        task_id,
+                        exc_info=True,
+                    )
+                    agent_service = injected_agent_service
+                    posted = attempt.outcome
+                elif not (
+                    disposition is InjectionDisposition.NOT_ACCEPTED_RETRYABLE
+                    and isinstance(injection_error, Exception)
+                ):
+                    injection_unknown = disposition is InjectionDisposition.UNKNOWN
+                    # Accepted before a cancellation or lease loss: the
+                    # handlers below treat it as posted, never as unknown.
+                    message_posted = disposition is InjectionDisposition.ACCEPTED
+                    raise
+            else:
+                disposition = classify_injection(attempt.outcome, posted=posted)
+        injection_unknown = disposition is InjectionDisposition.UNKNOWN
         if injection_unknown:
             raise TaskResumeOutcomeUnknownError(turn_id)
-        if posted is UserMessageInjectionOutcome.REJECTED_RETRYABLE:
-            # A fenced execution wrote nothing. Restore the prelease like any
-            # confirmed rejection, but never resume the fenced run.
+        if disposition is InjectionDisposition.NOT_ACCEPTED_RETRYABLE:
+            # Nothing was written (a fenced run, or a read-back that proved
+            # absence). Restore the prelease, never resume a fenced run, and
+            # tell the caller to resend under a new identity. The disposition
+            # is known even if the restore fails and TTL recovery must run.
             cleanup_task = asyncio.create_task(stop_and_restore_prelease())
             if not await drain_async_task_cancellation_safe(cleanup_task):
-                raise TaskLeaseLostError(
-                    f"Task {task_id} lease changed before reply rejection"
+                logger.error(
+                    "SDK reply for task %s was not accepted, but its prelease "
+                    "could not be restored; retained for TTL recovery",
+                    task_id,
                 )
-            raise TaskResumeBusyError
+            raise TaskResumeNotAcceptedError
 
-        message_posted = bool(posted)
-        if not posted:
+        message_posted = disposition is InjectionDisposition.ACCEPTED
+        if disposition is InjectionDisposition.DEFER:
             # No run-fenced checkpoint is available to resume onto. Never
             # fabricate a run or fall back to a transcript replay: release
             # the exact prelease back to waiting_for_user and fail closed

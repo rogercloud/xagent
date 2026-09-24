@@ -84,6 +84,10 @@ class UserMessageInjectionOutcome(str, Enum):
     nothing, so the message was not accepted and may be resent under a new
     id. Unlike NOT_POSTED it must not be deferred, since deferral resumes the
     fenced run. It is truthy, so handle it before any truthiness test.
+
+    Service layers do not interpret these values themselves: they pass the
+    returned value, the recorded attempt evidence and any escaped error to
+    ``classify_injection``.
     """
 
     NOT_POSTED = ""
@@ -142,11 +146,84 @@ class UserMessageInjectionResult:
 
 
 class UserMessageInjectionRejectedError(RuntimeError):
-    """An authoritative read proved that the attempted turn did not land."""
+    """An authoritative read proved that the attempted turn did not land.
+
+    Callers do not branch on this type directly: ``classify_injection`` maps
+    it to ``NOT_ACCEPTED_RETRYABLE``. Unlike ``REJECTED_RETRYABLE`` the
+    context is not fenced, since the read-back settled the only write.
+    """
 
 
 class UserMessageInjectionConflictError(ValueError):
     """The turn identity conflicts with an existing message, before any write."""
+
+
+class InjectionDisposition(str, Enum):
+    """What one injection attempt means for the input it carried.
+
+    ``classify_injection`` is the only place that derives it; each service
+    path maps a disposition onto its own protocol and task lifecycle.
+
+    ACCEPTED: the turn is durable. A later error or cancellation cannot undo
+    that and must not be reported as unknown or failed.
+    DEFER: no usable live context and nothing was written; the input may be
+    handed to a later owner.
+    NOT_ACCEPTED_RETRYABLE: nothing was written, proven either by a fenced
+    rejection or by an authoritative read-back. The sender may resend under a
+    new id. Never defer it and never resume a fenced run for it.
+    UNKNOWN: a write started and acceptance cannot be established. Never
+    reinject or resume automatically.
+    FAILED_BEFORE_WRITE: an error escaped before any write started; the
+    caller keeps its existing handling for that error.
+    """
+
+    ACCEPTED = "accepted"
+    DEFER = "defer"
+    NOT_ACCEPTED_RETRYABLE = "not_accepted_retryable"
+    UNKNOWN = "unknown"
+    FAILED_BEFORE_WRITE = "failed_before_write"
+
+
+_ACCEPTED_INJECTION_OUTCOMES = frozenset(
+    {
+        UserMessageInjectionOutcome.POSTED_FRESH,
+        UserMessageInjectionOutcome.POSTED_REPLAY,
+    }
+)
+
+
+def classify_injection(
+    attempt_outcome: UserMessageInjectionOutcome,
+    posted: UserMessageInjectionOutcome | None = None,
+    error: BaseException | None = None,
+) -> InjectionDisposition:
+    """Classify one attempt from its recorded evidence and how it ended.
+
+    ``attempt_outcome`` is ``UserMessageInjectionAttempt.outcome`` read after
+    the call settled. Pass ``posted`` when the call returned and ``error``
+    when it raised (including cancellation). Recorded acceptance wins over
+    any later error, because it is recorded only after the durable write.
+    """
+    if attempt_outcome in _ACCEPTED_INJECTION_OUTCOMES:
+        return InjectionDisposition.ACCEPTED
+    if error is not None:
+        if isinstance(error, UserMessageInjectionRejectedError):
+            return InjectionDisposition.NOT_ACCEPTED_RETRYABLE
+        if attempt_outcome is UserMessageInjectionOutcome.OUTCOME_UNKNOWN:
+            return InjectionDisposition.UNKNOWN
+        if attempt_outcome is UserMessageInjectionOutcome.REJECTED_RETRYABLE:
+            return InjectionDisposition.NOT_ACCEPTED_RETRYABLE
+        return InjectionDisposition.FAILED_BEFORE_WRITE
+    outcome = attempt_outcome if posted is None else posted
+    if not isinstance(outcome, UserMessageInjectionOutcome):
+        raise TypeError(f"Unexpected injection outcome {outcome!r}")
+    if outcome in _ACCEPTED_INJECTION_OUTCOMES:
+        return InjectionDisposition.ACCEPTED
+    if outcome is UserMessageInjectionOutcome.OUTCOME_UNKNOWN:
+        return InjectionDisposition.UNKNOWN
+    if outcome is UserMessageInjectionOutcome.REJECTED_RETRYABLE:
+        return InjectionDisposition.NOT_ACCEPTED_RETRYABLE
+    return InjectionDisposition.DEFER
 
 
 class AgentRunner:

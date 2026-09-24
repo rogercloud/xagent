@@ -9,6 +9,7 @@ import pytest
 from xagent.core.agent.context import ContextManager
 from xagent.core.agent.runner import (
     AgentRunner,
+    UserMessageInjectionConflictError,
     UserMessageInjectionOutcome,
     UserMessageInjectionRejectedError,
 )
@@ -638,3 +639,92 @@ async def test_write_only_checkpoint_wrapper_cannot_claim_authoritative_absence(
     with pytest.raises(CheckpointUnavailableError, match="no readable backend"):
         await runner.inject_user_message("atomic", "new", turn_id="new")
     backend.checkpoint.assert_not_awaited()
+
+
+_O = UserMessageInjectionOutcome
+
+
+@pytest.mark.parametrize(
+    "attempt,posted,error,expected",
+    [
+        # Returned outcomes.
+        (_O.POSTED_FRESH, _O.POSTED_FRESH, None, "ACCEPTED"),
+        (_O.POSTED_REPLAY, _O.POSTED_REPLAY, None, "ACCEPTED"),
+        (_O.OUTCOME_UNKNOWN, _O.OUTCOME_UNKNOWN, None, "UNKNOWN"),
+        (_O.REJECTED_RETRYABLE, _O.REJECTED_RETRYABLE, None, "NOT_ACCEPTED_RETRYABLE"),
+        (_O.NOT_POSTED, _O.NOT_POSTED, None, "DEFER"),
+        # A service layer that forwards the value without recording evidence.
+        (_O.NOT_POSTED, _O.POSTED_FRESH, None, "ACCEPTED"),
+        (_O.NOT_POSTED, None, None, "DEFER"),
+        # Recorded acceptance wins over any later error, including cancellation.
+        (_O.POSTED_FRESH, None, asyncio.CancelledError(), "ACCEPTED"),
+        (_O.POSTED_REPLAY, None, RuntimeError("registry event"), "ACCEPTED"),
+        (_O.OUTCOME_UNKNOWN, None, asyncio.CancelledError(), "UNKNOWN"),
+        (_O.OUTCOME_UNKNOWN, None, RuntimeError("late"), "UNKNOWN"),
+        (
+            _O.NOT_POSTED,
+            None,
+            UserMessageInjectionRejectedError("absent"),
+            "NOT_ACCEPTED_RETRYABLE",
+        ),
+        (_O.REJECTED_RETRYABLE, None, RuntimeError("lease"), "NOT_ACCEPTED_RETRYABLE"),
+        (_O.NOT_POSTED, None, RuntimeError("read failed"), "FAILED_BEFORE_WRITE"),
+        (_O.NOT_POSTED, None, asyncio.CancelledError(), "FAILED_BEFORE_WRITE"),
+        (
+            _O.NOT_POSTED,
+            None,
+            UserMessageInjectionConflictError("conflict"),
+            "FAILED_BEFORE_WRITE",
+        ),
+    ],
+)
+def test_classify_injection_rules(attempt, posted, error, expected):
+    from xagent.core.agent.runner import InjectionDisposition, classify_injection
+
+    assert classify_injection(attempt, posted=posted, error=error) is getattr(
+        InjectionDisposition, expected
+    )
+
+
+def test_classify_injection_rejects_untyped_outcome():
+    from xagent.core.agent.runner import classify_injection
+
+    with pytest.raises(TypeError):
+        classify_injection(_O.NOT_POSTED, posted=False)
+
+
+@pytest.mark.asyncio
+async def test_real_runner_outcomes_classify_at_the_write_boundary(live):
+    """The classifier agrees with what the runner actually records."""
+    from xagent.core.agent.runner import (
+        InjectionDisposition,
+        classify_injection,
+        track_user_message_injection,
+    )
+
+    runner, context, tracer = live
+    # Confirmed absence: the write failed and the read-back shows no turn.
+    tracer.checkpoint.side_effect = RuntimeError("write failed")
+    with track_user_message_injection() as attempt:
+        with pytest.raises(UserMessageInjectionRejectedError) as rejected:
+            await runner.inject_user_message("atomic", "new", turn_id="absent")
+    assert (
+        classify_injection(attempt.outcome, error=rejected.value)
+        is InjectionDisposition.NOT_ACCEPTED_RETRYABLE
+    )
+
+    # Accepted, then cancelled while tracing the accepted turn.
+    tracer.checkpoint.side_effect = None
+
+    async def cancelled_callback(**kwargs):
+        raise asyncio.CancelledError()
+
+    runner.callbacks = [SimpleNamespace(on_user_message_posted=cancelled_callback)]
+    with track_user_message_injection() as attempt:
+        with pytest.raises(asyncio.CancelledError) as cancelled:
+            await runner.inject_user_message("atomic", "new", turn_id="accepted")
+    assert context.messages[-1].content == "new"
+    assert (
+        classify_injection(attempt.outcome, error=cancelled.value)
+        is InjectionDisposition.ACCEPTED
+    )

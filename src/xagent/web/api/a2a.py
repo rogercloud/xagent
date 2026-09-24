@@ -256,6 +256,15 @@ async def _start_a2a_turn(
             status_code=504,
             details={"accepted": True, "taskId": task_id, "commandId": exc.command_id},
         ) from exc
+    except task_resume_service.TaskResumeNotAcceptedError as exc:
+        # Nothing was written for this messageId, and replaying it returns
+        # this same answer: the client must resend under a new messageId.
+        raise a2a_error(
+            "unsupported_operation",
+            "The message was not accepted. Resend it with a new messageId.",
+            status_code=400,
+            details={"taskId": task_id, "accepted": False, "retryWithNewId": True},
+        ) from exc
     except task_resume_service.TaskResumeBusyError as exc:
         raise a2a_error(
             "unsupported_operation",
