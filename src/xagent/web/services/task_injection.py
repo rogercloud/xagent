@@ -85,6 +85,11 @@ def clear_injection(lease: TaskLease, turn_id: str, *, rejected: bool = False) -
                 raise TaskLeaseLostError("Injection identity changed before settlement")
             if rejected:
                 from ..models.chat_message import TaskChatMessage
+                from .chat_history_service import (
+                    DELIVERY_FAILED,
+                    DELIVERY_OUTCOME_UNKNOWN,
+                    DELIVERY_PENDING,
+                )
 
                 _settle_reply_command(db, task, pending, "not_resumable")
 
@@ -92,9 +97,11 @@ def clear_injection(lease: TaskLease, turn_id: str, *, rejected: bool = False) -
                     TaskChatMessage.task_id == lease.task_id,
                     TaskChatMessage.turn_id == turn_id,
                     TaskChatMessage.role == "user",
-                    TaskChatMessage.delivery_status.in_(("pending", "outcome_unknown")),
+                    TaskChatMessage.delivery_status.in_(
+                        (DELIVERY_PENDING, DELIVERY_OUTCOME_UNKNOWN)
+                    ),
                 ).update(
-                    {TaskChatMessage.delivery_status: "failed"},
+                    {TaskChatMessage.delivery_status: DELIVERY_FAILED},
                     synchronize_session=False,
                 )
             setattr(task, "pending_injection", None)
