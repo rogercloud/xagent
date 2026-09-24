@@ -662,7 +662,7 @@ async def resume_a2a_task(
                 prelease_cleanup_done = True
                 if isinstance(exc, asyncio.CancelledError):
                     raise
-                raise TaskResumeOutcomeUnknownError() from exc
+                raise TaskResumeOutcomeUnknownError(message_id) from exc
         if (
             preacquired_lease is not None
             and injection_started
@@ -1200,7 +1200,7 @@ async def resume_task_reply(
                 prelease_cleanup_done = True
                 if isinstance(exc, asyncio.CancelledError):
                     raise
-                raise TaskResumeOutcomeUnknownError() from exc
+                raise TaskResumeOutcomeUnknownError(turn_id) from exc
         if (
             preacquired_lease is not None
             and injection_started

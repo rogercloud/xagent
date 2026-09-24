@@ -1601,6 +1601,11 @@ def _finalize_task_execution_result_isolated(
         final_task_status = pre_run_status.value
 
         if task_updated is not None:
+            preserve_completed_output = (
+                task_updated.pending_injection is not None
+                and result.get("success", False)
+                and result.get("status") not in {"interrupted", "waiting_for_user"}
+            )
             if task_updated.pending_injection is not None:
                 # A journaled input owns the next turn. The old pattern may
                 # have failed its now-blocked checkpoint while draining.
@@ -1611,6 +1616,7 @@ def _finalize_task_execution_result_isolated(
                 else {}
             )
             if task_agent_config.get("a2a_state") == "TASK_STATE_CANCELED":
+                preserve_completed_output = False
                 waiting_for_control = True
                 logger.info(
                     "Task %s was canceled while execution was in flight; "
@@ -1657,8 +1663,9 @@ def _finalize_task_execution_result_isolated(
                     task_updated,
                     task_updated.status,
                 )
-                finalize_db.commit()
-                metadata_committed = True
+                if not preserve_completed_output:
+                    finalize_db.commit()
+                    metadata_committed = True
                 terminal_state_committed = True
                 waiting_for_control = True
             elif task_updated.status not in {
@@ -1697,7 +1704,7 @@ def _finalize_task_execution_result_isolated(
                 terminal_state_committed = True
 
             final_task_status = task_updated.status.value
-            if not waiting_for_control:
+            if not waiting_for_control or preserve_completed_output:
                 if task_user_id is None:
                     raise ValueError(
                         f"Task {task_id}: cannot persist assistant message "
@@ -1720,6 +1727,7 @@ def _finalize_task_execution_result_isolated(
                     "output",
                     history_content
                     if task_updated.status == TaskStatus.COMPLETED
+                    or preserve_completed_output
                     else None,
                 )
                 persist_assistant_message_no_commit(
@@ -2402,6 +2410,11 @@ def _finalize_resumed_task(
             final_task_status = TaskStatus.COMPLETED
         else:
             final_task_status = TaskStatus.FAILED
+
+        if task.pending_injection is not None:
+            # The completed turn's output can still be saved below, but the
+            # unresolved input needs a paused owner handoff, not termination.
+            final_task_status = TaskStatus.PAUSED
 
         control_snapshot = apply_task_control_transition(
             task,

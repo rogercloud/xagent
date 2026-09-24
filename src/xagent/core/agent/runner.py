@@ -106,6 +106,10 @@ class UserMessageInjectionRejectedError(RuntimeError):
     """An authoritative read proved that the attempted turn did not land."""
 
 
+class UserMessageInjectionConflictError(ValueError):
+    """The turn identity conflicts with an existing message, before any write."""
+
+
 class AgentRunner:
     """Execute an agent by materializing an execution context and invoking patterns."""
 
@@ -656,7 +660,7 @@ class AgentRunner:
                     ):
                         continue
                     if existing.content != resolved_execution_message:
-                        raise ValueError(
+                        raise UserMessageInjectionConflictError(
                             "turn_id is already associated with a different user message"
                         )
                     if request_interrupt:

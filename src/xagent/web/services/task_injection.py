@@ -8,8 +8,13 @@ from typing import Any, cast
 from pydantic import BaseModel, ConfigDict
 from sqlalchemy import select
 
-from ...core.agent.checkpoint import CheckpointReadError
+from ...core.agent.checkpoint import (
+    CheckpointAccessRefusedError,
+    CheckpointCorruptError,
+    CheckpointReadError,
+)
 from ...core.agent.runner import (
+    UserMessageInjectionConflictError,
     UserMessageInjectionOutcome,
     UserMessageInjectionRejectedError,
 )
@@ -107,6 +112,31 @@ def clear_injection(lease: TaskLease, turn_id: str, *, rejected: bool = False) -
             setattr(task, "pending_injection", None)
 
 
+def suspend_injection_recovery(lease: TaskLease, turn_id: str) -> None:
+    with get_session_local()() as db, db.begin():
+        if not lock_task_lease_no_commit(db, lease):
+            raise TaskLeaseLostError("Injection owner changed before suspension")
+        task = db.get(Task, lease.task_id)
+        assert task is not None
+        pending = PendingInjection.model_validate(task.pending_injection)
+        if (
+            pending.run_id != lease.run_id
+            or pending.turn_id != turn_id
+            or pending.owner_id != task.user_id
+        ):
+            raise TaskLeaseLostError("Injection identity changed before suspension")
+        setattr(
+            task,
+            "pending_injection",
+            pending.model_copy(update={"auto_resume": False}).model_dump(mode="json"),
+        )
+        setattr(
+            task,
+            "error_message",
+            "Input delivery remains unknown because its checkpoint cannot be read. Repair the checkpoint or access before resuming.",
+        )
+
+
 async def load_pending_injection(lease: TaskLease) -> PendingInjection | None:
     return await run_db_io_cancellation_safe(lambda: _journal(lease, None))
 
@@ -149,6 +179,7 @@ async def post_journaled_message(
         )
     except (
         CheckpointReadError,
+        UserMessageInjectionConflictError,
         UserMessageInjectionRejectedError,
         AutoModelUnavailableError,
         DurableStorageOperationError,
@@ -173,6 +204,19 @@ async def settle_journaled_message(
             turn_id=pending.turn_id,
             files=pending.files,
         )
+    except UserMessageInjectionConflictError:
+        await run_db_io_cancellation_safe(
+            lambda: clear_injection(lease, pending.turn_id, rejected=True)
+        )
+        return UserMessageInjectionOutcome.NOT_POSTED
+    except (CheckpointCorruptError, CheckpointAccessRefusedError):
+        # Retain the original delivery evidence, but do not automatically
+        # retry an unreadable checkpoint forever. Explicit resume can retry
+        # after the checkpoint or access has been repaired.
+        await run_db_io_cancellation_safe(
+            lambda: suspend_injection_recovery(lease, pending.turn_id)
+        )
+        return UserMessageInjectionOutcome.OUTCOME_UNKNOWN
     except UserMessageInjectionRejectedError:
         # Read-back proved absence, but this recovery write failed. Keep the
         # journal for the next owner rather than inviting a new message ID.

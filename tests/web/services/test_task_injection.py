@@ -601,3 +601,202 @@ async def test_public_pause_disables_recovery_without_live_runner(
             "paused" if status == TaskStatus.PAUSED else "pause_requested"
         )
     assert module._pending_candidates(0, 10) == []
+
+
+@pytest.mark.asyncio
+async def test_conflicting_turn_rejects_without_leaving_recovery_journal(owned):
+    from xagent.core.agent.runner import UserMessageInjectionConflictError
+
+    context = ContextManager().create_context(str(owned.task_id))
+    context.add_user_message("different", metadata={"turn_id": "turn"})
+    runner = AgentRunner(SimpleNamespace(llm=None))
+
+    async def inject(*args, **kwargs):
+        return (await runner.inject_user_message(*args, **kwargs)).outcome
+
+    with pytest.raises(UserMessageInjectionConflictError):
+        await post(SimpleNamespace(post_user_message=inject), owned)
+    assert await module.load_pending_injection(owned) is None
+
+    # The same conflict in a previously unresolved journal is terminal too.
+    await post(
+        SimpleNamespace(
+            post_user_message=AsyncMock(
+                return_value=UserMessageInjectionOutcome.OUTCOME_UNKNOWN
+            )
+        ),
+        owned,
+    )
+    runner.tracer = SimpleNamespace(
+        load_latest_checkpoint=AsyncMock(return_value={"context": context.to_dict()})
+    )
+
+    async def settle(*args, **kwargs):
+        return (
+            await runner.settle_injection_against_checkpoint(*args, **kwargs)
+        ).outcome
+
+    pending = await module.load_pending_injection(owned)
+    assert pending is not None
+    assert (
+        await module.settle_journaled_message(
+            SimpleNamespace(settle_injection_against_checkpoint=settle), owned, pending
+        )
+        is UserMessageInjectionOutcome.NOT_POSTED
+    )
+    assert await module.load_pending_injection(owned) is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "error_name", ["CheckpointCorruptError", "CheckpointAccessRefusedError"]
+)
+async def test_unreadable_checkpoint_suspends_automatic_recovery(owned, error_name):
+    from xagent.core.agent import checkpoint
+    from xagent.web.services.task_lease_recovery import (
+        recover_expired_task_leases_batch_isolated,
+    )
+
+    await post(
+        SimpleNamespace(
+            post_user_message=AsyncMock(
+                return_value=UserMessageInjectionOutcome.OUTCOME_UNKNOWN
+            )
+        ),
+        owned,
+    )
+    pending = await module.load_pending_injection(owned)
+    assert pending is not None
+    service = SimpleNamespace(
+        settle_injection_against_checkpoint=AsyncMock(
+            side_effect=getattr(checkpoint, error_name)("unreadable")
+        )
+    )
+    assert (
+        await module.settle_journaled_message(service, owned, pending)
+        is UserMessageInjectionOutcome.OUTCOME_UNKNOWN
+    )
+    with get_session_local()() as db, db.begin():
+        db.get(Task, owned.task_id).lease_expires_at = datetime.now(
+            timezone.utc
+        ) - timedelta(seconds=1)
+    recover_expired_task_leases_batch_isolated(
+        cutoff=datetime.now(timezone.utc), batch_size=10, after=None
+    )
+    with get_session_local()() as db:
+        task = db.get(Task, owned.task_id)
+        assert task.status == TaskStatus.PAUSED
+        assert task.pending_injection["turn_id"] == "turn"
+        assert task.pending_injection["auto_resume"] is False
+        assert "delivery remains unknown" in task.error_message
+    assert module._pending_candidates(0, 10) == []
+
+
+def test_recovery_observes_journal_written_after_snapshot(owned, monkeypatch):
+    from xagent.web.services import task_lease_recovery as recovery
+
+    with get_session_local()() as db, db.begin():
+        db.get(Task, owned.task_id).lease_expires_at = datetime.now(
+            timezone.utc
+        ) - timedelta(seconds=1)
+    original = recovery.recover_expired_task_lease_no_commit
+
+    def land_journal_then_recover(db, candidate, **kwargs):
+        assert kwargs["status"] == TaskStatus.FAILED
+        module._journal(
+            owned,
+            dict(execution_message="answer", display_message="answer", turn_id="turn"),
+        )
+        return original(db, candidate, **kwargs)
+
+    monkeypatch.setattr(
+        recovery, "recover_expired_task_lease_no_commit", land_journal_then_recover
+    )
+    result = recovery.recover_expired_task_leases_batch_isolated(
+        cutoff=datetime.now(timezone.utc), batch_size=10, after=None
+    )
+    assert result.recovered == 1
+    with get_session_local()() as db:
+        task = db.get(Task, owned.task_id)
+        assert task.status == TaskStatus.PAUSED
+        assert task.control_state == "paused"
+        assert task.pending_injection is not None
+        assert task.runner_id is None
+    assert module._pending_candidates(0, 10)[0][0] == owned.task_id
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "status,success",
+    [("completed", True), ("failed", False), ("waiting_for_user", False)],
+)
+async def test_resumed_finalizer_hands_pending_input_to_recovery(
+    owned, status, success
+):
+    from xagent.web.services import task_execution as execution
+
+    await post(
+        SimpleNamespace(
+            post_user_message=AsyncMock(
+                return_value=UserMessageInjectionOutcome.OUTCOME_UNKNOWN
+            )
+        ),
+        owned,
+    )
+    result = execution._finalize_resumed_task(
+        owned.task_id,
+        status=status,
+        success=success,
+        output="final answer" if success else "",
+        task_owner_user_id=1,
+        result={"status": status, "success": success},
+        task_lease=owned,
+        prepared_outputs=execution._PreparedTaskFileOutputs((), (), ()),
+    )
+    with get_session_local()() as db:
+        task = db.get(Task, owned.task_id)
+        assert task.status == TaskStatus.PAUSED
+        assert task.pending_injection is not None
+        assert task.runner_id is None
+        if success:
+            assert task.output == "final answer"
+    assert result["final_status"] == "paused"
+    assert result["lease_released"] is True
+    assert module._pending_candidates(0, 10)[0][0] == owned.task_id
+
+
+@pytest.mark.asyncio
+async def test_first_finalizer_keeps_successful_answer_during_input_handoff(owned):
+    from xagent.web.models.chat_message import TaskChatMessage
+    from xagent.web.services import task_execution as execution
+
+    await post(
+        SimpleNamespace(
+            post_user_message=AsyncMock(
+                return_value=UserMessageInjectionOutcome.POSTED_FRESH
+            )
+        ),
+        owned,
+    )
+    execution._finalize_task_execution_result_isolated(
+        task_id=owned.task_id,
+        task_user_id=1,
+        pre_run_status=TaskStatus.RUNNING,
+        result={"status": "completed", "success": True, "output": "final answer"},
+        expected_run_id=owned.run_id,
+        task_lease=owned,
+        resolved_scope_segments=(),
+        prepared_outputs=execution._PreparedTaskFileOutputs((), (), ()),
+    )
+    with get_session_local()() as db:
+        task = db.get(Task, owned.task_id)
+        assert task.status == TaskStatus.PAUSED
+        assert task.output == "final answer"
+        assert task.pending_injection is not None
+        assert (
+            db.query(TaskChatMessage)
+            .filter_by(task_id=owned.task_id, role="assistant")
+            .one()
+            .content
+            == "final answer"
+        )

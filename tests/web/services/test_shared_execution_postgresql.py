@@ -79,3 +79,69 @@ def test_postgres_handoff_completion_and_lease_are_atomic(monkeypatch, fail_comp
                 assert task.status == TaskStatus.RUNNING
                 assert row.status == "completed"
                 assert row.result["lease_attempt_id"] == task.lease_attempt_id
+
+
+def test_recovery_keeps_journal_committed_after_candidate_read(monkeypatch):
+    from datetime import timedelta
+
+    from xagent.web.services import task_injection, task_lease_recovery
+    from xagent.web.services.task_lease_service import (
+        TaskLease,
+        get_expired_task_lease_candidates,
+        utc_now,
+    )
+
+    with disposable_database_factory("input_recovery") as make_database:
+        engine = make_database("journal_race")
+        Base.metadata.create_all(engine)
+        sessions = sessionmaker(bind=engine)
+        monkeypatch.setattr(task_injection, "get_session_local", lambda: sessions)
+        with sessions() as db, db.begin():
+            owner = User(username="owner", password_hash="unused")
+            db.add(owner)
+            db.flush()
+            task = Task(
+                user_id=owner.id,
+                title="Recovery",
+                status=TaskStatus.RUNNING,
+                run_id="run",
+                runner_id="worker",
+                lease_attempt_id="attempt",
+                state_version=1,
+                control_state="running",
+                lease_expires_at=utc_now() - timedelta(seconds=1),
+            )
+            db.add(task)
+            db.flush()
+            lease = TaskLease(task.id, "worker", "run", "attempt")
+        original = task_lease_recovery.recover_expired_task_lease_no_commit
+
+        def inject_before_update(db, candidate, **kwargs):
+            assert kwargs["status"] == TaskStatus.FAILED
+            task_injection._journal(
+                lease,
+                dict(
+                    execution_message="answer", display_message="answer", turn_id="turn"
+                ),
+            )
+            return original(db, candidate, **kwargs)
+
+        monkeypatch.setattr(
+            task_lease_recovery,
+            "recover_expired_task_lease_no_commit",
+            inject_before_update,
+        )
+        with sessions() as db, db.begin():
+            candidate = get_expired_task_lease_candidates(
+                db, cutoff=utc_now(), limit=1
+            )[0]
+            status = task_lease_recovery.recover_task_lease_candidate_no_commit(
+                db, candidate, recovered_at=utc_now()
+            )
+            assert status == TaskStatus.PAUSED
+        with sessions() as db:
+            task = db.get(Task, lease.task_id)
+            assert task.status == TaskStatus.PAUSED
+            assert task.control_state == "paused"
+            assert task.runner_id is None
+            assert task.pending_injection["turn_id"] == "turn"

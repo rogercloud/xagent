@@ -6,6 +6,7 @@ import asyncio
 import logging
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from typing import cast
 
 from sqlalchemy.orm import Session
 
@@ -67,10 +68,6 @@ def recover_task_lease_candidate_no_commit(
     next_status = (
         TaskStatus.PAUSED
         if verdict is CheckpointRecoveryVerdict.RECOVERABLE
-        or db.query(Task.pending_injection)
-        .filter(Task.id == candidate.task_id)
-        .scalar()
-        is not None
         else TaskStatus.FAILED
     )
     task_error = None if next_status == TaskStatus.PAUSED else TASK_LEASE_EXPIRED_ERROR
@@ -86,6 +83,7 @@ def recover_task_lease_candidate_no_commit(
 
     db.expire_all()
     task = db.query(Task).filter(Task.id == candidate.task_id).one()
+    next_status = cast(TaskStatus, task.status)
     sync_workforce_run_status(db, task, next_status)
     sync_trigger_run_status(
         db,

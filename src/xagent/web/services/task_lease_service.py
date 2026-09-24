@@ -14,7 +14,7 @@ from datetime import datetime, timedelta, timezone
 from enum import Enum
 from typing import Any, Callable, Coroutine, Iterator, Sequence, TypeVar, cast
 
-from sqlalchemy import and_, case, false, func, or_, select, text, update
+from sqlalchemy import and_, case, false, func, literal, or_, select, text, update
 from sqlalchemy.exc import MultipleResultsFound
 from sqlalchemy.orm import Query, Session
 from sqlalchemy.sql.elements import ColumnElement
@@ -760,14 +760,22 @@ def recover_expired_task_lease_no_commit(
     if status not in {TaskStatus.PAUSED, TaskStatus.FAILED}:
         raise ValueError("expired task leases can only recover to PAUSED or FAILED")
 
+    # A journal may commit after the recovery snapshot was read. Decide its
+    # lifecycle in this same fenced UPDATE, never from an earlier SELECT.
+    has_pending = Task.pending_injection.is_not(None)
     values: dict[str, Any] = {
-        "status": task_status_predicate.value(status),
+        "status": case(
+            (has_pending, literal(TaskStatus.PAUSED, type_=Task.status.type)),
+            else_=literal(task_status_predicate.value(status), type_=Task.status.type),
+        ).cast(Task.status.type),
         "runner_id": None,
         "lease_expires_at": None,
         "last_heartbeat_at": recovered_at,
-        "control_state": control_state_for_status(status).value,
+        "control_state": case(
+            (has_pending, "paused"), else_=control_state_for_status(status).value
+        ),
         "state_version": func.coalesce(Task.state_version, 0) + 1,
-        "error_message": error_message,
+        "error_message": case((has_pending, Task.error_message), else_=error_message),
         # Defence in depth: the column must never outlive the attempt that
         # wrote it. This writer already NULLs runner_id, so no live fence
         # depends on the value -- clearing it keeps the column honest for
@@ -775,7 +783,7 @@ def recover_expired_task_lease_no_commit(
         "lease_attempt_id": None,
     }
     if status == TaskStatus.FAILED:
-        values["output"] = None
+        values["output"] = case((has_pending, Task.output), else_=None)
 
     statement = (
         update(Task)
