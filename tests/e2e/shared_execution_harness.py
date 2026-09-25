@@ -339,6 +339,8 @@ class SharedExecutionApp:
             except EOFError:
                 pytest.fail(self.diagnostics())
             if role in {"web", "combined"}:
+                if self.client is not None:
+                    self.client.close()
                 self.client = httpx.Client(
                     base_url=f"http://127.0.0.1:{ready['port']}", timeout=30
                 )
