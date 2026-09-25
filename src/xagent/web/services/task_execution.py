@@ -2407,7 +2407,12 @@ def _finalize_resumed_task(
             return finalized
         if result.get("injection_outcome_unknown") and task.status == TaskStatus.FAILED:
             # Explicit cancellation/failure already owns the terminal result.
-            release_task_lease_no_commit(db, task_lease, status=TaskStatus.FAILED)
+            if not release_task_lease_no_commit(
+                db, task_lease, status=TaskStatus.FAILED
+            ):
+                db.rollback()
+                finalized["late_result"] = True
+                return finalized
             db.commit()
             finalized["late_result"] = True
             return finalized

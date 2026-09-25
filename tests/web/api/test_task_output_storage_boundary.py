@@ -769,6 +769,74 @@ def test_lost_resume_owner_compensates_new_version_without_deleting_committed_ob
         get_unscoped_file_storage.cache_clear()
 
 
+@pytest.mark.parametrize("release_succeeds", [True, False])
+def test_resumed_unknown_failed_result_commits_only_a_confirmed_release(
+    monkeypatch: pytest.MonkeyPatch,
+    release_succeeds: bool,
+) -> None:
+    task_id, user_id = _seed_running_task(
+        runner_id="failed-runner",
+        run_id="failed-run",
+    )
+    db = _direct_db_session()
+    try:
+        task = db.query(Task).filter(Task.id == task_id).one()
+        task.status = TaskStatus.FAILED
+        db.commit()
+    finally:
+        db.close()
+
+    real_release = task_execution_service.release_task_lease_no_commit
+
+    def release(db: Any, lease: TaskLease, **kwargs: Any) -> bool:
+        db.query(Task).filter(Task.id == lease.task_id).update(
+            {Task.error_message: "written before release"},
+            synchronize_session=False,
+        )
+        if release_succeeds:
+            return real_release(db, lease, **kwargs)
+        return False
+
+    monkeypatch.setattr(task_execution_service, "release_task_lease_no_commit", release)
+    prepared = task_execution_service._prepare_task_file_outputs_isolated(
+        task_id=task_id,
+        task_user_id=user_id,
+        file_outputs=[],
+        resolved_scope_segments=(),
+    )
+
+    finalized = task_execution_service._finalize_resumed_task(
+        task_id,
+        status="interrupted",
+        success=False,
+        output=None,
+        task_owner_user_id=user_id,
+        result={"success": False, "injection_outcome_unknown": True},
+        task_lease=TaskLease(
+            attempt_id="test-attempt",
+            task_id=task_id,
+            runner_id="failed-runner",
+            run_id="failed-run",
+        ),
+        prepared_outputs=prepared,
+    )
+
+    assert finalized["late_result"]
+    check_db = _direct_db_session()
+    try:
+        task = check_db.query(Task).filter(Task.id == task_id).one()
+        assert task.status == TaskStatus.FAILED
+        if release_succeeds:
+            assert task.runner_id is None
+            assert task.error_message == "written before release"
+        else:
+            # A failed release must not commit anything flushed before it.
+            assert task.runner_id == "failed-runner"
+            assert task.error_message != "written before release"
+    finally:
+        check_db.close()
+
+
 def test_superseded_output_is_deleted_only_after_exact_metadata_commit(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
