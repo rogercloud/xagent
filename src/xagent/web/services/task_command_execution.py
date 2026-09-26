@@ -3659,8 +3659,11 @@ async def _answer_message_outcome_unknown(
     The ingress ack only accepted the command into the inbox, so the terminal
     delivery outcome is reported before its personal route is retired. When
     no origin connection can receive it (the origin disconnected, or another
-    worker holds it), the notice is also published task-wide so the sender's
-    other views still learn the message will not be retried automatically.
+    worker holds it), the notice is also published to every subscriber of the
+    task, so whoever is watching it -- the sender's other views included --
+    learns the message will not be retried automatically. It carries only
+    ids, the error code and the generic client-safe text, never the message
+    body.
     """
 
     message = client_error_message(ClientErrorCode.MESSAGE_OUTCOME_UNKNOWN)
