@@ -1685,12 +1685,13 @@ def _finalize_task_execution_result_isolated(
                     or result.get("status") == "waiting_for_user"
                 )
             ) or result.get("status") == "interrupted":
-                # Unknown input never resumes on its own, even when a resume
-                # was requested mid-run; the resumed finalizer does the same.
+                # A resume requested mid-run carries input that was already
+                # accepted. Its handoff acquires the lease without reading this
+                # state and resumes from the checkpoint, even when later input
+                # became unknown, so keep the row saying a resume is coming.
                 next_control_state = (
                     TaskControlState.RESUME_REQUESTED
-                    if not result.get("injection_outcome_unknown")
-                    and task_updated.control_state
+                    if task_updated.control_state
                     == TaskControlState.RESUME_REQUESTED.value
                     else TaskControlState.PAUSED
                 )

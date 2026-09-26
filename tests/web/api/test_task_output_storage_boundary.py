@@ -506,20 +506,20 @@ def test_late_result_files_commit_only_with_a_pause_transition(
 
 
 @pytest.mark.parametrize(
-    ("variant", "expected_control"),
-    [
-        ("unknown_success", "paused"),
-        ("unknown_waiting", "paused"),
-        ("interrupted", "resume_requested"),
-    ],
+    "variant", ["unknown_success", "unknown_waiting", "interrupted"]
 )
-def test_first_run_unknown_input_never_keeps_a_pending_resume(
+def test_first_run_keeps_a_pending_resume_for_input_accepted_earlier(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     variant: str,
-    expected_control: str,
 ) -> None:
-    """Unknown input pauses even when a resume was requested mid-run."""
+    """A resume requested for earlier input survives later unknown input.
+
+    Message A was accepted and its handoff is waiting on this run; message B
+    then became unknown. The finalizer keeps ``resume_requested`` and A's
+    handoff still acquires the lease, since acquisition never reads the
+    control state.
+    """
     run_id = f"first-run-{variant}"
     task_id, user_id = _seed_running_task(runner_id="first-runner", run_id=run_id)
     db = _direct_db_session()
@@ -578,7 +578,7 @@ def test_first_run_unknown_input_never_keeps_a_pending_resume(
         try:
             task = check_db.get(Task, task_id)
             assert task.status == TaskStatus.PAUSED
-            assert task.control_state == expected_control
+            assert task.control_state == "resume_requested"
             # A pause transition owns its files, including an unknown success
             # whose answer is preserved in history.
             assert (
@@ -589,6 +589,16 @@ def test_first_run_unknown_input_never_keeps_a_pending_resume(
             )
             if variant == "unknown_success":
                 assert task.output == "answer produced before the unknown input"
+        finally:
+            check_db.close()
+
+        handoff = task_execution_service._acquire_resume_task_lease(
+            task_id, user_id, run_id
+        )
+        assert handoff is not None
+        check_db = _direct_db_session()
+        try:
+            assert check_db.get(Task, task_id).status == TaskStatus.RUNNING
         finally:
             check_db.close()
     finally:

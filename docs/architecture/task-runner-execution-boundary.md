@@ -140,6 +140,17 @@ that `turn_id` against the checkpoint it rebuilds from, so a turn that was
 written replays instead of being applied twice, and one that was not written is
 applied once.
 
+While the fenced run is still live, input that arrives after an unknown write
+never queues behind it: the fenced context rejects it as not accepted, and the
+client resends it under a new id.
+The reverse order can leave a resume pending. Suppose message A is accepted and
+its handoff is waiting for the current run, and message B then becomes
+unknown. The finalizer keeps `resume_requested`, and A's handoff still
+acquires the lease, because acquisition checks status and run, not the control
+state. It resumes from the checkpoint, so A is delivered, and B is part of the
+resumed context only if its write landed. B's client was already told its
+outcome is unknown, and B is never reinjected.
+
 The runtime records acceptance separately from later tracing and notification
 work, so an exception after a confirmed write cannot mean “not accepted”.
 Cancellation before a write and cancellation during a write have different
