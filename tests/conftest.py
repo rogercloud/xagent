@@ -305,6 +305,8 @@ def _reset_task_keyed_process_state() -> None:
         manager = manager_module.ContextManager()
         for context in manager.list_active_contexts():
             manager.remove_context(context.execution_id)
+        with manager._lock:
+            manager._cold_starts.clear()
     task_execution = sys.modules.get("xagent.web.services.task_execution")
     if task_execution is not None:
         task_execution._pause_accepted_task_ids.clear()
