@@ -6,7 +6,7 @@ import re
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, cast
 
 from sqlalchemy import func, update
 from sqlalchemy.exc import IntegrityError, OperationalError
@@ -1136,7 +1136,7 @@ class DatabaseTraceHandler(BaseTraceHandler):
                     },
                     occurred_at=timestamp,
                 )
-                data = fact.payload["data"]
+                data = cast(dict[str, Any], fact.payload["data"])
                 if is_state:
                     from .task_execution_event_writer import (
                         stage_applied_inputs_no_commit,

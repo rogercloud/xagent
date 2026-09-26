@@ -821,8 +821,12 @@ def test_trace_fact_and_command_acceptance_do_not_deadlock(canonical, engine):
     sa.event.listen(engine, "before_cursor_execute", before_execute)
     try:
         with (
-            ThreadPoolExecutor(max_workers=1, thread_name_prefix="trace-fact") as writers,
-            ThreadPoolExecutor(max_workers=1, thread_name_prefix="accept-command") as commands,
+            ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix="trace-fact"
+            ) as writers,
+            ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix="accept-command"
+            ) as commands,
         ):
             writer = writers.submit(write_trace)
             command = commands.submit(accept_command)
