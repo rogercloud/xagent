@@ -141,7 +141,7 @@ async def seed(stack) -> None:
     assert result.outcome is UserMessageInjectionOutcome.POSTED_FRESH
 
 
-async def test_injection_is_visible_only_after_postgresql_commit(stack):
+async def test_committed_injection_is_visible_and_replays(stack):
     result = await stack.runner.inject_user_message(EXECUTION_ID, "new", turn_id="t1")
 
     assert result.outcome is UserMessageInjectionOutcome.POSTED_FRESH
@@ -320,10 +320,25 @@ async def test_unknown_input_pause_never_revives_an_explicitly_failed_task(
         db.get(Task, leased_task.lease.task_id).status = TaskStatus.FAILED
         db.commit()
 
-    await pause_unknown_task_lease(leased_task.lease)
+    # The exact lease is still released, but nothing was paused or announced.
+    assert await pause_unknown_task_lease(leased_task.lease) is True
 
-    assert load_task(leased_task).status == TaskStatus.FAILED
+    task = load_task(leased_task)
+    assert task.status == TaskStatus.FAILED
+    assert task.lease_attempt_id is None
     leased_task.publish.assert_not_awaited()
+
+
+async def _lock_waiter_appears(engine) -> None:
+    query = text(
+        "SELECT count(*) FROM pg_stat_activity "
+        "WHERE datname = current_database() AND wait_event_type = 'Lock'"
+    )
+    while True:
+        with engine.connect() as probe:
+            if probe.execute(query).scalar_one():
+                return
+        await asyncio.sleep(0.02)
 
 
 async def test_unknown_input_pause_waits_for_a_concurrent_row_lock(leased_task):
@@ -335,8 +350,9 @@ async def test_unknown_input_pause_waits_for_a_concurrent_row_lock(leased_task):
     )
     try:
         pause = asyncio.create_task(pause_unknown_task_lease(leased_task.lease))
-        await asyncio.sleep(0.5)
-        # FOR UPDATE blocks the settlement instead of racing past the holder.
+        # Observe the settlement actually waiting on the row lock rather than
+        # inferring it from elapsed time.
+        await asyncio.wait_for(_lock_waiter_appears(leased_task.engine), 10)
         assert not pause.done()
         assert load_task(leased_task).status == TaskStatus.RUNNING
     finally:

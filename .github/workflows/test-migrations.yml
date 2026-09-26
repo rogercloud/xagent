@@ -138,6 +138,7 @@ on:
       - 'tests/web/services/test_task_retention_purge_postgresql.py'
       - 'src/xagent/core/agent/runner.py'
       - 'src/xagent/core/agent/runtime.py'
+      - 'src/xagent/core/agent/context/execution.py'
       - 'src/xagent/core/agent/trace.py'
       - 'tests/web/services/test_injection_atomicity_postgresql.py'
   pull_request:
@@ -314,6 +315,7 @@ jobs:
             tests/web/services/test_task_retention_purge_postgresql.py
             src/xagent/core/agent/runner.py
             src/xagent/core/agent/runtime.py
+            src/xagent/core/agent/context/execution.py
             src/xagent/core/agent/trace.py
             tests/web/services/test_injection_atomicity_postgresql.py
           )
