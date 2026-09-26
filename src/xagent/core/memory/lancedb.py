@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
-from typing import Any, List, Optional, Union
+from typing import Any, Callable, List, Optional, Union
 from uuid import uuid4
 
 import pyarrow as pa  # type: ignore
@@ -18,6 +18,7 @@ from ..model.model import EmbeddingModelConfig
 from ..tools.core.RAG_tools.LanceDB.schema_manager import _safe_close_table
 from .base import MemoryStore
 from .core import MemoryNote, MemoryResponse
+from .retrieval_compatibility import stream_lexical_top_k
 from .schema_migration import (
     MemoryMismatchKind,
     classify_memory_schema_mismatch,
@@ -32,6 +33,7 @@ from .scope_columns import (
     encode_scope_dims,
     scope_dim_where_term,
 )
+from .storage_admission import DormantLanceDBMemoryHandle
 
 logger = logging.getLogger(__name__)
 
@@ -702,6 +704,56 @@ class LanceDBMemoryStore(MemoryStore):
         filters: Optional[dict[str, Any]] = None,
         similarity_threshold: Optional[float] = None,
     ) -> list[MemoryNote]:
+        return self._search(
+            query,
+            k=k,
+            filters=filters,
+            similarity_threshold=similarity_threshold,
+            include_null_vector_fallback=False,
+        )
+
+    def search_with_null_vector_fallback(
+        self,
+        query: str,
+        k: int = 5,
+        filters: Optional[dict[str, Any]] = None,
+        similarity_threshold: Optional[float] = None,
+    ) -> list[MemoryNote]:
+        """Dormant admission primitive that safely supplements ANN results."""
+        return self._search(
+            query,
+            k=k,
+            filters=filters,
+            similarity_threshold=similarity_threshold,
+            include_null_vector_fallback=True,
+        )
+
+    def _residual_note_filter(
+        self, residual_filters: dict[str, Any]
+    ) -> Callable[[MemoryNote], bool]:
+        """Bind the shared filter dispatch to one residual filter set.
+
+        ``_flat_other_filters`` is note-independent, so it is computed once here
+        rather than per scanned row.
+        """
+        other_filters = self._flat_other_filters(residual_filters)
+        return lambda note: self._matches_filters(note, residual_filters, other_filters)
+
+    def _dormant_memory_handle(self) -> DormantLanceDBMemoryHandle:
+        """This collection as the layer B handle the streaming scan takes."""
+        return DormantLanceDBMemoryHandle(
+            self._vector_store.get_raw_connection(), self._collection_name
+        )
+
+    def _search(
+        self,
+        query: str,
+        k: int = 5,
+        filters: Optional[dict[str, Any]] = None,
+        similarity_threshold: Optional[float] = None,
+        *,
+        include_null_vector_fallback: bool,
+    ) -> list[MemoryNote]:
         """Search memory notes by query text with optional filters.
 
         Known limitation (#916): on the vector path, residual filters —
@@ -725,6 +777,7 @@ class LanceDBMemoryStore(MemoryStore):
                 self._collection_name
             )
             results = []
+            ann_search_completed = False
 
             # #822: push user_id + scope-dimension filters into a `where`
             # prefilter so the ANN returns k already-scoped neighbours; the rest
@@ -753,6 +806,7 @@ class LanceDBMemoryStore(MemoryStore):
                                     where_sql, prefilter=True
                                 )
                             vector_df = vector_query.limit(k).to_pandas()
+                            ann_search_completed = True
 
                             for _, row in vector_df.iterrows():
                                 # Check similarity threshold
@@ -827,6 +881,42 @@ class LanceDBMemoryStore(MemoryStore):
                 logger.warning(
                     f"Embedding generation failed, using text search: {embedding_error}"
                 )
+
+            if include_null_vector_fallback:
+                seen_ids: set[str] = set()
+                deduplicated: list[MemoryNote] = []
+                for note in results:
+                    identity = str(note.id)
+                    if identity not in seen_ids:
+                        seen_ids.add(identity)
+                        deduplicated.append(note)
+                results = deduplicated
+                # Dormant streaming retrieval (#2346): bounded batches, the
+                # scope clause pushed into `where`, and a heap bounded at the
+                # outstanding quota. ANN ids are excluded at the source, so a
+                # duplicate cannot consume a lexical slot.
+                candidates = (
+                    stream_lexical_top_k(
+                        self._dormant_memory_handle(),
+                        query,
+                        k - len(results),
+                        row_to_note=self._dict_to_memory_note,
+                        note_filter_factory=self._residual_note_filter,
+                        filters=filters,
+                        exclude_ids=seen_ids,
+                        null_vectors_only=ann_search_completed,
+                    )
+                    if len(results) < k
+                    else []
+                )
+                for note in candidates:
+                    identity = str(note.id)
+                    if identity not in seen_ids:
+                        seen_ids.add(identity)
+                        results.append(note)
+                    if len(results) >= k:
+                        break
+                return results[:k]
 
             # Fallback to text search if no vector results or vector search failed
             if not results:

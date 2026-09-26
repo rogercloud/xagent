@@ -33,11 +33,18 @@ from ..services.agent_team_scope import (
     get_agent_team_scope,
     owns_agent,
 )
+from ..services.client_error_messages import CLIENT_SAFE_AUTO_MODEL_UNAVAILABLE
 from ..services.deployments import (
     get_deployment,
     get_or_create_deployment,
     new_share_token,
     new_widget_key,
+)
+from ..services.llm_utils import AutoModelUnavailableError
+from ..services.public_trace_events import (
+    DELEGATED_AGENT_TRACE_SOURCE,
+    is_audit_only_trace_data,
+    normalize_public_trace_event,
 )
 from ..services.trace_event_types import GENERAL_ERROR_EVENT_TYPES
 from ..services.trace_message_storage import decode_trace_events_data
@@ -72,11 +79,6 @@ from ..services.workforce_snapshot import (
     validate_workforce_for_run,
 )
 from ..services.workforce_workers import create_workforce_worker
-from .public_trace_events import (
-    DELEGATED_AGENT_TRACE_SOURCE,
-    is_audit_only_trace_data,
-    normalize_public_trace_event,
-)
 
 router = APIRouter(prefix="/api/workforces", tags=["workforces"])
 logger = logging.getLogger(__name__)
@@ -622,7 +624,10 @@ async def create_workforce_from_prompt_endpoint(
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ) -> dict[str, Any]:
-    result = await create_workforce_from_prompt(db, user, prompt=request.prompt)
+    try:
+        result = await create_workforce_from_prompt(db, user, prompt=request.prompt)
+    except AutoModelUnavailableError as exc:
+        raise HTTPException(409, detail=CLIENT_SAFE_AUTO_MODEL_UNAVAILABLE) from exc
     workforce = _reload_workforce(db, result.workforce)
     return _serialize_workforce_detail(
         workforce, user, get_agent_team_scope(db, int(user.id))

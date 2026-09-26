@@ -97,6 +97,7 @@ interface Tool {
   type: string
   category: string
   enabled: boolean
+  always_available: boolean
   [key: string]: any
 }
 
@@ -268,6 +269,10 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
   // Set once loadAgent decides to load an owner-scoped MCP list for an admin
   // cross-user view, so the mount-time self-scoped fetch won't clobber it.
   const ownerScopedMcpRef = useRef(false)
+  // The CURRENT user's general default (not necessarily the agent owner's),
+  // kept so the edit-mode seed below can run whichever mount fetch lands last.
+  const userDefaultGeneralRef = useRef<number | null>(null)
+  const seededGeneralRef = useRef<number | null>(null)
   const router = useRouter()
   const searchParams = useSearchParams()
   const templateId = searchParams.get("template")
@@ -365,6 +370,8 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
   const [kbs, setKbs] = useState<KnowledgeBase[]>([])
   const [skills, setSkills] = useState<Skill[]>([])
   const [tools, setTools] = useState<Tool[]>([])
+  const [intrinsicToolNames, setIntrinsicToolNames] = useState<string[]>([])
+  const [skillLoaderTool, setSkillLoaderTool] = useState<string | null>(null)
   const [mcpServers, setMcpServers] = useState<any[]>([])
   const [isConnectMcpOpen, setIsConnectMcpOpen] = useState(false)
   const [isInitialDataLoaded, setIsInitialDataLoaded] = useState(false)
@@ -706,8 +713,13 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
 
   const fileInputRef = useRef<HTMLInputElement>(null)
   const previewTaskIdRef = useRef<number | null>(null)
+  // Bumped by resetPreviewSession (Clear, mount/unmount); a mismatch silently drops an in-flight send's task and error.
+  const previewGenerationRef = useRef(0)
+  // Bumped by invalidatePreviewTask on config changes; a mismatch still sends the in-flight message but won't cache its task.
+  const previewConfigGenerationRef = useRef(0)
 
   const resetPreviewSession = useCallback(() => {
+    previewGenerationRef.current += 1
     previewTaskIdRef.current = null
     closeFilePreview()
     dispatch({ type: "CLEAR_MESSAGES" })
@@ -720,6 +732,7 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
   }, [closeFilePreview, dispatch, setTaskId])
 
   const invalidatePreviewTask = useCallback(() => {
+    previewConfigGenerationRef.current += 1
     previewTaskIdRef.current = null
   }, [])
 
@@ -731,9 +744,6 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
   }, [resetPreviewSession])
 
   useEffect(() => {
-    if (!previewTaskIdRef.current) {
-      return
-    }
     invalidatePreviewTask()
   }, [instructions, executionMode, selectedKbs, selectedSkills, selectedToolCategories, selectedMcpServers, modelConfig, invalidatePreviewTask])
 
@@ -767,6 +777,9 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
           const toolsData = await toolsRes.json()
           // Filter only enabled tools
           setTools((toolsData.tools || []).filter((t: Tool) => t.enabled))
+          // Unfiltered: the runtime injects these without reading ToolConfig.enabled.
+          setIntrinsicToolNames((toolsData.tools || []).filter((t: Tool) => t.always_available).map((t: Tool) => t.name))
+          setSkillLoaderTool(readNonEmptyString(toolsData.skill_loader_tool))
         }
 
         if (mcpRes.ok && !ownerScopedMcpRef.current) {
@@ -788,22 +801,29 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
         if (userDefaultsRes.ok) {
           const userDefaults = await userDefaultsRes.json()
 
-          // Set model config based on user defaults (only for new agent)
+          // One pass: the general-default ref is needed in edit mode too (the
+          // seed effect above reads it), the rest only seeds a new agent.
+          // The shape guards are defensive -- fetchData's catch already
+          // swallows a malformed response, so no test can tell them apart.
+          const config: AgentModelConfig = {
+            general: null,
+            small_fast: null,
+            visual: null,
+            compact: null,
+          }
+          for (const m of Array.isArray(userDefaults) ? userDefaults : []) {
+            const id = m?.model?.id
+            if (!id) continue
+            if (m.config_type === 'general') {
+              config.general = id
+              userDefaultGeneralRef.current = id
+            }
+            else if (m.config_type === 'small_fast') config.small_fast = id
+            else if (m.config_type === 'visual') config.visual = id
+            else if (m.config_type === 'compact') config.compact = id
+          }
+
           if (!isEditMode) {
-            const config: AgentModelConfig = {
-              general: null,
-              small_fast: null,
-              visual: null,
-              compact: null,
-            }
-
-            for (const m of userDefaults) {
-              if (m.config_type === 'general') config.general = m.model.id
-              else if (m.config_type === 'small_fast') config.small_fast = m.model.id
-              else if (m.config_type === 'visual') config.visual = m.model.id
-              else if (m.config_type === 'compact') config.compact = m.model.id
-            }
-
             // Fallback: If no general model set, pick first available LLM
             if (!config.general && availableModels.length > 0) {
               // models endpoint was called with ?category=llm so these should be LLMs
@@ -838,6 +858,22 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
     }
   }
 
+  // Server-side creation paths persisted no model config, which rendered "--"
+  // and tripped the required-model guard on save. Both mount fetches must have
+  // landed before we can tell an unset slot from one still loading.
+  useEffect(() => {
+    // Not in a read-only cross-user view: the default below is the viewer's,
+    // so seeding there would render someone else's model as this agent's.
+    if (!isEditMode || readOnly || !isInitialDataLoaded || !originalData) return
+    if (seededGeneralRef.current !== null || modelConfig.general) return
+    const seeded = userDefaultGeneralRef.current
+    // Only an id the dropdown can actually show: seeding one that is missing
+    // from the fetched list renders an empty Select while counting as dirty.
+    if (!seeded || !models.some(m => m.id === seeded)) return
+    seededGeneralRef.current = seeded
+    setModelConfig(prev => ({ ...prev, general: seeded }))
+  }, [isEditMode, readOnly, isInitialDataLoaded, originalData, modelConfig.general, models])
+
   // Load agent data in edit mode
   useEffect(() => {
     if (!isEditMode || !localAgentId) return
@@ -857,6 +893,18 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
           if (!active) return
           setOriginalData(agent)
           setReadOnly(agent.can_edit === false)
+          // Same synchronous block as originalData: React 18 does not batch
+          // across the await below, so leaving this after it lets the seed
+          // effect run against a committed originalData and then be clobbered
+          // -- with the ref already stamped, it would never seed again.
+          if (agent.models) {
+            setModelConfig({
+              general: agent.models.general || null,
+              small_fast: agent.models.small_fast || null,
+              visual: agent.models.visual || null,
+              compact: agent.models.compact || null,
+            })
+          }
           setName(agent.name || "")
           setDescription(agent.description || "")
           setInstructions(agent.instructions || "")
@@ -901,16 +949,6 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
 
           setLogoUrl(agent.logo_url || null)
           setLogoRemoved(false)
-
-          // Load models
-          if (agent.models) {
-            setModelConfig({
-              general: agent.models.general || null,
-              small_fast: agent.models.small_fast || null,
-              visual: agent.models.visual || null,
-              compact: agent.models.compact || null,
-            })
-          }
         } else if (response.status === 404) {
           setNotFound(true)
         }
@@ -1062,6 +1100,39 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
     }
   })
 
+  // Depends on mcpServers/officialApps having loaded: a preview sent earlier
+  // falls back to the raw MCP selectors.
+  function buildToolCategories(): string[] {
+    const categories = [...selectedToolCategories]
+    if (selectedKbs.length > 0 && !categories.includes("knowledge")) {
+      categories.push("knowledge")
+    }
+    if (hasSshBindings && !categories.includes("ssh")) {
+      categories.push("ssh")
+    }
+
+    // Add selected MCP servers back into tool_categories, resolved to the
+    // real connected MCPServer row's name -- see resolveMcpToolSelector for
+    // why a hard-coded id/name fallback can't work for every app. Deduped:
+    // two distinct selectedMcpServers entries can resolve to the same real
+    // row, and the backend persists tool_categories verbatim (agents.py),
+    // so an unresolved duplicate here lands in the DB and stays there.
+    const resolvedMcpSelectors = new Set(
+      selectedMcpServers.map(server => resolveMcpToolSelector(server, mcpServers, officialApps))
+    )
+    resolvedMcpSelectors.forEach(selector => categories.push(`mcp:${selector}`))
+    return categories
+  }
+
+  // Same as buildToolCategories() being non-empty, without resolving MCP selectors (which warns).
+  const hasConfiguredTools =
+    selectedToolCategories.length > 0 || selectedKbs.length > 0 || hasSshBindings || selectedMcpServers.length > 0
+  // load_skill is appended outside tool selection, so a zero-tool agent still gets it.
+  const alwaysAvailableToolNames = [
+    ...(hasConfiguredTools ? intrinsicToolNames : []),
+    ...(skillLoaderTool && selectedSkills.length > 0 ? [skillLoaderTool] : []),
+  ]
+
   // Helper function for category descriptions
   function getCategoryDescription(category: string): string {
     const descriptions: Record<string, string> = {
@@ -1105,6 +1176,7 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
   }
 
   const handlePreviewSendMessage = async (content: string, _config?: any, files?: File[]) => {
+    const generationAtStart = previewGenerationRef.current
     try {
       // Check if general model is selected
       if (!modelConfig.general) {
@@ -1134,30 +1206,10 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
         backendMessage = `Uploaded files: ${processedFiles.map(f => f.name).join(', ')}`
       }
 
-      const finalToolCategories = [...selectedToolCategories]
-      // Match handleCreate below: a preview session with a knowledge base
-      // selected must include "knowledge" too, or it runs with different
-      // categories than the agent it's a preview of.
-      if (selectedKbs.length > 0 && !finalToolCategories.includes("knowledge")) {
-        finalToolCategories.push("knowledge")
-      }
-      // Resolve each selection to the real, connected MCPServer row's name
-      // (see resolveMcpToolSelector for why a name/id fallback alone isn't
-      // enough -- the backend uses either convention depending on app
-      // type). Depends on mcpServers/officialApps having loaded; if a
-      // preview message is sent before they do, this falls back to the raw
-      // selector for every MCP tool (matching pre-existing behavior for
-      // this call site, not just this connector). Deduped: two distinct
-      // selectedMcpServers entries can resolve to the same real row.
-      const resolvedMcpSelectors = new Set(
-        selectedMcpServers.map(server => resolveMcpToolSelector(server, mcpServers, officialApps))
-      )
-      resolvedMcpSelectors.forEach(selector => finalToolCategories.push(`mcp:${selector}`))
-      if (hasSshBindings && !finalToolCategories.includes("ssh")) {
-        finalToolCategories.push("ssh")
-      }
+      const finalToolCategories = buildToolCategories()
 
       if (!previewTaskId) {
+        const configGenerationAtStart = previewConfigGenerationRef.current
         const response = await apiRequest(`${getApiUrl()}/api/chat/task/create`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -1188,11 +1240,15 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
         }
 
         const taskData = await response.json()
+        if (previewGenerationRef.current !== generationAtStart) return
         previewTaskId = Number(taskData.task_id)
         if (!Number.isFinite(previewTaskId)) {
           throw new Error("Preview task creation returned an invalid task id")
         }
-        previewTaskIdRef.current = previewTaskId
+        // Config edited mid-create: this message still goes to the pre-edit task, the next send starts a fresh one.
+        if (previewConfigGenerationRef.current === configGenerationAtStart) {
+          previewTaskIdRef.current = previewTaskId
+        }
 
         // Close any file preview opened from the previous preview task before switching context.
         closeFilePreview()
@@ -1227,6 +1283,7 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
       await sendMessage(backendMessage, { force: true, targetTaskId: previewTaskId }, files)
     } catch (error) {
       console.error("Preview failed:", error)
+      if (previewGenerationRef.current !== generationAtStart) return
       dispatch({
         type: "ADD_MESSAGE",
         payload: {
@@ -1269,7 +1326,7 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
     })
   }
 
-  const isDirty = useMemo(() => {
+  const isDirtyBeyondGeneralModel = useMemo(() => {
     if (!originalData) return false
 
     // Helper to normalize arrays for comparison
@@ -1309,15 +1366,33 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
     const originalNonMcpCategories = (originalData.tool_categories || []).filter((c: string) => !c.startsWith('mcp:'))
     if (normalize(nonMcpCategories) !== normalize(originalNonMcpCategories)) return true
 
-    // Compare models
+    // Compare models. The general slot is compared outside this memo: the
+    // seed has to leave Update enabled (that is the only flow that persists
+    // it) while not blocking Publish.
     const origModels = originalData.models || {}
-    if ((modelConfig.general || null) !== (origModels.general || null)) return true
     if ((modelConfig.small_fast || null) !== (origModels.small_fast || null)) return true
     if ((modelConfig.visual || null) !== (origModels.visual || null)) return true
     if ((modelConfig.compact || null) !== (origModels.compact || null)) return true
 
     return false
   }, [name, description, instructions, executionMode, ownership, visibility, logoFile, logoRemoved, suggestedPrompts, selectedKbs, selectedSkills, selectedToolCategories, selectedMcpServers, modelConfig, originalData])
+
+  const generalModelDiffers =
+    (modelConfig.general || null) !== ((originalData?.models || {}).general || null)
+  // Enables Update, so the seeded value has a way into the database: Publish
+  // posts no body and never persists models.
+  const isDirty = isDirtyBeyondGeneralModel || generalModelDiffers
+  // ...but a slot holding the seeded value is not an edit worth blocking
+  // Publish over, for the very agents the seed exists to unblock. Picking the
+  // seeded model by hand is indistinguishable from the seed itself, which is
+  // harmless: either way the delegation resolves the same default. The
+  // stored-slot test retires the exemption once an Update has persisted a
+  // model, so re-picking the seeded one is then an ordinary unsaved edit.
+  const seedStillUnsaved = !(originalData?.models || {}).general
+  const publishBlockedByEdits =
+    isDirtyBeyondGeneralModel ||
+    (generalModelDiffers &&
+      !(seedStillUnsaved && modelConfig.general === seededGeneralRef.current))
 
   // After a successful save, align server-side ownership with the chosen control:
   // promote a personal agent to team (with visibility) or demote a team agent back
@@ -1462,24 +1537,7 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
       return
     }
 
-    let finalToolCategories = [...selectedToolCategories]
-    if (selectedKbs.length > 0 && !finalToolCategories.includes("knowledge")) {
-      finalToolCategories.push("knowledge")
-    }
-    if (hasSshBindings && !finalToolCategories.includes("ssh")) {
-      finalToolCategories.push("ssh")
-    }
-
-    // Add selected MCP servers back into tool_categories, resolved to the
-    // real connected MCPServer row's name -- see resolveMcpToolSelector for
-    // why a hard-coded id/name fallback can't work for every app. Deduped:
-    // two distinct selectedMcpServers entries can resolve to the same real
-    // row, and the backend persists tool_categories verbatim (agents.py),
-    // so an unresolved duplicate here lands in the DB and stays there.
-    const resolvedMcpSelectors = new Set(
-      selectedMcpServers.map(server => resolveMcpToolSelector(server, mcpServers, officialApps))
-    )
-    resolvedMcpSelectors.forEach(selector => finalToolCategories.push(`mcp:${selector}`))
+    const finalToolCategories = buildToolCategories()
 
     setIsCreating(true)
 
@@ -2005,7 +2063,7 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
                   <Button
                     variant="secondary"
                     onClick={handlePublish}
-                    disabled={isCreating || loadingAgent || isDirty}
+                    disabled={isCreating || loadingAgent || publishBlockedByEdits}
                   >
                     {t("builds.editor.header.publish")}
                   </Button>
@@ -2514,6 +2572,13 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
               })}
             </div>
           )}
+          {alwaysAvailableToolNames.length > 0 && (
+            <div className="text-xs text-muted-foreground">
+              {t("builds.configForm.tools.alwaysAvailable", {
+                tools: alwaysAvailableToolNames.join(", "),
+              })}
+            </div>
+          )}
         </div>
 
         {failedStagedTriggers.length > 0 && (
@@ -2947,7 +3012,9 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
               if (updates.modelConfig !== undefined) setModelConfig(updates.modelConfig);
               if (updates.selectedKbs !== undefined) setSelectedKbs(updates.selectedKbs);
               if (updates.selectedSkills !== undefined) setSelectedSkills(updates.selectedSkills);
-              if (updates.selectedToolCategories !== undefined) setSelectedToolCategories(updates.selectedToolCategories);
+              const chatCategories = updates.selectedToolCategories
+              // Chat never writes connectors: keep a bare "mcp" grant or saving revokes it.
+              if (chatCategories !== undefined) setSelectedToolCategories(prev => [...chatCategories, ...prev.filter(c => c === "mcp")]);
             }}
             availableOptions={{
               models: (Array.isArray(models) ? models : []).map(m => ({ id: m.id, name: m.model_name || m.model_id })),

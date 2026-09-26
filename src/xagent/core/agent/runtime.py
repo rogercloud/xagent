@@ -4,13 +4,13 @@ import asyncio
 import inspect
 import logging
 from collections.abc import Mapping
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from typing import Any, Callable
 from uuid import uuid4
 
-from ...config import get_compact_threshold_ratio
+from ...config import COMPACT_THRESHOLD_DEFAULT
 from ..agent.trace import (
-    ExecutionEventPersistenceError,
     TraceAction,
     TraceCategory,
     TraceEventType,
@@ -21,9 +21,10 @@ from ..context_materializer import (
     ContextReferenceResolver,
     materialize_llm_kwargs,
 )
+from ..inline_file_delivery import InlineFileDelivery, InlineFileStreamGuard
 from ..model.chat.basic.base import BaseLLM
-from ..model.chat.error import retry_on
-from ..model.chat.exceptions import LLMToolProtocolError
+from ..model.chat.error import is_context_length_error, retry_on
+from ..model.chat.exceptions import LLMContextLengthError, LLMToolProtocolError
 from ..model.chat.token_context import extract_cached_input_tokens
 from ..model.chat.tool_protocol import TOOL_PROTOCOL_ERROR_KEY
 from ..model.chat.types import ChunkType
@@ -35,11 +36,100 @@ from ..tools.user_interaction import (
     WAITING_FOR_USER_STATUS,
     tool_result_waits_for_user,
 )
-from .context.execution import COMPACT_SUMMARY_FALLBACK_BUDGETS
+from .checkpoint import (
+    CheckpointPersistenceError,
+    ExecutionEventPersistenceError,
+    TraceCheckpointStore,
+)
+from .context.execution import (
+    COMPACT_SUMMARY_FALLBACK_BUDGETS,
+    COMPACT_THRESHOLD_SOURCE_DEFAULT,
+    COMPACT_THRESHOLD_SOURCE_UNKNOWN,
+    LLM_COMPACT_CONTEXT_WINDOW_UNKNOWN_KEY,
+    LLM_COMPACT_TOKENIZER_UNAVAILABLE_KEY,
+    CompactResult,
+    ExecutionContext,
+    context_checkpoint_gate,
+    derive_compact_threshold,
+)
 from .result import normalize_tool_failure_code, tool_result_succeeded
 from .streaming import merge_streamed_tool_call_arguments
 
 logger = logging.getLogger(__name__)
+
+# Keys already warned about running compaction without a usable context
+# window (see ``warn_once_per_model``). One line per model per process is
+# enough to point at the missing column; one per task or per iteration would
+# bury it.
+_COMPACT_WINDOW_WARNED_MODELS: set[str] = set()
+
+# Roles a model can be warned about; the same model can hold both.
+THRESHOLD_WARNING_KEY_PREFIX = "threshold:"
+COMPACT_MODEL_WARNING_KEY_PREFIX = "compact:"
+
+
+def compact_model_key(llm: Any) -> str:
+    """Name a model for the once-per-model compaction warnings.
+
+    Prefers the stable ``model_id`` so identically-named rows under two
+    providers each get their own warning; falls back to the model name, then
+    the class name for test doubles and wrappers that carry neither.
+    """
+    for attribute in ("model_id", "model_name"):
+        value = getattr(llm, attribute, None)
+        if isinstance(value, str) and value:
+            return value
+    return type(llm).__name__
+
+
+def warn_once_per_model(key: str, message: str, *args: Any) -> None:
+    """Log ``message`` at WARNING the first time ``key`` is seen in this process.
+
+    ``key`` should combine the warning's role with ``compact_model_key`` so the
+    same model can be reported once as the agent model and once as the compact
+    model; the two messages describe different failures.
+    """
+    if key in _COMPACT_WINDOW_WARNED_MODELS:
+        return
+    _COMPACT_WINDOW_WARNED_MODELS.add(key)
+    logger.warning(message, *args)
+
+
+def warn_restored_compact_threshold(context: Any, llm: Any) -> None:
+    """Re-issue the fallback warning for a context restored from a checkpoint.
+
+    ``AgentRunner`` only resolves the threshold at task start, so a task
+    resumed in a fresh process would otherwise run on the default threshold
+    with no line in this process's log saying so. Checkpoints written before
+    ``threshold_source`` existed restore as ``unknown`` and are warned about
+    too, on the same terms, when the live model still has no window.
+    """
+    compact_config = getattr(context, "compact_config", None)
+    if llm is None or compact_config is None:
+        return
+    # The live model row may have been populated since the checkpoint was
+    # written, and a virtual model resolves its window per call; neither is
+    # running on the fallback for lack of a window.
+    if derive_compact_threshold(getattr(llm, "context_window", None)) is not None:
+        return
+    if callable(getattr(llm, "prepare_for_call", None)):
+        return
+    if getattr(compact_config, "threshold_source", None) not in (
+        COMPACT_THRESHOLD_SOURCE_DEFAULT,
+        COMPACT_THRESHOLD_SOURCE_UNKNOWN,
+    ):
+        return
+    model_key = compact_model_key(llm)
+    warn_once_per_model(
+        THRESHOLD_WARNING_KEY_PREFIX + model_key,
+        "Model %s has no context_window; the resumed task keeps its context "
+        "compaction threshold of %s tokens (%s). Set context_window on the "
+        "model so new tasks compact at a fraction of its real window instead.",
+        model_key,
+        getattr(compact_config, "threshold", None),
+        COMPACT_THRESHOLD_DEFAULT,
+    )
+
 
 # Fixed final_answer stream close reasons. ReAct's fail() call sites import
 # these names directly (react.py already imports this module at module
@@ -165,17 +255,30 @@ async def prepare_llm_for_context(
 
     context_window = getattr(prepared, "context_window", None)
     compact_config = getattr(context, "compact_config", None)
+    derived = derive_compact_threshold(context_window)
     # Fixed-model thresholds are initialized once by AgentRunner and restored
     # verbatim from checkpoints. Recompute only when a virtual model resolves to
     # a concrete per-call wrapper whose window was unavailable at task start.
-    if (
-        prepared is not llm
-        and isinstance(context_window, int)
-        and context_window > 0
-        and compact_config is not None
-    ):
-        compact_config.threshold = max(
-            1, int(context_window * get_compact_threshold_ratio())
+    if prepared is not llm and compact_config is not None and derived is not None:
+        compact_config.threshold, compact_config.threshold_source = derived
+    elif prepared is not llm and compact_config is not None:
+        # The standing threshold may have been derived from an earlier selection;
+        # it no longer describes the active model, so stop claiming that source.
+        compact_config.threshold_source = COMPACT_THRESHOLD_SOURCE_UNKNOWN
+        # The virtual model was exempt from AgentRunner's warning because its
+        # window is only known here, and the concrete model it picked has
+        # none. The threshold is left as it was -- the fallback, or one
+        # derived from an earlier selection -- and the message says which.
+        model_key = compact_model_key(prepared)
+        warn_once_per_model(
+            THRESHOLD_WARNING_KEY_PREFIX + model_key,
+            "Model %s (selected by a virtual model) has no context_window; "
+            "the context compaction threshold stays at %s tokens "
+            "(threshold_source=%s). Set context_window on the model so "
+            "compaction triggers at a fraction of its real window instead.",
+            model_key,
+            getattr(compact_config, "threshold", None),
+            getattr(compact_config, "threshold_source", None),
         )
 
     return prepared
@@ -222,7 +325,17 @@ class PatternRuntime:
     # on_tool_error so tool trace events can be joined to their turn without
     # relying on step_id or timestamp-adjacency heuristics.
     active_turn_id: str | None = None
+    # Set by on_pattern_error() before it does anything else, so the
+    # runner's CheckpointPersistenceError guard can tell whether the
+    # failing pattern already reported its own terminal trace (as
+    # DAGPattern and ReActPattern do) or whether it needs a fallback
+    # report for a custom pattern that only raises.
+    pattern_error_reported: bool = False
     last_final_answer_stream_message_id: str | None = None
+    inline_file_delivery: InlineFileDelivery | None = None
+    _inline_stream_guards: dict[str, InlineFileStreamGuard] = field(
+        default_factory=dict, init=False, repr=False
+    )
     _active_llm_tasks: set[asyncio.Future[Any]] = field(
         default_factory=set,
         init=False,
@@ -277,6 +390,12 @@ class PatternRuntime:
             kwargs=kwargs,
             resolver=self.context_ref_resolver,
         )
+        # Setup may yield before a provider task exists for cancellation.
+        await self.should_interrupt()
+        if self._interrupt_requested:
+            raise LLMCallInterrupted(
+                self.interrupt_reason or "interrupted before LLM call"
+            )
         call = llm.chat(**kwargs)
         if not inspect.isawaitable(call):
             return call
@@ -290,6 +409,12 @@ class PatternRuntime:
                 raise LLMCallInterrupted(
                     self.interrupt_reason or "interrupted during LLM call"
                 ) from exc
+            raise
+        except Exception as exc:  # noqa: BLE001
+            if is_context_length_error(exc):
+                if isinstance(exc, LLMContextLengthError):
+                    raise
+                raise LLMContextLengthError(str(exc)) from exc
             raise
         finally:
             self._active_llm_tasks.discard(task)
@@ -344,13 +469,19 @@ class PatternRuntime:
             response = await self.run_streaming_llm_call(
                 llm, on_chunk=emit_text_delta, **kwargs
             )
+            content = self._response_content(response)
+            await stream.finish(content)
+            return response
         except Exception as exc:
-            await stream.fail(str(exc))
+            if self.last_final_answer_stream_message_id != stream.message_id:
+                await stream.fail(str(exc))
             raise
-        content = self._response_content(response)
-
-        await stream.finish(content)
-        return response
+        finally:
+            # Includes cancellation, which is not an Exception on Python 3.11+.
+            # Once end has started broadcasting, it cannot safely be retracted
+            # with a contradictory error frame after partial delivery.
+            if self.last_final_answer_stream_message_id != stream.message_id:
+                await stream.fail("Final answer stream abandoned")
 
     async def run_streaming_llm_call(
         self,
@@ -377,38 +508,66 @@ class PatternRuntime:
             provider_payload: dict[str, Any] = {}
             protocol_error_payload: dict[str, Any] = {}
             saw_payload_chunk = False
-            async for chunk in stream_chat(**kwargs):
-                await self._raise_if_interrupted("interrupted during LLM stream")
-                self._raise_for_stream_error(chunk)
-                is_protocol_error = (
-                    callable(getattr(chunk, "is_protocol_error", None))
-                    and chunk.is_protocol_error()
-                )
-                if (
-                    getattr(chunk, "type", None) == ChunkType.PROTOCOL_ERROR
-                    or is_protocol_error
-                ):
-                    payload = getattr(chunk, "protocol_error", None)
-                    if isinstance(payload, dict):
-                        protocol_error_payload.update(payload)
-                    saw_payload_chunk = True
+            stream = aiter(stream_chat(**kwargs))
+            loop_completed = False
+            try:
+                async for chunk in stream:
+                    # Buffered streams and synchronous callbacks may never suspend.
+                    # Give API requests and cancellation callbacks a scheduling turn
+                    # before checking interruption or provider errors. Keep this above
+                    # the protocol-error continue so every chunk yields; cancellation
+                    # deliberately takes precedence over a concurrently received error.
+                    await asyncio.sleep(0)
+                    await self._raise_if_interrupted("interrupted during LLM stream")
+                    self._raise_for_stream_error(chunk)
+                    is_protocol_error = (
+                        callable(getattr(chunk, "is_protocol_error", None))
+                        and chunk.is_protocol_error()
+                    )
+                    if (
+                        getattr(chunk, "type", None) == ChunkType.PROTOCOL_ERROR
+                        or is_protocol_error
+                    ):
+                        payload = getattr(chunk, "protocol_error", None)
+                        if isinstance(payload, dict):
+                            protocol_error_payload.update(payload)
+                        saw_payload_chunk = True
+                        if on_chunk is not None:
+                            await self._maybe_await(on_chunk(chunk))
+                        continue
+                    text_delta = self._chunk_text_delta(chunk)
+                    if text_delta:
+                        saw_payload_chunk = True
+                        content_parts.append(text_delta)
+                    chunk_tool_calls = self._chunk_tool_calls(chunk)
+                    if chunk_tool_calls:
+                        saw_payload_chunk = True
+                        self._merge_tool_call_chunks(tool_call_chunks, chunk_tool_calls)
+                    chunk_usage = self._chunk_usage(chunk)
+                    if chunk_usage:
+                        self._merge_usage(usage_payload, chunk_usage)
+                    self._merge_provider_payload(provider_payload, chunk)
                     if on_chunk is not None:
                         await self._maybe_await(on_chunk(chunk))
-                    continue
-                text_delta = self._chunk_text_delta(chunk)
-                if text_delta:
-                    saw_payload_chunk = True
-                    content_parts.append(text_delta)
-                chunk_tool_calls = self._chunk_tool_calls(chunk)
-                if chunk_tool_calls:
-                    saw_payload_chunk = True
-                    self._merge_tool_call_chunks(tool_call_chunks, chunk_tool_calls)
-                chunk_usage = self._chunk_usage(chunk)
-                if chunk_usage:
-                    self._merge_usage(usage_payload, chunk_usage)
-                self._merge_provider_payload(provider_payload, chunk)
-                if on_chunk is not None:
-                    await self._maybe_await(on_chunk(chunk))
+                loop_completed = True
+            finally:
+                close = getattr(stream, "aclose", None)
+                if callable(close):
+                    try:
+                        # A checker can cancel this consumer itself. Deliver that
+                        # pending cancellation before entering async cleanup, but
+                        # close in this same task for task-affine generators.
+                        try:
+                            await asyncio.sleep(0)
+                        finally:
+                            await close()
+                    except Exception as exc:
+                        if loop_completed:
+                            raise
+                        # Preserve the original provider/callback error on abort.
+                        logger.warning(
+                            "LLM stream close failed (%s)", type(exc).__name__
+                        )
 
             content = "".join(content_parts)
             tool_calls = [
@@ -644,14 +803,20 @@ class PatternRuntime:
         if self.outbound_message_handler is None:
             return None
         message_id = f"final_answer_{uuid4().hex}"
+        if self.inline_file_delivery is not None:
+            self._inline_stream_guards[message_id] = InlineFileStreamGuard()
         self.last_final_answer_stream_message_id = None
-        await self._emit_outbound(
-            {
-                "type": "final_answer_start",
-                "message_id": message_id,
-                "task_id": self.execution_id,
-            }
-        )
+        try:
+            await self._emit_outbound(
+                {
+                    "type": "final_answer_start",
+                    "message_id": message_id,
+                    "task_id": self.execution_id,
+                }
+            )
+        except BaseException:
+            self._inline_stream_guards.pop(message_id, None)
+            raise
         logger.info(
             "final_answer stream opened. task_id=%s step=%s turn=%s message_id=%s",
             self.execution_id,
@@ -662,6 +827,9 @@ class PatternRuntime:
         return message_id
 
     async def emit_final_answer_delta(self, message_id: str, delta: str) -> None:
+        guard = self._inline_stream_guards.get(message_id)
+        if guard is not None:
+            delta = guard.feed(delta)
         if not delta:
             return
         await self._emit_outbound(
@@ -673,7 +841,16 @@ class PatternRuntime:
             }
         )
 
+    async def prepare_final_answer(self, content: str) -> str:
+        if self.inline_file_delivery is None or "base64" not in content.lower():
+            return content
+        return await asyncio.to_thread(self.inline_file_delivery.transform, content)
+
     async def end_final_answer_stream(self, message_id: str, content: str) -> None:
+        guard = self._inline_stream_guards.pop(message_id, None)
+        content = await self.prepare_final_answer(content)
+        if guard is not None:
+            await self.emit_final_answer_delta(message_id, guard.flush())
         self.last_final_answer_stream_message_id = message_id
         await self._emit_outbound(
             {
@@ -693,7 +870,12 @@ class PatternRuntime:
             len(content),
         )
 
+    def discard_inline_file_streams(self) -> None:
+        """Release per-run buffers even if a pattern abandoned a candidate."""
+        self._inline_stream_guards.clear()
+
     async def fail_final_answer_stream(self, message_id: str, error: str) -> None:
+        self._inline_stream_guards.pop(message_id, None)
         if self.last_final_answer_stream_message_id == message_id:
             self.last_final_answer_stream_message_id = None
         await self._emit_outbound(
@@ -727,17 +909,34 @@ class PatternRuntime:
         status: str | None = None,
         metadata: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        payload = self._build_checkpoint_payload(
-            label=label,
-            context=context,
-            pattern=pattern,
-            status=status,
-            metadata=metadata,
+        # Keep ordinary checkpoint writes concurrent. A future exclusive
+        # injection must cover snapshot construction as well as persistence.
+        gate = (
+            context_checkpoint_gate(context).shared()
+            if isinstance(context, ExecutionContext)
+            else nullcontext()
         )
-        self.last_checkpoint = payload
-        self.checkpoints.append(payload)
-        await self._emit_checkpoint(payload)
-        return payload
+        async with gate:
+            if (
+                isinstance(context, ExecutionContext)
+                and context_checkpoint_gate(context).injection_uncertain
+            ):
+                # Tool steps after the fence may re-run on explicit resume; see
+                # docs/architecture/task-runner-execution-boundary.md.
+                raise ExecutionInterrupted(
+                    "Injection outcome unknown; explicit resume must reload the checkpoint."
+                )
+            payload = self._build_checkpoint_payload(
+                label=label,
+                context=context,
+                pattern=pattern,
+                status=status,
+                metadata=metadata,
+            )
+            self.last_checkpoint = payload
+            self.checkpoints.append(payload)
+            await self._emit_checkpoint(payload)
+            return payload
 
     async def send_message(
         self,
@@ -776,6 +975,24 @@ class PatternRuntime:
 
         if self.outbound_message_handler is not None:
             await self._maybe_await(self.outbound_message_handler(payload))
+        elif expect_response or message_type == "question":
+            # A dropped question parks the run waiting for a reply that can
+            # never arrive, so this is worth a warning.
+            logger.warning(
+                "Dropping agent outbound message for execution %s: no outbound "
+                "message handler is installed (type=%r, expect_response=%s)",
+                self.execution_id,
+                message_type,
+                expect_response,
+            )
+        else:
+            logger.debug(
+                "Dropping agent outbound message for execution %s: no outbound "
+                "message handler is installed (type=%r, expect_response=%s)",
+                self.execution_id,
+                message_type,
+                expect_response,
+            )
 
         return payload
 
@@ -845,6 +1062,12 @@ class PatternRuntime:
         pattern: Any,
         error: Exception,
     ) -> None:
+        # Set before any I/O below, so a pattern is marked as having
+        # reported its own failure even if a later step here raises --
+        # the runner's fallback terminal-trace reporting (see its
+        # ``CheckpointPersistenceError`` guard) checks this to decide
+        # whether it still needs to report the abort itself.
+        self.pattern_error_reported = True
         await self._emit_trace_event(
             TraceEventType(TraceScope.TASK, TraceAction.ERROR, TraceCategory.GENERAL),
             task_id=self._task_id(context),
@@ -862,19 +1085,29 @@ class PatternRuntime:
             return
         finish_trace = getattr(self.tracer, "finish_trace", None)
         if callable(finish_trace):
-            await self._maybe_await(
-                finish_trace(
-                    name=self._pattern_trace_name(pattern),
-                    status="error",
-                    output={"error": str(error)},
-                    metadata={
-                        "execution_id": getattr(
-                            context, "execution_id", self.execution_id
-                        ),
-                        "pattern": pattern.__class__.__name__,
-                    },
+            try:
+                await self._maybe_await(
+                    finish_trace(
+                        name=self._pattern_trace_name(pattern),
+                        status="error",
+                        output={"error": str(error)},
+                        metadata={
+                            "execution_id": getattr(
+                                context, "execution_id", self.execution_id
+                            ),
+                            "pattern": pattern.__class__.__name__,
+                        },
+                    )
                 )
-            )
+            except Exception:
+                # Trace finalization is best-effort here: this method's job
+                # is to report ``error`` (often a CheckpointPersistenceError
+                # durability abort) to the caller. Letting a ``finish_trace``
+                # failure propagate would replace ``error`` with this
+                # unrelated exception, and the runner's typed guard would
+                # then treat the replacement as an ordinary recoverable
+                # pattern exception instead of aborting the run.
+                logger.exception("finish_trace failed while reporting a pattern error")
 
     async def on_tool_start(self, *, tool_call: dict[str, Any]) -> None:
         # Count one billable action per tool invocation, at invocation time.
@@ -1126,12 +1359,11 @@ class PatternRuntime:
             **event_metadata,
         }
         # Surface current context size vs. the compaction threshold so the UI
-        # can show a context-usage gauge. Uses the same estimate that drives the
-        # compaction decision, so the gauge fills exactly when compaction fires.
+        # can show final provider-payload usage, including dynamic system content.
         estimate = getattr(context, "estimate_context_tokens", None)
         if callable(estimate):
             try:
-                context_data["context_tokens"] = estimate()
+                context_data["context_tokens"] = estimate(messages, tools)
             except Exception:  # noqa: BLE001 - gauge metadata must never break the call
                 pass
         compact_config = getattr(context, "compact_config", None)
@@ -1302,6 +1534,8 @@ class PatternRuntime:
         except LLMCallInterrupted:
             raise
         except Exception as exc:  # noqa: BLE001
+            if is_context_length_error(exc):
+                raise
             budgets = [
                 budget
                 for budget in COMPACT_SUMMARY_FALLBACK_BUDGETS
@@ -1335,7 +1569,11 @@ class PatternRuntime:
                     raise
                 except Exception as retry_exc:  # noqa: BLE001
                     exc = retry_exc
-                    if retry_on(retry_exc) or self._interrupt_requested:
+                    if (
+                        is_context_length_error(retry_exc)
+                        or retry_on(retry_exc)
+                        or self._interrupt_requested
+                    ):
                         break
                     continue
                 metadata["compact_budget_reduced_to"] = budget
@@ -1381,6 +1619,7 @@ class PatternRuntime:
         # budget, so the compact trace event can say so alongside the other
         # degrade markers.
         compact_outcome: dict[str, Any] = {}
+        compaction_blocked = False
         if (
             llm is not None
             and callable(getattr(llm, "chat", None))
@@ -1388,65 +1627,132 @@ class PatternRuntime:
             and callable(compact_with_llm_response)
         ):
             summary_unavailable_metadata = None
-            request = llm_compact_request_if_needed()
+            context_window = getattr(llm, "context_window", None)
+            request = llm_compact_request_if_needed(context_window=context_window)
             if request is not None:
                 request_metadata = request.get("metadata") or {}
-                llm_metadata = {**request_metadata, "purpose": "context_compaction"}
-                try:
-                    await self.on_llm_start(
-                        context=context,
-                        messages=request["messages"],
-                        metadata=llm_metadata,
+                if request.get("blocked"):
+                    compaction_blocked = True
+                    message_count = len(getattr(context, "messages", ()))
+                    result = CompactResult(
+                        compacted=False,
+                        original_count=message_count,
+                        final_count=message_count,
+                        strategy="none",
+                        metadata={
+                            **request_metadata,
+                            "fallback_suppressed": True,
+                        },
                     )
-                    response = await self._run_compact_llm_call(
-                        llm,
-                        messages=request["messages"],
-                        max_tokens=request["max_tokens"],
-                        metadata=llm_metadata,
-                        outcome=compact_outcome,
-                    )
-                    await self.on_llm_end(
-                        context=context,
-                        response=response,
-                        metadata=llm_metadata,
-                    )
-                    result = compact_with_llm_response(
-                        response,
-                        llm=llm,
-                        original_tokens=request.get("original_tokens"),
-                    )
-                    for key, value in request_metadata.items():
-                        result.metadata.setdefault(key, value)
-                    result.metadata.update(compact_outcome)
-                    if not getattr(result, "compacted", False):
-                        logger.warning(
-                            "Context compaction summary was unusable; falling "
-                            "back to dropping messages. execution_id=%s",
+                    if request_metadata.get(LLM_COMPACT_CONTEXT_WINDOW_UNKNOWN_KEY):
+                        # Not a fit problem: the compact model row has no
+                        # context_window, so no summary request can be sized
+                        # and compaction stays off until the column is set.
+                        # Once per model: the context stays over threshold, so
+                        # this branch recurs on every iteration otherwise.
+                        model_key = compact_model_key(llm)
+                        warn_once_per_model(
+                            COMPACT_MODEL_WARNING_KEY_PREFIX + model_key,
+                            "Compact model %s has no context_window; context "
+                            "compaction is disabled until it is set on the "
+                            "model. First seen on execution_id=%s",
+                            model_key,
                             getattr(context, "execution_id", None),
                         )
-                        unusable_summary_metadata = {
-                            "llm_summary_unusable": True,
-                            **request_metadata,
-                        }
-                except LLMCallInterrupted:
-                    raise
-                except Exception as exc:  # noqa: BLE001
-                    await self.on_llm_error(
-                        context=context,
-                        error=exc,
-                        metadata=llm_metadata,
-                    )
-                    if not callable(compact_if_needed):
+                    elif request_metadata.get(LLM_COMPACT_TOKENIZER_UNAVAILABLE_KEY):
+                        logger.warning(
+                            "Context compaction could not count the compact "
+                            "request's tokens (%s); preserving the original "
+                            "context. execution_id=%s",
+                            request_metadata.get("compact_tokenizer_error_type"),
+                            getattr(context, "execution_id", None),
+                        )
+                    else:
+                        logger.warning(
+                            "Context compaction request cannot fit the compact "
+                            "model window without discarding unrecoverable "
+                            "messages; preserving the original context. "
+                            "execution_id=%s",
+                            getattr(context, "execution_id", None),
+                        )
+                else:
+                    llm_metadata = {
+                        **request_metadata,
+                        "purpose": "context_compaction",
+                    }
+                    try:
+                        await self.on_llm_start(
+                            context=context,
+                            messages=request["messages"],
+                            metadata=llm_metadata,
+                        )
+                        response = await self._run_compact_llm_call(
+                            llm,
+                            messages=request["messages"],
+                            max_tokens=request["max_tokens"],
+                            metadata=llm_metadata,
+                            outcome=compact_outcome,
+                        )
+                        await self.on_llm_end(
+                            context=context,
+                            response=response,
+                            metadata=llm_metadata,
+                        )
+                        result = compact_with_llm_response(
+                            response,
+                            llm=llm,
+                            original_tokens=request.get("original_tokens"),
+                        )
+                        for key, value in request_metadata.items():
+                            result.metadata.setdefault(key, value)
+                        result.metadata.update(compact_outcome)
+                        if not getattr(result, "compacted", False):
+                            logger.warning(
+                                "Context compaction summary was unusable; falling "
+                                "back to dropping messages. execution_id=%s",
+                                getattr(context, "execution_id", None),
+                            )
+                            unusable_summary_metadata = {
+                                "llm_summary_unusable": True,
+                                **request_metadata,
+                            }
+                    except LLMCallInterrupted:
                         raise
-                    result = compact_if_needed()
-                    result.metadata["llm_compact_error"] = str(exc)
-                    result.metadata["fallback_strategy"] = result.strategy
-                    result.metadata.update(request_metadata)
+                    except Exception as exc:  # noqa: BLE001
+                        await self.on_llm_error(
+                            context=context,
+                            error=exc,
+                            metadata=llm_metadata,
+                        )
+                        if not callable(compact_if_needed):
+                            raise
+                        if is_context_length_error(exc):
+                            compaction_blocked = True
+                            message_count = len(getattr(context, "messages", ()))
+                            result = CompactResult(
+                                compacted=False,
+                                original_count=message_count,
+                                final_count=message_count,
+                                strategy="none",
+                                metadata={
+                                    **request_metadata,
+                                    "llm_compact_error": str(exc),
+                                    "llm_compact_context_length_error": True,
+                                    "fallback_suppressed": True,
+                                },
+                            )
+                        else:
+                            result = compact_if_needed()
+                            result.metadata["llm_compact_error"] = str(exc)
+                            result.metadata["fallback_strategy"] = result.strategy
+                            result.metadata.update(request_metadata)
 
         # Backstop. ``compact_if_needed`` drops the oldest messages outright,
         # so it runs only after summarization was skipped, errored, or came
         # back unusable -- never as an alternative worth choosing.
-        if result is None or not getattr(result, "compacted", False):
+        if not compaction_blocked and (
+            result is None or not getattr(result, "compacted", False)
+        ):
             if not callable(compact_if_needed):
                 return result
             result = compact_if_needed()
@@ -1594,6 +1900,28 @@ class PatternRuntime:
         if self.tracer is None:
             return
 
+        # Normalize here rather than only in ``TraceCheckpointStore``: that
+        # wrapper is applied in exactly one place (``xagent/service.py``), so
+        # the fallback ``PatternRuntime`` constructions in ``auto.py``,
+        # ``react.py`` and ``dag.py`` talk to a bare tracer and would otherwise
+        # surface a raw writer exception. DAG only treats
+        # ``CheckpointPersistenceError`` as a durability failure; anything else
+        # is swallowed by its generic handler into a permanent step failure.
+        #
+        # ``CheckpointPersistenceError`` is re-raised untouched so an error the
+        # store already normalized is not wrapped twice, and ``BaseException``
+        # is not caught at all so cancellation / ``SystemExit`` /
+        # ``KeyboardInterrupt`` keep their control-flow semantics.
+        try:
+            await self._write_checkpoint_to_tracer(payload)
+        except CheckpointPersistenceError:
+            raise
+        except Exception as exc:
+            raise CheckpointPersistenceError(
+                "Checkpoint writer failed before persistence was confirmed."
+            ) from exc
+
+    async def _write_checkpoint_to_tracer(self, payload: dict[str, Any]) -> None:
         checkpoint = getattr(self.tracer, "checkpoint", None)
         if callable(checkpoint):
             await self._maybe_await(checkpoint(**payload))
@@ -1606,13 +1934,46 @@ class PatternRuntime:
 
         trace_event = getattr(self.tracer, "trace_event", None)
         if callable(trace_event):
-            await self._maybe_await(
-                trace_event(
-                    self._checkpoint_trace_event_type(trace_event),
-                    task_id=str(payload.get("execution_id") or self.execution_id),
-                    data=payload,
-                )
+            # Write through ``TraceCheckpointStore`` rather than emitting the
+            # event here. Asking a plain event tracer for persisted delivery
+            # only proves its handlers ran; it does not make a task-scoped
+            # event carrying the raw payload a *readable* checkpoint. The
+            # checkpoint readers select on the canonical envelope -- system
+            # scope, ``checkpoint_type`` in ``READABLE_CHECKPOINT_TYPES``, and
+            # a ``snapshot`` dict -- so a raw event is dropped by
+            # ``EphemeralCheckpointTraceHandler`` and filtered out of the
+            # database checkpoint lookup. A cold resume would then find no
+            # checkpoint and could replay non-idempotent work, even though
+            # this call reported success.
+            #
+            # The store also keeps the capability check: it raises
+            # ``CheckpointPersistenceError`` when ``trace_event`` cannot
+            # accept ``require_persisted``, when a genuine ``Tracer`` has no
+            # handler that can answer a checkpoint read (a ``Tracer`` wired
+            # with only observational handlers such as
+            # ``ConsoleTraceHandler`` would otherwise dispatch cleanly and
+            # return an event id without ever being able to survive a cold
+            # resume), and when the write returns no event id. Nothing is
+            # double-wrapped, because a tracer that is already a
+            # ``TraceCheckpointStore`` exposes ``checkpoint`` and returns at
+            # the first branch above.
+            await TraceCheckpointStore(self.tracer, require_persisted=True).save(
+                payload
             )
+            return
+
+        # No writer capability at all: the tracer does spans only, which is
+        # the same "checkpointing is not configured" mode as ``tracer=None``
+        # above, and is treated the same way rather than failing the run.
+        # Raising here would break every execution that passes an
+        # observability-only tracer (see the span-only tracer in
+        # ``test_react.py``), which is a supported shape.
+        #
+        # The case just above is different and does raise: a tracer that
+        # exposes an event writer but cannot be asked for persisted delivery
+        # is claiming to record the checkpoint without being able to promise
+        # it survives, and that claim must not be reported as durable.
+        return
 
     async def _maybe_await(self, result: Any) -> None:
         if inspect.isawaitable(result):
@@ -1757,16 +2118,6 @@ class PatternRuntime:
     def _pattern_trace_name(self, pattern: Any) -> str:
         del pattern
         return "agent.task"
-
-    def _checkpoint_trace_event_type(self, trace_event: Any) -> Any:
-        del trace_event
-        # Runtime checkpoints are task-scoped progress events. Durable checkpoint
-        # persistence uses TraceCheckpointStore, which emits system-scoped events.
-        return TraceEventType(
-            TraceScope.TASK,
-            TraceAction.UPDATE,
-            TraceCategory.GENERAL,
-        )
 
 
 def load_pattern_checkpoint(pattern: Any, checkpoint: dict[str, Any] | None) -> None:

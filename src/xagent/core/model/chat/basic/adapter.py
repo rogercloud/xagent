@@ -1,10 +1,11 @@
 import os
-from typing import Callable, Optional
+from typing import Callable, Optional, overload
 
 from ....model import ChatModelConfig, ModelConfig
-from ....retry import create_retry_wrapper
+from ....retry import chat_retry_budget, create_retry_wrapper
 from ...providers import (
     AUTO_MODEL_NAME,
+    ROUTER_PROVIDER,
     canonical_provider_name,
     is_auto_router_model,
     provider_compatibility_for_provider,
@@ -24,6 +25,51 @@ from .xinference import XinferenceLLM
 from .zhipu import ZhipuLLM
 
 
+@overload
+def attach_chat_retry_wrapper(
+    llm: BaseLLM, max_retries: Optional[int] = ...
+) -> BaseLLM: ...
+
+
+@overload
+def attach_chat_retry_wrapper(llm: None, max_retries: Optional[int] = ...) -> None: ...
+
+
+def attach_chat_retry_wrapper(
+    llm: Optional[BaseLLM], max_retries: Optional[int] = None
+) -> Optional[BaseLLM]:
+    """Install the shared retry layer on a chat model.
+
+    ``create_base_llm`` is not the only way a chat model gets built: the
+    environment and default fallbacks construct one directly. Those paths used
+    to lean on the provider SDK's own retry budget, which is now zero so that
+    retry policy lives in one layer -- this is that layer, and every
+    construction path has to reach it or it has no retries at all.
+
+    ``max_retries`` defaults to what a model row without an explicit value
+    would carry, read off the config model so the two cannot drift.
+    """
+    # The env and default factories are all ``Optional``-returning, and this
+    # sits on their ``return`` statements: pass a missing model through rather
+    # than handing callers a retry proxy wrapped around nothing.
+    if llm is None:
+        return None
+    if max_retries is None:
+        max_retries = int(ModelConfig.model_fields["max_retries"].default)
+    return create_retry_wrapper(
+        llm,
+        BaseLLM,  # type: ignore[type-abstract]
+        retry_methods={"chat", "vision_chat", "stream_chat"},
+        max_retries=max_retries,
+        retry_on=retry_on,
+        # ``max_retries`` alone cannot bound how long one call holds an
+        # execution slot, because each attempt may consume a full request
+        # timeout. The budget adds the wall-clock ceiling and the short
+        # capacity-refusal budget on top of it.
+        budget=chat_retry_budget(),
+    )
+
+
 def create_base_llm(
     model: ModelConfig,
     downstream_resolver: Optional[Callable[[str], BaseLLM]] = None,
@@ -31,9 +77,8 @@ def create_base_llm(
     """
     Creates a custom BaseLLM instance from a ModelConfig.
 
-    ``downstream_resolver`` is only used by the OpenRouter ``auto`` model: given
-    a chosen OpenRouter slug it returns the LLM that runs it, so "auto" reuses
-    the user-configured OpenRouter model instead of any environment variable.
+    ``downstream_resolver`` is used by virtual ``auto`` models: given a chosen
+    routing profile it returns the concrete configured LLM that runs it.
     """
     if not isinstance(model, ChatModelConfig):
         raise TypeError(f"Invalid model type: {type(model).__name__}")
@@ -43,10 +88,10 @@ def create_base_llm(
     llm: BaseLLM
 
     if is_auto_router_model(provider, model.model_name):
-        # OpenRouter model named "auto": pick a concrete model via xrouter-llm,
-        # then dispatch it through this same OpenRouter config.
+        # Pick a concrete model via xrouter-llm. Legacy OpenRouter Auto clones
+        # its own provider config; configured Auto injects saved model bindings.
         router = RouterLLM(
-            model_name=AUTO_MODEL_NAME,
+            model_name=model.router_config_name or AUTO_MODEL_NAME,
             api_key=model.api_key,
             base_url=model.base_url,
             default_temperature=model.default_temperature,
@@ -54,6 +99,9 @@ def create_base_llm(
             timeout=model.timeout,
             abilities=model.abilities,
             downstream_resolver=downstream_resolver,
+            candidate_models=model.router_candidate_models,
+            fallback_model=model.router_fallback_model,
+            use_environment_fallback=provider != ROUTER_PROVIDER,
         )
         router.context_window = model.context_window
         # No _model_id stamp here: RouterLLM delegates every call to a resolved
@@ -162,10 +210,4 @@ def create_base_llm(
     # Stamp the unique model id so token-usage details can disambiguate models
     # that share a model_name (e.g. a platform model vs a user's own).
     llm._model_id = model.id
-    return create_retry_wrapper(
-        llm,
-        BaseLLM,  # type: ignore[type-abstract]
-        retry_methods={"chat", "vision_chat", "stream_chat"},
-        max_retries=model.max_retries,
-        retry_on=retry_on,
-    )
+    return attach_chat_retry_wrapper(llm, model.max_retries)

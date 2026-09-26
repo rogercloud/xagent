@@ -21,13 +21,14 @@ from xagent.core.agent import (
     ReActPattern,
 )
 from xagent.core.agent.context.enrichment import MEMORY_CONTEXT_METADATA_KEY
+from xagent.core.agent.grounding import VALUE_KINDS
 from xagent.core.agent.language import (
     OUTPUT_LANGUAGE_METADATA_KEY,
     OUTPUT_LANGUAGE_SOURCE_METADATA_KEY,
     OUTPUT_LANGUAGE_SOURCE_PLAN,
-    response_language_rules,
 )
 from xagent.core.agent.pattern.auto.auto import DECISION_TOOL_NAME, _AutoChildRuntime
+from xagent.core.agent.pattern.dag.dag import _DAGStepRuntime
 from xagent.core.model.chat.basic.router import RouterLLM
 from xagent.core.model.chat.exceptions import LLMToolProtocolError
 from xagent.core.model.chat.tool_protocol import (
@@ -687,6 +688,8 @@ class RecordingTracer:
         task_id: str | None = None,
         step_id: str | None = None,
         data: dict[str, Any] | None = None,
+        # Mirrors the real ``Tracer.trace_event``; see test_runtime.py.
+        require_persisted: bool = False,
     ) -> str:
         self.events.append(
             {
@@ -864,10 +867,10 @@ async def test_auto_pattern_final_answer_completes_without_child_pattern() -> No
     assert runtime.last_checkpoint is not None
     assert runtime.last_checkpoint["pattern"] == "AutoPattern"
     assert (
-        "same natural language as the current user request"
+        "canonical language contract provided by the system context"
         in tool_schema["description"]
     )
-    assert "tool results, source documents" in answer_schema["description"]
+    assert "canonical language contract" in answer_schema["description"]
 
 
 @pytest.mark.asyncio
@@ -1052,12 +1055,26 @@ async def test_auto_decision_prompt_includes_grounding_rule() -> None:
     assert result["success"] is True
     decision_prompt = llm.calls[0]["messages"][-1]["content"]
     assert "quantitative data" in decision_prompt
-    assert "illustrative placeholders" in decision_prompt
+    assert (
+        "a current user request that explicitly asks you to write a template"
+        in decision_prompt
+    )
     assert "invented values" in decision_prompt
     assert decision_prompt.count("## FINAL DELIVERABLE FILE REFERENCES") == 1
     assert decision_prompt.index(
-        "If the answer would need such unsupported specifics"
+        "If the answer would need any value the rule above forbids"
     ) < decision_prompt.index("## FINAL DELIVERABLE FILE REFERENCES")
+    # The routing remedy stays specific to auto's own decision, so it is
+    # worded independently of the shared rule's neutral gap-reporting text.
+    assert (
+        "set existing_context_sufficient=false and choose react, so the agent "
+        "can obtain it with tools" in decision_prompt
+    )
+    # The value kinds are not auto's own wording: the sibling sentence
+    # interpolates the shared constant, so this pins the reference rather
+    # than restating the list.
+    assert f"-- {VALUE_KINDS} -- that no source here supports" in decision_prompt
+    assert "such unsupported specifics" not in decision_prompt
     assert "get_workspace_output_files" not in decision_prompt
     assert "You must classify whether" in decision_prompt
     assert "You must also classify whether" not in decision_prompt
@@ -1116,10 +1133,12 @@ async def test_auto_pattern_does_not_emit_general_task_start_or_completion() -> 
     )
 
     assert result["success"] is True
+    # The checkpoint now rides the canonical system-scoped envelope rather
+    # than a task-scoped progress event, so no general task event is emitted.
     assert {event["event_type"] for event in tracer.events} == {
         "action_start_llm",
         "action_end_llm",
-        "task_update_general",
+        "system_update_general",
     }
 
 
@@ -1321,6 +1340,7 @@ async def test_auto_pattern_falls_back_to_the_main_llm_for_compaction() -> None:
             "react done",
         ]
     )
+    llm.context_window = 32_000
     pattern = AutoPattern()
     context = ExecutionContext()
     context.compact_config.threshold = 1
@@ -2300,7 +2320,7 @@ async def test_stale_memory_language_does_not_reach_child_as_hard_policy() -> No
     assert "Output language:" not in child_system
     assert "Output language policy:" not in child_system
     assert "Summarize the quarterly revenue trend in one paragraph." in child_system
-    assert response_language_rules() in child_system
+    assert "Canonical request-language evidence" in child_system
 
 
 @pytest.mark.asyncio
@@ -2326,15 +2346,9 @@ async def test_direct_final_answer_allows_an_explicit_target_language() -> None:
     assert result["success"] is True
     assert result["output"] == "La capitale de l'Italie est Rome."
     assert OUTPUT_LANGUAGE_METADATA_KEY not in context.metadata
-    target_rule = (
-        "If the current user request explicitly asks to translate, rewrite, or "
-        "answer in another language, use that requested target language."
-    )
+    target_rule = "explicit or implicit target-language intent"
     tool_schema = llm.calls[0]["tools"][0]["function"]
-    assert target_rule in tool_schema["description"]
-    assert (
-        target_rule in tool_schema["parameters"]["properties"]["answer"]["description"]
-    )
+    assert "canonical language contract" in tool_schema["description"]
     system_content = context.get_messages_for_llm()[0]["content"]
     assert request in system_content
     assert target_rule in system_content
@@ -2368,11 +2382,12 @@ class RoutedDecisionLLM:
 def _auto_routing_router(downstream: Any, route_prompts: list[str]) -> RouterLLM:
     """A real ``RouterLLM`` with its selection stubbed to record the prompt.
 
-    ``context_window`` is set, as production always does via ``adapter.py``;
-    4 gives a compaction threshold of 3, so any context compacts.
+    ``context_window`` is set, as production always does via ``adapter.py``.
+    The fixture uses a realistic 32k window and enough history below to trigger
+    compaction.
     """
     router = RouterLLM(downstream_resolver=lambda _model_id: downstream)
-    router.context_window = 4
+    router.context_window = 32_000
 
     async def select_model(prompt: str) -> str:
         route_prompts.append(prompt)
@@ -2401,7 +2416,22 @@ async def test_auto_summarizes_with_the_main_model_when_no_compact_model() -> No
     router = _auto_routing_router(downstream, route_prompts)
     context = ExecutionContext()
     context.add_user_message("hi")
-    context.add_tool_result("read_file", {"output": "x" * 200}, tool_call_id="call-1")
+    context.add_assistant_message(
+        "",
+        tool_calls=[
+            {
+                "id": "call-1",
+                "type": "function",
+                "function": {
+                    "name": "read_file",
+                    "arguments": '{"path":"large.txt"}',
+                },
+            }
+        ],
+    )
+    context.add_tool_result(
+        "read_file", {"output": "x" * 120_000}, tool_call_id="call-1"
+    )
 
     result = await AutoPattern().run(
         context=context,
@@ -2420,3 +2450,118 @@ async def test_auto_summarizes_with_the_main_model_when_no_compact_model() -> No
     assert not any(
         "Conversation history to compact" in prompt for prompt in route_prompts
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "tool_name", ["send_message", "ask_user_question", "zhipu_web_search"]
+)
+async def test_auto_react_messages_preserve_user_turn_attribution(
+    tool_name: str,
+) -> None:
+    class WaitingSearchTool(FakeSearchTool):
+        async def run_json_async(self, args: dict[str, Any]) -> dict[str, Any]:
+            return {"status": "waiting_for_user", "message": "Which source?"}
+
+    context = ExecutionContext(execution_id="auto-message-source")
+    context.add_user_message("Ask before continuing", metadata={"turn_id": "turn-42"})
+    runtime = PatternRuntime()
+    observed: list[dict[str, Any]] = []
+
+    async def capture(payload: dict[str, Any]) -> None:
+        assert runtime.active_turn_id == "turn-42"
+        observed.append(payload)
+
+    runtime.outbound_message_handler = capture
+    args = (
+        {"query": "options"}
+        if tool_name == "zhipu_web_search"
+        else {"message": "Which option?", "expect_response": True}
+    )
+    llm = FakeLLM(
+        [
+            decision_tool_response("react", "Needs user input."),
+            {
+                "tool_calls": [
+                    {
+                        "id": "ask-1",
+                        "function": {
+                            "name": tool_name,
+                            "arguments": json.dumps(args),
+                        },
+                    }
+                ]
+            },
+        ]
+    )
+    result = await AutoPattern().run(
+        context=context, tools=[WaitingSearchTool()], llm=llm, runtime=runtime
+    )
+
+    assert result["status"] == "waiting_for_user"
+    assert len(observed) == 1
+    source = observed[0]["metadata"]
+    if tool_name == "zhipu_web_search":
+        assert len(source["tool_calls"]) == 1
+        source = source["tool_calls"][0]
+    assert source["tool_call_id"] == "ask-1"
+    assert source["tool_name"] == tool_name
+    assert source["turn_id"] == "turn-42"
+
+
+def test_auto_child_runtime_forwards_dag_turn_resolution() -> None:
+    """A DAG step nested under ``auto`` must keep its turn identity.
+
+    ``_DAGStepRuntime.active_turn_id`` resolves the turn on every access by
+    calling ``parent._dag_turn_id(root_context)``. Under ``auto`` that
+    parent is ``_AutoChildRuntime``, so a missing forward raises
+    ``AttributeError`` from inside the property -- which every caller's
+    ``getattr(runtime, "active_turn_id", None)`` silently converts into an
+    unstamped tool call, costing the step both its trace turn attribution
+    and the same-turn duplicate-write guard (which only fires for calls
+    carrying a turn_id).
+    """
+    context = ExecutionContext()
+    context.add_user_message("Plan this", metadata={"turn_id": "turn-42"})
+    child_runtime = _AutoChildRuntime(
+        parent=PatternRuntime(),
+        auto_pattern=AutoPattern(),
+        root_context=context,
+    )
+    step_runtime = _DAGStepRuntime(
+        parent=child_runtime,
+        # Irrelevant to turn resolution, which reads only parent and
+        # root_context; kept real so the adapter is built as callers build it.
+        dag_pattern=DAGPattern(LLMPlanGenerator()),
+        root_context=context,
+        step_id="step-1",
+    )
+
+    # Read it the way react.py's _with_runtime_turn_id does: a plain getattr
+    # with a default is what hides a raising property, so the assertion has
+    # to go through the same access to catch a regression.
+    assert getattr(step_runtime, "active_turn_id", None) == "turn-42"
+
+
+def test_routing_prompt_is_rebuilt_with_the_marker_on_every_parse_retry() -> None:
+    """The marker is read inside the retry loop, not hoisted above it.
+
+    A compaction between two parse attempts must reach the second prompt.
+    Hoisting the read is the cheap "optimization" that would drop it silently,
+    so the source position is asserted rather than left to a comment.
+    """
+    source = inspect.getsource(AutoPattern._decide)
+    loop_body = source.split("while attempt < MAX_DECISION_PARSE_ATTEMPTS:", 1)[1]
+    assert "evidence_state=tool_evidence_state(context)" in loop_body
+
+
+def test_the_routing_prompt_has_no_second_default_for_the_marker() -> None:
+    """The read function holds the default, so the prompt builder must not.
+
+    Two holders of the same default drift: a caller that forgets to pass the
+    state renders main's wording on a run that really did lose observations.
+    """
+    parameter = inspect.signature(AutoPattern._decision_prompt).parameters[
+        "evidence_state"
+    ]
+    assert parameter.default is inspect.Parameter.empty

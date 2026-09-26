@@ -14,7 +14,7 @@ from datetime import datetime, timedelta, timezone
 from enum import Enum
 from typing import Any, Callable, Coroutine, Iterator, Sequence, TypeVar, cast
 
-from sqlalchemy import and_, case, func, or_, update
+from sqlalchemy import and_, case, false, func, or_, select, text, update
 from sqlalchemy.exc import MultipleResultsFound
 from sqlalchemy.orm import Query, Session
 from sqlalchemy.sql.elements import ColumnElement
@@ -50,39 +50,12 @@ def _rowcount(result: Any) -> int:
 
 @dataclass(frozen=True)
 class TaskLease:
-    """One runner's claim on one task row.
+    """Fixed run fence used by execution writers.
 
-    ``attempt_id`` names the exact acquisition that produced this lease. It
-    is minted fresh by ``acquire_task_lease_no_commit`` on every successful
-    claim and mirrored into ``tasks.lease_attempt_id`` in the same UPDATE, so
-    a holder can later prove the row still belongs to *its* attempt rather
-    than to a successor that reused the same ``(runner_id, run_id)`` tuple.
-
-    ``attempt_id is None`` is a fail-open sentinel with two distinct sources:
-
-    * a lease acquired by a worker running code from before this column
-      existed -- a rolling-restart window that closes on its own once every
-      worker has restarted; and
-    * ``_task_lease_snapshot`` in ``websocket.py``, which reconstructs an
-      ambient lease from an already-loaded task row. That one carries None
-      permanently and on purpose: every one of its fields is read from the
-      task row, so populating ``attempt_id`` from the same row would make any
-      later ``task.lease_attempt_id != lease.attempt_id`` check compare a
-      value against itself -- an always-passing fence, which is strictly
-      worse than an explicit None that callers can detect and skip. Today
-      that snapshot only feeds checkpoint fencing via
-      ``bind_task_lease_context`` and never reaches a settlement path, so
-      the permanent None also has no behavioural cost.
-
-    Consumers must therefore treat None as "cannot prove attempt identity"
-    and fall back to whatever fence they already had, never as "matches".
-
-    The existing lease writers (refresh, release, fail-and-release) do not
-    fence on this column yet, deliberately: rejecting a stale attempt there
-    turns its refresh into a LOST classification and an active cancellation,
-    which is a behavior change that belongs to the first consumer of this
-    column, with its own tests. Until then the pre-existing
-    ``(runner_id, run_id)`` fences are the only guards on those paths.
+    Shared execution carries the coordinator's acquisition token and never
+    independently renews or releases it. Local execution mints a token on each
+    acquisition. Both paths require the exact task/runner/run/attempt tuple;
+    a missing attempt cannot authorize execution writes or renewal.
     """
 
     task_id: int
@@ -137,24 +110,64 @@ def task_row_matches_lease_owner(task: Task, lease: TaskLease) -> bool:
 
 
 def task_row_matches_lease_attempt(task: Task, lease: TaskLease) -> bool:
-    """Whether ``task``'s current attempt is the one ``lease`` names.
+    """Whether the caller proves the exact acquisition still owns the row."""
 
-    ``lease.attempt_id is None`` returns True. That is a fail-open
-    sentinel and it is deliberate: ``None`` means this lease cannot prove
-    attempt identity at all (a pre-attempt-column lease, or the
-    permanently-``None`` ambient snapshot ``_task_lease_snapshot`` builds
-    in ``websocket.py`` -- see ``TaskLease.attempt_id`` for both sources),
-    and the established reading is "skip this check", never "treat it as a
-    mismatch". A caller that needs attempt identity proven rather than
-    merely not-contradicted has to check ``lease.attempt_id is not None``
-    itself; this predicate does not make that distinction for it.
+    return bool(
+        lease.attempt_id is not None and task.lease_attempt_id == lease.attempt_id
+    )
 
-    This is a plain Python object comparison, not a SQL expression: the
-    ``== None`` -> ``IS NULL`` folding that affects a SQLAlchemy column
-    comparison compiled to SQL does not apply here.
+
+def task_lease_attempt_predicate(lease: TaskLease) -> ColumnElement[bool]:
+    """SQL fence for a holder's acquisition; missing tokens never match."""
+    if lease.run_id is None or lease.attempt_id is None:
+        return false()
+    return Task.lease_attempt_id == lease.attempt_id
+
+
+def lock_task_lease_no_commit(db: Session, lease: TaskLease) -> bool:
+    """Fence and lock before an ORM settlement, including on SQLite.
+
+    SQLite ignores SELECT FOR UPDATE. A conditional no-op UPDATE takes its
+    write lock before reading state and holds it through the caller's commit.
     """
+    result = db.execute(
+        update(Task)
+        .where(
+            Task.id == lease.task_id,
+            Task.runner_id == lease.runner_id,
+            Task.run_id == lease.run_id,
+            task_lease_attempt_predicate(lease),
+        )
+        .values(updated_at=Task.updated_at)
+        .execution_options(synchronize_session=False)
+    )
+    return _rowcount(result) == 1
 
-    return bool(lease.attempt_id is None or task.lease_attempt_id == lease.attempt_id)
+
+def lock_task_lease_for_settlement_no_commit(db: Session, lease: TaskLease) -> bool:
+    """Take the finalizer's full row lock before any weaker task write lock.
+
+    On PostgreSQL, upgrading a no-op UPDATE's lock to FOR UPDATE can deadlock
+    with a checkpoint that holds the task FK's KEY SHARE lock and then updates
+    its checkpoint pointer. Acquire FOR UPDATE directly, preserving its
+    exclusion of concurrent FK inserts as well as task updates. SQLite needs
+    the existing conditional UPDATE because it ignores FOR UPDATE.
+    """
+    if db.get_bind().dialect.name != "postgresql":
+        return lock_task_lease_no_commit(db, lease)
+    return (
+        db.execute(
+            select(Task.id)
+            .where(
+                Task.id == lease.task_id,
+                Task.runner_id == lease.runner_id,
+                Task.run_id == lease.run_id,
+                task_lease_attempt_predicate(lease),
+            )
+            .with_for_update()
+        ).scalar_one_or_none()
+        is not None
+    )
 
 
 _CURRENT_TASK_LEASE: ContextVar[TaskLease | None] = ContextVar(
@@ -197,6 +210,7 @@ class TaskLeaseRecoveryCandidate:
     state_version: int
     last_checkpoint_event_id: str | None
     last_checkpoint_trace_event_id: int | None
+    attempt_id: str | None = None
 
     @property
     def cursor(self) -> tuple[datetime, int]:
@@ -227,13 +241,14 @@ class TaskLeaseRefreshState(str, Enum):
     REFRESHED = "refreshed"
     SETTLEMENT_READY = "settlement_ready"
     LOST = "lost"
+    DEFERRED = "deferred"
 
 
-TaskLeaseKey = tuple[int, str, str | None]
+TaskLeaseKey = tuple[int, str, str | None, str | None]
 
 
 def _task_lease_key(lease: TaskLease) -> TaskLeaseKey:
-    return lease.task_id, lease.runner_id, lease.run_id
+    return lease.task_id, lease.runner_id, lease.run_id, lease.attempt_id
 
 
 async def run_while_task_lease_owned(
@@ -359,11 +374,16 @@ def _checkpoint_row_matches_candidate(
     (``resolve_checkpoint_recovery``) rather than here, because only the
     exact-pointer path has a second candidate set to defer to.
 
-    The vocabularies still differ -- this path calls the outcome a mismatch
-    and the reader calls it corrupt (``CheckpointCorruptError``) -- and that
-    difference is still deliberate, because each names the outcome for its
-    own caller. What is no longer true is that the two could drift on *what*
-    they judge.
+    The vocabularies still differ deliberately -- this path calls the
+    outcome a mismatch, the by-primary-key read raises
+    ``CheckpointCorruptError`` for it, and each names the outcome for its
+    own caller -- but they can no longer drift on *what* they judge. One
+    qualification the older wording lacked: what that read's *caller*
+    ultimately sees is not always corrupt either. A read performed under
+    the widened (untagged) partition has its verdict re-probed at the
+    read's boundary and reclassified as a retryable
+    ``CheckpointUnavailableError`` when a run-tagged checkpoint has since
+    appeared (see ``_load_pk_anchored_checkpoint``'s own docstring).
     """
 
     if candidate.run_id is None:
@@ -510,10 +530,19 @@ def resolve_checkpoint_recovery(
             # the same predicate, so a RECOVERABLE verdict still requires a
             # real run-partition match. The by-primary-key *read*
             # (``_load_pk_anchored_checkpoint``, ``trace_handlers.py``) does
-            # not reach this verdict for the same row shape -- it still
-            # raises ``CheckpointCorruptError``, unchanged from before this
-            # predicate existed. That divergence is deliberate; see
-            # task_interaction_anchor.py's module docstring and #2023.
+            # not reach this verdict for the same row shape, and which way
+            # it goes there is decided by the partition that read resolved.
+            # A read bound to a run raises ``CheckpointCorruptError`` for
+            # the row, unchanged. A widened (untagged) read finds the same
+            # row's absent run field a partition match instead and hands
+            # the checkpoint back, so it never reaches a corrupt verdict
+            # for this shape. Only the run-bound read is the comparison
+            # here -- a candidate without a ``run_id`` already returned
+            # above, and a widened read is never run-bound -- and that
+            # divergence remains deliberate. See
+            # ``_load_pk_anchored_checkpoint``'s own docstring for the
+            # boundary, task_interaction_anchor.py's module docstring for
+            # the write direction, and #2023 for the convergence.
             logger.info(
                 "Task %s's checkpoint pointer %s is missing its "
                 "run-partition field; deferring to the legacy event_id scan "
@@ -612,6 +641,7 @@ def _expired_task_lease_candidates_query(
             Task.runner_id,
             Task.run_id,
             Task.lease_expires_at,
+            Task.lease_attempt_id,
             Task.state_version,
             Task.last_checkpoint_event_id,
             Task.last_checkpoint_trace_event_id,
@@ -648,6 +678,7 @@ def _task_lease_recovery_candidate_from_row(
         runner_id=str(row.runner_id) if row.runner_id is not None else None,
         run_id=str(row.run_id) if row.run_id is not None else None,
         lease_expires_at=lease_expires_at,
+        attempt_id=row.lease_attempt_id,
         state_version=int(row.state_version or 0),
         last_checkpoint_event_id=(
             str(row.last_checkpoint_event_id)
@@ -753,6 +784,7 @@ def recover_expired_task_lease_no_commit(
             task_status_predicate.eq(TaskStatus.RUNNING),
             _nullable_match(Task.runner_id, candidate.runner_id),
             _nullable_match(Task.run_id, candidate.run_id),
+            _nullable_match(Task.lease_attempt_id, candidate.attempt_id),
             Task.lease_expires_at == candidate.lease_expires_at,
             Task.lease_expires_at < recovered_at,
             Task.state_version == candidate.state_version,
@@ -819,7 +851,16 @@ def acquire_task_lease_no_commit(
     new_run: bool = False,
     claim_predicates: Sequence[ColumnElement[bool]] = (),
 ) -> TaskLease | None:
-    """Stage one atomic lease claim; the caller owns commit/rollback."""
+    """Stage one atomic claim; the caller owns commit/rollback.
+
+    In coordinator context, transition execution state under the existing
+    owner and return its fixed run fence. Otherwise, existing entry-point
+    reservations govern acquisition and each claim supersedes prior handles.
+    """
+    from .task_coordinator_runtime import current_task_coordinator
+    from .task_coordinator_service import task_lease_predicate
+
+    coordinator = current_task_coordinator(task_id)
     runner = runner_id or get_runner_id()
     now = utc_now()
     expires_at = task_lease_expires_at(now)
@@ -859,20 +900,29 @@ def acquire_task_lease_no_commit(
             lease_checkpoint_trace_event_id_case()
         )
 
-    stmt = (
-        update(Task)
-        .where(Task.id == task_id)
-        .where(
-            or_(
-                task_status_predicate.ne(TaskStatus.RUNNING),
-                Task.runner_id == runner,
-                Task.runner_id.is_(None),
-                Task.lease_expires_at.is_(None),
-                Task.lease_expires_at < now,
-            )
+    if coordinator is not None:
+        # In shared execution this operation admits a run under the existing
+        # task owner. It must never mint a second acquisition or heartbeat.
+        assert coordinator.lease is not None
+        runner = coordinator.lease.runner_id
+        attempt_id = coordinator.lease.attempt_id
+        for field in (
+            "runner_id",
+            "lease_attempt_id",
+            "lease_expires_at",
+            "last_heartbeat_at",
+        ):
+            values.pop(field)
+        owner_predicate = task_lease_predicate(coordinator.lease)
+    else:
+        owner_predicate = or_(
+            task_status_predicate.ne(TaskStatus.RUNNING),
+            Task.runner_id == runner,
+            Task.runner_id.is_(None),
+            Task.lease_expires_at.is_(None),
+            Task.lease_expires_at < now,
         )
-        .values(**values)
-    )
+    stmt = update(Task).where(Task.id == task_id, owner_predicate).values(**values)
     if new_run:
         stmt = stmt.where(task_status_predicate.ne(TaskStatus.RUNNING))
     if expected_run_id is not None:
@@ -891,7 +941,7 @@ def acquire_task_lease_no_commit(
         task_id=task_id,
         runner_id=runner,
         run_id=str(stored_run_id) if stored_run_id is not None else None,
-        attempt_id=values["lease_attempt_id"],
+        attempt_id=attempt_id,
     )
 
 
@@ -940,6 +990,7 @@ def _refresh_task_lease_no_commit(
         update(Task)
         .where(Task.id == lease.task_id)
         .where(Task.runner_id == lease.runner_id)
+        .where(task_lease_attempt_predicate(lease))
         .where(task_status_predicate.eq(TaskStatus.RUNNING))
         .values(last_heartbeat_at=now, lease_expires_at=expires_at)
     )
@@ -952,6 +1003,7 @@ def _refresh_task_lease_no_commit(
     owned_query = db.query(Task.status).filter(
         Task.id == lease.task_id,
         Task.runner_id == lease.runner_id,
+        task_lease_attempt_predicate(lease),
     )
     if lease.run_id is not None:
         owned_query = owned_query.filter(Task.run_id == lease.run_id)
@@ -980,6 +1032,97 @@ def refresh_task_lease(db: Session, lease: TaskLease) -> TaskLeaseRefreshState:
     return state
 
 
+def _refresh_task_leases_postgresql_no_commit(
+    db: Session, leases: tuple[TaskLease, ...]
+) -> dict[TaskLeaseKey, TaskLeaseRefreshState]:
+    """Renew available rows without making healthy leases wait for busy ones."""
+    # Bound exceptional SQL waits without tying the budget to retry cadence.
+    statement_ms = max(1, int(min(5, get_task_lease_ttl_seconds() / 4) * 1000))
+    db.execute(
+        text(
+            "SELECT set_config('statement_timeout', :statement, true), "
+            "set_config('lock_timeout', :lock, true)"
+        ),
+        {"statement": f"{statement_ms}ms", "lock": f"{min(1000, statement_ms)}ms"},
+    )
+    owned = or_(
+        *(
+            and_(
+                Task.id == lease.task_id,
+                Task.runner_id == lease.runner_id,
+                Task.run_id == lease.run_id,
+                task_lease_attempt_predicate(lease),
+            )
+            for lease in leases
+        )
+    )
+    available = list(
+        db.scalars(
+            select(Task.id)
+            .where(owned, task_status_predicate.eq(TaskStatus.RUNNING))
+            # SQLAlchemy's key_share=True (without read=True) means NO KEY
+            # UPDATE, compatible with checkpoint foreign-key KEY SHARE locks.
+            .with_for_update(of=Task, key_share=True, skip_locked=True)
+        )
+    )
+    refreshed: set[TaskLeaseKey] = set()
+    if available:
+        now = utc_now()
+        rows = db.execute(
+            update(Task)
+            .where(
+                Task.id.in_(available),
+                owned,
+                task_status_predicate.eq(TaskStatus.RUNNING),
+            )
+            .values(last_heartbeat_at=now, lease_expires_at=task_lease_expires_at(now))
+            .returning(Task.id, Task.runner_id, Task.run_id, Task.lease_attempt_id)
+            .execution_options(synchronize_session=False)
+        )
+        refreshed = {
+            (row.id, row.runner_id, row.run_id, row.lease_attempt_id) for row in rows
+        }
+    remaining = [lease for lease in leases if _task_lease_key(lease) not in refreshed]
+    # A skipped row is not evidence of lost ownership. Read committed state
+    # without acquiring more row locks; uncommitted takeovers stay deferred.
+    visible = (
+        {
+            row.id: row
+            for row in db.execute(
+                select(
+                    Task.id,
+                    Task.runner_id,
+                    Task.run_id,
+                    Task.lease_attempt_id,
+                    Task.status,
+                ).where(Task.id.in_([lease.task_id for lease in remaining]))
+            )
+        }
+        if remaining
+        else {}
+    )
+    states = {}
+    for lease in leases:
+        key = _task_lease_key(lease)
+        if key in refreshed:
+            states[key] = TaskLeaseRefreshState.REFRESHED
+            continue
+        row = visible.get(lease.task_id)
+        if (
+            lease.run_id is None
+            or lease.attempt_id is None
+            or row is None
+            or (row.runner_id, row.run_id, row.lease_attempt_id)
+            != (lease.runner_id, lease.run_id, lease.attempt_id)
+        ):
+            states[key] = TaskLeaseRefreshState.LOST
+        elif row.status != TaskStatus.RUNNING:
+            states[key] = TaskLeaseRefreshState.SETTLEMENT_READY
+        else:
+            states[key] = TaskLeaseRefreshState.DEFERRED
+    return states
+
+
 def refresh_task_leases_isolated(
     leases: tuple[TaskLease, ...],
 ) -> dict[TaskLeaseKey, TaskLeaseRefreshState]:
@@ -1000,15 +1143,19 @@ def refresh_task_leases_isolated(
     expires_at = task_lease_expires_at(now)
     with SessionLocal() as db:
         try:
-            states = {
-                _task_lease_key(lease): _refresh_task_lease_no_commit(
-                    db,
-                    lease,
-                    now=now,
-                    expires_at=expires_at,
-                )
-                for lease in leases
-            }
+            states = (
+                _refresh_task_leases_postgresql_no_commit(db, leases)
+                if (db.get_bind().dialect.name == "postgresql")
+                else {
+                    _task_lease_key(lease): _refresh_task_lease_no_commit(
+                        db,
+                        lease,
+                        now=now,
+                        expires_at=expires_at,
+                    )
+                    for lease in leases
+                }
+            )
             db.commit()
             return states
         except Exception:
@@ -1021,8 +1168,12 @@ def validate_preacquired_task_lease_isolated(
 ) -> TaskLeaseRefreshState:
     """Refresh and validate an exact lease committed before local scheduling."""
 
-    states = refresh_task_leases_isolated((lease,))
-    return states.get(_task_lease_key(lease), TaskLeaseRefreshState.LOST)
+    from ..models.database import get_session_local
+
+    # Execution admission needs a definitive refresh, not a heartbeat's
+    # DEFERRED result while another transaction holds the task row.
+    with get_session_local()() as db:
+        return refresh_task_lease(db, lease)
 
 
 _NON_TERMINAL_RELEASE_STATUSES = frozenset(
@@ -1042,6 +1193,22 @@ def release_task_lease(
         return False
     db.commit()
     return released
+
+
+def task_settlement_ownership_values(
+    task_id: int, *, last_heartbeat_at: datetime | None = None
+) -> dict[str, Any]:
+    """Only the coordinator releases shared ownership after all handles drain."""
+    from .task_coordinator_runtime import current_task_coordinator
+
+    if current_task_coordinator(task_id) is not None:
+        return {}
+    return {
+        "runner_id": None,
+        "lease_attempt_id": None,
+        "lease_expires_at": None,
+        "last_heartbeat_at": last_heartbeat_at,
+    }
 
 
 def release_task_lease_no_commit(
@@ -1076,12 +1243,26 @@ def release_task_lease_no_commit(
         ),
         "lease_attempt_id": None,
     }
+    from .task_coordinator_runtime import current_task_coordinator
+
+    coordinator = current_task_coordinator(lease.task_id)
+    if coordinator is not None:
+        if not coordinator.owns_execution(lease):
+            return False
+        for field in (
+            "runner_id",
+            "lease_attempt_id",
+            "lease_expires_at",
+            "last_heartbeat_at",
+        ):
+            values.pop(field)
     if status in _NON_TERMINAL_RELEASE_STATUSES:
         values["error_message"] = None
     stmt = (
         update(Task)
         .where(Task.id == lease.task_id)
         .where(Task.runner_id == lease.runner_id)
+        .where(task_lease_attempt_predicate(lease))
         .values(**values)
     )
     if lease.run_id is not None:
@@ -1111,18 +1292,20 @@ def fail_and_release_task_lease_no_commit(
         update(Task)
         .where(Task.id == lease.task_id)
         .where(Task.runner_id == lease.runner_id)
+        .where(task_lease_attempt_predicate(lease))
         .where(Task.run_id == lease.run_id)
         .where(task_status_predicate.eq(TaskStatus.RUNNING))
         .values(
-            status=task_status_predicate.value(TaskStatus.FAILED),
-            runner_id=None,
-            lease_expires_at=None,
-            last_heartbeat_at=utc_now(),
-            control_state=failed_control_state,
-            state_version=func.coalesce(Task.state_version, 0) + 1,
-            error_message=error_message,
-            output=None,
-            lease_attempt_id=None,
+            {
+                "status": task_status_predicate.value(TaskStatus.FAILED),
+                "control_state": failed_control_state,
+                "state_version": func.coalesce(Task.state_version, 0) + 1,
+                "error_message": error_message,
+                "output": None,
+                **task_settlement_ownership_values(
+                    lease.task_id, last_heartbeat_at=utc_now()
+                ),
+            }
         )
     )
     result = db.execute(stmt.execution_options(synchronize_session=False))
@@ -1137,7 +1320,10 @@ def release_current_runner_task_lease(
     runner_id: str | None = None,
     expected_run_id: str | None = None,
 ) -> bool:
-    """Release the current runner's lease for a task."""
+    """Release the context holder; a runner id alone cannot authorize release."""
+    lease = current_task_lease()
+    if lease is None or lease.task_id != task_id:
+        return False
     if status == TaskStatus.RUNNING:
         raise ValueError("Cannot release a task lease with RUNNING status")
     runner = runner_id or get_runner_id()
@@ -1147,16 +1333,19 @@ def release_current_runner_task_lease(
         update(Task)
         .where(Task.id == task_id)
         .where(Task.runner_id == runner)
+        .where(Task.run_id == lease.run_id)
+        .where(task_lease_attempt_predicate(lease))
         .values(
-            status=task_status_predicate.value(status),
-            runner_id=None,
-            lease_expires_at=None,
-            last_heartbeat_at=utc_now(),
-            control_state=control_state,
-            state_version=lease_state_version_case(
-                status, control_state, current_version
-            ),
-            lease_attempt_id=None,
+            {
+                "status": task_status_predicate.value(status),
+                "control_state": control_state,
+                "state_version": lease_state_version_case(
+                    status, control_state, current_version
+                ),
+                **task_settlement_ownership_values(
+                    task_id, last_heartbeat_at=utc_now()
+                ),
+            }
         )
     )
     if expected_run_id is not None:
@@ -1175,6 +1364,8 @@ class _TaskLeaseHeartbeatEntry:
     )
     terminal_event: asyncio.Event = field(default_factory=asyncio.Event)
     refresh_waiter: asyncio.Future[TaskLeaseHeartbeatOutcome] | None = None
+    retry_at: float | None = None
+    deferred_since: float | None = None
 
 
 class _TaskLeaseHeartbeatRegistration:
@@ -1277,7 +1468,16 @@ class _TaskLeaseHeartbeatManager:
         try:
             next_refresh_at = self._loop.time() + get_task_lease_heartbeat_seconds()
             while self._entries:
-                delay = max(0.0, next_refresh_at - self._loop.time())
+                next_attempt_at = min(
+                    (
+                        entry.retry_at
+                        for entry in self._entries.values()
+                        if entry.retry_at is not None
+                    ),
+                    default=next_refresh_at,
+                )
+                next_attempt_at = min(next_refresh_at, next_attempt_at)
+                delay = max(0.0, next_attempt_at - self._loop.time())
                 if delay > 0:
                     self._wake_event.clear()
                     try:
@@ -1289,10 +1489,17 @@ class _TaskLeaseHeartbeatManager:
                         pass
                     if not self._entries:
                         return
-                    if self._loop.time() < next_refresh_at:
+                    if self._loop.time() < next_attempt_at:
                         continue
 
-                snapshot_entries = tuple(self._entries.items())
+                now = self._loop.time()
+                regular_refresh = now >= next_refresh_at
+                snapshot_entries = tuple(
+                    (key, entry)
+                    for key, entry in self._entries.items()
+                    if regular_refresh
+                    or (entry.retry_at is not None and entry.retry_at <= now)
+                )
                 snapshot = tuple(entry.lease for _, entry in snapshot_entries)
                 refresh_waiters = tuple(
                     (key, entry, self._loop.create_future())
@@ -1301,6 +1508,9 @@ class _TaskLeaseHeartbeatManager:
                 active_refresh_waiters = refresh_waiters
                 for _, entry, waiter in refresh_waiters:
                     entry.refresh_waiter = waiter
+                    # A database error waits for the next normal tick instead
+                    # of retrying the same failed statement in a tight loop.
+                    entry.retry_at = None
                 try:
                     states = await run_db_io_cancellation_safe(
                         lambda: refresh_task_leases_isolated(snapshot)
@@ -1341,6 +1551,18 @@ class _TaskLeaseHeartbeatManager:
                 else:
                     for key, entry, waiter in refresh_waiters:
                         state = states.get(key, TaskLeaseRefreshState.LOST)
+                        if state == TaskLeaseRefreshState.DEFERRED:
+                            now = self._loop.time()
+                            if entry.deferred_since is None:
+                                entry.deferred_since = now
+                            entry.retry_at = now + min(
+                                1.0, get_task_lease_heartbeat_seconds() / 4
+                            )
+                            # Skipping a locked row neither proves ownership
+                            # loss nor clears a preceding pool checkout error.
+                            self._settle_refresh_waiter(entry, waiter, entry.outcome)
+                            continue
+                        entry.deferred_since = None
                         if state == TaskLeaseRefreshState.LOST:
                             self._settle_refresh_waiter(
                                 entry,
@@ -1361,12 +1583,29 @@ class _TaskLeaseHeartbeatManager:
                                 waiter,
                                 TaskLeaseHeartbeatOutcome(),
                             )
+                    deferred = [
+                        entry
+                        for _, entry, _ in refresh_waiters
+                        if entry.deferred_since is not None
+                    ]
+                    if deferred:
+                        logger.debug(
+                            "component=lease-heartbeat deferred_count=%s "
+                            "oldest_deferred_seconds=%.3f",
+                            len(deferred),
+                            max(
+                                self._loop.time() - cast(float, entry.deferred_since)
+                                for entry in deferred
+                            ),
+                        )
                 active_refresh_waiters = ()
                 interval = get_task_lease_heartbeat_seconds()
-                next_refresh_at += interval
                 now = self._loop.time()
-                while next_refresh_at <= now:
-                    next_refresh_at += interval
+                # A slow subset retry must not consume a normal tick owed to
+                # the other leases. Run that overdue batch on the next loop.
+                if regular_refresh:
+                    while next_refresh_at <= now:
+                        next_refresh_at += interval
         finally:
             for _, entry, waiter in active_refresh_waiters:
                 self._settle_refresh_waiter(
@@ -1391,6 +1630,34 @@ def _get_task_lease_heartbeat_manager() -> _TaskLeaseHeartbeatManager:
     return manager
 
 
+def registered_task_lease(snapshot: TaskLease | None) -> TaskLease | None:
+    """Resolve a routing observation to the actual local heartbeat holder.
+
+    The database observation is only a lookup key, never an ownership grant.
+    SQL writers still validate the returned holder after any intervening takeover.
+    """
+    if snapshot is None or snapshot.attempt_id is None:
+        return None
+    from .task_coordinator_runtime import current_task_coordinator
+
+    coordinator = current_task_coordinator(snapshot.task_id)
+    if coordinator is not None and coordinator.owns_execution(snapshot):
+        assert coordinator.lease is not None
+        return TaskLease(
+            task_id=coordinator.task_id,
+            runner_id=coordinator.lease.runner_id,
+            attempt_id=coordinator.lease.attempt_id,
+            run_id=snapshot.run_id,
+        )
+    manager = _task_lease_heartbeat_manager
+    if manager is None or manager._loop is not asyncio.get_running_loop():
+        return None
+    entry = manager._entries.get(_task_lease_key(snapshot))
+    if entry is None or entry.terminal_event.is_set():
+        return None
+    return entry.lease
+
+
 async def wait_for_heartbeat_manager_idle() -> None:
     """Wait for the current loop's shared heartbeat worker to become idle."""
     manager = _task_lease_heartbeat_manager
@@ -1403,6 +1670,13 @@ async def run_task_lease_heartbeat(
     stop_event: asyncio.Event,
 ) -> TaskLeaseHeartbeatOutcome:
     """Keep a task lease in the process-local heartbeat batch until stopped."""
+    from .task_coordinator_runtime import current_task_coordinator
+
+    coordinator = current_task_coordinator(lease.task_id)
+    if coordinator is not None:
+        if not coordinator.owns_execution(lease):
+            return TaskLeaseHeartbeatOutcome(lease_lost=True)
+        return await coordinator.observe_ownership(stop_event)
     registration = _get_task_lease_heartbeat_manager().register(lease)
     stop_waiter = asyncio.create_task(stop_event.wait())
     terminal_waiter = asyncio.create_task(registration.terminal_event.wait())

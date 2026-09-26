@@ -48,7 +48,7 @@ import asyncio
 import enum
 import logging
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 from uuid import uuid4
@@ -56,6 +56,7 @@ from uuid import uuid4
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
+from ...config import get_shared_task_execution_enabled
 from ...core.agent.context.execution import CLOCK_TIMEZONE_METADATA_KEY
 from ...core.execution_scope import resolve_execution_scope
 from ...core.tools.adapters.vibe.config import RequiredMCPUnavailableError
@@ -74,6 +75,8 @@ from .chat_history_service import (
 )
 from .client_error_messages import (
     CLIENT_SAFE_TASK_FAILURE,
+    ClientErrorCode,
+    client_error_message,
     connector_runtime_client_code,
     connector_runtime_client_message,
     required_mcp_unavailable_client_message,
@@ -89,15 +92,19 @@ from .external_task_cancel import (
 )
 from .file_turn import bind_turn_files_no_commit
 from .hot_path_cache import invalidate_task_cache
+from .llm_utils import AutoModelUnavailableError
 from .mcp_runtime import (
     MCPBuiltinOAuthActorPolicy,
     MCPBuiltinOAuthActorPolicyRequiredError,
 )
+from .task_command_transport import ClaimedTaskCommand
 from .task_execution_controller import (
+    TaskControlSnapshot,
     TaskControlState,
     apply_task_control_transition,
     task_execution_controller,
 )
+from .task_execution_host import enqueues_task_turns
 from .task_lease_service import (
     TaskLease,
     TaskLeaseHeartbeatOutcome,
@@ -108,10 +115,12 @@ from .task_lease_service import (
     acquire_task_lease_no_commit,
     fail_and_release_task_lease_no_commit,
     get_runner_id,
+    lock_task_lease_for_settlement_no_commit,
     release_task_lease,
     run_task_lease_heartbeat,
     run_while_task_lease_owned,
     stop_task_lease_heartbeat,
+    task_lease_attempt_predicate,
     validate_preacquired_task_lease_isolated,
 )
 from .task_runtime import mcp_runtime_authorization_policy_required
@@ -281,7 +290,7 @@ class TurnStarted:
     updated_at: Optional[datetime]
     before_message_id: Optional[int]
     task_source: Optional[str]
-    background_task: "asyncio.Task[None]"
+    background_task: "asyncio.Task[None] | None"
     run_id: str = ""
     state_version: int = 0
     control_state: str = TaskControlState.RUNNING.value
@@ -509,7 +518,9 @@ class TaskTurnOrchestrator:
         # strand the row as RUNNING with no worker. One owned child covers
         # claim through scheduling and is drained before cancellation reaches
         # the caller.
-        async def _claim_and_schedule() -> tuple[_ClaimedTurn, "asyncio.Task[None]"]:
+        async def _claim_and_schedule() -> tuple[
+            _PreparedTurn, "asyncio.Task[None] | None"
+        ]:
             # Off-loop atomic claim + persist + commit. Only raises pre-commit
             # (busy / not-found), so a normal exception here means nothing was
             # committed; reaching the schedule means the row is RUNNING.
@@ -519,6 +530,9 @@ class TaskTurnOrchestrator:
                     task_owner_user_id,
                     payload=payload,
                     kind=kind,
+                    context=context,
+                    force_fresh=force_fresh,
+                    actor_user_id=actor_user_id,
                 )
             )
             handle = await _schedule_committed_turn(
@@ -550,7 +564,10 @@ class TaskTurnOrchestrator:
         task_id: int,
         task_owner_user_id: int,
         payload: TaskTurnPayload,
-    ) -> "_ClaimedTurn":
+        actor_user_id: int | None = None,
+        context: Optional[dict[str, Any]] = None,
+        mcp_runtime_authorization_policy: MCPBuiltinOAuthActorPolicy | None = None,
+    ) -> "_PreparedTurn":
         """Stage one CREATE turn inside the caller-owned transaction.
 
         This is used only when the task row itself is still uncommitted, so the
@@ -564,7 +581,10 @@ class TaskTurnOrchestrator:
             task_id=task_id,
             task_owner_user_id=task_owner_user_id,
             payload=payload,
+            actor_user_id=actor_user_id,
+            context=context,
             kind=TurnKind.CREATE,
+            mcp_runtime_authorization_policy=mcp_runtime_authorization_policy,
         )
 
     @staticmethod
@@ -574,7 +594,9 @@ class TaskTurnOrchestrator:
         task_id: int,
         task_owner_user_id: int,
         payload: TaskTurnPayload,
-    ) -> "_ClaimedTurn":
+        actor_user_id: int | None = None,
+        context: Optional[dict[str, Any]] = None,
+    ) -> "_PreparedTurn":
         """Stage one APPEND turn inside a domain-owned transaction.
 
         File/runtime domain mutations that must be atomic with acceptance can
@@ -587,6 +609,8 @@ class TaskTurnOrchestrator:
             task_id=task_id,
             task_owner_user_id=task_owner_user_id,
             payload=payload,
+            actor_user_id=actor_user_id,
+            context=context,
             kind=TurnKind.APPEND,
         )
 
@@ -597,7 +621,7 @@ class TaskTurnOrchestrator:
         task_owner_user_id: int,
         actor_user_id: int | None,
         payload: TaskTurnPayload,
-        claimed: "_ClaimedTurn",
+        claimed: "_PreparedTurn",
         kind: TurnKind,
         force_fresh: bool = False,
         context: Optional[Dict[str, Any]] = None,
@@ -622,7 +646,7 @@ class TaskTurnOrchestrator:
         task_owner_user_id: int,
         actor_user_id: int | None,
         payload: TaskTurnPayload,
-        claimed: "_ClaimedTurn",
+        claimed: "_PreparedTurn",
         kind: TurnKind,
         force_fresh: bool = False,
         context: Optional[Dict[str, Any]] = None,
@@ -670,7 +694,7 @@ class TaskTurnOrchestrator:
         task_owner_user_id: int,
         actor_user_id: int | None,
         payload: TaskTurnPayload,
-        claimed: "_ClaimedTurn",
+        claimed: "_PreparedTurn",
         context: Optional[Dict[str, Any]] = None,
         mcp_runtime_authorization_policy: MCPBuiltinOAuthActorPolicy | None = None,
     ) -> TurnStarted:
@@ -692,12 +716,7 @@ class TaskTurnOrchestrator:
 
 
 @dataclass(frozen=True)
-class _ClaimedTurn:
-    """Snapshot returned by ``_begin_turn_atomic_sync`` after the claim
-    commits, so ``begin_turn`` can build :class:`TurnStarted` without the
-    caller re-reading the ORM."""
-
-    task_lease: TaskLease
+class _AcceptedTurn:
     status: TaskStatus
     updated_at: Optional[datetime]
     before_message_id: Optional[int]
@@ -708,18 +727,37 @@ class _ClaimedTurn:
     agent_config: Optional[dict[str, Any]] = None
 
 
+@dataclass(frozen=True, kw_only=True)
+class _ClaimedTurn(_AcceptedTurn):
+    task_lease: TaskLease
+
+
+@dataclass(frozen=True, kw_only=True)
+class _EnqueuedTurn(_AcceptedTurn):
+    command_db_id: int
+    command_payload: dict[str, Any]
+
+
+_PreparedTurn = _ClaimedTurn | _EnqueuedTurn
+
+
 async def _schedule_committed_turn(
     *,
     task_id: int,
     task_owner_user_id: int,
     payload: TaskTurnPayload,
-    claimed: _ClaimedTurn,
+    claimed: _PreparedTurn,
     kind: TurnKind,
     force_fresh: bool,
     context: Optional[Dict[str, Any]],
     mcp_runtime_authorization_policy: MCPBuiltinOAuthActorPolicy | None = None,
-) -> "asyncio.Task[None]":
+) -> "asyncio.Task[None] | None":
     """Own scheduling and compensation after a turn claim has committed."""
+    if isinstance(claimed, _EnqueuedTurn):
+        from .task_command_transport import notify_task_command_dispatcher
+
+        notify_task_command_dispatcher()
+        return None
 
     try:
         actor_marked = mcp_runtime_authorization_policy_required(claimed.agent_config)
@@ -936,8 +974,8 @@ def _turn_started_snapshot(
     task_owner_user_id: int,
     actor_user_id: int | None,
     kind: TurnKind,
-    claimed: _ClaimedTurn,
-    background_task: "asyncio.Task[None]",
+    claimed: _PreparedTurn,
+    background_task: "asyncio.Task[None] | None",
 ) -> TurnStarted:
     """Build the detached turn result and emit its owner/actor audit record."""
 
@@ -961,15 +999,14 @@ def _turn_started_snapshot(
     )
 
 
-def _persist_claimed_turn_no_commit(
+def _persist_accepted_turn_no_commit(
     db: Session,
     *,
     task_id: int,
     task_owner_user_id: int,
     payload: TaskTurnPayload,
-    task_lease: TaskLease,
-) -> _ClaimedTurn:
-    """Persist the first message and snapshot one already-claimed turn."""
+) -> _AcceptedTurn:
+    """Persist the first message and snapshot one accepted turn."""
 
     from .chat_history_service import persist_user_message_no_commit
 
@@ -1009,8 +1046,7 @@ def _persist_claimed_turn_no_commit(
         .filter(Task.id == task_id)
         .one()
     )
-    return _ClaimedTurn(
-        task_lease=task_lease,
+    return _AcceptedTurn(
         status=status,
         updated_at=updated_at,
         before_message_id=before_message_id,
@@ -1059,15 +1095,47 @@ def _task_requires_actor_policy_sync(
         return _task_requires_actor_policy(db, task_id, task_owner_user_id)
 
 
-def _claim_turn_no_commit(
+def reserve_task_start_no_commit(
+    db: Session,
+    *,
+    task_id: int,
+    task_owner_user_id: int,
+    statuses: tuple[TaskStatus, ...],
+) -> bool:
+    """Lock admission without replacing the run or the owner still draining it."""
+    from sqlalchemy import exists, select
+
+    from ..models.task_command import TaskExecutionCommand
+
+    pending_start = exists(
+        select(1).where(
+            TaskExecutionCommand.task_id == task_id,
+            TaskExecutionCommand.kind == "start",
+            TaskExecutionCommand.status.in_(("pending", "processing")),
+        )
+    )
+    return (
+        db.query(Task)
+        .filter(
+            Task.id == task_id,
+            Task.user_id == task_owner_user_id,
+            Task.status.in_(statuses),
+            ~pending_start,
+        )
+        .update({Task.updated_at: Task.updated_at}, synchronize_session=False)
+        == 1
+    )
+
+
+def _accept_turn_no_commit(
     db: Session,
     task_id: int,
     task_owner_user_id: int,
     *,
     payload: TaskTurnPayload,
     kind: TurnKind,
-) -> _ClaimedTurn:
-    """Stage one atomic turn claim; the caller owns commit and rollback."""
+) -> _AcceptedTurn:
+    """Stage turn acceptance without a lease; the caller owns the transaction."""
 
     if kind == TurnKind.APPEND and _task_requires_actor_policy(
         db,
@@ -1081,33 +1149,57 @@ def _claim_turn_no_commit(
     else:  # APPEND
         status_filter = Task.status.in_(_APPENDABLE_STATUSES)
 
+    from .task_coordinator_runtime import current_task_coordinator
+
     run_id = str(uuid4())
-    claimed = (
-        db.query(Task)
-        .filter(
-            Task.id == task_id,
-            Task.user_id == task_owner_user_id,
-            status_filter,
+    queued = enqueues_task_turns()
+    if queued:
+        claimed: int = reserve_task_start_no_commit(
+            db,
+            task_id=task_id,
+            task_owner_user_id=task_owner_user_id,
+            statuses=(TaskStatus.PENDING,)
+            if kind == TurnKind.CREATE
+            else tuple(_APPENDABLE_STATUSES),
         )
-        .update(
-            {
-                Task.status: TaskStatus.RUNNING,
-                Task.input: payload.transcript_message,
-                Task.output: None,
-                Task.error_message: None,
-                Task.runner_id: None,
-                Task.lease_attempt_id: None,
-                Task.lease_expires_at: None,
-                Task.last_heartbeat_at: None,
-                Task.run_id: run_id,
-                Task.last_checkpoint_event_id: None,
-                Task.last_checkpoint_trace_event_id: None,
-                Task.state_version: func.coalesce(Task.state_version, 0) + 1,
-                Task.control_state: TaskControlState.RUNNING.value,
-            },
-            synchronize_session=False,
+    else:
+        values = {
+            Task.status: TaskStatus.RUNNING,
+            Task.input: payload.transcript_message,
+            Task.output: None,
+            Task.error_message: None,
+            Task.run_id: run_id,
+            Task.last_checkpoint_event_id: None,
+            Task.last_checkpoint_trace_event_id: None,
+            Task.state_version: func.coalesce(Task.state_version, 0) + 1,
+            Task.control_state: TaskControlState.RUNNING.value,
+        }
+        coordinator = current_task_coordinator(task_id)
+        predicates = []
+        if coordinator is not None:
+            from .task_coordinator_service import task_lease_predicate
+
+            assert coordinator.lease is not None
+            predicates.append(task_lease_predicate(coordinator.lease))
+        else:
+            values.update(
+                {
+                    Task.runner_id: None,
+                    Task.lease_attempt_id: None,
+                    Task.lease_expires_at: None,
+                    Task.last_heartbeat_at: None,
+                }
+            )
+        claimed = (
+            db.query(Task)
+            .filter(
+                Task.id == task_id,
+                Task.user_id == task_owner_user_id,
+                status_filter,
+                *predicates,
+            )
+            .update(values, synchronize_session=False)
         )
-    )
     if claimed == 0:
         owned = (
             db.query(Task.id, Task.status)
@@ -1120,22 +1212,11 @@ def _claim_turn_no_commit(
             raise TaskTurnError("interaction_response_required")
         raise TaskTurnError("busy")
 
-    task_lease = acquire_task_lease_no_commit(
-        db,
-        task_id,
-        expected_run_id=run_id,
-    )
-    if task_lease is None:
-        raise RuntimeError(
-            f"task {task_id} claim could not stage its exact execution lease"
-        )
-
-    result = _persist_claimed_turn_no_commit(
+    result = _persist_accepted_turn_no_commit(
         db,
         task_id=task_id,
         task_owner_user_id=task_owner_user_id,
         payload=payload,
-        task_lease=task_lease,
     )
     missing_bindings = bind_turn_files_no_commit(
         file_ids=list(payload.file_ids),
@@ -1167,22 +1248,111 @@ def _claim_turn_no_commit(
         except WorkforceTurnRejectedError as exc:
             raise TaskTurnError(exc.reason) from exc
         # Keep the WorkforceRun projection in the same transaction as the
-        # Task RUNNING claim and exact prelease. A later best-effort worker can
+        # Task RUNNING acceptance. A later best-effort worker can
         # otherwise arrive after completion and resurrect the projection.
         from .workforce_runtime import sync_workforce_run_status
 
-        claimed_task = (
-            db.query(Task)
-            .filter(
-                Task.id == task_id,
-                Task.status == TaskStatus.RUNNING,
-                Task.runner_id == task_lease.runner_id,
-                Task.run_id == task_lease.run_id,
+        if not queued:
+            claimed_task = (
+                db.query(Task).filter(Task.id == task_id, Task.run_id == run_id).one()
             )
-            .one()
-        )
-        sync_workforce_run_status(db, claimed_task, TaskStatus.RUNNING)
+            sync_workforce_run_status(db, claimed_task, TaskStatus.RUNNING)
+    if queued:
+        return replace(result, run_id=run_id, status=TaskStatus.PENDING)
     return result
+
+
+def _claim_turn_no_commit(
+    db: Session,
+    task_id: int,
+    task_owner_user_id: int,
+    *,
+    payload: TaskTurnPayload,
+    kind: TurnKind,
+    context: Optional[dict[str, Any]] = None,
+    force_fresh: bool = False,
+    actor_user_id: int | None = None,
+    mcp_runtime_authorization_policy: MCPBuiltinOAuthActorPolicy | None = None,
+) -> _PreparedTurn:
+    if enqueues_task_turns():
+        from .task_event_bridge import get_task_event_bridge
+
+        get_task_event_bridge().require_ready()
+        from .task_actor_policy import bind_shared_actor_policy
+
+        task = db.get(Task, task_id)
+        if task is None or task.user_id != task_owner_user_id:
+            raise TaskTurnNotFoundError(task_id)
+        if kind is TurnKind.CREATE:
+            bind_shared_actor_policy(
+                task, mcp_runtime_authorization_policy, is_create=True
+            )
+    accepted = _accept_turn_no_commit(
+        db,
+        task_id,
+        task_owner_user_id,
+        payload=payload,
+        kind=kind,
+    )
+    if enqueues_task_turns():
+        from .task_runtime_secrets import bind_runtime_values_to_run
+        from .task_start_protocol import TaskStartPayload, stage_task_start_command
+
+        # Trigger metadata already lives on the task. No arbitrary request
+        # context or executable policy object is copied through START.
+        stored = accepted.agent_config or {}
+        clock_timezone = None
+        for key, value in (context or {}).items():
+            if key == CLOCK_TIMEZONE_METADATA_KEY:
+                clock_timezone = value
+            elif (
+                key
+                not in {"trigger_id", "trigger_run_id", "trigger_type", "trigger_test"}
+                or stored.get(key) != value
+            ):
+                raise ValueError(f"Unsupported durable START context field: {key}")
+        has_runtime_values = bind_runtime_values_to_run(
+            db,
+            task_id=task_id,
+            turn_id=payload.turn_id,
+            run_id=accepted.run_id,
+        )
+        start = TaskStartPayload(
+            version=1,
+            run_id=accepted.run_id,
+            expected_run_id=db.query(Task.run_id).filter(Task.id == task_id).scalar(),
+            state_version=accepted.state_version,
+            turn_id=payload.turn_id,
+            kind=kind.value,
+            message=payload.transcript_message,
+            execution_message=payload.execution_message,
+            file_ids=list(payload.file_ids),
+            before_message_id=accepted.before_message_id,
+            timezone=clock_timezone,
+            force_fresh=force_fresh,
+            runtime_values_ref=payload.turn_id if has_runtime_values else None,
+        )
+        staged = stage_task_start_command(
+            db,
+            task_id=task_id,
+            actor_user_id=(
+                task_owner_user_id if actor_user_id is None else actor_user_id
+            ),
+            start=start,
+        )
+        if not staged.created or not staged.payload_matches:
+            # A new accepted run cannot adopt a different earlier command.
+            raise TaskTurnError("turn_identity_conflict")
+        return _EnqueuedTurn(
+            **vars(accepted),
+            command_db_id=staged.staged_db_id,
+            command_payload=start.model_dump(mode="json"),
+        )
+
+    lease = acquire_task_lease_no_commit(db, task_id, expected_run_id=accepted.run_id)
+    if lease is None:
+        raise RuntimeError(f"task {task_id} could not stage its exact execution lease")
+    return _ClaimedTurn(**vars(accepted), task_lease=lease)
 
 
 def _begin_turn_atomic_sync(
@@ -1191,7 +1361,10 @@ def _begin_turn_atomic_sync(
     *,
     payload: TaskTurnPayload,
     kind: TurnKind,
-) -> _ClaimedTurn:
+    context: Optional[dict[str, Any]] = None,
+    force_fresh: bool = False,
+    actor_user_id: int | None = None,
+) -> _PreparedTurn:
     """Atomic claim + user-message persist + commit on its OWN session.
 
     Designed to run under ``asyncio.to_thread`` so the synchronous write
@@ -1219,7 +1392,7 @@ def _begin_turn_atomic_sync(
 
     SessionLocal = get_session_local()
     db = SessionLocal()
-    result: _ClaimedTurn | None = None
+    result: _PreparedTurn | None = None
     session_retired = False
     try:
         try:
@@ -1229,6 +1402,9 @@ def _begin_turn_atomic_sync(
                 task_owner_user_id,
                 payload=payload,
                 kind=kind,
+                context=context,
+                force_fresh=force_fresh,
+                actor_user_id=actor_user_id,
             )
             db.flush()
         except Exception:
@@ -1267,9 +1443,19 @@ def _reconcile_claimed_turn_after_commit_ack_failure(
     task_id: int,
     task_owner_user_id: int,
     payload: TaskTurnPayload,
-    claimed: _ClaimedTurn,
+    claimed: _PreparedTurn,
 ) -> bool:
     """Check the complete accepted turn graph in a fresh owned Session."""
+
+    if isinstance(claimed, _EnqueuedTurn):
+        from .task_start_consumer import reconcile_start_acceptance
+
+        return reconcile_start_acceptance(
+            task_id=task_id,
+            task_owner_user_id=task_owner_user_id,
+            payload=payload,
+            accepted=claimed,
+        )
 
     from ..models.chat_message import TaskChatMessage
     from ..models.database import get_session_local
@@ -1288,6 +1474,7 @@ def _reconcile_claimed_turn_after_commit_ack_failure(
                     Task.status == TaskStatus.RUNNING,
                     Task.run_id == claimed.run_id,
                     Task.runner_id == claimed.task_lease.runner_id,
+                    task_lease_attempt_predicate(claimed.task_lease),
                 )
                 .first()
             )
@@ -1364,7 +1551,7 @@ def commit_claimed_turn_or_reconcile(
     task_id: int,
     task_owner_user_id: int,
     payload: TaskTurnPayload,
-    claimed: _ClaimedTurn,
+    claimed: _PreparedTurn,
 ) -> None:
     """Commit a complete turn graph or prove an ambiguous COMMIT succeeded.
 
@@ -1411,7 +1598,7 @@ def _refuse_if_bg_inflight(task_id: int) -> None:
     works fine for the legitimate "previous task naturally completed"
     case).
     """
-    from ..api.websocket import background_task_manager
+    from .task_execution import background_task_manager
 
     existing = background_task_manager.running_tasks.get(task_id)
     if existing is not None and not existing.done():
@@ -1421,12 +1608,58 @@ def _refuse_if_bg_inflight(task_id: int) -> None:
 def _get_agent_manager() -> Any:
     """Resolve the global ``AgentServiceManager`` singleton.
 
-    Local import keeps the services -> api boundary one-way at module
-    load time.
+    Resolve lazily so importing turn lifecycle helpers does not construct
+    the process-local runtime manager.
     """
-    from ..api.chat import get_agent_manager
+    from .agent_service_manager import get_agent_manager
 
     return get_agent_manager()
+
+
+async def pause_unknown_task_lease(lease: TaskLease) -> bool:
+    """Commit an unknown-input pause before publishing its fenced snapshot."""
+    from ..models.database import get_session_local
+    from .task_events import publish_task_event
+    from .workforce_runtime import sync_workforce_run_status
+
+    def settle() -> tuple[bool, TaskControlSnapshot | None]:
+        with get_session_local()() as db:
+            if not lock_task_lease_for_settlement_no_commit(db, lease):
+                return False, None
+            task = db.query(Task).filter(Task.id == lease.task_id).one()
+            snapshot = None
+            if task.status == TaskStatus.RUNNING:
+                snapshot = apply_task_control_transition(
+                    task,
+                    TaskControlState.PAUSED,
+                    status=TaskStatus.PAUSED,
+                    expected_run_id=lease.run_id,
+                )
+                sync_workforce_run_status(db, task, TaskStatus.PAUSED)
+                db.flush()
+            settled = finish_turn(db, lease.task_id, task_lease=lease)
+            return settled, snapshot if settled else None
+
+    settled, snapshot = await run_db_io_cancellation_safe(settle)
+    if snapshot is not None:
+        try:
+            await publish_task_event(
+                {
+                    "type": "task_paused",
+                    "task_id": lease.task_id,
+                    "message": "Input outcome unknown; execution paused",
+                    "timestamp": datetime.now(timezone.utc).timestamp(),
+                    **snapshot.as_dict(),
+                },
+                lease.task_id,
+            )
+        except Exception:
+            logger.warning(
+                "Unknown-input pause committed but broadcast failed for task %s",
+                lease.task_id,
+                exc_info=True,
+            )
+    return settled
 
 
 def settle_task_lease_isolated(
@@ -1484,6 +1717,14 @@ def settle_task_lease_isolated(
                     stage_result_fact_no_commit(
                         settle_db, task, {"error": error_message}
                     )
+                    if get_shared_task_execution_enabled():
+                        from .task_runtime_secrets import (
+                            delete_runtime_values_no_commit,
+                        )
+
+                        delete_runtime_values_no_commit(
+                            settle_db, task_id=lease.task_id, run_id=lease.run_id
+                        )
                     settle_db.commit()
                     invalidate_task_cache_best_effort(lease.task_id)
                     return True
@@ -1563,8 +1804,10 @@ def finish_turn(
                 task_id,
             )
             return False
+        lock_task_lease_for_settlement_no_commit(bg_db, task_lease)
         query = query.filter(
             Task.runner_id == task_lease.runner_id,
+            task_lease_attempt_predicate(task_lease),
             Task.run_id == task_lease.run_id,
         )
         # PostgreSQL locks the exact owned row until release_task_lease commits;
@@ -1581,6 +1824,13 @@ def finish_turn(
         return False
 
     def commit_terminal(status: TaskStatus, *, changed: bool = True) -> bool:
+        if get_shared_task_execution_enabled() and status in (
+            TaskStatus.COMPLETED,
+            TaskStatus.FAILED,
+        ):
+            from .task_runtime_secrets import delete_runtime_values_no_commit
+
+            delete_runtime_values_no_commit(bg_db, task_id=task_id, run_id=fresh.run_id)
         if task_lease is not None:
             released = release_task_lease(bg_db, task_lease, status=status)
             if released:
@@ -1755,6 +2005,7 @@ def _schedule_bg(
     context: Optional[Dict[str, Any]],
     before_message_id: Optional[int] = None,
     mcp_runtime_authorization_policy: MCPBuiltinOAuthActorPolicy | None = None,
+    channel_command: ClaimedTaskCommand | None = None,
 ) -> "asyncio.Task[None]":
     """Lease-aware bg scheduler.
 
@@ -1764,7 +2015,10 @@ def _schedule_bg(
     runs later as its own task). Being sync removes a misleading
     suspension/cancellation point right after ``begin_turn``'s claim commit.
 
-    Owns the full lease lifecycle for the bg run:
+    Under shared coordination, the registered outer handle keeps the owner
+    alive through cleanup. Heartbeat calls observe that owner and finalization
+    settles business state without releasing it. Outside coordinator context,
+    this scheduler owns the local lease lifecycle:
 
       - primary turn claims supply the exact lease committed with the turn
         state. Delayed execution validates that same run/runner fence before
@@ -1786,14 +2040,17 @@ def _schedule_bg(
     bg run loads its own snapshot and opens its own sessions, so no
     caller-bound ORM object crosses into the coroutine.
     """
-    from ..api.websocket import (
+    from .task_events import publish_task_event
+    from .task_execution import (
         background_task_manager,
         create_terminal_task_error_event,
         execute_task_background,
     )
-    from ..api.websocket import manager as websocket_manager
+
+    execution_failed = False
 
     async def _runner() -> None:
+        nonlocal execution_failed
         lease: TaskLease | None = task_lease
         stop_event: asyncio.Event | None = None
         hb_task: asyncio.Task[TaskLeaseHeartbeatOutcome] | None = None
@@ -1890,26 +2147,67 @@ def _schedule_bg(
                     )
                     nonlocal execution_started
                     execution_started = True
-                    await execute_task_background(
-                        task_id=task_id,
-                        user_message=payload.transcript_message,
-                        context=_execution_context_with_turn_id(
-                            context,
-                            payload.turn_id,
-                            files=payload.attachments,
-                        ),
-                        agent_manager=_get_agent_manager(),
-                        task_owner_user_id=task_owner_user_id,
-                        before_message_id=before_message_id,
-                        llm_user_message=payload.execution_message,
-                        task_setup_snapshot=snapshot,
-                        expected_run_id=lease.run_id,
-                        task_lease=lease,
-                        resolved_execution_scope=scope,
-                        mcp_runtime_authorization_policy=(
-                            mcp_runtime_authorization_policy
-                        ),
+                    execution_context = _execution_context_with_turn_id(
+                        context, payload.turn_id, files=payload.attachments
                     )
+                    if (
+                        channel_command is None
+                        and get_shared_task_execution_enabled()
+                        and payload.file_ids
+                    ):
+                        from ..models.database import get_session_local
+                        from .file_turn import (
+                            normalize_attachments_for_persistence,
+                            resolve_turn_file_infos,
+                        )
+
+                        def resolve_files() -> list[dict[str, Any]]:
+                            with get_session_local()() as file_db:
+                                infos, missing = resolve_turn_file_infos(
+                                    file_ids=list(payload.file_ids),
+                                    owner_user_id=task_owner_user_id,
+                                    task_id=task_id,
+                                    db=file_db,
+                                )
+                                if missing:
+                                    raise TaskTurnFileBindingError(missing)
+                                return infos
+
+                        infos = await run_db_io_cancellation_safe(resolve_files)
+                        execution_context.update(
+                            {
+                                "file_info": infos,
+                                "uploaded_files": [item["path"] for item in infos],
+                                "files": normalize_attachments_for_persistence(infos),
+                            }
+                        )
+                    if channel_command is not None:
+                        from .shared_channel_execution import execute_channel_background
+
+                        await execute_channel_background(
+                            command=channel_command,
+                            lease=lease,
+                            heartbeat_task=hb_task,
+                            snapshot=snapshot,
+                            payload=payload,
+                        )
+                    else:
+                        await execute_task_background(
+                            task_id=task_id,
+                            user_message=payload.transcript_message,
+                            context=execution_context,
+                            agent_manager=_get_agent_manager(),
+                            task_owner_user_id=task_owner_user_id,
+                            before_message_id=before_message_id,
+                            llm_user_message=payload.execution_message,
+                            task_setup_snapshot=snapshot,
+                            expected_run_id=lease.run_id,
+                            task_lease=lease,
+                            resolved_execution_scope=scope,
+                            mcp_runtime_authorization_policy=(
+                                mcp_runtime_authorization_policy
+                            ),
+                        )
 
                 await run_while_task_lease_owned(
                     execute_owned_run(),
@@ -1936,6 +2234,9 @@ def _schedule_bg(
                     settlement_error = "task execution cancelled"
                 raise
             except Exception as setup_or_run_err:
+                # Handled setup/run failures settle and return normally, so
+                # the done callback cannot infer them from task.exception().
+                execution_failed = True
                 if is_database_pool_timeout(setup_or_run_err):
                     # The failed setup/run checkout already waited for the
                     # exhausted pool. An immediate settlement would perform a
@@ -1970,6 +2271,15 @@ def _schedule_bg(
                                 fallback=CLIENT_SAFE_TASK_FAILURE,
                             )
                         )
+                    elif isinstance(setup_or_run_err, AutoModelUnavailableError):
+                        broadcast_error_code = (
+                            ClientErrorCode.AUTO_MODEL_UNAVAILABLE.value
+                        )
+                        broadcast_error_message = client_error_message(
+                            ClientErrorCode.AUTO_MODEL_UNAVAILABLE
+                        )
+                        settlement_error = broadcast_error_message
+                        client_history_message_type = CLIENT_SAFE_FAILURE_MESSAGE_TYPE
                     elif isinstance(setup_or_run_err, ConnectorRuntimeError):
                         # This exception's message is a curated public-safe
                         # sentence -- it says a runtime input is missing, not
@@ -2071,7 +2381,7 @@ def _schedule_bg(
                         lease_settled = bool(settled)
                         if settled and broadcast_error_message is not None:
                             try:
-                                await websocket_manager.broadcast_to_task(
+                                await publish_task_event(
                                     create_terminal_task_error_event(
                                         task_id,
                                         broadcast_error_message,
@@ -2142,6 +2452,14 @@ def _schedule_bg(
 
                 if turn_id is not None:
                     pop_ephemeral_runtime_values(turn_id)
+                if get_shared_task_execution_enabled():
+                    from .task_runtime_secrets import clean_finished_runtime_values
+
+                    await run_db_io_cancellation_safe(
+                        lambda: clean_finished_runtime_values(
+                            task_id=task_id, run_id=run_id
+                        )
+                    )
             except Exception:
                 logger.warning(
                     "connector runtime cleanup failed for task %s turn %s",
@@ -2173,6 +2491,18 @@ def _schedule_bg(
 
     bg_task = asyncio.create_task(_runner())
     background_task_manager.register_task(task_id, bg_task)
+    if task_source == "trigger":
+        from ...core.utils.setup_metrics import trigger_execution
+
+        started_at = trigger_execution.start()
+        bg_task.add_done_callback(
+            lambda task: trigger_execution.finish(
+                started_at,
+                cancelled=task.cancelled(),
+                failed=not task.cancelled()
+                and (execution_failed or task.exception() is not None),
+            )
+        )
     logger.info(
         "task %s scheduled in background v2 (source=%s, force_fresh=%s)",
         task_id,

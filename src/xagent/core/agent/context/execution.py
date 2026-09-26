@@ -1,14 +1,23 @@
 from __future__ import annotations
 
+import asyncio
+import copy
 import json
+import logging
 from collections import Counter
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from enum import Enum
-from typing import Any
+from functools import lru_cache
+from typing import Any, Literal, cast
 from uuid import uuid4
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+import tiktoken
+
+from ....config import get_compact_threshold_ratio
 from ...context_ref import (
     CONTEXT_REFS_KEY,
     ContextReference,
@@ -25,9 +34,21 @@ from ...tools.artifacts import (
     format_tool_result_for_observation,
     sanitize_tool_result_for_public_context,
 )
+from ...tools.tool_result_spill import (
+    SPILL_RESERVED_RESULT_KEY,
+    SPILL_UNAVAILABLE_NOTICE,
+    render_spill_notice,
+    resolve_spilled_under,
+    spill_dir_for_workspace,
+    spill_record_shape_is_valid,
+)
+from ..grounding import VALUE_KINDS, step_intent_not_fact_rule
 from ..language import (
     effective_output_language,
-    output_language_directives,
+    render_dag_step_language_reference,
+    render_request_language_harness,
+    render_root_request_language_harness,
+    serialize_pending_user_response,
 )
 from ..result import CONTROL_TOOL_NAMES, tool_result_succeeded
 from .components import (
@@ -35,6 +56,7 @@ from .components import (
     ExecutionComponent,
     GenericComponent,
     MemoryComponent,
+    SpillRegistryComponent,
     WorkspaceComponent,
     clone_component,
 )
@@ -42,6 +64,9 @@ from .enrichment import (
     IMAGE_EDIT_UNAVAILABLE_METADATA_KEY,
     MEMORY_CONTEXT_METADATA_KEY,
     SKILL_CONTEXT_METADATA_KEY,
+    latest_pending_user_response,
+    pending_user_response,
+    pending_user_response_lifecycle,
     top_level_user_request,
 )
 from .memory_tool import MEMORY_TOOLS_METADATA_KEY
@@ -52,13 +77,79 @@ from .skill_tool import (
     SKILL_INDEX_METADATA_KEY,
 )
 
+logger = logging.getLogger(__name__)
+
+
+def snapshot_container(value: Any) -> Any:
+    """Return a point-in-time copy of a container held in live state.
+
+    Used by the checkpoint snapshot producers (``ExecutionContext.to_dict``
+    and ``ReActPattern.get_state``) for the containers that some code path
+    mutates in place. Holding a copy is what lets the DAG checkpoint
+    rollback reinstate a previous snapshot, rather than handing back an
+    object that has since been written through.
+
+    Serializing a checkpoint must never fail because of what a value *is*:
+    a tool result can hold anything a custom or MCP tool chose to return
+    (a lock, a file handle, a generator), and the JSON layer downstream
+    already degrades those to a placeholder rather than erroring. So a
+    ``deepcopy`` failure falls back to a shallow copy of the top-level
+    container, which still defends against the mutations that matter here
+    (``pop``, ``__setitem__``, ``append`` on the container itself), and a
+    failure of even that returns the value unchanged.
+    """
+    if not isinstance(value, (dict, list, set)):
+        return value
+    try:
+        return copy.deepcopy(value)
+    except Exception:  # noqa: BLE001 - never fail a snapshot over a value
+        logger.debug(
+            "snapshot_container: deep copy failed, falling back to a shallow "
+            "copy of %s",
+            type(value).__name__,
+            exc_info=True,
+        )
+    try:
+        return copy.copy(value)
+    except Exception:  # noqa: BLE001 - last resort: hand back the original
+        logger.debug(
+            "snapshot_container: shallow copy failed for %s; returning it as-is",
+            type(value).__name__,
+            exc_info=True,
+        )
+        return value
+
+
 READ_FILE_CONTEXT_LIMIT = 12_000
+SPILL_REGISTRY_MAX_RECORDS = 64
 # Set by the web layer into ``ExecutionContext.metadata`` at turn start: the
 # largest persisted transcript row id the context was built from. The agent
 # core never resolves it -- it is opaque here and only has meaning to the
 # caller that issued it -- but carrying it through compaction is what lets a
 # later turn know which stored rows the summary already stands in for.
 TRANSCRIPT_WATERMARK_METADATA_KEY = "transcript_watermark"
+# Wire name: ``to_dict`` writes ``self.metadata`` unfiltered, so renaming this
+# strands every checkpoint written before the rename, and request_context keys
+# reach this dict verbatim, which is why AgentRunner refuses this one there.
+# That refusal covers the effective value only -- a refused key still sits
+# under ``metadata["request_context"]`` and rides into every checkpoint from
+# there, so nothing may read that copy as authoritative.
+# A value under this key is only trusted when the payload it arrived in also
+# carried ``EVIDENCE_MARKER_WRITER_FIELD``; see ``ExecutionContext.from_dict``.
+TOOL_EVIDENCE_REMOVED_METADATA_KEY = "tool_evidence_removed"
+# Serialized writer seal, a sibling of ``metadata`` in ``to_dict``'s payload.
+# ``from_dict`` refuses to carry ``TOOL_EVIDENCE_REMOVED_METADATA_KEY`` in
+# from a payload that arrives without it: a build that does not know that key
+# round-trips it unchanged (``git show origin/main`` rebuilds a fresh dict of
+# known keys and never sees it) across a compaction of its own that removed
+# tool observations, so the value that survives such a round trip is not a
+# statement about anything. A generation is a promise that this writer latches
+# the marker on every lossy compaction, and generations only ever add to the
+# promise before them -- which is why any generation at or above this one is
+# attested. A future build that stops latching must write no seal at all
+# rather than a higher number.
+EVIDENCE_MARKER_WRITER_FIELD = "evidence_marker_writer"
+EVIDENCE_MARKER_WRITER_GENERATION = 1
 # Written onto ``CompactResult.metadata`` (and from there onto the compact
 # trace event) when an LLM summary replaces the history. The message-dropping
 # backstop never sets them: a dropped-message result stands in for nothing and
@@ -70,6 +161,24 @@ COMPACT_WATERMARK_METADATA_KEY = "watermark_message_id"
 # restores the summary must restore them too or it silently drops images the
 # compaction judged worth the budget.
 COMPACT_CONTEXT_REFS_METADATA_KEY = "summary_context_refs"
+
+# Floor for the per-message cap on what compaction is asked to read. Unlike
+# the summary's output budget this has no ceiling: providers cap output far
+# below input, which is why ``COMPACT_SUMMARY_MAX_TOKENS`` exists, but nothing
+# caps a single input message except the window it has to fit in -- so the
+# input cap can scale with the window without ever outgrowing a provider
+# limit. The floor says only that a message this small was never what
+# exhausted a context window; it stops a tiny threshold from capping
+# everything to nothing.
+COMPACT_TRANSCRIPT_MESSAGE_MIN_TOKENS = 2048
+COMPACT_REQUEST_SAFETY_TOKENS = 512
+COMPACT_TOKEN_COUNT_CHUNK_CHARS = 1_024
+# The minimal safe allowlist for whole-message omission. A matching recorded
+# tool call is also required, so the summary retains the source path and exact
+# read arguments. Other tool results may contain one-time handles or write
+# receipts and must not be assumed recoverable merely because their role is
+# ``tool``.
+COMPACT_REREADABLE_TOOL_NAMES = frozenset({"read_file"})
 
 COMPACT_SUMMARY_MAX_TOKENS = 8192
 COMPACT_SUMMARY_MIN_TOKENS = 256
@@ -96,8 +205,35 @@ COMPACT_SUMMARY_MIN_TOKENS = 256
 COMPACT_SUMMARY_FALLBACK_BUDGETS = (4096, 2048, 1024, COMPACT_SUMMARY_MIN_TOKENS)
 COMPACT_CONTEXT_REF_MAX_TOKENS = 2048
 COMPACT_DROPPED_REF_NOTICE_MAX_CHARS = 2048
-COMPACT_DROPPED_TOOL_NOTICE_MAX_CHARS = 1024
+# Sized so the notice prefix, which spells out the shared VALUE_KINDS list,
+# leaves room for the full name list rather than crowding names out of it.
+COMPACT_DROPPED_TOOL_NOTICE_MAX_CHARS = 1152
 COMPACT_DROPPED_TOOL_NAME_MAX_CHARS = 64
+
+
+@lru_cache(maxsize=1)
+def _compact_token_encoding() -> Any:
+    # get_encoding may download its merge table on the first cache miss. Keep
+    # that I/O out of module import so an offline deployment can still start.
+    return tiktoken.get_encoding("cl100k_base")
+
+
+def _count_compact_request_tokens(content: str) -> int:
+    # Encoding very long repetitive strings in one pass can make tiktoken's
+    # BPE merge work disproportionately expensive. Independent chunks also
+    # form a conservative count because tokens cannot merge across a chunk
+    # boundary.
+    encoding = _compact_token_encoding()
+    return sum(
+        len(
+            encoding.encode(
+                content[offset : offset + COMPACT_TOKEN_COUNT_CHUNK_CHARS],
+                disallowed_special=(),
+            )
+        )
+        for offset in range(0, len(content), COMPACT_TOKEN_COUNT_CHUNK_CHARS)
+    )
+
 
 # load_skill retrieves guidance, not evidence, and re-running it restores
 # nothing a dropped observation held.
@@ -107,6 +243,37 @@ COMPACT_DROPPED_TOOL_NOTICE_MAX_NAMES = 20
 # Wire name: request_context keys reach metadata verbatim, so renaming this
 # breaks the clients that populate it.
 CLOCK_TIMEZONE_METADATA_KEY = "timezone"
+
+
+def estimate_provider_prompt_tokens(
+    messages: list[dict[str, Any]],
+    tools: list[dict[str, Any]] | None = None,
+) -> int:
+    """Estimate one logical provider payload without materializing references."""
+    total = 0
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        payload = {
+            key: value for key, value in message.items() if key != CONTEXT_REFS_KEY
+        }
+        try:
+            serialized = json.dumps(payload, ensure_ascii=False, default=str)
+        except (TypeError, ValueError):
+            serialized = str(payload)
+        total += max(1, len(serialized) // 4)
+        try:
+            references = normalize_context_references(message.get(CONTEXT_REFS_KEY))
+        except (TypeError, ValueError):
+            references = ()
+        total += sum(reference.estimated_tokens() for reference in references)
+    if tools:
+        try:
+            serialized_tools = json.dumps(tools, ensure_ascii=False, default=str)
+        except (TypeError, ValueError):
+            serialized_tools = str(tools)
+        total += max(1, len(serialized_tools) // 4)
+    return total
 
 
 def _utcnow() -> datetime:
@@ -121,6 +288,35 @@ class MergeStrategy(str, Enum):
     PREFER_FIRST = "prefer_first"
 
 
+# Where ``CompactConfig.threshold`` came from, recorded in the compaction trace
+# metadata so an operator can tell a threshold derived from the model's context
+# window apart from the global fallback without reading the model table.
+COMPACT_THRESHOLD_SOURCE_CONTEXT_WINDOW = "context_window"
+COMPACT_THRESHOLD_SOURCE_DEFAULT = "default"
+# Restored from a checkpoint written before the field existed.
+COMPACT_THRESHOLD_SOURCE_UNKNOWN = "unknown"
+
+
+def derive_compact_threshold(context_window: Any) -> tuple[int, str] | None:
+    """Threshold and provenance for a positive integer context window, else None."""
+    if isinstance(context_window, int) and context_window > 0:
+        return (
+            max(1, int(context_window * get_compact_threshold_ratio())),
+            COMPACT_THRESHOLD_SOURCE_CONTEXT_WINDOW,
+        )
+    return None
+
+
+# Set on a blocked compact request when the compact model's context window is
+# unknown, so no summary request can be sized. ``PatternRuntime`` reads it to
+# tell this apart from a request that is merely too large.
+LLM_COMPACT_CONTEXT_WINDOW_UNKNOWN_KEY = "llm_compact_context_window_unknown"
+# Set on a blocked compact request when the summary prompt could not be sized
+# because the local tokenizer failed to load. ``PatternRuntime`` reads it to
+# tell this apart from a request that is merely too large for a known window.
+LLM_COMPACT_TOKENIZER_UNAVAILABLE_KEY = "llm_compact_tokenizer_unavailable"
+
+
 @dataclass
 class CompactConfig:
     """Compaction policy for message history.
@@ -129,10 +325,13 @@ class CompactConfig:
     first and to fall back to dropping messages only when it cannot; this
     dataclass configures the threshold that triggers either, and
     ``max_messages`` sizes the retained tail when messages are dropped.
+    ``threshold_source`` says whether ``threshold`` was derived from the
+    model's context window or is the global fallback.
     """
 
     enabled: bool = True
     threshold: int = 32000
+    threshold_source: str = COMPACT_THRESHOLD_SOURCE_DEFAULT
     max_messages: int = 20
 
 
@@ -145,6 +344,207 @@ class CompactResult:
     final_count: int
     strategy: str
     metadata: dict[str, Any] = field(default_factory=dict)
+
+
+def note_compaction_evidence_loss(context: Any, result: Any) -> None:
+    """Latch the context marker when a compaction removed tool observations.
+
+    Reads ``dropped_tool_result_count``, never ``compacted``: the tail window
+    reports ``compacted=True`` while keeping every message it was handed, and a
+    summary can replace a transcript that held no tool observation at all. Only
+    ever writes True -- a later lossless compaction must not clear it, because
+    the hole the earlier one left is still in ``messages``. A cross-build
+    restore can still discard the marker entirely (``from_dict`` drops it when
+    the payload names no attested writer); that is not a compaction and does
+    not contradict this rule.
+    """
+    metadata = getattr(context, "metadata", None)
+    if not isinstance(metadata, dict):
+        return
+    result_metadata = getattr(result, "metadata", None)
+    if not isinstance(result_metadata, dict):
+        return
+    # The key is absent, not malformed, whenever this call did not compact at
+    # all -- compaction disabled, or the context already under threshold. A
+    # context object with no compaction protocol at all does not reach here
+    # either: it makes the call above return None, which the guard two lines
+    # up already stops. Every case that does reach this line is an ordinary
+    # result of this call, so it stays silent and unlatched exactly as
+    # before: nothing here is a warning-worthy shape.
+    if "dropped_tool_result_count" not in result_metadata:
+        return
+    dropped = result_metadata["dropped_tool_result_count"]
+    # A malformed count here is treated the opposite way from a malformed
+    # marker in tool_evidence_state below, and that asymmetry is deliberate.
+    # tool_evidence_state reads a context that already carries some value for
+    # a decision already made, so reading a corrupt one as "removed" only
+    # adds a cautious word to a prompt -- it asserts nothing false. This
+    # function instead reads the return value of one compaction call:
+    # latching True for a malformed count would assert that this run's
+    # compaction removed observations when it may have removed none at all,
+    # which is a false claim, not a cautious one. So a malformed count here
+    # is left unlatched instead. Both compaction paths in this codebase
+    # write a real int under this key whenever they write the key at all, so
+    # this branch is not known to be reachable in production; the warning
+    # below exists to find out if it ever is.
+    if isinstance(dropped, bool) or not isinstance(dropped, int):
+        logger.warning(
+            "Compaction returned a non-integer dropped_tool_result_count of "
+            "type %s; leaving the evidence marker unlatched. execution_id=%s",
+            type(dropped).__name__,
+            getattr(context, "execution_id", None),
+        )
+        return
+    if dropped > 0:
+        metadata[TOOL_EVIDENCE_REMOVED_METADATA_KEY] = True
+
+
+EvidenceState = Literal["intact", "removed", "unknown"]
+
+
+def _evidence_marker_writer_attested(data: Any) -> bool:
+    """Whether a serialized payload names a writer that latches the marker.
+
+    ``True`` is not a generation: Python makes ``True == 1``, so a hand-edited
+    or JSON-mangled boolean would otherwise attest itself. A storage layer that
+    stringified the number attests nothing either, and the marker beside it then
+    reads unknown -- the same JSON-fidelity dependency ``tool_evidence_state``
+    documents for the marker itself, and in the same fail-safe direction.
+    """
+    if not isinstance(data, dict):
+        return False
+    seal = data.get(EVIDENCE_MARKER_WRITER_FIELD)
+    if isinstance(seal, bool) or not isinstance(seal, int):
+        return False
+    return seal >= EVIDENCE_MARKER_WRITER_GENERATION
+
+
+def tool_evidence_state(context: Any) -> EvidenceState:
+    """Whether a compaction on this context removed tool observations.
+
+    Three states, because two cannot tell "nothing was removed" apart from
+    "no one was keeping track". ``ContextManager.create_context`` stamps the
+    key False on every context this build creates, so:
+
+    - the key literally ``False`` is a latching build saying nothing was
+      removed, and it is only ever read off a payload that also carried this
+      build's writer seal: ``from_dict`` drops the key from any payload
+      without one, because a build that does not know the key round-trips it
+      unchanged across a compaction of its own that removed observations, and
+      what survives that round trip states nothing (see
+      ``EVIDENCE_MARKER_WRITER_FIELD``);
+    - the key absent means one of two things, and both read as unknown: a
+      payload written by a build that did not track this, or a marker
+      ``from_dict`` dropped because the payload named no attested writer.
+      Neither answer can be given for the first case -- those builds drop
+      tool observations on the truncate path without leaving a word in the
+      context, and they also complete runs that lost nothing, and the
+      payload does not say which one happened;
+    - anything else -- ``True``, a corrupt value, or a context object whose
+      metadata is not a dict -- reads as removed. A corrupt or malformed
+      payload is not an old payload: "unknown" states that the context
+      carries no record either way, and a payload that does carry the key
+      has a record, so that statement would be false about it. Removed is
+      both the fail-safe direction and the only one that asserts nothing
+      false.
+
+    Telling "intact" apart from "removed" here is a literal ``is False``
+    check on the stored key, which depends on a checkpoint round trip
+    handing back the same JSON boolean it was given rather than a
+    stringified one. Checkpoint payloads land in the ``TRACE_PAYLOAD_JSON``
+    column defined in ``src/xagent/web/models/task.py``, which is a plain
+    ``JSON`` type on most dialects and ``JSONB`` on PostgreSQL. A storage
+    layer that did not preserve JSON boolean fidelity would make every
+    restored marker read as removed.
+
+    The writer seal is bound by the same fidelity requirement: a seal that
+    storage stringified is not attested, and the marker beside it then reads
+    unknown rather than intact -- the same fail-safe direction as a
+    stringified marker itself.
+    """
+    metadata = getattr(context, "metadata", None)
+    if not isinstance(metadata, dict):
+        return "removed"
+    if TOOL_EVIDENCE_REMOVED_METADATA_KEY not in metadata:
+        return "unknown"
+    return (
+        "intact" if metadata[TOOL_EVIDENCE_REMOVED_METADATA_KEY] is False else "removed"
+    )
+
+
+# Runtime coordination only: excluded from snapshots, equality and copies.
+_CHECKPOINT_GATE_ATTR = "_checkpoint_gate"
+
+
+class _ContextCheckpointGate:
+    """Single-event-loop checkpoint coordination with writer preference.
+
+    Ordinary snapshots share the gate; an exclusive operation waits for them
+    to drain and blocks new snapshots. Acquisitions are not reentrant. Waiters
+    recheck their predicate after broadcast wakeup, so cancelling a notified
+    waiter cannot consume another waiter's chance to proceed.
+    """
+
+    def __init__(self) -> None:
+        self.injection_uncertain = False
+        self.run_finishing = False
+        self._shared = 0
+        self._exclusive = False
+        self._writers_waiting = 0
+        self._waiters: set[asyncio.Future[None]] = set()
+
+    async def _wait(self) -> None:
+        waiter = asyncio.get_running_loop().create_future()
+        self._waiters.add(waiter)
+        try:
+            await waiter
+        finally:
+            self._waiters.discard(waiter)
+
+    def _wake(self) -> None:
+        for waiter in self._waiters:
+            if not waiter.done():
+                waiter.set_result(None)
+
+    @asynccontextmanager
+    async def shared(self) -> AsyncIterator[None]:
+        while self._exclusive or self._writers_waiting:
+            await self._wait()
+        self._shared += 1
+        try:
+            yield
+        finally:
+            self._shared -= 1
+            if not self._shared:
+                self._wake()
+
+    @asynccontextmanager
+    async def exclusive(self) -> AsyncIterator[None]:
+        self._writers_waiting += 1
+        try:
+            while self._exclusive or self._shared:
+                await self._wait()
+            self._exclusive = True
+        finally:
+            self._writers_waiting -= 1
+            # A cancelled writer may have been the only reason new shared
+            # acquisitions were blocked, even while other readers remain.
+            if not self._exclusive:
+                self._wake()
+        try:
+            yield
+        finally:
+            self._exclusive = False
+            self._wake()
+
+
+def context_checkpoint_gate(context: ExecutionContext) -> _ContextCheckpointGate:
+    """Return the context's transient gate; idle gates retain no event loop."""
+    gate = context.__dict__.get(_CHECKPOINT_GATE_ATTR)
+    if gate is None:
+        gate = _ContextCheckpointGate()
+        context.__dict__[_CHECKPOINT_GATE_ATTR] = gate
+    return cast(_ContextCheckpointGate, gate)
 
 
 @dataclass
@@ -166,6 +566,23 @@ class ExecutionContext:
         self.components.setdefault("workspace", WorkspaceComponent())
         self.components.setdefault("memory", MemoryComponent())
 
+    def __copy__(self) -> ExecutionContext:
+        new = self.__class__.__new__(self.__class__)
+        new.__dict__.update(
+            (key, value)
+            for key, value in self.__dict__.items()
+            if key != _CHECKPOINT_GATE_ATTR
+        )
+        return new
+
+    def __deepcopy__(self, memo: dict[int, Any]) -> ExecutionContext:
+        new = self.__class__.__new__(self.__class__)
+        memo[id(self)] = new
+        for key, value in self.__dict__.items():
+            if key != _CHECKPOINT_GATE_ATTR:
+                new.__dict__[key] = copy.deepcopy(value, memo)
+        return new
+
     def get_component(self, name: str) -> ExecutionComponent | None:
         return self.components.get(name)
 
@@ -184,6 +601,13 @@ class ExecutionContext:
         if not isinstance(component, MemoryComponent):
             component = MemoryComponent()
             self.components["memory"] = component
+        return component
+
+    def _spill_component(self) -> SpillRegistryComponent:
+        component = self.components.get("spilled_results")
+        if not isinstance(component, SpillRegistryComponent):
+            component = SpillRegistryComponent()
+            self.components["spilled_results"] = component
         return component
 
     @property
@@ -209,6 +633,125 @@ class ExecutionContext:
     @property
     def memory_snapshot(self) -> dict[str, Any] | None:
         return self._memory_component().snapshot
+
+    @property
+    def spilled_results(self) -> tuple[dict[str, Any], ...]:
+        return tuple(self._spill_component().records)
+
+    def _spill_dir(self) -> str | None:
+        """This execution's spill directory as a plain path string.
+
+        Returns None when the context carries no workspace path, which is
+        also how every deployment without a spill target reads: no
+        directory, so no record can pass gate 2 (existence). The layout
+        itself comes from the spill module, which is the same place the
+        writer's target comes from -- this side must not spell it a second
+        time.
+
+        spill_dir_for_workspace raises ValueError for a workspace_path that
+        is non-empty but not absolute. A freshly built TaskWorkspace never
+        produces one, but this context's workspace_path can also arrive
+        from a deserialized checkpoint, which sets it with no validation of
+        its own -- an older build, a hand-edited checkpoint, or a migrated
+        one could carry a relative value. Registering spilled results is
+        not the place to fail a tool call over that: this degrades to "no
+        spill directory" the same way a missing workspace_path already
+        does, with a warning so the bad value is not silently swallowed.
+
+        The two cases this degrades to the same reading are not the same
+        cost, though. A missing workspace_path means there is no
+        workspace, so the file genuinely does not exist and telling the
+        model "unavailable" is the truth. A relative workspace_path means
+        the workspace does exist and the writer -- which always holds the
+        real workspace object, resolved to an absolute path at
+        construction -- already wrote the file; only this side is looking
+        for it in the wrong place, so "unavailable" is told to the model in
+        place of data it could otherwise have read. That cost is accepted
+        anyway, because the alternative is worse: letting the ValueError
+        propagate would fail the whole tool call over a checkpoint field
+        this code never validated to begin with.
+        """
+        workspace_path = self.workspace_path
+        if not workspace_path:
+            return None
+        try:
+            return spill_dir_for_workspace(workspace_path)
+        except ValueError:
+            logger.warning(
+                "Execution context workspace_path %r is not an absolute "
+                "path; treating this execution as having no spill "
+                "directory.",
+                workspace_path,
+            )
+            return None
+
+    def _register_spilled_results(
+        self, result: Any
+    ) -> tuple[tuple[dict[str, Any], ...], int]:
+        """Validate a tool result's spill report through three gates.
+
+        Gate 1 (shape) failures are forged or malformed and are dropped
+        silently -- the model is never told they existed. Path syntax used
+        to be a separate gate here; it now lives inside gate 1, because
+        spill_record_shape_is_valid (and the failure-naming helper behind
+        it) already rejects a relative_path that is not its own
+        normalization, so a second check here would never fire. Gate 2
+        (existence) failures are real reports pointing at a file that is
+        gone (e.g. an external-credential task's workspace was removed at
+        the end of the previous turn); those count toward the caller's
+        unavailable-value notice. Gate 3 (capacity) stops registering new
+        files once the registry is full but still returns the record for
+        this message's own observation text, the same way an
+        already-registered relative_path is returned without being
+        duplicated.
+
+        The registry component is only obtained once a record has passed
+        every gate and is actually about to be appended: a reserved key
+        whose list is empty, or whose every record is rejected, must leave
+        the checkpoint exactly as it would read with no reserved key at
+        all, not add an empty registry component to it.
+        """
+        if not isinstance(result, dict):
+            return (), 0
+        raw_records = result.get(SPILL_RESERVED_RESULT_KEY)
+        if not isinstance(raw_records, list):
+            return (), 0
+
+        existing = self.components.get("spilled_results")
+        registry = existing if isinstance(existing, SpillRegistryComponent) else None
+        known_records = registry.records if registry is not None else []
+        known_paths = {record.get("relative_path") for record in known_records}
+        accepted: list[dict[str, Any]] = []
+        unavailable_count = 0
+        spill_dir = self._spill_dir()
+
+        for record in raw_records:
+            if not spill_record_shape_is_valid(record):
+                continue
+            relative_path = record["relative_path"]
+            if (
+                spill_dir is None
+                or resolve_spilled_under(spill_dir, relative_path) is None
+            ):
+                unavailable_count += 1
+                continue
+            accepted.append(record)
+            if relative_path in known_paths:
+                continue
+            if len(known_records) >= SPILL_REGISTRY_MAX_RECORDS:
+                logger.warning(
+                    "Spill registry at capacity (%d); not registering %s",
+                    SPILL_REGISTRY_MAX_RECORDS,
+                    relative_path,
+                )
+                continue
+            if registry is None:
+                registry = self._spill_component()
+                known_records = registry.records
+            registry.records.append(record)
+            known_paths.add(relative_path)
+
+        return tuple(accepted), unavailable_count
 
     def add_message(self, role: str, content: str, **kwargs: Any) -> Message:
         message = Message(role=role, content=content, **kwargs)
@@ -253,7 +796,22 @@ class ExecutionContext:
         context_result = self._sanitize_tool_result_for_context(
             tool_name, public_result
         )
-        content = self._format_tool_result(tool_name, context_result)
+        spill_records, spill_unavailable_count = self._register_spilled_results(
+            context_result
+        )
+        # The reserved key -- and the relative_path inside each of its
+        # records -- stays in context_result and therefore in raw_result:
+        # replay (runner.py) only ever passes raw_result back into a fresh
+        # context, and that record is the only way the three gates have
+        # anything to re-validate on that later pass. _format_tool_result
+        # keeps the reserved key out of the rendered observation text
+        # itself; only the notice built from spill_records names a path.
+        content = self._format_tool_result(
+            tool_name,
+            context_result,
+            spill_records=spill_records,
+            unavailable_count=spill_unavailable_count,
+        )
         metadata: dict[str, Any] = {
             "tool_name": tool_name,
             "raw_result": context_result,
@@ -262,6 +820,8 @@ class ExecutionContext:
             "cwd": self.cwd,
             "memory_session_id": self.memory_session_id,
         }
+        if spill_records:
+            metadata["spilled_results"] = list(spill_records)
         if supersedes_scope:
             metadata["supersedes_scope"] = supersedes_scope
             self._compact_superseded_tool_messages(supersedes_scope)
@@ -339,14 +899,41 @@ class ExecutionContext:
         memory.session_id = session_id
         memory.snapshot = snapshot
 
-    def _format_tool_result(self, tool_name: str, result: Any) -> str:
-        if isinstance(result, dict) and isinstance(result.get("artifacts"), list):
-            formatted = format_tool_result_for_observation(tool_name, result)
-        elif isinstance(result, dict):
-            formatted = result.get("output", result)
+    def _format_tool_result(
+        self,
+        tool_name: str,
+        result: Any,
+        spill_records: tuple[dict[str, Any], ...] = (),
+        unavailable_count: int = 0,
+    ) -> str:
+        formatted: Any
+        if isinstance(result, dict):
+            # The reserved key (and the relative_path inside its records)
+            # stays in result itself for raw_result, but none of the branches
+            # below may render it: the notice appended after the body is the
+            # only place a path may appear. Dropping it once here keeps every
+            # branch -- the artifact formatter's metadata line included --
+            # from seeing it at all.
+            visible = {
+                key: value
+                for key, value in result.items()
+                if key != SPILL_RESERVED_RESULT_KEY
+            }
+            if isinstance(visible.get("artifacts"), list):
+                formatted = format_tool_result_for_observation(tool_name, visible)
+            elif "output" in visible:
+                formatted = visible["output"]
+            else:
+                formatted = visible
         else:
             formatted = result
-        return f"Tool {tool_name} returned: {formatted}"
+        parts = [f"Tool {tool_name} returned: {formatted}"]
+        notice = render_spill_notice(spill_records, style="observation")
+        if notice:
+            parts.append(notice)
+        if unavailable_count:
+            parts.append(SPILL_UNAVAILABLE_NOTICE)
+        return "\n".join(parts)
 
     def _sanitize_tool_result_for_context(self, tool_name: str, result: Any) -> Any:
         if isinstance(result, dict):
@@ -445,6 +1032,14 @@ class ExecutionContext:
         if max_tokens:
             visible_messages = self._truncate_by_tokens(visible_messages, max_tokens)
         visible_messages = self._sanitize_tool_message_pairs(visible_messages)
+        latest_pending_message = next(
+            (
+                message
+                for message in reversed(visible_messages)
+                if pending_user_response(message) is not None
+            ),
+            None,
+        )
 
         for message in visible_messages:
             message_dict = message.to_dict()
@@ -452,18 +1047,30 @@ class ExecutionContext:
                 provider_state = message.metadata.get("_xagent_provider_state")
                 if isinstance(provider_state, dict):
                     message_dict["_xagent_provider_state"] = provider_state
-            waiting_response = message.metadata.get("response_to_waiting_for_user")
-            if message_dict.get("role") == "user" and isinstance(
-                waiting_response, dict
-            ):
-                question = str(waiting_response.get("question") or "").strip()
-                answer = str(message_dict.get("content") or "").strip()
+            waiting_response = pending_user_response(message)
+            if waiting_response is not None:
+                if message is latest_pending_message:
+                    framing = (
+                        "The exact allowlisted question and clean answer are in the "
+                        "canonical request-language evidence in the system context."
+                    )
+                else:
+                    framing = (
+                        "Historical pending-response evidence (JSON):\n"
+                        f"{json.dumps(serialize_pending_user_response(waiting_response), ensure_ascii=False)}"
+                    )
                 message_dict["content"] = (
-                    "This user message is the answer to a pending agent question. "
-                    "Treat it as the response to that pending question, not as a new "
-                    "independent task.\n"
-                    f"Pending question: {question}\n"
-                    f"User answer: {answer}"
+                    "This user message is the answer to a pending agent question "
+                    "and is the primary response, not an independent task. "
+                    f"{framing}\nExecution-enriched message content follows:\n"
+                    f"{str(message_dict.get('content') or '')}"
+                )
+            elif pending_user_response_lifecycle(message) is not None:
+                message_dict["content"] = (
+                    "This user message is the primary response in a waiting lifecycle "
+                    "whose question text is unavailable or blank, not an independent "
+                    "task. Execution-enriched message content follows:\n"
+                    f"{str(message_dict.get('content') or '')}"
                 )
             if include_system and message_dict.get("role") == "system":
                 content = str(message_dict.get("content") or "").strip()
@@ -564,11 +1171,15 @@ class ExecutionContext:
     def _system_context(self) -> str:
         parts = [self._current_time_context(), FILE_REF_MODEL_INSTRUCTIONS]
         dag_step_id = self.metadata.get("dag_step_id")
-        current_task = self.current_user_request_text()
+        request = top_level_user_request(self)
+        current_task = request.execution_text
+        pending_response = latest_pending_user_response(self)
         output_language = effective_output_language(self)
         if current_task and not dag_step_id:
-            language_directives = output_language_directives(
-                output_language, section="root_system_context"
+            language_directives = render_root_request_language_harness(
+                request,
+                pending_response,
+                output_language,
             )
             parts.append(
                 "Current user request:\n"
@@ -607,11 +1218,10 @@ class ExecutionContext:
                     "Task input/output examples:\n" + "\n".join(formatted_examples)
                 )
         if dag_step_id:
-            language_policy = output_language_directives(
-                output_language, section="dag_step_scope"
-            )
-            step_language_rules = output_language_directives(
-                output_language, section="dag_step_rules"
+            language_harness = render_request_language_harness(
+                request,
+                pending_response,
+                output_language=output_language,
             )
             dag_step_name = str(self.metadata.get("dag_step_name") or "").strip()
             dag_step_description = str(
@@ -632,7 +1242,7 @@ class ExecutionContext:
                 "- Overall user goal is background context only and is already "
                 "available in the conversation when needed; do not treat it as "
                 "the executable goal for this step.\n"
-                f"- {language_policy}\n"
+                f"- {render_dag_step_language_reference()}\n"
                 f"- Current step id: {dag_step_id}\n"
                 f"- Current step title: {dag_step_name or dag_step_id}\n"
                 f"- Current step description: "
@@ -640,16 +1250,10 @@ class ExecutionContext:
                 f"- Current step dependencies: {dag_dependencies}\n"
                 f"- Suggested tools for this step: {suggested_tools}\n\n"
                 "Only execute the current DAG step. Detailed step boundary rules are "
-                "provided in the latest DAG step instruction message.\n\n"
-                f"{step_language_rules}"
+                "provided in the latest DAG step instruction message.\n"
+                f"{step_intent_not_fact_rule(compact=True)}\n\n"
+                f"{language_harness}"
             )
-            request_anchor = output_language_directives(
-                output_language,
-                section="dag_step_request_anchor",
-                request=self.current_user_request_text(prefer_display=True),
-            )
-            if request_anchor:
-                parts.append(request_anchor)
         memory_context = self.metadata.get(MEMORY_CONTEXT_METADATA_KEY)
         if memory_context:
             parts.append(
@@ -958,6 +1562,27 @@ class ExecutionContext:
         return child
 
     def to_dict(self) -> dict[str, Any]:
+        # Containers that some code path mutates in place are snapshotted
+        # here, so a caller holding the result is not looking at live state.
+        # The DAG checkpoint rollback (``_DAGStepRuntime.checkpoint``)
+        # depends on that: it reinstates a previously returned dict to undo
+        # a failed checkpoint.
+        #
+        # Only ``metadata`` needs it. Its in-place writers include
+        # ``runner.py`` (``metadata[key] = value``, ``update``, ``pop``),
+        # ``dag.py`` (``OUTPUT_LANGUAGE_METADATA_KEY``,
+        # ``PREFERRED_INPUT_MODALITIES_METADATA_KEY``) and ``react.py``
+        # (``IMAGE_EDIT_UNAVAILABLE_METADATA_KEY``).
+        #
+        # Deliberately NOT copied, because nothing writes into them after the
+        # owning object is created -- copying them would cost time on every
+        # checkpoint and buy nothing:
+        #   * ``message.metadata`` / ``message.tool_calls`` -- ``Message`` is
+        #     a frozen dataclass and no writer mutates either dict of an
+        #     already-appended message.
+        #   * component payloads (workspace state, memory snapshot) -- these
+        #     are replaced wholesale, and a deep copy of a large workspace
+        #     state would be the most expensive thing on this path.
         return {
             "execution_id": self.execution_id,
             "user_id": self.user_id,
@@ -982,7 +1607,18 @@ class ExecutionContext:
                 for message in self.messages
             ],
             "system_prompt": self.system_prompt,
-            "metadata": self.metadata,
+            "metadata": snapshot_container(self.metadata),
+            # A sibling of ``metadata``, deliberately not a member of it:
+            # ``request_context`` keys land inside ``metadata`` verbatim
+            # (``runner.py:1001`` writes ``context.metadata[key] = value``), so
+            # a client can put any key there, while a top-level field of this
+            # payload has no client-reachable writer at all -- no API accepts a
+            # serialized context, and every dict that reaches ``from_dict``
+            # comes from this method (``runner.py:159``, ``runner.py:551``,
+            # ``dag.py:960``, ``dag.py:1948``). That asymmetry is the whole
+            # reason this field, and not the marker beside it, is the thing
+            # ``from_dict`` trusts.
+            EVIDENCE_MARKER_WRITER_FIELD: EVIDENCE_MARKER_WRITER_GENERATION,
             "created_at": self.created_at.isoformat(),
             "llm_calls": [
                 {
@@ -1005,6 +1641,7 @@ class ExecutionContext:
             "compact_config": {
                 "enabled": self.compact_config.enabled,
                 "threshold": self.compact_config.threshold,
+                "threshold_source": self.compact_config.threshold_source,
                 "max_messages": self.compact_config.max_messages,
             },
             # Backward compatibility for older serialized payloads.
@@ -1048,6 +1685,10 @@ class ExecutionContext:
         compact_config = CompactConfig(
             enabled=compact.get("enabled", True),
             threshold=compact.get("threshold", CompactConfig().threshold),
+            # Older checkpoints carry no provenance; do not invent one.
+            threshold_source=compact.get(
+                "threshold_source", COMPACT_THRESHOLD_SOURCE_UNKNOWN
+            ),
             max_messages=compact.get("max_messages", 20),
         )
         created_at = (
@@ -1065,6 +1706,30 @@ class ExecutionContext:
             else:
                 components[name] = GenericComponent(data=payload)
 
+        metadata = data.get("metadata", {})
+        if (
+            isinstance(metadata, dict)
+            and TOOL_EVIDENCE_REMOVED_METADATA_KEY in metadata
+            and not _evidence_marker_writer_attested(data)
+        ):
+            logger.warning(
+                "Restored context carries a tool-evidence marker with no "
+                "attested writer seal; dropping it so the state reads unknown. "
+                "execution_id=%s",
+                data.get("execution_id"),
+            )
+            # Built fresh rather than popped in place: ``to_dict`` hands out
+            # the live ``metadata`` object (``tests/core/agent/test_context.py``
+            # pins ``payload["metadata"] is context.metadata``), so a payload
+            # reaching here can be aliased to a caller's checkpoint dict or to
+            # another live context's metadata. Deleting the key would edit
+            # someone else's state as a side effect of reading.
+            metadata = {
+                key: value
+                for key, value in metadata.items()
+                if key != TOOL_EVIDENCE_REMOVED_METADATA_KEY
+            }
+
         context = cls(
             execution_id=data.get("execution_id", str(uuid4())),
             user_id=data.get("user_id"),
@@ -1072,7 +1737,7 @@ class ExecutionContext:
             components=components,
             messages=messages,
             system_prompt=data.get("system_prompt"),
-            metadata=data.get("metadata", {}),
+            metadata=metadata,
             created_at=created_at,
             llm_calls=llm_calls,
             compact_config=compact_config,
@@ -1115,7 +1780,7 @@ class ExecutionContext:
             )
 
         top_level_user_request(self)
-        total_tokens = self._get_total_tokens()
+        total_tokens = self.estimate_context_tokens()
         if total_tokens > self.compact_config.threshold:
             result = self._drop_oldest_messages()
             return self._annotate_compact_result(result, total_tokens)
@@ -1127,12 +1792,14 @@ class ExecutionContext:
             strategy="none",
         )
 
-    def build_llm_compact_request_if_needed(self) -> dict[str, Any] | None:
+    def build_llm_compact_request_if_needed(
+        self, *, context_window: int | None = None
+    ) -> dict[str, Any] | None:
         if not self.compact_config.enabled:
             return None
 
         top_level_user_request(self)
-        total_tokens = self._get_total_tokens()
+        total_tokens = self.estimate_context_tokens()
         if total_tokens <= self.compact_config.threshold:
             return None
 
@@ -1141,15 +1808,78 @@ class ExecutionContext:
             return None
 
         max_tokens = self._llm_compact_max_tokens()
+        omitted: list[dict[str, Any]] = []
+        messages = self._build_llm_compact_prompt(visible_messages, omitted=omitted)
+        metadata: dict[str, Any] = {
+            "original_tokens": total_tokens,
+            "threshold": self.compact_config.threshold,
+            "threshold_source": self.compact_config.threshold_source,
+            "max_summary_tokens": max_tokens,
+        }
+        if not isinstance(context_window, int) or context_window <= 0:
+            metadata[LLM_COMPACT_CONTEXT_WINDOW_UNKNOWN_KEY] = True
+            return {
+                "blocked": True,
+                "messages": messages,
+                "original_tokens": total_tokens,
+                "max_tokens": 0,
+                "metadata": metadata,
+            }
+        try:
+            request_input_tokens = sum(
+                max(
+                    1,
+                    _count_compact_request_tokens(str(message.get("content") or "")),
+                )
+                for message in messages
+            )
+        except Exception as exc:  # noqa: BLE001
+            metadata.update(
+                {
+                    LLM_COMPACT_TOKENIZER_UNAVAILABLE_KEY: True,
+                    "compact_tokenizer_error_type": type(exc).__name__,
+                }
+            )
+            return {
+                "blocked": True,
+                "messages": messages,
+                "original_tokens": total_tokens,
+                "max_tokens": 0,
+                "metadata": metadata,
+            }
+        metadata["compact_request_input_tokens"] = request_input_tokens
+        metadata["compact_request_tokenizer"] = "cl100k_base"
+
+        available_output_tokens = (
+            context_window - request_input_tokens - COMPACT_REQUEST_SAFETY_TOKENS
+        )
+        metadata["compact_context_window"] = context_window
+        metadata["compact_request_safety_tokens"] = COMPACT_REQUEST_SAFETY_TOKENS
+        if available_output_tokens < COMPACT_SUMMARY_MIN_TOKENS:
+            metadata["llm_compact_request_too_large"] = True
+            return {
+                "blocked": True,
+                "messages": messages,
+                "original_tokens": total_tokens,
+                "max_tokens": 0,
+                "metadata": metadata,
+            }
+        if available_output_tokens < max_tokens:
+            max_tokens = available_output_tokens
+            metadata["max_summary_tokens"] = max_tokens
+            metadata["compact_budget_reduced_to"] = max_tokens
+        if omitted:
+            # Surfaced so a thin summary has a visible cause. Counts and sizes
+            # only -- never the omitted content, which is the whole reason it
+            # was left out.
+            metadata["omitted_message_count"] = len(omitted)
+            metadata["omitted_messages"] = omitted
+            metadata["max_message_tokens"] = self._compact_message_max_tokens()
         return {
-            "messages": self._build_llm_compact_prompt(visible_messages),
+            "messages": messages,
             "original_tokens": total_tokens,
             "max_tokens": max_tokens,
-            "metadata": {
-                "original_tokens": total_tokens,
-                "threshold": self.compact_config.threshold,
-                "max_summary_tokens": max_tokens,
-            },
+            "metadata": metadata,
         }
 
     def _drop_oldest_messages(self) -> CompactResult:
@@ -1193,8 +1923,11 @@ class ExecutionContext:
     ) -> CompactResult:
         result.metadata.setdefault("original_tokens", original_tokens)
         result.metadata.setdefault("threshold", self.compact_config.threshold)
+        result.metadata.setdefault(
+            "threshold_source", self.compact_config.threshold_source
+        )
         if result.compacted:
-            compacted_tokens = self._estimate_message_tokens(self.messages)
+            compacted_tokens = self.estimate_context_tokens()
             result.metadata.setdefault("compacted_tokens", compacted_tokens)
             if original_tokens > 0:
                 ratio = compacted_tokens / original_tokens * 100
@@ -1242,9 +1975,11 @@ class ExecutionContext:
             "explicitly asks to restart, revise, or regenerate them, or the detail "
             "you need was lost in compaction. This summary is a lossy paraphrase of "
             "the raw history, not the history itself: when the answer needs an exact "
-            "value, figure, statistic, table row, quotation, or identifier that this "
+            f"statistic, quotation, or other value -- {VALUE_KINDS} -- that this "
             "summary does not literally contain, re-read or re-query the source "
             "instead of reconstructing the value from this summary or from memory. "
+            "If no tool can supply it, report it as unavailable rather than "
+            "reconstructing it. "
             "Only re-run tools that read; if the value came from a tool that writes, "
             "sends, executes, or otherwise changes state, do not re-run it -- re-read "
             "the artifact it produced, or report the value as unavailable. "
@@ -1400,7 +2135,7 @@ class ExecutionContext:
         """Describe the tool observations this compaction removes from context.
 
         Without this, the summary silently replaces every retrieved value and
-        the agent cannot tell a remembered figure from an invented one.
+        the agent cannot tell a remembered value from an invented one.
         """
         if not counts:
             return ""
@@ -1409,9 +2144,9 @@ class ExecutionContext:
         prefix = (
             f"Raw observations from {total} tool {call_label} dropped by this "
             "compaction. Their exact values are no longer in context; only the "
-            "summary above describes them. Treat any figure not literally present in "
-            "that summary as unavailable rather than recalled. Tools whose results "
-            "were dropped:\n"
+            "summary above describes them. Treat any value not literally present in "
+            f"that summary -- {VALUE_KINDS} -- as unavailable rather than recalled. "
+            "Tools whose results were dropped:\n"
         )
         # Tool names can come from dynamic MCP server config, so bound both the
         # per-name length and the total notice size the way the sibling
@@ -1444,9 +2179,11 @@ class ExecutionContext:
         return None
 
     def _build_llm_compact_prompt(
-        self, messages: list[Message]
+        self,
+        messages: list[Message],
+        omitted: list[dict[str, Any]] | None = None,
     ) -> list[dict[str, str]]:
-        transcript = self._compact_transcript(messages)
+        transcript = self._compact_transcript(messages, omitted=omitted)
         return [
             {
                 "role": "system",
@@ -1456,17 +2193,39 @@ class ExecutionContext:
                     "tool calls, tool observations, files or URLs mentioned, "
                     "decisions made, and open work. Drop duplicated search noise, "
                     "irrelevant raw payloads, and verbose intermediate text. "
-                    "Preserve exact reusable artifact handles, including file_id "
-                    "values, file: references, markdown file links, URLs, relative "
-                    "paths, absolute paths, output_path, image_path, video_path, "
-                    "artifact filenames, and any other path-like result fields; do "
-                    "not replace machine-usable handles with only descriptive "
-                    "filenames. Clearly separate completed work from remaining work "
-                    "and name the next action needed. "
-                    "Preserve the language of user-facing requests and constraints; "
-                    "if the history is multilingual, keep important details in their "
-                    "original language instead of translating them. "
-                    "Return only the compact summary."
+                    "Preserve exact reusable artifact handles -- file_id values, "
+                    "file: references, markdown links, URLs, paths, output_path, "
+                    "image_path, video_path, artifact filenames, any other "
+                    "path-like field -- never a descriptive filename instead. "
+                    "Preserve, character for character, the values a tool result "
+                    "returned for the records the request points at: their names, "
+                    "the people, organizations or teams they belong to, their "
+                    "identifiers and reference codes, their statuses, dates, "
+                    "counts and totals. Copy such a value or omit it; never "
+                    "paraphrase, substitute, or invent one to complete a pattern. "
+                    "Dropping a raw payload does not license dropping these "
+                    "values; they are not the bulk that instruction covers. "
+                    "Never copy, in whole or in part, a credential, token, key, "
+                    "password, or other authentication material, or personal "
+                    "information the request does not point at; note only that "
+                    "such a value was present and was omitted. If a value is both "
+                    "an identifier or handle the request points at and "
+                    "authentication material, the exclusion wins: omit it. If "
+                    "your budget cannot hold all of this, keep, in this order: "
+                    "first state what is missing and not listed here, with "
+                    "counts; artifact handles; the identifiers and names the "
+                    "request points at; statuses and dates; then the rest. "
+                    "Separate completed work from remaining work. Write no "
+                    "instruction to the next call about tool use or whether to "
+                    "answer: that decision is not yours and its tools are "
+                    "unknown to you. Report only what happened and what is "
+                    "missing: never call a dataset complete, fully retrieved, or "
+                    "fully processed unless the history shows every item was "
+                    "returned and every one is still described here; say which "
+                    "parts survive as prose only. Preserve the "
+                    "language of user-facing requests and constraints; keep "
+                    "multilingual details in their original language. Return only "
+                    "the compact summary."
                 ),
             },
             {
@@ -1475,8 +2234,9 @@ class ExecutionContext:
                     "Conversation history to compact:\n"
                     f"{transcript}\n\n"
                     "Write a concise but complete continuity summary for the next "
-                    "LLM call. The next LLM call should be able to continue without "
-                    "redoing completed tool calls."
+                    "LLM call. Record which tool calls already completed and what "
+                    "they returned, so the next call can judge for itself what "
+                    "still needs doing."
                 ),
             },
         ]
@@ -1506,7 +2266,40 @@ class ExecutionContext:
             min(COMPACT_SUMMARY_MAX_TOKENS, self.compact_config.threshold // 4),
         )
 
-    def _compact_transcript(self, messages: list[Message]) -> str:
+    def _compact_message_max_tokens(self) -> int:
+        """Cap on what any single message contributes to a summary request.
+
+        A summary is written by reading the history, so a message large enough
+        to exhaust the window on its own makes compaction impossible rather
+        than merely expensive: the request cannot be sent, the backstop then
+        finds a message count small enough that its tail window keeps
+        everything, and the context stays over budget with nothing able to
+        shrink it.
+
+        Shares the summary output budget's ``threshold // 4`` denominator on
+        purpose -- no single message should be able to claim more of the
+        request than the whole summary is allowed to produce.
+        """
+        return max(
+            COMPACT_TRANSCRIPT_MESSAGE_MIN_TOKENS,
+            self.compact_config.threshold // 4,
+        )
+
+    def _compact_transcript(
+        self,
+        messages: list[Message],
+        omitted: list[dict[str, Any]] | None = None,
+    ) -> str:
+        max_message_tokens = self._compact_message_max_tokens()
+        rereadable_tool_call_ids = {
+            str(tool_call["id"])
+            for message in messages
+            for tool_call in message.tool_calls or ()
+            if isinstance(tool_call, dict)
+            and tool_call.get("id")
+            and self._compact_tool_call_name(tool_call) in COMPACT_REREADABLE_TOOL_NAMES
+            and self._compact_tool_call_arguments(tool_call)
+        }
         chunks: list[str] = []
         for index, message in enumerate(messages, start=1):
             header = f"{index}. {message.role.upper()}"
@@ -1518,12 +2311,70 @@ class ExecutionContext:
                     "tool_calls="
                     + json.dumps(message.tool_calls, ensure_ascii=False, default=str)
                 )
-            chunks.append(message.content)
+            content_tokens = max(1, len(message.content) // 4)
+            can_reread = (
+                message.role == "tool"
+                and message.metadata.get("tool_name") in COMPACT_REREADABLE_TOOL_NAMES
+                and message.tool_call_id is not None
+                and str(message.tool_call_id) in rereadable_tool_call_ids
+            )
+            # User, system, assistant, and non-rereadable tool messages are
+            # their own source. Omitting one here would permanently discard it
+            # when the summary replaces the raw history.
+            if can_reread and content_tokens > max_message_tokens:
+                chunks.append(self._omitted_content_notice(message, content_tokens))
+                if omitted is not None:
+                    omitted.append(
+                        {
+                            "index": index,
+                            "role": message.role,
+                            "tool_name": message.metadata.get("tool_name"),
+                            "estimated_tokens": content_tokens,
+                        }
+                    )
+            else:
+                chunks.append(message.content)
             if message.context_refs:
                 context_refs_text = message.context_refs_text()
                 if context_refs_text:
                     chunks.append(context_refs_text)
         return "\n".join(chunks)
+
+    @staticmethod
+    def _compact_tool_call_name(tool_call: dict[str, Any]) -> str:
+        function = tool_call.get("function")
+        if isinstance(function, dict):
+            return str(function.get("name") or "")
+        return str(tool_call.get("name") or "")
+
+    @staticmethod
+    def _compact_tool_call_arguments(tool_call: dict[str, Any]) -> Any:
+        function = tool_call.get("function")
+        if isinstance(function, dict):
+            return function.get("arguments")
+        return tool_call.get("args")
+
+    @staticmethod
+    def _omitted_content_notice(message: Message, content_tokens: int) -> str:
+        """Stand-in for a message too large to include in a summary request.
+
+        Replaces the whole message rather than a prefix of it. A byte-slice
+        can land inside a structured value -- a JSON key, an identifier -- and
+        the model completes the severed token by guessing, which reads as data
+        and is silently wrong. Naming what was dropped instead lets the
+        summary say the work happened and point at where to re-read it.
+
+        Deterministic by construction: the text is derived only from the
+        message, never from the clock or a request id, so retrying the same
+        compaction at a smaller output budget sends a byte-identical request.
+        """
+        tool_name = message.metadata.get("tool_name")
+        subject = f"{tool_name} result" if tool_name else "tool result"
+        return (
+            f"[content omitted from this summary request: {subject}, "
+            f"~{content_tokens} tokens. Re-run the recorded read-only tool "
+            f"call if its contents are needed rather than reconstructing them.]"
+        )
 
     @staticmethod
     def _is_reasoning_fallback(response: Any) -> bool:
@@ -1561,13 +2412,20 @@ class ExecutionContext:
             return str(content)
         return str(response) if response is not None else ""
 
-    def estimate_context_tokens(self) -> int:
+    def estimate_context_tokens(
+        self,
+        messages: list[dict[str, Any]] | None = None,
+        tools: list[dict[str, Any]] | None = None,
+    ) -> int:
         """Public estimate of the current context size in tokens.
 
-        Uses the same accounting as the compaction decision so a UI gauge fed
-        by this value reaches its threshold exactly when compaction triggers.
+        When final provider messages are supplied, account for exactly their
+        rendered dynamic system content rather than the persisted message list.
         """
-        return self._get_total_tokens()
+        provider_messages = (
+            messages if messages is not None else self.get_messages_for_llm()
+        )
+        return estimate_provider_prompt_tokens(provider_messages, tools)
 
     def _get_total_tokens(self) -> int:
         if self.llm_calls:

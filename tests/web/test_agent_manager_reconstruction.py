@@ -7,7 +7,6 @@ from unittest.mock import AsyncMock, MagicMock, call, patch
 import pytest
 
 from xagent.core.tools.adapters.vibe.config import MCPFailurePolicy
-from xagent.web.api.chat import AgentServiceManager
 from xagent.web.models.task import (
     DAGExecution,
     DAGExecutionPhase,
@@ -16,6 +15,7 @@ from xagent.web.models.task import (
     TraceEvent,
 )
 from xagent.web.models.user import User
+from xagent.web.services.agent_service_manager import AgentServiceManager
 from xagent.web.services.task_setup_snapshot import (
     RuntimeUserFields,
     TaskReconstructionSnapshot,
@@ -26,7 +26,7 @@ from xagent.web.services.task_setup_snapshot import (
 
 @pytest.fixture(autouse=True)
 def legacy_task_selection(monkeypatch):
-    from xagent.web.api.trace_handlers import DatabaseTraceHandler
+    from xagent.web.services.trace_handlers import DatabaseTraceHandler
 
     monkeypatch.setattr(
         "xagent.web.tracing.task_database_handler", DatabaseTraceHandler
@@ -232,16 +232,21 @@ class TestAgentServiceManagerReconstruction:
         mock_db.add = MagicMock()
 
         with (
-            patch("xagent.web.api.chat.AgentService") as mock_agent_service_class,
             patch(
-                "xagent.web.api.chat.load_task_setup_snapshot_sync",
+                "xagent.web.services.agent_service_manager.AgentService"
+            ) as mock_agent_service_class,
+            patch(
+                "xagent.web.services.agent_service_manager.load_task_setup_snapshot_sync",
                 side_effect=[None, post_create_snapshot],
             ) as snapshot_loader,
             patch(
-                "xagent.web.api.chat.create_default_tools",
+                "xagent.web.services.agent_service_manager.create_default_tools",
                 new=AsyncMock(return_value=([], MagicMock())),
             ),
-            patch("xagent.web.api.chat.get_memory_store", return_value=MagicMock()),
+            patch(
+                "xagent.web.services.agent_service_manager.get_memory_store",
+                return_value=MagicMock(),
+            ),
             patch("xagent.web.sandbox_manager.get_sandbox_manager", return_value=None),
         ):
             # 创建mock AgentService实例
@@ -276,12 +281,17 @@ class TestAgentServiceManagerReconstruction:
             task_llm=MagicMock(),
         )
         with (
-            patch("xagent.web.api.chat.AgentService") as mock_agent_service_class,
             patch(
-                "xagent.web.api.chat.create_default_tools",
+                "xagent.web.services.agent_service_manager.AgentService"
+            ) as mock_agent_service_class,
+            patch(
+                "xagent.web.services.agent_service_manager.create_default_tools",
                 new=AsyncMock(return_value=([], MagicMock())),
             ),
-            patch("xagent.web.api.chat.get_memory_store", return_value=MagicMock()),
+            patch(
+                "xagent.web.services.agent_service_manager.get_memory_store",
+                return_value=MagicMock(),
+            ),
             patch("xagent.web.sandbox_manager.get_sandbox_manager", return_value=None),
         ):
             mock_agent_service = MagicMock()
@@ -314,8 +324,13 @@ class TestAgentServiceManagerReconstruction:
         )
 
         with (
-            patch("xagent.web.api.chat.AgentService") as mock_agent_service_class,
-            patch("xagent.web.api.chat.get_memory_store", return_value=MagicMock()),
+            patch(
+                "xagent.web.services.agent_service_manager.AgentService"
+            ) as mock_agent_service_class,
+            patch(
+                "xagent.web.services.agent_service_manager.get_memory_store",
+                return_value=MagicMock(),
+            ),
             patch(
                 "xagent.web.sandbox_manager.get_sandbox_manager",
                 return_value=sandbox_mgr,
@@ -373,11 +388,15 @@ class TestAgentServiceManagerReconstruction:
         uploads_dir = tmp_path / "uploads"
 
         with (
-            patch("xagent.web.api.chat.AgentService") as mock_agent_service_class,
+            patch(
+                "xagent.web.services.agent_service_manager.AgentService"
+            ) as mock_agent_service_class,
             patch(
                 "xagent.web.services.llm_utils.UserAwareModelStorage.resolve_llms_from_names"
             ) as mock_resolve_llms,
-            patch("xagent.web.api.chat.get_memory_store") as mock_get_memory,
+            patch(
+                "xagent.web.services.agent_service_manager.get_memory_store"
+            ) as mock_get_memory,
             # Backend workspace paths are composed in the workspace
             # projection, so that is the seam the base dir comes from.
             patch(
@@ -453,11 +472,15 @@ class TestAgentServiceManagerReconstruction:
         uploads_dir = tmp_path / "uploads"
 
         with (
-            patch("xagent.web.api.chat.AgentService") as mock_agent_service_class,
+            patch(
+                "xagent.web.services.agent_service_manager.AgentService"
+            ) as mock_agent_service_class,
             patch(
                 "xagent.web.services.llm_utils.UserAwareModelStorage.resolve_llms_from_names"
             ) as mock_resolve_llms,
-            patch("xagent.web.api.chat.get_memory_store") as mock_get_memory,
+            patch(
+                "xagent.web.services.agent_service_manager.get_memory_store"
+            ) as mock_get_memory,
             patch(
                 "xagent.web.services.workspace_binding.get_uploads_dir",
                 return_value=uploads_dir,
@@ -547,11 +570,15 @@ class TestAgentServiceManagerReconstruction:
             )
 
         with (
-            patch("xagent.web.api.chat.AgentService") as mock_agent_service_class,
+            patch(
+                "xagent.web.services.agent_service_manager.AgentService"
+            ) as mock_agent_service_class,
             patch(
                 "xagent.web.services.llm_utils.UserAwareModelStorage.resolve_llms_from_names"
             ) as mock_resolve_llms,
-            patch("xagent.web.api.chat.get_memory_store") as mock_get_memory,
+            patch(
+                "xagent.web.services.agent_service_manager.get_memory_store"
+            ) as mock_get_memory,
             patch(
                 "xagent.web.services.workspace_binding.get_uploads_dir",
                 return_value=uploads_dir,
@@ -766,9 +793,11 @@ class TestAgentServiceManagerReconstruction:
         )
         # 使用更高级的方法直接patch AgentService创建
         with (
-            patch("xagent.web.api.chat.AgentService") as mock_agent_service_class,
             patch(
-                "xagent.web.api.chat.create_default_tools",
+                "xagent.web.services.agent_service_manager.AgentService"
+            ) as mock_agent_service_class,
+            patch(
+                "xagent.web.services.agent_service_manager.create_default_tools",
                 new=AsyncMock(return_value=([], MagicMock())),
             ),
             patch("xagent.web.sandbox_manager.get_sandbox_manager", return_value=None),
@@ -816,11 +845,13 @@ class TestAgentServiceManagerReconstruction:
         )
         with (
             patch(
-                "xagent.web.api.chat.create_default_tools",
+                "xagent.web.services.agent_service_manager.create_default_tools",
                 new=AsyncMock(return_value=(["tool"], "tool_config")),
             ),
             patch("xagent.web.sandbox_manager.get_sandbox_manager", return_value=None),
-            patch("xagent.web.api.chat.AgentService") as mock_agent_service_class,
+            patch(
+                "xagent.web.services.agent_service_manager.AgentService"
+            ) as mock_agent_service_class,
         ):
             # 设置mock AgentService实例
             mock_agent_instance = MagicMock()
@@ -876,11 +907,13 @@ class TestAgentServiceManagerReconstruction:
 
         with (
             patch(
-                "xagent.web.api.chat.create_default_tools",
+                "xagent.web.services.agent_service_manager.create_default_tools",
                 new=AsyncMock(return_value=(["tool"], "tool_config")),
             ),
             patch("xagent.web.sandbox_manager.get_sandbox_manager", return_value=None),
-            patch("xagent.web.api.chat.AgentService") as mock_agent_service_class,
+            patch(
+                "xagent.web.services.agent_service_manager.AgentService"
+            ) as mock_agent_service_class,
         ):
             mock_agent_instance = MagicMock()
             mock_agent_instance.reconstruct_from_history = AsyncMock()
@@ -931,11 +964,13 @@ class TestAgentServiceManagerReconstruction:
 
         with (
             patch(
-                "xagent.web.api.chat.create_default_tools",
+                "xagent.web.services.agent_service_manager.create_default_tools",
                 new=AsyncMock(return_value=(["tool"], "tool_config")),
             ),
             patch("xagent.web.sandbox_manager.get_sandbox_manager", return_value=None),
-            patch("xagent.web.api.chat.AgentService") as mock_agent_service_class,
+            patch(
+                "xagent.web.services.agent_service_manager.AgentService"
+            ) as mock_agent_service_class,
         ):
             mock_agent_instance = MagicMock()
             mock_agent_instance.reconstruct_from_history = AsyncMock()
@@ -983,7 +1018,7 @@ class TestAgentServiceManagerReconstruction:
         # 调用方法应该抛出异常
         with (
             patch(
-                "xagent.web.api.chat.load_task_setup_snapshot_sync",
+                "xagent.web.services.agent_service_manager.load_task_setup_snapshot_sync",
                 side_effect=Exception("Database error"),
             ),
             pytest.raises(Exception) as exc_info,
@@ -1001,7 +1036,7 @@ class TestAgentServiceManagerReconstruction:
 
         with (
             patch(
-                "xagent.web.api.chat.load_task_setup_snapshot_sync",
+                "xagent.web.services.agent_service_manager.load_task_setup_snapshot_sync",
                 side_effect=error,
             ) as snapshot_loader,
             pytest.raises(RuntimeError) as exc_info,

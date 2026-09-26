@@ -80,7 +80,9 @@ def stage_chat_message_no_commit(
     turn_id = cast(str | None, message.turn_id)
     if message.role == "user" and not turn_id:
         turn_id = str(uuid4())
-    identity = turn_id if message.role == "user" else str(uuid4())
+    identity = (
+        turn_id if message.role == "user" else (message.source_event_id or str(uuid4()))
+    )
     if message.role == "assistant" and task.status in {
         TaskStatus.COMPLETED,
         TaskStatus.FAILED,
@@ -97,6 +99,7 @@ def stage_chat_message_no_commit(
         "attachments": message.attachments,
         "turn_id": turn_id,
         "delivery_status": message.delivery_status,
+        "source_event_id": message.source_event_id,
     }
     event = append_fact_no_commit(
         db,

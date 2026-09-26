@@ -5,6 +5,8 @@ import pytest
 
 from xagent.web.channels.feishu.bot import FeishuBotInstance, FeishuChannelManager
 from xagent.web.models.task import TaskStatus
+from xagent.web.services.client_error_messages import CLIENT_SAFE_AUTO_MODEL_UNAVAILABLE
+from xagent.web.services.llm_utils import AutoModelUnavailableError
 from xagent.web.services.task_execution_context_service import (
     TaskExecutionRecoverySnapshot,
 )
@@ -18,6 +20,11 @@ _TEST_TIMEOUT_SECONDS = 5.0
 
 def make_bot() -> FeishuBotInstance:
     bot = object.__new__(FeishuBotInstance)
+    bot._initialize_batch_control()
+    bot.user_active_trace_handlers = {}
+    bot.control_tasks = set()
+    bot.control_queues = {}
+    bot.control_locks = {}
     bot._accepting = True
     bot._ingress_stopped = False
     bot._stop_lock = None
@@ -30,16 +37,30 @@ def make_bot() -> FeishuBotInstance:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("auto_unavailable", [False, True])
 async def test_error_after_prepare_settles_preclaimed_task_instead_of_orphaning_it(
     monkeypatch: pytest.MonkeyPatch,
+    auto_unavailable: bool,
 ) -> None:
     bot = object.__new__(FeishuBotInstance)
+    bot._initialize_batch_control()
+    bot.user_active_trace_handlers = {}
+    bot.control_tasks = set()
+    bot.control_queues = {}
+    bot.control_locks = {}
     bot.channel_id = 1
     bot.channel_name = "Feishu prepare failure"
     bot.active_tasks = {}
     bot.api_client = object()
-    bot._save_active_tasks = lambda: (_ for _ in ()).throw(
-        RuntimeError("mapping persistence failed")
+    bot._save_active_tasks = lambda: True
+    failure = (
+        AutoModelUnavailableError("private model details")
+        if auto_unavailable
+        else RuntimeError("snapshot failed")
+    )
+    monkeypatch.setattr(
+        "xagent.web.channels.feishu.bot.load_task_setup_snapshot_sync",
+        lambda *_args: (_ for _ in ()).throw(failure),
     )
     lease = TaskLease(task_id=45, runner_id="runner-a", run_id="run-a")
     finalized: list[TaskStatus] = []
@@ -95,7 +116,11 @@ async def test_error_after_prepare_settles_preclaimed_task_instead_of_orphaning_
 
     assert finalized == [TaskStatus.FAILED]
     assert managed.closed is True
-    assert sent_messages == ["Sorry, an error occurred while processing your request."]
+    assert sent_messages == [
+        CLIENT_SAFE_AUTO_MODEL_UNAVAILABLE
+        if auto_unavailable
+        else "Sorry, an error occurred while processing your request."
+    ]
 
 
 @pytest.mark.asyncio
@@ -103,11 +128,16 @@ async def test_channel_failure_suppresses_stale_error_after_exact_settlement_rej
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     bot = object.__new__(FeishuBotInstance)
+    bot._initialize_batch_control()
+    bot.user_active_trace_handlers = {}
+    bot.control_tasks = set()
+    bot.control_queues = {}
+    bot.control_locks = {}
     bot.channel_id = 1
     bot.channel_name = "Feishu exact settlement"
     bot.active_tasks = {}
     bot.api_client = object()
-    bot._save_active_tasks = lambda: None
+    bot._save_active_tasks = lambda: True
 
     lease = TaskLease(task_id=45, runner_id="runner-a", run_id="shared-run")
 
@@ -184,6 +214,10 @@ async def test_channel_failure_suppresses_stale_error_after_exact_settlement_rej
             conversation_history=(),
             conversation_watermark=None,
             execution_recovery=TaskExecutionRecoverySnapshot(),
+            # The turn binds ``task.source`` into the agent context (MCP
+            # approval gate identity), so the stand-in row carries the
+            # ``Task.source`` column default a channel-created task gets.
+            task=SimpleNamespace(source="internal"),
         ),
     )
 
@@ -275,11 +309,16 @@ async def test_successful_channel_turn_persists_user_before_exact_assistant_sett
     expected_error: str | None,
 ) -> None:
     bot = object.__new__(FeishuBotInstance)
+    bot._initialize_batch_control()
+    bot.user_active_trace_handlers = {}
+    bot.control_tasks = set()
+    bot.control_queues = {}
+    bot.control_locks = {}
     bot.channel_id = 1
     bot.channel_name = "Feishu history"
     bot.active_tasks = {"open-id": "45"}
     bot.api_client = object()
-    bot._save_active_tasks = lambda: None
+    bot._save_active_tasks = lambda: True
     events: list[str] = []
     finalized: list[dict] = []
 
@@ -358,6 +397,10 @@ async def test_successful_channel_turn_persists_user_before_exact_assistant_sett
             conversation_history=(),
             conversation_watermark=None,
             execution_recovery=TaskExecutionRecoverySnapshot(),
+            # The turn binds ``task.source`` into the agent context (MCP
+            # approval gate identity), so the stand-in row carries the
+            # ``Task.source`` column default a channel-created task gets.
+            task=SimpleNamespace(source="internal"),
         ),
     )
     monkeypatch.setattr(

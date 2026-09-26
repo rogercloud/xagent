@@ -10,8 +10,7 @@ from pydantic import BaseModel, Field, field_validator
 
 from ...core.agent.language import (
     detect_prose_script_mismatch,
-    output_language_policy,
-    response_language_rules,
+    render_dag_step_language_reference,
 )
 from ...core.agent.result import extract_assistant_message
 from ...core.agent.service import AgentService
@@ -20,6 +19,7 @@ from ...core.model.chat.basic.base import BaseLLM
 from ...core.tools.adapters.vibe.agent_tool import (
     ListAvailableSkillsTool,
     ListToolCategoriesTool,
+    resolve_llm_tool_categories,
 )
 from ...core.tools.adapters.vibe.base import (
     AbstractBaseTool,
@@ -166,6 +166,21 @@ class WorkforcePromptBuilderState:
                 "message": ("execution_mode must be flash, balanced, think, or auto."),
             }
 
+        requested_categories = args.get("tool_categories")
+        try:
+            tool_categories = (
+                []
+                if requested_categories is None
+                else resolve_llm_tool_categories(
+                    requested_categories,
+                    "are connectors, which a Workforce built from a prompt cannot "
+                    "grant; once it is created, the user can add connectors to its "
+                    "worker agents in the agent builder.",
+                )
+            )
+        except ValueError as exc:
+            return {"status": "error", "message": str(exc)}
+
         ref = f"new:{self._next_agent_number}"
         self._next_agent_number += 1
         spec = StagedAgentSpec(
@@ -173,7 +188,7 @@ class WorkforcePromptBuilderState:
             name=name,
             description=description,
             instructions=instructions,
-            tool_categories=ensure_list(args.get("tool_categories")) or [],
+            tool_categories=tool_categories,
             skills=ensure_list(args.get("skills")),
             execution_mode=execution_mode,
         )
@@ -404,7 +419,10 @@ class StageAgentArgs(BaseModel):
     )
     tool_categories: list[str] = Field(
         default_factory=list,
-        description="Tool categories assigned to this agent.",
+        description=(
+            "Tool categories from list_tool_categories. Connectors ('mcp', "
+            "'mcp:<server>') cannot be set here. Omit for an agent with no tools."
+        ),
     )
     skills: list[str] | None = Field(
         default=None,
@@ -568,8 +586,7 @@ success when finalization did not happen.
 All persisted user-facing prose passed to tools, including {_WORKFORCE_BUILDER_PERSISTED_FIELDS},
 must follow the user's request language. English tool names, schemas, and tool
 results do not authorize changing it.
-{output_language_policy()}
-{response_language_rules(subject="current user request")}
+{render_dag_step_language_reference()}
 """
 
 

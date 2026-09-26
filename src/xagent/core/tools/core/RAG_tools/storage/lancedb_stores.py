@@ -5,17 +5,21 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import threading
 from collections import OrderedDict, defaultdict
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
+from enum import Enum
 from typing import Any, Dict, Iterator, List, Literal, Optional, Sequence, Tuple, cast
 
-import lancedb
 import pyarrow as pa  # type: ignore
 from filelock import FileLock, Timeout
 from lancedb.db import DBConnection
 
-from xagent.providers.vector_store.lancedb import get_connection_from_env
+from xagent.providers.vector_store.lancedb import (
+    get_async_connection_from_env,
+    get_connection_from_env,
+)
 
 from ..core.config import (
     DEFAULT_INDEX_POLICY,
@@ -25,7 +29,11 @@ from ..core.config import (
 )
 from ..core.schemas import CollectionInfo, IndexResult
 from ..LanceDB.schema_manager import ensure_documents_table
-from ..utils.lancedb_query_utils import list_table_names, query_to_list
+from ..utils.lancedb_query_utils import (
+    build_fts_query,
+    list_table_names,
+    query_to_list,
+)
 from ..utils.string_utils import (
     build_lancedb_filter_expression,
     build_user_id_filter_for_table,
@@ -116,6 +124,30 @@ def _compaction_lock(conn: Any, table_name: str) -> Iterator[bool]:
             logger.debug("Could not release compaction lock for %s: %s", table_name, e)
 
 
+class FtsRebuildOutcome(Enum):
+    """Why :meth:`LanceDBVectorIndexStore.rebuild_text_fts_index` returned.
+
+    Failure is not a member: it propagates as the original exception, which
+    carries the cause a member would throw away.
+    """
+
+    REBUILT = "rebuilt"
+    SKIPPED_NO_INDEX = "skipped_no_index"
+    SKIPPED_LOCKED = "skipped_locked"
+
+
+def _has_text_fts_index(table: Any) -> bool:
+    """Whether ``table`` carries an FTS index on the ``text`` column.
+
+    Both halves matter: an FTS index on another column is not one this rebuild
+    can replace.
+    """
+    return any(
+        idx.index_type == "FTS" and "text" in idx.columns
+        for idx in table.list_indices()
+    )
+
+
 def _stale_version_count(table: Any, cutoff: datetime) -> int:
     """How many of ``table``'s versions predate ``cutoff`` (0 when unavailable).
 
@@ -159,11 +191,8 @@ def _stale_version_count(table: Any, cutoff: datetime) -> int:
 class LanceDBMetadataStore(MetadataStore):
     """LanceDB implementation for control-plane metadata operations."""
 
-    def __init__(self) -> None:
-        self._conn: Optional[DBConnection] = None
-
     async def _get_connection(self) -> DBConnection:
-        """Open (and memoise) the connection without stalling the event loop.
+        """Reach the connection pool without stalling the event loop.
 
         Opening a LanceDB connection is blocking I/O, so it is dispatched to a
         worker thread. ``get_raw_connection`` is the synchronous equivalent for
@@ -626,15 +655,12 @@ class LanceDBMetadataStore(MetadataStore):
         """Get the underlying LanceDB connection.
 
         This method provides access to the raw connection for operations that
-        cannot be performed through the storage abstraction. It initializes
-        and caches the connection for consistency with async methods.
+        cannot be performed through the storage abstraction.
 
         Returns:
             DBConnection: The LanceDB connection object
         """
-        if self._conn is None:
-            self._conn = get_connection_from_env()
-        return self._conn
+        return get_connection_from_env()
 
 
 class LanceDBVectorIndexStore(VectorIndexStore):
@@ -648,70 +674,83 @@ class LanceDBVectorIndexStore(VectorIndexStore):
     _TABLE_CACHE_MAXSIZE = 64
 
     def __init__(self) -> None:
-        self._conn: Optional[DBConnection] = None
-        self._async_conn: Optional[Any] = None  # AsyncConnection
-        self._async_lock = asyncio.Lock()  # Protect async connection initialization
         self._table_cache: OrderedDict[str, Any] = OrderedDict()
+        # Guards _table_cache across the worker threads asyncio.to_thread
+        # dispatches handle storage calls to.
+        self._table_cache_lock = threading.Lock()
+        self._table_cache_epoch = 0
 
     def _get_connection(self) -> DBConnection:
-        if self._conn is None:
-            self._conn = get_connection_from_env()
-        return self._conn
+        return get_connection_from_env()
 
     def _get_table(self, table_name: str, *, use_cache: bool = True) -> Any:
         """Get a table handle, optionally reusing the per-process cache."""
         from ..LanceDB.schema_manager import _safe_close_table
 
-        if use_cache:
-            cached = self._table_cache.get(table_name)
-            if cached is not None:
-                self._table_cache.move_to_end(table_name)
-                return cached
-        table = self._get_connection().open_table(table_name)
-        if use_cache:
-            self._table_cache[table_name] = table
-            if len(self._table_cache) > self._TABLE_CACHE_MAXSIZE:
-                _evicted_name, _evicted_table = self._table_cache.popitem(last=False)
-                _safe_close_table(_evicted_table)
-        return table
+        if not use_cache:
+            return self._get_connection().open_table(table_name)
+
+        # At most two passes. An invalidation landing while the unlocked open
+        # below is in flight means the table may have just been dropped, so
+        # that handle is thrown away and re-opened against the new epoch.
+        for last_pass in (False, True):
+            with self._table_cache_lock:
+                cached = self._table_cache.get(table_name)
+                if cached is not None:
+                    self._table_cache.move_to_end(table_name)
+                    return cached
+                epoch = self._table_cache_epoch
+
+            # Blocking I/O, deliberately outside the lock: holding it across
+            # this would serialize every concurrent open.
+            table = self._get_connection().open_table(table_name)
+
+            discarded = None
+            with self._table_cache_lock:
+                if self._table_cache_epoch != epoch and not last_pass:
+                    discarded, table = table, None
+                else:
+                    # Unlocked, an insert landing inside
+                    # invalidate_table_cache's own critical section is dropped
+                    # by its clear() while absent from its stale snapshot, so
+                    # that handle would be neither cached nor closed.
+                    existing = self._table_cache.get(table_name)
+                    if existing is not None:
+                        self._table_cache.move_to_end(table_name)
+                        discarded, table = table, existing
+                    else:
+                        self._table_cache[table_name] = table
+                        if len(self._table_cache) > self._TABLE_CACHE_MAXSIZE:
+                            _evicted_name, discarded = self._table_cache.popitem(
+                                last=False
+                            )
+            _safe_close_table(discarded)
+            if table is not None:
+                return table
+
+        raise RuntimeError("unreachable: the second pass always returns")
 
     def invalidate_table_cache(self, table_name: str | None = None) -> None:
         """Clear table cache after drop/delete to avoid stale handles.
 
-        Cached handles are closed before removal so underlying file
-        descriptors are released promptly.
+        Handles are dropped from the cache under the lock, then closed outside
+        it so a blocking close never runs while the lock is held.
         """
         from ..LanceDB.schema_manager import _safe_close_table
 
-        if table_name is None:
-            for _name, _table in list(self._table_cache.items()):
-                _safe_close_table(_table)
-            self._table_cache.clear()
-        else:
-            _table = self._table_cache.pop(table_name, None)
+        with self._table_cache_lock:
+            self._table_cache_epoch += 1
+            if table_name is None:
+                stale = list(self._table_cache.values())
+                self._table_cache.clear()
+            else:
+                stale = [self._table_cache.pop(table_name, None)]
+        for _table in stale:
             _safe_close_table(_table)
 
     async def _get_async_connection(self) -> Any:
-        """Get or create async LanceDB connection with thread-safe initialization."""
-        # Fast path: return existing connection without lock
-        if self._async_conn is not None:
-            return self._async_conn
-
-        # Slow path: initialize with lock to prevent race condition
-        async with self._async_lock:
-            # Double-check after acquiring lock
-            if self._async_conn is not None:
-                return self._async_conn
-
-            # Get URI from sync connection for reuse
-            sync_conn = self._get_connection()
-            uri = getattr(sync_conn, "uri", None)
-            if uri is None:
-                # Fallback: use LANCEDB_DIR env var
-
-                uri = os.getenv("LANCEDB_DIR", "./data/lancedb")
-            self._async_conn = await lancedb.connect_async(uri)  # type: ignore[attr-defined]
-            return self._async_conn
+        """Get the process-wide async LanceDB connection."""
+        return await get_async_connection_from_env()
 
     def list_document_records(
         self,
@@ -1133,11 +1172,9 @@ class LanceDBVectorIndexStore(VectorIndexStore):
         without cascading into documents/parses/chunks. Idempotent: returns 0
         when no embeddings table matches.
         """
-        from ..kb.cleanup_filters import (
-            build_embedding_cleanup_filters,
-            resolve_cleanup_scope,
-        )
+        from ..kb.cleanup_filters import resolve_cleanup_scope
         from ..LanceDB.schema_manager import _safe_close_table
+        from .lancedb_cleanup_filters import build_embedding_cleanup_filters
 
         scope = resolve_cleanup_scope(
             collection=collection_name,
@@ -1626,16 +1663,40 @@ class LanceDBVectorIndexStore(VectorIndexStore):
         Guarded because ``compact_tables`` routes documents, parses, chunks and
         ingestion_runs through the same path and only embeddings carries FTS.
         """
-        has_fts = any(
-            idx.index_type == "FTS" and "text" in idx.columns
-            for idx in table.list_indices()
-        )
-        if not has_fts:
+        if not _has_text_fts_index(table):
             return
 
         fts_params = {"with_position": True, **(DEFAULT_INDEX_POLICY.fts_params or {})}
         table.create_fts_index("text", replace=True, **fts_params)
-        logger.info("Rebuilt FTS index for %s before optimize", table_name)
+        logger.info("Rebuilt FTS index for %s", table_name)
+
+    def rebuild_text_fts_index(self, table_name: str) -> FtsRebuildOutcome:
+        """Rebuild one table's ``text`` FTS index, and nothing else.
+
+        Unlike :meth:`trigger_reindex` this neither compacts nor swallows a
+        failed rebuild: the return value says what happened and anything else
+        raises, so a caller can report the rebuild rather than infer it.
+
+        Shares ``trigger_reindex``'s per-table lock, so a concurrent ingestion
+        compacting the same table yields ``SKIPPED_LOCKED`` instead of racing
+        it into a lost rewrite.
+        """
+        from ..LanceDB.schema_manager import _safe_close_table
+
+        conn = self._get_connection()
+        with _compaction_lock(conn, table_name) as acquired:
+            if not acquired:
+                return FtsRebuildOutcome.SKIPPED_LOCKED
+            table = None
+            try:
+                table = conn.open_table(table_name)
+                if not _has_text_fts_index(table):
+                    return FtsRebuildOutcome.SKIPPED_NO_INDEX
+                self._rebuild_fts_index(table, table_name)
+                self.invalidate_table_cache(table_name)
+                return FtsRebuildOutcome.REBUILT
+            finally:
+                _safe_close_table(table)
 
     def should_compact(
         self, table_name: str, policy: Optional[IndexPolicy] = None
@@ -2334,12 +2395,12 @@ class LanceDBVectorIndexStore(VectorIndexStore):
                 filters, user_id=None, is_admin=False
             )
 
-            # Build FTS search query
-            # Note: LanceDB async API supports query_type="fts"
-            search_query = table.search(
-                query_text,
-                query_type="fts",
-            )
+            fts_query = build_fts_query(query_text, text_column_name)
+            if fts_query is None:
+                return []
+            # AsyncTable.search is a coroutine; the builder chain starts on its
+            # result, not on the call.
+            search_query = await table.search(fts_query, query_type="fts")
 
             if backend_filter:
                 search_query = search_query.where(backend_filter)
@@ -2521,7 +2582,7 @@ class LanceDBVectorIndexStore(VectorIndexStore):
 
         # Note: ensure_documents_table uses sync connection - may need async variant
         # For now, reuse sync connection for table creation
-        sync_conn = self._get_connection()
+        sync_conn = await asyncio.to_thread(self._get_connection)
         ensure_documents_table(sync_conn)
 
         from ..LanceDB.schema_manager import _safe_close_table
@@ -2550,7 +2611,7 @@ class LanceDBVectorIndexStore(VectorIndexStore):
         async_conn = await self._get_async_connection()
 
         # Reuse sync connection for table creation
-        sync_conn = self._get_connection()
+        sync_conn = await asyncio.to_thread(self._get_connection)
         ensure_chunks_table(sync_conn)
 
         from ..LanceDB.schema_manager import _safe_close_table
@@ -2584,7 +2645,7 @@ class LanceDBVectorIndexStore(VectorIndexStore):
             return
 
         async_conn = await self._get_async_connection()
-        sync_conn = self._get_connection()
+        sync_conn = await asyncio.to_thread(self._get_connection)
 
         table_name = f"embeddings_{to_model_tag(model_tag)}"
 
@@ -2872,10 +2933,7 @@ class LanceDBVectorIndexStore(VectorIndexStore):
         confirm: bool = False,
     ) -> Dict[str, int]:
         from ..core.exceptions import CascadeCleanupError
-        from ..kb.cleanup_filters import (
-            KBCleanupScope,
-            build_embedding_cleanup_filters,
-        )
+        from ..kb.cleanup_filters import KBCleanupScope
         from ..LanceDB.schema_manager import (
             ensure_chunks_table,
             ensure_documents_table,
@@ -2885,6 +2943,7 @@ class LanceDBVectorIndexStore(VectorIndexStore):
         from ..version_management.main_pointer_manager import (
             _get_main_pointer_impl as get_main_pointer,
         )
+        from .lancedb_cleanup_filters import build_embedding_cleanup_filters
 
         conn = self._get_connection()
         ensure_documents_table(conn)
@@ -3093,7 +3152,6 @@ class LanceDBVectorIndexStore(VectorIndexStore):
         confirm: bool = False,
     ) -> Dict[str, int]:
         from ..core.exceptions import CascadeCleanupError
-        from ..kb.cleanup_filters import select_embedding_tables
         from ..LanceDB.schema_manager import (
             ensure_chunks_table,
             ensure_documents_table,
@@ -3102,6 +3160,7 @@ class LanceDBVectorIndexStore(VectorIndexStore):
             ensure_parses_table,
         )
         from ..utils.user_scope import resolve_user_scope
+        from .lancedb_cleanup_filters import select_embedding_tables
 
         user_scope = resolve_user_scope(user_id=user_id, is_admin=is_admin)
         user_id = user_scope.user_id
@@ -3216,11 +3275,11 @@ def _vis_append_user_filter_if_needed(
     user_id: Optional[int],
     is_admin: bool,
 ) -> str:
-    from ..kb.cleanup_filters import (
+    from ..LanceDB.schema_manager import _safe_close_table
+    from .lancedb_cleanup_filters import (
         append_user_filter_for_table,
         append_user_filter_without_schema,
     )
-    from ..LanceDB.schema_manager import _safe_close_table
 
     table = None
     try:
@@ -3250,7 +3309,7 @@ def _vis_replace_embedding_predicates(
     is_admin: bool,
     model_tag: Optional[str] = None,
 ) -> None:
-    from ..kb.cleanup_filters import build_embedding_cleanup_filters_from_base
+    from .lancedb_cleanup_filters import build_embedding_cleanup_filters_from_base
 
     table_filters = build_embedding_cleanup_filters_from_base(
         conn,
@@ -3276,8 +3335,8 @@ def _vis_get_table_names(conn: Any) -> list:
 def _vis_plan_by_predicates(
     conn: Any, table_to_filter: Dict[str, list], model_tag: Optional[str] = None
 ) -> Dict[str, int]:
-    from ..kb.cleanup_filters import select_embedding_tables
     from ..LanceDB.schema_manager import _safe_close_table
+    from .lancedb_cleanup_filters import select_embedding_tables
 
     counts: Dict[str, int] = {}
     table_names = _vis_get_table_names(conn)
@@ -3323,8 +3382,8 @@ def _vis_delete_by_predicates(
 ) -> Dict[str, int]:
     import logging as _logging
 
-    from ..kb.cleanup_filters import select_embedding_tables
     from ..LanceDB.schema_manager import _safe_close_table
+    from .lancedb_cleanup_filters import select_embedding_tables
 
     _logger = _logging.getLogger(__name__)
     deleted: Dict[str, int] = {}
@@ -3445,8 +3504,8 @@ def _vis_build_collection_filter(
 
     Adds user_id filtering only when the target table contains a user_id column.
     """
-    from ..kb.cleanup_filters import table_has_column as _table_has_column
     from ..LanceDB.schema_manager import _safe_close_table
+    from .lancedb_cleanup_filters import table_has_column as _table_has_column
 
     base: Dict[str, str] = {"collection": collection}
     table = None
@@ -3479,8 +3538,8 @@ def _vis_build_document_filter(
     is_admin: bool,
 ) -> str:
     """Build a safe filter for document-scoped deletion."""
-    from ..kb.cleanup_filters import table_has_column as _table_has_column
     from ..LanceDB.schema_manager import _safe_close_table
+    from .lancedb_cleanup_filters import table_has_column as _table_has_column
 
     base: Dict[str, str] = {"collection": collection, "doc_id": doc_id}
     table = None
@@ -3520,8 +3579,8 @@ def _vis_build_documents_filter(
     is_admin: bool,
 ) -> str:
     """Build a safe filter for deleting multiple document-scoped rows."""
-    from ..kb.cleanup_filters import table_has_column as _table_has_column
     from ..LanceDB.schema_manager import _safe_close_table
+    from .lancedb_cleanup_filters import table_has_column as _table_has_column
 
     base_expr = build_lancedb_filter_expression(
         {"collection": collection}, skip_user_filter=True
@@ -3562,7 +3621,6 @@ def _vis_cascade_delete_documents(
     confirm: bool = False,
 ) -> Dict[str, int]:
     """Cascade delete multiple documents using one predicate set per table."""
-    from ..kb.cleanup_filters import select_embedding_tables
     from ..LanceDB.schema_manager import (
         ensure_chunks_table,
         ensure_documents_table,
@@ -3571,6 +3629,7 @@ def _vis_cascade_delete_documents(
         ensure_parses_table,
     )
     from ..utils.user_scope import resolve_user_scope
+    from .lancedb_cleanup_filters import select_embedding_tables
 
     normalized_doc_ids = sorted({str(d) for d in doc_ids if d})
     if not normalized_doc_ids:
@@ -3633,26 +3692,9 @@ class LanceDBIngestionStatusStore(IngestionStatusStore):
     Manages ingestion_runs table for tracking document processing status.
     """
 
-    def __init__(self) -> None:
-        self._sync_conn: Optional[DBConnection] = None
-        self._async_conn: Optional[Any] = None
-        self._async_lock = asyncio.Lock()
-
     def _get_sync_connection(self) -> DBConnection:
         """Get sync LanceDB connection."""
-        if self._sync_conn is None:
-            self._sync_conn = get_connection_from_env()
-        return self._sync_conn
-
-    async def _get_async_connection(self) -> Any:
-        """Get async LanceDB connection."""
-        if self._async_conn is None:
-            async with self._async_lock:
-                if self._async_conn is None:
-                    self._async_conn = await lancedb.connect_async(  # type: ignore[attr-defined]
-                        get_connection_from_env().uri  # type: ignore[attr-defined]
-                    )
-        return self._async_conn
+        return get_connection_from_env()
 
     def _ensure_ingestion_runs_table(self, conn: DBConnection) -> None:
         """Ensure ingestion_runs table exists."""
@@ -3937,14 +3979,9 @@ class LanceDBPromptTemplateStore(PromptTemplateStore):
     Manages prompt_templates table for storing and retrieving prompt templates.
     """
 
-    def __init__(self) -> None:
-        self._sync_conn: Optional[DBConnection] = None
-
     def _get_sync_connection(self) -> DBConnection:
         """Get or create sync connection."""
-        if self._sync_conn is None:
-            self._sync_conn = get_connection_from_env()
-        return self._sync_conn
+        return get_connection_from_env()
 
     def _ensure_table(self) -> None:
         """Ensure prompt_templates table exists."""
@@ -4427,14 +4464,9 @@ class LanceDBMainPointerStore(MainPointerStore):
     multi-tenancy support.
     """
 
-    def __init__(self) -> None:
-        self._sync_conn: Optional[DBConnection] = None
-
     def _get_sync_connection(self) -> DBConnection:
         """Get or create sync connection."""
-        if self._sync_conn is None:
-            self._sync_conn = get_connection_from_env()
-        return self._sync_conn
+        return get_connection_from_env()
 
     def _ensure_table(self) -> None:
         """Ensure main_pointers table exists."""

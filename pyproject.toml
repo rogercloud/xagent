@@ -38,24 +38,34 @@ dependencies = [
   "rich >= 14.0.0",
   "prompt_toolkit >= 3.0.0",
   "langfuse >= 4.0.6, < 5.0.0",    # Tracing implementation targets the v4 SDK API
+  "opentelemetry-api >= 1.39.0, < 2.0.0",
+  "opentelemetry-sdk >= 1.39.0, < 2.0.0",
+  "opentelemetry-exporter-otlp-proto-http >= 1.39.0, < 2.0.0",
   "python-dotenv >= 1.0.1",
   "mcp>=1.12.4,<2",  # streamablehttp_client (sessions.py) was removed/renamed in mcp 2.0
   "asyncssh>=2.14.0",  # SSH MCP runner (production runtime, not just tests)
   "requests >= 2.32.0",
   "idna >= 3.7",  # magento.py's non-ASCII MAGENTO_BASE_URL handling; currently only pulled in transitively via requests
+  "python-dateutil >= 2.8.2",  # calendar.py's RRULE validation (utils.parse_rrule); currently only pulled in transitively
   "boto3 >= 1.34.0",  # AWS built-in MCP connector (CloudWatch/DynamoDB/SQS, read-only)
   "celery[redis]>=5.4.0,<6.0.0",
   "redis>=5.0.0",
   "pillow >= 10.0.0",
+  "defusedxml>=0.7.1",
+  "python-docx>=1.1.0",  # Built-in Word MCP connector runtime
   "pypinyin>=0.53.0",
   "cairosvg >= 2.7.1",
-  "lancedb>=0.24.2",
+  "lancedb>=0.32.0",
+  # Dictionary for lance FTS jieba tokenizer; only the macOS wheel embeds one.
+  "jieba>=0.42.1",
   "pyarrow>=16.1.0",
   # Basic document processing (keep pypdf for basic PDF support)
   "pypdf>=4.0.0",
   "tiktoken>=0.8.0",
   # Database ORM and migrations (core for web interface)
   "sqlalchemy>=2.0.0",
+  "aiosqlite>=0.20.0",
+  "greenlet>=3.0",
   "alembic>=1.13.0",
   "python-jose[cryptography]>=3.3.0",
   "cryptography>=3.0.0",
@@ -72,6 +82,11 @@ dependencies = [
   "matplotlib>=3.5.0",
   "google-auth-oauthlib>=1.2.0",
   "google-api-python-client>=2.145.0",
+  # zoneinfo's IANA timezone database - stdlib zoneinfo relies on the OS's
+  # tz data, which minimal container images may not ship; this guarantees
+  # it's present regardless of platform (calendar/outlook conflict-check
+  # timezone math needs real zone offsets, not just zone names).
+  "tzdata>=2024.1",
   "boxlite>=0.6.0; sys_platform == 'linux' and platform_machine == 'x86_64'",
   "boxlite>=0.6.0; sys_platform == 'darwin' and platform_machine == 'arm64'",
   "filelock>=3.0.0",
@@ -127,7 +142,8 @@ ai-document = ["docling>=2.68.0"]
 
 # PostgreSQL driver (uses psycopg2-binary for convenience)
 # Note: For production, consider installing psycopg2 from source instead
-postgresql = ["psycopg2-binary>=2.9.0"]
+postgresql = ["psycopg2-binary>=2.9.0", "psycopg[binary]>=3.2.0"]
+postgresql-async = ["psycopg2-binary>=2.9.0", "psycopg[binary]>=3.2.0", "greenlet>=3.0"]
 
 duckdb = ["duckdb>=1.0.0,<2.0", "duckdb-engine>=0.10.0,<1.0"]
 
@@ -155,6 +171,8 @@ all = [
   "pypdf2>=3.0.1",
   "docling>=2.68.0",
   "psycopg2-binary>=2.9.0",
+  "psycopg[binary]>=3.2.0",
+  "greenlet>=3.0",
   "playwright>=1.40.0",
   "curl_cffi>=0.14.0",
   "chromadb",
@@ -191,6 +209,7 @@ backend-image = [
   "pypdf2>=3.0.1",
   "docling>=2.68.0",
   "psycopg2-binary>=2.9.0",
+  "psycopg[binary]>=3.2.0",
   "playwright>=1.40.0",
   "curl_cffi>=0.14.0",
   "chromadb",
@@ -223,6 +242,7 @@ test = [
   "pytest-timeout>=2.4.0",
   "pytest-socket>=0.7.0",
   "psycopg2-binary>=2.9.0",
+  "psycopg[binary]>=3.2.0",
   "chromadb",
   "pymilvus>=2.6.9,<3.0.0",
   "copilotkit==0.1.69",
@@ -239,6 +259,7 @@ static-type-check = [
   "types-openpyxl>=3.1.5",
   "types-setuptools>=69.0.0",
   "types-docker>=7.1.0.20251009",
+  "types-python-dateutil>=2.8.19",
 ]
 
 [project.scripts]
@@ -298,9 +319,14 @@ module = [
   "asyncssh",
   "bashlex",
   "docx",
+  "docx.*",
+  "defusedxml",
+  "defusedxml.*",
   "pptx",
   "pptx.*",
   "pdfplumber",
+  "pypdf",
+  "pypdf.*",
   "unstructured.*",
   "fitz",
   "pandas",
@@ -308,6 +334,7 @@ module = [
   "matplotlib.pyplot",
   "deepdoc",
   "deepdoc.*",
+  "jieba",
   "json_repair",
   "langchain_core.*",
   "langchain.*",
@@ -358,6 +385,9 @@ module = [
   # asyncssh ships no type stubs; the runner annotates connection types that
   # would otherwise trip disallow_any_unimported.
   "xagent.core.ssh.runner",
+  # python-docx ships no type stubs; this module annotates its Document type
+  # (docx.document.Document) which would otherwise trip disallow_any_unimported.
+  "xagent.web.tools.mcp.word",
 ]
 disallow_any_unimported = false
 warn_unused_ignores = false

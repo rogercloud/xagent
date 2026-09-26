@@ -7,12 +7,16 @@ their OAuth configurations, and server launch configurations.
 from collections.abc import Iterable, Mapping, Sequence
 from copy import deepcopy
 from dataclasses import dataclass
+from enum import Enum
 from typing import Any, Dict, List
 
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from .builtin_mcp_registry import get_builtin_execution_fields_and_optional_scopes
+from .builtin_mcp_registry import (
+    _persisted_builtin_provenance_matches,
+    get_builtin_execution_fields_and_optional_scopes,
+)
 from .models.public_mcp import PublicMCPApp
 
 # Apps that must not be satisfied by a bare provider-level OAuth grant (one
@@ -45,11 +49,65 @@ from .models.public_mcp import PublicMCPApp
 # scopes at all, yet the callback would still complete (MYOB's businessId
 # guard has nothing to do with scopes) and activate the app's UserMCPServer
 # against a grant with zero sme-* permissions.
-APPS_REQUIRING_APP_SCOPED_OAUTH_GRANT = frozenset({"facebook", "github", "myob"})
+#
+# meta-ads: same reasoning as facebook -- its "ads_read" scope isn't part of
+# the meta provider's default_scopes and is brand new (no pre-existing bare
+# "meta" grant could ever have carried it), so a bare connect must never be
+# treated as satisfying it.
+#
+# whatsapp: same reasoning as facebook -- none of its scopes
+# (business_management, whatsapp_business_management,
+# whatsapp_business_messaging) is part of the meta provider's
+# default_scopes, and the connector is brand new (no pre-existing bare
+# "meta" grant could ever have carried them), so a bare connect must never
+# be treated as satisfying it.
+#
+# planner: the shared Microsoft provider requests only User.Read, while the
+# Planner app requires Tasks.ReadWrite. A bare Microsoft login must not batch
+# connect Planner or satisfy its runtime token lookup with that under-scoped
+# provider grant.
+#
+# sharepoint: same reasoning as facebook -- its "Sites.ReadWrite.All" scope
+# isn't part of the microsoft provider's default_scopes (["User.Read"]),
+# and the connector is brand new (no pre-existing bare "microsoft" grant,
+# e.g. one created by connecting Outlook/Teams/OneDrive, could ever have
+# carried it), so a bare connect -- or a grant scoped to one of those other
+# Microsoft apps -- must never be treated as satisfying it.
+# excel: the shared microsoft provider's default scope is identity-only
+# (User.Read), while workbook reads and writes require Files.ReadWrite from
+# the Excel app row. A bare microsoft grant may continue serving other
+# Microsoft connectors, but it must neither provision nor satisfy Excel.
+# word: likewise, its Files.ReadWrite.All scope isn't part of the microsoft
+# provider's defaults, so only the Word app-scoped grant is sufficient.
+#
+# powerpoint: same reasoning as excel -- reading/writing presentations
+# requires Files.ReadWrite, which isn't part of the microsoft provider's
+# default_scopes (["User.Read"]). A bare microsoft grant, or one scoped to
+# a different Microsoft app, must never be treated as satisfying it.
+APPS_REQUIRING_APP_SCOPED_OAUTH_GRANT = frozenset(
+    {
+        "excel",
+        "facebook",
+        "github",
+        "myob",
+        "meta-ads",
+        "planner",
+        "powerpoint",
+        "sharepoint",
+        "whatsapp",
+        "word",
+    }
+)
+
+# Word's seed migration deliberately preserves a pre-existing custom row with
+# the same app_id. Such a row must keep the OAuth behavior it had before Word
+# became a builtin. Other entries in APPS_REQUIRING_APP_SCOPED_OAUTH_GRANT do
+# not share that migration contract and continue to be identified by app_id.
+_APPS_REQUIRING_PROVENANCE_FOR_OAUTH_POLICY = frozenset({"word"})
 
 
 def _normalize_oauth_grant_key(value: object) -> str | None:
-    """Case/whitespace-insensitive key, matching mcp.py's _normalize_app_key.
+    """Case/whitespace-insensitive key, matching ``normalize_catalog_key``.
 
     Duplicated rather than imported: mcp.py imports this module, so importing
     back would cycle. An admin-created PublicMCPApp.app_id is free-form (see
@@ -64,18 +122,42 @@ def _normalize_oauth_grant_key(value: object) -> str | None:
     return normalized or None
 
 
-def requires_app_scoped_oauth_grant(app_id: object) -> bool:
+def _oauth_policy_app_id(app_or_id: object) -> object:
+    if isinstance(app_or_id, Mapping):
+        return app_or_id.get("id")
+    return getattr(app_or_id, "app_id", app_or_id)
+
+
+def requires_app_scoped_oauth_grant(app_or_id: object) -> bool:
     """Whether app_id must not be satisfied by a bare provider-level grant.
 
     Normalized the same way _app_lookup_keys resolves an app's own id, so a
     differently-cased or whitespace-padded admin-created app_id (e.g.
     "Facebook") is covered consistently everywhere this policy is checked.
     """
-    return _normalize_oauth_grant_key(app_id) in APPS_REQUIRING_APP_SCOPED_OAUTH_GRANT
+    app_id = _oauth_policy_app_id(app_or_id)
+    normalized_app_id = _normalize_oauth_grant_key(app_id)
+    if normalized_app_id not in APPS_REQUIRING_APP_SCOPED_OAUTH_GRANT:
+        return False
+
+    # Word's catalog row can predate its newly reserved builtin id. Its seed
+    # migration preserves that operator-owned collision instead of adopting
+    # it, so runtime OAuth policy must make the same ownership distinction.
+    if normalized_app_id not in _APPS_REQUIRING_PROVENANCE_FOR_OAUTH_POLICY:
+        return True
+    if isinstance(app_or_id, Mapping):
+        return _persisted_builtin_provenance_matches(
+            str(app_id), app_or_id.get("launch_config")
+        )
+    if hasattr(app_or_id, "launch_config"):
+        return _persisted_builtin_provenance_matches(
+            str(app_id), getattr(app_or_id, "launch_config")
+        )
+    return True
 
 
 def restrict_to_app_scoped_oauth_grant(
-    app_id: object, candidates: Iterable[object]
+    app_or_id: object, candidates: Iterable[object]
 ) -> list[str]:
     """Narrow OAuth provider/grant candidates to app-scoped ones where required.
 
@@ -91,8 +173,9 @@ def restrict_to_app_scoped_oauth_grant(
     """
     deduped = list(dict.fromkeys(c for c in candidates if isinstance(c, str) and c))
 
-    if not requires_app_scoped_oauth_grant(app_id):
+    if not requires_app_scoped_oauth_grant(app_or_id):
         return deduped
+    app_id = _oauth_policy_app_id(app_or_id)
     normalized_app_id = _normalize_oauth_grant_key(app_id)
     return [
         candidate
@@ -159,6 +242,11 @@ def _app_to_dict(app: PublicMCPApp) -> Dict[str, Any]:
     execution_fields, optional_oauth_scopes = (
         get_builtin_execution_fields_and_optional_scopes(app.app_id)
     )
+    if execution_fields is not None and not _persisted_builtin_provenance_matches(
+        app.app_id, app.launch_config
+    ):
+        execution_fields = None
+        optional_oauth_scopes = []
     if execution_fields is None:
         execution_fields = {
             "name": app.name,
@@ -191,19 +279,26 @@ def _app_to_dict(app: PublicMCPApp) -> Dict[str, Any]:
 
 @dataclass(frozen=True)
 class MCPAppSnapshot:
-    """One catalog/server view for repeated canonical builtin validation."""
+    """One catalog/server/ownership view for repeated canonical validation."""
 
     catalog_apps: tuple[PublicMCPApp, ...]
     servers: tuple[Any, ...]
+    owner_mcpserver_ids: frozenset[int]
 
 
 def load_mcp_app_snapshot(db: Session) -> MCPAppSnapshot:
     """Load the catalog and server rows once for one validation projection."""
-    from .models.mcp import MCPServer
+    from .models.mcp import MCPServer, UserMCPServer
 
     return MCPAppSnapshot(
         catalog_apps=tuple(db.query(PublicMCPApp).all()),
         servers=tuple(db.query(MCPServer).all()),
+        owner_mcpserver_ids=frozenset(
+            int(server_id)
+            for (server_id,) in db.query(UserMCPServer.mcpserver_id)
+            .filter(UserMCPServer.is_owner)
+            .all()
+        ),
     )
 
 
@@ -235,12 +330,20 @@ class BuiltinOAuthServerDefinitionError(ValueError):
     """Raised when trusted builtin OAuth identity is absent or ambiguous."""
 
 
-def _normalized_catalog_key(value: object) -> str | None:
+class RemoteOAuthServerDefinitionError(ValueError):
+    """Raised when a remote catalog OAuth server is not canonical."""
+
+
+class RemoteOAuthDefinitionOwnership(Enum):
+    UNKNOWN = "unknown"
+    TEAM = "team"
+
+
+def normalize_catalog_key(value: object) -> str | None:
     """Normalize only for collision detection, never for persisted identity."""
-    if value is None:
-        return None
-    normalized = "-".join(str(value).strip().lower().split())
-    return normalized or None
+    from ..builtin_identity import canonicalize_builtin_identity
+
+    return canonicalize_builtin_identity(value)
 
 
 def _strict_catalog_app_by_id(
@@ -272,11 +375,11 @@ def _strict_catalog_app_by_id(
         )
     app = matches[0]
 
-    normalized_id = _normalized_catalog_key(app_id)
+    normalized_id = normalize_catalog_key(app_id)
     collisions = [
         candidate
         for candidate in catalog_apps
-        if _normalized_catalog_key(candidate.app_id) == normalized_id
+        if normalize_catalog_key(candidate.app_id) == normalized_id
     ]
     if len(collisions) != 1:
         raise BuiltinOAuthServerDefinitionError(
@@ -286,6 +389,10 @@ def _strict_catalog_app_by_id(
     execution_fields, _optional_scopes = (
         get_builtin_execution_fields_and_optional_scopes(app.app_id)
     )
+    if execution_fields is not None and not _persisted_builtin_provenance_matches(
+        app.app_id, app.launch_config
+    ):
+        execution_fields = None
     if require_builtin_oauth and execution_fields is None:
         raise BuiltinOAuthServerDefinitionError(
             f"OAuth catalog app {app_id!r} is absent from the builtin registry"
@@ -450,7 +557,7 @@ def _builtin_server_candidates(
     app_id = str(app_info["id"])
     app_name = str(app_info["name"])
     normalized_names = {
-        key for key in map(_normalized_catalog_key, (app_id, app_name)) if key
+        key for key in map(normalize_catalog_key, (app_id, app_name)) if key
     }
     catalog_apps: Sequence[PublicMCPApp] = (
         snapshot.catalog_apps if snapshot is not None else db.query(PublicMCPApp).all()
@@ -476,8 +583,8 @@ def _builtin_server_candidates(
             candidates.append(server)
             continue
         if (
-            _normalized_catalog_key(server_app_id) in normalized_names
-            or _normalized_catalog_key(server.name) in normalized_names
+            normalize_catalog_key(server_app_id) in normalized_names
+            or normalize_catalog_key(server.name) in normalized_names
         ):
             raise BuiltinOAuthServerDefinitionError(
                 f"builtin OAuth app {app_id!r} has an ambiguous reserved server identity"
@@ -514,8 +621,8 @@ def classify_actor_builtin_oauth_server(
     has_app_id = isinstance(auth, Mapping) and "app_id" in auth
     server_app_id = auth.get("app_id") if isinstance(auth, Mapping) else None
     server_name = str(getattr(server, "name", ""))
-    normalized_name = _normalized_catalog_key(server_name)
-    normalized_app_id = _normalized_catalog_key(server_app_id)
+    normalized_name = normalize_catalog_key(server_name)
+    normalized_app_id = normalize_catalog_key(server_app_id)
 
     exact_app = next(
         (
@@ -539,8 +646,8 @@ def classify_actor_builtin_oauth_server(
             normalized_app_id,
         }
         & {
-            _normalized_catalog_key(app_info.get("id")),
-            _normalized_catalog_key(app_info.get("name")),
+            normalize_catalog_key(app_info.get("id")),
+            normalize_catalog_key(app_info.get("name")),
         }
         - {None}
     ]
@@ -735,6 +842,24 @@ def ensure_builtin_oauth_server_visibility_for_user(
     return server
 
 
+def _get_app_for_server_name(
+    db: Session,
+    name: str,
+    *,
+    snapshot: MCPAppSnapshot | None = None,
+) -> Dict[str, Any] | None:
+    candidates: Sequence[PublicMCPApp] = (
+        [app for app in snapshot.catalog_apps if app.app_id == name or app.name == name]
+        if snapshot is not None
+        else db.query(PublicMCPApp)
+        .filter((PublicMCPApp.app_id == name) | (PublicMCPApp.name == name))
+        .all()
+    )
+    if len({str(candidate.app_id) for candidate in candidates}) != 1:
+        return None
+    return _app_to_dict(candidates[0])
+
+
 def get_app_for_mcp_server(db: Session, server: Any) -> Dict[str, Any] | None:
     """Resolve a server's catalog app by stable identity when it is available.
 
@@ -778,12 +903,100 @@ def get_app_for_mcp_server(db: Session, server: Any) -> Dict[str, Any] | None:
     # fails closed -- deletion keeps the credentials, listing and runtime
     # decline to name an app -- rather than acting on a coin flip. Only the
     # stamp settles it, which is what the branch above is for.
-    candidates = (
-        db.query(PublicMCPApp)
-        .filter((PublicMCPApp.app_id == name) | (PublicMCPApp.name == name))
-        .all()
+    return _get_app_for_server_name(db, name)
+
+
+def classify_actor_remote_oauth_server(
+    db: Session,
+    server: Any,
+    *,
+    definition_ownership: RemoteOAuthDefinitionOwnership = (
+        RemoteOAuthDefinitionOwnership.UNKNOWN
+    ),
+    snapshot: MCPAppSnapshot | None = None,
+) -> Dict[str, Any] | None:
+    """Validate catalog OAuth or preserve a proven custom definition."""
+
+    from .models.mcp import MCPServer, UserMCPServer
+    from .services.mcp_runtime import HTTP_MCP_TRANSPORTS
+
+    auth = getattr(server, "auth", None)
+    is_remote_oauth = (
+        str(getattr(server, "transport", "") or "").lower() in HTTP_MCP_TRANSPORTS
+        and isinstance(auth, Mapping)
+        and auth.get("type") == "mcp_oauth"
     )
-    owners = {str(candidate.app_id) for candidate in candidates}
-    if len(owners) != 1:
+    app_info = _get_app_for_server_name(
+        db,
+        str(getattr(server, "name", "")),
+        snapshot=snapshot,
+    )
+
+    def has_owner() -> bool:
+        server_id = int(server.id)
+        if snapshot is not None:
+            return server_id in snapshot.owner_mcpserver_ids
+        return (
+            db.query(UserMCPServer.id)
+            .filter(
+                UserMCPServer.mcpserver_id == server_id,
+                UserMCPServer.is_owner,
+            )
+            .first()
+            is not None
+        )
+
+    if app_info is None or app_info.get("auth_type") != "mcp_oauth":
+        if is_remote_oauth:
+            # Native OAuth servers have an owner. Catalog rows do not.
+            if (
+                not has_owner()
+                and definition_ownership is not RemoteOAuthDefinitionOwnership.TEAM
+            ):
+                raise RemoteOAuthServerDefinitionError(
+                    "remote OAuth catalog identity is unavailable"
+                )
         return None
-    return _app_to_dict(candidates[0])
+    if not app_info.get("is_visible_in_connector", True):
+        raise RemoteOAuthServerDefinitionError("remote OAuth app is hidden")
+
+    app_id = str(app_info["id"])
+    app_name = str(app_info["name"])
+    # Remote catalog identity is the reserved server name, not mutable auth.
+    candidates: Sequence[Any] = (
+        [row for row in snapshot.servers if row.name in (app_id, app_name)]
+        if snapshot is not None
+        else db.query(MCPServer).filter(MCPServer.name.in_((app_id, app_name))).all()
+    )
+    if len(candidates) != 1 or int(candidates[0].id) != int(server.id):
+        raise RemoteOAuthServerDefinitionError(
+            "remote OAuth app must have exactly one server definition"
+        )
+
+    launch = app_info.get("launch_config") or {}
+    expected_auth = launch.get("auth") or {}
+    decrypted_auth = server._decrypt_auth_config(server.auth)
+    if not isinstance(decrypted_auth, Mapping):
+        raise RemoteOAuthServerDefinitionError("remote OAuth auth is invalid")
+    actual_auth = dict(decrypted_auth)
+    actual_auth.pop("app_id", None)
+    failures = []
+    if str(server.managed or "") != "external":
+        failures.append("managed")
+    if (
+        str(server.transport or "").lower()
+        != str(app_info.get("transport") or "").lower()
+    ):
+        failures.append("transport")
+    if server.url != launch.get("url"):
+        failures.append("url")
+    if actual_auth != expected_auth:
+        failures.append("auth")
+    if has_owner():
+        failures.append("ownership")
+    if failures:
+        raise RemoteOAuthServerDefinitionError(
+            f"remote OAuth app {app_id!r} has non-canonical fields: "
+            f"{', '.join(sorted(failures))}"
+        )
+    return app_info

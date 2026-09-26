@@ -23,7 +23,13 @@ observers. It does not import historical Trace rows into the fact log. The
 ordinary database Trace callback becomes a no-op on this path, retaining its
 checkpoint read interface only for the transition. Console, WebSocket and
 exporter failures cannot invalidate a committed fact. A failed fact commit
-raises `ExecutionEventPersistenceError` and stops execution before broadcast.
+raises `ExecutionEventPersistenceError` (a `CheckpointPersistenceError` subclass)
+and stops execution before broadcast. Writers use the current trace database
+runtime, including its bounded sync/async execution and cancellation draining.
+Execution and outbound integration live in services so shared workers and Web
+hosts use the same path. Bound leases include the acquisition attempt identity,
+including for delegated scopes; replacing an attempt within the same run fences
+out its old producer.
 
 Recovery events contain the complete existing execution snapshot: context,
 messages, adopted summaries, pattern state, planning state and pending work.
@@ -67,7 +73,8 @@ responsibility. Neither helper is an externally exposed endpoint.
 
 ## Migration and rollback
 
-The new migration permits storage versions `1` and `2`, keeping SQL and ORM
+The writer migration follows `20260925_task_cleanup_obligations` in the current
+single-head revision chain. It permits storage versions `1` and `2`, keeping SQL and ORM
 creation defaults at `1`. On SQLite it replaces the version column, whose old
 CHECK guarantees all pre-migration values are `1`; it does not rebuild `tasks`
 or trigger inbound cascade deletes. PostgreSQL replaces the CHECK. Existing

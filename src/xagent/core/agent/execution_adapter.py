@@ -162,6 +162,12 @@ class AgentExecutionAdapter:
         # Carry the mid-run quota checker into the resumed run too, so a
         # paused-and-resumed continuation is gated like a fresh run.
         kwargs.setdefault("interrupt_checker", self.config.interrupt_checker)
+        # The handle may have been built by post_user_message before the
+        # host installed the outbound handler, so re-read it from config
+        # for the resumed run (#1328).
+        kwargs.setdefault(
+            "outbound_message_handler", self.config.outbound_message_handler
+        )
         resume_metadata = dict(kwargs.get("metadata") or {})
         preferred_modalities = normalize_input_modalities(
             self.config.preferred_input_modalities
@@ -440,11 +446,16 @@ class AgentExecutionAdapter:
                 "task_id": execution_id,
             },
             "agent_result": result,
+            "injection_outcome_unknown": result.get("injection_outcome_unknown", False),
         }
         completion_outcome = result.get("completion_outcome")
         if completion_outcome in {"completed", "partial", "blocked"}:
             normalized["completion_outcome"] = completion_outcome
             normalized["metadata"]["completion_outcome"] = completion_outcome
+        termination_reason = result.get("termination_reason")
+        if termination_reason in ("max_iterations", "step_failed"):
+            normalized["termination_reason"] = termination_reason
+            normalized["metadata"]["termination_reason"] = termination_reason
         if status == "waiting_for_user":
             message = str(result.get("message") or output or "")
             interactions = result.get("interactions")

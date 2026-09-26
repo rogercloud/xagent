@@ -62,6 +62,7 @@ from ...core.tools.core.RAG_tools.core.schemas import (
     FusionConfig,
     IngestionConfig,
     IngestionResult,
+    IngestionStepResult,
     ListCollectionsResult,
     ParseMethod,
     ParseResultResponse,
@@ -73,12 +74,14 @@ from ...core.tools.core.RAG_tools.core.schemas import (
 )
 from ...core.tools.core.RAG_tools.kb import (
     KBApiCompatibilityFacade,
+    KBApiFailedIngestCleanupDecision,
     KBApiOperationResult,
     get_kb_coordinator,
 )
 from ...core.tools.core.RAG_tools.kb.config_merge import (
     merge_collection_config_json,
 )
+from ...core.tools.core.RAG_tools.kb.models import RollbackFailedUploadIngestionRequest
 from ...core.tools.core.RAG_tools.management.status import clear_ingestion_status
 from ...core.tools.core.RAG_tools.pipelines.web_ingestion import FileHandlerResult
 from ...core.tools.core.RAG_tools.progress import get_progress_manager
@@ -129,13 +132,13 @@ from ..services.kb_file_service import (
     capture_uploaded_file_refresh_snapshot as _capture_uploaded_file_refresh_snapshot,
 )
 from ..services.kb_file_service import (
-    compensate_new_uploaded_file as _compensate_new_uploaded_file,
-)
-from ..services.kb_file_service import (
     delete_uploaded_file_if_orphaned as _delete_uploaded_file_if_orphaned,
 )
 from ..services.kb_file_service import (
     get_document_record_file_id as _get_document_record_file_id,
+)
+from ..services.kb_file_service import (
+    list_document_records_for_file_ids as _list_document_records_for_file_ids,
 )
 from ..services.kb_file_service import (
     list_documents_for_user as _list_documents_for_user,
@@ -224,9 +227,9 @@ def _create_file_compensation_restore(
     existing_path: Path,
     backup_path: Optional[Path],
     record_snapshot: dict[str, Any],
+    previous_version: UploadedFileVersionSnapshot,
+    expected_current_version: UploadedFileVersionSnapshot,
     had_existing_file: bool = True,
-    previous_version: UploadedFileVersionSnapshot | None = None,
-    expected_current_version: UploadedFileVersionSnapshot | None = None,
 ) -> Callable[[], None]:
     """Create a FILE-boundary compensation callback for restoring a refreshed/recreated web file."""
 
@@ -251,13 +254,7 @@ def _create_file_compensation_restore(
                 .first()
             )
             if refreshed_record is not None:
-                if previous_version is None or expected_current_version is None:
-                    logger.warning(
-                        "Skipping legacy uploaded-file metadata rollback without "
-                        "both previous and applied version receipts: %s",
-                        file_record_id,
-                    )
-                elif had_existing_file:
+                if had_existing_file:
                     UploadedFileStore(rollback_db).upsert_by_storage_path(
                         user_id=previous_version.user_id,
                         file_id=previous_version.file_id,
@@ -300,6 +297,7 @@ def _create_document_compensation(
     is_admin: bool,
     file_record_id: str,
     rag_document_snapshot: Optional["_RagDocumentSnapshot"] = None,
+    status_cleared: Optional[set[str]] = None,
 ) -> Callable[[Optional[IngestionResult]], Callable[[], None]]:
     """Create a DOCUMENT-boundary compensation factory.
 
@@ -320,6 +318,10 @@ def _create_document_compensation(
                 rag_snapshot=rag_document_snapshot,
                 file_id=file_record_id,
             )
+            # No RAG snapshot: a normal return means DOCUMENT already cleared status.
+            doc_id = _normalized_doc_id(getattr(ingestion_result, "doc_id", None))
+            if status_cleared is not None and rag_document_snapshot is None and doc_id:
+                status_cleared.add(doc_id)
 
         return _compensate
 
@@ -332,6 +334,7 @@ def _create_status_compensation(
     user_id: int,
     is_admin: bool,
     ingestion_runs_snapshot: Optional["_IngestionRunsSnapshot"] = None,
+    status_cleared: Optional[set[str]] = None,
 ) -> Callable[[Optional[IngestionResult]], Callable[[], None]]:
     """Create a STATUS-boundary compensation factory."""
 
@@ -342,13 +345,8 @@ def _create_status_compensation(
             if ingestion_runs_snapshot is not None:
                 _restore_ingestion_runs_snapshot(ingestion_runs_snapshot)
             elif ingestion_result is not None:
-                doc_id = (
-                    ingestion_result.doc_id
-                    if isinstance(ingestion_result.doc_id, str)
-                    and ingestion_result.doc_id
-                    else None
-                )
-                if doc_id:
+                doc_id = _normalized_doc_id(ingestion_result.doc_id)
+                if doc_id and doc_id not in (status_cleared or ()):
                     clear_ingestion_status(
                         collection_name,
                         doc_id,
@@ -810,6 +808,84 @@ def _get_completed_step_metadata(
     return None
 
 
+def _normalized_doc_id(doc_id: object) -> Optional[str]:
+    return doc_id if isinstance(doc_id, str) and doc_id else None
+
+
+def _ingested_document_identity(result: IngestionResult) -> tuple[bool, Optional[str]]:
+    register_metadata = _get_completed_step_metadata(result, "register_document") or {}
+    register_created = bool(register_metadata.get("created"))
+    doc_id = _normalized_doc_id(result.doc_id)
+    return register_created, doc_id
+
+
+def _file_document_registered(collection_name: str, file_id: str) -> bool:
+    doc_id = generate_deterministic_doc_id(collection_name, file_id)
+    return (collection_name, doc_id) in _list_document_refs_for_uploaded_file(file_id)
+
+
+async def _document_existed_before_ingest(
+    collection_name: str, existing_file_record: Optional[UploadedFile]
+) -> bool:
+    if existing_file_record is None:
+        return False
+    file_id = str(existing_file_record.file_id)
+    try:
+        return await asyncio.to_thread(
+            _file_document_registered, collection_name, file_id
+        )
+    except Exception as exc:  # noqa: BLE001
+        # Unknown counts as existing, so a raised ingest keeps the document.
+        logger.warning(
+            "Could not check for an existing document of %s in %s: %s",
+            file_id,
+            collection_name,
+            exc,
+        )
+        return True
+
+
+async def _raised_ingestion_rollback_result(
+    *,
+    collection_name: str,
+    file_id: str,
+    document_existed_before: bool,
+    message: str,
+) -> IngestionResult:
+    """Rebuild the document identity an ingest lost when it raised."""
+    doc_id = generate_deterministic_doc_id(collection_name, file_id)
+    try:
+        registered = await asyncio.to_thread(
+            _file_document_registered, collection_name, file_id
+        )
+    except Exception:  # noqa: BLE001
+        # Unknown counts as registered: deleting a missing new document stops the
+        # rollback before FILE; a pre-existing one only has its status cleared.
+        logger.warning(
+            "Could not check whether document %s is registered in %s",
+            doc_id,
+            collection_name,
+            exc_info=True,
+        )
+        registered = True
+    completed_steps = (
+        [
+            IngestionStepResult(
+                name="register_document",
+                metadata={"doc_id": doc_id, "created": not document_existed_before},
+            )
+        ]
+        if registered
+        else []
+    )
+    return IngestionResult(
+        status="error",
+        doc_id=doc_id,
+        completed_steps=completed_steps,
+        message=message,
+    )
+
+
 def _restore_ingest_file_backup(
     *,
     file_path: Path,
@@ -927,6 +1003,31 @@ def _rollback_failed_web_document_ingestion(
     file_id: Optional[str] = None,
 ) -> None:
     """Remove RAG-side writes from a failed per-page web ingestion."""
+    _rollback_ingested_document(
+        collection_name=collection_name,
+        result=result,
+        user_id=user_id,
+        is_admin=is_admin,
+        rag_snapshot=rag_snapshot,
+        file_id=file_id,
+        label="web rollback",
+    )
+
+
+def _rollback_ingested_document(
+    *,
+    collection_name: str,
+    result: Optional[IngestionResult],
+    user_id: int,
+    is_admin: bool,
+    label: str,
+    rag_snapshot: Optional["_RagDocumentSnapshot"] = None,
+    file_id: Optional[str] = None,
+) -> None:
+    """DOCUMENT compensation shared by the web, local and cloud rollbacks.
+
+    Only the web path passes ``rag_snapshot`` and ``file_id``.
+    """
     if result is None:
         if rag_snapshot is not None:
             _restore_rag_document_snapshot(
@@ -943,9 +1044,7 @@ def _rollback_failed_web_document_ingestion(
             )
         return
 
-    register_metadata = _get_completed_step_metadata(result, "register_document") or {}
-    register_created = bool(register_metadata.get("created"))
-    doc_id = result.doc_id if isinstance(result.doc_id, str) and result.doc_id else None
+    register_created, doc_id = _ingested_document_identity(result)
     if not doc_id:
         if rag_snapshot is not None:
             _restore_rag_document_snapshot(
@@ -970,10 +1069,11 @@ def _rollback_failed_web_document_ingestion(
             is_admin,
         )
         _ensure_cleanup_succeeded(
-            f"delete document '{doc_id}' during web rollback",
+            f"delete document '{doc_id}' during {label}",
             document_delete_result,
         )
         if rag_snapshot is None:
+            # delete_document already clears status.
             return
 
     if rag_snapshot is not None:
@@ -1214,15 +1314,14 @@ async def _cleanup_collection_metadata_after_failed_ingest(
     collection_name: str,
     user: User,
     context: str,
-    successful_documents: int = 0,
-    side_effects_may_remain: bool = False,
+    decision: KBApiFailedIngestCleanupDecision,
 ) -> None:
     """Clean up only truly empty new collections; config is saved after ingest."""
     if collection_existed_before:
         return
 
-    if successful_documents > 0 or side_effects_may_remain:
-        if side_effects_may_remain:
+    if decision.keeps_new_collection_metadata:
+        if decision.side_effects_may_remain:
             logger.warning(
                 "Skipping failed-ingest collection metadata cleanup for %s/user_%s "
                 "during %s because rollback side effects may remain",
@@ -1263,8 +1362,7 @@ async def _cleanup_collection_metadata_after_failed_api_ingest(
         collection_name=collection_name,
         user=user,
         context=context,
-        successful_documents=cleanup_decision.successful_documents,
-        side_effects_may_remain=cleanup_decision.side_effects_may_remain,
+        decision=cleanup_decision,
     )
 
 
@@ -1289,8 +1387,7 @@ async def _cleanup_collection_metadata_after_failed_batch_api_ingest(
         collection_name=collection_name,
         user=user,
         context=context,
-        successful_documents=cleanup_decision.successful_documents,
-        side_effects_may_remain=cleanup_decision.side_effects_may_remain,
+        decision=cleanup_decision,
     )
 
 
@@ -1311,9 +1408,41 @@ async def _rollback_failed_ingestion(
     user_id = int(user.id)
     file_record_id = str(file_record.file_id)
     vector_store = get_vector_index_store()
-    register_metadata = _get_completed_step_metadata(result, "register_document") or {}
-    register_created = bool(register_metadata.get("created"))
-    doc_id = result.doc_id if isinstance(result.doc_id, str) and result.doc_id else None
+    register_created, doc_id = _ingested_document_identity(result)
+
+    def _compensate_document() -> None:
+        _rollback_ingested_document(
+            collection_name=collection_name,
+            result=result,
+            user_id=user_id,
+            is_admin=bool(user.is_admin),
+            label="rollback",
+        )
+
+    def _compensate_file() -> None:
+        if register_created and doc_id:
+            remaining_records = _list_document_records_for_file_ids(
+                [file_record_id],
+                user_id=user_id,
+                is_admin=bool(user.is_admin),
+            )
+            remaining_file_ids = {
+                current_file_id
+                for current_file_id in (
+                    _get_document_record_file_id(record) for record in remaining_records
+                )
+                if current_file_id
+            }
+            _delete_uploaded_file_if_orphaned(
+                db,
+                file_id=file_record_id,
+                user_id=user_id,
+                remaining_file_ids=remaining_file_ids,
+            )
+            db.commit()
+        elif not uploaded_file_existed_before:
+            UploadedFileStore(db).delete(file_record, delete_local=False)
+            db.commit()
 
     try:
         collection_records = (
@@ -1332,23 +1461,8 @@ async def _rollback_failed_ingestion(
             )
             if file_id
         }
-        # Comparing doc_ids, not file_ids: two ingests of the same path share a
-        # file_id, so a file_id match cannot tell a sibling's work from ours.
-        if await _rollback_may_delete_collection(
-            collection_name=collection_name,
-            user_id=user_id,
-            collection_existed_before=collection_existed_before,
-            other_document_present=any(
-                (
-                    record.get("doc_id")
-                    if isinstance(record, dict)
-                    else getattr(record, "doc_id", None)
-                )
-                != doc_id
-                for record in collection_records
-            ),
-            context="failed-ingest rollback",
-        ):
+
+        async def _compensate_collection() -> None:
             collection_delete_result = delete_collection(
                 collection_name,
                 user_id,
@@ -1370,8 +1484,8 @@ async def _rollback_failed_ingestion(
                 raise RuntimeError(
                     f"delete collection physical directory during rollback failed: {error_detail}"
                 )
-            remaining_records = vector_store.list_document_records(
-                collection_name=None,
+            remaining_records = _list_document_records_for_file_ids(
+                collection_file_ids,
                 user_id=user_id,
                 is_admin=bool(user.is_admin),
             )
@@ -1406,54 +1520,37 @@ async def _rollback_failed_ingestion(
                 user=user,
             )
             db.commit()
-            _restore_ingest_file_backup(
-                file_path=file_path,
-                backup_path=file_backup_path,
-                had_existing_file=had_existing_file,
-            )
-            return
 
-        if register_created and doc_id:
-            _ensure_cleanup_succeeded(
-                f"delete document '{doc_id}' during rollback",
-                delete_document(
-                    collection_name,
-                    doc_id,
-                    user_id,
-                    bool(user.is_admin),
-                ),
-            )
-            remaining_records = vector_store.list_document_records(
-                collection_name=None,
-                user_id=user_id,
-                is_admin=bool(user.is_admin),
-            )
-            remaining_file_ids = {
-                current_file_id
-                for current_file_id in (
-                    _get_document_record_file_id(record) for record in remaining_records
+        # Compare doc_ids, not file_ids (same-path ingests share a file_id); any
+        # record but the document this run created counts as another's.
+        delete_whole_collection = await _rollback_may_delete_collection(
+            collection_name=collection_name,
+            user_id=user_id,
+            collection_existed_before=collection_existed_before,
+            other_document_present=any(
+                not register_created
+                or (
+                    record.get("doc_id")
+                    if isinstance(record, dict)
+                    else getattr(record, "doc_id", None)
                 )
-                if current_file_id
-            }
-            _delete_uploaded_file_if_orphaned(
-                db,
-                file_id=file_record_id,
-                user_id=user_id,
-                remaining_file_ids=remaining_file_ids,
+                != doc_id
+                for record in collection_records
+            ),
+            context="failed-ingest rollback",
+        )
+        if delete_whole_collection:
+            request = RollbackFailedUploadIngestionRequest(
+                collection_compensation=_compensate_collection
             )
-            db.commit()
         else:
-            if doc_id:
-                clear_ingestion_status(
-                    collection_name,
-                    doc_id,
-                    user_id=user_id,
-                    is_admin=bool(user.is_admin),
-                )
-            if not uploaded_file_existed_before:
-                UploadedFileStore(db).delete(file_record, delete_local=False)
-                db.commit()
-
+            request = RollbackFailedUploadIngestionRequest(
+                document_compensation=_compensate_document,
+                file_compensation=_compensate_file,
+            )
+        outcome = await get_kb_coordinator().rollback_failed_upload_ingestion(request)
+        if outcome.error is not None:
+            raise outcome.error
         _restore_ingest_file_backup(
             file_path=file_path,
             backup_path=file_backup_path,
@@ -1505,32 +1602,20 @@ async def _rollback_failed_cloud_ingestion(
     user_id = int(user.id)
     file_record_id = str(file_record.file_id) if file_record is not None else None
     vector_store = get_vector_index_store()
-    register_metadata = _get_completed_step_metadata(result, "register_document") or {}
-    register_created = bool(register_metadata.get("created"))
-    doc_id = result.doc_id if isinstance(result.doc_id, str) and result.doc_id else None
 
-    try:
-        if register_created and doc_id:
-            document_delete_result = delete_document(
-                collection_name,
-                doc_id,
-                user_id,
-                bool(user.is_admin),
-            )
-            _ensure_cleanup_succeeded(
-                f"delete document '{doc_id}' during cloud rollback",
-                document_delete_result,
-            )
-        elif doc_id:
-            clear_ingestion_status(
-                collection_name,
-                doc_id,
-                user_id=user_id,
-                is_admin=bool(user.is_admin),
-            )
+    def _compensate_document() -> None:
+        # Must precede FILE's records query.
+        _rollback_ingested_document(
+            collection_name=collection_name,
+            result=result,
+            user_id=user_id,
+            is_admin=bool(user.is_admin),
+            label="cloud rollback",
+        )
 
-        remaining_records = vector_store.list_document_records(
-            collection_name=None,
+    def _compensate_file() -> None:
+        remaining_records = _list_document_records_for_file_ids(
+            [file_record_id] if file_record_id is not None else [],
             user_id=user_id,
             is_admin=bool(user.is_admin),
         )
@@ -1550,13 +1635,13 @@ async def _rollback_failed_cloud_ingestion(
                 remaining_file_ids=remaining_file_ids,
             )
 
+    async def _compensate_collection() -> None:
         collection_records = vector_store.list_document_records(
             collection_name=collection_name,
             user_id=user_id,
             is_admin=bool(user.is_admin),
             max_results=1,
         )
-        removed_new_collection = False
         if await _rollback_may_delete_collection(
             collection_name=collection_name,
             user_id=user_id,
@@ -1573,14 +1658,21 @@ async def _rollback_failed_cloud_ingestion(
                 f"delete collection '{collection_name}' during cloud rollback",
                 collection_delete_result,
             )
-            removed_new_collection = True
-
-        if removed_new_collection:
             await _cleanup_failed_new_collection_metadata(
                 collection_name=collection_name,
                 user=user,
             )
 
+    try:
+        outcome = await get_kb_coordinator().rollback_failed_upload_ingestion(
+            RollbackFailedUploadIngestionRequest(
+                document_compensation=_compensate_document,
+                file_compensation=_compensate_file,
+                collection_compensation=_compensate_collection,
+            )
+        )
+        if outcome.error is not None:
+            raise outcome.error
         db.commit()
         _restore_ingest_file_backup(
             file_path=file_path,
@@ -2464,42 +2556,9 @@ def _existing_web_file_result_with_rollback(
         ingestion_runs_snapshot=ingestion_runs_snapshot,
     )
 
-    def _rollback_existing(
-        ingestion_result: Optional[IngestionResult] = None,
-    ) -> None:
-        rollback_error: Optional[Exception] = None
-        try:
-            doc_cb = document_compensation(ingestion_result)
-            doc_cb()
-        except Exception as exc:  # noqa: BLE001
-            rollback_error = exc
-            logger.warning(
-                "Failed to restore RAG rows during existing web file rollback: "
-                "file_id=%s, error=%s",
-                file_record_id,
-                exc,
-                exc_info=True,
-            )
-        try:
-            status_cb = status_compensation(ingestion_result)
-            status_cb()
-        except Exception as exc:  # noqa: BLE001
-            if rollback_error is None:
-                rollback_error = exc
-            logger.warning(
-                "Failed to restore ingestion runs during existing web file rollback: "
-                "file_id=%s, error=%s",
-                file_record_id,
-                exc,
-                exc_info=True,
-            )
-        if rollback_error is not None:
-            raise rollback_error
-
     return FileHandlerResult(
         file_path=str(file_path),
         file_id=file_record_id,
-        rollback_on_failure=_rollback_existing,
         document_compensation=document_compensation,
         status_compensation=status_compensation,
         rollback_context={
@@ -2554,65 +2613,24 @@ def _create_new_web_file_handler_result(
             file_record_id=file_record_id,
             persistent_file_path=persistent_file_path,
         )
+        status_cleared: set[str] = set()
         document_compensation = _create_document_compensation(
             collection_name=collection_name,
             user_id=user_id,
             is_admin=is_admin,
             file_record_id=file_record_id,
+            status_cleared=status_cleared,
         )
         status_compensation = _create_status_compensation(
             collection_name=collection_name,
             user_id=user_id,
             is_admin=is_admin,
+            status_cleared=status_cleared,
         )
-
-        def _rollback_new_web_file(
-            ingestion_result: Optional[IngestionResult] = None,
-        ) -> None:
-            rollback_error: Optional[Exception] = None
-            try:
-                doc_cb = document_compensation(ingestion_result)
-                doc_cb()
-            except Exception as exc:  # noqa: BLE001
-                if rollback_error is None:
-                    rollback_error = exc
-                logger.warning(
-                    "Failed to clean RAG rows during new web file rollback: file_id=%s, error=%s",
-                    file_record_id,
-                    exc,
-                    exc_info=True,
-                )
-            try:
-                file_compensation()
-            except Exception as exc:  # noqa: BLE001
-                if rollback_error is None:
-                    rollback_error = exc
-                logger.warning(
-                    "Failed to clean file during new web file rollback: file_id=%s, error=%s",
-                    file_record_id,
-                    exc,
-                    exc_info=True,
-                )
-            try:
-                status_cb = status_compensation(ingestion_result)
-                status_cb()
-            except Exception as exc:  # noqa: BLE001
-                if rollback_error is None:
-                    rollback_error = exc
-                logger.warning(
-                    "Failed to clear ingestion status during new web file "
-                    "rollback: file_id=%s, error=%s",
-                    file_record_id,
-                    exc,
-                    exc_info=True,
-                )
-            if rollback_error is not None:
-                raise rollback_error
 
         return FileHandlerResult(
             file_path=str(persistent_file),
             file_id=file_record_id,
-            rollback_on_failure=_rollback_new_web_file,
             file_compensation=file_compensation,
             document_compensation=document_compensation,
             status_compensation=status_compensation,
@@ -2638,6 +2656,15 @@ def _create_new_web_file_handler_result(
                     cleanup_error,
                 )
         raise
+
+
+def _existing_uploaded_file_version(record: Any) -> UploadedFileVersionSnapshot:
+    if getattr(record, "id", None) is None:
+        raise ValueError(
+            f"Uploaded file {record.file_id} has no row id; "
+            "cannot take its version receipt"
+        )
+    return snapshot_uploaded_file_version(record)
 
 
 def _refresh_existing_file_if_changed(
@@ -2679,11 +2706,7 @@ def _refresh_existing_file_if_changed(
     """
     existing_path = Path(str(existing_record.storage_path))
     record_snapshot = _snapshot_uploaded_file_record(existing_record)
-    previous_version = (
-        snapshot_uploaded_file_version(existing_record)
-        if getattr(existing_record, "id", None) is not None
-        else None
-    )
+    previous_version = _existing_uploaded_file_version(existing_record)
     if not existing_path.exists():
         try:
             existing_path = ManagedFileRef(existing_record).ensure_local()
@@ -2837,69 +2860,12 @@ def _refresh_existing_file_if_changed(
         backup_path=backup_path,
     )
 
-    def _rollback_refresh(
-        ingestion_result: Optional[IngestionResult] = None,
-    ) -> None:
-        rollback_error: Optional[Exception] = None
-        file_succeeded = False
-        try:
-            doc_cb = document_compensation(ingestion_result)
-            doc_cb()
-        except Exception as exc:  # noqa: BLE001
-            if rollback_error is None:
-                rollback_error = exc
-            logger.warning(
-                "Failed to restore RAG rows during web file refresh rollback: file_id=%s, error=%s",
-                file_record_id,
-                exc,
-                exc_info=True,
-            )
-        try:
-            file_compensation()
-            file_succeeded = True
-        except Exception as exc:  # noqa: BLE001
-            if rollback_error is None:
-                rollback_error = exc
-            logger.warning(
-                "Failed to restore file during web file refresh rollback: file_id=%s, error=%s",
-                file_record_id,
-                exc,
-                exc_info=True,
-            )
-        try:
-            status_cb = status_compensation(ingestion_result)
-            status_cb()
-        except Exception as exc:  # noqa: BLE001
-            if rollback_error is None:
-                rollback_error = exc
-            logger.warning(
-                "Failed to restore ingestion runs during web file refresh "
-                "rollback: file_id=%s, error=%s",
-                file_record_id,
-                exc,
-                exc_info=True,
-            )
-        if rollback_error is None and file_succeeded:
-            try:
-                snapshot_compensation()
-            except Exception as exc:  # noqa: BLE001
-                logger.warning(
-                    "Failed to cleanup backup file during web file refresh "
-                    "rollback: file_id=%s, error=%s",
-                    file_record_id,
-                    exc,
-                    exc_info=True,
-                )
-        if rollback_error is not None:
-            raise rollback_error
-
     def _commit_refresh() -> None:
         backup_path.unlink(missing_ok=True)
 
     return FileHandlerResult(
         file_path=str(existing_record.storage_path),
         file_id=str(existing_record.file_id),
-        rollback_on_failure=_rollback_refresh,
         commit_on_success=_commit_refresh,
         file_compensation=file_compensation,
         document_compensation=document_compensation,
@@ -2928,11 +2894,7 @@ def _recreate_missing_existing_file(
 ) -> FileHandlerResult:
     existing_path = Path(str(existing_record.storage_path))
     record_snapshot = _snapshot_uploaded_file_record(existing_record)
-    previous_version = (
-        snapshot_uploaded_file_version(existing_record)
-        if getattr(existing_record, "id", None) is not None
-        else None
-    )
+    previous_version = _existing_uploaded_file_version(existing_record)
     ingestion_runs_snapshot = _snapshot_ingestion_runs_for_uploaded_file(
         str(existing_record.file_id)
     )
@@ -3002,9 +2964,9 @@ def _recreate_missing_existing_file(
                 .filter(UploadedFile.file_id == str(existing_record.file_id))
                 .first()
             )
-            if refreshed_record is not None and (
-                previous_version is None
-                or snapshot_uploaded_file_version(refreshed_record) != previous_version
+            if (
+                refreshed_record is not None
+                and snapshot_uploaded_file_version(refreshed_record) != previous_version
             ):
                 raise UploadedFileVersionConflict(
                     "Uploaded file changed while recreate setup failed; "
@@ -3066,63 +3028,6 @@ def _recreate_missing_existing_file(
         backup_path=backup_for_failure,
     )
 
-    def _rollback_recreate(
-        ingestion_result: Optional[IngestionResult] = None,
-    ) -> None:
-        rollback_error: Optional[Exception] = None
-        file_succeeded = False
-        try:
-            doc_cb = document_compensation(ingestion_result)
-            doc_cb()
-        except Exception as exc:  # noqa: BLE001
-            if rollback_error is None:
-                rollback_error = exc
-            logger.warning(
-                "Failed to restore RAG rows during recreated web file rollback: "
-                "file_id=%s, error=%s",
-                file_record_id,
-                exc,
-                exc_info=True,
-            )
-        try:
-            file_compensation()
-            file_succeeded = True
-        except Exception as exc:  # noqa: BLE001
-            if rollback_error is None:
-                rollback_error = exc
-            logger.warning(
-                "Failed to restore file during recreated web file rollback: file_id=%s, error=%s",
-                file_record_id,
-                exc,
-                exc_info=True,
-            )
-        try:
-            status_cb = status_compensation(ingestion_result)
-            status_cb()
-        except Exception as exc:  # noqa: BLE001
-            if rollback_error is None:
-                rollback_error = exc
-            logger.warning(
-                "Failed to restore ingestion runs during recreated web file "
-                "rollback: file_id=%s, error=%s",
-                file_record_id,
-                exc,
-                exc_info=True,
-            )
-        if rollback_error is None and file_succeeded:
-            try:
-                snapshot_compensation()
-            except Exception as exc:  # noqa: BLE001
-                logger.warning(
-                    "Failed to cleanup backup file during recreated web file "
-                    "rollback: file_id=%s, error=%s",
-                    file_record_id,
-                    exc,
-                    exc_info=True,
-                )
-        if rollback_error is not None:
-            raise rollback_error
-
     def _commit_recreate() -> None:
         if backup_for_failure is not None:
             backup_for_failure.unlink(missing_ok=True)
@@ -3130,7 +3035,6 @@ def _recreate_missing_existing_file(
     return FileHandlerResult(
         file_path=str(existing_record.storage_path),
         file_id=str(existing_record.file_id),
-        rollback_on_failure=_rollback_recreate,
         commit_on_success=_commit_recreate,
         file_compensation=file_compensation,
         document_compensation=document_compensation,
@@ -3145,36 +3049,6 @@ def _recreate_missing_existing_file(
             "file_id": file_record_id,
         },
     )
-
-
-def _compensate_new_web_ingest_files(
-    db: Session,
-    *,
-    file_ids: set[str],
-    user_id: int,
-) -> tuple[bool, list[str]]:
-    cleanup_incomplete = False
-    cleanup_errors: list[str] = []
-    for file_id in sorted(file_ids):
-        cleanup_result = _compensate_new_uploaded_file(
-            db,
-            file_id=file_id,
-            user_id=user_id,
-        )
-        if cleanup_result.side_effects_may_remain:
-            cleanup_incomplete = True
-            cleanup_errors.extend(cleanup_result.errors)
-            db.rollback()
-            continue
-        try:
-            db.commit()
-        except Exception as commit_exc:  # noqa: BLE001
-            cleanup_incomplete = True
-            cleanup_errors.append(
-                f"Database commit failed for file {file_id}: {commit_exc}"
-            )
-            db.rollback()
-    return cleanup_incomplete, cleanup_errors
 
 
 class _WebFileLock:
@@ -4049,6 +3923,9 @@ async def ingest(
         .first()
     )
     uploaded_file_existed_before = existing_file_record is not None
+    document_existed_before = await _document_existed_before_ingest(
+        safe_collection, existing_file_record
+    )
     had_existing_file = file_path.exists()
     file_backup_path: Optional[Path] = None
     if had_existing_file:
@@ -4247,9 +4124,10 @@ async def ingest(
         raise
     except Exception:
         if file_record is not None:
-            rollback_result = IngestionResult(
-                status="error",
-                doc_id=safe_filename,
+            rollback_result = await _raised_ingestion_rollback_result(
+                collection_name=safe_collection,
+                file_id=str(file_record.file_id),
+                document_existed_before=document_existed_before,
                 message="Ingestion setup failed before completion.",
             )
             rollback_api_result = KBApiOperationResult(result=rollback_result)
@@ -4830,11 +4708,14 @@ async def ingest_cloud(
                             )
                         return rollback_execution.operation_result
 
-                    uploaded_file_existed_before = (
+                    existing_file_record = (
                         db.query(UploadedFile)
                         .filter(UploadedFile.storage_path == str(file_path))
                         .first()
-                        is not None
+                    )
+                    uploaded_file_existed_before = existing_file_record is not None
+                    document_existed_before = await _document_existed_before_ingest(
+                        safe_collection, existing_file_record
                     )
 
                     file_record = _upsert_uploaded_file_record(
@@ -4907,23 +4788,17 @@ async def ingest_cloud(
                             except OSError:
                                 pass
                         return api_result
-                    except RollbackFailureError as rollback_exc:
-                        return KBApiOperationResult(
-                            result=IngestionResult(
-                                status="error",
-                                message=str(rollback_exc),
-                                doc_id=source_filename,
-                            ),
-                            operation_outcome=api_result.operation_outcome
-                            if "api_result" in locals()
-                            else None,
-                            rollback_complete=False,
-                        )
                     except Exception as e:
                         rollback_result = IngestionResult(
                             status="error",
                             doc_id=source_filename,
                             message=f"Ingestion failed: {str(e)}",
+                        )
+                        raised_result = await _raised_ingestion_rollback_result(
+                            collection_name=safe_collection,
+                            file_id=str(file_record.file_id),
+                            document_existed_before=document_existed_before,
+                            message=rollback_result.message,
                         )
                         rollback_api_result = KBApiOperationResult(
                             result=rollback_result,
@@ -4937,7 +4812,7 @@ async def ingest_cloud(
                                 db=db,
                                 user=_user,
                                 collection_name=safe_collection,
-                                result=rollback_result,
+                                result=raised_result,
                                 file_path=file_path,
                                 file_record=file_record,
                                 collection_existed_before=collection_existed_before,
@@ -4967,16 +4842,6 @@ async def ingest_cloud(
                         )
                     )
 
-            except RollbackFailureError as e:
-                logger.exception("Rollback failed for %s: %s", file_info.fileName, e)
-                return KBApiOperationResult(
-                    result=IngestionResult(
-                        status="error",
-                        message=str(e),
-                        doc_id=source_filename,
-                    ),
-                    rollback_complete=False,
-                )
             except Exception as e:
                 rollback_api_result = KBApiOperationResult(
                     result=IngestionResult(
@@ -6655,8 +6520,8 @@ def _perform_kb_collection_delete(
                 deleted_counts=result.deleted_counts,
             )
 
-        remaining_records = get_vector_index_store().list_document_records(
-            collection_name=None,
+        remaining_records = _list_document_records_for_file_ids(
+            set().union(*mutation_scope.file_ids_by_owner.values()),
             user_id=user_id,
             is_admin=is_admin,
         )
@@ -7597,7 +7462,8 @@ async def delete_document_api(
 
     if cleanup_candidate_file_ids:
         try:
-            remaining_records = _list_documents_for_user(
+            remaining_records = _list_document_records_for_file_ids(
+                cleanup_candidate_file_ids,
                 user_id=user_id_int,
                 is_admin=bool(_user.is_admin),
             )

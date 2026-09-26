@@ -46,6 +46,7 @@ from .chat_history_service import (
 from .db_runtime import run_db_io_cancellation_safe
 from .task_command_transport import TaskCommandRejected
 from .task_execution_controller import TaskControlState
+from .task_lease_service import task_settlement_ownership_values
 
 logger = logging.getLogger(__name__)
 
@@ -401,10 +402,7 @@ def _finalize_external_cancel_sync(
                 status=TaskStatus.FAILED,
                 control_state=TaskControlState.FAILED.value,
                 state_version=expected_state_version + 1,
-                runner_id=None,
-                lease_attempt_id=None,
-                lease_expires_at=None,
-                last_heartbeat_at=None,
+                **task_settlement_ownership_values(task_id),
                 error_message=EXTERNAL_CANCEL_ERROR_MESSAGE,
             )
         )
@@ -439,11 +437,11 @@ def _finalize_external_cancel_sync(
 
 
 async def _broadcast_external_cancel_terminal_event(task_id: int) -> None:
-    from ..api.websocket import create_terminal_task_error_event
-    from ..api.websocket import manager as websocket_manager
+    from .task_events import publish_task_event
+    from .task_execution import create_terminal_task_error_event
 
     try:
-        await websocket_manager.broadcast_to_task(
+        await publish_task_event(
             create_terminal_task_error_event(
                 task_id,
                 EXTERNAL_TURN_INTERRUPTED_MESSAGE,
@@ -479,7 +477,7 @@ async def cancel_external_task_unserialized(
         )
     )
     if not already_settled:
-        from ..api.websocket import background_task_manager
+        from .task_execution import background_task_manager
 
         await background_task_manager.cancel_task(
             task_id,

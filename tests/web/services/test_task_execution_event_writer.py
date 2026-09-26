@@ -10,10 +10,12 @@ from tests.web.services.test_task_execution_event_store import engine as engine_
 from tests.web.services.test_task_execution_event_store import (
     task_id as task_id_fixture,
 )
-from xagent.core.agent.checkpoint import TraceCheckpointStore
+from xagent.core.agent.checkpoint import (
+    ExecutionEventPersistenceError,
+    TraceCheckpointStore,
+)
 from xagent.core.agent.runtime import PatternRuntime
 from xagent.core.agent.trace import (
-    ExecutionEventPersistenceError,
     TraceAction,
     TraceCategory,
     TraceEventType,
@@ -44,7 +46,7 @@ def canonical(engine, task_id, monkeypatch):
         db.commit()
     monkeypatch.setattr("xagent.web.models.database.get_session_local", lambda: factory)
     monkeypatch.setattr(
-        "xagent.web.api.trace_handlers.get_db", lambda: iter([factory()])
+        "xagent.web.services.trace_handlers.get_db", lambda: iter([factory()])
     )
     return factory, task_id
 
@@ -93,7 +95,7 @@ async def test_factory_commits_recoverable_state_before_observers(canonical):
     assert tracer.records_execution_events
     assert any(isinstance(h, ExecutionEventTraceAdapter) for h in tracer.handlers)
     observer = AsyncMock()
-    tracer.handlers = [observer]
+    tracer.handlers.append(observer)
     payload = {
         "execution_id": "run-root",
         "pattern": "ReActPattern",
@@ -166,7 +168,9 @@ async def test_observer_failure_does_not_invalidate_fact(canonical):
 async def test_attempt_result_keeps_batch_identity_and_blocks_blind_replay(canonical):
     factory, task_id = canonical
     tracer = create_task_tracer(task_id)
-    tracer.handlers = []
+    tracer.handlers = [
+        h for h in tracer.handlers if isinstance(h, ExecutionEventTraceAdapter)
+    ]
     runtime = PatternRuntime(tracer=TraceCheckpointStore(tracer))
     call = {
         "id": "provider-duplicate-id",
@@ -239,7 +243,9 @@ async def test_real_react_loop_records_batch_before_tool_and_retains_identity(
 
     factory, task_id = canonical
     tracer = create_task_tracer(task_id)
-    tracer.handlers = []
+    tracer.handlers = [
+        h for h in tracer.handlers if isinstance(h, ExecutionEventTraceAdapter)
+    ]
     runtime = PatternRuntime(tracer=TraceCheckpointStore(tracer))
     context = ExecutionContext(system_prompt="Calculate")
     context.add_user_message("2+2", metadata={"turn_id": "real-turn"})
@@ -297,7 +303,7 @@ async def test_real_react_loop_records_batch_before_tool_and_retains_identity(
 async def test_outbound_stream_is_committed_before_websocket_and_failure_is_strict(
     canonical, monkeypatch
 ):
-    from xagent.web.api import websocket
+    from xagent.web.services import task_execution as websocket
 
     factory, task_id = canonical
     monkeypatch.setattr(websocket, "get_db", lambda: iter([factory()]))
@@ -308,7 +314,7 @@ async def test_outbound_stream_is_committed_before_websocket_and_failure_is_stri
             assert facts(db, task_id)[-1].payload["data"]["delta"] == "hello"
         broadcasts.append(event)
 
-    monkeypatch.setattr(websocket.manager, "broadcast_to_task", broadcast)
+    monkeypatch.setattr(websocket, "publish_task_event", broadcast)
     handler = websocket.make_agent_outbound_handler(task_id, authoritative=True)
     payload = {"type": "final_answer_delta", "delta": "hello", "stream_id": "stream1"}
     await handler(payload)
@@ -430,10 +436,12 @@ def test_command_fact_and_inbox_are_one_transaction(canonical):
 def test_pre_runner_failure_is_a_fact_and_failed_commit_is_not_broadcastable(
     canonical, monkeypatch
 ):
-    from xagent.web.api.websocket import _terminal_task_error_payload
+    from xagent.web.services.task_execution import _terminal_task_error_payload
 
     factory, task_id = canonical
-    monkeypatch.setattr("xagent.web.api.websocket.get_session_local", lambda: factory)
+    monkeypatch.setattr(
+        "xagent.web.services.task_execution.get_session_local", lambda: factory
+    )
     _terminal_task_error_payload(task_id, "sandbox unavailable")
     with factory() as db:
         rows = facts(db, task_id)
@@ -472,3 +480,131 @@ def test_settlement_serializes_execution_context_without_losing_state(canonical)
         )
         with pytest.raises(TypeError, match="Unsupported execution fact"):
             stage_result_fact_no_commit(db, task, {"unknown": object()})
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("native_async", [False, True], ids=["sync", "async"])
+async def test_fact_and_checkpoint_projection_use_current_trace_database_runtime(
+    canonical, engine, monkeypatch, native_async
+):
+    from xagent.web.services import trace_handlers
+    from xagent.web.services.task_lease_service import bind_task_lease_context
+    from xagent.web.services.trace_database import TraceDatabaseRuntime
+
+    factory, task_id = canonical
+    source = engine
+    if native_async and engine.dialect.name == "postgresql":
+        # This fixture uses creator= for disposable databases; recover its URL
+        # so the async driver connects to the same isolated database.
+        connection = engine.raw_connection()
+        try:
+            parameters = connection.driver_connection.info.dsn_parameters
+            source = sa.create_engine(
+                sa.URL.create(
+                    "postgresql",
+                    username=parameters["user"],
+                    host=parameters["host"],
+                    port=int(parameters["port"]),
+                    database=parameters["dbname"],
+                )
+            )
+        finally:
+            connection.close()
+    database_runtime = TraceDatabaseRuntime(source, use_async=native_async, limit=1)
+    monkeypatch.setattr(
+        trace_handlers, "get_trace_database_runtime", lambda: database_runtime
+    )
+    with factory() as db:
+        lease = acquire_task_lease(db, task_id, new_run=True)
+    tracer = create_task_tracer(task_id)
+    store = TraceCheckpointStore(tracer)
+    payload = {
+        "execution_id": "root",
+        "context": {},
+        "label": "after_llm",
+        "pattern_state": {"pending_tool_calls": []},
+    }
+    try:
+        with bind_task_lease_context(lease):
+            await store.save(payload)
+            assert await tracer.load_latest_checkpoint("root") == payload
+        with factory() as db:
+            task = db.get(Task, task_id)
+            assert task.last_checkpoint_trace_event_id is not None
+            row = db.get(TraceEvent, task.last_checkpoint_trace_event_id)
+            event = next(e for e in facts(db, task_id) if e.kind == "recovery_state")
+            assert row.event_id == event.payload["protocol_event_id"]
+            assert event.run_id == lease.run_id
+            assert event.payload["data"]["snapshot"] == payload
+    finally:
+        await database_runtime.close()
+        if source is not engine:
+            source.dispose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("producer", ["root", "child", "outbound"])
+async def test_replaced_attempt_in_same_run_cannot_write_facts(
+    canonical, producer, monkeypatch
+):
+    from xagent.web.services import task_execution
+    from xagent.web.services.task_lease_service import bind_task_lease_context
+
+    factory, task_id = canonical
+    with factory() as db:
+        lease = acquire_task_lease(db, task_id, new_run=True)
+        task = db.get(Task, task_id)
+        task.lease_attempt_id = "replacement-attempt"
+        db.commit()
+    monkeypatch.setattr(task_execution, "get_db", lambda: iter([factory()]))
+    broadcast = AsyncMock()
+    monkeypatch.setattr(task_execution, "publish_task_event", broadcast)
+    with bind_task_lease_context(lease):
+        with pytest.raises(ExecutionEventPersistenceError):
+            if producer == "outbound":
+                await task_execution.make_agent_outbound_handler(
+                    task_id, authoritative=True
+                )({"type": "final_answer_delta", "delta": "stale"})
+            else:
+                adapter = ExecutionEventTraceAdapter(
+                    task_id, build_id="child" if producer == "child" else None
+                )
+                from xagent.core.agent.trace import TraceEvent as CoreTraceEvent
+
+                await adapter.commit_event(
+                    CoreTraceEvent(
+                        TraceEventType(
+                            TraceScope.TASK, TraceAction.START, TraceCategory.GENERAL
+                        ),
+                        task_id=str(task_id),
+                    )
+                )
+    broadcast.assert_not_awaited()
+    with factory() as db:
+        assert facts(db, task_id) == []
+        assert db.query(TraceEvent).count() == 0
+
+
+@pytest.mark.asyncio
+async def test_outbound_question_preserves_source_identity_in_atomic_projection(
+    canonical, monkeypatch
+):
+    from xagent.web.services import task_execution
+
+    factory, task_id = canonical
+    monkeypatch.setattr(task_execution, "get_db", lambda: iter([factory()]))
+    monkeypatch.setattr(task_execution, "publish_task_event", AsyncMock())
+    await task_execution.make_agent_outbound_handler(task_id, authoritative=True)(
+        {
+            "event_id": "question-event",
+            "message": "Which file?",
+            "expect_response": True,
+        }
+    )
+    with factory() as db:
+        row = db.query(TaskChatMessage).one()
+        assert row.source_event_id == "question-event"
+        event = next(e for e in facts(db, task_id) if e.kind == "assistant_message")
+        assert row.execution_event_id == event.event_id
+        assert event.payload["source_event_id"] == "question-event"
+        assert db.query(TraceEvent).one().event_id == "question-event"

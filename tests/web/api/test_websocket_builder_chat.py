@@ -15,6 +15,8 @@ from xagent.web.api.websocket import (
 )
 from xagent.web.models.user import User
 from xagent.web.services.builder_chat_runtime import BuilderChatRuntimeInputs
+from xagent.web.services.client_error_messages import CLIENT_SAFE_AUTO_MODEL_UNAVAILABLE
+from xagent.web.services.llm_utils import AutoModelUnavailableError
 
 
 @pytest.mark.asyncio
@@ -491,6 +493,50 @@ async def test_handle_builder_chat_without_voice_leaves_prompt_unchanged() -> No
 
 
 @pytest.mark.asyncio
+async def test_handle_builder_chat_hides_connectors_from_current_config() -> None:
+    mock_websocket = AsyncMock()
+    message_data = {
+        "messages": [{"role": "user", "content": "Add web search"}],
+        "models": {"general": 1},
+        "tool_categories": ["file", "mcp", "mcp:github"],
+    }
+    runtime_loader = AsyncMock(
+        return_value=BuilderChatRuntimeInputs(
+            authorized_file_ids=(), llm=AsyncMock(), compact_llm=None
+        )
+    )
+
+    with (
+        patch(
+            "xagent.web.services.builder_chat_runtime.load_builder_chat_runtime_inputs",
+            runtime_loader,
+        ),
+        patch("xagent.web.api.websocket.get_session_local", return_value=MagicMock()),
+        patch("xagent.core.agent.service.AgentService") as MockAgentService,
+        patch("xagent.core.memory.in_memory.InMemoryMemoryStore"),
+        patch("xagent.web.user_isolated_memory.UserContext"),
+    ):
+        mock_agent_service = MockAgentService.return_value
+        mock_agent_service.execute_task = AsyncMock(
+            return_value={"output": "done", "status": "completed"}
+        )
+        mock_websocket.state = MagicMock()
+        del mock_websocket.state.builder_task_id
+        del mock_websocket.state.builder_agent_service
+
+        await handle_builder_chat(
+            mock_websocket,
+            message_data,
+            SimpleNamespace(id=1, is_admin=False, voice=None),
+        )
+
+    system_prompt = mock_agent_service.execute_task.await_args.kwargs["context"][
+        "system_prompt"
+    ]
+    assert "'tool_categories': ['file']" in system_prompt
+
+
+@pytest.mark.asyncio
 async def test_handle_builder_chat_no_llm() -> None:
     """
     Test that handle_builder_chat handles missing LLM gracefully.
@@ -531,6 +577,23 @@ async def test_handle_builder_chat_no_llm() -> None:
         sent_data = json.loads(mock_websocket.send_text.call_args[0][0])
         assert sent_data["type"] == "error"
         assert "No LLM configured" in sent_data["message"]
+
+
+@pytest.mark.asyncio
+async def test_builder_auto_unavailable_has_safe_message_and_code():
+    websocket = AsyncMock()
+    user = SimpleNamespace(id=1, is_admin=False)
+    with patch(
+        "xagent.web.services.builder_chat_runtime.load_builder_chat_runtime_inputs",
+        AsyncMock(side_effect=AutoModelUnavailableError("private model details")),
+    ):
+        await handle_builder_chat(websocket, {"message": "Create an agent"}, user)
+    payload = json.loads(websocket.send_text.call_args.args[0])
+    assert payload == {
+        "type": "error",
+        "message": CLIENT_SAFE_AUTO_MODEL_UNAVAILABLE,
+        "error_code": "auto_model_unavailable",
+    }
 
 
 if __name__ == "__main__":

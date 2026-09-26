@@ -5,6 +5,7 @@ import logging
 import os
 import time
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import ExitStack
 from dataclasses import FrozenInstanceError, is_dataclass
 from datetime import datetime, timedelta
 from threading import Barrier, Event, get_ident
@@ -17,13 +18,19 @@ from sqlalchemy.exc import TimeoutError as SQLAlchemyTimeoutError
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import QueuePool
 
+from tests.web.pool_contention_shared import (
+    GUARD_TIMEOUT,
+    LOOP_LIVENESS_TICKS,
+    assert_pool_checkout_off_loop,
+    gated_pool_checkout,
+    wait_for_ticks,
+)
+from tests.web.services.task_lease_shared import (
+    live_task_lease as live_task_lease_fixture,
+)
 from xagent.core.agent.runner import UserMessageInjectionOutcome
 from xagent.db.sqlite import apply_sqlite_concurrency_pragmas
 from xagent.web.api import websocket as websocket_api
-from xagent.web.api.websocket import (
-    _load_command_message_delivery_status,
-    execute_durable_task_command,
-)
 from xagent.web.models import database as database_module
 from xagent.web.models.chat_message import TaskChatMessage
 from xagent.web.models.database import (
@@ -37,7 +44,13 @@ from xagent.web.models.task import Task, TaskStatus
 from xagent.web.models.task_command import TaskExecutionCommand
 from xagent.web.models.task_command_terminal_event import TaskCommandTerminalEvent
 from xagent.web.models.user import User
+from xagent.web.services import task_command_execution as command_execution_service
 from xagent.web.services import task_command_transport as task_command_transport_module
+from xagent.web.services import task_execution as task_execution_service
+from xagent.web.services.task_command_execution import (
+    _load_command_message_delivery_status,
+    execute_durable_task_command,
+)
 from xagent.web.services.task_command_transport import (
     COMMAND_COMPLETED,
     COMMAND_FAILED,
@@ -72,6 +85,8 @@ from xagent.web.services.task_command_transport import (
     task_has_live_foreign_runner,
     task_has_live_runner,
 )
+
+live_task_lease = live_task_lease_fixture
 
 
 @pytest.fixture()
@@ -119,8 +134,7 @@ def low_timeout_sqlite_engine(tmp_path):
         f"sqlite:///{tmp_path / 'task-command-lock-path.db'}",
         connect_args={"check_same_thread": False},
     )
-    # Long enough to stay clear of thread-scheduling jitter under a loaded
-    # test run, short enough to keep the lock-path tests well under 2s.
+    # Keep SQLite lock waits short without asserting wall-clock performance.
     apply_sqlite_concurrency_pragmas(engine, busy_timeout_ms=200)
     Base.metadata.create_all(bind=engine)
     SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
@@ -580,7 +594,7 @@ async def test_cancel_command_does_not_require_persisted_actor(db_session) -> No
     )
 
     with (
-        patch.object(websocket_api, "_load_command_actor") as load_actor,
+        patch.object(command_execution_service, "_load_command_actor") as load_actor,
         pytest.raises(ValueError, match="Agent ID is missing"),
     ):
         await execute_durable_task_command(command)
@@ -1004,6 +1018,7 @@ def test_failed_command_retry_preserves_immutable_target(db_session) -> None:
 
 @pytest.mark.asyncio
 async def test_recovery_dispatches_committed_message_across_run_rotation(
+    live_task_lease,
     db_session,
 ) -> None:
     user, task = _create_running_task(db_session)
@@ -1041,6 +1056,7 @@ async def test_recovery_dispatches_committed_message_across_run_rotation(
     task.run_id = "run-2"
     task.lease_expires_at = datetime.utcnow() - timedelta(seconds=1)
     db_session.commit()
+    live_task_lease(db_session, task)
 
     runtime_agent = MagicMock()
     runtime_agent.supports_live_control.return_value = True
@@ -1050,28 +1066,46 @@ async def test_recovery_dispatches_committed_message_across_run_rotation(
     runtime_manager = MagicMock(
         get_agent_for_task=AsyncMock(return_value=runtime_agent)
     )
-    resume = AsyncMock()
+    allow_resume_to_finish = asyncio.Event()
+
+    async def hold_resume(*args, **kwargs) -> None:
+        await allow_resume_to_finish.wait()
+
+    resume = AsyncMock(side_effect=hold_resume)
+    resume_task = None
 
     with (
         patch(
-            "xagent.web.api.chat.get_agent_manager",
+            "xagent.web.services.agent_service_manager.get_agent_manager",
             return_value=runtime_manager,
         ),
-        patch.object(websocket_api, "execute_resume_background", new=resume),
+        patch.object(task_execution_service, "execute_resume_background", new=resume),
     ):
-        assert await dispatch_one_task_command(
-            execute_durable_task_command,
-            command_db_id=enqueued.command_id,
-        )
-        resume_task = websocket_api.background_task_manager.resume_tasks.get(
-            int(task.id)
-        )
-        assert resume_task is not None
-        await resume_task
-        websocket_api.background_task_manager.cleanup_task(
-            int(task.id),
-            expected_task=resume_task,
-        )
+        try:
+            assert await dispatch_one_task_command(
+                execute_durable_task_command,
+                command_db_id=enqueued.command_id,
+            )
+            # A completed mock can already have been unregistered by the time
+            # command dispatch returns. Hold execution to inspect live ownership.
+            resume_task = (
+                task_execution_service.background_task_manager.resume_tasks.get(
+                    int(task.id)
+                )
+            )
+            assert resume_task is not None
+            assert not resume_task.done()
+        finally:
+            allow_resume_to_finish.set()
+            if resume_task is not None:
+                await asyncio.wait_for(resume_task, timeout=1)
+
+    assert (
+        int(task.id) not in task_execution_service.background_task_manager.resume_tasks
+    )
+    assert (
+        int(task.id) not in task_execution_service.background_task_manager.running_tasks
+    )
 
     db_session.expire_all()
     messages = (
@@ -1292,20 +1326,28 @@ async def test_dispatch_claim_pool_wait_does_not_block_event_loop(
     async def execute(command: ClaimedTaskCommand) -> None:
         assert isinstance(command, ClaimedTaskCommand)
 
-    ticker_task = asyncio.create_task(ticker())
-    dispatch_task = asyncio.create_task(
-        dispatch_one_task_command(execute, command_db_id=enqueued.command_id)
-    )
-    try:
-        await asyncio.sleep(0.08)
-        assert ticks >= 3, "command claim QueuePool checkout blocked the event loop"
-        assert not dispatch_task.done()
-    finally:
-        held_connection.close()
-        ticker_stop.set()
-        await ticker_task
+    with gated_pool_checkout(engine) as gate:
+        ticker_task = asyncio.create_task(ticker())
+        dispatch_task = asyncio.create_task(
+            dispatch_one_task_command(execute, command_db_id=enqueued.command_id)
+        )
+        try:
+            await gate.wait_until_contending()
+            observed = await wait_for_ticks(lambda: ticks)
+            assert observed >= LOOP_LIVENESS_TICKS, (
+                "command claim QueuePool checkout blocked the event loop"
+            )
+            assert not dispatch_task.done()
+        finally:
+            held_connection.close()
+            gate.let_through()
+            ticker_stop.set()
+            await asyncio.wait_for(
+                asyncio.gather(dispatch_task, ticker_task, return_exceptions=True),
+                timeout=GUARD_TIMEOUT,
+            )
 
-    assert await asyncio.wait_for(dispatch_task, timeout=1)
+    assert dispatch_task.result()
     assert session_threads
     assert session_threads[0] != loop_thread
 
@@ -1335,14 +1377,7 @@ async def test_command_handler_pool_timeout_does_not_checkout_again(
 
     monkeypatch.setattr(database_module, "get_session_local", lambda: SessionLocal)
     held_connections = []
-    ticker_stop = asyncio.Event()
-    ticks = 0
-
-    async def ticker() -> None:
-        nonlocal ticks
-        while not ticker_stop.is_set():
-            ticks += 1
-            await asyncio.sleep(0.01)
+    checkout_probe = ExitStack()
 
     def checkout_from_exhausted_pool() -> None:
         with SessionLocal() as db:
@@ -1350,27 +1385,24 @@ async def test_command_handler_pool_timeout_does_not_checkout_again(
 
     async def execute(_command: ClaimedTaskCommand) -> None:
         held_connections.append(engine.connect())
+        checkout_probe.enter_context(assert_pool_checkout_off_loop(engine))
         await asyncio.to_thread(checkout_from_exhausted_pool)
 
     caplog.set_level(
         logging.ERROR,
         logger="xagent.web.services.task_command_transport",
     )
-    ticker_task = asyncio.create_task(ticker())
     try:
         assert await dispatch_one_task_command(
             execute,
             command_db_id=enqueued.command_id,
         )
-        assert ticks >= 10, (
-            "command handler QueuePool timeout blocked the event loop; "
-            f"ticker advanced only {ticks} times"
-        )
     finally:
-        ticker_stop.set()
-        await ticker_task
-        for connection in held_connections:
-            connection.close()
+        try:
+            checkout_probe.close()
+        finally:
+            for connection in held_connections:
+                connection.close()
 
     with SessionLocal() as verify_db:
         stored = verify_db.get(TaskExecutionCommand, enqueued.command_id)
@@ -1495,38 +1527,28 @@ async def test_real_final_disposition_pool_timeout_stays_off_event_loop(
 
     monkeypatch.setattr(database_module, "get_session_local", lambda: SessionLocal)
     held_connections = []
-    ticker_stop = asyncio.Event()
-    ticks = 0
-
-    async def ticker() -> None:
-        nonlocal ticks
-        while not ticker_stop.is_set():
-            ticks += 1
-            await asyncio.sleep(0.01)
+    checkout_probe = ExitStack()
 
     async def execute(_command: ClaimedTaskCommand) -> dict[str, bool]:
         held_connections.append(engine.connect())
+        checkout_probe.enter_context(assert_pool_checkout_off_loop(engine))
         return {"ok": True}
 
     caplog.set_level(
         logging.ERROR,
         logger="xagent.web.services.task_command_transport",
     )
-    ticker_task = asyncio.create_task(ticker())
     try:
         assert await dispatch_one_task_command(
             execute,
             command_db_id=enqueued.command_id,
         )
-        assert ticks >= 10, (
-            "final disposition QueuePool timeout blocked the event loop; "
-            f"ticker advanced only {ticks} times"
-        )
     finally:
-        ticker_stop.set()
-        await ticker_task
-        for connection in held_connections:
-            connection.close()
+        try:
+            checkout_probe.close()
+        finally:
+            for connection in held_connections:
+                connection.close()
 
     with SessionLocal() as verify_db:
         stored = verify_db.get(TaskExecutionCommand, enqueued.command_id)
@@ -1664,15 +1686,123 @@ async def test_dispatcher_worker_isolates_one_command_error(
         )
     )
     try:
-        await asyncio.wait_for(recovered.wait(), timeout=0.25)
+        await asyncio.wait_for(recovered.wait(), timeout=GUARD_TIMEOUT)
     finally:
         worker.cancel()
+        await asyncio.gather(worker, return_exceptions=True)
 
     with pytest.raises(asyncio.CancelledError):
-        await worker
+        worker.result()
     assert calls >= 2
     assert "component=task-command-dispatcher" in caplog.text
     assert "single command failure" in caplog.text
+
+
+def _dispatch_diagnostics(db_session, dispatch_task, command_db_id) -> str:
+    """Temporary CI diagnostics: why finish_task_command was never reached."""
+    import io
+
+    from xagent.config import (
+        get_shared_task_execution_enabled,
+        get_task_execution_role,
+        get_worker_count,
+    )
+
+    try:  # Added on main by the shared-worker admission change.
+        from xagent.web.models.task_admission import TaskAdmissionTicket
+        from xagent.web.services import task_execution_admission
+    except ImportError:
+        TaskAdmissionTicket = None
+        task_execution_admission = None
+    from xagent.web.services.task_execution_host import consumes_task_commands
+    from xagent.web.services.task_lease_service import get_runner_id
+
+    lines = [f"dispatch done={dispatch_task.done()}"]
+    if dispatch_task.done():
+        if dispatch_task.cancelled():
+            lines.append("dispatch cancelled")
+        elif dispatch_task.exception() is not None:
+            lines.append(f"dispatch exception={dispatch_task.exception()!r}")
+        else:
+            lines.append(f"dispatch result={dispatch_task.result()!r}")
+    else:
+        stack = io.StringIO()
+        dispatch_task.print_stack(file=stack)
+        lines.append(f"dispatch stack=\n{stack.getvalue()}")
+    lines.append(
+        "shared_enabled={} role={} worker_count={} consumes={} runner_id={}".format(
+            get_shared_task_execution_enabled(),
+            get_task_execution_role(),
+            get_worker_count(),
+            consumes_task_commands(),
+            get_runner_id(),
+        )
+    )
+    lines.append(
+        "admission_hook={!r}".format(
+            getattr(task_execution_admission, "_hook", "<no admission module>")
+        )
+    )
+    lines.append(
+        "env="
+        + repr(
+            {
+                key: value
+                for key, value in os.environ.items()
+                if key.startswith("XAGENT_")
+                and any(
+                    part in key
+                    for part in ("SHARED", "ROLE", "WORKER", "RUNNER", "LEASE")
+                )
+            }
+        )
+    )
+    db_session.expire_all()
+    command = db_session.get(TaskExecutionCommand, command_db_id)
+    if command is None:
+        lines.append("command row missing")
+    else:
+        lines.append(
+            "command status={} kind={} attempts={} claimed_by={} "
+            "claim_expires_at={} retry_available_at={}".format(
+                command.status,
+                command.kind,
+                command.attempt_count,
+                command.claimed_by,
+                command.claim_expires_at,
+                command.retry_available_at,
+            )
+        )
+        task_row = db_session.get(Task, command.task_id)
+        lines.append(
+            "task status={} runner_id={} run_id={} lease_attempt_id={} "
+            "lease_expires_at={}".format(
+                task_row.status,
+                task_row.runner_id,
+                task_row.run_id,
+                task_row.lease_attempt_id,
+                task_row.lease_expires_at,
+            )
+        )
+        if TaskAdmissionTicket is not None:
+            tickets = (
+                db_session.query(TaskAdmissionTicket)
+                .filter(TaskAdmissionTicket.command_id == command_db_id)
+                .count()
+            )
+            lines.append(f"admission tickets={tickets}")
+        lines.append(
+            "commands on task: "
+            + repr(
+                [
+                    (row.id, row.kind, row.status)
+                    for row in db_session.query(TaskExecutionCommand)
+                    .filter(TaskExecutionCommand.task_id == command.task_id)
+                    .all()
+                ]
+            )
+        )
+    return "finish_task_command not reached within 1s\n" + "\n".join(lines)
 
 
 @pytest.mark.asyncio
@@ -1713,7 +1843,12 @@ async def test_dispatch_cancellation_drains_inflight_completion_worker(
     dispatch_task = asyncio.create_task(
         dispatch_one_task_command(execute, command_db_id=enqueued.command_id)
     )
-    await asyncio.wait_for(asyncio.to_thread(finish_started.wait, 1), timeout=1)
+    try:
+        await asyncio.wait_for(asyncio.to_thread(finish_started.wait, 1), timeout=1)
+    except TimeoutError:
+        pytest.fail(
+            _dispatch_diagnostics(db_session, dispatch_task, enqueued.command_id)
+        )
     dispatch_task.cancel()
     try:
         await asyncio.sleep(0.02)
@@ -1975,7 +2110,9 @@ async def test_claim_heartbeat_survives_transient_database_error(
         renew,
     )
 
-    await asyncio.wait_for(_claim_heartbeat(7, "runner-a", 3, stop_event), timeout=0.2)
+    await asyncio.wait_for(
+        _claim_heartbeat(7, "runner-a", 3, stop_event), timeout=GUARD_TIMEOUT
+    )
 
     assert attempts == 2
 
@@ -1984,6 +2121,20 @@ async def test_claim_heartbeat_survives_transient_database_error(
 async def test_dispatcher_does_not_erase_wakeup_during_empty_claim(monkeypatch) -> None:
     second_claim = asyncio.Event()
     calls = 0
+    notification_delivered = asyncio.Event()
+    wakeup_at_empty_claim = []
+
+    class ObservedWakeup(asyncio.Event):
+        def set(self):
+            super().set()
+            notification_delivered.set()
+
+        async def wait(self):
+            if calls == 1:
+                wakeup_at_empty_claim.append(self.is_set())
+            return await super().wait()
+
+    wakeup = ObservedWakeup()
 
     async def fake_dispatch(_executor, *, command_db_id=None) -> bool:
         nonlocal calls
@@ -1991,6 +2142,8 @@ async def test_dispatcher_does_not_erase_wakeup_during_empty_claim(monkeypatch) 
         calls += 1
         if calls == 1:
             notify_task_command_dispatcher()
+            # Deliver the notification while the first claim is still in flight.
+            await notification_delivered.wait()
             return False
         second_claim.set()
         return False
@@ -2000,13 +2153,27 @@ async def test_dispatcher_does_not_erase_wakeup_during_empty_claim(monkeypatch) 
         fake_dispatch,
     )
 
-    start_task_command_dispatcher(lambda _command: asyncio.sleep(0))
+    monkeypatch.setattr(task_command_transport_module, "_dispatcher_wakeup", wakeup)
+    monkeypatch.setattr(
+        task_command_transport_module, "_dispatcher_loop", asyncio.get_running_loop()
+    )
+    # One worker must observe the notification; a sibling or the periodic poll
+    # must not make a lost wakeup look like success.
+    worker = asyncio.create_task(
+        task_command_transport_module._run_task_command_dispatcher_worker(
+            lambda _command: asyncio.sleep(0)
+        )
+    )
     try:
-        await asyncio.wait_for(second_claim.wait(), timeout=0.25)
+        await asyncio.wait_for(second_claim.wait(), timeout=GUARD_TIMEOUT)
     finally:
-        await stop_task_command_dispatcher()
+        worker.cancel()
+        await asyncio.gather(worker, return_exceptions=True)
 
+    with pytest.raises(asyncio.CancelledError):
+        worker.result()
     assert calls >= 2
+    assert wakeup_at_empty_claim == [True]
 
 
 @pytest.mark.asyncio
@@ -2123,7 +2290,7 @@ def test_websocket_enqueue_rejects_missing_task_with_client_visible_wording(
             payload={"type": "pause_task"},
             allow_missing_task=False,
         )
-    assert isinstance(raised.value, websocket_api.ClientVisibleValidationError)
+    assert isinstance(raised.value, task_execution_service.ClientVisibleValidationError)
     assert str(raised.value) == f"Task {task_id} not found"
 
 
@@ -2736,6 +2903,7 @@ async def test_dispatch_with_staged_id_before_commit_is_noop_and_converges_after
         await stop_task_command_dispatcher()
 
 
+@pytest.mark.timeout(30)
 def test_owner_holding_a_flushed_command_blocks_a_concurrent_claim(
     low_timeout_sqlite_engine,
 ) -> None:
@@ -2744,7 +2912,8 @@ def test_owner_holding_a_flushed_command_blocks_a_concurrent_claim(
     transaction -- far longer than the microseconds an insert that committed
     itself holds it for. SQLite's writer lock is database-wide, so a concurrent claim
     of a different, already-committed command must still wait out
-    busy_timeout and fail with OperationalError rather than hang."""
+    busy_timeout and fail with OperationalError. Once the owner commits,
+    the same command must be claimable."""
 
     engine, SessionLocal = low_timeout_sqlite_engine
     with SessionLocal() as setup_db:
@@ -2773,18 +2942,25 @@ def test_owner_holding_a_flushed_command_blocks_a_concurrent_claim(
             payload={"agent_id": 1},
         )
         # Deliberately not committed yet -- this is the window under test.
-        started = time.monotonic()
         with SessionLocal() as claimant_db:
-            with pytest.raises(OperationalError):
+            with pytest.raises(OperationalError, match="database is locked"):
                 claim_task_command(
                     claimant_db,
                     runner_id="lock-path-claimant",
                     command_db_id=claimable.command_id,
                 )
-        elapsed = time.monotonic() - started
         owner_db.commit()
 
-    assert elapsed < 2.0
+    with SessionLocal() as claimant_db:
+        claimed = claim_task_command(
+            claimant_db,
+            runner_id="lock-path-claimant",
+            command_db_id=claimable.command_id,
+        )
+
+    assert claimed is not None
+    assert claimed.id == claimable.command_id
+    assert claimed.attempt_count == 1
 
 
 @pytest.mark.asyncio
@@ -2929,3 +3105,30 @@ def test_defer_budget_is_coupled_to_the_lease_ttl(
     # An invalid value falls back to the default TTL, not the floor.
     monkeypatch.setenv("XAGENT_TASK_LEASE_TTL_SECONDS", "not-a-number")
     assert max_command_defers() == 120
+
+
+def test_duplicate_command_cannot_replace_persisted_reply_origin(db_session):
+    user, task = _create_running_task(db_session)
+    arguments = dict(
+        task_id=int(task.id),
+        actor_user_id=int(user.id),
+        command_id="routed-pause",
+        kind=TaskCommandKind.PAUSE,
+        payload={"type": "pause_task"},
+    )
+    original = enqueue_task_command(
+        db_session, **arguments, reply_host_id="web-a", reply_origin="socket-a"
+    )
+    duplicate = enqueue_task_command(
+        db_session, **arguments, reply_host_id="web-b", reply_origin="socket-b"
+    )
+    assert original.created
+    assert not duplicate.created
+    assert duplicate.payload_matches
+    db_session.expire_all()
+    row = (
+        db_session.query(TaskExecutionCommand)
+        .filter_by(command_id="routed-pause")
+        .one()
+    )
+    assert (row.reply_host_id, row.reply_origin) == ("web-a", "socket-a")

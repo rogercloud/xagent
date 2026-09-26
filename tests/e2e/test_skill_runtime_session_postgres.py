@@ -47,6 +47,16 @@ POSTGRES_DATABASE = "xagent_test"
 MIN_SERVER_VERSION_NUM = 170000
 SKILL_INDEX_SENTINEL = "Pool handoff regression fixture"
 QUESTION = "Which deployment target should I use?"
+# Mirrors interaction_types.DEFAULT_WAITING_INTERACTION as a literal on
+# purpose: a change to the published shape must fail here, not follow the
+# source.
+DEFAULT_WAITING_FIELD = {
+    "type": "text_input",
+    "field": "response",
+    "label": "Your response",
+    "placeholder": "Type your answer",
+    "multiline": True,
+}
 EXPECTED_SKILL_INDEX_LINE = (
     "- session-safe: Pool handoff regression fixture "
     "When to use: Test authenticated Skill database reads"
@@ -137,6 +147,10 @@ def _configure_postgres_app(
     postgres_url: str,
 ) -> None:
     monkeypatch.setenv("DATABASE_URL", postgres_url)
+    # These tests measure request/service checkouts, not worker polling.
+    # A combined host dispatcher can borrow the only slot after a response
+    # and make the zero-checkout assertions fail despite correct cleanup.
+    monkeypatch.setenv("XAGENT_TASK_EXECUTION_ROLE", "web")
     monkeypatch.setenv("XAGENT_DB_POOL_SIZE", "1")
     monkeypatch.setenv("XAGENT_DB_MAX_OVERFLOW", "0")
     monkeypatch.setenv("XAGENT_DB_POOL_TIMEOUT_SECONDS", "1")
@@ -529,7 +543,7 @@ async def test_retained_agent_services_wait_without_holding_postgres_pool(
     tmp_path: Path,
     postgres_url: str,
 ) -> None:
-    from xagent.web.api.chat import create_default_tools
+    from xagent.web.services.agent_service_manager import create_default_tools
 
     _configure_postgres_app(
         monkeypatch,
@@ -651,10 +665,10 @@ async def test_retained_agent_services_wait_without_holding_postgres_pool(
             assert result["status"] == "waiting_for_user"
             assert result["message"] == QUESTION
             assert result["message_type"] == "question"
-            assert result["interactions"] == []
+            assert result["interactions"] == [DEFAULT_WAITING_FIELD]
             assert result["chat_response"] == {
                 "message": QUESTION,
-                "interactions": [],
+                "interactions": [DEFAULT_WAITING_FIELD],
             }
             assert (
                 service.get_execution_status(f"retained-skill-runtime-{index}")[

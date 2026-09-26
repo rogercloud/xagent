@@ -14,6 +14,12 @@ from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import QueuePool
 
 from tests.shared.db_teardown import drop_all_tables
+from tests.web.pool_contention_shared import (
+    GUARD_TIMEOUT,
+    LOOP_LIVENESS_TICKS,
+    gated_pool_checkout,
+    wait_for_ticks,
+)
 from xagent.core.agent.checkpoint import CHECKPOINT_TYPE, LEGACY_CHECKPOINT_TYPES
 from xagent.web.models import database as database_module
 from xagent.web.models.database import Base, get_db, get_engine, init_db
@@ -314,6 +320,7 @@ def test_refresh_batch_uses_one_pool_checkout(
                 execution_mode="auto",
                 runner_id="runner-a",
                 run_id=run_id,
+                lease_attempt_id="test-attempt",
             )
             seed_db.add(task)
             seed_db.flush()
@@ -322,6 +329,7 @@ def test_refresh_batch_uses_one_pool_checkout(
                     task_id=int(task.id),
                     runner_id="runner-a",
                     run_id=run_id,
+                    attempt_id="test-attempt",
                 )
             )
         seed_db.commit()
@@ -371,6 +379,7 @@ def test_fail_and_release_task_lease_rejects_superseded_owner(db_session) -> Non
     assert stale_lease is not None
 
     task.runner_id = "new-runner"
+    task.lease_attempt_id = "test-attempt"
     task.run_id = "new-run"
     task.error_message = None
     task.output = "new owner output"
@@ -498,6 +507,7 @@ async def test_lease_heartbeat_keeps_loop_responsive_during_pool_checkout(
         task = _create_task(seed_db, status=TaskStatus.RUNNING)
         task_id = int(task.id)
         task.runner_id = "runner-a"
+        task.lease_attempt_id = "test-attempt"
         task.run_id = "run-a"
         seed_db.commit()
 
@@ -532,26 +542,37 @@ async def test_lease_heartbeat_keeps_loop_responsive_during_pool_checkout(
             await asyncio.sleep(0.01)
             ticks += 1
 
-    heartbeat_task = asyncio.create_task(
-        run_task_lease_heartbeat(
-            TaskLease(task_id=task_id, runner_id="runner-a", run_id="run-a"),
-            stop_event,
+    with gated_pool_checkout(engine) as gate:
+        heartbeat_task = asyncio.create_task(
+            run_task_lease_heartbeat(
+                TaskLease(
+                    task_id=task_id,
+                    runner_id="runner-a",
+                    run_id="run-a",
+                    attempt_id="test-attempt",
+                ),
+                stop_event,
+            )
         )
-    )
-    ticker_task = asyncio.create_task(ticker())
-    try:
-        await asyncio.sleep(0.12)
-        assert ticks >= 3, "QueuePool checkout blocked the asyncio event loop"
-    finally:
-        held_connection.close()
-        stop_event.set()
-        await asyncio.wait_for(heartbeat_task, timeout=1)
-        ticker_stop.set()
-        await ticker_task
+        ticker_task = asyncio.create_task(ticker())
+        try:
+            await gate.wait_until_contending()
+            observed = await wait_for_ticks(lambda: ticks)
+            assert observed >= LOOP_LIVENESS_TICKS
+        finally:
+            held_connection.close()
+            gate.let_through()
+            stop_event.set()
+            ticker_stop.set()
+            await asyncio.wait_for(
+                asyncio.gather(heartbeat_task, ticker_task, return_exceptions=True),
+                timeout=GUARD_TIMEOUT,
+            )
+        heartbeat_task.result()
 
-    with SessionLocal() as verify_db:
-        refreshed = verify_db.query(Task).filter(Task.id == task_id).one()
-        assert refreshed.last_heartbeat_at is not None
+        with SessionLocal() as verify_db:
+            refreshed = verify_db.query(Task).filter(Task.id == task_id).one()
+            assert refreshed.last_heartbeat_at is not None
 
 
 @pytest.mark.asyncio
@@ -565,7 +586,7 @@ async def test_stop_heartbeat_waits_for_shared_batch_result(monkeypatch) -> None
         refresh_started.set()
         assert allow_refresh_to_finish.wait(timeout=2)
         return {
-            (lease.task_id, lease.runner_id, lease.run_id): (
+            (lease.task_id, lease.runner_id, lease.run_id, lease.attempt_id): (
                 TaskLeaseRefreshState.REFRESHED
             )
             for lease in leases
@@ -585,7 +606,12 @@ async def test_stop_heartbeat_waits_for_shared_batch_result(monkeypatch) -> None
     stop_event = asyncio.Event()
     heartbeat_task = asyncio.create_task(
         run_task_lease_heartbeat(
-            TaskLease(task_id=1, runner_id="runner-a", run_id="run-a"),
+            TaskLease(
+                task_id=1,
+                runner_id="runner-a",
+                run_id="run-a",
+                attempt_id="test-attempt",
+            ),
             stop_event,
         )
     )
@@ -617,7 +643,7 @@ async def test_cancelled_heartbeat_manager_settles_active_registration(
         refresh_started.set()
         assert allow_refresh_to_finish.wait(timeout=2)
         return {
-            (lease.task_id, lease.runner_id, lease.run_id): (
+            (lease.task_id, lease.runner_id, lease.run_id, lease.attempt_id): (
                 TaskLeaseRefreshState.REFRESHED
             )
             for lease in leases
@@ -636,7 +662,9 @@ async def test_cancelled_heartbeat_manager_settles_active_registration(
 
     manager = task_lease_service._TaskLeaseHeartbeatManager(asyncio.get_running_loop())
     registration = manager.register(
-        TaskLease(task_id=1, runner_id="runner-a", run_id="run-a")
+        TaskLease(
+            task_id=1, runner_id="runner-a", run_id="run-a", attempt_id="test-attempt"
+        )
     )
     await asyncio.wait_for(asyncio.to_thread(refresh_started.wait, 1), timeout=1)
 
@@ -704,7 +732,7 @@ async def test_repeated_cancellation_drains_heartbeat_close_and_waiters(
         refresh_started.set()
         assert allow_refresh_to_finish.wait(timeout=2)
         return {
-            (lease.task_id, lease.runner_id, lease.run_id): (
+            (lease.task_id, lease.runner_id, lease.run_id, lease.attempt_id): (
                 TaskLeaseRefreshState.REFRESHED
             )
             for lease in leases
@@ -729,7 +757,12 @@ async def test_repeated_cancellation_drains_heartbeat_close_and_waiters(
 
     heartbeat_task = asyncio.get_running_loop().create_task(
         run_task_lease_heartbeat(
-            TaskLease(task_id=1, runner_id="runner-a", run_id="run-a"),
+            TaskLease(
+                task_id=1,
+                runner_id="runner-a",
+                run_id="run-a",
+                attempt_id="test-attempt",
+            ),
             asyncio.Event(),
         )
     )
@@ -765,14 +798,41 @@ async def test_repeated_cancellation_drains_heartbeat_close_and_waiters(
 
 @pytest.mark.asyncio
 async def test_heartbeat_requires_exact_run_id() -> None:
-    lease = TaskLease(task_id=1, runner_id="runner-a")
+    lease = TaskLease(task_id=1, runner_id="runner-a", attempt_id="test-attempt")
 
     with pytest.raises(ValueError, match="exact run_id fence"):
         await run_task_lease_heartbeat(lease, asyncio.Event())
 
 
+@pytest.fixture
+def heartbeat_batch_ready(monkeypatch):
+    """Start the shared runner only after both test leases are registered."""
+    manager_type = task_lease_service._TaskLeaseHeartbeatManager
+    register = manager_type.register
+    run = manager_type._run
+    ready = asyncio.Event()
+    registrations = 0
+
+    def register_and_signal(manager, lease):
+        nonlocal registrations
+        registration = register(manager, lease)
+        registrations += 1
+        if registrations == 2:
+            ready.set()
+        return registration
+
+    async def run_when_ready(manager):
+        await asyncio.wait_for(ready.wait(), timeout=GUARD_TIMEOUT)
+        await run(manager)
+
+    monkeypatch.setattr(manager_type, "register", register_and_signal)
+    monkeypatch.setattr(manager_type, "_run", run_when_ready)
+
+
 @pytest.mark.asyncio
-async def test_heartbeat_batches_registered_leases(monkeypatch) -> None:
+async def test_heartbeat_batches_registered_leases(
+    monkeypatch, heartbeat_batch_ready
+) -> None:
     refreshed = threading.Event()
     batches: list[tuple[TaskLease, ...]] = []
 
@@ -782,7 +842,7 @@ async def test_heartbeat_batches_registered_leases(monkeypatch) -> None:
         batches.append(leases)
         refreshed.set()
         return {
-            (lease.task_id, lease.runner_id, lease.run_id): (
+            (lease.task_id, lease.runner_id, lease.run_id, lease.attempt_id): (
                 TaskLeaseRefreshState.REFRESHED
             )
             for lease in leases
@@ -803,26 +863,38 @@ async def test_heartbeat_batches_registered_leases(monkeypatch) -> None:
     second_stop = asyncio.Event()
     first_task = asyncio.create_task(
         run_task_lease_heartbeat(
-            TaskLease(task_id=1, runner_id="runner-a", run_id="run-a"),
+            TaskLease(
+                task_id=1,
+                runner_id="runner-a",
+                run_id="run-a",
+                attempt_id="test-attempt",
+            ),
             first_stop,
         )
     )
     second_task = asyncio.create_task(
         run_task_lease_heartbeat(
-            TaskLease(task_id=2, runner_id="runner-a", run_id="run-b"),
+            TaskLease(
+                task_id=2,
+                runner_id="runner-a",
+                run_id="run-b",
+                attempt_id="test-attempt",
+            ),
             second_stop,
         )
     )
-    assert await asyncio.to_thread(refreshed.wait, 1)
+    try:
+        assert await asyncio.to_thread(refreshed.wait, GUARD_TIMEOUT)
+    finally:
+        first_stop.set()
+        second_stop.set()
+        await asyncio.gather(
+            stop_task_lease_heartbeat(first_task, first_stop),
+            stop_task_lease_heartbeat(second_task, second_stop),
+        )
+        await task_lease_service.wait_for_heartbeat_manager_idle()
 
-    await stop_task_lease_heartbeat(first_task, first_stop)
-    await stop_task_lease_heartbeat(second_task, second_stop)
-    await task_lease_service.wait_for_heartbeat_manager_idle()
-
-    # The 1 ms test interval may legitimately permit another refresh for the
-    # second lease between the two sequential stop calls.  The batching
-    # invariant is that the first interval refreshes both active leases with
-    # one worker checkout, not that no later interval can run.
+    # Both registered leases must share the first worker checkout.
     assert batches
     assert {(lease.task_id, lease.run_id) for lease in batches[0]} == {
         (1, "run-a"),
@@ -839,8 +911,10 @@ async def test_old_batch_result_does_not_contaminate_replacement_registration(
     second_refresh_started = threading.Event()
     allow_second_refresh = threading.Event()
     attempts = 0
-    lease = TaskLease(task_id=1, runner_id="runner-a", run_id="run-a")
-    key = (lease.task_id, lease.runner_id, lease.run_id)
+    lease = TaskLease(
+        task_id=1, runner_id="runner-a", run_id="run-a", attempt_id="test-attempt"
+    )
+    key = (lease.task_id, lease.runner_id, lease.run_id, lease.attempt_id)
 
     def refresh_batch(
         _leases: tuple[TaskLease, ...],
@@ -905,7 +979,7 @@ async def test_old_batch_result_does_not_contaminate_replacement_registration(
 
 @pytest.mark.asyncio
 async def test_stop_heartbeat_reports_shared_batch_pool_timeout(
-    monkeypatch, caplog
+    monkeypatch, caplog, heartbeat_batch_ready
 ) -> None:
     refresh_attempted = threading.Event()
     allow_timeout = threading.Event()
@@ -915,7 +989,7 @@ async def test_stop_heartbeat_reports_shared_batch_pool_timeout(
         _leases: tuple[TaskLease, ...],
     ) -> dict[tuple[int, str, str | None], TaskLeaseRefreshState]:
         refresh_attempted.set()
-        assert allow_timeout.wait(timeout=2)
+        assert allow_timeout.wait(timeout=GUARD_TIMEOUT)
         raise heartbeat_timeout
 
     monkeypatch.setattr(
@@ -957,18 +1031,29 @@ async def test_stop_heartbeat_reports_shared_batch_pool_timeout(
         with caplog.at_level(logging.WARNING):
             first_heartbeat_task = asyncio.create_task(
                 run_task_lease_heartbeat(
-                    TaskLease(task_id=1, runner_id="runner-a", run_id="run-a"),
+                    TaskLease(
+                        task_id=1,
+                        runner_id="runner-a",
+                        run_id="run-a",
+                        attempt_id="test-attempt",
+                    ),
                     first_stop_event,
                 )
             )
             second_heartbeat_task = asyncio.create_task(
                 run_task_lease_heartbeat(
-                    TaskLease(task_id=2, runner_id="runner-b", run_id="run-b"),
+                    TaskLease(
+                        task_id=2,
+                        runner_id="runner-b",
+                        run_id="run-b",
+                        attempt_id="test-attempt",
+                    ),
                     second_stop_event,
                 )
             )
-            await asyncio.wait_for(
-                asyncio.to_thread(refresh_attempted.wait, 1), timeout=1
+            assert await asyncio.wait_for(
+                asyncio.to_thread(refresh_attempted.wait, GUARD_TIMEOUT),
+                timeout=GUARD_TIMEOUT,
             )
 
             first_stopping = asyncio.create_task(
@@ -984,7 +1069,7 @@ async def test_stop_heartbeat_reports_shared_batch_pool_timeout(
             allow_timeout.set()
             first_outcome, second_outcome = await asyncio.wait_for(
                 asyncio.gather(first_stopping, second_stopping),
-                timeout=1,
+                timeout=GUARD_TIMEOUT,
             )
 
         heartbeat_warnings = [
@@ -1027,7 +1112,12 @@ async def test_stop_heartbeat_reports_lost_ownership(monkeypatch) -> None:
         leases: tuple[TaskLease, ...],
     ) -> dict[tuple[int, str, str | None], TaskLeaseRefreshState]:
         return {
-            (lease.task_id, lease.runner_id, lease.run_id): TaskLeaseRefreshState.LOST
+            (
+                lease.task_id,
+                lease.runner_id,
+                lease.run_id,
+                lease.attempt_id,
+            ): TaskLeaseRefreshState.LOST
             for lease in leases
         }
 
@@ -1045,7 +1135,12 @@ async def test_stop_heartbeat_reports_lost_ownership(monkeypatch) -> None:
     stop_event = asyncio.Event()
     heartbeat_task = asyncio.create_task(
         run_task_lease_heartbeat(
-            TaskLease(task_id=1, runner_id="runner-a", run_id="run-a"),
+            TaskLease(
+                task_id=1,
+                runner_id="runner-a",
+                run_id="run-a",
+                attempt_id="test-attempt",
+            ),
             stop_event,
         )
     )
@@ -1066,7 +1161,7 @@ async def test_heartbeat_does_not_report_settlement_ready_as_lease_lost(
         leases: tuple[TaskLease, ...],
     ) -> dict[tuple[int, str, str | None], TaskLeaseRefreshState]:
         return {
-            (lease.task_id, lease.runner_id, lease.run_id): (
+            (lease.task_id, lease.runner_id, lease.run_id, lease.attempt_id): (
                 TaskLeaseRefreshState.SETTLEMENT_READY
             )
             for lease in leases
@@ -1093,7 +1188,12 @@ async def test_heartbeat_does_not_report_settlement_ready_as_lease_lost(
 
     outcome = await asyncio.wait_for(
         run_task_lease_heartbeat(
-            TaskLease(task_id=1, runner_id="runner-a", run_id="run-a"),
+            TaskLease(
+                task_id=1,
+                runner_id="runner-a",
+                run_id="run-a",
+                attempt_id="test-attempt",
+            ),
             asyncio.Event(),
         ),
         timeout=5,
@@ -1120,7 +1220,7 @@ async def test_batch_heartbeat_recovers_after_transient_pool_timeout(
             raise SQLAlchemyTimeoutError("transient pool checkout timeout")
         refresh_recovered.set()
         return {
-            (lease.task_id, lease.runner_id, lease.run_id): (
+            (lease.task_id, lease.runner_id, lease.run_id, lease.attempt_id): (
                 TaskLeaseRefreshState.REFRESHED
             )
             for lease in leases
@@ -1140,7 +1240,12 @@ async def test_batch_heartbeat_recovers_after_transient_pool_timeout(
     stop_event = asyncio.Event()
     heartbeat_task = asyncio.create_task(
         run_task_lease_heartbeat(
-            TaskLease(task_id=1, runner_id="runner-a", run_id="run-a"),
+            TaskLease(
+                task_id=1,
+                runner_id="runner-a",
+                run_id="run-a",
+                attempt_id="test-attempt",
+            ),
             stop_event,
         )
     )
@@ -1158,7 +1263,9 @@ async def test_cancellation_safe_acquire_drains_and_cleans_returned_lease() -> N
     allow_acquire_to_finish = threading.Event()
     cleanup_started = threading.Event()
     allow_cleanup_to_finish = threading.Event()
-    expected_lease = TaskLease(task_id=9, runner_id="runner-a", run_id="run-a")
+    expected_lease = TaskLease(
+        task_id=9, runner_id="runner-a", run_id="run-a", attempt_id="test-attempt"
+    )
     cleaned_leases: list[TaskLease] = []
 
     def acquire() -> TaskLease:
@@ -1312,6 +1419,7 @@ def test_running_task_reacquire_retains_checkpoint_pointer_via_case(
     """
     task = _create_task(db_session, status=TaskStatus.RUNNING)
     task.runner_id = "runner-a"
+    task.lease_attempt_id = "test-attempt"
     task.run_id = "existing-run"
     task.last_checkpoint_event_id = "existing-checkpoint"
     checkpoint = TraceEvent(
@@ -1366,6 +1474,7 @@ def test_old_lease_cannot_refresh_or_release_a_new_run(db_session) -> None:
     task.status = TaskStatus.RUNNING
     task.control_state = "running"
     task.runner_id = "runner-a"
+    task.lease_attempt_id = "test-attempt"
     db_session.commit()
 
     assert refresh_task_lease(db_session, old_lease) == TaskLeaseRefreshState.LOST
@@ -1413,6 +1522,7 @@ def test_stale_running_task_with_checkpoint_becomes_paused(db_session) -> None:
 def test_stale_running_task_ignores_child_agent_checkpoint(db_session) -> None:
     task = _create_task(db_session, status=TaskStatus.RUNNING)
     task.runner_id = "dead-runner"
+    task.lease_attempt_id = "test-attempt"
     task.run_id = "child-checkpoint-run"
     task.lease_expires_at = utc_now() - timedelta(seconds=1)
     task.last_checkpoint_event_id = "child-checkpoint-1"
@@ -1449,6 +1559,7 @@ def test_stale_running_task_ignores_child_agent_checkpoint(db_session) -> None:
 def test_stale_running_task_with_legacy_checkpoint_becomes_paused(db_session) -> None:
     task = _create_task(db_session, status=TaskStatus.RUNNING)
     task.runner_id = "dead-runner"
+    task.lease_attempt_id = "test-attempt"
     task.run_id = "legacy-checkpoint-run"
     task.lease_expires_at = utc_now() - timedelta(seconds=1)
     task.last_checkpoint_event_id = "legacy-checkpoint-1"
@@ -1618,25 +1729,24 @@ def test_release_current_runner_task_lease_clears_the_attempt_id(db_session) -> 
     db_session.refresh(task)
     assert task.lease_attempt_id is not None
 
-    changed = task_lease_service.release_current_runner_task_lease(
-        db_session,
-        int(task.id),
-        status=TaskStatus.PAUSED,
-        runner_id="runner-a",
-    )
+    with task_lease_service.bind_task_lease_context(lease):
+        changed = task_lease_service.release_current_runner_task_lease(
+            db_session,
+            int(task.id),
+            status=TaskStatus.PAUSED,
+            runner_id="runner-a",
+        )
 
     assert changed is True
     db_session.refresh(task)
     assert task.lease_attempt_id is None
 
 
-def test_task_lease_snapshot_never_carries_an_attempt_id() -> None:
-    """The ambient snapshot rebuilt from a task row must keep attempt_id None
-    even when the row has one, so a later attempt check cannot compare a
-    value against itself and always pass."""
+def test_task_lease_snapshot_carries_the_routing_epoch() -> None:
+    """A routing key includes the epoch; it must resolve to a local holder."""
     from types import SimpleNamespace
 
-    from xagent.web.api.websocket import _task_lease_snapshot
+    from xagent.web.services.task_command_execution import _task_lease_snapshot
 
     row = SimpleNamespace(
         id=7,
@@ -1646,4 +1756,4 @@ def test_task_lease_snapshot_never_carries_an_attempt_id() -> None:
     )
     lease = _task_lease_snapshot(row)
     assert lease is not None
-    assert lease.attempt_id is None
+    assert lease.attempt_id == "attempt-c"

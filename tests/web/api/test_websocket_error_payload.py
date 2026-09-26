@@ -1,7 +1,6 @@
-import sys
 import threading
 from datetime import datetime, timedelta, timezone
-from types import ModuleType, SimpleNamespace
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -9,10 +8,13 @@ from sqlalchemy import event
 from sqlalchemy.exc import TimeoutError as SQLAlchemyTimeoutError
 
 from xagent.web.api import websocket as websocket_api
-from xagent.web.api.websocket import _terminal_task_error_payload
+from xagent.web.api.websocket import _make_command_reply
 from xagent.web.models.database import get_engine
 from xagent.web.models.task import Task, TaskStatus
 from xagent.web.models.user import User
+from xagent.web.services import task_command_execution as command_execution_service
+from xagent.web.services import task_execution as task_execution_service
+from xagent.web.services.task_execution import _terminal_task_error_payload
 from xagent.web.services.task_lease_service import TaskLease, get_runner_id
 
 from .conftest import _direct_db_session
@@ -61,8 +63,19 @@ def test_terminal_task_error_payload_marks_unowned_task_failed(_test_db):
         assert payload["message"] == websocket_api.CLIENT_SAFE_TASK_FAILURE
         assert payload["task"]["id"] == task_id
         assert payload["task"]["status"] == "failed"
-        assert len(task_updates) == 1
-        assert "tasks.runner_id IS NULL" in task_updates[0]
+        # Exactly one *status* write, and it still carries the ownership
+        # fence -- that is what this test exists to protect. The path now
+        # emits a second `UPDATE tasks` as well: persisting the client-safe
+        # failure message advances the retention anchor (#2562), and it runs
+        # only after the fenced transition above reported rowcount 1, so it
+        # cannot touch a task this path failed to claim. Asserting the split
+        # rather than a bumped count keeps an unfenced *status* write from
+        # slipping in behind the anchor.
+        status_updates = [s for s in task_updates if "tasks.runner_id IS NULL" in s]
+        anchor_updates = [s for s in task_updates if "last_activity_at" in s]
+        assert len(status_updates) == 1
+        assert len(anchor_updates) == 1
+        assert len(task_updates) == len(status_updates) + len(anchor_updates)
 
         db.expire_all()
         persisted_task = db.query(Task).filter(Task.id == task_id).one()
@@ -246,7 +259,9 @@ def test_terminal_task_error_payload_fallback_never_returns_raw_detail(
     db = MagicMock()
     db.execute.side_effect = RuntimeError(secret)
     session_factory = MagicMock(return_value=db)
-    monkeypatch.setattr(websocket_api, "get_session_local", lambda: session_factory)
+    monkeypatch.setattr(
+        task_execution_service, "get_session_local", lambda: session_factory
+    )
 
     payload = _terminal_task_error_payload(42, f"raw diagnostic: {secret}")
 
@@ -305,12 +320,10 @@ async def test_legacy_handler_does_not_steal_live_foreign_lease(
         async def get_agent_for_task(self, *args, **kwargs):
             raise failure_type("setup failed")
 
-    fake_chat_module = ModuleType("xagent.web.api.chat")
-    fake_chat_module.get_agent_manager = lambda: FailingAgentManager()  # type: ignore[attr-defined]
-    monkeypatch.setitem(
-        sys.modules,
-        "xagent.web.api.chat",
-        fake_chat_module,
+    from xagent.web.services import agent_service_manager
+
+    monkeypatch.setattr(
+        agent_service_manager, "get_agent_manager", lambda: FailingAgentManager()
     )
     monkeypatch.setattr(
         websocket_api.manager,
@@ -329,7 +342,7 @@ async def test_legacy_handler_does_not_steal_live_foreign_lease(
         return real_session_factory
 
     monkeypatch.setattr(
-        websocket_api,
+        command_execution_service if handler_name == "chat" else websocket_api,
         "get_session_local",
         tracked_get_session_local,
     )
@@ -340,8 +353,8 @@ async def test_legacy_handler_does_not_steal_live_foreign_lease(
         "user": SimpleNamespace(id=user_id, is_admin=False),
     }
     if handler_name == "chat":
-        await websocket_api._handle_chat_message_unserialized(
-            object(),
+        await command_execution_service.handle_task_message(
+            _make_command_reply(object()),
             task_id,
             message_data,
         )
@@ -505,8 +518,27 @@ async def test_handle_execute_task_unauthenticated_does_not_fail_task(
 
 
 @pytest.mark.asyncio
-async def test_execute_task_background_error_marks_task_failed(_test_db, monkeypatch):
+@pytest.mark.parametrize(
+    ("error_factory", "expected_error_code"),
+    [
+        (
+            lambda secret: RuntimeError(f"setup failed: {secret}"),
+            websocket_api.ClientErrorCode.TASK_EXECUTION_FAILED,
+        ),
+        (
+            lambda secret: websocket_api.AutoModelUnavailableError(
+                f"no active candidate: {secret}"
+            ),
+            websocket_api.ClientErrorCode.AUTO_MODEL_UNAVAILABLE,
+        ),
+    ],
+    ids=["generic", "auto-model-unavailable"],
+)
+async def test_execute_task_background_error_marks_task_failed(
+    _test_db, monkeypatch, error_factory, expected_error_code
+):
     secret = "provider-token-secret"
+    failure = error_factory(secret)
     db = _direct_db_session()
     try:
         user = User(username="owner", password_hash="hash")
@@ -535,7 +567,7 @@ async def test_execute_task_background_error_marks_task_failed(_test_db, monkeyp
 
     class FailingAgentManager:
         async def get_agent_for_task(self, *args, **kwargs):
-            raise RuntimeError(f"setup failed: {secret}")
+            raise failure
 
     monkeypatch.setattr(
         websocket_api.manager,
@@ -543,7 +575,7 @@ async def test_execute_task_background_error_marks_task_failed(_test_db, monkeyp
         fake_broadcast_to_task,
     )
 
-    await websocket_api.execute_task_background(
+    await task_execution_service.execute_task_background(
         task_id=task_id,
         user_message="run",
         context={},
@@ -556,8 +588,10 @@ async def test_execute_task_background_error_marks_task_failed(_test_db, monkeyp
     assert broadcast_task_id == task_id
     assert payload["type"] == "task_error"
     assert payload["task"]["status"] == "failed"
-    assert payload["message"] == websocket_api.CLIENT_SAFE_TASK_FAILURE
-    assert payload["error"] == websocket_api.CLIENT_SAFE_TASK_FAILURE
+    expected_message = websocket_api.client_error_message(expected_error_code)
+    assert payload["message"] == expected_message
+    assert payload["error"] == expected_message
+    assert payload["error_code"] == expected_error_code.value
     assert secret not in repr(payload)
 
     db = _direct_db_session()
@@ -567,7 +601,7 @@ async def test_execute_task_background_error_marks_task_failed(_test_db, monkeyp
         assert persisted_task.status == TaskStatus.FAILED
         assert persisted_task.runner_id is None
         assert persisted_task.lease_expires_at is None
-        assert persisted_task.error_message == f"setup failed: {secret}"
+        assert persisted_task.error_message == str(failure)
     finally:
         db.close()
 
@@ -616,10 +650,12 @@ async def test_orchestrated_background_error_defers_database_settlement(
         websocket_api.manager, "broadcast_to_task", fake_broadcast_to_task
     )
     terminal_writer = MagicMock()
-    monkeypatch.setattr(websocket_api, "_terminal_task_error_payload", terminal_writer)
+    monkeypatch.setattr(
+        task_execution_service, "_terminal_task_error_payload", terminal_writer
+    )
 
     with pytest.raises(RuntimeError, match="setup failed before execution"):
-        await websocket_api.execute_task_background(
+        await task_execution_service.execute_task_background(
             task_id=task_id,
             user_message="run",
             context={},
@@ -681,10 +717,12 @@ async def test_orchestrated_background_pool_timeout_is_not_broadcast_as_failed(
         websocket_api.manager, "broadcast_to_task", fake_broadcast_to_task
     )
     terminal_writer = MagicMock()
-    monkeypatch.setattr(websocket_api, "_terminal_task_error_payload", terminal_writer)
+    monkeypatch.setattr(
+        task_execution_service, "_terminal_task_error_payload", terminal_writer
+    )
 
     with pytest.raises(SQLAlchemyTimeoutError, match="setup pool exhausted"):
-        await websocket_api.execute_task_background(
+        await task_execution_service.execute_task_background(
             task_id=task_id,
             user_message="run",
             context={},
@@ -743,12 +781,12 @@ async def test_background_failure_uses_worker_owned_setup_and_terminal_sessions(
         load_snapshot,
     )
     monkeypatch.setattr(
-        websocket_api.background_task_manager,
+        task_execution_service.background_task_manager,
         "wait_for_previous",
         AsyncMock(),
     )
     monkeypatch.setattr(
-        websocket_api,
+        task_execution_service,
         "_terminal_task_error_payload",
         terminal_payload,
     )
@@ -758,7 +796,7 @@ async def test_background_failure_uses_worker_owned_setup_and_terminal_sessions(
         AsyncMock(),
     )
 
-    await websocket_api.execute_task_background(
+    await task_execution_service.execute_task_background(
         task_id=42,
         user_message="run",
         context={},

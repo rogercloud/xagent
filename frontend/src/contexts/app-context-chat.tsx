@@ -9,6 +9,7 @@ import { ReplayScheduler } from '@/lib/replay-scheduler'
 import { CollapsibleSection } from "@/components/collapsible-section"
 import { Badge } from "@/components/ui/badge"
 import { ClarificationForm } from "@/components/chat/clarification-form"
+import { ConnectorRuntimeDialog } from "@/components/chat/connector-runtime-dialog"
 import {
   AgentCardPresentationCapability,
   LinksOpenInNewTabCapability,
@@ -18,6 +19,8 @@ import {
   FileAccessProvider,
   type FileAccessPolicy,
 } from "@/contexts/file-access-context"
+import { useConnectorRuntimeDialogActionsIfMounted } from "@/contexts/connector-runtime-dialog-context"
+import { isConnectorRuntimeDialogTriggerCode } from "@/lib/connector-runtime-api"
 
 interface WebSocketMessage {
   type: string
@@ -28,6 +31,8 @@ interface WebSocketMessage {
   event_type?: string
   event_id?: string
   run_id?: string | null
+  stream_run_id?: string | null
+  stream_attempt_id?: string | null
   state_version?: number
   control_state?: TaskControlState
   status?: unknown
@@ -61,7 +66,8 @@ type TaskControlEnvelope = {
   status?: TaskStatus
 }
 
-const VERSIONED_TASK_EVENT_TYPES = new Set([
+export const VERSIONED_TASK_EVENT_TYPES = new Set([
+  "task_stream_snapshot",
   "agent_error",
   "error",
   "task_completed",
@@ -100,6 +106,8 @@ const TASK_SCOPED_ACTION_TYPES = new Set<AppAction["type"]>([
   "SET_HISTORY_LOADING",
   "ADD_MESSAGE",
   "UPSERT_STREAMING_FINAL_ANSWER",
+  "SET_STREAM_RECOVERY",
+  "RECONCILE_STREAM_OUTPUT",
   "ADD_TRACE_EVENT",
   "SET_CONTEXT_USAGE",
   "SET_PLAN_MEMORY_INFO",
@@ -356,7 +364,7 @@ import {
 } from "@/hooks/use-websocket"
 import { generateClientMessageId, getApiUrl, getUploadApiUrl, shouldAutoOpenTaskPreview } from "@/lib/utils"
 import { apiRequest, classifyUploadError, getApiErrorMessage, isJsonRecord, parseApiResponse } from "@/lib/api-wrapper"
-import { clientErrorTranslationKey, readClientErrorCode } from "@/lib/client-errors"
+import { clientErrorTranslationKey, readClientErrorCode, type ClientErrorCode } from "@/lib/client-errors"
 import { normalizeUploadFileIds } from "@/lib/upload-file-ids"
 import { useI18n, type Translate } from "@/contexts/i18n-context"
 import { normalizeTimestampMs } from "@/lib/time-utils"
@@ -374,6 +382,10 @@ import {
   shouldBufferMessageForHistoricalReplay,
 } from "@/lib/streaming-final-answer"
 import { extractSharedChatResponse } from "@/lib/chat-response"
+import {
+  isStableAssistantMessageId,
+  stableAssistantMessageId,
+} from "@/lib/assistant-message-identity"
 
 // Unique ID generator for messages
 let messageIdCounter = 0
@@ -440,7 +452,6 @@ const dispatchAutoOpenPreview = (
   })
 }
 
-const OPTIMISTIC_USER_MESSAGE_PREFIX = "msg-user-optimistic"
 const USER_TURN_MESSAGE_PREFIX = "msg-user-turn"
 const USER_EVENT_MESSAGE_PREFIX = "msg-user-event"
 const USER_MESSAGE_REPLACE_WINDOW_MS = 30000
@@ -487,11 +498,29 @@ const normalizeMessageContent = (content: string | React.ReactNode): string => {
   return ''
 }
 
+// A user message id minted from a stable per-turn identity: the wire's
+// `turn_id` / `event_id` (stableUserMessageId) or the sender's own
+// client_message_id (userTurnMessageId), which the backend echoes back as
+// that turn's id.
+const hasStableUserTurnIdentity = (id: string): boolean =>
+  id.startsWith(`${USER_TURN_MESSAGE_PREFIX}-`) ||
+  id.startsWith(`${USER_EVENT_MESSAGE_PREFIX}-`)
+
 const findOptimisticUserMessageIndex = (
   messages: Message[],
   incomingMessage: Message,
 ): number => {
   if (incomingMessage.role !== "user") {
+    return -1
+  }
+
+  // Identity beats text: a message carrying one is reconciled by
+  // ADD_MESSAGE's id branch alone. Merging by text instead can drop a turn
+  // from the transcript with no error, and repeated text is routine here -
+  // a clarification form with no free-text field serializes to a fixed
+  // string. Only identity-less legacy events still need text. See the commit
+  // for which same-turn pairs this gives up on, and why they are unreachable.
+  if (hasStableUserTurnIdentity(incomingMessage.id)) {
     return -1
   }
 
@@ -504,14 +533,7 @@ const findOptimisticUserMessageIndex = (
 
   for (let index = messages.length - 1; index >= 0; index -= 1) {
     const existingMessage = messages[index]
-    if (
-      existingMessage.role !== "user" ||
-      typeof existingMessage.id !== "string" ||
-      (
-        !existingMessage.isOptimistic &&
-        !existingMessage.id.startsWith(OPTIMISTIC_USER_MESSAGE_PREFIX)
-      )
-    ) {
+    if (existingMessage.role !== "user" || !existingMessage.isOptimistic) {
       continue
     }
 
@@ -965,14 +987,21 @@ export type ErrorFrameDisplay = {
   occurrenceIdentity: string | undefined
   bubbleContent: string
   isResult: boolean
+  /** The frame's own code, once it has cleared the client error table --
+   *  null on a non-terminal frame, a terminal frame with no code, or a code
+   *  the table does not list (e.g. auto_model_unavailable). Reuses the same
+   *  `projectedCode` this function already derives for the bubble; a caller
+   *  must not call getTaskErrorProjection a second time to get it. */
+  terminalErrorCode: ClientErrorCode | null
 }
 
-// One place where a frame on the error/task_error handler becomes the five
+// One place where a frame on the error/task_error handler becomes the six
 // values the handler needs: the bubble's wording, the dedup text, the dedup
-// identity, the result flag, and the task status to dispatch. Each of those
-// needs a different subset of "is this terminal / is legacy prose trusted /
-// did a code survive / is there a state version", and deriving each subset at
-// its own use site is what let five separate defects land in this handler.
+// identity, the result flag, the task status to dispatch, and the code that
+// opens the connector-runtime dialog. Each of those needs a different subset
+// of "is this terminal / is legacy prose trusted / did a code survive / is
+// there a state version", and deriving each subset at its own use site is
+// what let five separate defects land in this handler.
 // Pure on purpose: no dispatch, no refs, nothing
 // outside its arguments, so every cell of that matrix is unit-testable
 // without rendering the provider -- the same shape extractTaskControlEnvelope
@@ -1059,6 +1088,7 @@ export const projectErrorFrameForDisplay = (
     // ADD_MESSAGE reducer case's isResult branch, which merges
     // state.traceEvents into the message and clears it).
     isResult: isTerminal,
+    terminalErrorCode: projectedCode,
   }
 }
 
@@ -1163,6 +1193,7 @@ const normalizeDagExecutionPayload = (raw: Record<string, unknown>): DAGExecutio
 }
 
 export interface AppState {
+  streamRecoveryTaskId?: number | null
   messages: Message[]
   currentTask: Task | null
   taskRuntimeExtensions: TaskRuntimeExtensions
@@ -1210,6 +1241,8 @@ export interface AppState {
 }
 
 type AppAction =
+  | { type: "SET_STREAM_RECOVERY"; payload: number | null }
+  | { type: "RECONCILE_STREAM_OUTPUT"; payload: { runId: string; output: string; timestamp: string; interrupted: boolean } }
   | { type: "SESSION_CONVERSATION"; payload: SessionConversationAction }
   | { type: "SET_TASK_ID"; payload: number | null }
   | { type: "ADOPT_SESSION_TASK"; payload: { taskId: number; task: Task } }
@@ -1406,6 +1439,39 @@ function projectAppState(state: AppState, action: AppAction): AppState {
         }
       }
 
+      // One assistant question can be delivered twice -- live, then replayed
+      // from the transcript after a reconnect -- under one event identity but
+      // with different text, because the replayed copy carries the rendered
+      // interaction list. Identity decides, never text: #2250 is the record
+      // of what text matching costs. The mounted bubble is kept rather than
+      // replaced so an open clarification form is not remounted under the
+      // visitor; the re-delivery only fills in what the bubble lacks. Content
+      // is deliberately not among those fields: one event id is one question,
+      // and the replayed copy differs only by the rendered interaction list
+      // the form already draws.
+      if (messageToAdd.role === "assistant" && isStableAssistantMessageId(messageToAdd.id)) {
+        const deliveredIndex = state.messages.findIndex(
+          message => message.role === "assistant" && message.id === messageToAdd.id,
+        )
+        if (deliveredIndex >= 0) {
+          const updatedMessages = state.messages.map((message, index) =>
+            index === deliveredIndex
+              ? {
+                ...message,
+                interactions: message.interactions ?? messageToAdd.interactions,
+                interactionRequestId:
+                  message.interactionRequestId ?? messageToAdd.interactionRequestId,
+                traceEvents: mergeTraceEventsById(
+                  message.traceEvents,
+                  messageToAdd.traceEvents,
+                ),
+              }
+              : message
+          )
+          return { ...state, messages: updatedMessages, traceEvents: newTraceEvents }
+        }
+      }
+
       const optimisticUserMessageIndex = findOptimisticUserMessageIndex(
         state.messages,
         messageToAdd,
@@ -1459,6 +1525,40 @@ function projectAppState(state: AppState, action: AppAction): AppState {
         return normalizeTimestampMs(a.timestamp) - normalizeTimestampMs(b.timestamp)
       })
       return { ...state, messages: updatedMessages, traceEvents: newTraceEvents }
+    }
+
+    case "SET_STREAM_RECOVERY":
+      return { ...state, streamRecoveryTaskId: action.payload }
+
+    case "RECONCILE_STREAM_OUTPUT": {
+      const { runId, output, timestamp, interrupted } = action.payload
+      let resultIndex = -1
+      for (let index = state.messages.length - 1; index >= 0; index--) {
+        const message = state.messages[index]
+        if (message.role === "user") break
+        if (message.role === "assistant" && message.isResult) {
+          resultIndex = index
+          break
+        }
+      }
+      const existing = state.messages[resultIndex]
+      // Preserve richer live formatting/files when a complete result already
+      // arrived. A partial stream, or a missed result, needs the durable text.
+      if (existing?.status === "completed" && !interrupted) return state
+      const restored: Message = {
+        ...existing,
+        id: existing?.id ?? `final_answer_recovered_${runId}`,
+        role: "assistant",
+        content: output,
+        rawContent: output,
+        timestamp: existing?.timestamp ?? timestamp,
+        status: "completed",
+        isResult: true,
+      }
+      const messages = [...state.messages]
+      if (resultIndex >= 0) messages[resultIndex] = restored
+      else messages.push(restored)
+      return { ...state, messages, streamRecoveryTaskId: null }
     }
 
     case "UPSERT_STREAMING_FINAL_ANSWER": {
@@ -2071,6 +2171,18 @@ export function AppProvider({
   )
   const pendingTaskToExecuteRef = useRef<{ description: string } | null>(null)
   const startDelayedPlaybackRef = useRef<() => void>(() => {})
+  // Read through a ref, not a useCallback dependency, so the dialog
+  // provider's state changes never change handleMessage's or sendMessage's
+  // identity -- the same shape sessionMessageHandlerRef uses. Uses the
+  // "if mounted" form, not useConnectorRuntimeDialogActions(): this context
+  // is mounted on the widget/share pages with no ConnectorRuntimeDialogProvider
+  // above it, and every call site below that reads connectorRuntimeDialogRef
+  // legitimately expects that shape rather than a wiring mistake.
+  const connectorRuntimeDialogActions = useConnectorRuntimeDialogActionsIfMounted()
+  const connectorRuntimeDialogRef = useRef(connectorRuntimeDialogActions)
+  useLayoutEffect(() => {
+    connectorRuntimeDialogRef.current = connectorRuntimeDialogActions
+  }, [connectorRuntimeDialogActions])
   const isHistoricalDataLoadingRef = useRef(false)
   const historicalDataRequestMapRef = useRef(new Map<number, boolean>())
   const recentMessagesRef = useRef(new Map<string, ReturnType<typeof setTimeout>>())
@@ -2103,6 +2215,10 @@ export function AppProvider({
   // produced by the preceding action before React commits the batch.
   const stateRef = useRef(state)
   const dispatch = useCallback((action: AppAction) => {
+    // Whatever cleared the transcript (reconnect, task switch, workforce run
+    // swap) will have it replayed back; a surviving 30s entry would swallow
+    // the replayed bubbles as duplicates.
+    if (action.type === "CLEAR_MESSAGES") recentMessagesRef.current.clear()
     const next = projectAppState(stateRef.current, action)
     stateRef.current = next
     privateCommit({ state: next })
@@ -2190,6 +2306,14 @@ export function AppProvider({
   const { t } = useI18n()
   const router = useRouter()
   const lastConnectedTaskId = useRef<number | null>(null)
+  const sharedStreamRef = useRef<{
+    taskId?: number
+    runId?: string | null
+    attemptId?: string | null
+    interrupted: boolean
+    prefixSeen: boolean
+    complete: boolean
+  }>({ interrupted: false, prefixSeen: false, complete: false })
   const taskStateVersionsRef = useRef(
     new Map<number, TaskStateVersionEntry>()
   )
@@ -2618,7 +2742,41 @@ export function AppProvider({
         if (pendingTaskToExecuteRef.current) {
           const hasUserMessages = stateRef.current.messages.some(m => m.role === 'user')
           if (!hasUserMessages) {
-            sendChatMessage(pendingTaskToExecuteRef.current.description, [])
+            const description = pendingTaskToExecuteRef.current.description
+            const taskId = stateRef.current.taskId
+            const clientMessageId = generateClientMessageId()
+            // This auto-send bypasses sendMessage entirely (it predates the
+            // connector-runtime dialog and must keep this old path's own
+            // behavior unchanged, not gain sendMessage's optimistic bubble
+            // or send guards), so it never staged a resend candidate for
+            // itself. Stage/redeem/discard it here the same way sendMessage's
+            // own call sites do, or a terminal task_error this send provokes
+            // finds no candidate to offer.
+            if (typeof taskId === "number") {
+              connectorRuntimeDialogRef.current.stagePendingDelivery({
+                taskId, clientMessageId, text: description, files: [],
+              })
+            }
+            sendChatMessage(description, [], false, clientMessageId)
+              .then(() => {
+                if (typeof taskId === "number") {
+                  connectorRuntimeDialogRef.current.recordDelivery({
+                    taskId, clientMessageId, text: description, files: [],
+                  })
+                }
+              })
+              .catch(() => {
+                // Logged, not rethrown. This is a detached promise inside a
+                // setTimeout callback: there is no caller above it to receive
+                // a rethrow, so one would surface as an unhandled rejection
+                // instead of reaching anything that could act on it. The
+                // sibling stage/discard sites in sendMessage do rethrow
+                // because each of them sits inside a call its own caller
+                // awaits. Without this line the send failing here is silent
+                // on every surface -- no bubble, no toast, no log.
+                console.warn("[connector-runtime] pending-task auto-send failed")
+                connectorRuntimeDialogRef.current.discardPendingDelivery(clientMessageId)
+              })
             pendingTaskToExecuteRef.current = null
           }
         }
@@ -2645,6 +2803,33 @@ export function AppProvider({
       timestamp: new Date().toISOString()
     })
   }, [isConnected, state.taskId, connectionError])
+
+  // The single place that answers "this frame ends the turn -- now what?".
+  // Each of the three settlement call sites below (task_completed,
+  // agent_error, terminal task_error) keeps its own predicate for WHETHER a
+  // frame is terminal, because the three frame families prove terminality
+  // differently (see each call site's own comment). What they must NOT keep
+  // is their own idea of what to do once settled: that lives here, so a
+  // fourth frame family added later cannot settle a turn while quietly
+  // skipping the stash and pending-candidate cleanup that settlement
+  // requires (see the stash lifecycle docs on ConnectorRuntimePendingDelivery).
+  //
+  // Recreated on every render and captured by handleMessage's useCallback
+  // without appearing in its dependency array. That is safe for as long as
+  // the body below reads nothing but connectorRuntimeDialogRef.current,
+  // which a ref always resolves to the latest value regardless of which
+  // render's closure is calling. Anything read here that is not a ref --
+  // a prop, a state value, another callback -- makes a stale capture
+  // possible, and at that point this has to move behind a ref of its own
+  // rather than be added to that array.
+  const settleConnectorRuntimeTurn = (taskId: number, opensDialog: boolean): void => {
+    // openForTask hands this tab's candidate (staged or already-confirmed)
+    // to the request and clears it in the same update: that frame both
+    // opens the dialog and settles the turn. Never call forgetDelivery
+    // before this for the same frame -- see its own misuse warning.
+    if (opensDialog) connectorRuntimeDialogRef.current.openForTask(taskId)
+    else connectorRuntimeDialogRef.current.forgetDelivery(taskId)
+  }
 
   const handleMessage = useCallback((
     message: WebSocketMessage,
@@ -2694,6 +2879,126 @@ export function AppProvider({
         return
       }
       rawDispatch(action)
+    }
+    if (!isMessageForOtherTask && typeof messageTaskId === "number") {
+      let stream = sharedStreamRef.current
+      if (stream.taskId !== messageTaskId) {
+        stream = { taskId: messageTaskId, interrupted: false, prefixSeen: false, complete: false }
+        sharedStreamRef.current = stream
+      }
+      if (message.type === "stream_unavailable" || message.type === "stream_resync_required") {
+        stream.interrupted = true
+        dispatch({ type: "SET_STREAM_RECOVERY", payload: messageTaskId })
+        return
+      }
+      if (message.type === "task_stream_snapshot") {
+        if (isHistoricalDataLoadingRef.current) return
+        const envelope = extractTaskControlEnvelope(message)
+        if (!acceptTaskControlVersion(message, envelope, taskStateVersionsRef.current)) return
+        const data = asMessageRecord(message.data)
+        // A new run starting can't have inherited an interruption from
+        // whatever run preceded it - carrying a stale `true` forward would
+        // flag the very first snapshot of a brand-new, healthy run. But
+        // going from "no run known yet" to "this run" is NOT a run change:
+        // stream.runId starts undefined, and the backend reports `null` for
+        // a task that hasn't started running yet (both mean "nothing to
+        // compare against" the same way) - an explicit stream_unavailable/
+        // stream_resync_required for the CURRENT run can set interrupted
+        // before its first snapshot with a real run id ever arrives. Only a
+        // known-to-different-known transition is a genuine new run.
+        const isNewRun =
+          stream.runId != null && envelope.runId != null && stream.runId !== envelope.runId
+        if (stream.runId !== envelope.runId) {
+          stream.runId = envelope.runId
+          stream.prefixSeen = false
+          stream.complete = false
+          if (isNewRun) stream.interrupted = false
+        }
+        stream.attemptId = typeof data.lease_attempt_id === "string" ? data.lease_attempt_id : null
+        // "running with no prefix seen yet" is the ordinary state of every task
+        // between the run starting and its final-answer text beginning to
+        // stream (planning, tool calls, etc.) - it is NOT evidence anything
+        // was missed. This periodic snapshot fires every 5s for every
+        // connected task regardless of stream health, so treating that as an
+        // interruption flagged the recovery banner on almost every run.
+        // Genuine misses are already caught elsewhere: an explicit
+        // stream_unavailable/stream_resync_required message above, or a
+        // final_answer_delta arriving before its prefix below - both leave
+        // positive evidence content was produced without us. Leave
+        // stream.interrupted as carried over from those instead of deriving
+        // a new value from status alone.
+        const active = envelope.status === "running"
+        if (envelope.status) {
+          dispatch({ type: "UPDATE_TASK_STATUS", payload: {
+            status: envelope.status, runId: envelope.runId,
+            stateVersion: envelope.stateVersion, controlState: envelope.controlState,
+            ...(envelope.status === "waiting_for_user" ? {
+              waitingQuestion: typeof data.question === "string" ? data.question : undefined,
+              waitingInteractions: normalizeInteractions(data.interactions),
+            } : {}),
+          } })
+          dispatch({ type: "SET_PROCESSING", payload: active })
+        }
+        if (typeof data.output === "string" && typeof envelope.runId === "string") {
+          dispatch({ type: "RECONCILE_STREAM_OUTPUT", payload: {
+            runId: envelope.runId, output: data.output,
+            timestamp: message.timestamp, interrupted: stream.interrupted,
+          } })
+          stream.interrupted = false
+          stream.complete = true
+        } else if (envelope.status && envelope.status !== "running") {
+          stream.interrupted = false
+        }
+        dispatch({ type: "SET_STREAM_RECOVERY", payload: stream.interrupted ? messageTaskId : null })
+        return
+      }
+      if (message.stream_run_id !== undefined) {
+        const known = taskStateVersionsRef.current.get(messageTaskId)
+        if (known?.runId !== undefined && known.runId !== message.stream_run_id) {
+          const envelope = extractTaskControlEnvelope(message)
+          if (!envelope.isStateEvent || envelope.runId !== message.stream_run_id
+            || envelope.stateVersion === undefined || envelope.stateVersion <= known.version) return
+        }
+        if (stream.runId !== message.stream_run_id) {
+          stream.runId = message.stream_run_id
+          stream.attemptId = message.stream_attempt_id
+          stream.prefixSeen = false
+          stream.interrupted = false
+          stream.complete = false
+          dispatch({ type: "SET_STREAM_RECOVERY", payload: null })
+        }
+        if (stream.attemptId && message.stream_attempt_id !== stream.attemptId) return
+      }
+      const streamType = getWebSocketEventType(message)
+      if (stream.complete && isFinalAnswerStreamEventType(streamType)) return
+      if (streamType === "final_answer_start") {
+        stream.prefixSeen = true
+        stream.interrupted = false
+        dispatch({ type: "SET_STREAM_RECOVERY", payload: null })
+      }
+      if (isFinalAnswerStreamEventType(streamType)) {
+        const sharedFrame = message.stream_run_id !== undefined
+        const data = asMessageRecord(message.data)
+        const eventData = message.type === "trace_event"
+          ? asMessageRecord(data.data ?? data)
+          : { ...data, ...message }
+        const replacesContent = sharedFrame && (
+          (streamType === "final_answer_end" && typeof eventData.content === "string")
+          || (streamType === "final_answer_error" && typeof eventData.error === "string")
+        )
+        if (sharedFrame && streamType === "final_answer_delta" && !stream.prefixSeen) {
+          stream.interrupted = true
+          dispatch({ type: "SET_STREAM_RECOVERY", payload: messageTaskId })
+          return
+        }
+        if (replacesContent) {
+          stream.prefixSeen = true
+          stream.interrupted = false
+          dispatch({ type: "SET_STREAM_RECOVERY", payload: null })
+        }
+        if (stream.interrupted) return
+        if (replacesContent) stream.complete = true
+      }
     }
     // The 30s dedup cache below is keyed on message content/type only, not
     // task id - several dedupKeys (e.g. dag-execute-end's "task end, this
@@ -2909,23 +3214,6 @@ export function AppProvider({
     }
 
     switch (message.type) {
-      case "chat":
-        const chatData = message as any
-        const messageContent = chatData.message || ""
-
-        if (!isDuplicateMessageForViewedTask(messageContent, 'user-message')) {
-          dispatch({
-            type: "ADD_MESSAGE",
-            payload: {
-              id: generateMessageId("msg-user"),
-              role: "user",
-              content: messageContent,
-              timestamp: message.timestamp?.toString() || Date.now().toString(),
-            }
-          })
-        }
-        break
-
       case "trace_event":
         const traceEventData = (message.data ?? {}) as any
 
@@ -3256,7 +3544,12 @@ export function AppProvider({
             )) {
               return
             }
-            const msgId = generateMessageId("msg-agent")
+            const msgId =
+              (isAgentMessage
+                ? stableAssistantMessageId(
+                  message.event_id || traceEventData.event_id || eventData.event_id,
+                )
+                : null) ?? generateMessageId("msg-agent")
             dispatch({
               type: "ADD_MESSAGE",
               payload: {
@@ -5392,20 +5685,6 @@ export function AppProvider({
         }
         break
 
-      case "chat_message":
-        console.trace('Original message:', JSON.stringify(message), 'Handler: handleMessage (chat_message)')
-        const messageData = message.data as any
-        dispatch({
-          type: "ADD_MESSAGE",
-          payload: {
-            id: `msg-${messageData.id}`,
-            role: messageData.role,
-            content: messageData.content,
-            timestamp: messageData.timestamp,
-          },
-        })
-        break
-
       case "task_completed":
         const taskData = normalizeTaskCompletedMessage(message)
         dispatch({
@@ -5419,6 +5698,18 @@ export function AppProvider({
         })
         dispatch({ type: "TRIGGER_TASK_UPDATE" })
         dispatch({ type: "SET_PROCESSING", payload: false })  // Stop processing on task completion
+
+        if (!isMessageForOtherTask && currentState.taskId && isTerminalTaskStatus(taskData.status)) {
+          // A settled turn can no longer be resent, whether it succeeded or
+          // failed for a reason other than a missing connector input; see
+          // the stash lifecycle in connector-runtime-api.ts's docs.
+          // taskData.status is always "completed" or "failed" here
+          // (NormalizedTaskCompletion narrows it), so this reads the same
+          // terminal-status predicate the agent_error branch below reads,
+          // rather than assuming this frame type alone proves settlement.
+          // This frame type never opens the dialog itself.
+          settleConnectorRuntimeTurn(currentState.taskId, false)
+        }
 
         if (!taskData.success) {
           // error_details carries the structured reason ({code, ..., message});
@@ -5775,6 +6066,19 @@ export function AppProvider({
           dispatch({ type: "SET_PROCESSING", payload: false })
         }
 
+        if (!isMessageForOtherTask && currentState.taskId && isTerminalTaskStatus(agentErrorTaskStatus)) {
+          // Unlike task_completed and the terminal task_error frame, this
+          // frame type is not on its own proof that the turn is over: its
+          // status is a live DB read from a command-execution rejection path
+          // (see the stash lifecycle docs) and can just as easily be
+          // "running" as "failed". Read the same terminal-status check the
+          // task_completed branch above satisfies unconditionally, so a
+          // frame that only pauses processing (paused, waiting_for_user)
+          // leaves a still-resendable message's stash alone.
+          // This frame type never opens the dialog itself.
+          settleConnectorRuntimeTurn(currentState.taskId, false)
+        }
+
         dispatch({
           type: "ADD_MESSAGE",
           payload: {
@@ -5804,6 +6108,34 @@ export function AppProvider({
           dispatch({ type: "SET_PROCESSING", payload: false })
         }
 
+        // errorFrame.isTerminal (message.type === "task_error") is this
+        // family's terminal-status predicate: a task_error frame is only
+        // ever emitted after its lease owner commits a terminal status, so
+        // the frame type itself already reads as terminal here -- unlike
+        // agent_error above, which shares this branch's underlying
+        // task_status field with a live, possibly non-terminal DB read.
+        // The sibling `error` type carries the same task_status field for
+        // an unrelated meaning (a rejection while the turn is still
+        // running), which is why this checks the frame type and not the
+        // status value directly.
+        //
+        // Kept outside the bubble-dedup guard below, matching the
+        // task_completed and agent_error settle-task call sites above: a
+        // terminal frame whose dedup text collapses into an existing bubble
+        // (most often a version-less frame, since a version makes the dedup
+        // key occurrence-specific) must still resolve this turn's dialog and
+        // stash even when the bubble it would have added does not render.
+        if (errorFrame.isTerminal && !isMessageForOtherTask && currentState.taskId) {
+          // A trigger code both opens the dialog and settles the turn in
+          // the same call; any other terminal code just settles it. See
+          // settleConnectorRuntimeTurn's own docs for what "settles" means.
+          settleConnectorRuntimeTurn(
+            currentState.taskId,
+            errorFrame.terminalErrorCode !== null
+              && isConnectorRuntimeDialogTriggerCode(errorFrame.terminalErrorCode),
+          )
+        }
+
         if (
           !isDuplicateMessageForViewedTask(
             errorFrame.dedupText,
@@ -5820,6 +6152,8 @@ export function AppProvider({
               timestamp: message.timestamp,
               status: "failed",
               isResult: errorFrame.isResult,
+              // Delivery uncertainty is informational, not the task's result.
+              isSystemNotice: getWebSocketErrorCode(message) === "message_outcome_unknown",
             },
           })
         }
@@ -6133,9 +6467,14 @@ export function AppProvider({
       )
     }
 
-    const clientMessageId = typeof config?.clientMessageId === 'string'
-      ? config.clientMessageId
-      : generateClientMessageId()
+    // Mirrors stableUserMessageId's trim guard. `config` is untyped, so a
+    // blank id would reach userTurnMessageId and mint a bare
+    // `msg-user-turn-` that every other blank-id turn collides on.
+    const requestedClientMessageId =
+      typeof config?.clientMessageId === 'string'
+        ? config.clientMessageId.trim()
+        : ''
+    const clientMessageId = requestedClientMessageId || generateClientMessageId()
     const requestId = typeof config?.metadata?.request_id === 'string'
       ? config.metadata.request_id
       : undefined
@@ -6154,6 +6493,10 @@ export function AppProvider({
     // invisible until a reload replays the persisted transcript row. The
     // reducer reconciles by turn id / content, keeping the persisted event
     // when it already arrived and replacing this copy when it arrives later.
+    // Also the one place that stashes this turn as the connector-runtime
+    // dialog's resend candidate: this guard is exactly "delivered, and the
+    // user is still looking at this task", which is the stash's own
+    // definition (see connector-runtime-api.ts's docs).
     const addOptimisticUserMessage = (intendedTaskId: number | null) => {
       // Delivery acknowledgement can arrive after the user has navigated to a
       // different task. Never append this turn to whichever task happens to be
@@ -6174,6 +6517,14 @@ export function AppProvider({
         || stateRef.current.taskId !== intendedTaskId
       ) {
         return
+      }
+      if (typeof intendedTaskId === "number") {
+        connectorRuntimeDialogRef.current.recordDelivery({
+          taskId: intendedTaskId,
+          clientMessageId,
+          text: message,
+          files: files ?? [],
+        })
       }
       let content: React.ReactNode = message
       if (files && files.length > 0) {
@@ -6249,6 +6600,17 @@ export function AppProvider({
         }
         beginSessionPreAdoptionBuffer(sessionDeliveryOwner.connectionIdentity)
       }
+      // Staged before the delivery acknowledgement is awaited, keyed by this
+      // turn's own clientMessageId, so a terminal frame that arrives first
+      // (the transport gives no ordering guarantee between the two) can
+      // still claim it in openForTask. Only staged when there is a task to
+      // attribute it to -- addOptimisticUserMessage below only records the
+      // delivery under the same condition.
+      if (typeof state.taskId === "number") {
+        connectorRuntimeDialogRef.current.stagePendingDelivery({
+          taskId: state.taskId, clientMessageId, text: message, files: files ?? [],
+        })
+      }
       beginSessionMessageDelivery()
       try {
         await sendChatMessage(
@@ -6305,18 +6667,40 @@ export function AppProvider({
         throw error
       } finally {
         endSessionMessageDelivery()
+        // A no-op if addOptimisticUserMessage already redeemed the ticket
+        // above (recordDelivery removes the pending entry on success): this
+        // only has anything to withdraw when the try block threw or
+        // returned early before reaching that call.
+        connectorRuntimeDialogRef.current.discardPendingDelivery(clientMessageId)
       }
       return
     }
 
     if (targetTaskId !== null && state.taskId !== targetTaskId) {
-      await queuePendingMessage({
-        message,
-        files,
-        targetTaskId,
-        force: config?.force,
-        clientMessageId,
+      connectorRuntimeDialogRef.current.stagePendingDelivery({
+        taskId: targetTaskId, clientMessageId, text: message, files: files ?? [],
       })
+      try {
+        await queuePendingMessage({
+          message,
+          files,
+          targetTaskId,
+          force: config?.force,
+          clientMessageId,
+        })
+      } catch (error) {
+        connectorRuntimeDialogRef.current.discardPendingDelivery(clientMessageId)
+        throw error
+      }
+      // The discard above cannot become a `finally` the way the session
+      // path's one below is, because the call on the next line -- which is
+      // what promotes the staged candidate into the resend stash, through
+      // recordDelivery -- sits outside the try. A `finally` would run
+      // before it and withdraw the candidate, and recordDelivery ignores a
+      // delivery it has no staged entry for, so every message queued for
+      // another task would stop leaving a resend candidate behind at all.
+      // Making the two paths one shape means moving this promotion inside
+      // the try first; that regrouping is tracked in xorbitsai/xagent#2488.
       addOptimisticUserMessage(targetTaskId)
       return
     }
@@ -6488,14 +6872,22 @@ export function AppProvider({
 
           // Do not clear the composer until the newly connected task socket
           // confirms that the message was durably accepted.
-          await queuePendingMessage({
-            message,
-            files,
-            targetTaskId: newTaskId,
-            force: config?.force,
-            clientMessageId,
-            requestId,
+          connectorRuntimeDialogRef.current.stagePendingDelivery({
+            taskId: newTaskId, clientMessageId, text: message, files: files ?? [],
           })
+          try {
+            await queuePendingMessage({
+              message,
+              files,
+              targetTaskId: newTaskId,
+              force: config?.force,
+              clientMessageId,
+              requestId,
+            })
+          } catch (error) {
+            connectorRuntimeDialogRef.current.discardPendingDelivery(clientMessageId)
+            throw error
+          }
           addOptimisticUserMessage(newTaskId)
         } else {
           const parsed = await parseApiResponse(response)
@@ -6540,7 +6932,15 @@ export function AppProvider({
       // deliberately runs only after this succeeds - clearing dagExecution/
       // steps first and then throwing would remove the Progress panel and its
       // header toggle for a run that never actually changed.
-      await sendChatMessage(message, files, config?.force, clientMessageId, requestId)
+      connectorRuntimeDialogRef.current.stagePendingDelivery({
+        taskId: state.taskId, clientMessageId, text: message, files: files ?? [],
+      })
+      try {
+        await sendChatMessage(message, files, config?.force, clientMessageId, requestId)
+      } catch (error) {
+        connectorRuntimeDialogRef.current.discardPendingDelivery(clientMessageId)
+        throw error
+      }
 
       // A prior turn's DAG plan/steps must not linger into this turn - otherwise
       // the Progress panel would auto-open (or stay open) showing stale steps
@@ -6841,6 +7241,9 @@ export function AppProvider({
     if (taskId) {
       isHistoricalDataLoadingRef.current = true
       dispatch({ type: "SET_HISTORY_LOADING", payload: true })
+    } else {
+      // The task socket is keyed on taskId, so no terminal WS event will clear this.
+      dispatch({ type: "SET_PROCESSING", payload: false })
     }
   }, [dispatch, router])
 
@@ -6958,6 +7361,20 @@ export function AppProvider({
           }}
         >
           {children}
+          {/*
+            A second seam alongside the existing TASK_ERROR_EVENT /
+            TaskErrorController mechanism, not a replacement for it. Three
+            reasons it is not reused here: (1) that event only fires from the
+            task_completed branch above (see emitTaskError), while this
+            dialog is driven by the terminal task_error branch -- a
+            different frame entirely; (2) TaskErrorController is mounted as
+            a sibling of AppProvider (see application-shell.tsx), so it
+            cannot reach useApp() the way this component does; (3) that
+            controller's own file already documents itself as a seam an
+            app-layer overlay may replace, which is not this dialog's role.
+            Do not "consolidate" the two without re-checking all three.
+          */}
+          <ConnectorRuntimeDialog />
           </AppContext.Provider>
         </FileAccessProvider>
       </LinksOpenInNewTabCapability.Provider>

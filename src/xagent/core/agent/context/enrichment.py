@@ -32,7 +32,6 @@ class TopLevelUserRequest:
     execution_text: str
     language_text: str
     display_state: DisplayMessageState
-    has_pending_response: bool = False
 
 
 @dataclass(frozen=True)
@@ -42,6 +41,7 @@ class PendingUserResponse:
     answer: str
     question: str
     message_type: str
+    step_id: str | None = None
 
 
 def pending_user_response(message: Any) -> PendingUserResponse | None:
@@ -65,10 +65,57 @@ def pending_user_response(message: Any) -> PendingUserResponse | None:
         if isinstance(raw_message_type, str) and raw_message_type.strip()
         else "question"
     )
-    answer = getattr(message, "content", "")
+    answer = display_message_override(metadata)
+    if answer is None:
+        answer = getattr(message, "content", "")
     if not isinstance(answer, str):
         return None
-    return PendingUserResponse(answer, question, message_type)
+    raw_step_id = marker.get("step_id")
+    step_id = raw_step_id if isinstance(raw_step_id, str) and raw_step_id else None
+    return PendingUserResponse(answer, question, message_type, step_id)
+
+
+def pending_user_response_lifecycle(message: Any) -> dict[str, Any] | None:
+    """Return the durable marker for a real waiting-response lifecycle.
+
+    Unlike :func:`pending_user_response`, lifecycle identity does not require a
+    usable question. The strict parser remains the gate for language evidence.
+    """
+    if getattr(message, "role", None) != "user":
+        return None
+    metadata = getattr(message, "metadata", None)
+    if not isinstance(metadata, dict):
+        return None
+    marker = metadata.get("response_to_waiting_for_user")
+    if not isinstance(marker, dict) or not isinstance(marker.get("question"), str):
+        return None
+    return marker
+
+
+def pending_user_responses(context: Any) -> list[PendingUserResponse]:
+    """Every answered waiting question in the context, in message order."""
+    responses = []
+    for message in getattr(context, "messages", []) or []:
+        response = pending_user_response(message)
+        if response is not None:
+            responses.append(response)
+    return responses
+
+
+def latest_pending_user_response(context: Any) -> PendingUserResponse | None:
+    responses = pending_user_responses(context)
+    return responses[-1] if responses else None
+
+
+def pending_user_response_marker(waiting_request: Any) -> dict[str, Any] | None:
+    if not isinstance(waiting_request, dict):
+        return None
+    question = waiting_request.get("message")
+    question = question if isinstance(question, str) else ""
+    return {
+        "question": question,
+        "message_type": waiting_request.get("message_type", "question"),
+    }
 
 
 def _stored_top_level_user_request(context: Any) -> TopLevelUserRequest | None:
@@ -229,7 +276,6 @@ def top_level_user_request(
     ``user_message_limit`` freezes selection to a checkpointed prefix when a
     later waiting response has already been appended to the root context.
     """
-    has_pending_response = False
     messages = list(getattr(context, "messages", []) or [])
     if user_message_limit is not None:
         user_messages = [
@@ -244,7 +290,6 @@ def top_level_user_request(
         metadata = getattr(message, "metadata", None)
         metadata = metadata if isinstance(metadata, dict) else {}
         if metadata.get("response_to_waiting_for_user"):
-            has_pending_response = True
             continue
         if metadata.get("dag_step_id"):
             continue
@@ -258,14 +303,12 @@ def top_level_user_request(
                 execution_text=execution_text,
                 language_text=execution_text,
                 display_state="missing",
-                has_pending_response=has_pending_response,
             )
         else:
             request = TopLevelUserRequest(
                 execution_text=execution_text,
                 language_text=display_text,
                 display_state="text" if display_text else "empty",
-                has_pending_response=has_pending_response,
             )
         _persist_top_level_user_request(context, request)
         return request
@@ -276,7 +319,6 @@ def top_level_user_request(
             execution_text=stored.execution_text,
             language_text=stored.language_text,
             display_state=stored.display_state,
-            has_pending_response=has_pending_response,
         )
 
     metadata = getattr(context, "metadata", None)
@@ -286,7 +328,6 @@ def top_level_user_request(
         execution_text=task_text,
         language_text=task_text,
         display_state="missing",
-        has_pending_response=has_pending_response,
     )
     _persist_top_level_user_request(context, request)
     return request

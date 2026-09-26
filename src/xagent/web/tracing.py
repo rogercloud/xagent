@@ -2,14 +2,15 @@
 
 from __future__ import annotations
 
-import asyncio
 from typing import Any, Optional
 
-from ..core.agent.checkpoint import READABLE_CHECKPOINT_TYPES
+from ..core.agent.checkpoint import (
+    READABLE_CHECKPOINT_TYPES,
+    ExecutionEventPersistenceError,
+)
 from ..core.agent.trace import (
     BaseTraceHandler,
     ConsoleTraceHandler,
-    ExecutionEventPersistenceError,
 )
 from ..core.agent.trace import TraceEvent as CoreTraceEvent
 from ..core.agent.trace import (
@@ -17,8 +18,8 @@ from ..core.agent.trace import (
     Tracer,
 )
 from ..core.tracing import create_agent_tracer
-from .api.trace_handlers import DatabaseTraceHandler
 from .models.user import User
+from .services.trace_handlers import DatabaseTraceHandler
 
 
 class EphemeralCheckpointTraceHandler(BaseTraceHandler):
@@ -71,7 +72,7 @@ class ExecutionEventTraceAdapter(DatabaseTraceHandler):
         required = event.require_persisted
         event.require_persisted = True
         try:
-            await asyncio.to_thread(self._sync_save_to_database, event)
+            await self._save_to_database(event)
         except Exception as exc:
             raise ExecutionEventPersistenceError(
                 "Conversation event commit failed"
@@ -99,7 +100,7 @@ def create_task_tracer(
     user_id: Optional[int] = None,
 ) -> Tracer:
     """Build the standard tracer stack for persisted web task execution."""
-    from .api.ws_trace_handlers import WebSocketTraceHandler
+    from .services.task_event_trace_handler import TaskEventTraceHandler
 
     resolved_user_id = user_id
     if user is not None and user.id is not None:
@@ -110,7 +111,7 @@ def create_task_tracer(
         handlers=[
             ConsoleTraceHandler(),
             database_handler,
-            WebSocketTraceHandler(task_id),
+            TaskEventTraceHandler(task_id),
         ],
         task_id=str(task_id),
         user_id=resolved_user_id,

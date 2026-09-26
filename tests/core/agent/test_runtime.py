@@ -1,14 +1,25 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from typing import Any
+from unittest.mock import AsyncMock
 
 import pytest
 
 from xagent.core.agent import ExecutionContext, PatternRuntime
 from xagent.core.agent import runtime as runtime_module
+from xagent.core.agent.checkpoint import (
+    CHECKPOINT_SCHEMA_VERSION,
+    READABLE_CHECKPOINT_TYPES,
+    CheckpointPersistenceError,
+)
+from xagent.core.agent.context import execution as execution_module
 from xagent.core.agent.context.execution import (
     COMPACT_SUMMARY_METADATA_KEY,
+    COMPACT_THRESHOLD_SOURCE_CONTEXT_WINDOW,
+    COMPACT_THRESHOLD_SOURCE_DEFAULT,
+    COMPACT_THRESHOLD_SOURCE_UNKNOWN,
     COMPACT_WATERMARK_METADATA_KEY,
     TRANSCRIPT_WATERMARK_METADATA_KEY,
 )
@@ -41,6 +52,12 @@ class SlowLLM:
         return "never"
 
 
+@pytest.fixture(autouse=True)
+def reset_compact_warnings(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The once-per-model warning set is process-global; isolate it per test.
+    monkeypatch.setattr(runtime_module, "_COMPACT_WINDOW_WARNED_MODELS", set())
+
+
 @pytest.mark.asyncio
 async def test_prepare_llm_for_context_uses_resolved_model_window(monkeypatch) -> None:
     monkeypatch.delenv("XAGENT_COMPACT_THRESHOLD_RATIO", raising=False)
@@ -69,6 +86,9 @@ async def test_prepare_llm_for_context_uses_resolved_model_window(monkeypatch) -
 
     assert isinstance(prepared, PreparedLLM)
     assert context.compact_config.threshold == 786_432
+    assert context.compact_config.threshold_source == (
+        COMPACT_THRESHOLD_SOURCE_CONTEXT_WINDOW
+    )
     assert resolved_llm_metadata(prepared) == {
         "selected_model": "deepseek/deepseek-v4-flash",
         "context_window": 1_048_576,
@@ -178,6 +198,222 @@ class StreamingLLM:
         yield StreamChunk(type=ChunkType.TOKEN, delta="hello")
         yield StreamChunk(type=ChunkType.TOKEN, delta=" world")
         yield StreamChunk(type=ChunkType.END)
+
+
+@pytest.mark.asyncio
+async def test_buffered_stream_yields_to_other_callbacks_between_chunks() -> None:
+    runtime = PatternRuntime()
+    observed = []
+    received = []
+    loop = asyncio.get_running_loop()
+
+    def on_chunk(chunk: StreamChunk) -> None:
+        received.append(chunk)
+        loop.call_soon(lambda: observed.append(len(received)))
+
+    result = await runtime.run_streaming_llm_call(StreamingLLM(), on_chunk=on_chunk)
+
+    assert result == "hello world"
+    assert observed == [1, 2, 3]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("interrupt", [False, True])
+async def test_buffered_stream_can_be_stopped_between_chunks(interrupt: bool) -> None:
+    runtime = PatternRuntime()
+    received = []
+    loop = asyncio.get_running_loop()
+
+    def on_chunk(chunk: StreamChunk) -> None:
+        received.append(chunk.delta)
+        if interrupt:
+            loop.call_soon(runtime.request_interrupt, "stop buffered stream")
+        else:
+            loop.call_soon(call.cancel)
+
+    call = asyncio.create_task(
+        runtime.run_streaming_llm_call(StreamingLLM(), on_chunk=on_chunk)
+    )
+    expected = LLMCallInterrupted if interrupt else asyncio.CancelledError
+    with pytest.raises(expected):
+        await call
+    assert received == ["hello"]
+    assert not runtime._active_llm_tasks
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "mode",
+    ["complete", "provider_error", "callback_error", "cancel", "interrupt", "checker"],
+)
+async def test_stream_is_closed_before_runtime_returns(mode: str) -> None:
+    closed = asyncio.Event()
+    stop = asyncio.Event()
+
+    class RetainedStream:
+        def __init__(self) -> None:
+            # Keep a reference so GC cannot hide missing explicit cleanup.
+            self.stream = self.generate()
+
+        def stream_chat(self, **_: Any) -> Any:
+            return self.stream
+
+        async def generate(self) -> Any:
+            owner = asyncio.current_task()
+            try:
+                yield StreamChunk(type=ChunkType.TOKEN, delta="first")
+                yield StreamChunk(
+                    type=ChunkType.ERROR
+                    if mode == "provider_error"
+                    else ChunkType.TOKEN,
+                    content="provider failed",
+                    delta="second",
+                )
+            finally:
+                assert asyncio.current_task() is owner
+                await asyncio.sleep(0)
+                closed.set()
+
+    runtime = PatternRuntime(
+        interrupt_checker=lambda: "checker stopped" if stop.is_set() else False
+    )
+    llm = RetainedStream()
+    received = []
+
+    def on_chunk(chunk: StreamChunk) -> None:
+        received.append(chunk.delta)
+        if mode == "callback_error":
+            raise ValueError("callback failed")
+        loop = asyncio.get_running_loop()
+        if mode == "cancel":
+            loop.call_soon(call.cancel)
+        elif mode == "interrupt":
+            loop.call_soon(runtime.request_interrupt, "requested stop")
+        elif mode == "checker":
+            # No explicit cancel/request_interrupt: exercise the checker path.
+            loop.call_soon(stop.set)
+
+    call = asyncio.create_task(runtime.run_streaming_llm_call(llm, on_chunk=on_chunk))
+    try:
+        if mode == "complete":
+            assert await call == "firstsecond"
+        else:
+            exception = {
+                "provider_error": RuntimeError,
+                "callback_error": ValueError,
+                "cancel": asyncio.CancelledError,
+                "interrupt": LLMCallInterrupted,
+                "checker": LLMCallInterrupted,
+            }[mode]
+            with pytest.raises(exception) as error:
+                await call
+            if mode == "checker":
+                assert str(error.value) == "checker stopped"
+            assert received == ["first"]
+        assert closed.is_set()
+        assert not runtime._active_llm_tasks
+    finally:
+        await llm.stream.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("source_error", [False, True])
+async def test_stream_close_error_does_not_mask_source_error(
+    source_error: bool,
+) -> None:
+    class BrokenClose:
+        def stream_chat(self, **_: Any) -> Any:
+            return self
+
+        def __aiter__(self) -> Any:
+            return self
+
+        async def __anext__(self) -> Any:
+            if source_error:
+                raise ValueError("source failed")
+            raise StopAsyncIteration
+
+        async def aclose(self) -> None:
+            await asyncio.sleep(0)
+            raise RuntimeError("close failed")
+
+    expected = ValueError if source_error else RuntimeError
+    message = "source failed" if source_error else "close failed"
+    with pytest.raises(expected, match=message):
+        await PatternRuntime().run_streaming_llm_call(BrokenClose())
+
+
+@pytest.mark.asyncio
+async def test_stream_without_aclose_remains_supported() -> None:
+    class Iterator:
+        def __init__(self) -> None:
+            self.done = False
+
+        def __aiter__(self) -> Any:
+            return self
+
+        async def __anext__(self) -> StreamChunk:
+            if self.done:
+                raise StopAsyncIteration
+            self.done = True
+            return StreamChunk(type=ChunkType.TOKEN, delta="answer")
+
+    class LLM:
+        def stream_chat(self, **_: Any) -> Any:
+            return Iterator()
+
+    assert await PatternRuntime().run_streaming_llm_call(LLM()) == "answer"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("interrupt", [False, True])
+async def test_cancellation_wins_over_concurrent_provider_error(
+    interrupt: bool,
+) -> None:
+    runtime = PatternRuntime()
+
+    class ErrorStream:
+        async def stream_chat(self, **_: Any) -> Any:
+            loop = asyncio.get_running_loop()
+            if interrupt:
+                loop.call_soon(runtime.request_interrupt, "requested stop")
+            else:
+                loop.call_soon(call.cancel)
+            yield StreamChunk(type=ChunkType.ERROR, content="provider failed")
+
+    call = asyncio.create_task(runtime.run_streaming_llm_call(ErrorStream()))
+    expected = LLMCallInterrupted if interrupt else asyncio.CancelledError
+    with pytest.raises(expected):
+        await call
+
+
+@pytest.mark.asyncio
+async def test_buffered_protocol_error_keeps_usage_and_yields() -> None:
+    from xagent.core.model.chat.tool_protocol import TOOL_PROTOCOL_ERROR_KEY
+
+    class ProtocolStream:
+        async def stream_chat(self, **_: Any) -> Any:
+            yield StreamChunk(
+                type=ChunkType.PROTOCOL_ERROR,
+                protocol_error={"code": "invalid_tool_call"},
+            )
+            yield StreamChunk(type=ChunkType.USAGE, usage={"total_tokens": 10})
+
+    observed = []
+    received = []
+
+    def on_chunk(chunk: StreamChunk) -> None:
+        received.append(chunk.type)
+        asyncio.get_running_loop().call_soon(lambda: observed.append(len(received)))
+
+    result = await PatternRuntime().run_streaming_llm_call(
+        ProtocolStream(), on_chunk=on_chunk
+    )
+    assert observed == [1, 2]
+    assert result[TOOL_PROTOCOL_ERROR_KEY] == {"code": "invalid_tool_call"}
+    assert result["usage"] == {"total_tokens": 10}
+    assert result["content"] == ""
+    assert result["tool_calls"] == []
 
 
 class StreamingLLMWithUsage:
@@ -373,7 +609,11 @@ class TraceOnlyTracer:
         *,
         task_id: str | None = None,
         data: dict[str, Any] | None = None,
-    ) -> None:
+        # Mirrors the real ``Tracer.trace_event``: a checkpoint write asks
+        # for persisted delivery, and a tracer that cannot accept the flag
+        # is not treated as a durable checkpoint writer.
+        require_persisted: bool = False,
+    ) -> str:
         self.events.append(
             {
                 "event_type": getattr(event_type, "value", str(event_type)),
@@ -381,6 +621,9 @@ class TraceOnlyTracer:
                 "data": data or {},
             }
         )
+        # The real ``Tracer.trace_event`` returns the event id; a writer that
+        # returns nothing cannot evidence persistence and is rejected.
+        return f"evt-{len(self.events)}"
 
 
 class FailingTraceOnlyTracer:
@@ -393,6 +636,76 @@ class PatternWithState:
 
     def get_state(self) -> dict[str, Any]:
         return {"step": 1}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("during_materialization", [False, True])
+@pytest.mark.parametrize("via_checker", [False, True])
+async def test_runtime_does_not_start_llm_after_interrupt(
+    monkeypatch: pytest.MonkeyPatch, during_materialization: bool, via_checker: bool
+) -> None:
+    runtime = PatternRuntime()
+    checker_requested = False
+
+    async def checker() -> str | None:
+        return "stop before provider" if checker_requested else None
+
+    if via_checker:
+        runtime.interrupt_checker = checker
+
+    def stop() -> None:
+        nonlocal checker_requested
+        if via_checker:
+            checker_requested = True
+        else:
+            runtime.request_interrupt("stop before provider")
+
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def materialize(**kwargs: Any) -> dict[str, Any]:
+        if during_materialization:
+            started.set()
+            await release.wait()
+        return dict(kwargs["kwargs"])
+
+    monkeypatch.setattr(runtime_module, "materialize_llm_kwargs", materialize)
+    llm = type("LLM", (), {"chat": AsyncMock(return_value="must not call")})()
+    if not during_materialization:
+        stop()
+    task = asyncio.create_task(runtime.run_llm_call(llm))
+    if during_materialization:
+        await asyncio.wait_for(started.wait(), timeout=1)
+        stop()
+        release.set()
+
+    with pytest.raises(LLMCallInterrupted, match="stop before provider"):
+        await task
+    llm.chat.assert_not_called()
+    assert not runtime._active_llm_tasks
+
+
+@pytest.mark.asyncio
+async def test_runtime_respects_explicit_stop_while_checker_returns_false() -> None:
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def checker() -> bool:
+        started.set()
+        await release.wait()
+        return False
+
+    runtime = PatternRuntime(interrupt_checker=checker)
+    llm = type("LLM", (), {"chat": AsyncMock()})()
+    task = asyncio.create_task(runtime.run_llm_call(llm))
+    await asyncio.wait_for(started.wait(), timeout=1)
+    runtime.request_interrupt("stop during checker")
+    release.set()
+
+    with pytest.raises(LLMCallInterrupted, match="stop during checker"):
+        await task
+    llm.chat.assert_not_called()
+    assert not runtime._active_llm_tasks
 
 
 @pytest.mark.asyncio
@@ -638,12 +951,16 @@ class RecordingLogger:
     def __init__(self) -> None:
         self.info_calls: list[tuple[str, tuple[Any, ...]]] = []
         self.warning_calls: list[tuple[str, tuple[Any, ...]]] = []
+        self.debug_calls: list[tuple[str, tuple[Any, ...]]] = []
 
     def info(self, msg: str, *args: Any) -> None:
         self.info_calls.append((msg, args))
 
     def warning(self, msg: str, *args: Any) -> None:
         self.warning_calls.append((msg, args))
+
+    def debug(self, msg: str, *args: Any) -> None:
+        self.debug_calls.append((msg, args))
 
 
 _NEWLINE_AND_QUOTE_EXCEPTION_TEXT = (
@@ -985,16 +1302,37 @@ async def test_runtime_checkpoint_prefers_checkpoint_api() -> None:
 
 
 @pytest.mark.asyncio
-async def test_runtime_checkpoint_trace_event_fallback_is_task_scoped() -> None:
+async def test_runtime_checkpoint_trace_event_fallback_is_a_canonical_checkpoint() -> (
+    None
+):
+    """The event-tracer fallback must emit a *readable* checkpoint.
+
+    Asking a plain event tracer for persisted delivery only proves its
+    handlers ran. The checkpoint readers select on the canonical envelope --
+    system scope, ``checkpoint_type``, and a ``snapshot`` dict -- so a
+    task-scoped event carrying the raw payload is dropped by
+    ``EphemeralCheckpointTraceHandler`` and filtered out of the database
+    checkpoint lookup, and a cold resume would find nothing.
+    """
+
     tracer = TraceOnlyTracer()
     runtime = PatternRuntime(tracer=tracer, execution_id="exec-runtime")
     context = ExecutionContext(execution_id="exec-runtime")
 
     await runtime.checkpoint("fallback", context=context, pattern=PatternWithState())
 
-    assert tracer.events[0]["event_type"] == "task_update_general"
-    assert tracer.events[0]["task_id"] == "exec-runtime"
-    assert tracer.events[0]["data"]["label"] == "fallback"
+    event = tracer.events[0]
+    assert event["event_type"] == "system_update_general"
+    assert event["task_id"] == "exec-runtime"
+    data = event["data"]
+    # The exact fields the readers select on.
+    assert data["checkpoint_type"] in READABLE_CHECKPOINT_TYPES
+    assert data["snapshot_schema_version"] == CHECKPOINT_SCHEMA_VERSION
+    assert data["root_execution_id"] == "exec-runtime"
+    assert data["execution_id"] == "exec-runtime"
+    assert data["label"] == "fallback"
+    assert isinstance(data["snapshot"], dict)
+    assert data["snapshot"]["label"] == "fallback"
 
 
 @pytest.mark.asyncio
@@ -1049,17 +1387,17 @@ async def test_on_llm_start_emits_context_usage_fields() -> None:
     runtime = PatternRuntime(tracer=tracer, execution_id="task-1")
     ctx = ExecutionContext()
     ctx.compact_config.threshold = 96000
-    ctx.add_message("user", "x" * 400)
+    ctx.add_message("user", "persisted-only")
 
-    await runtime.on_llm_start(
-        context=ctx, messages=[{"role": "user", "content": "x" * 400}]
-    )
+    messages = [{"role": "user", "content": "x" * 400}]
+    tools = [{"function": {"name": "save", "description": "d" * 400}}]
+    await runtime.on_llm_start(context=ctx, messages=messages, tools=tools)
 
     usage = [e["data"] for e in tracer.events if "context_threshold" in e["data"]]
     assert usage, tracer.events
     assert usage[0]["context_threshold"] == 96000
     assert isinstance(usage[0]["context_tokens"], int)
-    assert usage[0]["context_tokens"] > 0
+    assert usage[0]["context_tokens"] == ctx.estimate_context_tokens(messages, tools)
 
 
 @pytest.mark.asyncio
@@ -1317,6 +1655,7 @@ class RaisingCompactLLM:
     fallback in ``PatternRuntime.compact_context_if_needed``."""
 
     model_name = "raising-compact-llm"
+    context_window = 32_000
 
     async def chat(self, **_: Any) -> Any:
         raise RuntimeError("compact llm exploded")
@@ -1459,6 +1798,7 @@ async def test_compaction_records_that_an_unusable_summary_was_discarded() -> No
 
     class EmptySummaryLLM:
         model_name = "compact-test"
+        context_window = 32_000
 
         async def chat(self, **_: Any) -> Any:
             return {"content": ""}
@@ -1495,12 +1835,19 @@ async def test_compaction_retries_with_a_smaller_budget_before_truncating() -> N
     context = ExecutionContext(execution_id="budget-retry")
     context.compact_config.threshold = 32000
     context.add_user_message("current request")
+    context.add_assistant_message(
+        "",
+        tool_calls=[
+            {"id": "call-1", "function": {"name": "read_file", "arguments": "{}"}}
+        ],
+    )
     context.add_tool_result(
         "read_file", {"output": "x" * 200_000}, tool_call_id="call-1"
     )
 
     class OutputCappedLLM:
         model_name = "compact-test"
+        context_window = 64_000
 
         def __init__(self) -> None:
             self.budgets: list[int] = []
@@ -1541,12 +1888,19 @@ async def test_compaction_ladder_skips_a_budget_the_model_cannot_use() -> None:
     context = ExecutionContext(execution_id="budget-ladder")
     context.compact_config.threshold = 32000
     context.add_user_message("current request")
+    context.add_assistant_message(
+        "",
+        tool_calls=[
+            {"id": "call-1", "function": {"name": "read_file", "arguments": "{}"}}
+        ],
+    )
     context.add_tool_result(
         "read_file", {"output": "x" * 200_000}, tool_call_id="call-1"
     )
 
     class CappedReasoningLLM:
         model_name = "compact-test"
+        context_window = 64_000
 
         def __init__(self) -> None:
             self.budgets: list[int] = []
@@ -1590,12 +1944,19 @@ async def test_compaction_stops_descending_once_a_budget_is_accepted() -> None:
     context = ExecutionContext(execution_id="budget-monotone")
     context.compact_config.threshold = 32000
     context.add_user_message("current request")
+    context.add_assistant_message(
+        "",
+        tool_calls=[
+            {"id": "call-1", "function": {"name": "read_file", "arguments": "{}"}}
+        ],
+    )
     context.add_tool_result(
         "read_file", {"output": "x" * 200_000}, tool_call_id="call-1"
     )
 
     class AlwaysReasoningLLM:
         model_name = "compact-test"
+        context_window = 64_000
 
         def __init__(self) -> None:
             self.budgets: list[int] = []
@@ -1694,6 +2055,7 @@ async def test_compaction_does_not_blame_the_model_when_nothing_is_summarizable(
 
     class UnusedCompactLLM:
         model_name = "compact-test"
+        context_window = 32_000
 
         async def chat(self, **_: Any) -> Any:  # pragma: no cover - never called
             raise AssertionError("no request should have been built")
@@ -1716,15 +2078,475 @@ async def test_compaction_does_not_blame_the_model_when_nothing_is_summarizable(
 
 class _SummarizingLLM:
     model_name = "compact-test"
+    context_window = 32_000
 
     async def chat(self, **_: Any) -> Any:
         return {"content": "what happened earlier"}
+
+
+@pytest.mark.asyncio
+async def test_compaction_does_not_truncate_an_unsendable_safe_request(
+    caplog,
+) -> None:
+    context = ExecutionContext(execution_id="unsafe-to-truncate")
+    context.compact_config.threshold = 24000
+    context.compact_config.max_messages = 2
+    for _ in range(6):
+        context.add_user_message("z" * 17_000)
+    context.add_assistant_message(
+        "",
+        tool_calls=[
+            {
+                "id": "call-1",
+                "type": "function",
+                "function": {
+                    "name": "large_call",
+                    "arguments": "v" * 200_000,
+                },
+            }
+        ],
+    )
+    original_messages = list(context.messages)
+
+    class UnusedLLM:
+        context_window = 32_000
+
+        async def chat(self, **_: Any) -> Any:  # pragma: no cover - must not run
+            raise AssertionError("an oversized compact request must not be sent")
+
+    with caplog.at_level(logging.WARNING, logger="xagent.core.agent.runtime"):
+        result = await PatternRuntime().compact_context_if_needed(
+            context=context,
+            llm=UnusedLLM(),
+        )
+
+    assert not result.compacted
+    assert result.metadata["llm_compact_request_too_large"] is True
+    assert result.metadata["fallback_suppressed"] is True
+    assert context.messages == original_messages
+    # Too large is a fit problem; the unknown-window warning must not claim it.
+    assert not any("has no context_window" in r.getMessage() for r in caplog.records)
+    assert any(
+        "cannot fit the compact model window" in r.getMessage() for r in caplog.records
+    )
+
+
+@pytest.mark.asyncio
+async def test_compaction_names_the_compact_model_when_its_window_is_unknown(
+    caplog,
+) -> None:
+    context = ExecutionContext(execution_id="compact-window-unknown")
+    context.compact_config.threshold = 1
+    context.add_user_message("requirement that must survive")
+    context.add_assistant_message("work in progress")
+    original_messages = list(context.messages)
+
+    class WindowlessLLM:
+        model_name = "qwen3.6-plus"
+        context_window = None
+
+        async def chat(self, **_: Any) -> Any:  # pragma: no cover - must not run
+            raise AssertionError("compaction must not call a model with no window")
+
+    with caplog.at_level(logging.WARNING, logger="xagent.core.agent.runtime"):
+        result = await PatternRuntime().compact_context_if_needed(
+            context=context, llm=WindowlessLLM()
+        )
+        # Blocked compaction leaves the context over threshold, so the next
+        # iteration blocks again; the warning must not repeat with it.
+        repeat = await PatternRuntime().compact_context_if_needed(
+            context=context, llm=WindowlessLLM()
+        )
+
+    assert not result.compacted
+    assert result.metadata["llm_compact_context_window_unknown"] is True
+    assert result.metadata["fallback_suppressed"] is True
+    assert repeat.metadata["llm_compact_context_window_unknown"] is True
+    assert context.messages == original_messages
+    messages = [record.getMessage() for record in caplog.records]
+    unknown_window = [m for m in messages if "qwen3.6-plus" in m]
+    assert len(unknown_window) == 1
+    assert "context_window" in unknown_window[0]
+    assert "compact-window-unknown" in unknown_window[0]
+    # The generic "cannot fit" message describes a different failure and must
+    # not be logged for this one.
+    assert not any("cannot fit the compact model window" in m for m in messages)
+
+
+@pytest.mark.asyncio
+async def test_compaction_reports_tokenizer_unavailable_distinctly(
+    monkeypatch: pytest.MonkeyPatch, caplog
+) -> None:
+    """A known compact-model window but a tokenizer that fails to load is
+    neither the "window unknown" case nor the generic "cannot fit" case --
+    each describes a different reason compaction had to be skipped, and
+    conflating them would point an operator at the wrong fix."""
+    context = ExecutionContext(execution_id="compact-tokenizer-unavailable")
+    context.compact_config.threshold = 1
+    context.add_user_message("requirement that must survive")
+    context.add_assistant_message("work in progress")
+    original_messages = list(context.messages)
+
+    class SizedLLM:
+        model_name = "compact-test"
+        context_window = 32_000
+
+        async def chat(self, **_: Any) -> Any:  # pragma: no cover - must not run
+            raise AssertionError("compaction must not call a model with no tokenizer")
+
+    execution_module._compact_token_encoding.cache_clear()
+
+    def fail_to_load(_: str) -> None:
+        raise OSError("offline")
+
+    monkeypatch.setattr(execution_module.tiktoken, "get_encoding", fail_to_load)
+    try:
+        with caplog.at_level(logging.WARNING, logger="xagent.core.agent.runtime"):
+            result = await PatternRuntime().compact_context_if_needed(
+                context=context, llm=SizedLLM()
+            )
+    finally:
+        execution_module._compact_token_encoding.cache_clear()
+
+    assert not result.compacted
+    assert result.metadata["llm_compact_tokenizer_unavailable"] is True
+    assert result.metadata["fallback_suppressed"] is True
+    assert context.messages == original_messages
+    messages = [record.getMessage() for record in caplog.records]
+    tokenizer_unavailable = [m for m in messages if "could not count" in m]
+    assert len(tokenizer_unavailable) == 1
+    assert "cannot fit the compact model window" not in tokenizer_unavailable[0]
+    assert "has no context_window" not in tokenizer_unavailable[0]
+    assert not any("cannot fit the compact model window" in m for m in messages)
+    assert not any("has no context_window" in m for m in messages)
+
+
+@pytest.mark.asyncio
+async def test_drop_backstop_metadata_carries_threshold_source() -> None:
+    context = ExecutionContext(execution_id="backstop-provenance")
+    context.compact_config.threshold = 1
+    context.compact_config.max_messages = 2
+    for index in range(5):
+        context.add_user_message(f"message-{index}")
+
+    # No compact model: the runtime drops messages instead of summarizing.
+    result = await PatternRuntime().compact_context_if_needed(context=context)
+
+    assert result.compacted
+    assert result.metadata["threshold"] == 1
+    assert result.metadata["threshold_source"] == COMPACT_THRESHOLD_SOURCE_DEFAULT
+
+
+@pytest.mark.asyncio
+async def test_prepare_llm_for_context_warns_when_selected_model_has_no_window(
+    caplog,
+) -> None:
+    class PreparedLLM:
+        model_name = "moonshotai.kimi-k2.5"
+        context_window = None
+
+    class VirtualLLM:
+        async def prepare_for_call(
+            self,
+            messages: list[dict[str, Any]],
+            *,
+            preferred_input_modalities: tuple[str, ...] = (),
+        ) -> Any:
+            return PreparedLLM()
+
+    context = ExecutionContext()
+    with caplog.at_level(logging.WARNING, logger="xagent.core.agent.runtime"):
+        for _ in range(2):
+            await prepare_llm_for_context(
+                llm=VirtualLLM(),
+                messages=[{"role": "user", "content": "hello"}],
+                context=context,
+            )
+
+    # Nothing to derive from, so the threshold stands as-is, but its source no
+    # longer claims to be the plain default since a selection was made.
+    assert context.compact_config.threshold == 32000
+    assert context.compact_config.threshold_source == COMPACT_THRESHOLD_SOURCE_UNKNOWN
+    warnings = [
+        r.getMessage()
+        for r in caplog.records
+        if "moonshotai.kimi-k2.5" in r.getMessage()
+    ]
+    assert len(warnings) == 1
+    assert "compaction threshold" in warnings[0]
+    assert "32000" in warnings[0]
+
+
+@pytest.mark.asyncio
+async def test_prepare_llm_for_context_warns_when_a_later_selection_has_no_window(
+    caplog,
+) -> None:
+    class SizedLLM:
+        model_name = "sized"
+        context_window = 128_000
+
+    class WindowlessLLM:
+        model_name = "windowless"
+        context_window = None
+
+    class VirtualLLM:
+        def __init__(self) -> None:
+            self.selections = [SizedLLM(), WindowlessLLM(), WindowlessLLM()]
+
+        async def prepare_for_call(self, messages: Any, **_: Any) -> Any:
+            return self.selections.pop(0)
+
+    context = ExecutionContext()
+    llm = VirtualLLM()
+    messages = [{"role": "user", "content": "hello"}]
+    with caplog.at_level(logging.WARNING, logger="xagent.core.agent.runtime"):
+        for _ in range(3):
+            await prepare_llm_for_context(llm=llm, messages=messages, context=context)
+
+    # The earlier selection's derived threshold value stands, but its source
+    # no longer claims to describe the active (windowless) model.
+    assert context.compact_config.threshold == 96_000
+    assert context.compact_config.threshold_source == COMPACT_THRESHOLD_SOURCE_UNKNOWN
+    warnings = [
+        r.getMessage() for r in caplog.records if "windowless" in r.getMessage()
+    ]
+    assert len(warnings) == 1
+    assert "96000" in warnings[0]
+    assert "threshold_source=unknown" in warnings[0]
+    assert "XAGENT_COMPACT_THRESHOLD_DEFAULT" not in warnings[0]
+
+
+def test_warn_restored_compact_threshold_only_for_the_default_source(caplog) -> None:
+    class FixedLLM:
+        model_id = "row-35"
+        model_name = "moonshotai.kimi-k2.5"
+
+    restored = ExecutionContext.from_dict(ExecutionContext().to_dict())
+    assert restored.compact_config.threshold_source == COMPACT_THRESHOLD_SOURCE_DEFAULT
+    derived = ExecutionContext()
+    derived.compact_config.threshold_source = COMPACT_THRESHOLD_SOURCE_CONTEXT_WINDOW
+
+    with caplog.at_level(logging.WARNING, logger="xagent.core.agent.runtime"):
+        runtime_module.warn_restored_compact_threshold(restored, FixedLLM())
+        runtime_module.warn_restored_compact_threshold(restored, FixedLLM())
+        runtime_module.warn_restored_compact_threshold(derived, FixedLLM())
+        runtime_module.warn_restored_compact_threshold(restored, None)
+
+    warnings = [
+        r.getMessage() for r in caplog.records if "resumed task" in r.getMessage()
+    ]
+    assert len(warnings) == 1
+    # Keyed on the stable model id, not the display name.
+    assert "row-35" in warnings[0]
+    assert "32000" in warnings[0]
+
+
+def test_warn_restored_compact_threshold_default_source_windowless_model_warns(
+    caplog,
+) -> None:
+    class WindowlessLLM:
+        model_id = "row-40"
+        model_name = "moonshotai.kimi-k2.5"
+
+    context = ExecutionContext.from_dict(ExecutionContext().to_dict())
+    assert context.compact_config.threshold_source == COMPACT_THRESHOLD_SOURCE_DEFAULT
+
+    with caplog.at_level(logging.WARNING, logger="xagent.core.agent.runtime"):
+        runtime_module.warn_restored_compact_threshold(context, WindowlessLLM())
+        runtime_module.warn_restored_compact_threshold(context, WindowlessLLM())
+
+    warnings = [
+        r.getMessage() for r in caplog.records if "resumed task" in r.getMessage()
+    ]
+    assert len(warnings) == 1
+    assert "row-40" in warnings[0]
+
+
+def test_warn_restored_compact_threshold_silent_when_live_model_has_a_window(
+    caplog,
+) -> None:
+    class SizedLLM:
+        model_id = "row-41"
+        context_window = 256_000
+
+    context = ExecutionContext.from_dict(ExecutionContext().to_dict())
+    assert context.compact_config.threshold_source == COMPACT_THRESHOLD_SOURCE_DEFAULT
+
+    with caplog.at_level(logging.WARNING, logger="xagent.core.agent.runtime"):
+        runtime_module.warn_restored_compact_threshold(context, SizedLLM())
+
+    assert not any("resumed task" in r.getMessage() for r in caplog.records)
+
+
+def test_warn_restored_compact_threshold_silent_for_virtual_model(caplog) -> None:
+    class VirtualLLM:
+        model_id = "row-42"
+        context_window = None
+
+        async def prepare_for_call(self, messages: Any, **_: Any) -> Any:
+            return self
+
+    context = ExecutionContext.from_dict(ExecutionContext().to_dict())
+    assert context.compact_config.threshold_source == COMPACT_THRESHOLD_SOURCE_DEFAULT
+
+    with caplog.at_level(logging.WARNING, logger="xagent.core.agent.runtime"):
+        runtime_module.warn_restored_compact_threshold(context, VirtualLLM())
+
+    assert not any("resumed task" in r.getMessage() for r in caplog.records)
+
+
+def test_warn_restored_compact_threshold_unknown_source_windowless_model_warns(
+    caplog,
+) -> None:
+    class WindowlessLLM:
+        model_id = "row-43"
+        model_name = "moonshotai.kimi-k2.5"
+
+    payload = ExecutionContext().to_dict()
+    del payload["compact_config"]["threshold_source"]
+    context = ExecutionContext.from_dict(payload)
+    assert context.compact_config.threshold_source == COMPACT_THRESHOLD_SOURCE_UNKNOWN
+
+    with caplog.at_level(logging.WARNING, logger="xagent.core.agent.runtime"):
+        runtime_module.warn_restored_compact_threshold(context, WindowlessLLM())
+
+    warnings = [
+        r.getMessage() for r in caplog.records if "resumed task" in r.getMessage()
+    ]
+    assert len(warnings) == 1
+    assert "row-43" in warnings[0]
+
+
+def test_warn_restored_compact_threshold_silent_for_context_window_source(
+    caplog,
+) -> None:
+    class WindowlessLLM:
+        model_id = "row-44"
+        model_name = "moonshotai.kimi-k2.5"
+
+    context = ExecutionContext()
+    context.compact_config.threshold_source = COMPACT_THRESHOLD_SOURCE_CONTEXT_WINDOW
+
+    with caplog.at_level(logging.WARNING, logger="xagent.core.agent.runtime"):
+        runtime_module.warn_restored_compact_threshold(context, WindowlessLLM())
+
+    assert not any("resumed task" in r.getMessage() for r in caplog.records)
+
+
+def test_warn_restored_compact_threshold_silent_for_none_llm(caplog) -> None:
+    context = ExecutionContext.from_dict(ExecutionContext().to_dict())
+
+    with caplog.at_level(logging.WARNING, logger="xagent.core.agent.runtime"):
+        runtime_module.warn_restored_compact_threshold(context, None)
+
+    assert not any("resumed task" in r.getMessage() for r in caplog.records)
+
+
+def test_compact_model_key_prefers_the_stable_model_id() -> None:
+    class Both:
+        model_id = "row-36"
+        model_name = "moonshotai.kimi-k2.5"
+
+    class NameOnly:
+        model_id = ""
+        model_name = "moonshotai.kimi-k2.5"
+
+    class Neither:
+        pass
+
+    assert runtime_module.compact_model_key(Both()) == "row-36"
+    assert runtime_module.compact_model_key(NameOnly()) == "moonshotai.kimi-k2.5"
+    assert runtime_module.compact_model_key(Neither()) == "Neither"
+
+
+@pytest.mark.asyncio
+async def test_compact_trace_event_carries_threshold_source() -> None:
+    class CompactEventTracer:
+        def __init__(self) -> None:
+            self.events: list[dict[str, Any]] = []
+
+        async def trace_event(
+            self,
+            event_type: Any,
+            *,
+            task_id: str | None = None,
+            step_id: str | None = None,
+            data: dict[str, Any] | None = None,
+        ) -> None:
+            self.events.append(
+                {
+                    "event_type": getattr(event_type, "value", str(event_type)),
+                    "data": data or {},
+                }
+            )
+
+    tracer = CompactEventTracer()
+    runtime = PatternRuntime(tracer=tracer, execution_id="compact-trace")
+    context = ExecutionContext(execution_id="compact-trace")
+    context.compact_config.threshold = 1
+    context.compact_config.max_messages = 2
+    for index in range(5):
+        context.add_user_message(f"message-{index}")
+
+    result = await runtime.compact_context_if_needed(context=context)
+
+    assert result.compacted
+    compact_events = [e for e in tracer.events if "compact" in str(e["event_type"])]
+    assert compact_events, tracer.events
+    for event in compact_events:
+        assert event["data"]["threshold"] == 1
+        assert event["data"]["threshold_source"] == COMPACT_THRESHOLD_SOURCE_DEFAULT
+
+
+@pytest.mark.asyncio
+async def test_compaction_preserves_context_after_provider_rejects_its_length() -> None:
+    context = ExecutionContext(execution_id="provider-context-rejection")
+    context.compact_config.threshold = 1
+    context.compact_config.max_messages = 2
+    marker = "ORIGINAL_REQUIREMENT_MUST_SURVIVE"
+    context.add_user_message(marker)
+    for index in range(4):
+        context.add_assistant_message(f"work-{index}")
+    original_messages = list(context.messages)
+
+    class RejectingLLM:
+        context_window = 32_000
+
+        def __init__(self) -> None:
+            self.budgets: list[int] = []
+
+        async def chat(self, **kwargs: Any) -> Any:
+            self.budgets.append(kwargs["max_tokens"])
+            raise RuntimeError(
+                "The input token count (461428) exceeds the maximum number "
+                "of tokens allowed (131072)."
+            )
+
+    llm = RejectingLLM()
+    result = await PatternRuntime().compact_context_if_needed(context=context, llm=llm)
+
+    assert llm.budgets == [256]
+    assert not result.compacted
+    assert result.strategy == "none"
+    assert result.metadata["llm_compact_context_length_error"] is True
+    assert result.metadata["fallback_suppressed"] is True
+    assert context.messages == original_messages
+    assert marker in context.messages[0].content
 
 
 def _oversized_context(execution_id: str) -> ExecutionContext:
     context = ExecutionContext(execution_id=execution_id)
     context.compact_config.threshold = 32000
     context.add_user_message("current request")
+    context.add_assistant_message(
+        "",
+        tool_calls=[
+            {
+                "id": "call-1",
+                "function": {"name": "read_file", "arguments": "{}"},
+            }
+        ],
+    )
     context.add_tool_result(
         "read_file", {"output": "x" * 200_000}, tool_call_id="call-1"
     )
@@ -1787,3 +2609,129 @@ async def test_dropping_messages_publishes_no_summary_to_replay() -> None:
     assert result.strategy == "truncate"
     assert COMPACT_SUMMARY_METADATA_KEY not in result.metadata
     assert COMPACT_WATERMARK_METADATA_KEY not in result.metadata
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("message_type", ["question", "confirmation"])
+async def test_runtime_send_message_warns_when_no_outbound_handler(
+    monkeypatch: pytest.MonkeyPatch,
+    message_type: str,
+) -> None:
+    """#1328: an agent rebuilt from history (process restart, cache miss,
+    other worker) can end up with no outbound message handler installed.
+    Today ``send_message`` silently drops the payload in that case -- the
+    only trace is the payload sitting in ``outbound_messages``, with nothing
+    logged to say the delivery never happened. This pins that a warning is
+    logged instead, naming the execution and the message shape but never
+    the message text itself (message content can be arbitrary agent/user
+    output and must not be duplicated into logs). The warning must fire on
+    expect_response=True regardless of message_type, because react.py's
+    send_message tool handler reads the two arguments independently."""
+
+    recording_logger = RecordingLogger()
+    monkeypatch.setattr(runtime_module, "logger", recording_logger)
+    runtime = PatternRuntime(execution_id="task-123", outbound_message_handler=None)
+
+    payload = await runtime.send_message(
+        message="Question?",
+        message_type=message_type,
+        expect_response=True,
+    )
+
+    assert payload["message"] == "Question?"
+    assert runtime.outbound_messages == [payload]
+
+    assert len(recording_logger.warning_calls) == 1
+    msg, args = recording_logger.warning_calls[0]
+    logged = msg % args
+    assert "no outbound message handler" in logged
+    assert "task-123" in logged
+    assert "Question?" not in logged
+    assert recording_logger.debug_calls == []
+
+
+@pytest.mark.asyncio
+async def test_runtime_send_message_debug_logs_dropped_progress_update(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#1328: a dropped progress update (not a question, no response
+    expected) does not park the run, so it should only be debug-logged --
+    the warning is reserved for the case that actually loses the agent's
+    turn. The payload must still be recorded and returned even though
+    nothing is installed to deliver it."""
+
+    recording_logger = RecordingLogger()
+    monkeypatch.setattr(runtime_module, "logger", recording_logger)
+    runtime = PatternRuntime(execution_id="task-123", outbound_message_handler=None)
+
+    payload = await runtime.send_message(
+        message="Still working",
+        message_type="progress",
+        expect_response=False,
+    )
+
+    assert payload["message"] == "Still working"
+    assert runtime.outbound_messages == [payload]
+
+    assert recording_logger.warning_calls == []
+    assert len(recording_logger.debug_calls) == 1
+    msg, args = recording_logger.debug_calls[0]
+    logged = msg % args
+    assert "no outbound message handler" in logged
+    assert "task-123" in logged
+    assert "Still working" not in logged
+
+
+class _FailingFinishTraceTracer:
+    """A tracer whose finish_trace hook always fails."""
+
+    async def finish_trace(self, **kwargs: Any) -> None:
+        raise RuntimeError("tracer backend unavailable")
+
+
+class _RecordingReActPattern:
+    __class__ = type("ReActPattern", (), {})  # noqa: A003 - mimic real class name
+
+
+@pytest.mark.asyncio
+async def test_on_pattern_error_preserves_the_original_error_when_finish_trace_fails() -> (
+    None
+):
+    """A failing ``finish_trace`` hook must not mask the reported error.
+
+    Before this fix, ``on_pattern_error`` awaited the optional
+    ``tracer.finish_trace()`` hook unshielded. If that hook raised, its
+    exception propagated out of ``on_pattern_error`` in place of the
+    original error -- for a ``CheckpointPersistenceError`` durability abort,
+    that would let the runner's typed guard miss it entirely and treat the
+    replacement as an ordinary recoverable pattern exception.
+    """
+
+    runtime = PatternRuntime(
+        tracer=_FailingFinishTraceTracer(), execution_id="exec-finish-trace-fails"
+    )
+    original = CheckpointPersistenceError("after_tool checkpoint failed")
+
+    # Must return normally: the finish_trace failure is swallowed as
+    # best-effort telemetry cleanup, not re-raised in place of ``original``.
+    await runtime.on_pattern_error(
+        context=ExecutionContext(execution_id="exec-finish-trace-fails"),
+        pattern=_RecordingReActPattern(),
+        error=original,
+    )
+
+
+@pytest.mark.asyncio
+async def test_on_pattern_error_marks_the_pattern_error_as_reported() -> None:
+    """The runner's fallback terminal-trace report checks this flag."""
+
+    runtime = PatternRuntime(execution_id="exec-reported-flag")
+    assert runtime.pattern_error_reported is False
+
+    await runtime.on_pattern_error(
+        context=ExecutionContext(execution_id="exec-reported-flag"),
+        pattern=_RecordingReActPattern(),
+        error=CheckpointPersistenceError("checkpoint write failed"),
+    )
+
+    assert runtime.pattern_error_reported is True

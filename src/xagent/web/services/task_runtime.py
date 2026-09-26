@@ -90,6 +90,9 @@ MCP_RUNTIME_AUTHORIZATION_POLICY_REQUIRED_KEY = (
 MCP_RUNTIME_AUTHORIZATION_POLICY_IDENTITY_KEY = (
     "mcp_runtime_authorization_policy_identity"
 )
+MCP_RUNTIME_AUTHORIZATION_POLICY_STDIO_KEY = (
+    "__xagent_mcp_runtime_authorization_policy_allow_builtin_stdio"
+)
 # Keys in ``tasks.agent_config`` that only the server may write. Task-create
 # request bodies carry a free-form ``agent_config`` dict that endpoints copy
 # wholesale, so anything the server later reads back as authoritative has to
@@ -198,6 +201,7 @@ CLIENT_RESERVED_AGENT_CONFIG_KEYS: frozenset[str] = frozenset(
         EXECUTION_SCOPE_AGENT_CONFIG_KEY,
         MCP_RUNTIME_AUTHORIZATION_POLICY_REQUIRED_KEY,
         MCP_RUNTIME_AUTHORIZATION_POLICY_IDENTITY_KEY,
+        MCP_RUNTIME_AUTHORIZATION_POLICY_STDIO_KEY,
         SELECTED_FILE_IDS_AGENT_CONFIG_KEY,
         FILE_OPERATION_ACCESS_VERSION_KEY,
         "auth_mode",
@@ -554,7 +558,12 @@ async def delete_task_extensions(
     bound_extensions: Iterable[str],
     force: bool = False,
 ) -> tuple[str, ...]:
-    """Release provider-owned state before the core task row is deleted.
+    """Release provider-owned state for one task.
+
+    The on-demand deletion paths call this before the core task row is
+    deleted; the cleanup retry driver (``task_cleanup_obligations``) calls it
+    after, for a release that is owed -- see the provider contract in
+    ``core.task_runtime``.
 
     Only providers listed in ``bound_extensions`` -- the per-task binding record
     written when the task was created -- are dispatched. Deletion is therefore

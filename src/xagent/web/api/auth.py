@@ -11,7 +11,7 @@ import re
 import secrets
 import time
 from datetime import datetime, timedelta, timezone
-from typing import Annotated, Any, Dict, List, Literal, Optional, cast
+from typing import Annotated, Any, Dict, List, Literal, NamedTuple, Optional, cast
 
 import requests
 
@@ -34,8 +34,17 @@ from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session
 
+from ...builtin_identity import builtin_provenance_identity
 from ...config import get_app_base_url, get_password_reset_expire_minutes
 from ...core.agent.voice_policy import VALID_VOICES as _CORE_VALID_VOICES
+from ...core.runtime_performance import (
+    increment_counter as increment_performance_counter,
+)
+from ...core.runtime_performance import (
+    observe_duration,
+    observe_value,
+)
+from ...core.utils.security import host_matches_suffix
 from ..auth_config import (
     ACCESS_TOKEN_EXPIRE_MINUTES,
     JWT_ALGORITHM,
@@ -44,7 +53,13 @@ from ..auth_config import (
     REFRESH_TOKEN_EXPIRE_DAYS,
 )
 from ..auth_dependencies import get_current_user
+from ..first_admin_setup import FirstAdminIdentity, run_first_admin_setup_hook
 from ..models.actor_oauth_flow import ActorOAuthFlowState
+from ..models.auth_database import (
+    SyncAuthSessionFactory,
+    get_auth_db,
+    run_auth_db_worker,
+)
 from ..models.database import (
     get_db,
     get_session_local,
@@ -54,7 +69,6 @@ from ..models.system_setting import SystemSetting
 from ..models.user import User
 from ..models.user_oauth import UserOAuth
 from ..oauth_provider_quirks import (
-    host_matches_suffix,
     matches_provider_family,
     requires_json_accept_header,
     requires_pkce,
@@ -65,6 +79,7 @@ from ..services.db_runtime import await_task_settlement, propagate_deferred_canc
 from ..services.user_oauth import (
     delete_scoped_user_oauth_accounts,
     normalize_user_oauth_resource_owner_key,
+    scoped_user_oauth_query,
 )
 from ..utils.graphql_errors import graphql_errors_message, truncate_error_text
 
@@ -159,6 +174,64 @@ def _run_post_commit_oauth_side_effects(
             connector_key,
             exc_info=True,
         )
+
+
+def _matching_gmail_reconnect_tombstone(
+    db: Session,
+    *,
+    user_id: int,
+    resource_owner_key: str | None,
+    connector_key: str,
+    provider_user_id: object,
+    email: object,
+) -> UserOAuth | None:
+    """Return the same-identity Gmail tombstone that a reconnect can revive.
+
+    Gmail triggers and watch state bind to ``UserOAuth.id``. Replacing a
+    retained tombstone with a fresh row would cascade-delete its watch and
+    leave the trigger bound to the removed id. Only ordinary Gmail needs this
+    identity preservation; actor credentials have no Gmail lifecycle rows.
+
+    A stable upstream id wins. Email is a fallback only when the stored row
+    did not have an upstream id, so authorizing a different Google identity
+    cannot silently move an existing mailbox trigger to that account.
+    """
+    if resource_owner_key is not None or connector_key != "gmail":
+        return None
+
+    candidates = (
+        scoped_user_oauth_query(
+            db,
+            user_id=int(user_id),
+            resource_owner_key=None,
+        )
+        .filter(
+            UserOAuth.provider == connector_key,
+            UserOAuth.access_token == "",
+        )
+        .order_by(UserOAuth.id.desc())
+        .all()
+    )
+    normalized_provider_user_id = str(provider_user_id) if provider_user_id else None
+    if normalized_provider_user_id is not None:
+        for candidate in candidates:
+            if candidate.provider_user_id == normalized_provider_user_id:
+                return candidate
+
+    normalized_email = str(email or "").strip().lower()
+    if not normalized_email:
+        return None
+    for candidate in candidates:
+        if candidate.provider_user_id:
+            # The stored row has its own verified upstream id -- matching it
+            # by email alone would let an unverified reconnect (this
+            # callback's provider_user_id came back empty) silently move a
+            # different identity's mailbox trigger onto whatever account is
+            # authorizing right now.
+            continue
+        if str(candidate.email or "").strip().lower() == normalized_email:
+            return candidate
+    return None
 
 
 def _oauth_env_name(provider: str, suffix: str) -> str:
@@ -379,7 +452,48 @@ def _merged_oauth_scopes(
     return scopes, scope_str
 
 
-def _meta_login_config_id() -> str:
+# Under Facebook Login for Business (config_id mode), the Meta Login
+# Configuration named by config_id is the *sole* source of truth for granted
+# permissions -- see _generic_oauth_login below, which sends config_id
+# instead of scope/optional_scope entirely. Every provider="meta" app that
+# doesn't have its own entry here falls back to the one shared META_CONFIG_ID,
+# so a deployment that adds a new permission to that shared Login
+# Configuration for one app (e.g. ads_read for Meta Ads) hands that same
+# permission to every other meta app's authorize request too -- not merely
+# offered, since the resulting token is capable of it regardless of which app
+# the user thought they were connecting. Give an app its own env var here (a
+# dedicated Login Configuration scoped to just its own permissions) to avoid
+# sharing a token's capability across connectors that don't ask for it.
+_META_APP_CONFIG_ID_ENV_VARS = {
+    "facebook": "META_FACEBOOK_CONFIG_ID",
+    "instagram": "META_INSTAGRAM_CONFIG_ID",
+    "meta-ads": "META_ADS_CONFIG_ID",
+    "whatsapp": "META_WHATSAPP_CONFIG_ID",
+}
+
+
+def _meta_login_config_id(app_id: str | None = None) -> str:
+    if app_id:
+        # Normalized the same way requires_app_scoped_oauth_grant resolves
+        # app_id (mcp_apps._normalize_oauth_grant_key), not a bare .lower() --
+        # an admin-created app_id like "Meta Ads" normalizes to "meta-ads"
+        # there but not here, which would silently miss this override and
+        # fall back to the shared META_CONFIG_ID for that app, reintroducing
+        # the exact cross-app capability sharing this override exists to
+        # avoid. Imported locally to match this module's existing lazy-import
+        # convention for mcp_apps (see requires_app_scoped_oauth_grant above).
+        from ..mcp_apps import _normalize_oauth_grant_key
+
+        normalized_app_id = _normalize_oauth_grant_key(app_id)
+        app_env_var = (
+            _META_APP_CONFIG_ID_ENV_VARS.get(normalized_app_id)
+            if normalized_app_id
+            else None
+        )
+        if app_env_var:
+            app_config_id = os.environ.get(app_env_var)
+            if app_config_id:
+                return app_config_id
     return os.environ.get("META_CONFIG_ID", "")
 
 
@@ -947,9 +1061,15 @@ def create_access_token(
 
 def create_refresh_token(data: Dict[str, Any]) -> str:
     """Create JWT refresh token with longer expiry"""
-    to_encode = data.copy()
+    # Refresh consumes user_id, never username/sub. Omit that redundant,
+    # unbounded UTF-8 claim to keep the signed token within VARCHAR(255).
+    # Access tokens retain sub; verification still accepts existing refresh JWTs.
+    to_encode = {"user_id": data["user_id"]}
     expire = datetime.now(timezone.utc) + timedelta(days=REFRESH_TOKEN_EXPIRE_DAYS)
-    to_encode.update({"exp": expire, "type": "refresh"})
+    # Rotation must change the stored value even within one JWT timestamp second.
+    to_encode.update(
+        {"exp": expire, "type": "refresh", "jti": secrets.token_urlsafe(16)}
+    )
     encoded_jwt: str = jwt.encode(to_encode, JWT_SECRET_KEY, algorithm=JWT_ALGORITHM)
     return encoded_jwt
 
@@ -1276,7 +1396,9 @@ async def setup_status(db: Session = Depends(get_db)) -> SetupStatusResponse:
 
 @auth_router.post("/setup-admin", response_model=RegisterResponse)
 async def setup_admin(
-    request: RegisterRequest, db: Session = Depends(get_db)
+    request: RegisterRequest,
+    http_request: Request,
+    db: Session = Depends(get_db),
 ) -> RegisterResponse:
     if len(request.password) < PASSWORD_MIN_LENGTH:
         return RegisterResponse(
@@ -1322,11 +1444,17 @@ async def setup_admin(
         setup_setting = SystemSetting(key=SETUP_COMPLETED_SETTING_KEY, value="true")
         db.add(setup_setting)
 
+        run_first_admin_setup_hook(
+            http_request.app, db, FirstAdminIdentity(user_id=int(user.id))
+        )
         db.commit()
         db.refresh(user)
     except IntegrityError:
         db.rollback()
         return RegisterResponse(success=False, message="Setup already completed")
+    except Exception:
+        db.rollback()
+        raise
 
     return RegisterResponse(
         success=True,
@@ -1467,86 +1595,88 @@ def get_user_by_login_identifier(db: Session, identifier: str) -> Optional[User]
     return get_user_by_username(db, login_identifier)
 
 
-@auth_router.post("/login")
-async def login(request: LoginRequest, db: Session = Depends(get_db)) -> Dict[str, Any]:
-    """User login endpoint"""
-    try:
-        # Run synchronous database queries in thread pool to avoid blocking event loop
-        def _get_user_sync() -> User:
-            # Get user from database
-            user = get_user_by_login_identifier(db, request.username)
-            if not user:
-                raise HTTPException(
-                    status_code=status.HTTP_401_UNAUTHORIZED,
-                    detail="Incorrect username or password",
-                )
-            return user
-
-        # Execute database query in thread pool to avoid blocking
-        user = await asyncio.to_thread(_get_user_sync)
-
-        # Verify password
-        if not verify_password(request.password, str(user.password_hash)):
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Incorrect username or password",
-            )
-
-        # Create JWT tokens
-        access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+def _prepare_login_response(user: User | None, request: LoginRequest) -> Dict[str, Any]:
+    """Build detached response data before commit can expire ORM attributes."""
+    if user is None:
+        raise HTTPException(status_code=401, detail="Incorrect username or password")
+    with observe_duration("xagent.auth.login.password_verify.duration"):
+        valid = verify_password(request.password, str(user.password_hash))
+    if not valid:
+        raise HTTPException(status_code=401, detail="Incorrect username or password")
+    with observe_duration("xagent.auth.login.token_creation.duration"):
+        identity = {"sub": user.username, "user_id": user.id}
         access_token = create_access_token(
-            data={"sub": user.username, "user_id": user.id},
-            expires_delta=access_token_expires,
+            data=identity,
+            expires_delta=timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES),
         )
+        token = create_refresh_token(data=identity)
+    setattr(user, "refresh_token", token)
+    setattr(
+        user,
+        "refresh_token_expires_at",
+        datetime.now(timezone.utc) + timedelta(days=REFRESH_TOKEN_EXPIRE_DAYS),
+    )
+    return {
+        "success": True,
+        "message": "Login successful",
+        "user": serialize_auth_user(user, include_login_time=True),
+        "access_token": access_token,
+        "refresh_token": token,
+        "token_type": "bearer",
+        "expires_in": ACCESS_TOKEN_EXPIRE_MINUTES * 60,
+        "refresh_expires_in": REFRESH_TOKEN_EXPIRE_DAYS * 24 * 60 * 60,
+        "user_id": user.id,
+    }
 
-        # Create refresh token
-        refresh_token = create_refresh_token(
-            data={"sub": user.username, "user_id": user.id}
+
+def _login_in_worker(
+    request: LoginRequest, session_factory: SyncAuthSessionFactory
+) -> Dict[str, Any]:
+    # The same thread creates, queries, commits and closes the Session.
+    with session_factory() as session:
+        with observe_duration("xagent.auth.login.sync_lookup.duration"):
+            user = get_user_by_login_identifier(session, request.username)
+        response = _prepare_login_response(user, request)
+        with observe_duration("xagent.auth.login.sync_commit.duration"):
+            session.commit()
+        # Do not access user here: expire_on_commit=True would issue another SELECT.
+        return response
+
+
+@auth_router.post("/login")
+async def login(
+    request: LoginRequest,
+    db: SyncAuthSessionFactory = Depends(get_auth_db),
+) -> Dict[str, Any]:
+    """Authenticate with a single worker-owned database transaction."""
+    started_at = time.perf_counter()
+    outcome = "error"
+    try:
+        response = await run_auth_db_worker(
+            "login_database_transaction", lambda: _login_in_worker(request, db)
         )
-
-        # Store refresh token in database - run in thread pool to avoid blocking
-        def _update_user_sync() -> None:
-            setattr(user, "refresh_token", refresh_token)
-            setattr(
-                user,
-                "refresh_token_expires_at",
-                datetime.now(timezone.utc) + timedelta(days=REFRESH_TOKEN_EXPIRE_DAYS),
-            )
-            db.commit()
-
-        # Execute database update in thread pool to avoid blocking
-        await asyncio.to_thread(_update_user_sync)
-
-        # Login successful
-        return {
-            "success": True,
-            "message": "Login successful",
-            "user": serialize_auth_user(user, include_login_time=True),
-            "access_token": access_token,
-            "refresh_token": refresh_token,
-            "token_type": "bearer",
-            "expires_in": ACCESS_TOKEN_EXPIRE_MINUTES * 60,  # seconds
-            "refresh_expires_in": REFRESH_TOKEN_EXPIRE_DAYS * 24 * 60 * 60,  # seconds
-            "user_id": user.id,
-        }
-
+        outcome = "succeeded"
+        return response
     except HTTPException:
-        # Re-raise HTTP exceptions
+        outcome = "rejected"
         raise
     except Exception:
-        # str(e) is not put in the response: _update_user_sync's db.commit()
-        # above persists the just-issued refresh_token as a bound SQL
-        # parameter, and a SQLAlchemy StatementError's default __str__
-        # would otherwise echo that live session token back to the client
-        # -- the same class of leak fixed in generic_oauth_callback's
-        # callback handler. hide_parameters=True on the engine
-        # (models/database.py) now hides it there too, but this handler
-        # doesn't rely on that alone. logger.exception still captures it
-        # server-side.
+        # SQL errors may contain bound refresh tokens. Never expose them to clients.
         logger.exception("Login failed")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="An unexpected error occurred during login.",
+        )
+    finally:
+        observe_value(
+            "xagent.auth.login.total.duration",
+            (time.perf_counter() - started_at) * 1_000.0,
+            unit="ms",
+            attributes={"outcome": outcome},
+        )
+        increment_performance_counter(
+            "xagent.auth.login.requests",
+            attributes={"outcome": outcome},
         )
 
 
@@ -1981,7 +2111,7 @@ async def update_current_user_preferences(
             # client-visible 500 for a write that already happened,
             # mirroring the exact bug _run_post_commit_oauth_side_effects
             # (issue #1150) exists to prevent; same fix, same reasoning.
-            from .chat import get_agent_manager
+            from ..services.agent_service_manager import get_agent_manager
 
             try:
                 await get_agent_manager().invalidate_cached_agents_for_owner(user_id)
@@ -2001,91 +2131,85 @@ async def update_current_user_preferences(
         )
 
 
+def _prepare_refresh_response(
+    user: User | None, request: RefreshTokenRequest
+) -> RefreshTokenResponse:
+    if user is None:
+        raise HTTPException(status_code=401, detail="Invalid refresh token")
+    token = getattr(user, "refresh_token", None)
+    expires = getattr(user, "refresh_token_expires_at", None)
+    if token != request.refresh_token or expires is None:
+        raise HTTPException(status_code=401, detail="Invalid refresh token")
+    now = datetime.now(timezone.utc)
+    if getattr(expires, "tzinfo", None) is None:
+        now = now.replace(tzinfo=None)
+    if expires < now:
+        raise HTTPException(status_code=401, detail="Refresh token has expired")
+    identity = {"sub": user.username, "user_id": user.id}
+    access_token = create_access_token(
+        data=identity, expires_delta=timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    )
+    new_token = create_refresh_token(data=identity)
+    return RefreshTokenResponse(
+        success=True,
+        message="Token refreshed successfully",
+        access_token=access_token,
+        refresh_token=new_token,
+        expires_in=ACCESS_TOKEN_EXPIRE_MINUTES * 60,
+        refresh_expires_in=REFRESH_TOKEN_EXPIRE_DAYS * 24 * 60 * 60,
+    )
+
+
+def _refresh_in_worker(
+    request: RefreshTokenRequest,
+    user_id: Any,
+    session_factory: SyncAuthSessionFactory,
+) -> RefreshTokenResponse:
+    with session_factory() as session:
+        user = session.query(User).filter(User.id == user_id).first()
+        response = _prepare_refresh_response(user, request)
+        # End the read snapshot before competing for a write. In SQLite this
+        # avoids a deferred read-to-write lock upgrade; the conditional UPDATE
+        # below, not the preceding SELECT, is the authority on token consumption.
+        session.rollback()
+        now = datetime.now(timezone.utc)
+        changed = (
+            session.query(User)
+            .filter(
+                User.id == user_id,
+                User.refresh_token == request.refresh_token,
+                User.refresh_token_expires_at >= now,
+            )
+            .update(
+                {
+                    User.refresh_token: response.refresh_token,
+                    User.refresh_token_expires_at: now
+                    + timedelta(days=REFRESH_TOKEN_EXPIRE_DAYS),
+                },
+                synchronize_session=False,
+            )
+        )
+        if changed != 1:
+            raise HTTPException(status_code=401, detail="Invalid refresh token")
+        session.commit()
+        return response
+
+
 @auth_router.post("/refresh", response_model=RefreshTokenResponse)
 async def refresh_token(
     request: RefreshTokenRequest,
-    db: Session = Depends(get_db),
+    db: SyncAuthSessionFactory = Depends(get_auth_db),
 ) -> RefreshTokenResponse:
-    """Refresh JWT access token using refresh token"""
+    """Refresh tokens without sharing a synchronous Session across threads."""
     try:
-        # Verify refresh token
         payload = verify_refresh_token(request.refresh_token)
         if not payload:
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Invalid refresh token",
-            )
-
-        # Get user from database
+            raise HTTPException(status_code=401, detail="Invalid refresh token")
         user_id = payload.get("user_id")
-        user = db.query(User).filter(User.id == user_id).first()
-
-        if not user:
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Invalid refresh token",
-            )
-
-        # Check if refresh token matches and is not expired
-        user_refresh_token = getattr(user, "refresh_token", None)
-        refresh_token_expires_at = getattr(user, "refresh_token_expires_at", None)
-        if (
-            user_refresh_token != request.refresh_token
-            or refresh_token_expires_at is None
-        ):
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Invalid refresh token",
-            )
-
-        # Check expiration - handle timezone-aware and naive datetimes
-        now = datetime.now(timezone.utc)
-        if (
-            hasattr(refresh_token_expires_at, "tzinfo")
-            and getattr(refresh_token_expires_at, "tzinfo", None) is not None
-        ):
-            # Timezone-aware datetime
-            if cast(Any, refresh_token_expires_at) < now:
-                raise HTTPException(
-                    status_code=status.HTTP_401_UNAUTHORIZED,
-                    detail="Refresh token has expired",
-                )
-        else:
-            # Naive datetime - assume UTC
-            if cast(Any, refresh_token_expires_at) < now.replace(tzinfo=None):
-                raise HTTPException(
-                    status_code=status.HTTP_401_UNAUTHORIZED,
-                    detail="Refresh token has expired",
-                )
-
-        # Create new access token
-        access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
-        access_token = create_access_token(
-            data={"sub": user.username, "user_id": user.id},
-            expires_delta=access_token_expires,
+        return await run_auth_db_worker(
+            "refresh_database_transaction",
+            lambda: _refresh_in_worker(request, user_id, db),
         )
-
-        # Optionally: Create new refresh token (rotation)
-        new_refresh_token = create_refresh_token(
-            data={"sub": user.username, "user_id": user.id}
-        )
-        setattr(user, "refresh_token", new_refresh_token)
-        setattr(
-            user,
-            "refresh_token_expires_at",
-            datetime.now(timezone.utc) + timedelta(days=REFRESH_TOKEN_EXPIRE_DAYS),
-        )
-        db.commit()
-
-        return RefreshTokenResponse(
-            success=True,
-            message="Token refreshed successfully",
-            access_token=access_token,
-            refresh_token=new_refresh_token,
-            expires_in=ACCESS_TOKEN_EXPIRE_MINUTES * 60,  # seconds
-            refresh_expires_in=REFRESH_TOKEN_EXPIRE_DAYS * 24 * 60 * 60,  # seconds
-        )
-
     except HTTPException:
         raise
     except SQLAlchemyError:
@@ -2289,6 +2413,365 @@ def start_builtin_oauth_for_resource_owner(
         path=cookie_path,
     )
     return response
+
+
+def _revoke_github_oauth_grant(
+    access_token: str, client_id: str, client_secret: str
+) -> None:
+    """Best-effort delete of one GitHub OAuth App grant.
+
+    GitHub's authorize endpoint silently 302-redirects straight back to the
+    callback -- skipping the "Authorize application" consent screen -- for
+    any account that has already granted this app the requested scopes.
+    Disconnecting only the local ``UserOAuth`` row leaves that grant alive
+    on GitHub's side, so the very next reconnect is silent too. Deleting the
+    grant here (not just the token: deleting the grant, unlike deleting a
+    single token, clears every token issued under it and makes GitHub show
+    the consent screen again on the next authorize request) restores the
+    expected "reconnect always re-prompts" behavior.
+
+    Never raises: this runs after the local disconnect has already
+    committed, so a dead token (404), an unreachable GitHub, or literally
+    anything else going wrong here must not surface as a failed disconnect
+    -- every caller up the chain (revoke_resolved_github_oauth_grant,
+    revoke_builtin_oauth_grant_if_unreferenced, revoke_builtin_oauth_grant)
+    documents that same guarantee and depends on it holding here at the leaf.
+
+    Deployments that restrict outbound traffic must allow api.github.com:
+    this is the one new outbound call a GitHub disconnect makes.
+    """
+    try:
+        response = requests.delete(
+            f"https://api.github.com/applications/{client_id}/grant",
+            auth=(client_id, client_secret),
+            json={"access_token": access_token},
+            headers={"Accept": "application/vnd.github+json"},
+            timeout=10,
+        )
+    except Exception as exc:
+        # Broad except, not just requests.RequestException: "never raises"
+        # above is a real contract other functions rely on, not just a
+        # description of the common case. Not exc_info=True either way: the
+        # client_id above is embedded directly in the request URL, so a
+        # ConnectionError/Timeout's own str() -- which exc_info=True's
+        # traceback rendering includes -- would put it in the log. Same
+        # reasoning, same fix, as mcp.py's own provider revocation logging
+        # (exception_type only, never the full traceback).
+        logger.warning(
+            "GitHub OAuth grant revocation request failed (exception_type=%s)",
+            type(exc).__name__,
+        )
+        return
+    # 204: revoked. 404: GitHub already considers the token/grant gone
+    # (already revoked, expired, or never valid) -- also a successful outcome
+    # from the caller's point of view. 422 is deliberately NOT bucketed here:
+    # GitHub documents it for a malformed request or an abuse/rate-limit
+    # block, neither of which means the grant is actually gone, so it must
+    # surface as a genuine (still non-raising) failure instead of being
+    # silently treated the same as "already revoked".
+    if response.status_code == 204:
+        logger.info("GitHub OAuth grant revoked")
+    elif response.status_code != 404:
+        logger.warning(
+            "GitHub OAuth grant revocation returned unexpected status %s",
+            response.status_code,
+        )
+
+
+class BuiltinOAuthRevocation(NamedTuple):
+    """Everything needed to revoke one builtin OAuth grant after its local
+    ``UserOAuth`` row has already been deleted and committed, plus the
+    upstream identity (``provider_user_id``) needed to check whether another
+    local connection still needs that same grant alive -- see
+    :func:`has_other_builtin_oauth_reference`.
+    """
+
+    provider: str
+    access_token: str
+    client_id: str
+    client_secret: str
+    provider_user_id: str | None
+
+    def __repr__(self) -> str:
+        # The default NamedTuple repr would print access_token/client_secret
+        # in plain text -- a stray logger.debug(revocation) or an
+        # uncaught-exception traceback that includes this value as a local
+        # variable must not leak either one.
+        return (
+            f"BuiltinOAuthRevocation(provider={self.provider!r}, "
+            f"access_token=<redacted>, client_id={self.client_id!r}, "
+            f"client_secret=<redacted>, "
+            f"provider_user_id={self.provider_user_id!r})"
+        )
+
+
+def resolve_builtin_oauth_revocation(
+    db: Session,
+    *,
+    provider: str,
+    access_token: str,
+    provider_user_id: str | None,
+) -> BuiltinOAuthRevocation | None:
+    """Resolve one deleted ``UserOAuth`` row into a network-free revocation
+    record, decrypting the stored client_id/secret the same way
+    generic_oauth_login/generic_oauth_callback already do for this row.
+
+    Returns ``None`` when there's nothing to revoke -- an unsupported
+    provider, an empty token, no configured provider row, or a missing
+    secret -- so callers can skip revocation outright. Only reads the
+    database and makes no network call, so it is safe to call while still
+    holding a disconnect transaction's locks; do the actual provider call
+    (:func:`revoke_builtin_oauth_grant_if_unreferenced`) only after that
+    commits.
+    """
+    if provider != "github" or not access_token:
+        return None
+    from ..models.oauth_provider import OAuthProvider
+
+    db_provider = (
+        db.query(OAuthProvider)
+        .filter(OAuthProvider.provider_name == "github")
+        .one_or_none()
+    )
+    if not db_provider:
+        logger.warning(
+            "Skipping GitHub OAuth grant revocation: no github OAuthProvider "
+            "row is configured"
+        )
+        return None
+    # oauth_providers.client_id/client_secret are stored encrypted (or left
+    # blank to fall back to the GITHUB_CLIENT_ID/SECRET env vars) -- same
+    # resolution generic_oauth_login/generic_oauth_callback already use for
+    # this row, never the raw column value.
+    client_id = _resolve_oauth_secret(
+        "github", cast(Any, db_provider.client_id), "CLIENT_ID"
+    )
+    client_secret = _resolve_oauth_secret(
+        "github", cast(Any, db_provider.client_secret), "CLIENT_SECRET"
+    )
+    if not client_id or not client_secret:
+        # Every other skip reason here logs (missing provider row above,
+        # unreachable/failing GitHub in _revoke_github_oauth_grant) -- silence
+        # here would hide a real misconfiguration (e.g. only one of
+        # GITHUB_CLIENT_ID/GITHUB_CLIENT_SECRET set) behind an
+        # indistinguishable "disconnect worked" outcome.
+        logger.warning(
+            "Skipping GitHub OAuth grant revocation: client_id/client_secret "
+            "could not be resolved"
+        )
+        return None
+    return BuiltinOAuthRevocation(
+        provider="github",
+        access_token=access_token,
+        client_id=client_id,
+        client_secret=client_secret,
+        provider_user_id=provider_user_id,
+    )
+
+
+def has_other_builtin_oauth_reference(
+    db: Session, *, provider: str, provider_user_id: str | None
+) -> bool:
+    """True if any current ``UserOAuth`` row -- any local user, any owner
+    namespace -- still points at the same upstream (provider,
+    provider_user_id) identity.
+
+    GitHub's grant-delete revokes every token issued to that GitHub
+    account for this OAuth App, not just the one this disconnect deleted --
+    a different XAgent user (or actor namespace) connected to the *same*
+    upstream account would silently lose their own, still-active token.
+    This must be checked with a fresh read taken as late as possible (right
+    before the network call, never at snapshot/pre-commit time): the row
+    that matters may not exist yet when the disconnect that triggered this
+    revocation was itself committed -- for example a concurrent reconnect
+    (``generic_oauth_callback``) racing the same disconnect and committing a
+    replacement row in between. Checking late does not make this atomic
+    with that callback (there is no shared lock or generation fence between
+    the two paths), but it collapses the race window from "however long
+    until this best-effort revoke actually runs" down to the gap between
+    this query and the DELETE request, which is what makes checking here,
+    right before the call, meaningfully safer than checking at snapshot
+    time and calling it done.
+
+    ``provider_user_id=None`` (a provider whose callback records no stable
+    upstream id) can't prove anything either way -- treated as "no known
+    other reference" so the caller still revokes, matching this function's
+    behavior before this reference check existed, rather than silently
+    disabling revocation for such a provider.
+
+    Synchronous ORM work on ``db``: an async caller must run this directly
+    on the event loop (this module's normal, always-safe pattern for a
+    single fast query -- see the many un-offloaded ``db.query(...)`` calls
+    throughout mcp.py's own disconnect handlers), never inside
+    ``asyncio.to_thread`` with a request-scoped session it doesn't own. A
+    thread-offloaded operation on ``db`` must create and close its own
+    Session in the worker thread instead (see
+    ``services.db_runtime.run_db_io_cancellation_safe``'s own docstring for
+    why: a cancelled request's ``db.close()`` can otherwise race a worker
+    thread still mid-query on that same Session).
+    """
+    if not provider_user_id:
+        return False
+    return (
+        db.query(UserOAuth)
+        .filter(
+            UserOAuth.provider == provider,
+            UserOAuth.provider_user_id == provider_user_id,
+            UserOAuth.access_token != "",
+        )
+        .first()
+        is not None
+    )
+
+
+def revoke_resolved_github_oauth_grant(revocation: BuiltinOAuthRevocation) -> None:
+    """Public, database-free entry point for one already-resolved revocation.
+
+    Takes the whole record rather than three same-typed positional strings
+    on purpose: ``access_token``/``client_id``/``client_secret`` are all
+    plain ``str`` and trivially transposable if passed as separate
+    positional arguments (as this function briefly did) -- passing the
+    record itself, unpacked only here at the one place that needs to, is
+    what actually rules that out for every caller.
+
+    Touches no Session and no shared state, so it's always safe to run
+    inside ``asyncio.to_thread`` regardless of what owns the caller's
+    database session. Never raises (see :func:`_revoke_github_oauth_grant`).
+
+    Does not itself check :func:`has_other_builtin_oauth_reference` --
+    every caller must have already confirmed that check passed. A
+    synchronous/off-event-loop caller should call
+    :func:`revoke_builtin_oauth_grant_if_unreferenced` instead, which does
+    both in one call; an async caller on the event loop should call
+    :func:`has_other_builtin_oauth_reference` directly (never via
+    ``asyncio.to_thread`` -- see that function's own docstring) and only
+    offload this pure network call, exactly like
+    :func:`revoke_builtin_oauth_grants` does.
+    """
+    _revoke_github_oauth_grant(
+        revocation.access_token, revocation.client_id, revocation.client_secret
+    )
+
+
+def revoke_builtin_oauth_grant_if_unreferenced(
+    db: Session, revocation: BuiltinOAuthRevocation
+) -> None:
+    """Best-effort provider-side revoke of one already-resolved builtin
+    OAuth grant, skipped if another local connection (any owner, any user)
+    still references the same upstream account.
+
+    Must run strictly after the disconnect that produced ``revocation`` has
+    committed: the reference check is a fresh read of current ``UserOAuth``
+    rows (see :func:`has_other_builtin_oauth_reference` for exactly what
+    that does and does not make safe). Never raises: unlike
+    :func:`revoke_resolved_github_oauth_grant`, the reference check here
+    does real database work that can fail (a dropped connection, a pool
+    timeout), and this function -- not just its network-only half --
+    promises never to raise, so that failure is caught here too, rolling
+    the session back first so a caller that keeps using ``db`` afterward
+    doesn't inherit a transaction Postgres has already poisoned.
+
+    For a fully synchronous caller only (Toby's disconnect path, via
+    :func:`revoke_builtin_oauth_grant`, and this module's own tests): the
+    Session it does real query work on is ``db``, the caller's own, on
+    whatever thread the caller itself is already running on. An async
+    caller must NOT hand this whole function to ``asyncio.to_thread`` with
+    its request-scoped session -- see :func:`has_other_builtin_oauth_reference`
+    and :func:`revoke_resolved_github_oauth_grant` for the safe async shape.
+    """
+    try:
+        if has_other_builtin_oauth_reference(
+            db,
+            provider=revocation.provider,
+            provider_user_id=revocation.provider_user_id,
+        ):
+            logger.info(
+                "Skipping GitHub OAuth grant revocation: another local "
+                "connection still references this account"
+            )
+            return
+    except Exception as exc:
+        db.rollback()
+        logger.warning(
+            "GitHub OAuth grant reference check failed (exception_type=%s)",
+            type(exc).__name__,
+        )
+        return
+    revoke_resolved_github_oauth_grant(revocation)
+
+
+def revoke_builtin_oauth_grant(
+    db: Session,
+    *,
+    provider: str,
+    access_token: str,
+    provider_user_id: str | None,
+) -> None:
+    """Best-effort provider-side revoke of one deleted ``UserOAuth`` row.
+
+    Called after the local disconnect has committed. Only GitHub is
+    implemented today (see :func:`_revoke_github_oauth_grant`); every other
+    provider is a deliberate no-op here -- add a branch as each provider's
+    own "silently reuses an existing grant" behavior needs the same fix.
+    Never raises. A fully synchronous convenience wrapper around
+    :func:`resolve_builtin_oauth_revocation` +
+    :func:`revoke_builtin_oauth_grant_if_unreferenced` for callers that
+    already run off the event loop (e.g. inside ``anyio.to_thread.run_sync``);
+    an async caller should call those two directly instead, so credential
+    resolution can happen before its commit and the reference check plus
+    network call after.
+    """
+    resolved = resolve_builtin_oauth_revocation(
+        db,
+        provider=provider,
+        access_token=access_token,
+        provider_user_id=provider_user_id,
+    )
+    if resolved is None:
+        return
+    revoke_builtin_oauth_grant_if_unreferenced(db, resolved)
+
+
+async def revoke_builtin_oauth_grants(
+    db: Session, revocations: list[BuiltinOAuthRevocation], *, context: str
+) -> None:
+    """Best-effort provider-side revoke of every already-resolved builtin
+    OAuth grant in ``revocations``, run strictly after the local disconnect
+    that produced them has committed.
+
+    The single shared implementation for every async disconnect endpoint
+    (mcp.py's ``delete_mcp_server`` and ``teardown_mcp_app_server``,
+    cloud_storage.py's ``delete_connected_account``) -- so the
+    reference-check-then-revoke sequence, and its cancellation-safety
+    shape, has exactly one place to get right instead of being copied at
+    each call site. Each entry's reference check
+    (:func:`has_other_builtin_oauth_reference`) runs synchronously on the
+    event loop against the caller's own ``db`` -- never via
+    ``asyncio.to_thread``, per that function's own docstring -- and only
+    the resulting network call is offloaded. Never raises: a dead network,
+    a still-live sibling reference, or a failed reference-check query must
+    not turn an already-successful local disconnect into a failed request.
+
+    ``context`` is folded into the warning log line so a failure can be
+    traced back to which disconnect path it came from.
+    """
+    for revocation in revocations:
+        try:
+            if has_other_builtin_oauth_reference(
+                db,
+                provider=revocation.provider,
+                provider_user_id=revocation.provider_user_id,
+            ):
+                logger.info(
+                    "Skipping GitHub OAuth grant revocation (%s): another "
+                    "local connection still references this account",
+                    context,
+                )
+                continue
+            await asyncio.to_thread(revoke_resolved_github_oauth_grant, revocation)
+        except Exception:
+            db.rollback()
+            logger.warning("Builtin OAuth grant revocation failed (%s)", context)
 
 
 def _generic_oauth_login(
@@ -2503,7 +2986,12 @@ def _generic_oauth_login(
     }
     if provider.lower() == "google":
         params["access_type"] = "offline"
-        params["include_granted_scopes"] = "true"
+        # Do not carry a previously granted full-Drive permission into a
+        # narrowed drive.file reconnect. Other Google connectors still use
+        # incremental authorization so their independent grants compose.
+        params["include_granted_scopes"] = (
+            "false" if app_id == "google-drive" else "true"
+        )
         params["prompt"] = "consent"
     if provider.lower() == "zoom":
         params["prompt"] = "login"
@@ -2540,7 +3028,7 @@ def _generic_oauth_login(
         # consent screen. Without this, the callback's businessId guard
         # (see _normalize_myob_business_id) would reject every connection.
         params["prompt"] = "consent"
-    meta_config_id = _meta_login_config_id() if provider.lower() == "meta" else ""
+    meta_config_id = _meta_login_config_id(app_id) if provider.lower() == "meta" else ""
     if meta_config_id:
         params["config_id"] = meta_config_id
     else:
@@ -2580,11 +3068,23 @@ def _ensure_user_mcp_server(
             "connected via the OAuth flow."
         )
 
-    def _oauth_auth_metadata() -> dict[str, str]:
-        metadata = {"app_id": str(app_info["id"])}
+    def _oauth_auth_metadata() -> dict[str, Any]:
+        metadata: dict[str, Any] = {"app_id": str(app_info["id"])}
         provider = app_info.get("provider")
         if provider:
             metadata["provider"] = str(provider)
+        launch_config = app_info.get("launch_config")
+        provenance = (
+            launch_config.get("builtin_provenance")
+            if isinstance(launch_config, dict)
+            else None
+        )
+        provenance_identity = builtin_provenance_identity(provenance)
+        if isinstance(provenance, dict) and provenance_identity == (
+            "xagent",
+            str(app_info["id"]),
+        ):
+            metadata["builtin_provenance"] = dict(provenance)
         return metadata
 
     def _ensure_server_matches_oauth_app(server: MCPServer) -> None:
@@ -3556,20 +4056,50 @@ def generic_oauth_callback(
                 # Serialize replacement in the stable user namespace.
                 db.query(User.id).filter(User.id == user_id).with_for_update().one()
 
-            delete_scoped_user_oauth_accounts(
+            connector_key = app_id or provider
+            oauth_account = _matching_gmail_reconnect_tombstone(
                 db,
                 user_id=user_id,
                 resource_owner_key=resource_owner_key,
-                providers=[app_id or provider],
+                connector_key=connector_key,
+                provider_user_id=provider_user_id,
+                email=email,
             )
+            if oauth_account is None:
+                delete_scoped_user_oauth_accounts(
+                    db,
+                    user_id=user_id,
+                    resource_owner_key=resource_owner_key,
+                    providers=[connector_key],
+                )
+                oauth_account = UserOAuth(
+                    user_id=user_id,
+                    provider=connector_key,
+                    resource_owner_key=resource_owner_key,
+                )
+                db.add(oauth_account)
+            else:
+                # Preserve the matching tombstone's primary key, but retain
+                # the callback's replace-all semantics for any other Gmail
+                # rows in the ordinary namespace.
+                (
+                    scoped_user_oauth_query(
+                        db,
+                        user_id=user_id,
+                        resource_owner_key=None,
+                    )
+                    .filter(
+                        UserOAuth.provider == connector_key,
+                        UserOAuth.id != int(oauth_account.id),
+                    )
+                    .delete(synchronize_session=False)
+                )
 
-            oauth_account = UserOAuth(
-                user_id=user_id,
-                provider=(app_id or provider),
-                resource_owner_key=resource_owner_key,
-                provider_user_id=str(provider_user_id) if provider_user_id else None,
+            setattr(
+                oauth_account,
+                "provider_user_id",
+                str(provider_user_id) if provider_user_id else None,
             )
-            db.add(oauth_account)
 
             setattr(oauth_account, "access_token", access_token)
             setattr(oauth_account, "token_type", token_data.get("token_type", "Bearer"))
@@ -3589,15 +4119,15 @@ def generic_oauth_callback(
                 token_scope = " ".join(str(scope) for scope in token_scope)
             setattr(oauth_account, "scope", token_scope)
             setattr(oauth_account, "email", email)
+            setattr(oauth_account, "refresh_token", None)
             if "refresh_token" in token_data:
                 setattr(oauth_account, "refresh_token", token_data.get("refresh_token"))
             # Salesforce returns the per-org API host here instead of using a
             # fixed domain -- no other provider (besides Deputy, handled
-            # explicitly below) sends this key, and oauth_account is freshly
-            # created above (never an update to an existing row), so
-            # token_data.get() returning None for every other provider is
-            # already the correct, final value: no `if "instance_url" in
-            # token_data` guard needed to avoid clobbering anything.
+            # explicitly below) sends this key. A callback fully replaces
+            # credential metadata even when it revives a Gmail tombstone, so
+            # token_data.get() returning None for every other provider is the
+            # correct final value rather than stale state to preserve.
             resolved_instance_url = token_data.get("instance_url")
             if is_deputy:
                 # Deputy's equivalent is `endpoint`, not `instance_url`, and
@@ -3612,6 +4142,7 @@ def generic_oauth_callback(
                 # (MYOB can't reach this branch without it).
                 resolved_instance_url = myob_business_id
             setattr(oauth_account, "instance_url", resolved_instance_url)
+            setattr(oauth_account, "expires_at", None)
             if "expires_in" in token_data:
                 setattr(
                     oauth_account,
@@ -3679,7 +4210,7 @@ def generic_oauth_callback(
                     # picks up directly (bypassing the connected-state check)
                     # and can never resolve a token for; see
                     # APPS_REQUIRING_APP_SCOPED_OAUTH_GRANT.
-                    if requires_app_scoped_oauth_grant(app_info.get("id")):
+                    if requires_app_scoped_oauth_grant(app_info):
                         logger.info(
                             "Skipping app-scoped-only app %s during bare %s "
                             "OAuth batch connect",

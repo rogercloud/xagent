@@ -7,19 +7,24 @@ which lists all tools that can be used by agents.
 
 import logging
 import tempfile
+from datetime import datetime, timezone
 from types import SimpleNamespace
 
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
+from tests.shared.auth_database import auth_db_override
 from xagent.core.tools.adapters.vibe.config import (
     ToolFactoryRuntimeSessionBoundaryError,
 )
 from xagent.web.api.auth import auth_router
 from xagent.web.api.tools import _create_tool_info, tools_router
+from xagent.web.models.auth_database import get_auth_db
 from xagent.web.models.database import Base, get_db, get_engine, init_db
-from xagent.web.models.tool_config import ToolConfig, ToolUsage
+from xagent.web.models.task import Task, TraceEvent
+from xagent.web.models.tool_config import ToolConfig
+from xagent.web.models.user import User
 
 
 def override_get_db():
@@ -37,6 +42,7 @@ test_app = FastAPI()
 test_app.include_router(auth_router)
 test_app.include_router(tools_router)
 test_app.dependency_overrides[get_db] = override_get_db
+test_app.dependency_overrides[get_auth_db] = auth_db_override(override_get_db)
 
 # Create test client
 client = TestClient(test_app)
@@ -243,6 +249,10 @@ class _AvailableToolsRouteHarness:
             def query(self, model: object) -> Query:
                 return Query(model)
 
+        monkeypatch.setattr(
+            "xagent.web.api.tools._tool_usage_query", lambda _db: Query("tool_usage")
+        )
+
         class SandboxManager:
             async def get_or_create_lease_provider(
                 self, _scope: str, _user_id: str
@@ -334,7 +344,7 @@ async def test_available_tools_cleanup_failure_follows_complete_route_body(
         "sound_effect",
         "music",
         "response_shape",
-        ToolUsage.__name__,
+        "tool_usage",
         ToolConfig.__name__,
         "user_overrides",
         "close",
@@ -564,6 +574,32 @@ class TestToolsAvailableAPI:
         data = response.json()
         tools = data["tools"]
 
+        counted_tool = tools[0]["name"]
+        with next(get_db()) as db:
+            user = db.query(User).filter(User.username == "admin").one()
+            task = Task(user_id=user.id, title="Tool usage")
+            db.add(task)
+            db.flush()
+            db.add(
+                TraceEvent(
+                    task_id=task.id,
+                    event_id="tool-usage-list-event",
+                    event_type="tool_execution_end",
+                    timestamp=datetime.now(timezone.utc),
+                    data={"tool_name": counted_tool, "success": True},
+                )
+            )
+            db.commit()
+        response = client.get(
+            "/api/tools/available", headers={"Authorization": f"Bearer {token}"}
+        )
+        assert response.status_code == 200
+        tools = response.json()["tools"]
+        assert (
+            next(tool for tool in tools if tool["name"] == counted_tool)["usage_count"]
+            == 1
+        )
+
         # Each tool should have usage_count field
         for tool in tools:
             assert "usage_count" in tool
@@ -610,6 +646,21 @@ class TestToolsAvailableAPI:
 
         assert tool_display_categories.get("fetch_web_content") == "Web Search"
         assert tool_categories.get("fetch_web_content") == "web_search"
+
+    def test_get_available_tools_marks_always_available_tools(self) -> None:
+        from xagent.core.agent.context.skill_tool import LOAD_SKILL_TOOL_NAME
+        from xagent.core.tools.adapters.vibe.base import INTRINSIC_TOOL_NAMES
+
+        response = client.get(
+            "/api/tools/available",
+            headers={"Authorization": f"Bearer {self._login_admin()}"},
+        )
+
+        assert response.status_code == 200
+        data = response.json()
+        marked = {t["name"] for t in data["tools"] if t["always_available"]}
+        assert marked == INTRINSIC_TOOL_NAMES
+        assert data["skill_loader_tool"] == LOAD_SKILL_TOOL_NAME
 
     def test_get_available_tools_requires_auth(self):
         """Test that /api/tools/available requires authentication."""

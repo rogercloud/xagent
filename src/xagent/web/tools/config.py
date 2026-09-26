@@ -8,6 +8,7 @@ and other web-specific sources.
 import asyncio
 import copy
 import inspect
+import json
 import logging
 import os
 import random
@@ -42,6 +43,7 @@ from ...core.agent.result import (
     normalize_tool_failure_code,
 )
 from ...core.tools.adapters.vibe.config import (
+    ACTOR_STDIO_SHADOWED_REASON,
     BaseToolConfig,
     MCPConfigLoadError,
     MCPFailurePolicy,
@@ -61,7 +63,21 @@ from ...core.tools.adapters.vibe.connector_runtime import (
     runtime_bindings_from_config,
 )
 from ...core.tools.adapters.vibe.db_session import tool_session_scope
-from ..services.mcp_runtime import MCPBuiltinOAuthActorPolicy
+from ...core.tools.adapters.vibe.mcp_adapter import redact_urls_in_text
+from ..services.actor_mcp_runtime import (
+    ActorMCPStdioSessionIdentity,
+    resolve_actor_mcp_stdio_configs,
+)
+from ..services.mcp_runtime import (
+    MCPActorExecutionIdentity,
+    MCPBuiltinOAuthActorPolicy,
+)
+from ..services.slack_actor_runtime import (
+    SLACK_ACTOR_RUNTIME_REFRESH_KEY,
+    SLACK_CHANNEL_ACCESS_POLICY_ENV,
+    resolve_slack_actor_runtime_grant,
+    serialize_slack_channel_access_policy,
+)
 from ..services.tool_credentials import (
     TOOL_CREDENTIAL_SPECS,
     get_sql_connection_map,
@@ -96,6 +112,7 @@ _ACTOR_OAUTH_REFRESH_LOCKS: WeakValueDictionary[
 MCP_UNAVAILABLE_REASONS = frozenset(
     {
         "authorization_required",
+        ACTOR_STDIO_SHADOWED_REASON,
         "catalog_app_not_found",
         "config_load_failed",
         "insufficient_scope",
@@ -129,6 +146,15 @@ class TokenRequest:
     without canonicalization. ``scope`` is the current execution scope from
     ``WebToolConfig.get_execution_scope()`` when present; it is typed as
     Optional[Any] to avoid importing the core scope type into this config layer.
+    ``auth_type`` is the connector's declared authentication type as classified
+    by ``connector_auth_type()`` (e.g. ``"none"``, ``"bearer"``, ``"api_key"``,
+    ``"oauth2"``, ``"mcp_oauth"``); it is the literal string ``"builtin_oauth"``
+    for catalog apps whose OAuth is implied by ``transport == "oauth"``; and it
+    is ``None`` when the type cannot be determined, which a resolver should
+    treat as "unknown", never as "no credential needed". ``"none"`` means only
+    that the connector declares no ``auth`` JSON; it does not mean the
+    connector carries no credential, because static ``headers`` (e.g.
+    ``Authorization``) are sent regardless and are not inspected there.
     """
 
     provider: str
@@ -136,6 +162,7 @@ class TokenRequest:
     scope: Optional[Any] = None
     resource: str | None = None
     refresh: OAuthRefreshContext | None = None
+    auth_type: str | None = None
 
 
 @dataclass(frozen=True)
@@ -161,6 +188,7 @@ class ResolvedToken:
 class _LegacyOAuthTokenResolution:
     access_token: str | None
     refresh_failed: bool = False
+    credential_present: bool = False
     # Set only for providers that return a per-org API host instead of
     # using a fixed domain (Salesforce) -- None for everyone else.
     instance_url: str | None = None
@@ -457,6 +485,21 @@ def _bounded_oauth_metadata(value: Any, *, max_length: int = 128) -> str:
     return f"{text[: max_length - 3]}..."
 
 
+def _redacted_bounded_resource(resource: str | None) -> str | None:
+    """Redact and bound an OAuth resource URL for a diagnostic, or ``None``
+    if there is none. Every producer of ``resource`` (``mcp_runtime.py``'s
+    ``effective_mcp_oauth_resource`` and this module's
+    ``_oauth_token_configured_resource``) excludes the empty string, so a
+    truthy guard and an ``is not None`` guard are equivalent in practice;
+    this uses the truthy form so ``""`` -- if a producer's contract ever
+    changes -- is treated the same as ``None`` rather than redacted and
+    bounded into a diagnostic-empty string.
+    """
+    if not resource:
+        return None
+    return _bounded_oauth_metadata(redact_urls_in_text(resource))
+
+
 def _extract_oauth_token_resolver_diagnostic_actor_id(exc: Exception) -> str | None:
     try:
         raw_actor_id = getattr(exc, "oauth_token_resolver_diagnostic_actor_id", None)
@@ -497,7 +540,7 @@ def _oauth_token_provider_candidates(app_info: Mapping[str, Any]) -> list[str]:
     from ...web.mcp_apps import restrict_to_app_scoped_oauth_grant
 
     return restrict_to_app_scoped_oauth_grant(
-        app_info.get("id"), (app_info.get("provider"), app_info.get("id"))
+        app_info, (app_info.get("provider"), app_info.get("id"))
     )
 
 
@@ -724,7 +767,7 @@ class _OAuthRefreshPermanentlyInvalid(Exception):
     refresh token is dead -- revoked, expired, or the token/config it needs
     to refresh is simply missing -- as opposed to a transient failure
     (timeout, network error, provider 5xx) that may well succeed on a later
-    retry. Only this case should cost the user their stored connection.
+    retry. Only this case should invalidate the user's stored credentials.
     """
 
 
@@ -1647,6 +1690,10 @@ class WebToolConfig(BaseToolConfig):
         vision_model: Optional[Any] = None,
         llm: Optional[Any] = None,
         include_mcp_tools: bool = True,
+        # Set by a caller that must not let this config materialize live MCP
+        # connectors, but still wants the model told why. The selected servers
+        # are reported unavailable with this reason instead of being loaded.
+        mcp_unavailable_reason: Optional[str] = None,
         task_id: Optional[str] = None,
         workspace_base_dir: Optional[str] = None,
         browser_tools_enabled: bool = True,
@@ -1677,6 +1724,8 @@ class WebToolConfig(BaseToolConfig):
         # positional arguments for anything after agent_call_stack keeps
         # binding the same values it always did.
         voice: Optional[str] = None,
+        mcp_actor_stdio_connection_adapter: Any = None,
+        mcp_actor_execution_identity: MCPActorExecutionIdentity | None = None,
     ):
         # ``tool_selection_spec`` accepts :class:`ToolSelectionSpec` from
         # the tools adapter package; typed as ``Any`` here to avoid an
@@ -1704,6 +1753,14 @@ class WebToolConfig(BaseToolConfig):
         # object can be overwritten by the model, and this value must not
         # be confusable with that one at the resolution point.
         self._declared_knowledge_bases = declared_knowledge_bases
+        # Internal storage boundary for actor-scoped stdio. It is deliberately
+        # separate from ordinary MCP env/auth hooks and receives the exact
+        # actor and lifecycle identity on every secret read.
+        self._mcp_actor_stdio_connection_adapter = mcp_actor_stdio_connection_adapter
+        self._mcp_actor_execution_identity = mcp_actor_execution_identity
+        self._mcp_actor_stdio_session_identities: dict[
+            str, ActorMCPStdioSessionIdentity
+        ] = {}
         self._task_runtime_contribution: Any = None
         self._task_runtime_workspace: Any = None
         self._live_db = db
@@ -1759,6 +1816,7 @@ class WebToolConfig(BaseToolConfig):
         self._explicit_vision_model = vision_model
         self._explicit_llm = llm
         self._include_mcp_tools = include_mcp_tools
+        self._mcp_unavailable_reason = mcp_unavailable_reason
         self._task_id = task_id
         self._browser_tools_enabled = browser_tools_enabled
         self._allowed_collections = allowed_collections
@@ -1834,8 +1892,8 @@ class WebToolConfig(BaseToolConfig):
         self._browser_locale_resolved = False
         self._cached_browser_locale: Optional[str] = None
 
-    def _build_mcp_file_allowed_dirs(self) -> str:
-        """Build comma-separated file roots that local MCP tools may read."""
+    def _mcp_file_allowed_dir_paths(self) -> list[str]:
+        """Build unique, resolved file roots for local MCP read tools."""
         dirs: list[str] = []
         base_dir = Path(str(self._workspace_config.get("base_dir", get_uploads_dir())))
         task_id = self._workspace_config.get("task_id")
@@ -1851,7 +1909,27 @@ class WebToolConfig(BaseToolConfig):
             if dir_path not in seen:
                 unique_dirs.append(dir_path)
                 seen.add(dir_path)
-        return ",".join(unique_dirs)
+        return unique_dirs
+
+    def _build_mcp_task_output_dir(self) -> str:
+        """Single write-target root for connectors that create new files in
+        the task workspace (currently just Google Drive's download tool).
+
+        Deliberately distinct from _mcp_file_allowed_dir_paths() above:
+        that method builds a read allowlist that may reasonably include
+        allowed_external_dirs (e.g. read-only KB folders) alongside the
+        task dir, and multiple consumers of it pick whichever entry a
+        requested path happens to fall under. A write target has no such
+        "any of these" semantics — writing into an external read-only dir
+        by picking the wrong list entry would be wrong, not just
+        suboptimal — so this only ever returns the task dir itself, never
+        an external dir, and is empty whenever there's no task workspace.
+        """
+        task_id = self._workspace_config.get("task_id")
+        if not task_id:
+            return ""
+        base_dir = Path(str(self._workspace_config.get("base_dir", get_uploads_dir())))
+        return str((base_dir / str(task_id)).expanduser().resolve())
 
     def _get_is_admin_from_request(self, request: Any) -> bool:
         """Extract is_admin flag from the request user, defaulting to False.
@@ -2012,6 +2090,9 @@ class WebToolConfig(BaseToolConfig):
         if not self._include_mcp_tools:
             return []
 
+        if self._mcp_unavailable_reason is not None:
+            return self._refused_mcp_server_configs(self._mcp_unavailable_reason)
+
         if self._cached_mcp_configs is not None:
             if self._mcp_config_cache_is_valid():
                 return self._cached_mcp_configs
@@ -2023,6 +2104,53 @@ class WebToolConfig(BaseToolConfig):
         configs = await self._load_mcp_server_configs()
         self._store_mcp_config_cache_if_cacheable(configs)
         return configs
+
+    def _refused_mcp_server_configs(self, reason: str) -> List[Dict[str, Any]]:
+        """Project the selected MCP servers into unavailable configs.
+
+        Deliberately does not load anything: the point of the refusal is that
+        no connector is materialized, so paying the config scan to name the
+        servers more precisely would defeat it. The selection spec already
+        names them whenever the selection is server-scoped, which is the case
+        this refusal exists for -- a delegated agent whose persisted selection
+        lists ``mcp:<server>``.
+
+        An unrestricted selection (``scoped_mcp_servers()`` is ``None``, i.e.
+        the plain ``mcp`` parent or ALL mode) has no names to report without
+        that scan, so it yields no tools at all. The refusal still holds; only
+        the explanation is best effort.
+        """
+
+        spec = self._tool_selection_spec
+        scoped = spec.scoped_mcp_servers() if spec is not None else None
+        if not scoped:
+            return []
+        return [
+            {
+                "name": server_name,
+                "config": {"unavailable": True, "reason": reason},
+            }
+            for server_name in sorted(scoped)
+        ]
+
+    def get_actor_mcp_stdio_session_identities(
+        self,
+    ) -> Dict[str, ActorMCPStdioSessionIdentity]:
+        """Return host-only identities that must never enter MCP configs."""
+
+        return dict(self._mcp_actor_stdio_session_identities)
+
+    def get_actor_mcp_stdio_session_consumer(self) -> Any:
+        """Return the sandbox-only Chrome consumer for host-side identities."""
+
+        if not self._mcp_actor_stdio_session_identities:
+            return None
+
+        from ..services.chrome_mcp_runtime import (
+            consume_chrome_actor_stdio_session,
+        )
+
+        return consume_chrome_actor_stdio_session
 
     def _serialize_mcp_user_id(self) -> str:
         """Return the explicit identity used to isolate an MCP config."""
@@ -2120,6 +2248,19 @@ class WebToolConfig(BaseToolConfig):
             return False
         self._connector_runtime_turn_id = normalized_turn_id
         self._connector_runtime_view = None
+        self._cached_mcp_configs = None
+        self._factory_runtime_snapshot = None
+        self._pending_runtime_policy = None
+        return True
+
+    def set_mcp_actor_execution_identity(
+        self, identity: MCPActorExecutionIdentity | None
+    ) -> bool:
+        """Advance the exact actor execution fence on a reused tool config."""
+
+        if self._mcp_actor_execution_identity == identity:
+            return False
+        self._mcp_actor_execution_identity = identity
         self._cached_mcp_configs = None
         self._factory_runtime_snapshot = None
         self._pending_runtime_policy = None
@@ -2511,6 +2652,10 @@ class WebToolConfig(BaseToolConfig):
     def get_voice(self) -> Optional[str]:
         """See BaseToolConfig.get_voice's docstring."""
         return self._voice
+
+    def get_mcp_unavailable_reason(self) -> Optional[str]:
+        """See BaseToolConfig.get_mcp_unavailable_reason's docstring."""
+        return self._mcp_unavailable_reason
 
     def _note_unresolved_tool_policy(self, input_name: str, reason: str) -> None:
         """Record that a policy input could not be resolved for this turn.
@@ -3280,6 +3425,7 @@ class WebToolConfig(BaseToolConfig):
         providers: list[str],
         resource: str | None,
         resolver: TokenResolver | None = None,
+        auth_type: str | None,
     ) -> _ResolvedHookToken | None:
         if resolver is None:
             resolver, _ = _get_oauth_token_resolver_hook()
@@ -3292,6 +3438,7 @@ class WebToolConfig(BaseToolConfig):
                 user_id=int(self._user_id),
                 scope=self.get_execution_scope(),
                 resource=resource,
+                auth_type=auth_type,
             )
             try:
                 resolved = await _maybe_await_oauth_token_resolver_result(
@@ -3332,6 +3479,7 @@ class WebToolConfig(BaseToolConfig):
         resource: str | None,
         failed_generation: str | None,
         non_auth_connection: dict[str, Any],
+        auth_type: str | None,
     ) -> dict[str, Any] | ClassifiedToolFailure | None:
         from ...web.services.mcp_oauth import MCPAuthorizationChallenge
 
@@ -3356,6 +3504,7 @@ class WebToolConfig(BaseToolConfig):
                 challenge_scope=challenge.scope,
                 failed_generation=failed_generation,
             ),
+            auth_type=auth_type,
         )
         try:
             resolved = await _maybe_await_oauth_token_resolver_result(resolver(request))
@@ -3397,6 +3546,7 @@ class WebToolConfig(BaseToolConfig):
             scope=scope,
             resource=resource,
             non_auth_connection=non_auth_connection,
+            auth_type=auth_type,
         )
 
     def _build_resolver_owned_mcp_connection(
@@ -3410,6 +3560,7 @@ class WebToolConfig(BaseToolConfig):
         scope: Any,
         resource: str | None,
         non_auth_connection: dict[str, Any],
+        auth_type: str | None,
     ) -> dict[str, Any]:
         from ...web.services.mcp_runtime import connection_with_bearer_authorization
 
@@ -3427,6 +3578,7 @@ class WebToolConfig(BaseToolConfig):
                 resource=resource,
                 failed_generation=resolved.generation,
                 non_auth_connection=non_auth_connection,
+                auth_type=auth_type,
             )
 
         connection = connection_with_bearer_authorization(
@@ -3526,9 +3678,7 @@ class WebToolConfig(BaseToolConfig):
             server,
             code=OAUTH_TOKEN_RESOLVER_FAILURE_CODE,
             message=OAUTH_TOKEN_RESOLVER_FAILURE_MESSAGE,
-            resource=_bounded_oauth_metadata(error.resource)
-            if error.resource is not None
-            else None,
+            resource=_redacted_bounded_resource(error.resource),
         )
         diagnostic["providers"] = [
             _bounded_oauth_metadata(provider) for provider in error.providers[:2]
@@ -3551,9 +3701,12 @@ class WebToolConfig(BaseToolConfig):
         )
         self._mcp_oauth_diagnostics.append(diagnostic)
         logger.warning(
-            "OAuth token resolver failed for MCP server '%s' with %s",
+            "OAuth token resolver failed for MCP server '%s' with %s "
+            "(failure_code=%s, resource=%s)",
             getattr(server, "name", "<unknown>"),
             error.exception_type,
+            error.failure_code,
+            diagnostic["resource"],
         )
         return self._build_unavailable_mcp_config(
             server=server,
@@ -3595,7 +3748,6 @@ class WebToolConfig(BaseToolConfig):
             "description": getattr(server, "description", None),
             "config": inner_config,
             "user_id": serialized_user_id,
-            "allow_users": [serialized_user_id],
         }
 
     def _build_oauth_mcp_stdio_transport_config(
@@ -3658,10 +3810,29 @@ class WebToolConfig(BaseToolConfig):
                     "http_proxy": os.environ.get("http_proxy", ""),
                 }
             )
-            allowed_file_dirs = self._build_mcp_file_allowed_dirs()
-            if allowed_file_dirs:
+            allowed_file_dir_paths = self._mcp_file_allowed_dir_paths()
+            if allowed_file_dir_paths:
+                # JSON preserves commas inside directory names. The shared
+                # parser also accepts the legacy comma-delimited form for
+                # manually configured standalone deployments.
+                allowed_file_dirs = json.dumps(allowed_file_dir_paths)
                 env["XAGENT_LINKEDIN_IMAGE_ALLOWED_DIRS"] = allowed_file_dirs
                 env["XAGENT_SLACK_FILE_ALLOWED_DIRS"] = allowed_file_dirs
+                env["XAGENT_GMAIL_FILE_ALLOWED_DIRS"] = allowed_file_dirs
+                env["XAGENT_ONEDRIVE_FILE_ALLOWED_DIRS"] = allowed_file_dirs
+                env["XAGENT_SHAREPOINT_FILE_ALLOWED_DIRS"] = allowed_file_dirs
+                env["XAGENT_GOOGLE_DRIVE_FILE_ALLOWED_DIRS"] = allowed_file_dirs
+            # Distinct from the six read allowlists above: Google Drive's
+            # download tool writes NEW files into the task workspace, so it
+            # gets its own single-value, task-dir-only var rather than
+            # reusing the read-allowlist shape (see
+            # _build_mcp_task_output_dir's docstring for why that would be
+            # wrong, not just differently-shaped). google_drive_upload_file
+            # reads from XAGENT_GOOGLE_DRIVE_FILE_ALLOWED_DIRS above instead,
+            # like the other five read allowlists.
+            task_output_dir = self._build_mcp_task_output_dir()
+            if task_output_dir:
+                env["XAGENT_GOOGLE_DRIVE_OUTPUT_DIR"] = task_output_dir
             transport_config["env"] = env
             return transport_config
 
@@ -3707,8 +3878,12 @@ class WebToolConfig(BaseToolConfig):
         user_id: int,
         resource_owner_key: str | None,
     ) -> _LegacyOAuthTokenResolution:
-        if not oauth_account or not oauth_account.access_token:
+        if not oauth_account:
             return _LegacyOAuthTokenResolution(access_token=None)
+        if not oauth_account.access_token:
+            return _LegacyOAuthTokenResolution(
+                access_token=None, credential_present=True
+            )
 
         logger.info(
             "OAUTH CONFIG: Token found for '%s'. Refresh token present: %s, Expires: %s",
@@ -3742,12 +3917,13 @@ class WebToolConfig(BaseToolConfig):
             return _LegacyOAuthTokenResolution(
                 access_token=None,
                 refresh_failed=True,
+                credential_present=True,
             )
 
         if permanently_invalid:
             logger.warning(
                 "OAUTH CONFIG: Token for '%s' is invalid and could not be refreshed. "
-                "Deleting OAuth record to prompt user for reconnection.",
+                "Clearing stored credentials to prompt user for reconnection.",
                 provider_name,
             )
             if resource_owner_key is None:
@@ -3762,11 +3938,37 @@ class WebToolConfig(BaseToolConfig):
                     resource_owner_key=None,
                 )
             if oauth_account is not None:
-                oauth_db.delete(oauth_account)
+                # Keep the account identity as a reconnect tombstone. Deleting
+                # the row makes a permanently invalid connection
+                # indistinguishable from one that was never authorized, while
+                # retaining either token would keep dead credentials at rest.
+                if (
+                    str(oauth_account.provider) == "gmail"
+                    and oauth_account.resource_owner_key is None
+                ):
+                    # mark_gmail_oauth_reconnect_required clears the tokens
+                    # itself, atomically with quiescing the dependent
+                    # watch/triggers under the account's mailbox transition
+                    # lock. Clearing them here first would let the lock's own
+                    # pre-acquisition commit persist the clear before the
+                    # watch update runs, splitting one transaction into two.
+                    from ..services.gmail_provisioning import (
+                        mark_gmail_oauth_reconnect_required,
+                    )
+
+                    mark_gmail_oauth_reconnect_required(
+                        oauth_db,
+                        oauth_account=oauth_account,
+                    )
+                else:
+                    oauth_account.access_token = ""
+                    oauth_account.refresh_token = None
+                    oauth_account.expires_at = None
                 oauth_db.commit()
             return _LegacyOAuthTokenResolution(
                 access_token=None,
                 refresh_failed=True,
+                credential_present=True,
             )
 
         access_token = str(oauth_account.access_token)
@@ -3775,6 +3977,7 @@ class WebToolConfig(BaseToolConfig):
         return _LegacyOAuthTokenResolution(
             access_token=access_token,
             instance_url=instance_url,
+            credential_present=True,
         )
 
     async def _resolve_actor_oauth_access_token_in_worker(
@@ -3881,6 +4084,7 @@ class WebToolConfig(BaseToolConfig):
         *,
         provider_name: object,
         app_id: object,
+        app_info: Mapping[str, Any] | None = None,
         resource_owner_key: str | None = None,
     ) -> _LegacyOAuthTokenResolution:
         """Resolve and persist one exact OAuth owner in an isolated transaction."""
@@ -3908,7 +4112,8 @@ class WebToolConfig(BaseToolConfig):
                 # can't be trusted to carry a permission added after that flow
                 # already existed. See APPS_REQUIRING_APP_SCOPED_OAUTH_GRANT.
                 providers_to_check = restrict_to_app_scoped_oauth_grant(
-                    app_id, [provider_name, app_id]
+                    app_info if app_info is not None else app_id,
+                    [provider_name, app_id],
                 )
                 oauth_account = (
                     scoped_user_oauth_query(
@@ -3972,14 +4177,18 @@ class WebToolConfig(BaseToolConfig):
         user_env_by_id: Mapping[int, Any],
         shared_env_by_id: Mapping[int, Any],
         env_source_by_id: Mapping[int, Any],
-        actor_builtin_app_info: Mapping[str, Any] | None = None,
+        actor_catalog_app_info: Mapping[str, Any] | None = None,
         actor_builtin_invalid: bool = False,
+        actor_builtin_invalid_reason: str = "config_load_failed",
     ) -> Dict[str, Any]:
         """Build one MCP server config, preserving explicit unavailable outcomes."""
-        actor_builtin = actor_builtin_app_info is not None
+        actor_builtin = bool(
+            actor_catalog_app_info is not None
+            and actor_catalog_app_info.get("auth_type") == "builtin_oauth"
+        )
         if actor_builtin_invalid:
             policy_diagnostic = {
-                "code": "config_load_failed",
+                "code": actor_builtin_invalid_reason,
                 "message": "MCP server configuration is unavailable",
                 "server_id": int(server.id),
                 "server_name": server.name,
@@ -3987,7 +4196,7 @@ class WebToolConfig(BaseToolConfig):
             self._mcp_oauth_diagnostics.append(policy_diagnostic)
             return self._build_unavailable_mcp_config(
                 server=server,
-                reason="config_load_failed",
+                reason=actor_builtin_invalid_reason,
                 diagnostic=policy_diagnostic,
             )
 
@@ -4026,8 +4235,8 @@ class WebToolConfig(BaseToolConfig):
             "name": server.name,
             "transport": server.transport,
             "description": (
-                actor_builtin_app_info.get("description")
-                if actor_builtin_app_info is not None
+                actor_catalog_app_info.get("description")
+                if actor_catalog_app_info is not None
                 else server.description
             ),
         }
@@ -4055,8 +4264,8 @@ class WebToolConfig(BaseToolConfig):
             from ...web.mcp_apps import get_app_for_mcp_server
 
             app_info = (
-                dict(actor_builtin_app_info)
-                if actor_builtin_app_info is not None
+                dict(actor_catalog_app_info)
+                if actor_catalog_app_info is not None
                 else get_app_for_mcp_server(self.db, server)
             )
             if app_info is None:
@@ -4084,6 +4293,7 @@ class WebToolConfig(BaseToolConfig):
                     hook_token = await self._resolve_oauth_token_from_hook(
                         providers=providers_to_resolve,
                         resource=configured_resource,
+                        auth_type="builtin_oauth",
                     )
                 except _OAuthTokenResolverFailed as error:
                     return self._resolver_failure_config(
@@ -4132,6 +4342,7 @@ class WebToolConfig(BaseToolConfig):
                 legacy_token = await self._resolve_legacy_oauth_access_token(
                     provider_name=provider_name,
                     app_id=app_id,
+                    app_info=app_info,
                     resource_owner_key=(
                         self._mcp_runtime_authorization_policy.resource_owner_key
                         if actor_builtin
@@ -4146,7 +4357,44 @@ class WebToolConfig(BaseToolConfig):
                         message=UNAVAILABLE_MCP_CREDENTIAL_MESSAGE,
                         failure_code="oauth_token_required",
                     )
-                if legacy_token.access_token is None:
+                access_token = legacy_token.access_token
+                serialized_slack_policy: str | None = None
+                slack_runtime_refresh_args: (
+                    tuple[int, str, MCPActorExecutionIdentity, Any] | None
+                ) = None
+                actor_policy = self._mcp_runtime_authorization_policy
+                if (
+                    actor_builtin
+                    and app_id == "slack"
+                    and access_token is None
+                    and not legacy_token.credential_present
+                    and actor_policy is not None
+                ):
+                    grant = await resolve_slack_actor_runtime_grant(
+                        user_id=self._user_id,
+                        resource_owner_key=actor_policy.resource_owner_key,
+                        execution_identity=self._mcp_actor_execution_identity,
+                        scope=self.get_execution_scope(),
+                    )
+                    if grant is not None:
+                        access_token = grant.access_token
+                        serialized_slack_policy = serialize_slack_channel_access_policy(
+                            grant.channel_access
+                        )
+                        execution_identity = self._mcp_actor_execution_identity
+                        if (
+                            execution_identity is None
+                        ):  # pragma: no cover - resolver gate
+                            raise RuntimeError(
+                                "Slack actor runtime grant requires execution identity"
+                            )
+                        slack_runtime_refresh_args = (
+                            cast(int, self._user_id),
+                            actor_policy.resource_owner_key,
+                            execution_identity,
+                            self.get_execution_scope(),
+                        )
+                if access_token is None:
                     logger.info(
                         f"OAUTH CONFIG: No valid token found for '{provider_name}'."
                     )
@@ -4161,9 +4409,61 @@ class WebToolConfig(BaseToolConfig):
                     transport_config = self._build_oauth_mcp_stdio_transport_config(
                         server=server,
                         app_info=app_info,
-                        access_token=legacy_token.access_token,
+                        access_token=access_token,
                         instance_url=legacy_token.instance_url,
                     )
+                    if serialized_slack_policy is not None:
+                        transport_config.setdefault("env", {})[
+                            SLACK_CHANNEL_ACCESS_POLICY_ENV
+                        ] = serialized_slack_policy
+                    if slack_runtime_refresh_args is not None:
+                        (
+                            refresh_user_id,
+                            refresh_owner,
+                            refresh_identity,
+                            refresh_scope,
+                        ) = slack_runtime_refresh_args
+                        refresh_template = dict(transport_config)
+                        refresh_env = dict(refresh_template.get("env") or {})
+                        refresh_env.pop("SLACK_ACCESS_TOKEN", None)
+                        refresh_env.pop(SLACK_CHANNEL_ACCESS_POLICY_ENV, None)
+                        refresh_template["env"] = MappingProxyType(refresh_env)
+
+                        async def refresh_slack_actor_runtime_connection(
+                            *,
+                            _user_id: int = refresh_user_id,
+                            _owner: str = refresh_owner,
+                            _identity: MCPActorExecutionIdentity = refresh_identity,
+                            _scope: Any = refresh_scope,
+                            _template: Mapping[str, Any] = MappingProxyType(
+                                refresh_template
+                            ),
+                        ) -> dict[str, Any] | None:
+                            refreshed_grant = await resolve_slack_actor_runtime_grant(
+                                user_id=_user_id,
+                                resource_owner_key=_owner,
+                                execution_identity=_identity,
+                                scope=_scope,
+                            )
+                            if refreshed_grant is None:
+                                return None
+                            refreshed_connection = dict(_template)
+                            refreshed_connection["transport"] = "stdio"
+                            refreshed_env = dict(_template.get("env") or {})
+                            refreshed_env["SLACK_ACCESS_TOKEN"] = (
+                                refreshed_grant.access_token
+                            )
+                            refreshed_env[SLACK_CHANNEL_ACCESS_POLICY_ENV] = (
+                                serialize_slack_channel_access_policy(
+                                    refreshed_grant.channel_access
+                                )
+                            )
+                            refreshed_connection["env"] = refreshed_env
+                            return refreshed_connection
+
+                        transport_config[SLACK_ACTOR_RUNTIME_REFRESH_KEY] = (
+                            refresh_slack_actor_runtime_connection
+                        )
                 except _OAuthLaunchConfigInvalid as error:
                     logger.warning(
                         "Skipping OAuth MCP server '%s' because launch_config.%s is invalid",
@@ -4211,22 +4511,88 @@ class WebToolConfig(BaseToolConfig):
 
         elif server.transport in ["sse", "websocket", "streamable_http"]:
             from ...web.mcp_apps import get_app_for_mcp_server
+            from ...web.services.mcp_oauth import select_mcp_oauth_owner
             from ...web.services.mcp_runtime import (
                 build_mcp_runtime_connection,
                 connection_to_transport_config,
+                connector_auth_type,
                 effective_mcp_oauth_resource,
             )
+
+            resolver, registration_generation = _get_oauth_token_resolver_hook()
+            policy = self._mcp_runtime_authorization_policy
+            if policy is not None:
+                app_info = (
+                    dict(actor_catalog_app_info)
+                    if actor_catalog_app_info is not None
+                    else (
+                        get_app_for_mcp_server(self.db, server)
+                        if resolver is not None
+                        else None
+                    )
+                )
+            else:
+                app_info = (
+                    get_app_for_mcp_server(self.db, server)
+                    if resolver is not None
+                    else None
+                )
+            actor_remote_oauth = (
+                policy is not None and actor_catalog_app_info is not None
+            )
+            if actor_remote_oauth:
+                runtime_bindings = None
+                allow_delegated_authorization = False
+                runtime_values = None
+                for key in (
+                    "runtime_input_schema",
+                    "runtime_bindings",
+                    "allow_delegated_authorization",
+                    "connector_runtime",
+                ):
+                    config.pop(key, None)
+            if actor_remote_oauth and (self._mcp_auth_context or {}).get(
+                str(server.id)
+            ):
+                policy_diagnostic = {
+                    "code": "config_load_failed",
+                    "message": "Task-supplied MCP authorization is not accepted",
+                    "server_id": int(server.id),
+                    "server_name": server.name,
+                }
+                self._mcp_oauth_diagnostics.append(policy_diagnostic)
+                return self._build_unavailable_mcp_config(
+                    server=server,
+                    reason="config_load_failed",
+                    diagnostic=policy_diagnostic,
+                )
 
             auth_context = self._mcp_auth_context_for_server(
                 server_id=int(server.id),
                 runtime_values=runtime_values,
             )
-            resolver, registration_generation = _get_oauth_token_resolver_hook()
+            if actor_remote_oauth:
+                policy = cast(
+                    Any,
+                    self._mcp_runtime_authorization_policy,
+                )
+                auth_context = {
+                    str(server.id): {
+                        "resource_owner_key": select_mcp_oauth_owner(
+                            self.db,
+                            server_id=int(server.id),
+                            user_id=int(cast(int, self._user_id)),
+                            actor_owner_key=policy.resource_owner_key,
+                            auth_config=server._decrypt_auth_config(server.auth),
+                        )
+                    }
+                }
+
             remote_providers_to_resolve: list[str] = []
             remote_configured_resource: str | None = None
             remote_hook_token: _ResolvedHookToken | None = None
-            if resolver is not None:
-                app_info = get_app_for_mcp_server(self.db, server)
+            remote_auth_type: str | None = None
+            if resolver is not None and not actor_remote_oauth:
                 remote_providers_to_resolve = (
                     _oauth_token_provider_candidates(app_info)
                     if app_info
@@ -4236,12 +4602,14 @@ class WebToolConfig(BaseToolConfig):
                     server,
                     mcp_auth_context=auth_context,
                 )
+                remote_auth_type = connector_auth_type(server)
                 if remote_providers_to_resolve:
                     try:
                         remote_hook_token = await self._resolve_oauth_token_from_hook(
                             providers=remote_providers_to_resolve,
                             resource=remote_configured_resource,
                             resolver=resolver,
+                            auth_type=remote_auth_type,
                         )
                     except _OAuthTokenResolverFailed as error:
                         return self._resolver_failure_config(
@@ -4264,6 +4632,7 @@ class WebToolConfig(BaseToolConfig):
                         runtime_values=runtime_values,
                         runtime_bindings=runtime_bindings,
                     ),
+                    auth_type=remote_auth_type,
                 )
                 transport_config.update(
                     connection_to_transport_config(resolver_connection)
@@ -4327,6 +4696,13 @@ class WebToolConfig(BaseToolConfig):
                             diagnostic=diagnostic,
                             failure_code="oauth_token_required",
                         )
+                    if actor_remote_oauth:
+                        # Actor catalog execution trusts only its selected bearer.
+                        runtime_build.connection["headers"] = {
+                            "Authorization": runtime_build.connection["headers"][
+                                "Authorization"
+                            ]
+                        }
                     transport_config.update(
                         connection_to_transport_config(runtime_build.connection)
                     )
@@ -4360,9 +4736,7 @@ class WebToolConfig(BaseToolConfig):
         config["config"] = transport_config
 
         # Add user context for MCP tool isolation
-        serialized_user_id = self._serialize_mcp_user_id()
-        config["user_id"] = serialized_user_id
-        config["allow_users"] = [serialized_user_id]  # Only allow current user
+        config["user_id"] = self._serialize_mcp_user_id()
 
         logger.debug(f"Loaded MCP server config: {server.name} ({server.transport})")
         return config
@@ -4374,8 +4748,9 @@ class WebToolConfig(BaseToolConfig):
         user_env_by_id: Mapping[int, Any],
         shared_env_by_id: Mapping[int, Any],
         env_source_by_id: Mapping[int, Any],
-        actor_builtin_app_info: Mapping[str, Any] | None = None,
+        actor_catalog_app_info: Mapping[str, Any] | None = None,
         actor_builtin_invalid: bool = False,
+        actor_builtin_invalid_reason: str = "config_load_failed",
     ) -> Dict[str, Any]:
         """Isolate unexpected failures while loading one MCP server config."""
         try:
@@ -4384,8 +4759,9 @@ class WebToolConfig(BaseToolConfig):
                 user_env_by_id=user_env_by_id,
                 shared_env_by_id=shared_env_by_id,
                 env_source_by_id=env_source_by_id,
-                actor_builtin_app_info=actor_builtin_app_info,
+                actor_catalog_app_info=actor_catalog_app_info,
                 actor_builtin_invalid=actor_builtin_invalid,
+                actor_builtin_invalid_reason=actor_builtin_invalid_reason,
             )
         except ConnectorRuntimeError:
             raise
@@ -4427,6 +4803,7 @@ class WebToolConfig(BaseToolConfig):
         of leaving the shared layer keyed on the run owner's personal
         shared-env hook answer."""
         self._mcp_oauth_diagnostics = []
+        self._mcp_actor_stdio_session_identities = {}
         self._reset_mcp_config_load_cache_state()
 
         # Resolved before the guarded region below: that region reports
@@ -4434,13 +4811,16 @@ class WebToolConfig(BaseToolConfig):
         # for "the scope could not be resolved". The typed error is what
         # survives the tool-creator frame -- an untyped one is dropped there
         # with a WARNING and no tool set at all.
-        from ..services.connector_team_scope import resolve_team_connector_ids_or_raise
-
-        team_mcp_ids = frozenset(
-            resolve_team_connector_ids_or_raise(
-                self.db, team_id=self._connector_team_id, log_subject=self._user_id
-            )["mcp"]
+        from ..services.connector_team_scope import (
+            resolve_team_connector_selection_or_raise,
         )
+
+        team_selection = resolve_team_connector_selection_or_raise(
+            self.db,
+            team_id=self._connector_team_id,
+            log_subject=self._user_id,
+        )
+        team_mcp_ids = team_selection.mcp_ids
 
         try:
             from ..services.mcp_runtime import (
@@ -4469,25 +4849,68 @@ class WebToolConfig(BaseToolConfig):
             if self._mcp_runtime_authorization_policy is not None:
                 from ...web.mcp_apps import (
                     BuiltinOAuthServerDefinitionError,
+                    RemoteOAuthDefinitionOwnership,
+                    RemoteOAuthServerDefinitionError,
                     classify_actor_builtin_oauth_server,
+                    classify_actor_remote_oauth_server,
                 )
 
                 for visible_server in servers:
                     try:
+                        catalog_app = classify_actor_builtin_oauth_server(
+                            self.db, visible_server
+                        )
+                        if catalog_app is None:
+                            catalog_app = classify_actor_remote_oauth_server(
+                                self.db,
+                                visible_server,
+                                definition_ownership=(
+                                    RemoteOAuthDefinitionOwnership.TEAM
+                                    if int(visible_server.id)
+                                    in team_selection.owned_mcp_definition_ids
+                                    else RemoteOAuthDefinitionOwnership.UNKNOWN
+                                ),
+                            )
                         actor_classifications[int(visible_server.id)] = (
-                            classify_actor_builtin_oauth_server(
-                                self.db, visible_server
-                            ),
+                            catalog_app,
                             False,
                         )
-                    except BuiltinOAuthServerDefinitionError:
+                    except (
+                        BuiltinOAuthServerDefinitionError,
+                        RemoteOAuthServerDefinitionError,
+                    ):
                         actor_classifications[int(visible_server.id)] = (None, True)
+
+            actor_stdio_resolution = resolve_actor_mcp_stdio_configs(
+                self.db,
+                user_id=(int(self._user_id) if isinstance(self._user_id, int) else 0),
+                policy=self._mcp_runtime_authorization_policy,
+                adapter=self._mcp_actor_stdio_connection_adapter,
+                visible_servers=servers,
+                execution_identity=self._mcp_actor_execution_identity,
+            )
+            for blocked_server_id in actor_stdio_resolution.blocked_server_ids:
+                actor_classifications[blocked_server_id] = (None, True)
+            actor_stdio_block_reasons = dict(
+                actor_stdio_resolution.blocked_server_reasons
+            )
+            self._mcp_actor_stdio_session_identities = dict(
+                actor_stdio_resolution.session_identities
+            )
 
             # Prefetch shared runtime state once before entering the isolated
             # per-server formatter.
-            user_env_by_id = load_user_env_overrides(self.db, self._user_id)
-            shared_env_by_id = load_shared_env_overrides(self.db, self._user_id)
-            env_source_by_id = load_user_env_sources(self.db, self._user_id)
+            if servers:
+                user_env_by_id = load_user_env_overrides(self.db, self._user_id)
+                shared_env_by_id = load_shared_env_overrides(self.db, self._user_id)
+                env_source_by_id = load_user_env_sources(self.db, self._user_id)
+            else:
+                # Synthetic actor stdio is intentionally independent from
+                # every ordinary MCP credential source. Avoid even querying
+                # those stores when there are no ordinary server rows.
+                user_env_by_id = {}
+                shared_env_by_id = {}
+                env_source_by_id = {}
 
             # Re-key the shared env layer, for team-owned ids only, onto the
             # governing team's own row -- never the run owner's team, and
@@ -4498,7 +4921,7 @@ class WebToolConfig(BaseToolConfig):
             # the credential-side hook was never installed -- the shared
             # layer stays user-keyed in that state, which is exactly the
             # cross-team influence this block exists to remove.
-            if self._connector_team_id is not None and team_mcp_ids:
+            if servers and self._connector_team_id is not None and team_mcp_ids:
                 if not team_env_hook_installed():
                     warn_team_env_hook_missing_once(
                         team_id=self._connector_team_id,
@@ -4557,15 +4980,19 @@ class WebToolConfig(BaseToolConfig):
                 user_env_by_id=user_env_by_id,
                 shared_env_by_id=shared_env_by_id,
                 env_source_by_id=env_source_by_id,
-                actor_builtin_app_info=actor_classifications.get(
+                actor_catalog_app_info=actor_classifications.get(
                     int(server.id), (None, False)
                 )[0],
                 actor_builtin_invalid=actor_classifications.get(
                     int(server.id), (None, False)
                 )[1],
+                actor_builtin_invalid_reason=actor_stdio_block_reasons.get(
+                    int(server.id), "config_load_failed"
+                ),
             )
             for server in servers
         ]
+        configs.extend(actor_stdio_resolution.configs)
         logger.info("Loaded %s MCP server configurations", len(configs))
         return configs
 

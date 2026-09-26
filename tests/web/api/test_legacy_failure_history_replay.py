@@ -8,6 +8,7 @@ from xagent.web.api import websocket as websocket_api
 from xagent.web.models.chat_message import TaskChatMessage
 from xagent.web.models.task import Task, TaskStatus, TraceEvent
 from xagent.web.models.user import User
+from xagent.web.services import task_execution as task_execution_service
 from xagent.web.services.assistant_history_safety import (
     CLIENT_SAFE_FAILURE_MESSAGE_TYPE,
 )
@@ -40,6 +41,7 @@ def _running_task(
             title=title,
             description=title,
             status=TaskStatus.RUNNING,
+            lease_attempt_id="test-attempt" if runner_id is not None else None,
             runner_id=runner_id,
             run_id=run_id,
             lease_expires_at=(
@@ -161,7 +163,7 @@ def _history_cache_entry(task_id: int, events: list[dict]) -> dict[str, object]:
             or 0
         )
         return {
-            "trace_scope": "public-v1",
+            "trace_scope": "public-v2",
             "updated_at": cache_version_token(task.updated_at),
             "max_trace_event_id": 0,
             "max_chat_message_id": int(max_chat_message_id),
@@ -531,7 +533,7 @@ async def test_new_plain_assistant_response_replays_unchanged(
         title="Normal response history",
     )
 
-    finalized = websocket_api._finalize_task_execution_result_isolated(
+    finalized = task_execution_service._finalize_task_execution_result_isolated(
         task_id=task_id,
         task_user_id=user_id,
         pre_run_status=TaskStatus.RUNNING,
@@ -543,7 +545,7 @@ async def test_new_plain_assistant_response_replays_unchanged(
         expected_run_id=None,
         task_lease=None,
         resolved_scope_segments=(),
-        prepared_outputs=websocket_api._PreparedTaskFileOutputs((), (), ()),
+        prepared_outputs=task_execution_service._PreparedTaskFileOutputs((), (), ()),
     )
     assert not finalized.late_result
 
@@ -569,7 +571,7 @@ def test_failed_websocket_result_with_null_diagnostics_uses_safe_fallback(
         title="Failed WebSocket null diagnostics",
     )
 
-    finalized = websocket_api._finalize_task_execution_result_isolated(
+    finalized = task_execution_service._finalize_task_execution_result_isolated(
         task_id=task_id,
         task_user_id=user_id,
         pre_run_status=TaskStatus.RUNNING,
@@ -582,7 +584,7 @@ def test_failed_websocket_result_with_null_diagnostics_uses_safe_fallback(
         expected_run_id=None,
         task_lease=None,
         resolved_scope_segments=(),
-        prepared_outputs=websocket_api._PreparedTaskFileOutputs((), (), ()),
+        prepared_outputs=task_execution_service._PreparedTaskFileOutputs((), (), ()),
     )
 
     assert not finalized.late_result
@@ -603,7 +605,7 @@ def test_successful_websocket_result_with_null_output_skips_empty_history(
         title="Successful WebSocket null output",
     )
 
-    finalized = websocket_api._finalize_task_execution_result_isolated(
+    finalized = task_execution_service._finalize_task_execution_result_isolated(
         task_id=task_id,
         task_user_id=user_id,
         pre_run_status=TaskStatus.RUNNING,
@@ -611,7 +613,7 @@ def test_successful_websocket_result_with_null_output_skips_empty_history(
         expected_run_id=None,
         task_lease=None,
         resolved_scope_segments=(),
-        prepared_outputs=websocket_api._PreparedTaskFileOutputs((), (), ()),
+        prepared_outputs=task_execution_service._PreparedTaskFileOutputs((), (), ()),
     )
 
     assert not finalized.late_result
@@ -642,7 +644,7 @@ async def test_failed_websocket_result_replays_only_safe_history(
         title="Failed WebSocket result",
     )
 
-    finalized = websocket_api._finalize_task_execution_result_isolated(
+    finalized = task_execution_service._finalize_task_execution_result_isolated(
         task_id=task_id,
         task_user_id=user_id,
         pre_run_status=TaskStatus.RUNNING,
@@ -658,7 +660,7 @@ async def test_failed_websocket_result_replays_only_safe_history(
         expected_run_id=None,
         task_lease=None,
         resolved_scope_segments=(),
-        prepared_outputs=websocket_api._PreparedTaskFileOutputs((), (), ()),
+        prepared_outputs=task_execution_service._PreparedTaskFileOutputs((), (), ()),
     )
     assert not finalized.late_result
 
@@ -690,7 +692,7 @@ async def test_failed_websocket_result_prefers_diagnostic_error_over_display_tex
         title="Failed WebSocket diagnostic",
     )
 
-    finalized = websocket_api._finalize_task_execution_result_isolated(
+    finalized = task_execution_service._finalize_task_execution_result_isolated(
         task_id=task_id,
         task_user_id=user_id,
         pre_run_status=TaskStatus.RUNNING,
@@ -703,7 +705,7 @@ async def test_failed_websocket_result_prefers_diagnostic_error_over_display_tex
         expected_run_id=None,
         task_lease=None,
         resolved_scope_segments=(),
-        prepared_outputs=websocket_api._PreparedTaskFileOutputs((), (), ()),
+        prepared_outputs=task_execution_service._PreparedTaskFileOutputs((), (), ()),
     )
 
     assert not finalized.late_result
@@ -722,7 +724,7 @@ def test_failed_resumed_websocket_result_prefers_diagnostic_error_over_display_t
         run_id="resume-run-1730",
     )
 
-    finalized = websocket_api._finalize_resumed_task(
+    finalized = task_execution_service._finalize_resumed_task(
         task_id,
         status="error",
         success=False,
@@ -735,11 +737,12 @@ def test_failed_resumed_websocket_result_prefers_diagnostic_error_over_display_t
             "error": raw_error,
         },
         task_lease=TaskLease(
+            attempt_id="test-attempt",
             task_id=task_id,
             runner_id="resume-runner-1730",
             run_id="resume-run-1730",
         ),
-        prepared_outputs=websocket_api._PreparedTaskFileOutputs((), (), ()),
+        prepared_outputs=task_execution_service._PreparedTaskFileOutputs((), (), ()),
     )
 
     assert not finalized["late_result"]
@@ -753,7 +756,7 @@ def test_terminal_failure_writer_persists_safe_provenance(_test_db) -> None:
         title="Terminal failure provenance",
     )
 
-    websocket_api._terminal_task_error_payload(task_id, raw_error)
+    task_execution_service._terminal_task_error_payload(task_id, raw_error)
 
     _assert_safe_failure_persisted(task_id, raw_error)
 
@@ -769,6 +772,7 @@ def test_lease_failure_writer_persists_safe_provenance(_test_db) -> None:
 
     committed = settle_task_lease_isolated(
         TaskLease(
+            attempt_id="test-attempt",
             task_id=task_id,
             runner_id="runner-1730",
             run_id="run-1730",
@@ -798,6 +802,7 @@ async def test_failed_managed_result_replays_only_safe_history(
         committed = finalize_managed_task_lease_result(
             db,
             TaskLease(
+                attempt_id="test-attempt",
                 task_id=task_id,
                 runner_id="managed-runner-1730",
                 run_id="managed-run-1730",
@@ -826,3 +831,95 @@ async def test_failed_managed_result_replays_only_safe_history(
         for event in events
     )
     _assert_safe_failure_persisted(task_id, raw_error)
+
+
+@pytest.mark.parametrize("resumed", [False, True])
+@pytest.mark.parametrize("success", [False, True])
+def test_unknown_input_preserves_completed_work_result(_test_db, resumed, success):
+    task_id, user_id = _running_task(
+        username="unknown-result",
+        title="Unknown input",
+        runner_id="owner",
+        run_id="run",
+    )
+    lease = TaskLease(task_id, "owner", "run", "test-attempt")
+    result = {
+        "success": success,
+        "output": "valuable final answer" if success else "",
+        "error": None if success else "original execution failure",
+        "injection_outcome_unknown": True,
+    }
+    prepared = task_execution_service._PreparedTaskFileOutputs((), (), ())
+    if resumed:
+        task_execution_service._finalize_resumed_task(
+            task_id,
+            status="",
+            success=success,
+            output=result["output"],
+            task_owner_user_id=user_id,
+            result=result,
+            task_lease=lease,
+            prepared_outputs=prepared,
+        )
+    else:
+        task_execution_service._finalize_task_execution_result_isolated(
+            task_id=task_id,
+            task_user_id=user_id,
+            pre_run_status=TaskStatus.RUNNING,
+            result=result,
+            expected_run_id="run",
+            task_lease=lease,
+            resolved_scope_segments=(),
+            prepared_outputs=prepared,
+        )
+    with _direct_db_session() as db:
+        task = db.get(Task, task_id)
+        row = (
+            db.query(TaskChatMessage).filter_by(task_id=task_id, role="assistant").one()
+        )
+        if success:
+            assert task.status == TaskStatus.PAUSED
+            assert task.output == "valuable final answer"
+            assert row.content == "valuable final answer"
+        else:
+            assert task.status == TaskStatus.FAILED
+            assert task.error_message == "original execution failure"
+            assert row.content == CLIENT_SAFE_TASK_FAILURE
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("state", ["running", "failed", "new-owner"])
+async def test_unknown_pause_broadcasts_only_committed_transition(
+    _test_db, state, monkeypatch
+):
+    from unittest.mock import AsyncMock
+
+    from xagent.web.services import task_events
+    from xagent.web.services.task_orchestrator import pause_unknown_task_lease
+
+    task_id, user_id = _running_task(
+        username="pause-event", title="Unknown input", runner_id="owner", run_id="run"
+    )
+    if state != "running":
+        with _direct_db_session() as db:
+            task = db.get(Task, task_id)
+            if state == "failed":
+                task.status = TaskStatus.FAILED
+            else:
+                task.runner_id = "replacement"
+            db.commit()
+    events = []
+
+    async def publish(event, event_task_id):
+        with _direct_db_session() as db:
+            assert db.get(Task, task_id).status == TaskStatus.PAUSED
+        events.append(event)
+
+    monkeypatch.setattr(
+        task_events, "publish_task_event", AsyncMock(side_effect=publish)
+    )
+    await pause_unknown_task_lease(TaskLease(task_id, "owner", "run", "test-attempt"))
+    assert len(events) == (1 if state == "running" else 0)
+    if events:
+        assert events[0]["type"] == "task_paused"
+        assert events[0]["run_id"] == "run"

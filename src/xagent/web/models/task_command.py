@@ -50,6 +50,10 @@ class TaskExecutionCommand(Base):  # type: ignore
     kind = Column(String(32), nullable=False)
     payload = Column(JSON, nullable=False)
 
+    # Server-generated route, bound before the command becomes visible.
+    reply_host_id = Column(String(64), nullable=True)
+    reply_origin = Column(String(64), nullable=True)
+
     # The run/worker observed when the command was accepted. Commands aimed at
     # a live run stay with its lease owner; once that lease expires another
     # worker may recover them from the durable inbox.
@@ -65,6 +69,8 @@ class TaskExecutionCommand(Base):  # type: ignore
     )
     claimed_by = Column(String(255), nullable=True)
     claim_expires_at = Column(DateTime(timezone=True), nullable=True)
+    # Earliest retry time; independent of task ownership and never renewed.
+    retry_available_at = Column(DateTime(timezone=True), nullable=True)
     attempt_count = Column(Integer, nullable=False, default=0, server_default="0")
     failure_count = Column(Integer, nullable=False, default=0, server_default="0")
     defer_count = Column(Integer, nullable=False, default=0, server_default="0")

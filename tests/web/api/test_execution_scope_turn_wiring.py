@@ -38,16 +38,17 @@ from xagent.core.execution_scope import (
     get_execution_scope,
     set_execution_scope_snapshot_loader,
 )
-from xagent.web.api.websocket import (
-    ResumeReservationOutcome,
-    _acquire_resume_task_lease,
-    _handle_resume_task_unserialized,
-    execute_resume_background,
-    execute_task_background,
-)
+from xagent.web.api.websocket import _make_command_reply
 from xagent.web.models.task import Task, TaskStatus
 from xagent.web.models.user import User
 from xagent.web.services.client_error_messages import CLIENT_SAFE_TASK_FAILURE
+from xagent.web.services.task_command_execution import resume_task
+from xagent.web.services.task_execution import (
+    ResumeReservationOutcome,
+    _acquire_resume_task_lease,
+    execute_resume_background,
+    execute_task_background,
+)
 from xagent.web.services.task_lease_service import (
     TaskLease,
     TaskLeaseHeartbeatOutcome,
@@ -97,6 +98,7 @@ def _bg_patches(db: Any) -> list[Any]:
             user_id=1,
             status=TaskStatus.RUNNING,
             agent_id=None,
+            source=None,
         ),
         runtime_user=SimpleNamespace(id=1, is_admin=False),
         agent=None,
@@ -111,12 +113,12 @@ def _bg_patches(db: Any) -> list[Any]:
             return_value=snapshot,
         ),
         patch(
-            "xagent.web.api.websocket.background_task_manager.wait_for_previous",
+            "xagent.web.services.task_execution.background_task_manager.wait_for_previous",
             new=AsyncMock(),
         ),
-        patch("xagent.web.api.websocket._register_uploaded_files_for_agent"),
+        patch("xagent.web.services.task_execution._register_uploaded_files_for_agent"),
         patch(
-            "xagent.web.api.websocket._finalize_task_execution_result_isolated",
+            "xagent.web.services.task_execution._finalize_task_execution_result_isolated",
             return_value=SimpleNamespace(
                 normalized_outputs=[],
                 ai_response="ok",
@@ -356,6 +358,7 @@ async def test_bg_turn_resolves_scope_before_loading_snapshot_off_loop() -> None
                 user_id=1,
                 status=TaskStatus.RUNNING,
                 agent_id=None,
+                source=None,
             ),
             runtime_user=SimpleNamespace(id=1, is_admin=False),
             agent=None,
@@ -411,8 +414,9 @@ async def test_resumed_turn_re_resolves_scope() -> None:
     seen: dict[str, Any] = {}
     agent_service = MagicMock()
 
-    async def _resume(task_id: str) -> dict:
+    async def _resume(task_id: str, *, metadata: dict[str, Any]) -> dict:
         seen["scope_at_resume"] = get_execution_scope()
+        assert metadata == {"task_source": None, "run_id": "scope-run"}
         return {"status": "completed", "success": True, "output": "ok"}
 
     agent_service.resume_execution_by_id = AsyncMock(side_effect=_resume)
@@ -432,7 +436,7 @@ async def test_resumed_turn_re_resolves_scope() -> None:
                 side_effect=lambda: _fresh_db_gen(),
             ),
             patch(
-                "xagent.web.api.websocket._acquire_resume_task_lease",
+                "xagent.web.services.task_execution._acquire_resume_task_lease",
                 return_value=TaskLease(
                     task_id=42,
                     runner_id="scope-runner",
@@ -440,14 +444,15 @@ async def test_resumed_turn_re_resolves_scope() -> None:
                 ),
             ),
             patch(
-                "xagent.web.api.websocket.run_task_lease_heartbeat",
+                "xagent.web.services.task_execution.run_task_lease_heartbeat",
                 side_effect=_heartbeat,
             ),
             patch(
-                "xagent.web.api.websocket.stop_task_lease_heartbeat", new=AsyncMock()
+                "xagent.web.services.task_execution.stop_task_lease_heartbeat",
+                new=AsyncMock(),
             ),
             patch(
-                "xagent.web.api.websocket._finalize_resumed_task",
+                "xagent.web.services.task_execution._finalize_resumed_task",
                 return_value={
                     "task_title": "scope wiring test",
                     "task_description": "x",
@@ -468,7 +473,7 @@ async def test_resumed_turn_re_resolves_scope() -> None:
                 MagicMock(broadcast_to_task=AsyncMock()),
             ),
             patch(
-                "xagent.web.api.websocket.background_task_manager.promote_resume_task"
+                "xagent.web.services.task_execution.background_task_manager.promote_resume_task"
             ),
         ]
     ):
@@ -504,15 +509,15 @@ async def test_resume_background_adopts_preacquired_lease_without_reacquiring() 
     with _Patches(
         [
             patch(
-                "xagent.web.api.websocket._acquire_resume_task_lease",
+                "xagent.web.services.task_execution._acquire_resume_task_lease",
                 new=acquire,
             ),
             patch(
-                "xagent.web.api.websocket.run_task_lease_heartbeat",
+                "xagent.web.services.task_execution.run_task_lease_heartbeat",
                 new=start_heartbeat,
             ),
             patch(
-                "xagent.web.api.websocket._finalize_resumed_task",
+                "xagent.web.services.task_execution._finalize_resumed_task",
                 return_value={
                     "task_title": "prelease",
                     "task_description": "x",
@@ -533,7 +538,7 @@ async def test_resume_background_adopts_preacquired_lease_without_reacquiring() 
                 MagicMock(broadcast_to_task=AsyncMock()),
             ),
             patch(
-                "xagent.web.api.websocket.background_task_manager.promote_resume_task"
+                "xagent.web.services.task_execution.background_task_manager.promote_resume_task"
             ),
         ]
     ):
@@ -550,7 +555,9 @@ async def test_resume_background_adopts_preacquired_lease_without_reacquiring() 
 
     acquire.assert_not_called()
     start_heartbeat.assert_not_called()
-    agent_service.resume_execution_by_id.assert_awaited_once_with("42")
+    agent_service.resume_execution_by_id.assert_awaited_once_with(
+        "42", metadata={"task_source": None, "run_id": "run-a"}
+    )
     assert heartbeat_task.done()
 
 
@@ -584,6 +591,7 @@ async def test_resume_handler_resolves_scope_once_off_loop_for_agent_lookup() ->
             control_state="paused",
             run_id="run-a",
             state_version=3,
+            source=None,
         ),
         runtime_user=SimpleNamespace(id=1, is_admin=False),
     )
@@ -613,30 +621,33 @@ async def test_resume_handler_resolves_scope_once_off_loop_for_agent_lookup() ->
                 "xagent.web.services.task_setup_snapshot.load_task_setup_snapshot_sync",
                 return_value=snapshot,
             ),
-            patch("xagent.web.api.chat.get_agent_manager", return_value=agent_manager),
+            patch(
+                "xagent.web.services.agent_service_manager.get_agent_manager",
+                return_value=agent_manager,
+            ),
             patch(
                 "xagent.web.api.websocket.task_execution_controller.transition",
                 new=transition,
             ),
             patch(
-                "xagent.web.api.websocket.background_task_manager",
+                "xagent.web.services.task_execution.background_task_manager",
                 background_manager,
             ),
             # The handler asks the DB whether another process still holds a
             # live lease before scheduling; this suite drives it without a
             # task row, so answer "no foreign owner" explicitly.
             patch(
-                "xagent.web.api.websocket.task_has_live_foreign_runner",
+                "xagent.web.services.task_command_execution.task_has_live_foreign_runner",
                 return_value=False,
             ),
             patch(
-                "xagent.web.api.websocket.execute_resume_background",
+                "xagent.web.services.task_execution.execute_resume_background",
                 side_effect=execute_resume,
             ),
         ]
     ):
-        await _handle_resume_task_unserialized(
-            MagicMock(),
+        await resume_task(
+            _make_command_reply(MagicMock()),
             42,
             {"user": SimpleNamespace(id=1, is_admin=False)},
         )
@@ -649,6 +660,90 @@ async def test_resume_handler_resolves_scope_once_off_loop_for_agent_lookup() ->
         is scope
     )
     assert resume_kwargs["resolved_execution_scope"] is EXECUTION_SCOPE_NOT_PROVIDED
+
+
+@pytest.mark.asyncio
+async def test_resume_task_forwards_the_task_rows_source() -> None:
+    """``resume_task`` must forward the paused task row's own ``source`` as
+    ``trusted_task_source`` -- not leave it at the ``execute_resume_background``
+    default of ``None``.
+
+    ``task_source`` is the key the MCP approval gate selects a registration
+    by; a resumed run that lost it would have its checkpointed source
+    overwritten by the runner's overlay reading nothing, silently ungating
+    (or wrongly refusing) an approval the user is resuming. No existing test
+    asserted this kwarg at all: a deleted ``trusted_task_source=`` line at
+    this call site would still pass the rest of the suite.
+    """
+    register_scope_resolver(lambda task_id: None)
+    snapshot = SimpleNamespace(
+        task=SimpleNamespace(
+            id=42,
+            user_id=1,
+            status=TaskStatus.PAUSED,
+            control_state="paused",
+            run_id="run-a",
+            state_version=3,
+            source="toby-slack",
+        ),
+        runtime_user=SimpleNamespace(id=1, is_admin=False),
+    )
+    agent_service = MagicMock()
+    agent_service.supports_live_control.return_value = True
+    agent_manager = MagicMock(get_agent_for_task=AsyncMock(return_value=agent_service))
+    resume_started = asyncio.Event()
+    resume_kwargs: dict[str, Any] = {}
+
+    async def execute_resume(**kwargs: Any) -> None:
+        resume_kwargs.update(kwargs)
+        resume_started.set()
+
+    background_manager = MagicMock()
+    background_manager.running_tasks = {}
+    background_manager.resume_admission_state.return_value = None
+    background_manager.try_reserve_resume.return_value = (
+        ResumeReservationOutcome.RESERVED
+    )
+    transition = AsyncMock(
+        return_value=SimpleNamespace(run_id="run-a", status=TaskStatus.PAUSED)
+    )
+
+    with _Patches(
+        [
+            patch(
+                "xagent.web.services.task_setup_snapshot.load_task_setup_snapshot_sync",
+                return_value=snapshot,
+            ),
+            patch(
+                "xagent.web.services.agent_service_manager.get_agent_manager",
+                return_value=agent_manager,
+            ),
+            patch(
+                "xagent.web.api.websocket.task_execution_controller.transition",
+                new=transition,
+            ),
+            patch(
+                "xagent.web.services.task_execution.background_task_manager",
+                background_manager,
+            ),
+            patch(
+                "xagent.web.services.task_command_execution.task_has_live_foreign_runner",
+                return_value=False,
+            ),
+            patch(
+                "xagent.web.services.task_execution.execute_resume_background",
+                side_effect=execute_resume,
+            ),
+        ]
+    ):
+        await resume_task(
+            _make_command_reply(MagicMock()),
+            42,
+            {"user": SimpleNamespace(id=1, is_admin=False)},
+        )
+        await asyncio.wait_for(resume_started.wait(), timeout=1)
+
+    assert resume_kwargs["trusted_task_source"] == "toby-slack"
 
 
 @pytest.mark.asyncio
@@ -685,6 +780,7 @@ async def test_resume_survives_a_scope_authority_mismatch() -> None:
             control_state="paused",
             run_id="run-a",
             state_version=3,
+            source=None,
         ),
         runtime_user=SimpleNamespace(id=1, is_admin=False),
     )
@@ -711,7 +807,10 @@ async def test_resume_survives_a_scope_authority_mismatch() -> None:
                 "xagent.web.services.task_setup_snapshot.load_task_setup_snapshot_sync",
                 return_value=snapshot,
             ),
-            patch("xagent.web.api.chat.get_agent_manager", return_value=agent_manager),
+            patch(
+                "xagent.web.services.agent_service_manager.get_agent_manager",
+                return_value=agent_manager,
+            ),
             patch(
                 "xagent.web.api.websocket.task_execution_controller.transition",
                 new=AsyncMock(
@@ -721,24 +820,24 @@ async def test_resume_survives_a_scope_authority_mismatch() -> None:
                 ),
             ),
             patch(
-                "xagent.web.api.websocket.background_task_manager",
+                "xagent.web.services.task_execution.background_task_manager",
                 background_manager,
             ),
             # The handler asks the DB whether another process still holds a
             # live lease before scheduling; this suite drives it without a
             # task row, so answer "no foreign owner" explicitly.
             patch(
-                "xagent.web.api.websocket.task_has_live_foreign_runner",
+                "xagent.web.services.task_command_execution.task_has_live_foreign_runner",
                 return_value=False,
             ),
             patch(
-                "xagent.web.api.websocket.execute_resume_background",
+                "xagent.web.services.task_execution.execute_resume_background",
                 side_effect=execute_resume,
             ),
         ]
     ):
-        await _handle_resume_task_unserialized(
-            MagicMock(),
+        await resume_task(
+            _make_command_reply(MagicMock()),
             42,
             {"user": SimpleNamespace(id=1, is_admin=False)},
         )
@@ -789,7 +888,7 @@ async def test_resume_background_fails_closed_on_scope_authority_mismatch(
     with _Patches(
         [
             patch(
-                "xagent.web.api.websocket.background_task_manager.promote_resume_task"
+                "xagent.web.services.task_execution.background_task_manager.promote_resume_task"
             ),
             patch("xagent.web.api.websocket.manager", broadcast_manager),
         ]
@@ -827,11 +926,11 @@ def test_resume_acquire_checkout_timeout_before_claim_does_not_try_cleanup() -> 
 
     with (
         patch(
-            "xagent.web.api.websocket.get_session_local",
+            "xagent.web.services.task_execution.get_session_local",
             return_value=session_factory,
         ),
         patch(
-            "xagent.web.api.websocket.acquire_task_lease_no_commit",
+            "xagent.web.services.task_execution.acquire_task_lease_no_commit",
             transaction_claim,
         ),
         pytest.raises(SQLAlchemyTimeoutError, match="pool exhausted"),
@@ -873,7 +972,10 @@ async def test_resume_db_lifecycle_runs_in_short_session_workers() -> None:
         }
 
     def release_resume_lease(
-        acquired_lease: object, *, error_message: str | None
+        acquired_lease: object,
+        *,
+        error_message: str | None,
+        injection_outcome_unknown: bool = False,
     ) -> None:
         assert acquired_lease is lease
         assert error_message is None
@@ -887,6 +989,7 @@ async def test_resume_db_lifecycle_runs_in_short_session_workers() -> None:
             assert kwargs == {
                 "expected_run_id": "run-a",
                 "expected_runner_id": "runner-a",
+                "expected_attempt_id": None,
             }
 
         async def start_tracking(self) -> None:
@@ -906,26 +1009,26 @@ async def test_resume_db_lifecycle_runs_in_short_session_workers() -> None:
     with _Patches(
         [
             patch(
-                "xagent.web.api.websocket._acquire_resume_task_lease",
+                "xagent.web.services.task_execution._acquire_resume_task_lease",
                 side_effect=acquire_resume_lease,
                 create=True,
             ),
             patch(
-                "xagent.web.api.websocket._finalize_resumed_task",
+                "xagent.web.services.task_execution._finalize_resumed_task",
                 side_effect=finalize_resume,
                 create=True,
             ),
             patch(
-                "xagent.web.api.websocket._settle_resumed_task_lease",
+                "xagent.web.services.task_execution._settle_resumed_task_lease",
                 side_effect=release_resume_lease,
                 create=True,
             ),
             patch(
-                "xagent.web.api.websocket.run_task_lease_heartbeat",
+                "xagent.web.services.task_execution.run_task_lease_heartbeat",
                 new=AsyncMock(),
             ),
             patch(
-                "xagent.web.api.websocket.stop_task_lease_heartbeat",
+                "xagent.web.services.task_execution.stop_task_lease_heartbeat",
                 new=AsyncMock(),
             ),
             patch(
@@ -933,7 +1036,7 @@ async def test_resume_db_lifecycle_runs_in_short_session_workers() -> None:
                 MagicMock(broadcast_to_task=AsyncMock()),
             ),
             patch(
-                "xagent.web.api.websocket.background_task_manager.promote_resume_task"
+                "xagent.web.services.task_execution.background_task_manager.promote_resume_task"
             ),
             patch("xagent.web.tracking.task_tracker.TaskTracker", FakeTracker),
         ]
@@ -966,6 +1069,7 @@ async def test_resume_final_usage_and_heartbeat_finish_before_lease_release() ->
             assert kwargs == {
                 "expected_run_id": "run-a",
                 "expected_runner_id": "runner-a",
+                "expected_attempt_id": None,
             }
 
         async def start_tracking(self) -> None:
@@ -1005,19 +1109,19 @@ async def test_resume_final_usage_and_heartbeat_finish_before_lease_release() ->
     with _Patches(
         [
             patch(
-                "xagent.web.api.websocket._acquire_resume_task_lease",
+                "xagent.web.services.task_execution._acquire_resume_task_lease",
                 return_value=lease,
             ),
             patch(
-                "xagent.web.api.websocket.run_task_lease_heartbeat",
+                "xagent.web.services.task_execution.run_task_lease_heartbeat",
                 new=AsyncMock(),
             ),
             patch(
-                "xagent.web.api.websocket.stop_task_lease_heartbeat",
+                "xagent.web.services.task_execution.stop_task_lease_heartbeat",
                 side_effect=stop_heartbeat,
             ),
             patch(
-                "xagent.web.api.websocket._finalize_resumed_task",
+                "xagent.web.services.task_execution._finalize_resumed_task",
                 side_effect=finalize,
             ),
             patch(
@@ -1025,7 +1129,7 @@ async def test_resume_final_usage_and_heartbeat_finish_before_lease_release() ->
                 MagicMock(broadcast_to_task=AsyncMock()),
             ),
             patch(
-                "xagent.web.api.websocket.background_task_manager.promote_resume_task"
+                "xagent.web.services.task_execution.background_task_manager.promote_resume_task"
             ),
             patch("xagent.web.tracking.task_tracker.TaskTracker", FakeTracker),
         ]
@@ -1057,6 +1161,7 @@ async def test_resume_pool_timeout_does_not_start_secondary_db_cleanup(caplog) -
             assert kwargs == {
                 "expected_run_id": "run-a",
                 "expected_runner_id": "runner-a",
+                "expected_attempt_id": None,
             }
             self.complete_tracking = AsyncMock()
             self.stop_periodic_updates = AsyncMock()
@@ -1073,24 +1178,24 @@ async def test_resume_pool_timeout_does_not_start_secondary_db_cleanup(caplog) -
         return_value={"status": "completed", "success": True, "output": "ok"}
     )
     ws_manager = MagicMock(broadcast_to_task=AsyncMock())
-    caplog.set_level(logging.ERROR, logger="xagent.web.api.websocket")
+    caplog.set_level(logging.ERROR, logger="xagent.web.services.task_execution")
 
     with _Patches(
         [
             patch(
-                "xagent.web.api.websocket._acquire_resume_task_lease",
+                "xagent.web.services.task_execution._acquire_resume_task_lease",
                 return_value=lease,
             ),
             patch(
-                "xagent.web.api.websocket._finalize_resumed_task",
+                "xagent.web.services.task_execution._finalize_resumed_task",
                 side_effect=SQLAlchemyTimeoutError("pool exhausted"),
             ),
             patch(
-                "xagent.web.api.websocket._settle_resumed_task_lease",
+                "xagent.web.services.task_execution._settle_resumed_task_lease",
                 settle,
             ),
             patch(
-                "xagent.web.api.websocket.mark_user_message_delivery_sync",
+                "xagent.web.services.task_execution.mark_user_message_delivery_sync",
                 mark_delivery,
             ),
             patch(
@@ -1098,16 +1203,16 @@ async def test_resume_pool_timeout_does_not_start_secondary_db_cleanup(caplog) -
                 new=snapshot,
             ),
             patch(
-                "xagent.web.api.websocket.run_task_lease_heartbeat",
+                "xagent.web.services.task_execution.run_task_lease_heartbeat",
                 new=AsyncMock(),
             ),
             patch(
-                "xagent.web.api.websocket.stop_task_lease_heartbeat",
+                "xagent.web.services.task_execution.stop_task_lease_heartbeat",
                 new=AsyncMock(),
             ),
             patch("xagent.web.api.websocket.manager", ws_manager),
             patch(
-                "xagent.web.api.websocket.background_task_manager.promote_resume_task"
+                "xagent.web.services.task_execution.background_task_manager.promote_resume_task"
             ),
             patch("xagent.web.tracking.task_tracker.TaskTracker", FakeTracker),
         ]
@@ -1161,14 +1266,14 @@ def test_acquire_resume_lease_reports_prior_status_before_claiming() -> None:
     prior_status_box: list[TaskStatus] = []
     with (
         patch(
-            "xagent.web.api.websocket.get_session_local",
+            "xagent.web.services.task_execution.get_session_local",
             return_value=session_factory,
         ),
         patch(
-            "xagent.web.api.websocket.acquire_task_lease_no_commit",
+            "xagent.web.services.task_execution.acquire_task_lease_no_commit",
             return_value=lease,
         ),
-        patch("xagent.web.api.websocket.sync_workforce_run_status"),
+        patch("xagent.web.services.task_execution.sync_workforce_run_status"),
     ):
         acquired = _acquire_resume_task_lease(
             42,
@@ -1197,11 +1302,11 @@ def test_acquire_resume_lease_reports_prior_status_when_claim_is_lost() -> None:
     prior_status_box: list[TaskStatus] = []
     with (
         patch(
-            "xagent.web.api.websocket.get_session_local",
+            "xagent.web.services.task_execution.get_session_local",
             return_value=session_factory,
         ),
         patch(
-            "xagent.web.api.websocket.acquire_task_lease_no_commit",
+            "xagent.web.services.task_execution.acquire_task_lease_no_commit",
             return_value=None,
         ),
     ):
@@ -1255,18 +1360,20 @@ async def test_resume_background_restores_prior_status_for_preacquired_lease() -
 
     with _Patches(
         [
-            patch("xagent.web.api.websocket._settle_resumed_task_lease", settle),
             patch(
-                "xagent.web.api.websocket._restore_resumed_task_lease_to_prior_status",
+                "xagent.web.services.task_execution._settle_resumed_task_lease", settle
+            ),
+            patch(
+                "xagent.web.services.task_execution._restore_resumed_task_lease_to_prior_status",
                 restore,
             ),
             patch(
-                "xagent.web.api.websocket.stop_task_lease_heartbeat",
+                "xagent.web.services.task_execution.stop_task_lease_heartbeat",
                 new=AsyncMock(),
             ),
             patch("xagent.web.api.websocket.manager", ws_manager),
             patch(
-                "xagent.web.api.websocket.background_task_manager.promote_resume_task"
+                "xagent.web.services.task_execution.background_task_manager.promote_resume_task"
             ),
             patch("xagent.web.tracking.task_tracker.TaskTracker", FakeTracker),
         ]
@@ -1349,31 +1456,33 @@ async def test_resume_background_restores_prior_status_on_checkpoint_read_failur
     with _Patches(
         [
             patch(
-                "xagent.web.api.websocket._acquire_resume_task_lease",
+                "xagent.web.services.task_execution._acquire_resume_task_lease",
                 side_effect=_fake_acquire_with_prior_status(
                     lease, TaskStatus.WAITING_FOR_USER
                 ),
             ),
-            patch("xagent.web.api.websocket._settle_resumed_task_lease", settle),
             patch(
-                "xagent.web.api.websocket._restore_resumed_task_lease_to_prior_status",
+                "xagent.web.services.task_execution._settle_resumed_task_lease", settle
+            ),
+            patch(
+                "xagent.web.services.task_execution._restore_resumed_task_lease_to_prior_status",
                 restore,
             ),
             patch(
-                "xagent.web.api.websocket.mark_user_message_delivery_sync",
+                "xagent.web.services.task_execution.mark_user_message_delivery_sync",
                 mark_delivery,
             ),
             patch(
-                "xagent.web.api.websocket.run_task_lease_heartbeat",
+                "xagent.web.services.task_execution.run_task_lease_heartbeat",
                 new=AsyncMock(),
             ),
             patch(
-                "xagent.web.api.websocket.stop_task_lease_heartbeat",
+                "xagent.web.services.task_execution.stop_task_lease_heartbeat",
                 new=AsyncMock(),
             ),
             patch("xagent.web.api.websocket.manager", ws_manager),
             patch(
-                "xagent.web.api.websocket.background_task_manager.promote_resume_task"
+                "xagent.web.services.task_execution.background_task_manager.promote_resume_task"
             ),
             patch("xagent.web.tracking.task_tracker.TaskTracker", FakeTracker),
         ]
@@ -1439,31 +1548,33 @@ async def test_resume_background_restore_broadcast_failure_does_not_affect_resto
     with _Patches(
         [
             patch(
-                "xagent.web.api.websocket._acquire_resume_task_lease",
+                "xagent.web.services.task_execution._acquire_resume_task_lease",
                 side_effect=_fake_acquire_with_prior_status(
                     lease, TaskStatus.WAITING_FOR_USER
                 ),
             ),
-            patch("xagent.web.api.websocket._settle_resumed_task_lease", settle),
             patch(
-                "xagent.web.api.websocket._restore_resumed_task_lease_to_prior_status",
+                "xagent.web.services.task_execution._settle_resumed_task_lease", settle
+            ),
+            patch(
+                "xagent.web.services.task_execution._restore_resumed_task_lease_to_prior_status",
                 restore,
             ),
             patch(
-                "xagent.web.api.websocket.mark_user_message_delivery_sync",
+                "xagent.web.services.task_execution.mark_user_message_delivery_sync",
                 mark_delivery,
             ),
             patch(
-                "xagent.web.api.websocket.run_task_lease_heartbeat",
+                "xagent.web.services.task_execution.run_task_lease_heartbeat",
                 new=AsyncMock(),
             ),
             patch(
-                "xagent.web.api.websocket.stop_task_lease_heartbeat",
+                "xagent.web.services.task_execution.stop_task_lease_heartbeat",
                 new=AsyncMock(),
             ),
             patch("xagent.web.api.websocket.manager", ws_manager),
             patch(
-                "xagent.web.api.websocket.background_task_manager.promote_resume_task"
+                "xagent.web.services.task_execution.background_task_manager.promote_resume_task"
             ),
             patch("xagent.web.tracking.task_tracker.TaskTracker", FakeTracker),
         ]
@@ -1522,27 +1633,29 @@ async def test_resume_background_checkpoint_unavailable_from_pool_timeout_keeps_
     with _Patches(
         [
             patch(
-                "xagent.web.api.websocket._acquire_resume_task_lease",
+                "xagent.web.services.task_execution._acquire_resume_task_lease",
                 side_effect=_fake_acquire_with_prior_status(
                     lease, TaskStatus.WAITING_FOR_USER
                 ),
             ),
-            patch("xagent.web.api.websocket._settle_resumed_task_lease", settle),
             patch(
-                "xagent.web.api.websocket._restore_resumed_task_lease_to_prior_status",
+                "xagent.web.services.task_execution._settle_resumed_task_lease", settle
+            ),
+            patch(
+                "xagent.web.services.task_execution._restore_resumed_task_lease_to_prior_status",
                 restore,
             ),
             patch(
-                "xagent.web.api.websocket.run_task_lease_heartbeat",
+                "xagent.web.services.task_execution.run_task_lease_heartbeat",
                 new=AsyncMock(),
             ),
             patch(
-                "xagent.web.api.websocket.stop_task_lease_heartbeat",
+                "xagent.web.services.task_execution.stop_task_lease_heartbeat",
                 new=AsyncMock(),
             ),
             patch("xagent.web.api.websocket.manager", ws_manager),
             patch(
-                "xagent.web.api.websocket.background_task_manager.promote_resume_task"
+                "xagent.web.services.task_execution.background_task_manager.promote_resume_task"
             ),
             patch("xagent.web.tracking.task_tracker.TaskTracker", FakeTracker),
         ]
@@ -1593,27 +1706,29 @@ async def test_resume_background_marks_failed_on_checkpoint_corrupt() -> None:
     with _Patches(
         [
             patch(
-                "xagent.web.api.websocket._acquire_resume_task_lease",
+                "xagent.web.services.task_execution._acquire_resume_task_lease",
                 side_effect=_fake_acquire_with_prior_status(
                     lease, TaskStatus.WAITING_FOR_USER
                 ),
             ),
-            patch("xagent.web.api.websocket._settle_resumed_task_lease", settle),
             patch(
-                "xagent.web.api.websocket._restore_resumed_task_lease_to_prior_status",
+                "xagent.web.services.task_execution._settle_resumed_task_lease", settle
+            ),
+            patch(
+                "xagent.web.services.task_execution._restore_resumed_task_lease_to_prior_status",
                 restore,
             ),
             patch(
-                "xagent.web.api.websocket.run_task_lease_heartbeat",
+                "xagent.web.services.task_execution.run_task_lease_heartbeat",
                 new=AsyncMock(),
             ),
             patch(
-                "xagent.web.api.websocket.stop_task_lease_heartbeat",
+                "xagent.web.services.task_execution.stop_task_lease_heartbeat",
                 new=AsyncMock(),
             ),
             patch("xagent.web.api.websocket.manager", ws_manager),
             patch(
-                "xagent.web.api.websocket.background_task_manager.promote_resume_task"
+                "xagent.web.services.task_execution.background_task_manager.promote_resume_task"
             ),
             patch("xagent.web.tracking.task_tracker.TaskTracker", FakeTracker),
         ]
@@ -1649,6 +1764,7 @@ async def test_resume_tracker_pool_timeout_skips_result_and_lease_checkouts() ->
             assert kwargs == {
                 "expected_run_id": "run-a",
                 "expected_runner_id": "runner-a",
+                "expected_attempt_id": None,
             }
 
         async def start_tracking(self) -> None:
@@ -1668,17 +1784,21 @@ async def test_resume_tracker_pool_timeout_skips_result_and_lease_checkouts() ->
     with _Patches(
         [
             patch(
-                "xagent.web.api.websocket._acquire_resume_task_lease",
+                "xagent.web.services.task_execution._acquire_resume_task_lease",
                 return_value=lease,
             ),
-            patch("xagent.web.api.websocket._finalize_resumed_task", finalize),
-            patch("xagent.web.api.websocket._settle_resumed_task_lease", settle),
             patch(
-                "xagent.web.api.websocket.run_task_lease_heartbeat",
+                "xagent.web.services.task_execution._finalize_resumed_task", finalize
+            ),
+            patch(
+                "xagent.web.services.task_execution._settle_resumed_task_lease", settle
+            ),
+            patch(
+                "xagent.web.services.task_execution.run_task_lease_heartbeat",
                 new=AsyncMock(),
             ),
             patch(
-                "xagent.web.api.websocket.stop_task_lease_heartbeat",
+                "xagent.web.services.task_execution.stop_task_lease_heartbeat",
                 new=AsyncMock(),
             ),
             patch(
@@ -1686,7 +1806,7 @@ async def test_resume_tracker_pool_timeout_skips_result_and_lease_checkouts() ->
                 MagicMock(broadcast_to_task=AsyncMock()),
             ),
             patch(
-                "xagent.web.api.websocket.background_task_manager.promote_resume_task"
+                "xagent.web.services.task_execution.background_task_manager.promote_resume_task"
             ),
             patch("xagent.web.tracking.task_tracker.TaskTracker", FakeTracker),
         ]
@@ -1718,6 +1838,7 @@ async def test_resume_heartbeat_pool_timeout_skips_result_and_lease_checkouts() 
             assert kwargs == {
                 "expected_run_id": "run-a",
                 "expected_runner_id": "runner-a",
+                "expected_attempt_id": None,
             }
 
         async def start_tracking(self) -> None:
@@ -1737,17 +1858,21 @@ async def test_resume_heartbeat_pool_timeout_skips_result_and_lease_checkouts() 
     with _Patches(
         [
             patch(
-                "xagent.web.api.websocket._acquire_resume_task_lease",
+                "xagent.web.services.task_execution._acquire_resume_task_lease",
                 return_value=lease,
             ),
-            patch("xagent.web.api.websocket._finalize_resumed_task", finalize),
-            patch("xagent.web.api.websocket._settle_resumed_task_lease", settle),
             patch(
-                "xagent.web.api.websocket.run_task_lease_heartbeat",
+                "xagent.web.services.task_execution._finalize_resumed_task", finalize
+            ),
+            patch(
+                "xagent.web.services.task_execution._settle_resumed_task_lease", settle
+            ),
+            patch(
+                "xagent.web.services.task_execution.run_task_lease_heartbeat",
                 new=AsyncMock(),
             ),
             patch(
-                "xagent.web.api.websocket.stop_task_lease_heartbeat",
+                "xagent.web.services.task_execution.stop_task_lease_heartbeat",
                 new=AsyncMock(
                     return_value=TaskLeaseHeartbeatOutcome(
                         pool_timeout=heartbeat_timeout
@@ -1759,7 +1884,7 @@ async def test_resume_heartbeat_pool_timeout_skips_result_and_lease_checkouts() 
                 MagicMock(broadcast_to_task=AsyncMock()),
             ),
             patch(
-                "xagent.web.api.websocket.background_task_manager.promote_resume_task"
+                "xagent.web.services.task_execution.background_task_manager.promote_resume_task"
             ),
             patch("xagent.web.tracking.task_tracker.TaskTracker", FakeTracker),
         ]
@@ -1792,6 +1917,7 @@ async def test_resume_lease_loss_cancels_execution_without_stale_side_effects() 
             assert kwargs == {
                 "expected_run_id": "run-a",
                 "expected_runner_id": "runner-a",
+                "expected_attempt_id": None,
             }
             self.complete_tracking = AsyncMock()
             self.stop_periodic_updates = AsyncMock()
@@ -1803,7 +1929,8 @@ async def test_resume_lease_loss_cancels_execution_without_stale_side_effects() 
         async def interrupt_reason_for_quota(self) -> None:
             return None
 
-    async def resume(_task_id: str) -> dict[str, Any]:
+    async def resume(_task_id: str, *, metadata: dict[str, Any]) -> dict[str, Any]:
+        assert metadata == {"task_source": None, "run_id": "run-a"}
         resume_started.set()
         try:
             await asyncio.Event().wait()
@@ -1824,23 +1951,27 @@ async def test_resume_lease_loss_cancels_execution_without_stale_side_effects() 
     with _Patches(
         [
             patch(
-                "xagent.web.api.websocket._acquire_resume_task_lease",
+                "xagent.web.services.task_execution._acquire_resume_task_lease",
                 return_value=lease,
             ),
             patch(
-                "xagent.web.api.websocket.run_task_lease_heartbeat",
+                "xagent.web.services.task_execution.run_task_lease_heartbeat",
                 new=lose_lease,
             ),
-            patch("xagent.web.api.websocket._finalize_resumed_task", finalize),
             patch(
-                "xagent.web.api.websocket._settle_resumed_task_lease",
+                "xagent.web.services.task_execution._finalize_resumed_task", finalize
+            ),
+            patch(
+                "xagent.web.services.task_execution._settle_resumed_task_lease",
                 settle,
             ),
             patch("xagent.web.api.websocket.manager", ws_manager),
             patch(
-                "xagent.web.api.websocket.background_task_manager.promote_resume_task"
+                "xagent.web.services.task_execution.background_task_manager.promote_resume_task"
             ),
-            patch("xagent.web.api.websocket.background_task_manager.cleanup_task"),
+            patch(
+                "xagent.web.services.task_execution.background_task_manager.cleanup_task"
+            ),
             patch("xagent.web.tracking.task_tracker.TaskTracker", FakeTracker),
         ]
     ):
@@ -1855,7 +1986,9 @@ async def test_resume_lease_loss_cancels_execution_without_stale_side_effects() 
         )
 
     assert resume_cancelled.is_set()
-    agent_service.resume_execution_by_id.assert_awaited_once_with("42")
+    agent_service.resume_execution_by_id.assert_awaited_once_with(
+        "42", metadata={"task_source": None, "run_id": "run-a"}
+    )
     finalize.assert_not_called()
     settle.assert_not_called()
     assert [
@@ -1884,6 +2017,7 @@ async def test_resume_error_delivery_pool_timeout_skips_lease_checkout() -> None
             assert kwargs == {
                 "expected_run_id": "run-a",
                 "expected_runner_id": "runner-a",
+                "expected_attempt_id": None,
             }
 
         async def start_tracking(self) -> None:
@@ -1903,15 +2037,15 @@ async def test_resume_error_delivery_pool_timeout_skips_lease_checkout() -> None
     with _Patches(
         [
             patch(
-                "xagent.web.api.websocket._acquire_resume_task_lease",
+                "xagent.web.services.task_execution._acquire_resume_task_lease",
                 return_value=lease,
             ),
             patch(
-                "xagent.web.api.websocket._settle_resumed_task_lease",
+                "xagent.web.services.task_execution._settle_resumed_task_lease",
                 settle,
             ),
             patch(
-                "xagent.web.api.websocket.mark_user_message_delivery_sync",
+                "xagent.web.services.task_execution.mark_user_message_delivery_sync",
                 mark_delivery,
             ),
             patch(
@@ -1919,11 +2053,11 @@ async def test_resume_error_delivery_pool_timeout_skips_lease_checkout() -> None
                 new=snapshot,
             ),
             patch(
-                "xagent.web.api.websocket.run_task_lease_heartbeat",
+                "xagent.web.services.task_execution.run_task_lease_heartbeat",
                 new=AsyncMock(),
             ),
             patch(
-                "xagent.web.api.websocket.stop_task_lease_heartbeat",
+                "xagent.web.services.task_execution.stop_task_lease_heartbeat",
                 new=AsyncMock(),
             ),
             patch(
@@ -1931,7 +2065,7 @@ async def test_resume_error_delivery_pool_timeout_skips_lease_checkout() -> None
                 MagicMock(broadcast_to_task=AsyncMock()),
             ),
             patch(
-                "xagent.web.api.websocket.background_task_manager.promote_resume_task"
+                "xagent.web.services.task_execution.background_task_manager.promote_resume_task"
             ),
             patch("xagent.web.tracking.task_tracker.TaskTracker", FakeTracker),
         ]
@@ -1966,6 +2100,7 @@ async def test_resume_cancellation_drains_all_final_cleanup() -> None:
             assert kwargs == {
                 "expected_run_id": "run-a",
                 "expected_runner_id": "runner-a",
+                "expected_attempt_id": None,
             }
 
         async def start_tracking(self) -> None:
@@ -2001,19 +2136,19 @@ async def test_resume_cancellation_drains_all_final_cleanup() -> None:
     with _Patches(
         [
             patch(
-                "xagent.web.api.websocket._acquire_resume_task_lease",
+                "xagent.web.services.task_execution._acquire_resume_task_lease",
                 return_value=lease,
             ),
             patch(
-                "xagent.web.api.websocket._settle_resumed_task_lease",
+                "xagent.web.services.task_execution._settle_resumed_task_lease",
                 side_effect=settle,
             ),
             patch(
-                "xagent.web.api.websocket.run_task_lease_heartbeat",
+                "xagent.web.services.task_execution.run_task_lease_heartbeat",
                 new=AsyncMock(),
             ),
             patch(
-                "xagent.web.api.websocket.stop_task_lease_heartbeat",
+                "xagent.web.services.task_execution.stop_task_lease_heartbeat",
                 side_effect=stop_heartbeat,
             ),
             patch(
@@ -2021,7 +2156,7 @@ async def test_resume_cancellation_drains_all_final_cleanup() -> None:
                 MagicMock(broadcast_to_task=AsyncMock()),
             ),
             patch(
-                "xagent.web.api.websocket.background_task_manager.promote_resume_task"
+                "xagent.web.services.task_execution.background_task_manager.promote_resume_task"
             ),
             patch("xagent.web.tracking.task_tracker.TaskTracker", FakeTracker),
         ]

@@ -11,10 +11,12 @@ const widgetConfig = mergeConfig(baseConfig, defineConfig({
         "src/components/chat/ChatInput.tsx",
         "src/components/chat/ChatMessage.tsx",
         "src/components/chat/clarification-form.tsx",
+        "src/components/chat/connector-runtime-dialog.tsx",
         "src/components/chat/TraceEventRenderer.tsx",
         "src/components/file/file-preview-content.tsx",
         "src/components/file/file-viewer.tsx",
         "src/components/file/inline-file-preview.tsx",
+        "src/components/file/artifact-validation.tsx",
         "src/components/file/pptx-preview-renderer.tsx",
         "src/components/task/task-conversation-panel.tsx",
         "src/components/ui/markdown-renderer.tsx",
@@ -24,12 +26,16 @@ const widgetConfig = mergeConfig(baseConfig, defineConfig({
         "src/components/widget/widget-chrome-controls.tsx",
         "src/contexts/app-context-chat.tsx",
         "src/contexts/auth-context.tsx",
+        "src/contexts/connector-runtime-dialog-context.tsx",
         "src/contexts/file-access-context.tsx",
         "src/hooks/use-file-mention.ts",
         "src/hooks/use-websocket.ts",
         "src/lib/api-wrapper.ts",
         "src/lib/auth-cache.ts",
+        "src/lib/connector-runtime-api.ts",
         "src/lib/files-disabled-presentation.ts",
+        "src/lib/remark-currency-safe-math.ts",
+        "src/lib/remark-preserve-table-content.ts",
         "src/lib/widget-parent-message.ts",
         "src/contexts/presentation-capabilities.tsx",
         "src/app/settings/page.tsx",
@@ -59,6 +65,9 @@ const widgetConfig = mergeConfig(baseConfig, defineConfig({
         "src/app/widget/chat/[[]token[]]/page-client.tsx": {
           statements: 90, branches: 75, functions: 90, lines: 90,
         },
+        "src/components/chat/connector-runtime-dialog.tsx": {
+          statements: 90, branches: 85, functions: 95, lines: 90,
+        },
         "src/components/widget/session-agent-chat-page.tsx": {
           statements: 90, branches: 85, functions: 75, lines: 90,
         },
@@ -75,6 +84,18 @@ const widgetConfig = mergeConfig(baseConfig, defineConfig({
           statements: 85, branches: 80, functions: 90, lines: 85,
         },
         "src/lib/auth-cache.ts": { statements: 90, branches: 80, functions: 90, lines: 90 },
+        "src/lib/connector-runtime-api.ts": {
+          statements: 95, branches: 85, functions: 95, lines: 95,
+        },
+        "src/contexts/connector-runtime-dialog-context.tsx": {
+          statements: 95, branches: 85, functions: 75, lines: 95,
+        },
+        "src/lib/remark-currency-safe-math.ts": {
+          statements: 100, branches: 100, functions: 100, lines: 100,
+        },
+        "src/lib/remark-preserve-table-content.ts": {
+          statements: 95, branches: 80, functions: 100, lines: 95,
+        },
         "src/contexts/presentation-capabilities.tsx": {
           statements: 100, branches: 100, functions: 100, lines: 100,
         },
@@ -112,6 +133,9 @@ const widgetConfig = mergeConfig(baseConfig, defineConfig({
         "src/components/file/inline-file-preview.tsx": {
           statements: 70, branches: 55, functions: 60, lines: 70,
         },
+        "src/components/file/artifact-validation.tsx": {
+          statements: 90, branches: 80, functions: 90, lines: 90,
+        },
         "src/components/file/pptx-preview-renderer.tsx": {
           statements: 45, branches: 35, functions: 30, lines: 45,
         },
@@ -140,10 +164,13 @@ export default defineConfig({
       "src/components/chat/chat-input-public-file-access.test.tsx",
       "src/components/chat/ChatMessage.test.tsx",
       "src/components/chat/TraceEventRenderer.test.tsx",
+      "src/components/chat/trace-event-processing.test.ts",
       "src/components/chat/clarification-form.test.tsx",
+      "src/components/chat/connector-runtime-dialog.test.tsx",
       "src/components/file/file-preview-content.test.tsx",
       "src/components/file/file-viewer.test.tsx",
       "src/components/file/inline-file-preview.test.tsx",
+      "src/components/file/artifact-validation.test.tsx",
       "src/components/file/pptx-preview-renderer.test.tsx",
       "src/components/layout/sidebar.test.tsx",
       "src/components/pages/login.test.tsx",
@@ -160,12 +187,15 @@ export default defineConfig({
       "src/components/widget/use-widget-session.test.tsx",
       "src/contexts/app-context-chat.test.tsx",
       "src/contexts/auth-context.test.tsx",
+      "src/contexts/connector-runtime-dialog-context.test.tsx",
       "src/contexts/file-access-context.test.tsx",
       "src/hooks/use-file-mention.test.tsx",
       "src/hooks/use-websocket.test.ts",
       "src/lib/api-wrapper.test.ts",
       "src/lib/auth-cache.test.ts",
+      "src/lib/connector-runtime-api.test.ts",
       "src/lib/files-disabled-presentation.test.ts",
+      "src/lib/remark-currency-safe-math.test.ts",
     ],
   },
 })

@@ -10,18 +10,20 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from xagent.web.api import websocket as websocket_api
-from xagent.web.api.websocket import (
-    ResumeReservationOutcome,
-    execute_durable_task_command,
+from tests.web.services.task_lease_shared import (
+    live_task_lease as live_task_lease_fixture,
 )
+from xagent.core.agent.runner import UserMessageInjectionOutcome
 from xagent.web.models.chat_message import TaskChatMessage
 from xagent.web.models.database import Base, get_db, get_engine, init_db
 from xagent.web.models.task import Task, TaskStatus
 from xagent.web.models.task_command import TaskExecutionCommand
 from xagent.web.models.task_command_terminal_event import TaskCommandTerminalEvent
 from xagent.web.models.user import User
+from xagent.web.services import task_command_execution as command_execution_service
+from xagent.web.services import task_execution as task_execution_service
 from xagent.web.services.chat_history_service import DELIVERY_PENDING
+from xagent.web.services.task_command_execution import execute_durable_task_command
 from xagent.web.services.task_command_transport import (
     COMMAND_COMPLETED,
     COMMAND_FAILED,
@@ -35,6 +37,9 @@ from xagent.web.services.task_command_transport import (
     get_runner_id,
     max_command_defers,
 )
+from xagent.web.services.task_execution import ResumeReservationOutcome
+
+live_task_lease = live_task_lease_fixture
 
 
 @pytest.fixture()
@@ -107,7 +112,16 @@ def _live_control_environment(
     agent = MagicMock()
     agent.supports_live_control.return_value = True
     agent.get_dag_pattern.return_value = None
-    agent.post_user_message = AsyncMock(return_value=True)
+    # The injection outcome is read two ways downstream: truthiness (did an
+    # exact checkpoint accept the message at all) and identity against
+    # ``POSTED_FRESH`` (did this call write a new turn, as opposed to a
+    # replayed one). A bare ``True`` satisfies the first read but is never
+    # ``is POSTED_FRESH``, so it silently skips the branch that fires only
+    # on identity -- the stub has to be a real enum member to exercise that
+    # branch at all.
+    agent.post_user_message = AsyncMock(
+        return_value=UserMessageInjectionOutcome.POSTED_FRESH
+    )
     if background_manager is None:
         background_manager = MagicMock()
         background_manager.try_reserve_resume.return_value = outcome
@@ -116,7 +130,7 @@ def _live_control_environment(
 
     with (
         patch(
-            "xagent.web.api.chat.get_agent_manager",
+            "xagent.web.services.agent_service_manager.get_agent_manager",
             return_value=MagicMock(get_agent_for_task=AsyncMock(return_value=agent)),
         ),
         patch(
@@ -126,9 +140,11 @@ def _live_control_environment(
                 send_personal_message=AsyncMock(),
             ),
         ),
-        patch("xagent.web.api.websocket.execute_resume_background", AsyncMock()),
         patch(
-            "xagent.web.api.websocket.background_task_manager",
+            "xagent.web.services.task_execution.execute_resume_background", AsyncMock()
+        ),
+        patch(
+            "xagent.web.services.task_execution.background_task_manager",
             background_manager,
         ),
     ):
@@ -137,7 +153,7 @@ def _live_control_environment(
 
 @pytest.mark.asyncio
 async def test_cancel_clears_pre_registration_resume_reservation() -> None:
-    background_manager = websocket_api.BackgroundTaskManager()
+    background_manager = task_execution_service.BackgroundTaskManager()
     assert (
         background_manager.try_reserve_resume(7, expected_run_id="live-run")
         is ResumeReservationOutcome.RESERVED
@@ -222,15 +238,17 @@ async def test_recovered_delivery_makes_contention_unsafe_to_resend(
 
 @pytest.mark.asyncio
 async def test_dispatcher_reclaims_and_applies_message_after_contention_clears(
+    live_task_lease,
     db_session,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    caplog.set_level("INFO", logger=websocket_api.__name__)
+    caplog.set_level("INFO", logger=command_execution_service.__name__)
     owner = _user(db_session, "eventual-delivery-owner")
     task = _live_task(db_session, int(owner.id))
     task.runner_id = get_runner_id()
     task.lease_expires_at = datetime.now(timezone.utc) + timedelta(minutes=1)
     db_session.commit()
+    live_task_lease(db_session, task)
 
     enqueued = enqueue_task_command(
         db_session,
@@ -247,7 +265,7 @@ async def test_dispatcher_reclaims_and_applies_message_after_contention_clears(
     )
     db_session.commit()
 
-    background_manager = websocket_api.BackgroundTaskManager()
+    background_manager = task_execution_service.BackgroundTaskManager()
     assert (
         background_manager.try_reserve_resume(
             int(task.id),
@@ -283,11 +301,30 @@ async def test_dispatcher_reclaims_and_applies_message_after_contention_clears(
         background_manager.release_resume_reservation(int(task.id))
         stored.claim_expires_at = None
         db_session.commit()
-        assert await dispatch_one_task_command(
-            execute_durable_task_command,
-            command_db_id=enqueued.command_id,
-        )
-        await asyncio.sleep(0)
+        # A stub that is truthy but not `is POSTED_FRESH` would let the
+        # dispatch above still report success while silently skipping the
+        # legacy-interaction close below it -- truthiness alone cannot tell
+        # the two apart. Patching with a spy lets us assert
+        # `close_spy.call_count == 1`, which fails if that regression
+        # silently skips the close; `wraps=` is added separately so the
+        # real close still executes for its own side effects (the DB
+        # write), keeping the rest of the test's assertions valid.
+        with patch.object(
+            command_execution_service,
+            "close_legacy_resume_interaction_sync",
+            wraps=command_execution_service.close_legacy_resume_interaction_sync,
+        ) as close_spy:
+            assert await dispatch_one_task_command(
+                execute_durable_task_command,
+                command_db_id=enqueued.command_id,
+            )
+            await asyncio.sleep(0)
+        assert close_spy.call_count == 1
+        # The call site swallows any internal failure into a warning
+        # (`except Exception: logger.warning(...)`), so call_count alone
+        # cannot tell a successful close from one that raised and was
+        # silently caught. Assert the warning is absent to catch that case.
+        assert "legacy resume interaction close failed" not in caplog.text
 
     db_session.expire_all()
     stored = db_session.get(TaskExecutionCommand, enqueued.command_id)

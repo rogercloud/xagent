@@ -5,6 +5,7 @@ Provides REST API endpoints for managing MCP server configurations
 in the web application.
 """
 
+import asyncio
 import base64
 import hashlib
 import hmac
@@ -12,11 +13,22 @@ import json
 import logging
 import secrets
 import shlex
-from collections.abc import Collection
+from collections.abc import Collection, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from enum import Enum
-from typing import Annotated, Any, Callable, Dict, List, Literal, Optional, Union, cast
+from typing import (
+    TYPE_CHECKING,
+    Annotated,
+    Any,
+    Callable,
+    Dict,
+    List,
+    Literal,
+    Optional,
+    Union,
+    cast,
+)
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 from uuid import UUID
 
@@ -40,6 +52,7 @@ from ..auth_dependencies import get_current_user, is_admin_user
 from ..mcp_apps import (
     get_all_mcp_apps,
     get_app_for_mcp_server,
+    normalize_catalog_key,
     restrict_to_app_scoped_oauth_grant,
 )
 from ..models.custom_api import CustomApi, UserCustomApi
@@ -55,6 +68,7 @@ from ..models.mcp_oauth import (
 )
 from ..models.public_mcp import PublicMCPApp
 from ..models.user import User
+from ..models.user_oauth import UserOAuth
 from ..services.mcp_oauth import (
     MCP_OAUTH_HTTP_TIMEOUT_SECONDS,
     MCP_OAUTH_PERSISTED_VALUE_MAX_LENGTH,
@@ -80,7 +94,15 @@ from ..services.user_oauth import (
     delete_scoped_user_oauth_accounts,
     list_scoped_user_oauth_accounts,
     normalize_user_oauth_resource_owner_key,
+    scoped_user_oauth_query,
 )
+
+if TYPE_CHECKING:
+    # Type-checking only: a real module-level import here would be a
+    # circular import (auth.py itself defers its own imports of this module
+    # into function bodies for exactly this reason) -- every runtime use
+    # imports from .auth locally at the call site instead.
+    from .auth import BuiltinOAuthRevocation
 
 logger = logging.getLogger(__name__)
 
@@ -203,6 +225,14 @@ class MCPServerResponse(BaseModel):
     connected_account: Optional[str] = None
     app_id: Optional[str] = None
     provider: Optional[str] = None
+    connection_status: Optional[Literal["connected", "needs_reconnect"]] = Field(
+        default=None,
+        description=(
+            "Persisted OAuth grant state: connected when the selected grant has an "
+            "access token, needs_reconnect when its token was cleared, or null when "
+            "no persisted grant exists. This is not a runtime readiness probe."
+        ),
+    )
 
     class Config:
         from_attributes = True
@@ -2001,7 +2031,18 @@ def _global_config_tampered(server_data: MCPServerUpdate, server: MCPServer) -> 
 class _TeamOwnedUserMCP:
     """Stand-in for a missing UserMCPServer row: a team connector the user does
     not personally own. Exposes the attributes the response builders read with
-    not-owned defaults (usable, but not editable/deletable)."""
+    not-owned defaults (usable, but not editable/deletable).
+
+    ``__slots__`` declares only ``user_id`` as a real per-instance attribute.
+    Every other name below is a class attribute, not a slot, so assigning to
+    it on an instance -- ``stand_in.is_active = False``, say -- raises
+    ``AttributeError`` instead of silently creating a shadowing instance
+    attribute the caller's own row never backs. A caller admitted through
+    this stand-in has no association row to write, so nothing here should
+    ever be writable.
+    """
+
+    __slots__ = ("user_id",)
 
     is_owner = False
     can_edit = False
@@ -2016,7 +2057,15 @@ class _TeamOwnedUserMCP:
 
 
 class _TeamOwnedUserApi:
-    """Stand-in for a missing UserCustomApi row (team-owned, not user-owned)."""
+    """Stand-in for a missing UserCustomApi row (team-owned, not user-owned).
+
+    Same reasoning as ``_TeamOwnedUserMCP`` above: ``__slots__`` leaves
+    ``user_id`` as the only attribute an instance can hold, so a write to
+    ``can_edit``, ``is_active`` or ``is_default`` raises ``AttributeError``
+    rather than shadowing the class default with a value nothing persists.
+    """
+
+    __slots__ = ("user_id",)
 
     can_edit = False
     is_active = True
@@ -2034,6 +2083,7 @@ def _db_server_to_response(
     app_id: Optional[str] = None,
     provider: Optional[str] = None,
     is_admin: bool = False,
+    connection_status: Optional[str] = None,
 ) -> MCPServerResponse:
     """Convert database MCPServer to response model."""
     # Get status from manager if available
@@ -2073,6 +2123,7 @@ def _db_server_to_response(
         connected_account=connected_account,
         app_id=app_id,
         provider=provider,
+        connection_status=connection_status,
     )
 
 
@@ -2108,45 +2159,122 @@ def _custom_api_to_mcp_response(
     )
 
 
-def _enrich_oauth_server_info(
-    db: Session, server: MCPServer, oauth_emails: dict
-) -> tuple[Optional[str], Optional[str], Optional[str]]:
+def _oauth_account_summaries(
+    db: Session, user_id: int
+) -> dict[str, tuple[Optional[str], str, int]]:
+    """Per-provider ``(email, connection_status, account_id)`` for the user's
+    OAuth grants.
+
+    ``connection_status`` describes only persisted grant state: "connected"
+    when the selected row has an access token and "needs_reconnect" when the
+    row exists but its token was cleared (for example by a scope migration).
+    It deliberately does not predict refreshability or resolver-hook output.
+    No entry means no persisted personal grant exists.
+
+    ``email`` is nullable on ``UserOAuth`` (some providers never return one,
+    or it was never backfilled) -- a grant missing it is still a grant, so
+    it stays in this map with ``email=None`` rather than being dropped. Keep
+    the existing ``connected_account`` contract by also hiding the email when
+    the stored credential fails the established connectability check; that
+    label is independent from the persisted-only ``connection_status``.
+
+    ``(user_id, provider, provider_user_id)`` is unique, not
+    ``(user_id, provider)`` -- two rows for the same provider are not a
+    schema violation, and the runtime token resolver
+    (``config.py``'s ``.filter(UserOAuth.provider.in_(...)).order_by(
+    UserOAuth.id.desc()).first()``) always uses the single most-recently
+    -created row for a provider, never falling back to an older row even
+    if it is the only usable one. This map must pick the same row runtime
+    would, or the API can claim "connected" for an account runtime will
+    never actually select -- ``account_id`` is kept so a caller checking
+    more than one candidate provider key for one app (an app-scoped and a
+    bare-provider connect are independent rows) can pool them the same way
+    runtime's ``provider.in_(...)`` does and take the overall newest.
     """
-    Return (app_id, provider, connected_account) for an OAuth-based MCPServer.
-    This encapsulates the logic of looking up app information in O(1) time.
+    oauth_accounts = list_scoped_user_oauth_accounts(
+        db,
+        user_id=user_id,
+        resource_owner_key=None,
+    )
+    summaries: dict[str, tuple[Optional[str], str, int]] = {}
+    for oauth in oauth_accounts:
+        provider = str(oauth.provider)
+        account_id = int(oauth.id)
+        existing = summaries.get(provider)
+        if existing is not None and existing[2] >= account_id:
+            continue
+        email = (
+            str(oauth.email)
+            if oauth.email and _oauth_account_can_connect(oauth)
+            else None
+        )
+        status = "connected" if oauth.access_token else "needs_reconnect"
+        summaries[provider] = (email, status, account_id)
+    return summaries
+
+
+def _enrich_oauth_server_info(
+    db: Session,
+    server: MCPServer,
+    oauth_accounts: dict[str, tuple[Optional[str], str, int]],
+) -> tuple[Optional[str], Optional[str], Optional[str], Optional[str]]:
+    """
+    Return (app_id, provider, connected_account, connection_status) for an
+    OAuth-based MCPServer. This encapsulates the logic of looking up app
+    information in O(1) time. ``oauth_accounts`` maps provider/app keys to
+    ``(email, connection_status, account_id)``, as built by
+    ``_oauth_account_summaries``.
     """
     if server.transport != "oauth":
-        return None, None, None
+        return None, None, None, None
 
     # Stable identity, not the mutable display name: an id-named row (the
     # catalog-connect convention) resolved to nothing here, so its app_id,
     # provider and connected account were all reported as absent.
     app_info = get_app_for_mcp_server(db, server)
     if not app_info:
-        return None, None, None
+        return None, None, None, None
 
     provider = app_info.get("provider")
     app_id = app_info.get("id")
-    connected_account = None
+
+    connected_account: Optional[str] = None
+    connection_status: Optional[str] = None
+    best_account_id = -1
+    # app_id and provider are two independent lookup keys (an app-scoped
+    # connect and a bare-provider connect leave separate UserOAuth rows --
+    # see auth.py's OAuth callback): pool whichever of the two has rows and
+    # take the overall newest by id, exactly mirroring the runtime token
+    # resolver's own `provider.in_([app_id, provider]).order_by(id.desc())`
+    # query -- never "whichever key is healthier," which can pick a row
+    # runtime would never select.
     for key in restrict_to_app_scoped_oauth_grant(app_id, [app_id, provider]):
-        connected_account = oauth_emails.get(key)
-        if connected_account:
-            break
+        summary = oauth_accounts.get(key)
+        if not summary:
+            continue
+        email, status, account_id = summary
+        if account_id > best_account_id:
+            connected_account, connection_status, best_account_id = (
+                email,
+                status,
+                account_id,
+            )
 
-    return app_id, provider, connected_account
+    # A pre-existing invariant this response has always kept (see
+    # test_meta_oauth.py's blanked-token regression test, from an earlier
+    # reconnect-migration incident): a stale email left on a row whose token
+    # no longer works must not be surfaced as an account label. Status remains
+    # the persisted-state projection documented on MCPServerResponse.
+    if connection_status != "connected":
+        connected_account = None
 
-
-def _normalize_app_key(value: object) -> Optional[str]:
-    if value is None:
-        return None
-    normalized = "-".join(str(value).strip().lower().split())
-    return normalized or None
+    return app_id, provider, connected_account, connection_status
 
 
 def _app_lookup_keys(*values: object) -> list[str]:
     keys = []
     for value in values:
-        key = _normalize_app_key(value)
+        key = normalize_catalog_key(value)
         if key and key not in keys:
             keys.append(key)
     return keys
@@ -2192,7 +2320,7 @@ def _server_catalog_keys(server: MCPServer) -> list[str]:
     — a key this misses is a #1346 duplicate, while a key it over-matches only
     moves a legacy row to the Remote tab, still editable via /api/mcp/servers.
     """
-    if _normalize_app_key(server.transport) != "oauth":
+    if normalize_catalog_key(server.transport) != "oauth":
         return _app_lookup_keys(server.name)
     return _app_lookup_keys(server.name, *_oauth_server_lookup_keys(server))
 
@@ -2204,7 +2332,7 @@ def _is_reserved_catalog_name(db: Session, name: object) -> bool:
     by normalized id/name, so a squatter would shadow the official shared row (or
     at least DoS legitimate connects). Enforced on both create and rename.
     """
-    key = _normalize_app_key(name)
+    key = normalize_catalog_key(name)
     if not key:
         return False
     return any(key in _catalog_app_keys(app) for app in get_all_mcp_apps(db))
@@ -2231,7 +2359,7 @@ def _oauth_account_can_connect(oauth_account: object) -> bool:
 
 def _oauth_keys_for_app(app: dict) -> list[str]:
     return restrict_to_app_scoped_oauth_grant(
-        app.get("id"), _app_lookup_keys(app.get("id"), app.get("provider"))
+        app, _app_lookup_keys(app.get("id"), app.get("provider"))
     )
 
 
@@ -2239,14 +2367,14 @@ def _is_oauth_server_for_app(server: MCPServer, app: dict) -> bool:
     if server.transport != "oauth":
         return False
 
-    app_id = _normalize_app_key(app.get("id"))
-    provider = _normalize_app_key(app.get("provider"))
-    server_name = _normalize_app_key(server.name)
+    app_id = normalize_catalog_key(app.get("id"))
+    provider = normalize_catalog_key(app.get("provider"))
+    server_name = normalize_catalog_key(server.name)
 
     auth = getattr(server, "auth", None)
     if isinstance(auth, dict):
-        auth_app_id = _normalize_app_key(auth.get("app_id"))
-        auth_provider = _normalize_app_key(auth.get("provider"))
+        auth_app_id = normalize_catalog_key(auth.get("app_id"))
+        auth_provider = normalize_catalog_key(auth.get("provider"))
 
         if auth_app_id and auth_app_id != app_id:
             return False
@@ -2287,7 +2415,7 @@ def _connected_oauth_server_for_app(
 def _build_oauth_account_lookup(oauth_accounts: list[object]) -> dict[str, object]:
     lookup: dict[str, object] = {}
     for account in oauth_accounts:
-        key = _normalize_app_key(getattr(account, "provider", None))
+        key = normalize_catalog_key(getattr(account, "provider", None))
         if key and key not in lookup and _oauth_account_can_connect(account):
             lookup[key] = account
     return lookup
@@ -2296,11 +2424,11 @@ def _build_oauth_account_lookup(oauth_accounts: list[object]) -> dict[str, objec
 def _oauth_server_lookup_keys(server: MCPServer) -> list[str]:
     auth = getattr(server, "auth", None)
     if isinstance(auth, dict):
-        auth_app_id = _normalize_app_key(auth.get("app_id"))
+        auth_app_id = normalize_catalog_key(auth.get("app_id"))
         if auth_app_id:
             return [auth_app_id]
 
-        auth_provider = _normalize_app_key(auth.get("provider"))
+        auth_provider = normalize_catalog_key(auth.get("provider"))
         if auth_provider:
             return [auth_provider]
 
@@ -2312,7 +2440,7 @@ def _build_active_oauth_server_lookup(
 ) -> dict[str, list[MCPServer]]:
     lookup: dict[str, list[MCPServer]] = {}
     for server, user_mcp in user_mcps:
-        if not user_mcp.is_active or _normalize_app_key(server.transport) != "oauth":
+        if not user_mcp.is_active or normalize_catalog_key(server.transport) != "oauth":
             continue
         for key in _oauth_server_lookup_keys(server):
             lookup.setdefault(key, []).append(server)
@@ -2339,8 +2467,8 @@ def _build_active_non_oauth_server_lookup(
 ) -> dict[tuple[str, str], MCPServer]:
     lookup: dict[tuple[str, str], MCPServer] = {}
     for server, user_mcp in user_mcps:
-        transport = _normalize_app_key(server.transport)
-        server_name = _normalize_app_key(server.name)
+        transport = normalize_catalog_key(server.transport)
+        server_name = normalize_catalog_key(server.name)
         if (
             not user_mcp.is_active
             or not transport
@@ -2456,7 +2584,7 @@ def _app_user_env_configured(configured_keys: list[str], required: list[str]) ->
 def _connected_non_oauth_server_for_app(
     app: dict, non_oauth_server_lookup: dict[tuple[str, str], MCPServer]
 ) -> Optional[int]:
-    app_transport = _normalize_app_key(app.get("transport"))
+    app_transport = normalize_catalog_key(app.get("transport"))
     if not app_transport or app_transport == "oauth":
         return None
 
@@ -2690,7 +2818,7 @@ def list_mcp_apps(
         for srv in (
             db.query(MCPServer).filter(MCPServer.name.in_(non_oauth_names)).all()
         ):
-            norm = _normalize_app_key(srv.name)
+            norm = normalize_catalog_key(srv.name)
             if norm:
                 server_by_key.setdefault(norm, srv)
     user_mcp_by_server_id = {cast(int, srv.id): um for srv, um in user_mcps}
@@ -3062,23 +3190,13 @@ def get_mcp_servers(
             .all()
         )
 
-        # Actor credentials are not personal server connections.
-        oauth_accounts = list_scoped_user_oauth_accounts(
-            db,
-            user_id=effective_user_id,
-            resource_owner_key=None,
-        )
-        oauth_emails = {
-            str(oauth.provider): str(oauth.email)
-            for oauth in oauth_accounts
-            if oauth.email and _oauth_account_can_connect(oauth)
-        }
+        oauth_account_summaries = _oauth_account_summaries(db, effective_user_id)
 
         is_admin = getattr(current_user, "is_admin", False)
         responses = []
         for user_mcp, server in user_mcps:
-            app_id, provider, connected_account = _enrich_oauth_server_info(
-                db, server, oauth_emails
+            app_id, provider, connected_account, connection_status = (
+                _enrich_oauth_server_info(db, server, oauth_account_summaries)
             )
             responses.append(
                 _db_server_to_response(
@@ -3089,6 +3207,7 @@ def get_mcp_servers(
                     app_id,
                     provider,
                     is_admin=is_admin,
+                    connection_status=connection_status,
                 )
             )
 
@@ -3115,8 +3234,8 @@ def get_mcp_servers(
             for server in (
                 db.query(MCPServer).filter(MCPServer.id.in_(missing_mcp)).all()
             ):
-                app_id, provider, connected_account = _enrich_oauth_server_info(
-                    db, server, oauth_emails
+                app_id, provider, connected_account, connection_status = (
+                    _enrich_oauth_server_info(db, server, oauth_account_summaries)
                 )
                 responses.append(
                     _db_server_to_response(
@@ -3127,6 +3246,7 @@ def get_mcp_servers(
                         app_id,
                         provider,
                         is_admin=is_admin,
+                        connection_status=connection_status,
                     )
                 )
 
@@ -3178,20 +3298,9 @@ def get_mcp_server(
 
         user_mcp, server = result
 
-        # Actor credentials are not personal server connections.
-        oauth_accounts = list_scoped_user_oauth_accounts(
-            db,
-            user_id=int(user_id),
-            resource_owner_key=None,
-        )
-        oauth_emails = {
-            oauth.provider: oauth.email
-            for oauth in oauth_accounts
-            if oauth.email and _oauth_account_can_connect(oauth)
-        }
-
-        app_id, provider, connected_account = _enrich_oauth_server_info(
-            db, server, oauth_emails
+        oauth_account_summaries = _oauth_account_summaries(db, int(user_id))
+        app_id, provider, connected_account, connection_status = (
+            _enrich_oauth_server_info(db, server, oauth_account_summaries)
         )
 
         return _db_server_to_response(
@@ -3202,6 +3311,7 @@ def get_mcp_server(
             app_id,
             provider,
             is_admin=getattr(current_user, "is_admin", False),
+            connection_status=connection_status,
         )
 
     except HTTPException:
@@ -3350,6 +3460,64 @@ def _reject_hidden_catalog_app(app_info: dict) -> None:
         )
 
 
+def _catalog_server_provenance_auth(app_info: dict) -> dict[str, Any] | None:
+    launch = app_info.get("launch_config")
+    marker = launch.get("builtin_provenance") if isinstance(launch, dict) else None
+    if not isinstance(marker, dict):
+        return None
+    return {"builtin_provenance": marker}
+
+
+def _reject_provenance_catalog_collisions(
+    db: Session, app_info: dict, expected_auth: dict[str, Any]
+) -> MCPServer | None:
+    """Return the exact stamped server, rejecting every normalized collision."""
+    from xagent.builtin_identity import canonicalize_builtin_identity
+
+    identity_keys = {
+        canonicalize_builtin_identity(app_info.get("id")),
+        canonicalize_builtin_identity(app_info.get("name")),
+    } - {None}
+    catalog_collisions = [
+        app
+        for app in db.query(PublicMCPApp).all()
+        if {
+            canonicalize_builtin_identity(app.app_id),
+            canonicalize_builtin_identity(app.name),
+        }
+        & identity_keys
+    ]
+    if len(catalog_collisions) != 1 or (
+        str(catalog_collisions[0].app_id) != str(app_info["id"])
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="The built-in catalog identity conflicts with a custom app",
+        )
+
+    server_collisions = [
+        server
+        for server in db.query(MCPServer).all()
+        if canonicalize_builtin_identity(server.name) in identity_keys
+    ]
+    if not server_collisions:
+        return None
+    exact_server = next(
+        (
+            server
+            for server in server_collisions
+            if server.name == str(app_info["id"]) and server.auth == expected_auth
+        ),
+        None,
+    )
+    if len(server_collisions) != 1 or exact_server is None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="The built-in catalog identity conflicts with a custom server",
+        )
+    return exact_server
+
+
 def _ensure_catalog_app_server(db: Session, app_id: str) -> tuple[MCPServer, dict]:
     """Idempotently ensure the shared server row for a key-based or keyless
     catalog app exists, without creating any per-user association. Returns
@@ -3383,7 +3551,12 @@ def _ensure_catalog_app_server(db: Session, app_id: str) -> tuple[MCPServer, dic
     # is what the connector uses to detect an app as connected.
     server_name = str(app_info["id"])
 
-    server = db.query(MCPServer).filter(MCPServer.name == server_name).first()
+    expected_provenance_auth = _catalog_server_provenance_auth(app_info)
+    server = (
+        _reject_provenance_catalog_collisions(db, app_info, expected_provenance_auth)
+        if expected_provenance_auth is not None
+        else db.query(MCPServer).filter(MCPServer.name == server_name).first()
+    )
     # Server names are a single global namespace. A row under this catalog id may
     # be a hijack — a custom server someone created with their own command — so
     # only reuse it if the command/transport match the official launch config.
@@ -3429,7 +3602,10 @@ def _ensure_catalog_app_server(db: Session, app_id: str) -> tuple[MCPServer, dic
             # transport/args; otherwise fall through to the same 409 every
             # such row already got before this change, leaving it and
             # whatever it holds untouched for an operator to resolve.
-            if _server_has_policy_beyond_catalog_identity(server):
+            if (
+                expected_provenance_auth is None
+                and _server_has_policy_beyond_catalog_identity(server)
+            ):
                 raise HTTPException(
                     status_code=status.HTTP_409_CONFLICT,
                     detail="A server with this name already exists with a different configuration",
@@ -3461,7 +3637,15 @@ def _ensure_catalog_app_server(db: Session, app_id: str) -> tuple[MCPServer, dic
                     name=server_name,
                     transport="stdio",
                     description=app_info.get("description"),
-                    config={"command": command, "args": launch.get("args") or []},
+                    config={
+                        "command": command,
+                        "args": launch.get("args") or [],
+                        **(
+                            {"auth": expected_provenance_auth}
+                            if expected_provenance_auth is not None
+                            else {}
+                        ),
+                    },
                 )
             )
         except ValueError as e:
@@ -3470,6 +3654,14 @@ def _ensure_catalog_app_server(db: Session, app_id: str) -> tuple[MCPServer, dic
                 detail=f"Invalid app configuration: {str(e)}",
             )
         server = _add_catalog_server_with_race_recovery(db, config, server_name)
+        if (
+            expected_provenance_auth is not None
+            and server.auth != expected_provenance_auth
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="The built-in catalog identity conflicts with a custom server",
+            )
     return server, app_info
 
 
@@ -4325,7 +4517,16 @@ def update_mcp_server(
         from ..services.connector_team_scope import rename_team_connector
 
         rename_team_connector(
-            db, int(user_id), "mcp", int(server_id), old_name, str(server.name)
+            db,
+            int(user_id),
+            "mcp",
+            int(server_id),
+            old_name,
+            str(server.name),
+            # This transaction holds the definition row FOR UPDATE ... KEY
+            # SHARE and has not committed anything yet; a hook that ends it
+            # drops that lock with this route none the wiser.
+            caller_holds_lock=True,
         )
 
         db.commit()
@@ -4365,7 +4566,7 @@ def _catalog_server_has_platform_key(db: Session, server: MCPServer) -> bool:
         return False
     from ..mcp_apps import get_all_mcp_apps
 
-    key = _normalize_app_key(getattr(server, "name", None))
+    key = normalize_catalog_key(getattr(server, "name", None))
     if not key:
         return False
     for app in get_all_mcp_apps(db):
@@ -4421,7 +4622,56 @@ def _locked_catalog_app_for_server(
     return expected_app if owners == {app_id} else None
 
 
-async def teardown_mcp_app_server(
+def _snapshot_builtin_oauth_revocations(
+    db: Session, *, user_id: int, providers: Sequence[str]
+) -> "list[BuiltinOAuthRevocation]":
+    """Resolve provider-side revocation records for the builtin
+    ``UserOAuth`` rows ``delete_scoped_user_oauth_accounts`` is about to
+    delete for ``providers``.
+
+    Must run before that call -- it's a bulk SQL DELETE that never loads
+    rows into Python, so this is the only chance to read each row's
+    access_token and provider_user_id. Only reads the database (see
+    ``auth.resolve_builtin_oauth_revocation``), so it's safe to call while
+    still holding the disconnect transaction's locks; the caller revokes the
+    resolved credentials only after its own commit, and only once
+    ``auth.has_other_builtin_oauth_reference`` (checked at that later point,
+    not here) confirms no other local connection still needs the grant.
+    """
+    from .auth import resolve_builtin_oauth_revocation
+
+    if not providers:
+        return []
+    accounts = (
+        scoped_user_oauth_query(db, user_id=user_id, resource_owner_key=None)
+        .filter(UserOAuth.provider.in_(providers))
+        .all()
+    )
+    resolved = []
+    for account in accounts:
+        if not account.access_token:
+            continue
+        snapshot = resolve_builtin_oauth_revocation(
+            db,
+            provider=str(account.provider),
+            access_token=str(account.access_token),
+            # is not None, not a truthy check: an empty-string
+            # provider_user_id is still a real (if unlikely) identity value,
+            # and coercing it to None here would silently disable
+            # has_other_builtin_oauth_reference's cross-user protection --
+            # only an actual NULL column means "no known identity".
+            provider_user_id=(
+                str(account.provider_user_id)
+                if account.provider_user_id is not None
+                else None
+            ),
+        )
+        if snapshot is not None:
+            resolved.append(snapshot)
+    return resolved
+
+
+def _teardown_mcp_app_server_locally(
     server_id: int,
     *,
     app_id: str,
@@ -4430,15 +4680,28 @@ async def teardown_mcp_app_server(
     expected_association_generation: UUID,
     current_user: User,
     db: Session,
-) -> None:
-    """Atomically disconnect one exact catalog-app association lifecycle.
+) -> "tuple[int, list[_MCPOAuthGrantRevocationSnapshot], list[BuiltinOAuthRevocation]]":
+    """Own the local teardown transaction and report what still needs revoking.
 
     The caller pins both generations during preflight. This function owns the
-    local transaction, revalidates every destructive identity while locked,
-    commits local cleanup once, and only then performs best-effort provider
-    revocation without ORM access or database locks.
+    local transaction, revalidates every destructive identity while locked, and
+    commits local cleanup once. Provider revocation stays with the caller,
+    because it may only run once this commit has released every lock.
+
+    Kept a plain ``def`` and run off the event loop by its caller: this half
+    calls the connector team seam, and an installed team hook answers from the
+    installing application's own tables, so it can be slow. A seam call made
+    from a coroutine runs on the event loop thread, where a slow hook stalls
+    every other request the process is serving instead of occupying one
+    worker.
+
+    Returns the acting user id alongside the revocation snapshots because this
+    function is the half of a split teardown that has ``current_user`` in
+    scope: the caller, ``teardown_mcp_app_server``, logs the completed
+    teardown after this function returns and needs the id to do it.
     """
     revocations: list[_MCPOAuthGrantRevocationSnapshot] = []
+    builtin_oauth_revocations: "list[BuiltinOAuthRevocation]" = []
     try:
         with db.no_autoflush:
             user_id = int(current_user.id)
@@ -4531,7 +4794,16 @@ async def teardown_mcp_app_server(
 
         from ..services.connector_team_scope import delete_team_connector
 
-        team_delete = delete_team_connector(db, user_id, "mcp", server_id)
+        team_delete = delete_team_connector(
+            db,
+            user_id,
+            "mcp",
+            server_id,
+            # Three row locks are held here -- public_mcp_apps, mcp_servers
+            # and user_mcpservers -- and nothing has been committed. A hook
+            # that ends this transaction releases all three at once.
+            caller_holds_lock=True,
+        )
         if team_delete.blocked_reason:
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
@@ -4546,9 +4818,14 @@ async def teardown_mcp_app_server(
         if str(server.transport or "").lower() == "oauth":
             provider = expected_app.provider_name
             providers_to_delete = restrict_to_app_scoped_oauth_grant(
-                app_id, [provider, app_id]
+                expected_app, [provider, app_id]
             )
             if providers_to_delete:
+                builtin_oauth_revocations.extend(
+                    _snapshot_builtin_oauth_revocations(
+                        db, user_id=user_id, providers=providers_to_delete
+                    )
+                )
                 delete_scoped_user_oauth_accounts(
                     db,
                     user_id=user_id,
@@ -4565,14 +4842,19 @@ async def teardown_mcp_app_server(
                     )
                     .all()
                 )
-                normalized_provider = _normalize_app_key(provider)
+                normalized_provider = normalize_catalog_key(provider)
                 sibling_still_connected = any(
                     (sibling_app := get_app_for_mcp_server(db, other_server))
-                    and _normalize_app_key(sibling_app.get("provider"))
+                    and normalize_catalog_key(sibling_app.get("provider"))
                     == normalized_provider
                     for other_server in other_servers
                 )
                 if not sibling_still_connected:
+                    builtin_oauth_revocations.extend(
+                        _snapshot_builtin_oauth_revocations(
+                            db, user_id=user_id, providers=[provider]
+                        )
+                    )
                     delete_scoped_user_oauth_accounts(
                         db,
                         user_id=user_id,
@@ -4654,6 +4936,59 @@ async def teardown_mcp_app_server(
             detail="Failed to delete MCP server",
         ) from None
 
+    return user_id, revocations, builtin_oauth_revocations
+
+
+async def teardown_mcp_app_server(
+    server_id: int,
+    *,
+    app_id: str,
+    expected_provider_name: str | None,
+    expected_catalog_generation: UUID,
+    expected_association_generation: UUID,
+    current_user: User,
+    db: Session,
+) -> None:
+    """Atomically disconnect one exact catalog-app association lifecycle.
+
+    The locked local transaction -- every destructive identity revalidated, the
+    connector team seam consulted, one commit -- is
+    ``_teardown_mcp_app_server_locally``, and runs in a worker thread rather
+    than here, because an installed team hook may be slow and this coroutine
+    runs on the event loop thread that serves every other request. The same
+    session is handed to that thread and back: SQLAlchemy's ``Session`` is
+    not bound to a single thread, it is only unsafe for two threads to use
+    it at once, so handing it to the worker and awaiting that call before
+    touching the session again is safe on its own terms -- this does not
+    depend on the SQLite-only engine options in ``models/database.py``
+    (``check_same_thread=False``, ``NullPool``); production runs a different
+    dialect through ``QueuePool``.
+
+    That does not by itself make the handoff safe against cancellation:
+    ``asyncio.to_thread`` does not stop the worker when the awaiting coroutine
+    is cancelled. A caller that hands this function a request-scoped session
+    (such as one ``get_db`` opened for that route) could have a client
+    disconnect trigger request cleanup and close that session while the
+    worker is still committing on it. This function has no such caller in
+    this repository today. Before wiring one in, route the call through
+    ``run_db_io_cancellation_safe`` instead and have the worker function open
+    and close its own session.
+
+    What remains here is the best-effort provider revocation, the one step that
+    genuinely needs to await. It needs no ORM access and holds no database
+    lock, and runs only after the commit above has released every lock.
+    """
+    user_id, revocations, builtin_oauth_revocations = await asyncio.to_thread(
+        _teardown_mcp_app_server_locally,
+        server_id,
+        app_id=app_id,
+        expected_provider_name=expected_provider_name,
+        expected_catalog_generation=expected_catalog_generation,
+        expected_association_generation=expected_association_generation,
+        current_user=current_user,
+        db=db,
+    )
+
     # No provider call may run until the local commit releases every lock.
     for revocation in revocations:
         try:
@@ -4663,6 +4998,14 @@ async def teardown_mcp_app_server(
                 "MCP OAuth token revocation failed after teardown for grant %s",
                 revocation.grant_id,
             )
+    if builtin_oauth_revocations:
+        from .auth import revoke_builtin_oauth_grants
+
+        await revoke_builtin_oauth_grants(
+            db,
+            builtin_oauth_revocations,
+            context=f"teardown for app {app_id!r}, server {server_id}",
+        )
     logger.info(
         "Completed app-scoped MCP teardown for app %r, server %s, user %s",
         app_id,
@@ -4739,7 +5082,18 @@ async def delete_mcp_server(
 
         from ..services.connector_team_scope import delete_team_connector
 
-        team_delete = delete_team_connector(db, int(user_id), "mcp", int(server_id))
+        team_delete = delete_team_connector(
+            db,
+            int(user_id),
+            "mcp",
+            int(server_id),
+            # Two row locks are already held here: _lock_active_mcp_oauth_lifecycle
+            # above takes them on ``mcp_servers`` and ``user_mcpservers`` before
+            # this call, and the same delete work follows as on the two locking
+            # delete call sites. Declaring keeps the three of them answering the
+            # same way.
+            caller_holds_lock=True,
+        )
         if team_delete.blocked_reason:
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
@@ -4752,6 +5106,7 @@ async def delete_mcp_server(
             )
 
         # If it's an OAuth server, also delete the corresponding OAuth tokens
+        builtin_oauth_revocations: "list[BuiltinOAuthRevocation]" = []
         if server.transport == "oauth":
             # Resolve by stable identity rather than by ``server.name``.
             # ``PublicMCPApp.name`` is mutable and carries no uniqueness
@@ -4778,9 +5133,14 @@ async def delete_mcp_server(
                 # disconnect any other app — Instagram — still relying on
                 # that shared grant.
                 providers_to_delete = restrict_to_app_scoped_oauth_grant(
-                    app_id, [provider, app_id]
+                    app_info, [provider, app_id]
                 )
                 if providers_to_delete:
+                    builtin_oauth_revocations.extend(
+                        _snapshot_builtin_oauth_revocations(
+                            db, user_id=int(user_id), providers=providers_to_delete
+                        )
+                    )
                     delete_scoped_user_oauth_accounts(
                         db,
                         user_id=int(user_id),
@@ -4807,14 +5167,19 @@ async def delete_mcp_server(
                         )
                         .all()
                     )
-                    normalized_provider = _normalize_app_key(provider)
+                    normalized_provider = normalize_catalog_key(provider)
                     sibling_still_connected = any(
                         (sibling_app := get_app_for_mcp_server(db, other_server))
-                        and _normalize_app_key(sibling_app.get("provider"))
+                        and normalize_catalog_key(sibling_app.get("provider"))
                         == normalized_provider
                         for other_server in other_servers
                     )
                     if not sibling_still_connected:
+                        builtin_oauth_revocations.extend(
+                            _snapshot_builtin_oauth_revocations(
+                                db, user_id=int(user_id), providers=[provider]
+                            )
+                        )
                         delete_scoped_user_oauth_accounts(
                             db,
                             user_id=int(user_id),
@@ -4887,6 +5252,15 @@ async def delete_mcp_server(
 
         for snapshot in grant_revocations:
             await _revoke_mcp_oauth_grant_snapshot_externally(snapshot)
+
+        if builtin_oauth_revocations:
+            from .auth import revoke_builtin_oauth_grants
+
+            await revoke_builtin_oauth_grants(
+                db,
+                builtin_oauth_revocations,
+                context=f"deleting MCP server {server_id}",
+            )
 
         if retained_team_server:
             logger.info(f"Kept shared MCP server '{server_name}' after team disconnect")
@@ -5035,6 +5409,10 @@ async def test_mcp_connection(
         connection.update(**test_data.config)
 
         try:
+            # No ``connector_refs``: this connection is not persisted yet, so
+            # there is no connector identity to carry. The tools built here
+            # are only projected to names/descriptions and never dispatched,
+            # so the approval gate is never consulted for them.
             connections_dict: Dict[str, Any] = {"test": connection}
             load_result = await load_mcp_tools_as_agent_tools(
                 connections_dict, name_prefix="test_"
@@ -5223,6 +5601,7 @@ async def get_mcp_server_tools(
         connection = runtime_build.connection
 
         # Try to load tools
+        from ...core.tools.adapters.vibe.connector_runtime import ConnectorRef
         from ...core.tools.adapters.vibe.mcp_adapter import (
             load_mcp_tools_as_agent_tools,
         )
@@ -5232,8 +5611,15 @@ async def get_mcp_server_tools(
         load_failures: tuple[dict[str, Any], ...] = ()
         if isinstance(server_name, str):
             connections_dict: Dict[str, Any] = {server_name: connection}
+            # This listing never dispatches a call, but it is still a place
+            # where MCP tools are materialized: carry the persisted server id
+            # so every materialization seam in the process is identifiable,
+            # rather than leaving one that would fail closed if it ever grew
+            # an execution path.
             load_result = await load_mcp_tools_as_agent_tools(
-                connections_dict, name_prefix=f"server_{server_id}_"
+                connections_dict,
+                connector_refs={server_name: ConnectorRef("mcp", int(server_id))},
+                name_prefix=f"server_{server_id}_",
             )
             projection = _project_mcp_tool_load_result(load_result)
             if not projection.tools:

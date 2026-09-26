@@ -17,6 +17,12 @@ from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.orm.state import InstanceState
 from sqlalchemy.pool import QueuePool
 
+from tests.web.pool_contention_shared import (
+    GUARD_TIMEOUT,
+    LOOP_LIVENESS_TICKS,
+    gated_pool_checkout,
+    wait_for_ticks,
+)
 from xagent.core.execution_scope import ExecutionScope
 from xagent.core.task_runtime import TaskRuntimeContext
 from xagent.core.tools.adapters.vibe.config import (
@@ -32,6 +38,7 @@ from xagent.core.tools.adapters.vibe.selection_spec import ToolSelectionSpec
 from xagent.web.models.mcp import MCPServer
 from xagent.web.models.tool_config import ToolConfig
 from xagent.web.models.user import User
+from xagent.web.services import agent_service_manager as agent_runtime_service
 from xagent.web.services.tool_credentials import (
     set_user_tool_allowlist_hook,
     set_user_tool_overrides_hook,
@@ -371,7 +378,7 @@ async def test_create_default_tools_uses_worker_session_factory_without_live_db(
     monkeypatch,
 ):
     """The chat bootstrap delegates all runtime preparation to ToolFactory."""
-    from xagent.web.api.chat import create_default_tools
+    from xagent.web.services.agent_service_manager import create_default_tools
 
     session_factory = object()
     captured: dict[str, object] = {}
@@ -421,7 +428,7 @@ async def test_build_tools_treats_non_mapping_policy_config_as_unmarked(
     monkeypatch,
     agent_config,
 ):
-    from xagent.web.api.chat import AgentServiceManager
+    from xagent.web.services.agent_service_manager import AgentServiceManager
 
     captured: dict[str, object] = {}
 
@@ -436,7 +443,7 @@ async def test_build_tools_treats_non_mapping_policy_config_as_unmarked(
         AsyncMock(return_value=None),
     )
     monkeypatch.setattr(
-        "xagent.web.api.chat.create_default_tools",
+        "xagent.web.services.agent_service_manager.create_default_tools",
         fake_create_default_tools,
     )
 
@@ -462,7 +469,7 @@ async def test_build_tools_treats_non_mapping_policy_config_as_unmarked(
 async def test_create_default_tools_preserves_legacy_positional_owner(
     monkeypatch,
 ):
-    from xagent.web.api.chat import create_default_tools
+    from xagent.web.services.agent_service_manager import create_default_tools
 
     captured: dict[str, object] = {}
 
@@ -499,8 +506,7 @@ async def test_create_default_tools_preserves_legacy_positional_owner(
 async def test_create_default_tools_skips_runtime_workspace_without_providers(
     monkeypatch,
 ):
-    import xagent.web.api.chat as chat_module
-    from xagent.web.api.chat import create_default_tools
+    from xagent.web.services.agent_service_manager import create_default_tools
 
     class _FakeToolConfig:
         def __init__(self, **kwargs):
@@ -525,8 +531,8 @@ async def test_create_default_tools_skips_runtime_workspace_without_providers(
     )
     monkeypatch.setattr(ToolFactory, "create_all_tools", create_tools)
     monkeypatch.setattr(ToolFactory, "create_workspace", unexpected_workspace)
-    monkeypatch.setattr(chat_module, "build_task_runtime", unexpected_runtime)
-    monkeypatch.setattr(chat_module, "registered_task_extensions", lambda: ())
+    monkeypatch.setattr(agent_runtime_service, "build_task_runtime", unexpected_runtime)
+    monkeypatch.setattr(agent_runtime_service, "registered_task_extensions", lambda: ())
 
     tools, config = await create_default_tools(
         None,
@@ -549,8 +555,7 @@ async def test_create_default_tools_degrades_when_runtime_provider_build_fails(
     monkeypatch,
     caplog,
 ):
-    import xagent.web.api.chat as chat_module
-    from xagent.web.api.chat import create_default_tools
+    from xagent.web.services.agent_service_manager import create_default_tools
     from xagent.web.services.task_runtime import TaskRuntimeExtensionError
 
     class _FakeToolConfig:
@@ -590,9 +595,9 @@ async def test_create_default_tools_degrades_when_runtime_provider_build_fails(
         "create_workspace",
         lambda _config: SimpleNamespace(id="workspace"),
     )
-    monkeypatch.setattr(chat_module, "build_task_runtime", fail_runtime)
+    monkeypatch.setattr(agent_runtime_service, "build_task_runtime", fail_runtime)
     monkeypatch.setattr(
-        chat_module,
+        agent_runtime_service,
         "registered_task_extensions",
         lambda: ("broken_runtime",),
     )
@@ -620,7 +625,6 @@ async def test_create_default_tools_isolates_runtime_tool_name_collision(
     monkeypatch,
     caplog,
 ):
-    import xagent.web.api.chat as chat_module
     from xagent.core.task_runtime import (
         TaskRuntimeContribution,
         merge_task_runtime_contributions,
@@ -628,7 +632,7 @@ async def test_create_default_tools_isolates_runtime_tool_name_collision(
     from xagent.core.tools.adapters.vibe.config import (
         ToolConfig as StandaloneToolConfig,
     )
-    from xagent.web.api.chat import create_default_tools
+    from xagent.web.services.agent_service_manager import create_default_tools
 
     core_tool = SimpleNamespace(
         name="computer",
@@ -689,9 +693,9 @@ async def test_create_default_tools_isolates_runtime_tool_name_collision(
         "create_workspace",
         lambda _config: SimpleNamespace(id="workspace"),
     )
-    monkeypatch.setattr(chat_module, "build_task_runtime", build_runtime)
+    monkeypatch.setattr(agent_runtime_service, "build_task_runtime", build_runtime)
     monkeypatch.setattr(
-        chat_module,
+        agent_runtime_service,
         "registered_task_extensions",
         lambda: ("desktop_runtime",),
     )
@@ -717,7 +721,7 @@ async def test_create_default_tools_isolates_runtime_tool_name_collision(
 @pytest.mark.asyncio
 async def test_create_default_tools_prefetches_excluded_agent_policy_once(monkeypatch):
     """The prefetched agent policy must include the excluded agent ID."""
-    from xagent.web.api.chat import create_default_tools
+    from xagent.web.services.agent_service_manager import create_default_tools
     from xagent.web.tools.config import _ToolFactoryRuntimeSnapshot
 
     plans = []
@@ -798,25 +802,29 @@ async def test_tool_factory_credential_prefetch_waits_off_event_loop(tmp_path):
     async def build_tools() -> list:
         return await ToolFactory.create_all_tools(cfg)
 
-    ticker_task = asyncio.create_task(ticker())
-    build_task = asyncio.create_task(build_tools())
-    try:
-        await asyncio.sleep(0.08)
-        assert ticks >= 4
-        assert not build_task.done()
+    with gated_pool_checkout(engine) as gate:
+        ticker_task = asyncio.create_task(ticker())
+        build_task = asyncio.create_task(build_tools())
+        try:
+            await gate.wait_until_contending()
+            observed = await wait_for_ticks(lambda: ticks)
+            assert observed >= LOOP_LIVENESS_TICKS
+            assert not build_task.done()
 
-        held_connection.close()
-        await build_task
-    finally:
-        if not held_connection.closed:
             held_connection.close()
-        if not build_task.done():
-            build_task.cancel()
+            gate.let_through()
+            await asyncio.wait_for(build_task, timeout=GUARD_TIMEOUT)
+        finally:
+            if not held_connection.closed:
+                held_connection.close()
+                gate.let_through()
+            if not build_task.done():
+                build_task.cancel()
             await asyncio.gather(build_task, return_exceptions=True)
-        stop.set()
-        await ticker_task
-        cfg.close()
-        engine.dispose()
+            stop.set()
+            await ticker_task
+            cfg.close()
+            engine.dispose()
 
 
 @pytest.mark.asyncio
@@ -2843,28 +2851,34 @@ async def test_runtime_policy_refresh_waits_for_pool_off_event_loop(tmp_path):
             ticks += 1
             await asyncio.sleep(0.01)
 
-    ticker_task = asyncio.create_task(ticker())
-    try:
-        await asyncio.sleep(0.02)
-        ticks_before_wait = ticks
-        refresh_task = asyncio.create_task(cfg.refresh_runtime_policy())
-        await asyncio.sleep(0.08)
-        assert ticks - ticks_before_wait >= 4
-        assert not refresh_task.done()
+    with gated_pool_checkout(engine) as gate:
+        ticker_task = asyncio.create_task(ticker())
+        try:
+            refresh_task = asyncio.create_task(cfg.refresh_runtime_policy())
+            await gate.wait_until_contending()
+            observed = await wait_for_ticks(lambda: ticks)
+            assert observed >= LOOP_LIVENESS_TICKS
+            assert not refresh_task.done()
 
-        held_connection.close()
-        await refresh_task
-        assert cfg.get_user_tool_overrides() == {"calculator": {"enabled": False}}
-        assert cfg.get_user_tool_allowlist() == ["file"]
-    finally:
-        if not held_connection.closed:
             held_connection.close()
-        stop.set()
-        await ticker_task
-        cfg.close()
-        set_user_tool_overrides_hook(None)
-        set_user_tool_allowlist_hook(None)
-        engine.dispose()
+            gate.let_through()
+            await asyncio.wait_for(refresh_task, timeout=GUARD_TIMEOUT)
+            assert cfg.get_user_tool_overrides() == {"calculator": {"enabled": False}}
+            assert cfg.get_user_tool_allowlist() == ["file"]
+        finally:
+            if not held_connection.closed:
+                held_connection.close()
+                gate.let_through()
+            await asyncio.wait_for(
+                asyncio.gather(refresh_task, return_exceptions=True),
+                timeout=GUARD_TIMEOUT,
+            )
+            stop.set()
+            await ticker_task
+            cfg.close()
+            set_user_tool_overrides_hook(None)
+            set_user_tool_allowlist_hook(None)
+            engine.dispose()
 
 
 def test_legacy_oauth_session_uses_engine_when_caller_is_connection_bound():

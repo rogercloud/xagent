@@ -25,20 +25,56 @@ class MCPBuiltinOAuthActorPolicyMismatchError(RuntimeError):
 
 
 @dataclass(frozen=True)
-class MCPBuiltinOAuthActorPolicy:
-    """Trusted actor owner namespace for builtin OAuth MCP execution.
+class MCPActorAuthorizationPolicy:
+    """Trusted actor identity and connector capabilities for MCP execution.
 
-    Server visibility and builtin classification remain xagent runtime
-    decisions. The caller supplies only the immutable credential owner.
+    Server visibility and catalog classification remain xagent runtime
+    decisions. The caller supplies only the immutable credential owner. The
+    owner governs builtin-provider OAuth, remote MCP OAuth, and explicitly
+    enabled actor-scoped stdio credentials. Stdio remains disabled by default
+    so existing OAuth-only callers retain their current behavior.
     """
 
     resource_owner_key: str = dataclass_field(repr=False)
+    allow_builtin_stdio: bool = False
 
     def __post_init__(self) -> None:
         owner_key = normalize_user_oauth_resource_owner_key(self.resource_owner_key)
         if owner_key is None:  # pragma: no cover - normalization preserves None only
             raise ValueError("resource_owner_key must not be null")
+        if type(self.allow_builtin_stdio) is not bool:
+            raise ValueError("allow_builtin_stdio must be a boolean")
         object.__setattr__(self, "resource_owner_key", owner_key)
+
+
+# Compatibility import for trusted callers deployed before actor-scoped stdio
+# support. Keep this as a direct alias so equality and isinstance semantics do
+# not diverge between old and new callers.
+MCPBuiltinOAuthActorPolicy = MCPActorAuthorizationPolicy
+
+
+@dataclass(frozen=True)
+class MCPActorExecutionIdentity:
+    """Exact task turn and lease acquisition that owns one actor execution."""
+
+    task_id: int
+    run_id: str
+    turn_id: str
+    lease_attempt_id: str
+
+    def __post_init__(self) -> None:
+        if (
+            isinstance(self.task_id, bool)
+            or not isinstance(self.task_id, int)
+            or self.task_id <= 0
+        ):
+            raise ValueError("actor execution identity requires a persisted task_id")
+        for field_name in ("run_id", "turn_id", "lease_attempt_id"):
+            value = getattr(self, field_name)
+            if not isinstance(value, str) or not value or value != value.strip():
+                raise ValueError(
+                    f"actor execution identity requires an exact {field_name}"
+                )
 
 
 @dataclass(frozen=True)
@@ -599,9 +635,46 @@ def _is_mcp_oauth_http_server(server: Any, auth_config: Any) -> bool:
     # Runtime classification of a *connected* server from its decrypted auth,
     # a different layer than the catalog auth_type (mcp_apps.classify_app_auth):
     # this also covers user-added custom HTTP servers that were never catalog
-    # entries, so it stays independent by design.
+    # entries, so it stays independent by design. Keep in sync with
+    # connector_auth_type() below: that function reports "mcp_oauth" for the
+    # same shape of ``auth`` this function treats as mcp_oauth (transport is
+    # not part of connector_auth_type's own check, since it only classifies
+    # the declared auth, not whether the transport is HTTP).
     return (
         getattr(server, "transport", None) in HTTP_MCP_TRANSPORTS
         and isinstance(auth_config, dict)
         and auth_config.get("type") == "mcp_oauth"
     )
+
+
+def connector_auth_type(server: Any) -> str | None:
+    """Return the connector's declared auth type without decrypting it.
+
+    ``"none"`` when the connector declares no authentication (``auth`` absent,
+    JSON null, an empty object, ``{"type": null}``, or an explicit
+    ``{"type": "none"}``); the declared ``type`` string otherwise; ``None``
+    when the shape is not recognisable (non-``dict`` ``auth``, or a ``type``
+    that is a non-string or the empty string). Callers must treat ``None`` as
+    unknown, not as "no credential".
+
+    ``"none"`` means only that the connector declares no ``auth`` JSON; it does
+    not mean the connector carries no credential, because static ``headers``
+    (e.g. ``Authorization``) are sent regardless and are not inspected here.
+
+    Reads the raw (encrypted-at-rest) ``auth`` JSON rather than the decrypted
+    form used by ``_is_mcp_oauth_http_server`` above: ``type`` is not one of
+    the sensitive fields encryption touches (see ``SENSITIVE_AUTH_FIELDS`` in
+    ``xagent.core.tools.core.mcp.model``), so no decryption is needed to
+    classify it.
+    """
+    auth = getattr(server, "auth", None)
+    if auth is None:
+        return "none"
+    if not isinstance(auth, dict):
+        return None
+    raw = auth.get("type")
+    if raw is None:
+        return "none"
+    if not isinstance(raw, str) or not raw:
+        return None
+    return raw

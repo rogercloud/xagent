@@ -40,6 +40,7 @@ from .task_execution_event_writer import (
     stage_chat_message_no_commit,
     stage_delivery_fact_no_commit,
 )
+from .task_retention import touch_task_last_activity
 
 logger = logging.getLogger(__name__)
 
@@ -47,6 +48,7 @@ DELIVERY_PENDING = "pending"
 DELIVERY_DISPATCHED = "dispatched"
 DELIVERY_COMPLETED = "completed"
 DELIVERY_FAILED = "failed"
+DELIVERY_OUTCOME_UNKNOWN = "outcome_unknown"
 
 QUESTION_MESSAGE_TYPE = "question"
 SUPERSEDED_MESSAGE_TYPE = "question_superseded"
@@ -96,6 +98,10 @@ class UserMessageDeliveryClaim:
     @property
     def failed(self) -> bool:
         return str(self.message.delivery_status) == DELIVERY_FAILED
+
+    @property
+    def outcome_unknown(self) -> bool:
+        return str(self.message.delivery_status) == DELIVERY_OUTCOME_UNKNOWN
 
     @property
     def pending(self) -> bool:
@@ -207,6 +213,7 @@ def claim_user_message_delivery(
         attachments=attachments,
     )
     message = stage_chat_message_no_commit(db, message)
+    touch_task_last_activity(db, task_id)
     try:
         db.commit()
         db.refresh(message)
@@ -262,6 +269,12 @@ def claim_user_message_delivery_no_commit(
         attachments=attachments,
     )
     message = stage_chat_message_no_commit(db, message)
+    # Before the insert, not after it: this is the one staging path that
+    # flushes, and touching afterwards would make it the only site to take
+    # the task row *after* writing task_chat_messages. Every other writer in
+    # the codebase takes the task row first, so the reversed order here would
+    # be a lock cycle waiting for two turns on one task to interleave.
+    touch_task_last_activity(db, task_id)
     db.flush()
     return UserMessageDeliveryClaim(
         message=message,
@@ -284,6 +297,7 @@ def mark_user_message_delivery(
         DELIVERY_DISPATCHED,
         DELIVERY_COMPLETED,
         DELIVERY_FAILED,
+        DELIVERY_OUTCOME_UNKNOWN,
     }:
         raise ValueError(f"Unknown delivery status: {status}")
     from .task_execution_event_store import lock_task_execution_events_no_commit
@@ -309,6 +323,7 @@ def mark_user_message_delivery(
             DELIVERY_DISPATCHED,
             DELIVERY_COMPLETED,
             DELIVERY_FAILED,
+            DELIVERY_OUTCOME_UNKNOWN,
         },
         DELIVERY_DISPATCHED: {DELIVERY_COMPLETED},
     }
@@ -660,6 +675,7 @@ def persist_user_message_no_commit(
         attachments=attachments,
     )
     message = stage_chat_message_no_commit(db, message)
+    touch_task_last_activity(db, task_id)
     return message
 
 
@@ -673,6 +689,7 @@ def persist_assistant_message(
     interactions: Optional[List[Dict[str, Any]]] = None,
     turn_id: Optional[str] = None,
     content_is_reconciled: bool = False,
+    source_event_id: Optional[str] = None,
 ) -> Optional[TaskChatMessage]:
     reconciled_content = (
         content
@@ -696,6 +713,7 @@ def persist_assistant_message(
         message_type=message_type,
         interactions=interactions,
         turn_id=turn_id,
+        source_event_id=source_event_id,
     )
 
 
@@ -709,6 +727,7 @@ def persist_assistant_message_no_commit(
     interactions: Optional[List[Dict[str, Any]]] = None,
     turn_id: Optional[str] = None,
     content_is_reconciled: bool = False,
+    source_event_id: Optional[str] = None,
 ) -> Optional[TaskChatMessage]:
     """Stage an assistant transcript row for an atomic caller-owned commit."""
 
@@ -737,8 +756,10 @@ def persist_assistant_message_no_commit(
         interactions=interactions,
         turn_id=turn_id,
         attachments=None,
+        source_event_id=source_event_id,
     )
     message = stage_chat_message_no_commit(db, message)
+    touch_task_last_activity(db, task_id)
     return message
 
 
@@ -1056,6 +1077,7 @@ def _persist_message(
     attachments: Optional[List[Dict[str, Any]]] = None,
     turn_id: Optional[str] = None,
     delivery_status: Optional[str] = None,
+    source_event_id: Optional[str] = None,
 ) -> Optional[TaskChatMessage]:
     normalized_content = content.strip()
     if not normalized_content and not attachments:
@@ -1070,11 +1092,13 @@ def _persist_message(
         interactions=interactions,
         turn_id=turn_id,
         delivery_status=delivery_status,
+        source_event_id=source_event_id,
         # Pass through ``attachments`` directly so an explicit empty list
         # round-trips as ``[]`` rather than being coerced to ``NULL``.
         attachments=attachments,
     )
     message = stage_chat_message_no_commit(db, message)
+    touch_task_last_activity(db, task_id)
     db.commit()
     db.refresh(message)
     return message

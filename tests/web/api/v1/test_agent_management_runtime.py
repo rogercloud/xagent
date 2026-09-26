@@ -11,6 +11,12 @@ import pytest
 from sqlalchemy import event, text
 from sqlalchemy.orm import Session
 
+from tests.web.pool_contention_shared import (
+    CONTENTION_POOL_TIMEOUT,
+    GUARD_TIMEOUT,
+    assert_pool_checkout_off_loop,
+    gated_pool_checkout,
+)
 from xagent.web.models.agent import Agent
 from xagent.web.models.agent_api_key import AgentApiKey
 from xagent.web.models.user import User
@@ -41,15 +47,12 @@ pytestmark = pytest.mark.usefixtures("_test_db")
 # one test instead of hanging the suite, so it is sized for the worst CI
 # machine rather than for the expected one.
 #
-# It has to be generous because the code these handshakes straddle is
-# deliberately expensive. Runtime-key delivery hashes with bcrypt at
-# ``BCRYPT_COST`` 12 -- ~100ms per draw on idle commodity hardware, up to
-# ``PREFIX_COLLISION_RETRIES`` draws -- and then commits. CI runs this suite
-# as ``pytest -n 4`` on a 4-vCPU runner that is simultaneously driving a
-# Docker daemon, so the 2s budget these waits used to carry (~9x headroom on
-# an idle workstation) was routinely missed there. Oversubscribing an
-# 18-core machine ~8x reproduces the exact CI failures: ``assert False`` on a
-# handshake wait, ``TimeoutError`` on a settlement wait.
+# It has to be generous because CI runs this suite as ``pytest -n 4`` on a
+# 4-vCPU runner that is simultaneously driving a Docker daemon and contended
+# database transactions. The 2s budget these waits used to carry was routinely
+# missed there. Oversubscribing an 18-core machine ~8x reproduces the exact CI
+# failures: ``assert False`` on a handshake wait, ``TimeoutError`` on a
+# settlement wait.
 _HANDSHAKE_TIMEOUT = 30.0
 
 # Deliberately short, and deliberately not the constant above: this probe
@@ -106,7 +109,7 @@ async def _cancel_after_runtime_key_commit(
 async def test_create_and_rotate_hash_without_holding_pool_connection(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """bcrypt is worker-owned and runs before either write transaction opens."""
+    """Key hashing is worker-owned and precedes either write transaction."""
 
     from xagent.core.utils import api_key
 
@@ -115,23 +118,23 @@ async def test_create_and_rotate_hash_without_holding_pool_connection(
     event_loop_thread = threading.get_ident()
     hash_observations: list[tuple[int, int]] = []
     sql_threads: list[int] = []
-    original_hashpw = api_key.bcrypt.hashpw
+    original_hash_api_key = api_key.hash_api_key
 
     @event.listens_for(engine, "before_cursor_execute")
     def record_sql_thread(*_args) -> None:  # type: ignore[no-untyped-def]
         sql_threads.append(threading.get_ident())
 
-    def recording_hashpw(*args, **kwargs):  # type: ignore[no-untyped-def]
+    def recording_hash_api_key(*args, **kwargs):  # type: ignore[no-untyped-def]
         hash_observations.append((threading.get_ident(), engine.pool.checkedout()))
-        return original_hashpw(*args, **kwargs)
+        return original_hash_api_key(*args, **kwargs)
 
-    monkeypatch.setattr(api_key.bcrypt, "hashpw", recording_hashpw)
+    monkeypatch.setattr(api_key, "hash_api_key", recording_hash_api_key)
     runtime = AgentManagementRuntime()
 
     created = await runtime.create_agent(
         user_id=user_id,
         is_admin=is_admin,
-        spec=_create_spec("bcrypt boundary"),
+        spec=_create_spec("hash boundary"),
     )
     rotated = await runtime.rotate_agent_runtime_key(
         user_id=user_id,
@@ -152,28 +155,25 @@ async def test_list_pool_wait_does_not_block_event_loop(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     user_id, _is_admin = _admin_identity()
-    engine = _install_one_slot_queue_pool(monkeypatch, pool_timeout=0.5)
+    engine = _install_one_slot_queue_pool(
+        monkeypatch, pool_timeout=CONTENTION_POOL_TIMEOUT
+    )
     held_connection = engine.connect()
     runtime = AgentManagementRuntime()
-    listing = asyncio.create_task(runtime.list_agents(user_id=user_id))
-
-    ticks = 0
-
-    async def ticker() -> None:
-        nonlocal ticks
-        for _ in range(4):
-            await asyncio.sleep(0.01)
-            ticks += 1
-
     try:
-        await ticker()
-        assert ticks == 4
-        assert listing.done() is False
+        with gated_pool_checkout(engine) as gate:
+            listing = asyncio.create_task(runtime.list_agents(user_id=user_id))
+            try:
+                await gate.wait_until_contending()
+                assert not listing.done()
+            finally:
+                held_connection.close()
+                gate.let_through()
+                result = await asyncio.wait_for(listing, timeout=GUARD_TIMEOUT)
+        assert result == ()
     finally:
         held_connection.close()
-
-    assert await listing == ()
-    engine.dispose()
+        engine.dispose()
 
 
 @pytest.mark.asyncio
@@ -1178,7 +1178,9 @@ async def test_compensation_keeps_the_event_loop_responsive_while_pool_is_held(
     from xagent.web.services import agent_management
 
     user_id, is_admin = _admin_identity()
-    engine = _install_one_slot_queue_pool(monkeypatch, pool_timeout=2)
+    engine = _install_one_slot_queue_pool(
+        monkeypatch, pool_timeout=CONTENTION_POOL_TIMEOUT
+    )
     committed = threading.Event()
     release = threading.Event()
     original_create = (
@@ -1205,22 +1207,25 @@ async def test_compensation_keeps_the_event_loop_responsive_while_pool_is_held(
     )
     assert await asyncio.to_thread(committed.wait, _HANDSHAKE_TIMEOUT)
     held_connection = engine.connect()
-    operation.cancel()
-    release.set()
     try:
-        ticks = 0
-        for _ in range(4):
-            await asyncio.sleep(0.01)
-            ticks += 1
-        assert ticks == 4
-        assert operation.done() is False
+        # Cancellation may swallow a worker failure. Assert the checkout's
+        # thread outside the worker as well as observing the parked operation.
+        with assert_pool_checkout_off_loop(engine), gated_pool_checkout(engine) as gate:
+            operation.cancel()
+            release.set()
+            try:
+                await gate.wait_until_contending()
+                assert not operation.done()
+            finally:
+                held_connection.close()
+                gate.let_through()
+                with pytest.raises(asyncio.CancelledError):
+                    await asyncio.wait_for(operation, timeout=_HANDSHAKE_TIMEOUT)
     finally:
+        release.set()
         held_connection.close()
-
-    with pytest.raises(asyncio.CancelledError):
-        await asyncio.wait_for(operation, timeout=_HANDSHAKE_TIMEOUT)
-    assert engine.pool.checkedout() == 0
-    engine.dispose()
+        assert engine.pool.checkedout() == 0
+        engine.dispose()
 
 
 @pytest.mark.asyncio

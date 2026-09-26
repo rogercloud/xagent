@@ -16,7 +16,7 @@ from xagent.web.tracing import create_ephemeral_tracer, create_task_tracer
 
 @pytest.fixture(autouse=True)
 def legacy_task_selection(monkeypatch):
-    from xagent.web.api.trace_handlers import DatabaseTraceHandler
+    from xagent.web.services.trace_handlers import DatabaseTraceHandler
 
     monkeypatch.setattr(
         "xagent.web.tracing.task_database_handler", DatabaseTraceHandler
@@ -34,7 +34,7 @@ def test_create_task_tracer_without_langfuse(langfuse_client_reset):
     assert handler_names == [
         "ConsoleTraceHandler",
         "DatabaseTraceHandler",
-        "WebSocketTraceHandler",
+        "TaskEventTraceHandler",
     ]
 
 

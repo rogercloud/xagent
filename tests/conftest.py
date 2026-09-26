@@ -62,6 +62,17 @@ else:
     print("Warning: Neither .env nor example.env file found")
 
 
+@pytest.fixture(autouse=True)
+def local_execution_unless_selected(monkeypatch):
+    """Existing suites select local execution; shared suites opt in explicitly."""
+    # A reachable CI Redis must not silently enable shared caches or rate limits.
+    # Tests that exercise Redis opt in explicitly after this fixture.
+    monkeypatch.delenv("XAGENT_REDIS_URL", raising=False)
+    monkeypatch.setenv("XAGENT_SHARED_TASK_EXECUTION_ENABLED", "false")
+    monkeypatch.setenv("XAGENT_TASK_EXECUTION_ROLE", "combined")
+    monkeypatch.delenv("XAGENT_CHANNEL_INGRESS_ENABLED", raising=False)
+
+
 def pytest_addoption(parser):
     parser.addoption(
         "--run-special",
@@ -301,6 +312,28 @@ def isolate_proxy_env(monkeypatch: pytest.MonkeyPatch) -> None:
         "HTTPS_PROXY",
         "https_proxy",
         "XAGENT_TRUSTED_EGRESS_PROXY",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+
+@pytest.fixture(autouse=True, scope="function")
+def isolate_meta_config_id_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Clear ambient Meta Login Configuration env vars for the same reason as
+    isolate_proxy_env above: a developer's real .env can carry META_CONFIG_ID
+    or one of the per-app overrides (META_FACEBOOK_CONFIG_ID /
+    META_INSTAGRAM_CONFIG_ID / META_ADS_CONFIG_ID / META_WHATSAPP_CONFIG_ID --
+    exactly what example.env now documents setting), and without this an
+    otherwise unrelated test exercising the Meta OAuth authorize flow would
+    silently pick up that ambient value instead of the one it explicitly
+    sets/expects. Tests exercising config_id behavior already opt in with
+    ``monkeypatch.setenv(...)`` for the exact var(s) they need.
+    """
+    for name in (
+        "META_CONFIG_ID",
+        "META_FACEBOOK_CONFIG_ID",
+        "META_INSTAGRAM_CONFIG_ID",
+        "META_ADS_CONFIG_ID",
+        "META_WHATSAPP_CONFIG_ID",
     ):
         monkeypatch.delenv(name, raising=False)
 

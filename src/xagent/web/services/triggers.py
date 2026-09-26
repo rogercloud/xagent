@@ -610,6 +610,10 @@ def _resolve_gmail_resource(
         raise TriggerServiceError("Gmail account not found")
     if not is_ordinary_gmail(account):
         raise TriggerServiceError("Selected account is not a Gmail account")
+    if not account.access_token:
+        raise TriggerServiceError(
+            "Gmail OAuth credentials are unavailable; reconnect required"
+        )
     email = str(account.email or "").strip().lower()
     if not email:
         raise TriggerServiceError("Gmail account has no email address")
@@ -1844,12 +1848,21 @@ def _mark_trigger_run_running_if_task_running(run_id: int, task_id: int) -> bool
         db.close()
 
 
-def _finish_trigger_run_after_task(start: _PreparedTriggerStart) -> None:
+def _finish_trigger_run_after_task(
+    start: _PreparedTriggerStart,
+    expected_task_run_id: str | None = None,
+) -> None:
     db = _with_session()
     try:
         task = db.query(Task).filter(Task.id == start.task_id).first()
         run = db.query(TriggerRun).filter(TriggerRun.id == start.run_id).first()
-        if task is None or run is None:
+        if (
+            task is None
+            or run is None
+            or (
+                expected_task_run_id is not None and task.run_id != expected_task_run_id
+            )
+        ):
             return
         if task.status == TaskStatus.COMPLETED:
             setattr(run, "status", TriggerRunStatus.COMPLETED.value)
@@ -1857,6 +1870,17 @@ def _finish_trigger_run_after_task(start: _PreparedTriggerStart) -> None:
         elif task.status == TaskStatus.FAILED:
             setattr(run, "status", TriggerRunStatus.FAILED.value)
             setattr(run, "error_message", task.error_message)
+        else:
+            # The task is not terminal yet (pending/running/paused/
+            # waiting_for_user). Leave the run untouched. If the task later
+            # terminates (or lease recovery reclaims a crashed RUNNING
+            # lease), sync_trigger_run_status finalizes the run; a task
+            # parked at PAUSED/WAITING_FOR_USER that never resumes leaves
+            # the run at "running" indefinitely (#2177). Stamping
+            # finished_at here would instead strand the run as "running"
+            # with a finish timestamp, because this finalizer only runs
+            # once.
+            return
         setattr(run, "finished_at", _now())
         db.add(run)
         db.commit()
@@ -1932,9 +1956,18 @@ async def _start_prepared_trigger_run_id(
     except Exception:
         logger.debug("Trigger quota record failed", exc_info=True)
 
-    if wait_for_completion and asyncio.isfuture(started.background_task):
-        await started.background_task
-        await asyncio.to_thread(_finish_trigger_run_after_task, start)
+    if wait_for_completion:
+        if started.background_task is None:
+            from .task_completion import TaskRunChanged, wait_for_task_run
+
+            try:
+                await wait_for_task_run(started.task_id, started.run_id)
+            except TaskRunChanged:
+                logger.info("Trigger run %s task execution was replaced", start.run_id)
+                return False
+        elif asyncio.isfuture(started.background_task):
+            await started.background_task
+        await asyncio.to_thread(_finish_trigger_run_after_task, start, started.run_id)
 
     return True
 

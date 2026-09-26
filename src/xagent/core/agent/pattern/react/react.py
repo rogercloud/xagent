@@ -32,9 +32,12 @@ flag never changes observable results, only latency:
   A batch that arrives here from a fresh LLM response carries no final_answer
   alongside a work tool: response normalization removes it first, because its
   answer text was written before those tools ran. That holds for fresh
-  responses only - pending_tool_calls restored from a checkpoint are replayed
-  without re-normalization, so a batch written by an earlier build can still
-  reach this loop carrying one, and takes the branches above unchanged.
+  responses only - pending_tool_calls restored from an interrupt checkpoint
+  are replayed without re-normalization, so a batch written by an earlier
+  build can still reach this loop carrying one, and takes the branches above
+  unchanged. A waiting_for_user resume is the exception: it cancels any
+  restored pending calls before the loop (legacy pre-#2216 checkpoints), so
+  the resumed turn replans instead of replaying.
 - I5 (interrupt / resume): an interrupt during a concurrent batch preserves
   calls that already completed and leaves only interrupted calls pending. A
   cancelled call may still have committed externally before cancellation was
@@ -60,29 +63,52 @@ import logging
 from dataclasses import dataclass, replace
 from datetime import timezone
 from enum import Enum
-from typing import Any, cast
+from typing import Any, Callable, cast
 from uuid import uuid4
 
+from ....context_ref import CONTEXT_REFS_KEY, SUPERSEDES_SCOPE_KEY
 from ....file_ref import (
     WORKSPACE_OUTPUT_FILES_TOOL_NAME,
     final_deliverable_file_reference_instructions,
 )
 from ....model.chat.exceptions import LLMToolProtocolError
 from ....model.chat.tool_protocol import get_tool_protocol_error
-from ....tools.adapters.vibe.interaction_types import INTERACTION_TYPES
+from ....tools.adapters.vibe.interaction_types import (
+    DEFAULT_WAITING_INTERACTION,
+    DEGRADED_FIELDS_NOTE,
+    INTERACTION_TYPE_ALIASES,
+    INTERACTION_TYPES,
+    OPTIONS_REQUIRED_GUIDANCE,
+    degrade_options_less_pickers,
+    lacks_required_options,
+)
+from ....tools.adapters.vibe.mcp_approval_gate import (
+    ToolCallExecutionContext,
+    bind_tool_call_execution_context,
+)
+from ....tools.tool_result_spill import SPILL_RESERVED_RESULT_KEY
 from ....tools.user_interaction import (
+    ToolInteractionSettlement,
     tool_result_waits_for_user,
     user_interaction_resume_callable,
 )
+from ...checkpoint import CheckpointPersistenceError, ExecutionEventPersistenceError
 from ...clarification import draft_from_waiting_request
 from ...context.enrichment import (
     IMAGE_EDIT_UNAVAILABLE_METADATA_KEY,
     enrich_context_with_memory,
     latest_user_text,
+    pending_user_response_lifecycle,
+    pending_user_response_marker,
+)
+from ...context.execution import (
+    note_compaction_evidence_loss,
+    snapshot_container,
+    tool_evidence_state,
 )
 from ...context.memory_tool import build_memory_tools
 from ...context.skill_tool import build_load_skill_tool
-from ...grounding import grounding_rule
+from ...grounding import evidence_facts, grounding_rule
 from ...language import final_answer_language_rule
 from ...result import (
     CONTROL_TOOL_NAMES,
@@ -104,9 +130,20 @@ from ...runtime import (
     prepare_llm_for_context,
     resolved_llm_metadata,
 )
-from ...trace import ExecutionEventPersistenceError
-from ..base import AgentPattern, PatternResult, truncate_prompt_preview
+from ...trace import TraceAction, TraceCategory, TraceEventType, TraceScope
+from ..base import (
+    AgentPattern,
+    PatternResult,
+    append_user_message_preserving_turns,
+    truncate_prompt_preview,
+)
 from ..final_answer_stream import ReActFinalAnswerStreamer
+from ..partial_delivery import request_partial_delivery
+from .duplicate_write_guard import (
+    DUPLICATE_WRITE_SUPPRESSED_KEY,
+    build_suppression_envelope,
+    tool_requires_duplicate_write_guard,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -131,14 +168,26 @@ UNGROUPED_TOOL_DECISION_CATEGORIES = frozenset({"basic", "other"})
 # module's untrusted-input logging: bounded length, escaped, never raw.
 STRIP_LOG_MAX_TOOL_NAMES = 8
 STRIP_LOG_MAX_TOOL_NAME_CHARS = 64
+# One best-effort delivery turn after the work budget, never another work loop.
+ITERATION_LIMIT_DELIVERY_TIMEOUT_SECONDS = 30.0
 REACT_RESPONSE_LANGUAGE_DESCRIPTION = (
     "Target natural language for user-facing prose in this ReAct response, "
     "for example English, Simplified Chinese, Traditional Chinese, or Spanish. "
-    "For Chinese requests, choose Simplified Chinese or Traditional Chinese to "
-    "match the request script; do not use generic Chinese. If the current user "
-    "request explicitly asks to answer in another language, use that requested "
-    "target language."
+    "Follow the canonical request-language policy in the system context; do not "
+    "collapse Chinese variants into generic Chinese."
 )
+# Settlement outcomes whose write must not be retried by the model: a denial
+# ("rejected") and a possibly-executed dispatch ("dispatch_unknown"). Both
+# raise the settlement final-answer fence and both enroll their ledger record
+# in the turn-scoped duplicate-write guard. "failed" is excluded on purpose:
+# it means the write provably did not happen, so a retry is legitimate.
+_GUARDED_SETTLEMENT_STATUSES = frozenset({"rejected", "dispatch_unknown"})
+# Every terminal settlement status, i.e. the ones whose ledger record carries a
+# settlement_turn_id that the duplicate-write guard keys on.
+_SETTLED_SETTLEMENT_STATUSES = frozenset({"succeeded"}) | _GUARDED_SETTLEMENT_STATUSES
+# Ledger ``status`` values that mean the row already reached a terminal
+# outcome, so re-delivering a response for it is an idempotent replay.
+_SETTLED_ROW_STATUSES = frozenset({"completed", "failed"})
 
 
 @dataclass
@@ -152,6 +201,21 @@ class ToolCallRecord:
     status: str
     result: Any = None
     error: str | None = None
+    # Terminal outcome supplied by a resumable tool callback. Kept separate
+    # from ``status`` so existing completed/failed ledger readers remain
+    # backward-compatible.
+    settlement_status: str | None = None
+    # The durable turn the call ran in (see _with_runtime_turn_id). None when
+    # the embedding provides no turn tracking, and for records restored from
+    # checkpoints written before the field existed.
+    turn_id: str | None = None
+    # The turn that delivered a terminal settlement. This is separate from
+    # ``turn_id`` so the original call keeps its execution identity while the
+    # duplicate-write guard can protect the one resumed turn that follows it.
+    settlement_turn_id: str | None = None
+    # The ReAct step that issued the call. Persisted so a rebuilt runtime can
+    # resume the exact gate identity instead of inventing a new execution slot.
+    step_id: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -162,6 +226,10 @@ class ToolCallRecord:
             "status": self.status,
             "result": self.result,
             "error": self.error,
+            "settlement_status": self.settlement_status,
+            "turn_id": self.turn_id,
+            "settlement_turn_id": self.settlement_turn_id,
+            "step_id": self.step_id,
         }
 
     @classmethod
@@ -174,6 +242,18 @@ class ToolCallRecord:
             status=str(data.get("status", "pending")),
             result=data.get("result"),
             error=data.get("error"),
+            settlement_status=(
+                str(data["settlement_status"])
+                if data.get("settlement_status") is not None
+                else None
+            ),
+            turn_id=str(data["turn_id"]) if data.get("turn_id") else None,
+            settlement_turn_id=(
+                str(data["settlement_turn_id"])
+                if data.get("settlement_turn_id") is not None
+                else None
+            ),
+            step_id=str(data["step_id"]) if data.get("step_id") else None,
         )
 
 
@@ -246,8 +326,10 @@ def _normalize_ask_user_interactions(interactions: Any) -> list[dict[str, Any]]:
     treated the same as missing: the option is dropped. A field name that is
     blank after normalization falls back to ``response_{index}``; a
     well-formed field name is normalized and written back so the frontend's
-    own ``trim()`` is a no-op on it. Survivors are otherwise kept verbatim --
-    only blankness is judged here, not content.
+    own ``trim()`` is a no-op on it. A ``type`` listed in
+    ``INTERACTION_TYPE_ALIASES`` is rewritten to the canonical name the
+    frontend maps it to; any other off-contract ``type`` is left verbatim.
+    Survivors are otherwise kept verbatim.
 
     The alias chain ``field or id or name`` intentionally keeps its raw
     truthiness check; it is not normalization-aware. The frontend's own
@@ -288,6 +370,9 @@ def _normalize_ask_user_interactions(interactions: Any) -> list[dict[str, Any]]:
             continue
 
         item = dict(interaction)
+        item_type = item.get("type")
+        if isinstance(item_type, str) and item_type in INTERACTION_TYPE_ALIASES:
+            item["type"] = INTERACTION_TYPE_ALIASES[item_type]
         field = item.get("field") or item.get("id") or item.get("name")
         normalized_field = (
             _normalize_interaction_text(field) if isinstance(field, str) else ""
@@ -398,6 +483,51 @@ def _normalize_ask_user_interactions(interactions: Any) -> list[dict[str, Any]]:
     return normalized
 
 
+def _unique_field(base_field: str, used_fields: set[str]) -> str:
+    """Suffix ``_2``/``_3``... until unused, record it, and return it."""
+
+    field = base_field
+    suffix = 2
+    while field in used_fields:
+        field = f"{base_field}_{suffix}"
+        suffix += 1
+    used_fields.add(field)
+    return field
+
+
+def _is_answerable(interaction: Any) -> bool:
+    """Whether a user handed this control could produce an answer with it.
+
+    A type outside ``INTERACTION_TYPES`` is dropped by the frontend's
+    ``normalizeInteractions``; ``connect_apps`` is the one it keeps and still
+    cannot answer, because a form whose fields are all widgets renders no
+    Submit button (``isConnectAppsOnly``, clarification-form.tsx). A picker
+    with no options survives ``_normalize_ask_user_interactions`` (which drops
+    the blank options, not the interaction) as a control with nothing to pick;
+    both publishing call sites degrade such a picker to a ``text_input``
+    (``degrade_options_less_pickers``) before the list reaches
+    ``_send_waiting_message``, so that branch fires here only for a caller
+    that skips that step. Aliases are not a third case: normalization has
+    already mapped them onto these seven. Two gaps stay open, both under the
+    embedded widget's default ``filesDisabled``: a ``file_upload`` renders
+    nothing, and an ``action_cards`` whose options are all file actions
+    renders no cards (``visibleOptions``, clarification-form.tsx).
+    """
+
+    if not isinstance(interaction, dict):
+        return False
+    interaction_type = interaction.get("type")
+    # The model is free to send an unhashable ``type`` (a list). Refused here
+    # rather than left to the membership test, which only tolerates one
+    # because ``INTERACTION_TYPES`` is a tuple -- as a set it would raise
+    # ``TypeError`` and take the whole run down.
+    if not isinstance(interaction_type, str):
+        return False
+    if interaction_type not in INTERACTION_TYPES:
+        return False
+    return not lacks_required_options(interaction)
+
+
 class ReActPattern(AgentPattern):
     """Minimal ReAct loop for the execution runtime."""
 
@@ -440,11 +570,16 @@ class ReActPattern(AgentPattern):
         )
         self.status = "idle"
         self.current_iteration = 0
+        self.iteration_limit_delivery_attempted = False
         self.last_response: Any = None
         self.pending_tool_calls: list[dict[str, Any]] = []
         self.pending_tool_call_content: dict[str, str] = {}
         self.tool_ledger: dict[str, ToolCallRecord] = {}
         self.force_final_answer_next = False
+        # See _settlement_fence_active: a one-way latch for the single turn
+        # that received a rejected / dispatch-unknown settlement.
+        self.settlement_final_answer_fence = False
+        self.settlement_fence_turn_id: str | None = None
         self.repeated_tool_decision: dict[str, Any] | None = None
         self.waiting_for_user_request: dict[str, Any] | None = None
         self.pending_tool_interaction_responses: list[dict[str, str]] = []
@@ -477,11 +612,21 @@ class ReActPattern(AgentPattern):
             ).to_dict()
 
         await runtime.on_pattern_start(context=context, pattern=self)
-        waiting_result = await self._resume_waiting_for_user_if_needed(
-            context=context,
-            runtime=runtime,
-            tools=tools,
-        )
+        try:
+            waiting_result = await self._resume_waiting_for_user_if_needed(
+                context=context,
+                runtime=runtime,
+                tools=tools,
+            )
+        except CheckpointPersistenceError as exc:
+            # This runs before the main try/except below, so without this
+            # handler a durability failure while checkpointing the received
+            # user response (see ``_resume_waiting_for_user_if_needed``'s
+            # ``"tool_interaction_response_received"`` checkpoint) would
+            # propagate straight past ``on_pattern_error``: no terminal
+            # ``trace_error`` would be recorded, even though the run aborts.
+            await runtime.on_pattern_error(context=context, pattern=self, error=exc)
+            raise
         if waiting_result is not None:
             await runtime.on_pattern_end(
                 context=context,
@@ -645,10 +790,15 @@ class ReActPattern(AgentPattern):
                 if decision_result is not None:
                     return decision_result
 
-            force_final_answer_now = self.force_final_answer_next or (
-                self.finalize_after_tool_result
-                and not self.pending_tool_calls
-                and self._latest_tool_result_success(context)
+            settlement_fence = self._settlement_fence_active(runtime)
+            force_final_answer_now = (
+                self.force_final_answer_next
+                or settlement_fence
+                or (
+                    self.finalize_after_tool_result
+                    and not self.pending_tool_calls
+                    and self._latest_tool_result_success(context)
+                )
             )
             tool_schemas = (
                 [self._final_answer_tool_schema()]
@@ -678,25 +828,55 @@ class ReActPattern(AgentPattern):
                 "iteration": iteration,
                 **resolved_llm_metadata(call_llm),
             }
-            await runtime.compact_context_if_needed(
-                context=context,
-                # Fall back to the main model when no compact model is
-                # configured. PatternRuntime skips summarization entirely
-                # without one and drops all but the last few messages
-                # instead, losing what the agent actually did; agent preview
-                # and delegated sub-agents resolve the compact slot on their
-                # own and validate only the default model, so an empty slot
-                # is ordinary rather than exceptional.
-                #
-                # Substituting here, rather than defaulting the field further
-                # up, keeps "unset" distinguishable from "explicitly set to
-                # the main model" -- and hands compaction the *resolved*
-                # per-call model, so a virtual model reuses this turn's
-                # routing decision instead of routing again on the compaction
-                # prompt, whose only user message is the whole transcript.
-                llm=compact_llm if compact_llm is not None else call_llm,
-                metadata={"iteration": iteration},
-            )
+            # A forced turn's schema is already down to final_answer alone,
+            # so compacting here deletes the values it must answer from and
+            # closes the only route back to them in the same breath. Every
+            # other turn still holds its tools and can fetch a compacted-away
+            # value again. The cost is deliberate: this turn can now exceed
+            # the model's window and fail instead of answering.
+            if force_final_answer_now:
+                # Measures the one new failure mode this change introduces,
+                # so it carries no switch. Numbers and ids only -- never
+                # message text, a tool name, or a tool argument. The estimate
+                # counts what this turn actually sends -- the same messages
+                # and the one tool schema handed to the call below -- so it is
+                # comparable with the threshold logged beside it.
+                context_tokens = context.estimate_context_tokens(
+                    route_messages, tool_schemas
+                )
+                threshold = context.compact_config.threshold
+                logger.info(
+                    "Forced-answer turn did not compact. execution_id=%s "
+                    "iteration=%s context_tokens=%s threshold=%s "
+                    "over_threshold=%s",
+                    context.execution_id,
+                    iteration,
+                    context_tokens,
+                    threshold,
+                    context_tokens > threshold,
+                )
+            else:
+                compact_result = await runtime.compact_context_if_needed(
+                    context=context,
+                    # Fall back to the main model when no compact model is
+                    # configured. PatternRuntime skips summarization entirely
+                    # without one and drops all but the last few messages
+                    # instead, losing what the agent actually did; agent
+                    # preview and delegated sub-agents resolve the compact
+                    # slot on their own and validate only the default model,
+                    # so an empty slot is ordinary rather than exceptional.
+                    #
+                    # Substituting here, rather than defaulting the field
+                    # further up, keeps "unset" distinguishable from
+                    # "explicitly set to the main model" -- and hands
+                    # compaction the *resolved* per-call model, so a virtual
+                    # model reuses this turn's routing decision instead of
+                    # routing again on the compaction prompt, whose only user
+                    # message is the whole transcript.
+                    llm=compact_llm if compact_llm is not None else call_llm,
+                    metadata={"iteration": iteration},
+                )
+                note_compaction_evidence_loss(context, compact_result)
 
             messages = self._messages_for_llm(
                 context,
@@ -765,6 +945,13 @@ class ReActPattern(AgentPattern):
                     },
                 )
                 try:
+                    # The settlement fence outranks unavailable-tool recovery:
+                    # restoring the full tool set here is exactly the hole that
+                    # would let a denied write be retried inside the resumed
+                    # turn, so the fence keeps the narrowed schema.
+                    restore_full_tool_set = (
+                        unavailable_tool_call and not settlement_fence
+                    )
                     (
                         response,
                         answer_streamer,
@@ -775,9 +962,13 @@ class ReActPattern(AgentPattern):
                         iteration=iteration,
                         tool_schemas=base_tool_schemas,
                         force_final_answer=(
-                            force_final_answer_now and not unavailable_tool_call
+                            force_final_answer_now and not restore_full_tool_set
                         ),
-                        recovery_reason=exc.code,
+                        recovery_reason=(
+                            "settlement_final_answer_required"
+                            if unavailable_tool_call and settlement_fence
+                            else exc.code
+                        ),
                     )
                 except LLMCallInterrupted:
                     interrupted = await self._interrupt_if_requested(
@@ -788,7 +979,7 @@ class ReActPattern(AgentPattern):
                     if interrupted is not None:
                         return interrupted
                     raise
-                if unavailable_tool_call:
+                if restore_full_tool_set:
                     self.force_final_answer_next = False
                     force_final_answer_now = False
                 protocol_retry_performed = True
@@ -839,9 +1030,14 @@ class ReActPattern(AgentPattern):
                 # prose invites it to treat that text as already committed. The cost
                 # is that a model which keeps emitting "preamble + empty answer"
                 # fails the run without the user seeing the preamble.
-                recover_full_tool_set = self._requires_full_tool_set_recovery(
-                    normalized,
-                    force_final_answer=force_final_answer_now,
+                # As in the exception path above, the settlement fence wins:
+                # a fenced turn never gets its work tools back.
+                recover_full_tool_set = (
+                    not settlement_fence
+                    and self._requires_full_tool_set_recovery(
+                        normalized,
+                        force_final_answer=force_final_answer_now,
+                    )
                 )
                 empty_final_answer = self._empty_final_answer_call(normalized)
                 if empty_final_answer is not None:
@@ -855,6 +1051,8 @@ class ReActPattern(AgentPattern):
                     recovery_reason: str | None = "unavailable_tool_call"
                 elif empty_final_answer is not None:
                     recovery_reason = "empty_final_answer"
+                elif settlement_fence:
+                    recovery_reason = "settlement_final_answer_required"
                 else:
                     recovery_reason = None
                 try:
@@ -981,6 +1179,22 @@ class ReActPattern(AgentPattern):
                     response=assistant_content or normalized.get("raw"),
                 )
 
+        # A DAG step cannot declare the parent task partially delivered: its
+        # dependencies and sibling results belong to the DAG's failure policy.
+        if not context.metadata.get("dag_step_id"):
+            delivery = await self._deliver_at_iteration_limit(
+                context=context, llm=llm, runtime=runtime
+            )
+            if delivery is not None:
+                return delivery
+            interrupted = await self._interrupt_if_requested(
+                runtime=runtime,
+                context=context,
+                label="after_failed_iteration_limit_delivery",
+            )
+            if interrupted is not None:
+                return interrupted
+
         self.status = "max_iterations"
         await runtime.checkpoint("max_iterations", context=context, pattern=self)
         return PatternResult(
@@ -988,6 +1202,115 @@ class ReActPattern(AgentPattern):
             error="ReActPattern reached max iterations without a final answer.",
             metadata={"iterations": self.max_iterations, "status": self.status},
         ).to_dict()
+
+    async def _deliver_at_iteration_limit(
+        self, *, context: Any, llm: Any, runtime: PatternRuntime
+    ) -> dict[str, Any] | None:
+        """Offer one bounded, answer-only turn; do not relax the work budget.
+
+        Buffer the response until validated, so a refused work call or an
+        invalid protocol cannot leak an unaccepted answer into the chat stream.
+        A failed delivery leaves the original failure path intact.
+        """
+        interrupted = await self._interrupt_if_requested(
+            runtime=runtime, context=context, label="before_iteration_limit_delivery"
+        )
+        if interrupted is not None:
+            return interrupted
+        if self.iteration_limit_delivery_attempted or self.max_iterations <= 0:
+            return None
+
+        self.iteration_limit_delivery_attempted = True
+        self.status = "max_iterations"
+        await runtime.checkpoint(
+            "before_iteration_limit_delivery", context=context, pattern=self
+        )
+        # Reuse the forced-answer evidence and file-reference rules. In
+        # particular, do not compact away results when tools can no longer run.
+        messages = self._messages_for_llm(
+            context,
+            has_tools=True,
+            force_final_answer=True,
+            tool_names=["final_answer"],
+        )
+        messages[0] = {
+            **messages[0],
+            "content": (
+                f"{messages[0].get('content', '')}\n\n"
+                "The execution iteration limit has been reached. No further work "
+                "or verification is possible in this run. Call final_answer once "
+                "to hand over only results supported by the retained evidence, "
+                "including trusted links to requested deliverables already made. "
+                "Clearly state that execution stopped at the iteration limit, "
+                "what is done, what is unverified or missing, and what remains. "
+                "Do not claim full completion or promise to keep working. Set "
+                "outcome=partial if useful results exist, otherwise blocked. "
+                "Do not reproduce raw exception messages or tool payloads."
+            ),
+        }
+        messages = append_user_message_preserving_turns(
+            messages,
+            content=(
+                "Runtime notice: the work phase has now stopped at the iteration "
+                "limit. This turn is only for handing over existing results, not "
+                "for performing the outstanding work. Call only final_answer, "
+                "include existing deliverable links, and list what was not done. "
+                "No other tools are available."
+            ),
+        )
+
+        def parse_response(response: Any) -> dict[str, Any] | None:
+            normalized = self._normalize_llm_response(response)
+            calls = normalized.get("tool_calls") or []
+            if (
+                len(calls) == 1
+                and calls[0]["name"] == "final_answer"
+                and bool(self._final_answer_text(calls[0].get("args")).strip())
+            ):
+                return dict(calls[0]["args"])
+            return None
+
+        schema = self._final_answer_tool_schema()
+        schema["function"]["parameters"]["properties"]["outcome"]["enum"] = [
+            "partial",
+            "blocked",
+        ]
+        args = await request_partial_delivery(
+            context=context,
+            llm=llm,
+            runtime=runtime,
+            messages=messages,
+            schema=schema,
+            parse_response=parse_response,
+            metadata={
+                "iteration": self.current_iteration,
+                "phase": "iteration_limit_delivery",
+            },
+            timeout=ITERATION_LIMIT_DELIVERY_TIMEOUT_SECONDS,
+        )
+        if args is None:
+            return None
+
+        interrupted = await self._interrupt_if_requested(
+            runtime=runtime, context=context, label="after_iteration_limit_delivery"
+        )
+        if interrupted is not None:
+            return interrupted
+        outcome = args["outcome"]
+        answer = (
+            "Execution stopped at the iteration limit; this is not a completed task."
+            f"\n\n{self._final_answer_text(args)}"
+        )
+        context.add_assistant_message(answer)
+        result = await self._finalize_outcome(
+            context=context, runtime=runtime, response=answer, outcome=outcome
+        )
+        # success means a final response was delivered, not that the requested
+        # work succeeded; use the existing partial/blocked outcome contract.
+        result.update(
+            termination_reason="max_iterations", iterations=self.max_iterations
+        )
+        return result
 
     async def _invalid_tool_protocol_result(
         self,
@@ -1102,13 +1425,48 @@ class ReActPattern(AgentPattern):
     ) -> list[dict[str, Any]]:
         messages = list(context.get_messages_for_llm())
         if force_final_answer:
+            # One body with switched phrases: hand-written duplicates would
+            # drift, and the weaker copy lands on the turn that invents a
+            # value. The outcome rule stays a conditional, because a removed
+            # observation is not a removed action -- a write whose result
+            # message was dropped still happened. A summary standing above
+            # says to re-query the source, which this turn cannot do; the
+            # sentence right after it in that summary -- report the value as
+            # unavailable -- is the branch a forced turn lands on. The third
+            # branch states that the engine cannot tell, because a payload
+            # written before the marker existed supports neither answer.
+            state = tool_evidence_state(context)
+            if state == "intact":
+                source_phrase = " using the accumulated conversation and tool results"
+                outcome_rule = (
+                    "Set outcome=completed only when "
+                    "every requested action or verification succeeded; otherwise set "
+                    "outcome=partial or outcome=blocked and say what remains. "
+                )
+            elif state == "removed":
+                source_phrase = ""
+                outcome_rule = (
+                    "Do not rest an outcome=completed claim on an observation "
+                    "that was removed; set outcome=partial when part of the "
+                    "request is still answerable from what remains and "
+                    "outcome=blocked when none of it is. "
+                )
+            else:
+                source_phrase = ""
+                outcome_rule = (
+                    "Do not rest an outcome=completed claim on an observation "
+                    "you cannot read in this context; set outcome=partial when "
+                    "part of the request is still answerable from what you can "
+                    "read and outcome=blocked when none of it is. "
+                )
+            evidence_facts_text = evidence_facts(state)
             instruction = (
                 "Produce the final user-facing answer by calling the final_answer "
-                "control tool exactly once using the accumulated conversation and "
-                "tool results. Do not call any other tool and do not output "
-                "tool-call markup as plain text. Set outcome=completed only when "
-                "every requested action or verification succeeded; otherwise set "
-                "outcome=partial or outcome=blocked and say what remains. If a "
+                f"control tool exactly once{source_phrase}. "
+                f"{evidence_facts_text}"
+                "Do not call any other tool and do not output "
+                f"tool-call markup as plain text. {outcome_rule}"
+                "If a "
                 "previous ask_user_question narrowed the request to a selected "
                 "subset of items or resources, the final answer must cover only "
                 "that subset — leave out anything outside it even if an earlier "
@@ -1148,6 +1506,16 @@ class ReActPattern(AgentPattern):
                 "the user or attempt an unavailable interaction tool; finish with "
                 "outcome=blocked and explain what is missing. "
             )
+            clarification_instruction = (
+                "Request clarification only when missing information prevents "
+                "correct or authorized work or the user explicitly asked to be "
+                "consulted. "
+                if self.user_interaction_enabled
+                else "User interaction is disabled. If the user explicitly asked "
+                "to choose and that choice is still pending, do not select for "
+                "them; finish with outcome=blocked and explain that the required "
+                "user choice cannot be obtained in this run. "
+            )
             instruction = (
                 "Use available tools when the user asks you to generate, compute, run, "
                 "execute, inspect, read, write, or otherwise produce a concrete result "
@@ -1159,6 +1527,12 @@ class ReActPattern(AgentPattern):
                 "as any other tool call: run the work tools first, then answer on a "
                 "later turn from their results. Do not write assistant text in the "
                 "same response as a work tool call; call the tool directly. "
+                f"{clarification_instruction}"
+                "For nonessential presentation choices, "
+                "including an unspecified output format, choose a sensible "
+                "default and deliver the supported work without pausing unless "
+                "the user explicitly asked to choose. This "
+                "does not permit guessing facts, action targets, or authorization. "
                 f"{missing_information_instruction}"
                 "If the latest user "
                 "message explicitly asks you to call a named available tool, call "
@@ -1239,6 +1613,13 @@ class ReActPattern(AgentPattern):
                 "when the task is actually complete and its required results exist."
             )
             retry_phase = "unavailable_tool_call_recovery"
+        elif recovery_reason == "settlement_final_answer_required":
+            retry_instruction = (
+                "A rejected or dispatch-unknown write ended this resumed turn. "
+                "Do not call or retry any work tool. Call final_answer with a "
+                "concise explanation of the recorded outcome."
+            )
+            retry_phase = "settlement_final_answer_recovery"
         elif recovery_reason == "malformed_tool_arguments":
             retry_instruction = (
                 "The previous response returned malformed JSON arguments for a "
@@ -1579,11 +1960,26 @@ class ReActPattern(AgentPattern):
         return self._tool_decision_groups_by_name.get(tool_name, tool_name)
 
     def get_state(self) -> dict[str, Any]:
-        """Return JSON-serializable ReAct state for checkpointing."""
+        """Return JSON-serializable ReAct state for checkpointing.
+
+        Containers that some code path mutates in place are snapshotted, so
+        a caller holding the result is not looking at live state. The DAG
+        checkpoint rollback (``_DAGStepRuntime.checkpoint``) depends on
+        that: without the copy below,
+        ``_deliver_pending_tool_interaction_responses`` popping from
+        ``pending_tool_interaction_responses`` would mutate the last-good
+        snapshot and a failed checkpoint would lose the user's reply.
+
+        Everything else is emitted by reference on purpose. Values that are
+        only ever *reassigned* cannot leak a later write into a snapshot,
+        and copying them would add cost to a path that runs on the order of
+        twenty times per step -- see the per-entry notes below.
+        """
         return {
             "reasoning_mode": self.reasoning_mode.value,
             "status": self.status,
             "current_iteration": self.current_iteration,
+            "iteration_limit_delivery_attempted": self.iteration_limit_delivery_attempted,
             "max_iterations": self.max_iterations,
             "finalize_after_tool_result": self.finalize_after_tool_result,
             "tool_parallel_enabled": self.tool_parallel_enabled,
@@ -1595,16 +1991,50 @@ class ReActPattern(AgentPattern):
                 self.repeated_tool_decision_after_consecutive_work_tool_calls
             ),
             "force_final_answer_next": self.force_final_answer_next,
+            # Scalars, so no snapshot needed: the fence flag and the turn it
+            # is scoped to are only ever reassigned (see
+            # ``_settlement_fence_active`` and ``_record_settled_tool_call``).
+            "settlement_final_answer_fence": self.settlement_final_answer_fence,
+            "settlement_fence_turn_id": self.settlement_fence_turn_id,
+            # Write-once: both are always rebound to a fresh dict, never
+            # written through -- see the "Rebind rather than mutate" comment
+            # on the ``waiting_for_user_request`` update below.
             "repeated_tool_decision": self.repeated_tool_decision,
             "waiting_for_user_request": self.waiting_for_user_request,
-            "pending_tool_interaction_responses": (
+            # Popped in place by ``_deliver_pending_tool_interaction_responses``
+            # and appended to when a response arrives, so the list itself must
+            # be snapshotted. The settlement-delivery transaction also
+            # re-inserts into the live list on rollback, and
+            # ``PatternRuntime.checkpoint`` records the payload before
+            # emitting it, so sharing the list would let a failed emit
+            # retroactively rewrite an already-stored payload. The entries are
+            # only read in the delivery loop, so a shallow copy of the list is
+            # enough.
+            "pending_tool_interaction_responses": snapshot_container(
                 self.pending_tool_interaction_responses
             ),
             "task_text": self.task_text,
             "memory_input_text": self.memory_input_text,
+            # Write-once: normally a plain dict from ``_normalize_llm_response``,
+            # but typed ``Any`` and only ever reassigned (518, 906, 993, 1831,
+            # 3490), never written through. The invariant holds by convention
+            # here rather than by construction.
             "last_response": self.last_response,
+            # Write-once: always rebound (``= list(...)``, slice assignments),
+            # never appended to or popped in place.
             "pending_tool_calls": self.pending_tool_calls,
-            "pending_tool_call_content": self.pending_tool_call_content,
+            # Written through by tool-call id while a turn is in flight
+            # (``pending_tool_call_content[tool_call_id] = content`` and a
+            # later ``pop``), so it needs a snapshot.
+            "pending_tool_call_content": snapshot_container(
+                self.pending_tool_call_content
+            ),
+            # Write-once: ``_record_tool_call`` builds a whole new
+            # ``ToolCallRecord`` per call and replaces the entry; no code
+            # mutates a stored record's ``args``/``result``. Copying them
+            # would also be the most expensive thing on this path and would
+            # break on results custom/MCP tools are free to return (locks,
+            # handles, generators).
             "tool_ledger": {
                 key: record.to_dict() for key, record in self.tool_ledger.items()
             },
@@ -1617,6 +2047,9 @@ class ReActPattern(AgentPattern):
         )
         self.status = str(state.get("status", "idle"))
         self.current_iteration = int(state.get("current_iteration", 0))
+        self.iteration_limit_delivery_attempted = bool(
+            state.get("iteration_limit_delivery_attempted", False)
+        )
         self.max_iterations = int(state.get("max_iterations", self.max_iterations))
         self.finalize_after_tool_result = bool(
             state.get("finalize_after_tool_result", self.finalize_after_tool_result)
@@ -1644,6 +2077,13 @@ class ReActPattern(AgentPattern):
                 int(raw_work_threshold) if raw_work_threshold is not None else None
             )
         self.force_final_answer_next = bool(state.get("force_final_answer_next", False))
+        self.settlement_final_answer_fence = bool(
+            state.get("settlement_final_answer_fence", False)
+        )
+        raw_fence_turn_id = state.get("settlement_fence_turn_id")
+        self.settlement_fence_turn_id = (
+            str(raw_fence_turn_id) if raw_fence_turn_id else None
+        )
         repeated_tool_decision = state.get("repeated_tool_decision")
         self.repeated_tool_decision = (
             dict(repeated_tool_decision)
@@ -1729,6 +2169,26 @@ class ReActPattern(AgentPattern):
             response=response or "",
             tools=tools,
         )
+        if self.pending_tool_calls:
+            # Waiting checkpoints written before the pause path discarded the
+            # plan pre-checkpoint still carry the parked batch's unexecuted
+            # siblings (#2216). Pause-time semantics already discarded them in
+            # memory, so cancel them here too: the resumed turn must replan
+            # from the user's answer, never replay a stale call.
+            logger.warning(
+                "ReAct cancelling %d stale pending tool call(s) restored from a "
+                "legacy waiting_for_user checkpoint (#2216): %s",
+                len(self.pending_tool_calls),
+                [call.get("name") for call in self.pending_tool_calls],
+            )
+            self._discard_pending_tool_plan_after_pause(
+                context,
+                reason=(
+                    "Discarded stale tool plan restored from a checkpoint "
+                    "written before user input arrived; the agent replans "
+                    "from the user's response."
+                ),
+            )
         waiting_task = self.waiting_for_user_request.get("task_text")
         if waiting_task and self.task_text is None:
             self.task_text = str(waiting_task)
@@ -1770,22 +2230,19 @@ class ReActPattern(AgentPattern):
         if not isinstance(messages, list):
             return None
 
-        for index in range(len(messages) - 1, after_message_count - 1, -1):
+        for index in range(after_message_count, len(messages)):
             message = messages[index]
             if getattr(message, "role", None) != "user":
                 continue
-            metadata = dict(getattr(message, "metadata", {}) or {})
-            if metadata.get("response_to_waiting_for_user"):
+            metadata = getattr(message, "metadata", None)
+            metadata = dict(metadata) if isinstance(metadata, dict) else {}
+            if pending_user_response_lifecycle(message) is not None:
                 return str(getattr(message, "content", "") or "")
             waiting_request = self.waiting_for_user_request or {}
-            metadata["response_to_waiting_for_user"] = {
-                "tool_name": waiting_request.get("tool_name"),
-                "tool_call_id": waiting_request.get("tool_call_id"),
-                "question": waiting_request.get("message", ""),
-                "message_type": waiting_request.get("message_type", "question"),
-                "interactions": waiting_request.get("interactions"),
-                "requests": waiting_request.get("requests"),
-            }
+            marker = pending_user_response_marker(waiting_request)
+            if marker is None:
+                return None
+            metadata["response_to_waiting_for_user"] = marker
             messages[index] = replace(message, metadata=metadata)
             return str(getattr(message, "content", "") or "")
         return None
@@ -1797,7 +2254,12 @@ class ReActPattern(AgentPattern):
         response: str,
         tools: list[Any],
     ) -> None:
-        """Queue replies only for tools that expose the optional resume callback."""
+        """Queue replies only for tools that expose the optional resume callback.
+
+        One user reply is queued verbatim for every resumable interaction in
+        the batch; see ``_deliver_pending_tool_interaction_responses`` for why
+        that fan-out is the intended product behavior.
+        """
 
         if (
             not isinstance(waiting_request, dict)
@@ -1840,7 +2302,19 @@ class ReActPattern(AgentPattern):
         context: Any,
         runtime: PatternRuntime,
     ) -> None:
-        """Deliver checkpointed replies to their exact suspended interactions."""
+        """Deliver checkpointed replies to their exact suspended interactions.
+
+        When a waiting batch holds several interactions that each carry a
+        resume callback, the user's single free-text reply is delivered
+        verbatim to every one of them, and each callback decides its own
+        terminal settlement. This is a deliberate product decision: the tool
+        that owns the interaction knows what its own question was, so it is
+        the only component that can interpret one shared answer, and a
+        machine-readable disambiguation protocol would put the burden on the
+        human instead. Interactions whose tool exposes no resume callback are
+        untouched by this path and keep the legacy free-text replan behavior
+        that issue #2256 requires to stay unchanged.
+        """
 
         while self.pending_tool_interaction_responses:
             pending = self.pending_tool_interaction_responses[0]
@@ -1856,39 +2330,574 @@ class ReActPattern(AgentPattern):
                 # Legacy checkpoints may contain callback delivery for a tool that
                 # no longer exists or never implemented the optional capability.
                 # The annotated user message is sufficient for the model to replan.
+                await self._skip_pending_tool_interaction_response(
+                    pending=pending,
+                    context=context,
+                    runtime=runtime,
+                    reason="resume_callback_unavailable",
+                )
+                continue
+
+            try:
+                record = self._validate_tool_interaction_settlement_target(
+                    pending=pending,
+                    context=context,
+                )
+            except RuntimeError as exc:
+                await self._abandon_invalid_settlement_target(
+                    pending=pending,
+                    context=context,
+                    runtime=runtime,
+                    error=exc,
+                )
+                continue
+
+            # Everything the rollback needs is captured BEFORE the callback
+            # runs: a raise while snapshotting would otherwise leave the
+            # external effect done but the entry still pending, re-invoking
+            # the callback on the next attempt.
+            record_before = replace(record)
+            messages = getattr(context, "messages", None)
+            messages_before = list(messages) if isinstance(messages, list) else None
+            force_final_before = self.force_final_answer_next
+            settlement_fence_before = self.settlement_final_answer_fence
+            settlement_fence_turn_before = self.settlement_fence_turn_id
+
+            # The resumed call re-enters the same execution slot that issued
+            # it, so the MCP approval gate sees the original identity (source,
+            # turn, ReAct step) instead of inventing a new one.
+            resume_call = {
+                "id": str(pending.get("tool_call_id") or ""),
+                "name": tool_name,
+                "turn_id": record.turn_id,
+                "step_id": record.step_id,
+            }
+            with bind_tool_call_execution_context(
+                self._mcp_gate_execution_context(resume_call, context, runtime)
+            ):
+                resumed = resume(
+                    interaction_id=pending.get("interaction_id", ""),
+                    response=pending.get("response", ""),
+                )
+                if inspect.isawaitable(resumed):
+                    resumed = await resumed
+            if resumed is not None and not isinstance(
+                resumed, ToolInteractionSettlement
+            ):
+                logger.error(
+                    "resume_user_interaction must return "
+                    "ToolInteractionSettlement or None; treating the outcome as "
+                    "dispatch_unknown. tool=%r interaction_id=%r",
+                    tool_name,
+                    pending.get("interaction_id", ""),
+                )
+                resumed = ToolInteractionSettlement.dispatch_unknown(
+                    error=(
+                        "The resume callback returned an invalid settlement. The "
+                        "external outcome is unknown and automatic retry is disabled."
+                    )
+                )
+            settled = isinstance(resumed, ToolInteractionSettlement)
+
+            popped = False
+            try:
+                if settled:
+                    self._project_tool_interaction_settlement(
+                        record=record,
+                        settlement=resumed,
+                        context=context,
+                        runtime=runtime,
+                    )
+
+                # The checkpoint must contain the terminal projection and no
+                # pending callback. If persistence fails, restore the entire
+                # in-memory transaction so replay starts from the last durable
+                # waiting state.
                 self.pending_tool_interaction_responses.pop(0)
+                popped = True
                 await runtime.checkpoint(
-                    "tool_interaction_response_skipped",
+                    "tool_interaction_response_delivered",
                     context=context,
                     pattern=self,
                     metadata={
                         "tool_name": tool_name,
                         "tool_call_id": pending.get("tool_call_id", ""),
                         "interaction_id": pending.get("interaction_id", ""),
-                        "reason": "resume_callback_unavailable",
+                        "settlement_status": resumed.status if settled else None,
                     },
                 )
-                continue
+            except BaseException:
+                self.tool_ledger[record_before.tool_call_id] = record_before
+                if messages_before is not None and isinstance(messages, list):
+                    messages[:] = messages_before
+                self.force_final_answer_next = force_final_before
+                self.settlement_final_answer_fence = settlement_fence_before
+                self.settlement_fence_turn_id = settlement_fence_turn_before
+                if popped:
+                    self.pending_tool_interaction_responses.insert(0, pending)
+                raise
+            if settled:
+                await self._trace_tool_interaction_settlement(
+                    record=record,
+                    settlement=resumed,
+                    runtime=runtime,
+                )
 
-            resumed = resume(
-                interaction_id=pending.get("interaction_id", ""),
-                response=pending.get("response", ""),
+    async def _abandon_invalid_settlement_target(
+        self,
+        *,
+        pending: dict[str, str],
+        context: Any,
+        runtime: PatternRuntime,
+        error: RuntimeError,
+    ) -> None:
+        """Close out a pending entry whose settlement target does not validate.
+
+        No resume callback has run and none will: the entry is unusable. What
+        happens to the ledger depends on which record, if any, it resolves to.
+
+        * The entry's own record is already ``completed``/``failed`` — an
+          idempotent replay of a delivery that already landed. Pop and skip;
+          the earlier terminal outcome stands.
+        * The entry's own record is still ``waiting_for_user`` (its transcript
+          slot is missing or duplicated). It cannot be left that way: the row
+          would stay waiting forever and, carrying no settlement, would be
+          invisible to ``_suppressed_duplicate_write_result``, leaving the
+          write unguarded against a model retry. A dispatch-unknown outcome is
+          forced onto it instead, which closes the row and enrolls it in the
+          turn-scoped guard.
+        * No record at that id, or a record belonging to a *different* tool.
+          Nothing here is ours to settle — writing a settlement onto another
+          tool's live row would corrupt an unrelated interaction — so the
+          entry is dropped with a warning.
+        """
+
+        tool_name = str(pending.get("tool_name") or "")
+        tool_call_id = str(pending.get("tool_call_id") or "")
+        candidate = self.tool_ledger.get(tool_call_id)
+        # Only a record for this exact call AND this exact tool is ours.
+        record = (
+            candidate
+            if candidate is not None and candidate.tool_name == tool_name
+            else None
+        )
+        already_settled = record is not None and record.status in _SETTLED_ROW_STATUSES
+        reason = "already_settled" if already_settled else "invalid_settlement_target"
+        logger.warning(
+            "Skipping stale tool interaction response. reason=%s "
+            "tool=%r tool_call_id=%r error=%s",
+            reason,
+            tool_name,
+            tool_call_id,
+            error,
+        )
+        if record is not None and record.status == "waiting_for_user":
+            await self._settle_unresolvable_waiting_record(
+                record=record,
+                pending=pending,
+                context=context,
+                runtime=runtime,
+                error=error,
             )
-            if inspect.isawaitable(resumed):
-                await resumed
+            return
+        await self._skip_pending_tool_interaction_response(
+            pending=pending,
+            context=context,
+            runtime=runtime,
+            reason=reason,
+        )
 
-            # Keep the response retryable until the tool acknowledges delivery.
+    async def _settle_unresolvable_waiting_record(
+        self,
+        *,
+        record: ToolCallRecord,
+        pending: dict[str, str],
+        context: Any,
+        runtime: PatternRuntime,
+        error: RuntimeError,
+    ) -> None:
+        """Force a dispatch-unknown outcome onto a row we can no longer settle."""
+
+        settlement = ToolInteractionSettlement.dispatch_unknown(
+            error=(
+                "The resumed tool call could not be matched to its original "
+                f"observation ({error}). The external outcome is unknown and "
+                "automatic retry is disabled."
+            )
+        )
+        # No message snapshot here: the transcript slot is precisely what
+        # failed to validate, so this path settles the ledger row alone and
+        # never rewrites the messages.
+        record_before = replace(record)
+        force_final_before = self.force_final_answer_next
+        settlement_fence_before = self.settlement_final_answer_fence
+        settlement_fence_turn_before = self.settlement_fence_turn_id
+        popped = False
+        try:
+            self._record_settled_tool_call(
+                record=record,
+                settlement=settlement,
+                result=settlement.projected_result(),
+                runtime=runtime,
+            )
             self.pending_tool_interaction_responses.pop(0)
+            popped = True
             await runtime.checkpoint(
-                "tool_interaction_response_delivered",
+                "tool_interaction_response_skipped",
                 context=context,
                 pattern=self,
                 metadata={
-                    "tool_name": tool_name,
-                    "tool_call_id": pending.get("tool_call_id", ""),
+                    "tool_name": record.tool_name,
+                    "tool_call_id": record.tool_call_id,
                     "interaction_id": pending.get("interaction_id", ""),
+                    "reason": "invalid_settlement_target",
+                    "settlement_status": settlement.status,
                 },
             )
+        except BaseException:
+            self.tool_ledger[record_before.tool_call_id] = record_before
+            self.force_final_answer_next = force_final_before
+            self.settlement_final_answer_fence = settlement_fence_before
+            self.settlement_fence_turn_id = settlement_fence_turn_before
+            if popped:
+                self.pending_tool_interaction_responses.insert(0, pending)
+            raise
+        await self._trace_tool_interaction_settlement(
+            record=record,
+            settlement=settlement,
+            runtime=runtime,
+        )
+
+    async def _skip_pending_tool_interaction_response(
+        self,
+        *,
+        pending: dict[str, str],
+        context: Any,
+        runtime: PatternRuntime,
+        reason: str,
+    ) -> None:
+        """Durably skip one undeliverable response without losing it on failure."""
+
+        self.pending_tool_interaction_responses.pop(0)
+        try:
+            await runtime.checkpoint(
+                "tool_interaction_response_skipped",
+                context=context,
+                pattern=self,
+                metadata={
+                    "tool_name": pending.get("tool_name", ""),
+                    "tool_call_id": pending.get("tool_call_id", ""),
+                    "interaction_id": pending.get("interaction_id", ""),
+                    "reason": reason,
+                },
+            )
+        except BaseException:
+            self.pending_tool_interaction_responses.insert(0, pending)
+            raise
+
+    async def _trace_tool_interaction_settlement(
+        self,
+        *,
+        record: ToolCallRecord,
+        settlement: ToolInteractionSettlement,
+        runtime: PatternRuntime,
+    ) -> None:
+        """Emit a paired lifecycle after the settlement is durably checkpointed.
+
+        The pause already emitted a full start/end pair for this tool_call_id
+        (the end carrying ``waiting_for_user``), so the frontend renderer needs
+        a fresh *running* action before it can close the call — an unpaired end
+        event would be mis-attributed to an unrelated card. The events are
+        written straight to the tracer rather than through
+        ``runtime.on_tool_start``: that method unconditionally calls
+        ``add_tool_call_usage(1)``, which would durably bill the user a second
+        tool call for a resume that executes no tool. The payload otherwise
+        mirrors what ``PatternRuntime.on_tool_start`` / ``on_tool_end`` /
+        ``on_tool_error`` write, and the ``settlement_delivery`` marker lets
+        consumers tell a settlement pair from an execution pair.
+        """
+
+        tracer = getattr(runtime, "tracer", None)
+        trace_event = getattr(tracer, "trace_event", None)
+        if not callable(trace_event):
+            return
+        result = settlement.projected_result()
+        succeeded = settlement.status == "succeeded"
+        base: dict[str, Any] = {
+            "tool_name": record.tool_name,
+            "tool_call_id": record.tool_call_id,
+            "settlement_delivery": True,
+            "settlement_status": settlement.status,
+        }
+        turn_id = getattr(runtime, "active_turn_id", None)
+        if turn_id:
+            base["turn_id"] = str(turn_id)
+        start_data = {**base, "tool_params": copy.deepcopy(record.args)}
+        if succeeded:
+            end_type = TraceEventType(
+                TraceScope.ACTION, TraceAction.END, TraceCategory.TOOL
+            )
+            end_data = {
+                **base,
+                "tool_params": copy.deepcopy(record.args),
+                "result": result,
+                "success": True,
+            }
+        else:
+            error_message = str(
+                settlement.error
+                or (result.get("error") if isinstance(result, dict) else result)
+            )
+            end_type = TraceEventType(
+                TraceScope.ACTION, TraceAction.ERROR, TraceCategory.TOOL
+            )
+            end_data = {
+                **base,
+                "error_type": "agent_tool_error",
+                "error": error_message,
+                "error_message": error_message,
+                "result": result,
+                "success": False,
+            }
+        await self._emit_settlement_trace_event(
+            trace_event,
+            TraceEventType(TraceScope.ACTION, TraceAction.START, TraceCategory.TOOL),
+            runtime=runtime,
+            data=start_data,
+        )
+        await self._emit_settlement_trace_event(
+            trace_event,
+            end_type,
+            runtime=runtime,
+            data=end_data,
+        )
+
+    @staticmethod
+    async def _emit_settlement_trace_event(
+        trace_event: Callable[..., Any],
+        event_type: TraceEventType,
+        *,
+        runtime: PatternRuntime,
+        data: dict[str, Any],
+    ) -> None:
+        """Write one settlement trace event, matching runtime's best-effort rule."""
+
+        execution_id = getattr(runtime, "execution_id", None)
+        step_id = getattr(runtime, "active_react_step_id", None)
+        try:
+            emitted = trace_event(
+                event_type,
+                task_id=str(execution_id or ""),
+                step_id=str(step_id or execution_id or "root"),
+                data=data,
+            )
+            if inspect.isawaitable(emitted):
+                await emitted
+        except Exception:
+            # UI trace events are best-effort, exactly as in
+            # PatternRuntime._emit_trace_event; a tracer fault must not undo a
+            # settlement that is already durable.
+            logger.debug("settlement trace event failed", exc_info=True)
+
+    def _validate_tool_interaction_settlement_target(
+        self,
+        *,
+        pending: dict[str, str],
+        context: Any,
+    ) -> ToolCallRecord:
+        """Validate every durable identity before a resume callback can run."""
+
+        tool_call_id = str(pending.get("tool_call_id") or "")
+        record = self.tool_ledger.get(tool_call_id)
+        if record is None:
+            raise RuntimeError(
+                "Cannot settle resumed tool interaction without its original "
+                f"ledger record: {tool_call_id or '<missing>'}"
+            )
+        pending_tool_name = str(pending.get("tool_name") or "")
+        if pending_tool_name != record.tool_name:
+            raise RuntimeError(
+                "Resumed tool interaction does not match its original ledger "
+                f"record: {pending_tool_name!r} != {record.tool_name!r}"
+            )
+        if record.status != "waiting_for_user":
+            raise RuntimeError(
+                "Cannot resume a tool call that is not waiting for user input: "
+                f"{tool_call_id!r} is {record.status!r} with settlement "
+                f"{record.settlement_status!r}."
+            )
+        messages = getattr(context, "messages", None)
+        if not isinstance(messages, list):
+            raise RuntimeError("Execution context does not expose a message list.")
+        matches = [
+            message
+            for message in messages
+            if getattr(message, "role", None) == "tool"
+            and getattr(message, "tool_call_id", None) == tool_call_id
+        ]
+        if len(matches) != 1:
+            raise RuntimeError(
+                "Expected exactly one tool result for resumed tool call "
+                f"{tool_call_id!r}; found {len(matches)}."
+            )
+        return record
+
+    def _project_tool_interaction_settlement(
+        self,
+        *,
+        record: ToolCallRecord,
+        settlement: ToolInteractionSettlement,
+        context: Any,
+        runtime: PatternRuntime,
+    ) -> None:
+        """Project a resumed outcome onto its original tool protocol slot."""
+
+        result = settlement.projected_result()
+        self._replace_tool_result(
+            context=context,
+            tool_name=record.tool_name,
+            tool_call_id=record.tool_call_id,
+            result=result,
+        )
+        self._record_settled_tool_call(
+            record=record,
+            settlement=settlement,
+            result=result,
+            runtime=runtime,
+        )
+
+    def _record_settled_tool_call(
+        self,
+        *,
+        record: ToolCallRecord,
+        settlement: ToolInteractionSettlement,
+        result: Any,
+        runtime: PatternRuntime,
+    ) -> None:
+        """Rewrite the ledger row and raise the fence a denied outcome demands."""
+
+        tool_call: dict[str, Any] = {
+            "id": record.tool_call_id,
+            "name": record.tool_name,
+            "args": copy.deepcopy(record.args),
+        }
+        if record.turn_id:
+            tool_call["turn_id"] = record.turn_id
+        if record.step_id:
+            tool_call["step_id"] = record.step_id
+        settlement_turn_id = getattr(runtime, "active_turn_id", None)
+
+        if settlement.status == "succeeded":
+            self._record_tool_call(
+                tool_call,
+                status="completed",
+                result=result,
+                settlement_status=settlement.status,
+                settlement_turn_id=settlement_turn_id,
+            )
+        else:
+            error = str(
+                settlement.error
+                or (result.get("error") if isinstance(result, dict) else result)
+            )
+            self._record_tool_call(
+                tool_call,
+                status="failed",
+                result=result,
+                error=error,
+                settlement_status=settlement.status,
+                settlement_turn_id=settlement_turn_id,
+            )
+        # A rejection or an unknown dispatch anywhere in the delivery batch is
+        # an authorization boundary for the whole resumed turn. Maintainers
+        # signed off on the one-way latch: once raised, a later success in the
+        # same batch must not reopen write authorization. It is scoped to the
+        # raising turn (see _settlement_fence_active) so a turn that exits via
+        # max_iterations, an interrupt or a second pause cannot lock the rest
+        # of the conversation out of tool use. The fence is the coarse half of
+        # a pair; the fine half is the turn-scoped duplicate-write guard in
+        # _suppressed_duplicate_write_result, which blocks the one exact write
+        # even when the model is allowed to call tools at all.
+        if settlement.status in _GUARDED_SETTLEMENT_STATUSES:
+            self.force_final_answer_next = True
+            self.settlement_final_answer_fence = True
+            self.settlement_fence_turn_id = (
+                str(settlement_turn_id) if settlement_turn_id else None
+            )
+
+    def _settlement_fence_active(self, runtime: PatternRuntime) -> bool:
+        """Whether the settlement fence still binds the turn now executing.
+
+        The fence is raised by a rejected / dispatch-unknown settlement and is
+        a one-way latch *within* that turn: it survives every tool-protocol
+        retry recovery path, which would otherwise hand the work tools back to
+        the model and let it repeat the denied write. It does not survive the
+        turn. A turn that ends without reaching ``_finalize_outcome`` — via
+        ``max_iterations``, an interrupt, an invalid tool protocol, or a second
+        ``waiting_for_user`` pause — leaves the flag set, so honoring it beyond
+        its own turn would silently lock every later user message in the
+        conversation to final-answer-only.
+
+        A fence with no recorded turn id (raised while the embedding stamped no
+        turn) binds only while the runtime also reports no turn: an unknowable
+        turn cannot be compared, and failing open there matches the
+        duplicate-write guard's rule for the same situation.
+        """
+
+        if not self.settlement_final_answer_fence:
+            return False
+        active_turn_id = getattr(runtime, "active_turn_id", None)
+        active_turn_id = str(active_turn_id) if active_turn_id else None
+        if self.settlement_fence_turn_id == active_turn_id:
+            return True
+        self.settlement_final_answer_fence = False
+        self.settlement_fence_turn_id = None
+        return False
+
+    @staticmethod
+    def _replace_tool_result(
+        *,
+        context: Any,
+        tool_name: str,
+        tool_call_id: str,
+        result: Any,
+    ) -> None:
+        """Replace the waiting observation without creating a second tool row.
+
+        The replacement lands at the original transcript index, i.e. before the
+        user message that authorized it. That ordering is deliberate: keeping
+        the result in its original tool-protocol slot is what lets the model
+        read one call with one outcome, which is the whole point of #2256, and
+        the alternative (appending a second tool row) is what the issue asks us
+        to avoid.
+        """
+
+        messages = getattr(context, "messages", None)
+        if not isinstance(messages, list):
+            raise RuntimeError("Execution context does not expose a message list.")
+        matching_indexes = [
+            index
+            for index, message in enumerate(messages)
+            if getattr(message, "role", None) == "tool"
+            and getattr(message, "tool_call_id", None) == tool_call_id
+        ]
+        if len(matching_indexes) != 1:
+            raise RuntimeError(
+                "Expected exactly one tool result for resumed tool call "
+                f"{tool_call_id!r}; found {len(matching_indexes)}."
+            )
+
+        replacement = context.add_tool_result(
+            tool_name=tool_name,
+            result=result,
+            tool_call_id=tool_call_id,
+        )
+        if not messages or messages[-1] is not replacement:
+            raise RuntimeError(
+                "Execution context did not append the replacement result."
+            )
+        messages.pop()
+        messages[matching_indexes[0]] = replacement
 
     def _normalize_llm_response(self, response: Any) -> dict[str, Any]:
         if isinstance(response, str):
@@ -2197,19 +3206,21 @@ class ReActPattern(AgentPattern):
                     "name": "ask_user_question",
                     "description": (
                         "Ask the user for structured input and pause execution until "
-                        "the user responds. Use this only when execution cannot "
+                        "the user responds. Use this when the user explicitly asks "
+                        "to be consulted, or when execution cannot "
                         "continue without missing user-provided information, such "
                         "as a required file, URL, account, target object, permission, "
                         "a fact-carrying value (one that asserts a real-world fact) "
                         "for a tool argument that the user has not provided, "
                         "or a choice between mutually exclusive actions with "
-                        "different side effects. Do not use it to confirm execution "
+                        "different side effects. Unless the user explicitly asks "
+                        "to be consulted, do not use it to confirm execution "
                         "strategy, whether to search, whether to use memory, whether "
                         "to apply formatting preferences, or whether to proceed with "
                         "a sufficiently specified task; decide those yourself. A task "
                         "is not sufficiently specified if carrying it out would "
                         "require inventing a fact-carrying argument value the user "
-                        "has not provided."
+                        "has not provided. " + OPTIONS_REQUIRED_GUIDANCE
                     ),
                     "parameters": {
                         "type": "object",
@@ -2296,12 +3307,25 @@ class ReActPattern(AgentPattern):
     def _control_tool_names(self) -> set[str]:
         return set(CONTROL_TOOL_NAMES)
 
+    def _tool_message_source(self, tool_call: dict[str, Any]) -> dict[str, Any]:
+        """Return message attribution, without exposing tool arguments."""
+        source = {
+            "tool_call_id": tool_call["id"],
+            "tool_name": tool_call["name"],
+        }
+        for key in ("step_id", "dag_step_id", "turn_id"):
+            if tool_call.get(key):
+                source[key] = tool_call[key]
+        return source
+
     async def _handle_control_tool(
         self,
         tool_call: dict[str, Any],
         context: Any,
         llm: Any,
         runtime: PatternRuntime,
+        *,
+        source: dict[str, Any],
     ) -> dict[str, Any] | None:
         name = tool_call["name"]
         args = tool_call.get("args", {})
@@ -2376,23 +3400,37 @@ class ReActPattern(AgentPattern):
             expect_response = bool(args.get("expect_response", False))
             message_type = str(args.get("message_type", "info"))
             visible = bool(args.get("visible", True))
-            outbound_message = await runtime.send_message(
-                message=message,
-                message_type=message_type,
-                expect_response=expect_response,
-                visible=visible,
-            )
-            self._record_tool_call(
-                tool_call,
-                status="completed",
-                result={
-                    "message": message,
-                    "expect_response": expect_response,
-                    "visible": visible,
-                },
-            )
+            interactions: list[dict[str, Any]] = []
+            if expect_response:
+                outbound_message, interactions = await self._send_waiting_message(
+                    runtime=runtime,
+                    message=message,
+                    message_type=message_type,
+                    interactions=[],
+                    metadata=source,
+                    visible=visible,
+                )
+            else:
+                outbound_message = await runtime.send_message(
+                    message=message,
+                    message_type=message_type,
+                    expect_response=False,
+                    visible=visible,
+                    metadata=source,
+                )
+            ledger_result: dict[str, Any] = {
+                "message": message,
+                "expect_response": expect_response,
+                "visible": visible,
+            }
+            if expect_response:
+                ledger_result["interactions"] = interactions
+            self._record_tool_call(tool_call, status="completed", result=ledger_result)
             if expect_response:
                 self.status = "waiting_for_user"
+                # No ``interactions`` in the tool result: the model called a
+                # tool that has no such parameter, and echoing a form back
+                # would read as one it produced.
                 context.add_tool_result(
                     tool_name=name,
                     result={
@@ -2408,6 +3446,7 @@ class ReActPattern(AgentPattern):
                     "tool_name": name,
                     "message": message,
                     "message_type": message_type,
+                    "interactions": interactions,
                     "task_text": self.task_text,
                     "message_count": len(getattr(context, "messages", [])),
                 }
@@ -2416,6 +3455,7 @@ class ReActPattern(AgentPattern):
                     "status": self.status,
                     "message": message,
                     "message_type": message_type,
+                    "interactions": interactions,
                     "context": context,
                     "clarification_draft": draft_from_waiting_request(
                         self.waiting_for_user_request,
@@ -2451,22 +3491,27 @@ class ReActPattern(AgentPattern):
             deduplicated_interactions: list[dict[str, Any]] = []
             for interaction in interactions:
                 item = dict(interaction)
-                base_field = str(item.get("field") or "response")
-                field = base_field
-                suffix = 2
-                while field in used_fields:
-                    field = f"{base_field}_{suffix}"
-                    suffix += 1
-                item["field"] = field
-                used_fields.add(field)
+                item["field"] = _unique_field(
+                    str(item.get("field") or "response"), used_fields
+                )
                 deduplicated_interactions.append(item)
-            interactions = deduplicated_interactions
-            outbound_message = await runtime.send_message(
+            deduplicated_interactions, degraded_fields = degrade_options_less_pickers(
+                deduplicated_interactions
+            )
+            # Absent, not empty, when nothing was degraded: the key is a
+            # signal, and a model that sees it on every call learns to
+            # ignore it.
+            degradation: dict[str, Any] = (
+                {"degraded_fields": degraded_fields, "note": DEGRADED_FIELDS_NOTE}
+                if degraded_fields
+                else {}
+            )
+            outbound_message, interactions = await self._send_waiting_message(
+                runtime=runtime,
                 message=message,
                 message_type="question",
-                expect_response=True,
-                visible=True,
-                metadata={"interactions": interactions},
+                interactions=deduplicated_interactions,
+                metadata=source,
             )
             self._record_tool_call(
                 tool_call,
@@ -2475,6 +3520,7 @@ class ReActPattern(AgentPattern):
                     "message": message,
                     "expect_response": True,
                     "interactions": interactions,
+                    **degradation,
                 },
             )
             self.status = "waiting_for_user"
@@ -2484,7 +3530,13 @@ class ReActPattern(AgentPattern):
                     "status": "waiting_for_user",
                     "message": message,
                     "message_type": "question",
-                    "interactions": interactions,
+                    # Pre-append copy: what the model supplied is its own output
+                    # and echoes back; an engine-appended field would read as
+                    # one it authored too. A degraded field is the model's own
+                    # (same name), so it does echo -- under the type the user
+                    # was actually shown.
+                    "interactions": deduplicated_interactions,
+                    **degradation,
                 },
                 tool_call_id=tool_call.get("id"),
             )
@@ -2513,6 +3565,54 @@ class ReActPattern(AgentPattern):
             }
 
         return None
+
+    async def _send_waiting_message(
+        self,
+        *,
+        runtime: PatternRuntime,
+        message: str,
+        message_type: str,
+        interactions: list[dict[str, Any]],
+        metadata: dict[str, Any],
+        visible: bool = True,
+    ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+        """Publish a message that suspends the run, and return what it carried.
+
+        The only ``expect_response=True`` producer, so the "at least one
+        answerable field" guarantee is made once. Not pushed into
+        ``runtime.send_message``, which also serves non-suspending messages
+        that must stay field-free, and whose callers need the published list
+        back to store on the waiting request.
+
+        Appended, never substituted for the list: an entry this check cannot
+        answer can still be a real control -- ``connect_apps`` is one the
+        frontend renders, reachable tool-authored or off-schema. An
+        options-less picker no longer reaches here from either call site
+        (``degrade_options_less_pickers``); if one did, its ``label`` would
+        be the only copy of the question text the run has, which is why this
+        appends rather than replaces.
+        """
+
+        published = list(interactions)
+        if not any(_is_answerable(item) for item in published):
+            appended = dict(DEFAULT_WAITING_INTERACTION)
+            appended["field"] = _unique_field(
+                str(appended["field"]),
+                {
+                    str(item.get("field") or "")
+                    for item in published
+                    if isinstance(item, dict)
+                },
+            )
+            published.append(appended)
+        outbound_message = await runtime.send_message(
+            message=message,
+            message_type=message_type,
+            expect_response=True,
+            visible=visible,
+            metadata={**metadata, "interactions": published},
+        )
+        return outbound_message, published
 
     def _reject_empty_final_answer(
         self, tool_call: dict[str, Any], context: Any
@@ -2669,7 +3769,9 @@ class ReActPattern(AgentPattern):
         )
         self._forget_tool_call_content(tool_call)
 
-    def _discard_pending_tool_plan_after_pause(self, context: Any) -> None:
+    def _discard_pending_tool_plan_after_pause(
+        self, context: Any, *, reason: str | None = None
+    ) -> None:
         """Close unexecuted calls so resume always starts with a fresh LLM plan."""
 
         discarded_calls = self.pending_tool_calls
@@ -2679,7 +3781,8 @@ class ReActPattern(AgentPattern):
         self._cancel_tool_calls(
             discarded_calls,
             context,
-            reason=(
+            reason=reason
+            or (
                 "Discarded because an earlier tool requires user input; "
                 "the agent will replan after the user responds."
             ),
@@ -2743,16 +3846,19 @@ class ReActPattern(AgentPattern):
             deduplicated_request_interactions: list[dict[str, Any]] = []
             for interaction in request_interactions:
                 item = dict(interaction)
-                base_field = str(item.get("field") or "response")
-                field = base_field
-                suffix = 2
-                while field in used_fields:
-                    field = f"{base_field}_{suffix}"
-                    suffix += 1
-                item["field"] = field
-                used_fields.add(field)
-                interactions.append(item)
+                item["field"] = _unique_field(
+                    str(item.get("field") or "response"), used_fields
+                )
                 deduplicated_request_interactions.append(item)
+            # Tool-authored, so there is no model to hand the degraded names
+            # back to; the warning inside is the only signal. Degraded before
+            # the per-request list is recorded on ``requests`` below, so the
+            # structured row (built from those lists) and the published list
+            # agree on what was shown.
+            deduplicated_request_interactions, _ = degrade_options_less_pickers(
+                deduplicated_request_interactions
+            )
+            interactions.extend(deduplicated_request_interactions)
 
             requests.append(
                 {
@@ -2782,12 +3888,21 @@ class ReActPattern(AgentPattern):
             )
             message_type = "question"
 
-        outbound_message = await runtime.send_message(
+        outbound_message, interactions = await self._send_waiting_message(
+            runtime=runtime,
             message=message,
             message_type=message_type,
-            expect_response=True,
-            visible=True,
-            metadata={"interactions": interactions},
+            interactions=interactions,
+            metadata={
+                "tool_calls": [
+                    self._tool_message_source(
+                        self._with_runtime_turn_id(
+                            self._with_runtime_step(tool_call, runtime), runtime
+                        )
+                    )
+                    for tool_call, _ in waiting_pairs
+                ],
+            },
         )
         self.status = "waiting_for_user"
         self.waiting_for_user_request = {
@@ -2845,7 +3960,9 @@ class ReActPattern(AgentPattern):
 
         async def _guarded(tool_call: dict[str, Any]) -> Any:
             async with semaphore:
-                return await self._execute_tool_safely(tool_call, tools, runtime)
+                return await self._execute_tool_safely(
+                    tool_call, tools, runtime, context=context
+                )
 
         raw_results = await asyncio.gather(
             *(_guarded(tool_call) for tool_call in batch),
@@ -2989,14 +4106,54 @@ class ReActPattern(AgentPattern):
 
             if kind == "control":
                 tool_call = segment[0]
-                control_result = await self._handle_control_tool(
+                control_result: dict[str, Any] | None = await self._execute_tool_safely(
                     tool_call,
-                    context,
-                    llm,
+                    tools,
                     runtime,
+                    context=context,
+                    llm=llm,
                 )
                 self.pending_tool_calls = self.pending_tool_calls[1:]
                 self._forget_tool_call_content(tool_call)
+                control_waits_for_user = (
+                    control_result is not None
+                    and control_result.get("status") == "waiting_for_user"
+                )
+                if control_waits_for_user:
+                    # Discard before the checkpoint below persists this state:
+                    # a resume restores pending_tool_calls verbatim, and a
+                    # sibling left in it replays without a fresh LLM plan --
+                    # a stale bundled final_answer even completes the resumed
+                    # turn with zero iterations (#2216). The cancellations
+                    # append tool results, so refresh the waiting request's
+                    # message watermark the way the tool-pause path snapshots
+                    # it after cancelling, keeping an answer-less resume
+                    # parked.
+                    self._discard_pending_tool_plan_after_pause(context)
+                    if self.waiting_for_user_request is not None:
+                        # Rebind rather than mutate: get_state() hands this
+                        # dict out by reference, so a fresh dict keeps any
+                        # state captured earlier from aliasing this update.
+                        # get_state() relies on this being the only way this
+                        # value ever changes, and skips copying it.
+                        self.waiting_for_user_request = {
+                            **self.waiting_for_user_request,
+                            "message_count": len(getattr(context, "messages", [])),
+                        }
+                        if control_result is not None:
+                            # The draft returned by _handle_control_tool was
+                            # built from the pre-discard message count; rebuild
+                            # it so turn_marker matches what an answer-less
+                            # resume re-derives from the persisted request
+                            # (clarification.py documents turn_marker as
+                            # stable for the lifetime of the waiting turn).
+                            control_result["clarification_draft"] = (
+                                draft_from_waiting_request(
+                                    self.waiting_for_user_request,
+                                    execution_id=getattr(context, "execution_id", None),
+                                    step_id=None,
+                                )
+                            )
                 await runtime.checkpoint(
                     str(control_result.get("status", "control_tool"))
                     if control_result is not None
@@ -3009,8 +4166,7 @@ class ReActPattern(AgentPattern):
                     if control_result.get("status") == "completed":
                         self.pending_tool_calls = []
                         return control_result
-                    if control_result.get("status") == "waiting_for_user":
-                        self._discard_pending_tool_plan_after_pause(context)
+                    if control_waits_for_user:
                         return control_result
                 continue
 
@@ -3022,7 +4178,9 @@ class ReActPattern(AgentPattern):
                     pattern=self,
                     metadata={"tool_call": tool_call},
                 )
-                result = await self._execute_tool_safely(tool_call, tools, runtime)
+                result = await self._execute_tool_safely(
+                    tool_call, tools, runtime, context=context
+                )
                 self._backfill_result(tool_call, result, context)
                 self.pending_tool_calls = self.pending_tool_calls[1:]
                 if tool_result_waits_for_user(result):
@@ -3196,14 +4354,43 @@ class ReActPattern(AgentPattern):
                 pattern=self,
                 metadata={**metadata, "decision": decision},
             )
+            # This text lands in the context, not in a per-turn prompt, so
+            # the forced turn that reads it next would otherwise be told to
+            # answer from results a compaction may already have removed.
+            state = tool_evidence_state(context)
+            source_phrase = (
+                "the accumulated conversation and tool results"
+                if state == "intact"
+                else "what this conversation still contains"
+            )
+            if state == "intact":
+                evidence_note = ""
+            elif state == "removed":
+                evidence_note = (
+                    "Compaction has removed tool observations from this run, so "
+                    "some earlier results are no longer readable; do not "
+                    "reconstruct them. "
+                )
+            else:
+                evidence_note = (
+                    "Whether compaction removed tool observations from this run "
+                    "cannot be determined, so do not reconstruct a value you "
+                    "cannot read here. "
+                )
+            shortfall_clause = (
+                "the accumulated results are insufficient or show the "
+                "task is incomplete"
+                if state == "intact"
+                else "what remains is insufficient or shows the task is incomplete"
+            )
             context.add_system_message(
                 "Repeated tool decision completion guidance:\n"
                 "The repeated-tool decision selected final_answer, so the next "
                 "normal ReAct step must produce the final user-facing answer from "
-                "the accumulated conversation and tool results. Do not call more "
+                f"{source_phrase}. {evidence_note}Do not call more "
                 "tools in that final step. Do not send a progress update or promise "
-                "future work as the final answer; if the accumulated results are "
-                "insufficient or show the task is incomplete, say that directly.",
+                f"future work as the final answer; if {shortfall_clause}, "
+                "say that directly.",
                 metadata={
                     "source": "repeated_tool_decision",
                     **metadata,
@@ -3307,20 +4494,38 @@ class ReActPattern(AgentPattern):
             latest_user_text(context) or "",
             limit=400,
         )
+        # This call decides whether the run goes to a forced answer turn at
+        # all, so it must not be asked whether accumulated results suffice
+        # while a compaction has already removed some of them.
+        state = tool_evidence_state(context)
+        completion_clause = (
+            "the accumulated tool results have completed the user's requested work"
+            if state == "intact"
+            else "what this conversation still contains has completed the user's "
+            "requested work"
+        )
+        sufficiency_clause = (
+            "the conversation and accumulated tool results are "
+            "sufficient to answer the latest user request"
+            if state == "intact"
+            else "what this conversation still contains is sufficient to answer "
+            "the latest user request"
+        )
+        evidence_facts_text = evidence_facts(state)
         request_anchor = (
             "Latest user request text:\n"
             f"{current_request or '(unavailable)'}\n\n"
-            "Use this as the controlling request when deciding whether the "
-            "accumulated tool results have completed the user's requested work."
+            "Use this as the controlling request when deciding whether "
+            f"{completion_clause}."
         )
         prompt = (
             f"You must call {REACT_DECISION_TOOL_NAME} exactly once. Decide whether "
             "the current ReAct run should finish or make another work-tool call. "
             f"{request_anchor} "
+            f"{evidence_facts_text}"
             f"You have just made {call_context} action must be "
             f"{REACT_DECISION_FINAL_ANSWER} or {REACT_DECISION_TOOL_CALL}. Choose "
-            f"{REACT_DECISION_FINAL_ANSWER} when the conversation and accumulated "
-            "tool results are sufficient to answer the latest user request. A "
+            f"{REACT_DECISION_FINAL_ANSWER} when {sufficiency_clause}. A "
             "final answer means the latest user request is already completed; if "
             "the next user-facing answer would describe a future tool action or "
             "say work is still in progress, choose tool_call instead. Choose "
@@ -3479,6 +4684,8 @@ class ReActPattern(AgentPattern):
         self.waiting_for_user_request = None
         self.pending_tool_interaction_responses = []
         self.force_final_answer_next = False
+        self.settlement_final_answer_fence = False
+        self.settlement_fence_turn_id = None
         self.status = "completed"
         await runtime.checkpoint("final", context=context, pattern=self)
         result = PatternResult(
@@ -3597,12 +4804,132 @@ class ReActPattern(AgentPattern):
             },
         ).to_dict()
 
+    def _suppressed_duplicate_write_result(
+        self,
+        tool_call: dict[str, Any],
+        tools: list[Any],
+    ) -> dict[str, Any] | None:
+        """Return the suppression envelope when this call repeats a completed write.
+
+        The comparison key is (guard turn id, tool_name, args_hash), each side
+        computed from the same post-transform ``tool_call`` that
+        ``_record_tool_call`` hashes and ``_execute_tool`` executes — so two
+        calls compare equal exactly when their executions would be identical.
+        The turn equality is what makes the guard strictly per-turn: the
+        runner stamps a fresh turn_id on every user message (initial and
+        injected), and ``active_turn_id`` is re-resolved from the latest user
+        message at each pattern start — so an explicit repeat requested in a
+        later turn always executes, while an intra-turn resume of the
+        checkpointed ledger keeps suppressing the replay.
+
+        An ordinary completion is keyed by its original ``turn_id``. A
+        settled row — resumed success, rejection, or unknown dispatch — is
+        keyed by ``settlement_turn_id``, the approval turn that received that
+        outcome, because the original call ran in an earlier turn and would
+        otherwise never compare equal to the model's retry. Rejected and
+        dispatch-unknown rows are guarded although their ``status`` is
+        ``"failed"``: the write must not be repeated either because the user
+        denied it or because it may already have happened. This is the fine
+        half of a defense-in-depth pair with the settlement final-answer fence
+        (see ``_settlement_fence_active``), which blocks work tools wholesale
+        for the same turn. A call with no guard turn id is never guarded:
+        without a turn to scope to, suppression could outlive a turn, so an
+        unknowable turn fails open.
+
+        Serial execution makes the check-then-record window safe for guarded
+        tools: they are non-idempotent by declaration, so
+        ``_tool_is_concurrency_safe`` keeps them out of concurrent batches
+        unless configuration marks a non-idempotent tool concurrency-safe
+        (for MCP tools that flag is connection-level operator config), which
+        contradicts the flag's documented idempotency meaning.
+        """
+        try:
+            tool = self._find_tool(tool_call["name"], tools)
+        except Exception:  # noqa: BLE001 - unknown tool fails in _execute_tool
+            return None
+        if not tool_requires_duplicate_write_guard(tool):
+            return None
+
+        turn_id = self._tool_call_turn_id(tool_call)
+        if turn_id is None:
+            return None
+
+        tool_name = str(tool_call["name"])
+        args_hash = self._args_hash(self._tool_call_args_dict(tool_call))
+        # The caller runs this scan before recording anything for the current
+        # call, so every ledger entry — including one under this call's own
+        # id, which a provider may have reused — belongs to an earlier call.
+        for record in self.tool_ledger.values():
+            guarded_settlement = (
+                record.settlement_status in _GUARDED_SETTLEMENT_STATUSES
+            )
+            if record.status != "completed" and not guarded_settlement:
+                continue
+            guard_turn_id = (
+                record.settlement_turn_id
+                if record.settlement_status in _SETTLED_SETTLEMENT_STATUSES
+                else record.turn_id
+            )
+            if guard_turn_id != turn_id:
+                continue
+            if record.tool_name != tool_name or record.args_hash != args_hash:
+                continue
+            if isinstance(record.result, dict) and record.result.get(
+                DUPLICATE_WRITE_SUPPRESSED_KEY
+            ):
+                # A prior suppression envelope: keep scanning so the model
+                # always gets the genuine execution's result attached. An
+                # envelope CAN precede its genuine record here — load_state
+                # rebuilds the ledger in the checkpoint's stored order, and
+                # _reorder_ledger_for_batch re-appends a batch's records at
+                # the tail, moving a genuine record behind an envelope when a
+                # provider reused its id inside a concurrent batch.
+                continue
+            # The ledger stores the raw execution return, which may still
+            # carry reserved transport keys. add_tool_result only splits
+            # those at the top level, so drop them here — unconditionally,
+            # not via the split helpers, whose scope validation could raise —
+            # or they reach the model as noise nested inside the envelope.
+            # The spill report is one of them: add_tool_result registers it
+            # and keeps it out of the rendered body only at the top level,
+            # so nested here it would print its relative_path in the
+            # envelope's body with no notice. Dropping it loses nothing; the
+            # report was registered when the original call's result was
+            # added.
+            prior_result = record.result
+            if isinstance(prior_result, dict):
+                prior_result = {
+                    key: value
+                    for key, value in prior_result.items()
+                    if key
+                    not in (
+                        CONTEXT_REFS_KEY,
+                        SUPERSEDES_SCOPE_KEY,
+                        SPILL_RESERVED_RESULT_KEY,
+                    )
+                }
+            return build_suppression_envelope(
+                tool_name=tool_name,
+                prior_tool_call_id=record.tool_call_id,
+                prior_result=prior_result,
+                prior_succeeded=record.status == "completed",
+            )
+        return None
+
     async def _execute_tool_safely(
         self,
         tool_call: dict[str, Any],
         tools: list[Any],
         runtime: PatternRuntime,
+        *,
+        context: Any = None,
+        llm: Any = None,
     ) -> Any:
+        """Share invocation preparation and lifecycle cleanup across tool kinds.
+
+        Control handlers retain their scheduling results. Only ordinary tools
+        use the existing tracing, metering and business-error conversion.
+        """
         # Stamp a stable id on the *original* dict before the _with_* transforms
         # (which may return a copy). _record_tool_call only computes a fallback
         # key locally; without writing it back, the key drifts between the
@@ -3612,18 +4939,55 @@ class ReActPattern(AgentPattern):
         # so concurrent batch members get distinct fallback ids.
         if not tool_call.get("id"):
             tool_call["id"] = f"tool_call_{len(self.tool_ledger)}"
+        pending_call = tool_call
         tool_call = self._with_tool_call_content(tool_call)
         tool_call = self._with_runtime_step(tool_call, runtime)
         tool_call = self._with_runtime_turn_id(tool_call, runtime)
-        tool_call = self._with_trace_safe_tool_args(tool_call, tools)
+        is_control = tool_call["name"] in CONTROL_TOOL_NAMES
+        if not is_control:
+            tool_call = self._with_trace_safe_tool_args(tool_call, tools)
+            # The duplicate-write scan runs before this call writes any ledger
+            # record: provider-supplied tool_call ids are not guaranteed
+            # unique (see _run_concurrent_batch), so recording "running" first
+            # would clobber the completed record that is the duplicate's own
+            # evidence when the model reuses the prior call's id. The scan and
+            # the envelope record are synchronous, preserving the
+            # distinct-fallback-id invariant for concurrent batch members.
+            suppressed = self._suppressed_duplicate_write_result(tool_call, tools)
+            if suppressed is not None:
+                # Never overwrite the matched genuine record with the
+                # envelope: on provider id reuse the genuine result must stay
+                # in the ledger so later duplicates still find it.
+                if str(tool_call["id"]) not in self.tool_ledger:
+                    self._record_tool_call(
+                        tool_call, status="completed", result=suppressed
+                    )
+                await runtime.on_tool_start(tool_call=tool_call)
+                await runtime.on_tool_end(tool_call=tool_call, result=suppressed)
+                return suppressed
         self._record_tool_call(tool_call, status="running")
         recorded_terminal = False
         try:
+            if is_control:
+                # Control rejection identifies siblings by pending-object
+                # identity. Pass that original object, not the enriched copy.
+                result = await self._handle_control_tool(
+                    pending_call,
+                    context,
+                    llm,
+                    runtime,
+                    source=self._tool_message_source(tool_call),
+                )
+                recorded_terminal = True
+                return result
             await runtime.on_tool_start(tool_call=tool_call)
             try:
-                result = await runtime.run_tool_call(
-                    lambda: self._execute_tool(tool_call, tools)
-                )
+                with bind_tool_call_execution_context(
+                    self._mcp_gate_execution_context(tool_call, context, runtime)
+                ):
+                    result = await runtime.run_tool_call(
+                        lambda: self._execute_tool(tool_call, tools)
+                    )
             except ToolCallInterrupted as exc:
                 await runtime.on_tool_cancelled(
                     tool_call=tool_call,
@@ -3688,12 +5052,31 @@ class ReActPattern(AgentPattern):
             recorded_terminal = True
             await runtime.on_tool_end(tool_call=tool_call, result=result)
             return result
+        except (ToolCallInterrupted, asyncio.CancelledError) as exc:
+            if (
+                is_control
+                and self.tool_ledger[str(tool_call["id"])].status == "running"
+            ):
+                self._record_tool_call(tool_call, status="interrupted", error=str(exc))
+                recorded_terminal = True
+            raise
+        except Exception as exc:
+            if (
+                is_control
+                and self.tool_ledger[str(tool_call["id"])].status == "running"
+            ):
+                self._record_tool_call(tool_call, status="failed", error=str(exc))
+                recorded_terminal = True
+            raise
         finally:
-            # An infra callback (on_tool_start) can raise before any terminal
-            # record is written. Never leave the ledger stuck at "running": the
-            # consecutive-count walks skip non-terminal records, which would
-            # undercount repeated-tool-decision triggers. The exception still
-            # propagates (serial path) or is captured by the batch gather.
+            # Final-answer handling can record completion before finalization
+            # raises. Preserve that outcome, like an ordinary on_tool_end error.
+            if is_control:
+                recorded_terminal = (
+                    self.tool_ledger[str(tool_call["id"])].status != "running"
+                )
+            # Sends and infra callbacks must propagate without leaving a
+            # running ledger entry or becoming a model-visible business error.
             if not recorded_terminal:
                 self._record_tool_call(
                     tool_call,
@@ -3743,6 +5126,33 @@ class ReActPattern(AgentPattern):
             "dag_step_id": str(step_id),
         }
 
+    @staticmethod
+    def _mcp_gate_execution_context(
+        tool_call: dict[str, Any], context: Any, runtime: PatternRuntime
+    ) -> ToolCallExecutionContext:
+        metadata = getattr(context, "metadata", None)
+        metadata = metadata if isinstance(metadata, dict) else {}
+        dag_step_id = metadata.get("dag_step_id")
+        task_source = metadata.get("task_source")
+        run_id = metadata.get("run_id")
+        return ToolCallExecutionContext(
+            task_source=str(task_source) if task_source else None,
+            task_id=str(
+                getattr(context, "execution_id", None)
+                or getattr(runtime, "execution_id", None)
+                or ""
+            )
+            or None,
+            run_id=str(run_id) if run_id else None,
+            turn_id=str(tool_call.get("turn_id")) if tool_call.get("turn_id") else None,
+            tool_call_id=str(tool_call.get("id") or ""),
+            pattern="dag" if dag_step_id else "react",
+            react_step_id=(
+                str(tool_call.get("step_id")) if tool_call.get("step_id") else None
+            ),
+            dag_step_id=str(dag_step_id) if dag_step_id else None,
+        )
+
     def _with_runtime_turn_id(
         self, tool_call: dict[str, Any], runtime: PatternRuntime
     ) -> dict[str, Any]:
@@ -3787,6 +5197,8 @@ class ReActPattern(AgentPattern):
         status: str,
         result: Any = None,
         error: str | None = None,
+        settlement_status: str | None = None,
+        settlement_turn_id: str | None = None,
     ) -> None:
         tool_call_id = str(tool_call.get("id") or f"tool_call_{len(self.tool_ledger)}")
         args = self._tool_call_args_dict(tool_call)
@@ -3799,7 +5211,18 @@ class ReActPattern(AgentPattern):
             status=status,
             result=result,
             error=error,
+            settlement_status=settlement_status,
+            turn_id=self._tool_call_turn_id(tool_call),
+            settlement_turn_id=(
+                str(settlement_turn_id) if settlement_turn_id else None
+            ),
+            step_id=(str(tool_call["step_id"]) if tool_call.get("step_id") else None),
         )
+
+    @staticmethod
+    def _tool_call_turn_id(tool_call: dict[str, Any]) -> str | None:
+        raw_turn_id = tool_call.get("turn_id")
+        return str(raw_turn_id) if raw_turn_id else None
 
     def _args_hash(self, args: dict[str, Any]) -> str:
         try:
