@@ -3601,3 +3601,32 @@ class TestCreateAndCallAgent:
                 os.remove(db_path)
             except OSError:
                 pass
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", ["start", "end", "error"])
+async def test_delegation_summary_fact_failure_is_strict(status):
+    from xagent.core.agent.checkpoint import ExecutionEventPersistenceError
+    from xagent.core.agent.trace import Tracer
+
+    failure = ExecutionEventPersistenceError("uncertain delegation fact")
+    writer = AsyncMock(side_effect=failure)
+    tracer = Tracer()
+    tracer.event_writer = writer
+    observer = AsyncMock()
+    tracer.add_handler(observer)
+    tool = AgentTool(
+        agent_id=17,
+        agent_name="child",
+        agent_description="child",
+        session_factory=None,
+        user_id=1,
+        parent_tracer=tracer,
+        parent_task_id=1,
+        runtime_metadata={"workforce": True},
+    )
+    with pytest.raises(ExecutionEventPersistenceError) as caught:
+        await tool._trace_delegation(status, execution_task_id="child-1")
+    assert caught.value is failure
+    writer.assert_awaited_once()
+    observer.handle_event.assert_not_awaited()

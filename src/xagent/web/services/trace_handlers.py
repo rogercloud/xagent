@@ -1075,7 +1075,6 @@ class DatabaseTraceHandler(BaseTraceHandler):
                             Task.run_id == lease.run_id,
                             Task.status == TaskStatus.RUNNING,
                         )
-                        .with_for_update()
                         .first()
                     )
                     if owned is None:

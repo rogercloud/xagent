@@ -2165,6 +2165,8 @@ class AgentTool(AbstractBaseTool):
             )
             if inspect.isawaitable(result):
                 await result
+        except ExecutionEventPersistenceError:
+            raise
         except Exception:
             logger.debug("Failed to emit workforce delegation trace", exc_info=True)
 

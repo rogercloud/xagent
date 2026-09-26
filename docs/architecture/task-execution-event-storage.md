@@ -56,12 +56,13 @@ repeated. This conservative block is intentional during the writer-only stage.
 
 Appends and pre-append attempt decisions use the same task-row UPDATE lock,
 including on SQLite. This serializes sequence allocation, replay and rollback.
-Delivery writers acquire the task lock before the message update to preserve
-lock order. Runtime and outbound writes reject a replaced bound lease.
+Delivery writers acquire the task lock before inspecting or updating the
+message, preserving one delivery owner when a concurrent claim reuses a fact. Runtime and outbound writes reject a replaced bound lease.
 
 The temporary chat projection has a nullable, unique `execution_event_id`.
 Legacy rows keep NULL; replaying one canonical message produces one compatible
-chat row. Final assistant message keys include run and state-version identity.
+chat row. Final assistant message and settlement keys include run and
+state-version identity, so repeated pauses within one run remain distinct.
 No table independently chooses authoritative message content on the new path.
 
 `load_task_execution_events` requires task and scope, and reads by sequence

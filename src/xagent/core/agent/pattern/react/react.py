@@ -2680,7 +2680,7 @@ class ReActPattern(AgentPattern):
         runtime: PatternRuntime,
         data: dict[str, Any],
     ) -> None:
-        """Write one settlement trace event, matching runtime's best-effort rule."""
+        """Persist settlement facts strictly and deliver observers best-effort."""
 
         execution_id = getattr(runtime, "execution_id", None)
         step_id = getattr(runtime, "active_react_step_id", None)
@@ -2693,6 +2693,8 @@ class ReActPattern(AgentPattern):
             )
             if inspect.isawaitable(emitted):
                 await emitted
+        except ExecutionEventPersistenceError:
+            raise
         except Exception:
             # UI trace events are best-effort, exactly as in
             # PatternRuntime._emit_trace_event; a tracer fault must not undo a

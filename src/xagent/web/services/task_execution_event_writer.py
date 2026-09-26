@@ -148,7 +148,7 @@ def stage_result_fact_no_commit(
             db,
             task_id=int(task.id),
             kind="execution_settled",
-            key=f"result:{task.run_id}:{task.status.value}",
+            key=f"result:{task.run_id}:{task.state_version}:{task.status.value}",
             run_id=cast(str | None, task.run_id),
             payload={"status": task.status.value, "result": result},
         )

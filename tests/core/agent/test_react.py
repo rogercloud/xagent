@@ -11096,3 +11096,50 @@ def test_react_get_state_is_unaffected_by_later_pop() -> None:
     assert [
         entry["interaction_id"] for entry in state["pending_tool_interaction_responses"]
     ] == ["i1", "i2"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failed_action", ["start", "end", "error"])
+async def test_resumed_settlement_fact_failure_stops_delivery(
+    failed_action: str, mocker: Any
+) -> None:
+    from xagent.core.agent.checkpoint import ExecutionEventPersistenceError
+    from xagent.core.agent.trace import Tracer
+
+    tracer = Tracer()
+    attempted: list[str] = []
+
+    async def write_fact(event: Any) -> None:
+        action = event.event_type.action.value
+        attempted.append(action)
+        if action == failed_action:
+            raise ExecutionEventPersistenceError("settlement fact commit uncertain")
+
+    tracer.event_writer = write_fact
+    pattern = ReActPattern()
+    pattern.pending_tool_interaction_responses = [
+        {
+            "tool_name": "approval_gate",
+            "tool_call_id": "call-1",
+            "interaction_id": "interaction-1",
+            "response": "Approve",
+        }
+    ]
+    pattern.tool_ledger["call-1"] = _waiting_ledger_record("call-1")
+    context = ExecutionContext(execution_id="settlement-fact-failure")
+    context.add_tool_result(
+        "approval_gate", {"success": False, "status": "waiting_for_user"}, "call-1"
+    )
+    settlement = ToolInteractionSettlement(
+        status="failed" if failed_action == "error" else "succeeded",
+        result={"success": failed_action != "error"},
+    )
+    runtime = PatternRuntime(tracer=tracer)
+    mocker.patch.object(runtime, "checkpoint", new_callable=mocker.AsyncMock)
+    with pytest.raises(ExecutionEventPersistenceError, match="settlement fact"):
+        await pattern._deliver_pending_tool_interaction_responses(
+            tools=[SettlementApprovalTool(resume_result=settlement)],
+            context=context,
+            runtime=runtime,
+        )
+    assert attempted[-1] == failed_action

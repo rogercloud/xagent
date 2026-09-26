@@ -608,3 +608,229 @@ async def test_outbound_question_preserves_source_identity_in_atomic_projection(
         assert row.execution_event_id == event.event_id
         assert event.payload["source_event_id"] == "question-event"
         assert db.query(TraceEvent).one().event_id == "question-event"
+
+
+@pytest.mark.parametrize("status", [TaskStatus.PAUSED, TaskStatus.WAITING_FOR_USER])
+def test_repeated_resting_settlements_keep_distinct_facts_in_same_run(
+    canonical, status
+):
+    from xagent.web.services.task_execution_event_writer import (
+        stage_result_fact_no_commit,
+    )
+
+    factory, task_id = canonical
+    with factory() as db:
+        lease = acquire_task_lease(db, task_id, new_run=True)
+        run_id = lease.run_id
+        for index in range(2):
+            if index:
+                lease = acquire_task_lease(db, task_id, expected_run_id=run_id)
+            assert lease.run_id == run_id
+            result = {"output": f"rest {index}"}
+            assert finalize_managed_task_lease_result(
+                db,
+                lease,
+                status=status,
+                assistant_content=result["output"],
+                execution_result=result,
+            )
+            # Replaying the same settlement keeps its original identity.
+            stage_result_fact_no_commit(db, db.get(Task, task_id), result)
+            db.commit()
+        settled = [e for e in facts(db, task_id) if e.kind == "execution_settled"]
+        assert len(settled) == 2
+        assert [e.payload["result"]["output"] for e in settled] == ["rest 0", "rest 1"]
+        assert db.query(TaskChatMessage).count() == 2
+        assert db.get(Task, task_id).runner_id is None
+
+
+@pytest.mark.parametrize("committing", [False, True])
+def test_racing_message_claim_has_only_one_delivery_owner(
+    canonical, engine, committing
+):
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Event, current_thread
+
+    from xagent.web.services.chat_history_service import (
+        claim_user_message_delivery,
+        claim_user_message_delivery_no_commit,
+    )
+
+    factory, task_id = canonical
+    waiting = Event()
+
+    def before_execute(connection, cursor, statement, parameters, context, many):
+        if (
+            current_thread().name.startswith("second-claim")
+            and "UPDATE tasks" in statement
+            and "conversation_event_sequence" in statement
+        ):
+            waiting.set()
+
+    sa.event.listen(engine, "before_cursor_execute", before_execute)
+    try:
+        with (
+            factory() as winner,
+            ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix="second-claim"
+            ) as pool,
+        ):
+            user_id = winner.get(Task, task_id).user_id
+            first = claim_user_message_delivery_no_commit(
+                winner, task_id, user_id, "one input", turn_id="same-turn"
+            )
+            assert first.claimed
+
+            def second_claim():
+                with factory() as db:
+                    claim = (
+                        claim_user_message_delivery
+                        if committing
+                        else claim_user_message_delivery_no_commit
+                    )(db, task_id, user_id, "one input", turn_id="same-turn")
+                    result = claim.claimed, claim.payload_matches
+                    db.commit()
+                    return result
+
+            future = pool.submit(second_claim)
+            try:
+                assert waiting.wait(5), "second claimant did not reach the task lock"
+            finally:
+                winner.commit()
+            assert future.result(timeout=5) == (False, True)
+        with factory() as db:
+            assert db.query(TaskChatMessage).count() == 1
+            assert (
+                len([e for e in facts(db, task_id) if e.kind == "input_accepted"]) == 1
+            )
+    finally:
+        sa.event.remove(engine, "before_cursor_execute", before_execute)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failed_action", [TraceAction.START, TraceAction.END])
+async def test_compaction_fact_failure_does_not_fall_back_or_mutate_context(
+    failed_action,
+):
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+
+    from xagent.core.agent.trace import Tracer
+
+    failure = ExecutionEventPersistenceError("one uncertain compaction fact")
+    written = []
+
+    async def writer(event):
+        written.append(event)
+        if (
+            event.event_type.category == TraceCategory.LLM
+            and event.event_type.action == failed_action
+        ):
+            raise failure
+
+    tracer = Tracer()
+    tracer.event_writer = writer
+    runtime = PatternRuntime(tracer=tracer)
+    context = SimpleNamespace(
+        execution_id="compaction",
+        messages=["preserve"],
+        metadata={},
+        build_llm_compact_request_if_needed=Mock(
+            return_value={"messages": [], "max_tokens": 100, "metadata": {}}
+        ),
+        compact_with_llm_response=Mock(),
+        compact_if_needed=Mock(),
+    )
+    llm = SimpleNamespace(chat=AsyncMock(return_value={"content": "summary"}))
+    with pytest.raises(ExecutionEventPersistenceError) as caught:
+        await runtime.compact_context_if_needed(context=context, llm=llm)
+    assert caught.value is failure
+    context.compact_if_needed.assert_not_called()
+    context.compact_with_llm_response.assert_not_called()
+    assert context.messages == ["preserve"]
+    assert len(written) == (1 if failed_action == TraceAction.START else 2)
+
+
+@pytest.mark.postgresql
+def test_trace_fact_and_command_acceptance_do_not_deadlock(canonical, engine):
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Event, current_thread
+
+    from xagent.core.agent.trace import TraceEvent as CoreTraceEvent
+    from xagent.web.services.task_command_transport import (
+        TaskCommandKind,
+        enqueue_task_command,
+    )
+    from xagent.web.services.task_lease_service import bind_task_lease_context
+
+    if engine.dialect.name != "postgresql":
+        pytest.skip("PostgreSQL foreign-key row locks")
+    factory, task_id = canonical
+    with factory() as db:
+        lease = acquire_task_lease(db, task_id, new_run=True)
+        user_id = db.get(Task, task_id).user_id
+    trace_locked = Event()
+    command_waiting = Event()
+
+    def after_execute(connection, cursor, statement, parameters, context, many):
+        if (
+            current_thread().name.startswith("trace-fact")
+            and "UPDATE tasks" in statement
+            and not trace_locked.is_set()
+        ):
+            trace_locked.set()
+            assert command_waiting.wait(5)
+
+    def before_execute(connection, cursor, statement, parameters, context, many):
+        if (
+            current_thread().name.startswith("accept-command")
+            and "UPDATE tasks" in statement
+            and "conversation_event_sequence" in statement
+        ):
+            # The command INSERT has already acquired the task FK KEY SHARE.
+            command_waiting.set()
+
+    def write_trace():
+        with factory() as db, bind_task_lease_context(lease):
+            db.execute(sa.text("SET LOCAL lock_timeout = '5s'"))
+            ExecutionEventTraceAdapter(task_id)._save_trace_event(
+                db,
+                CoreTraceEvent(
+                    TraceEventType(
+                        TraceScope.TASK, TraceAction.START, TraceCategory.GENERAL
+                    ),
+                    task_id=str(task_id),
+                ),
+            )
+            db.commit()
+
+    def accept_command():
+        assert trace_locked.wait(5)
+        with factory() as db:
+            db.execute(sa.text("SET LOCAL lock_timeout = '5s'"))
+            enqueue_task_command(
+                db,
+                task_id=task_id,
+                actor_user_id=user_id,
+                command_id="concurrent-command",
+                kind=TaskCommandKind.RESUME,
+                payload={},
+            )
+
+    sa.event.listen(engine, "after_cursor_execute", after_execute)
+    sa.event.listen(engine, "before_cursor_execute", before_execute)
+    try:
+        with (
+            ThreadPoolExecutor(max_workers=1, thread_name_prefix="trace-fact") as writers,
+            ThreadPoolExecutor(max_workers=1, thread_name_prefix="accept-command") as commands,
+        ):
+            writer = writers.submit(write_trace)
+            command = commands.submit(accept_command)
+            writer.result(timeout=10)
+            command.result(timeout=10)
+        with factory() as db:
+            assert len(facts(db, task_id)) == 2
+            assert db.query(TraceEvent).count() == 1
+    finally:
+        sa.event.remove(engine, "after_cursor_execute", after_execute)
+        sa.event.remove(engine, "before_cursor_execute", before_execute)

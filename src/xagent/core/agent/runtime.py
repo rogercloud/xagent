@@ -1716,7 +1716,7 @@ class PatternRuntime:
                                 "llm_summary_unusable": True,
                                 **request_metadata,
                             }
-                    except LLMCallInterrupted:
+                    except (LLMCallInterrupted, ExecutionEventPersistenceError):
                         raise
                     except Exception as exc:  # noqa: BLE001
                         await self.on_llm_error(

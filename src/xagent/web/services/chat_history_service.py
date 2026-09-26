@@ -189,8 +189,15 @@ def claim_user_message_delivery(
     The unique database index is the cross-worker serializer. A concurrent
     loser rolls back its insert and returns the winner's durable row, so only
     the claimant may inject the message into an active runtime.
+    Event-backed claims lock the task before checking for an existing row,
+    so projection reuse cannot turn a replay into a second delivery owner.
     """
 
+    from .task_execution_event_store import lock_task_execution_events_no_commit
+    from .task_execution_event_writer import uses_execution_events
+
+    if uses_execution_events(db, task_id):
+        lock_task_execution_events_no_commit(db, task_id)
     existing = inspect_user_message_delivery(
         db,
         task_id,
@@ -247,6 +254,11 @@ def claim_user_message_delivery_no_commit(
 ) -> UserMessageDeliveryClaim:
     """Stage a delivery claim without committing the caller's transaction."""
 
+    from .task_execution_event_store import lock_task_execution_events_no_commit
+    from .task_execution_event_writer import uses_execution_events
+
+    if uses_execution_events(db, task_id):
+        lock_task_execution_events_no_commit(db, task_id)
     existing = inspect_user_message_delivery(
         db,
         task_id,
