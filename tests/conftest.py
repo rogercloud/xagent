@@ -5,6 +5,7 @@ import os
 # In Python 3.11, pathlib.Path doesn't have _flavour but PosixPath does
 # This is needed for pytest internal usage
 import pathlib
+import sys
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Iterator
@@ -291,6 +292,36 @@ def isolate_execution_scope_hooks() -> Iterator[None]:
     yield
     set_execution_scope_resolver(None)
     set_execution_scope_snapshot_loader(None)
+
+
+def _reset_task_keyed_process_state() -> None:
+    # Only modules a test already imported can hold state; importing the web
+    # stack here would slow every core-only test.
+    manager_module = sys.modules.get("xagent.core.agent.context.manager")
+    if manager_module is not None:
+        manager = manager_module.ContextManager()
+        for context in manager.list_active_contexts():
+            manager.remove_context(context.execution_id)
+    task_execution = sys.modules.get("xagent.web.services.task_execution")
+    if task_execution is not None:
+        task_execution._pause_accepted_task_ids.clear()
+
+
+@pytest.fixture(autouse=True, scope="function")
+def isolate_task_keyed_process_state() -> Iterator[None]:
+    """Clear process-wide state keyed by task/execution id around every test.
+
+    Each test's database numbers tasks from 1 again, so an entry a test leaves
+    behind is picked up by the next test on the same worker as if it were its
+    own task: a fenced or finished ``ContextManager`` context becomes the
+    "cached" context of an unrelated injection, and a leaked pause-accepted id
+    routes an unrelated message into the pause-drain branch. Which test pairs
+    collide depends on how xdist distributes files, so these leaks surface as
+    order-dependent failures far from the test that caused them.
+    """
+    _reset_task_keyed_process_state()
+    yield
+    _reset_task_keyed_process_state()
 
 
 @pytest.fixture(autouse=True, scope="function")
