@@ -221,6 +221,9 @@ def test_missing_identity_must_never_renew(scenario, field):
 def inline_db_io(monkeypatch):
     """Keep fake-clock scheduling tests independent of thread-pool latency.
 
+    Only for stubs that return immediately; blocking stubs must keep the
+    worker boundary to avoid stalling the event loop.
+
     Tests of real locks, in-flight replacement and cancellation deliberately
     keep the production database worker boundary instead.
     """
