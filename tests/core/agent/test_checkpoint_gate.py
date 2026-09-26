@@ -250,6 +250,32 @@ async def test_checkpoint_without_execution_context_keeps_existing_payload() -> 
 
 
 @pytest.mark.asyncio
+async def test_failing_stall_timer_still_releases_the_gate() -> None:
+    gate = context_checkpoint_gate(ExecutionContext(execution_id="timer-fails"))
+    loop = asyncio.get_running_loop()
+
+    def refuse(*_args, **_kwargs):
+        raise RuntimeError("timer unavailable")
+
+    loop.call_later = refuse  # type: ignore[method-assign]
+    try:
+        with pytest.raises(RuntimeError, match="timer unavailable"):
+            async with gate.exclusive("timer-fails"):
+                pytest.fail("the section must not run without its stall timer")
+    finally:
+        del loop.call_later
+
+    async def acquire_both() -> None:
+        async with gate.shared():
+            pass
+        async with gate.exclusive():
+            pass
+
+    # Released: both kinds of acquisition proceed instead of waiting forever.
+    await asyncio.wait_for(acquire_both(), 1)
+
+
+@pytest.mark.asyncio
 async def test_long_exclusive_hold_is_reported_but_never_interrupted(
     monkeypatch, caplog
 ) -> None:

@@ -530,20 +530,10 @@ class _ContextCheckpointGate:
         Never timed out (see ``get_checkpoint_gate_stall_warning_seconds``):
         a long hold is reported while it lasts and measured on release.
         """
-        self._writers_waiting += 1
-        try:
-            while self._exclusive or self._shared:
-                await self._wait()
-            self._exclusive = True
-        finally:
-            self._writers_waiting -= 1
-            # A cancelled writer may have been the only reason new shared
-            # acquisitions were blocked, even while other readers remain.
-            if not self._exclusive:
-                self._wake()
+        # Resolve everything that can fail before acquiring, so nothing runs
+        # between taking the gate and the ``finally`` that releases it.
         loop = asyncio.get_running_loop()
         interval = get_checkpoint_gate_stall_warning_seconds()
-        started = time.monotonic()
         stall: list[asyncio.TimerHandle] = []
 
         def report_stall() -> None:
@@ -555,11 +545,24 @@ class _ContextCheckpointGate:
             )
             stall[0] = loop.call_later(interval, report_stall)
 
-        stall.append(loop.call_later(interval, report_stall))
+        self._writers_waiting += 1
         try:
+            while self._exclusive or self._shared:
+                await self._wait()
+            self._exclusive = True
+        finally:
+            self._writers_waiting -= 1
+            # A cancelled writer may have been the only reason new shared
+            # acquisitions were blocked, even while other readers remain.
+            if not self._exclusive:
+                self._wake()
+        started = time.monotonic()
+        try:
+            stall.append(loop.call_later(interval, report_stall))
             yield
         finally:
-            stall[0].cancel()
+            if stall:
+                stall[0].cancel()
             self._exclusive = False
             self._wake()
             observe_value(
