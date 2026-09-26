@@ -298,18 +298,27 @@ def _reset_task_keyed_process_state() -> None:
     # Only modules a test already imported can hold state; importing the web
     # stack here would slow every core-only test.
     manager_module = sys.modules.get("xagent.core.agent.context.manager")
-    if manager_module is not None:
+    if (
+        manager_module is not None
+        and manager_module.ContextManager._instance is not None
+    ):
         manager = manager_module.ContextManager()
         for context in manager.list_active_contexts():
             manager.remove_context(context.execution_id)
     task_execution = sys.modules.get("xagent.web.services.task_execution")
     if task_execution is not None:
         task_execution._pause_accepted_task_ids.clear()
+    connector_runtime = sys.modules.get("xagent.web.services.connector_runtime")
+    if connector_runtime is not None:
+        # Keyed by turn id, which is the client message id when one is sent.
+        with connector_runtime._EPHEMERAL_RUNTIME_VALUES_LOCK:
+            connector_runtime._EPHEMERAL_RUNTIME_VALUES.clear()
+            connector_runtime._EPHEMERAL_RUNTIME_MANIFESTS.clear()
 
 
 @pytest.fixture(autouse=True, scope="function")
 def isolate_task_keyed_process_state() -> Iterator[None]:
-    """Clear process-wide state keyed by task/execution id around every test.
+    """Clear process-wide state keyed by task, execution or turn id around every test.
 
     Each test's database numbers tasks from 1 again, so an entry a test leaves
     behind is picked up by the next test on the same worker as if it were its
