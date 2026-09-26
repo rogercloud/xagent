@@ -714,6 +714,10 @@ class AgentRunner:
                     raise CheckpointCorruptError(
                         "Stored checkpoint carries no execution context to restore."
                     )
+                # Migrate the payload before copying from it, so the restored
+                # context sees every change whatever the migration rewrites.
+                reset_output_language_to_request_context(checkpoint)
+                cold_start_checkpoint = checkpoint
                 context_data = checkpoint["context"]
                 stored_id = context_data.get("execution_id")
                 if not stored_id:
@@ -724,8 +728,6 @@ class AgentRunner:
                     raise CheckpointCorruptError(
                         "Stored checkpoint context belongs to a different execution."
                     )
-                cold_start_checkpoint = checkpoint
-                reset_output_language_to_request_context(checkpoint)
                 context = ExecutionContext.from_dict(context_data)
                 warn_restored_compact_threshold(
                     context, getattr(self.agent, "llm", None)

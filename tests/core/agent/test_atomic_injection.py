@@ -773,6 +773,39 @@ async def test_cold_start_adopts_the_lookup_id_when_the_checkpoint_has_none():
 
 
 @pytest.mark.asyncio
+async def test_cold_start_without_an_id_still_drops_a_derived_output_language():
+    from xagent.core.agent.language import (
+        OUTPUT_LANGUAGE_METADATA_KEY,
+        OUTPUT_LANGUAGE_SOURCE_METADATA_KEY,
+    )
+
+    checkpoint = _cold_checkpoint(None)
+    checkpoint["context"]["metadata"] = {
+        OUTPUT_LANGUAGE_METADATA_KEY: "fr",
+        OUTPUT_LANGUAGE_SOURCE_METADATA_KEY: "detected",
+    }
+    manager = ContextManager()
+    manager._contexts.clear()
+    tracer = SimpleNamespace(
+        load_latest_checkpoint=_yielding_reader(checkpoint),
+        checkpoint=AsyncMock(),
+    )
+    runner = AgentRunner(
+        SimpleNamespace(llm=None), tracer=tracer, context_manager=manager
+    )
+    try:
+        result = await asyncio.wait_for(
+            runner.inject_user_message("cold", "new", turn_id="turn"), 5
+        )
+        # The id is filled in on a copy; the migration must still reach it.
+        assert result.context.execution_id == "cold"
+        assert OUTPUT_LANGUAGE_METADATA_KEY not in result.context.metadata
+        assert OUTPUT_LANGUAGE_SOURCE_METADATA_KEY not in result.context.metadata
+    finally:
+        manager._contexts.clear()
+
+
+@pytest.mark.asyncio
 async def test_cold_start_rejects_a_checkpoint_of_another_execution():
     from xagent.core.agent.checkpoint import CheckpointCorruptError
 
