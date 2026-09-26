@@ -355,6 +355,7 @@ async def test_unknown_reply_returns_original_identity_without_reinjection(
     from xagent.core.agent.runner import UserMessageInjectionOutcome
 
     post = AsyncMock(return_value=UserMessageInjectionOutcome.POSTED_FRESH)
+    cancelled_tasks: list[asyncio.Task] = []
     if failure == "unknown_result":
         post.return_value = UserMessageInjectionOutcome.OUTCOME_UNKNOWN
     elif failure in {"during_post", "guard_cancel"}:
@@ -390,6 +391,7 @@ async def test_unknown_reply_returns_original_identity_without_reinjection(
 
             async def cancel_at_child_completion(operation, heartbeat):
                 parent = asyncio.current_task()
+                cancelled_tasks.append(parent)
 
                 async def child():
                     value = await operation
@@ -418,15 +420,25 @@ async def test_unknown_reply_returns_original_identity_without_reinjection(
         await eventually(lambda: _has_pending(ctx.task_id))
         command = await claim(ctx.task_id)
         await task_command_execution.execute_durable_task_command(command)
+        if failure == "guard_cancel":
+            # The real resume_task_reply / resume_a2a_task call site settled
+            # the cancellation as unknown and consumed the request.
+            assert len(cancelled_tasks) == 1
+            assert cancelled_tasks[0].cancelling() == 0
         with pytest.raises(task_resume.TaskResumeOutcomeUnknownError) as unknown:
             await asyncio.wait_for(request, 10)
         assert unknown.value.command_id == ctx.command_id
-        assert (
-            task_resume_command._read_reply_outcome(command.id)["outcome"] == "unknown"
-        )
+        stored = task_resume_command._read_reply_outcome(command.id)
+        assert stored["outcome"] == "unknown"
         with pytest.raises(task_resume.TaskResumeOutcomeUnknownError):
             await reply(TaskStatus.RUNNING)
         post.assert_awaited_once()
+        if failure not in {"after_post", "guard_cancel"}:
+            # The reply outcome precedes the coordinator's asynchronous idle
+            # release. Observe that release without forcing coordinator shutdown.
+            await eventually(
+                lambda: task_completion._is_run_finished(ctx.task_id, stored["run_id"])
+            )
         with get_session_local()() as db:
             task = db.get(Task, ctx.task_id)
             if failure in {"after_post", "guard_cancel"}:
@@ -825,6 +837,9 @@ async def test_proven_absent_reply_replays_retry_with_new_id_for_same_identity(
         stored = task_resume_command._read_reply_outcome(command.id)
         assert stored["outcome"] == "busy"
         assert stored["retry_with_new_id"] is True
+        await eventually(
+            lambda: task_completion._is_run_finished(ctx.task_id, stored["run_id"])
+        )
         with get_session_local()() as db:
             task = db.get(Task, ctx.task_id)
             assert task.status == TaskStatus.WAITING_FOR_USER

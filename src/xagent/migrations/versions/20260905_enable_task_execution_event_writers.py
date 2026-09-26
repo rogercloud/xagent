@@ -4,7 +4,7 @@ import sqlalchemy as sa
 from alembic import op
 
 revision = "20260905_execution_event_writers"
-down_revision = "20260925_task_cleanup_obligations"
+down_revision = "20260916_durable_create_operations"
 branch_labels = None
 depends_on = None
 

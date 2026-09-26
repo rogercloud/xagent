@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import threading
 from collections.abc import Callable
 from datetime import datetime, timedelta, timezone
@@ -3892,7 +3893,38 @@ async def test_execute_resume_background_rejects_owner_mismatch(db_session) -> N
     ]
     assert task_errors[0]["message"] == websocket_api.CLIENT_SAFE_TASK_FAILURE
     assert task_errors[0]["error"] == websocket_api.CLIENT_SAFE_TASK_FAILURE
-    assert str(int(owner.id) + 999) not in repr(task_errors[0])
+    assert not _mentions_number(task_errors[0], int(owner.id) + 999)
+
+
+def _mentions_number(payload: Any, number: int) -> bool:
+    """Whether ``number`` appears as a value or a whole token in ``payload``.
+
+    A substring search over ``repr(payload)`` also matches digits inside
+    unrelated values, such as the event's float timestamp, so it fails
+    intermittently.
+    """
+    if isinstance(payload, bool):
+        return False
+    if isinstance(payload, int):
+        return payload == number
+    if isinstance(payload, str):
+        return re.search(rf"(?<!\d){number}(?!\d)", payload) is not None
+    if isinstance(payload, dict):
+        return any(
+            _mentions_number(key, number) or _mentions_number(value, number)
+            for key, value in payload.items()
+        )
+    if isinstance(payload, (list, tuple, set)):
+        return any(_mentions_number(item, number) for item in payload)
+    return False
+
+
+def test_mentions_number_ignores_digits_inside_other_values() -> None:
+    # The CI timestamp that made a repr() substring check report a leak.
+    assert not _mentions_number({"timestamp": 1790404311.310002}, 1000)
+    assert not _mentions_number({"message": "task 51000 failed"}, 1000)
+    assert _mentions_number({"message": "owner 1000 mismatch"}, 1000)
+    assert _mentions_number({"details": [{"owner_id": 1000}]}, 1000)
 
 
 @pytest.mark.asyncio
@@ -4215,12 +4247,44 @@ async def test_resume_failure_rejection_redacts_exception_text(db_session) -> No
     assert secret not in repr(rejected[0])
 
 
+def _fenced_live_runner(execution_id: str):
+    """A real runner whose live context is fenced by an earlier unknown write."""
+    from xagent.core.agent.context import ContextManager
+    from xagent.core.agent.context.execution import context_checkpoint_gate
+    from xagent.core.agent.runner import AgentRunner
+
+    manager = ContextManager()
+    manager._contexts.clear()
+    context = manager.create_context(execution_id)
+    context.add_user_message("original")
+    context_checkpoint_gate(context).injection_uncertain = True
+    tracer = SimpleNamespace(
+        load_latest_checkpoint=AsyncMock(return_value=None), checkpoint=AsyncMock()
+    )
+    runner = AgentRunner(
+        SimpleNamespace(llm=None), tracer=tracer, context_manager=manager
+    )
+    # The fenced run is still active, so the fence rejects instead of evicting.
+    runner._active_controls[execution_id] = SimpleNamespace(
+        runtime=SimpleNamespace(last_checkpoint=None, request_interrupt=lambda *_: None)
+    )
+    return runner, manager
+
+
+def _injecting_through(runner):
+    async def post_user_message(execution_id, **kwargs):
+        result = await runner.inject_user_message(execution_id, **kwargs)
+        assert result.outcome is UserMessageInjectionOutcome.REJECTED_RETRYABLE
+        runner.tracer.checkpoint.assert_not_awaited()
+        return result.outcome
+
+    return post_user_message
+
+
 @pytest.mark.asyncio
 async def test_deferred_injection_rejected_by_fence_pauses_without_resuming(
     db_session,
 ) -> None:
-    from xagent.core.agent.runner import _record_injection_outcome
-
     owner = _user(db_session, "owner")
     task = _task(db_session, owner.id, status=TaskStatus.PAUSED)
     db_session.add(
@@ -4236,41 +4300,51 @@ async def test_deferred_injection_rejected_by_fence_pauses_without_resuming(
     )
     db_session.commit()
 
-    async def post_user_message(*_args, **_kwargs):
-        _record_injection_outcome(UserMessageInjectionOutcome.REJECTED_RETRYABLE)
-        return UserMessageInjectionOutcome.REJECTED_RETRYABLE
-
+    runner, manager = _fenced_live_runner(str(task.id))
     agent = MagicMock(
-        post_user_message=AsyncMock(side_effect=post_user_message),
+        post_user_message=AsyncMock(side_effect=_injecting_through(runner)),
         resume_execution_by_id=AsyncMock(),
     )
     ws_manager = MagicMock(
         broadcast_to_task=AsyncMock(),
         send_personal_message=AsyncMock(),
     )
+    published = AsyncMock()
 
-    with (
-        patch("xagent.web.api.websocket.manager", ws_manager),
-        patch(
-            "xagent.web.services.task_execution.background_task_manager.promote_resume_task"
-        ),
-    ):
-        await execute_resume_background(
-            task_id=int(task.id),
-            agent_service=agent,
-            task_owner_user_id=int(owner.id),
-            pending_user_message={
-                "execution_message": "Deferred guidance",
-                "display_message": "Deferred guidance",
-                "files": [],
-                "turn_id": "deferred-fenced-reject",
-            },
-            delivery_turn_id="deferred-fenced-reject",
-            delivery_notifier=make_delivery_notifier(
-                _make_command_reply(MagicMock()), "deferred-fenced-reject"
+    try:
+        with (
+            patch("xagent.web.api.websocket.manager", ws_manager),
+            patch(
+                "xagent.web.services.task_execution.background_task_manager.promote_resume_task"
             ),
-        )
+            patch("xagent.web.services.task_events.publish_task_event", published),
+        ):
+            await execute_resume_background(
+                task_id=int(task.id),
+                agent_service=agent,
+                task_owner_user_id=int(owner.id),
+                pending_user_message={
+                    "execution_message": "Deferred guidance",
+                    "display_message": "Deferred guidance",
+                    "files": [],
+                    "turn_id": "deferred-fenced-reject",
+                },
+                delivery_turn_id="deferred-fenced-reject",
+                delivery_notifier=make_delivery_notifier(
+                    _make_command_reply(MagicMock()), "deferred-fenced-reject"
+                ),
+            )
+    finally:
+        manager._contexts.clear()
 
+    paused = [
+        call.args[0]
+        for call in published.await_args_list
+        if call.args[0].get("type") == "task_paused"
+    ]
+    assert [event["message"] for event in paused] == [
+        "Input was not accepted; execution paused"
+    ]
     delivery_events = [
         call.args[0]
         for call in ws_manager.send_personal_message.call_args_list
@@ -5617,24 +5691,18 @@ async def test_live_injection_rejected_by_fence_is_retryable_not_unknown(
     live_task_lease,
     db_session,
 ) -> None:
-    from xagent.core.agent.runner import _record_injection_outcome
-
     owner = _user(db_session, "fenced-reject-owner")
     task = _task(db_session, owner.id, status=TaskStatus.RUNNING)
     task.runner_id = "fenced-reject-runner"
     task.run_id = "fenced-reject-run"
     db_session.commit()
     live_task_lease(db_session, task)
-
-    async def post_user_message(*_args, **_kwargs):
-        # Mirror the runner: the attempt evidence carries the same outcome.
-        _record_injection_outcome(UserMessageInjectionOutcome.REJECTED_RETRYABLE)
-        return UserMessageInjectionOutcome.REJECTED_RETRYABLE
+    runner, context_manager = _fenced_live_runner(str(task.id))
 
     agent = MagicMock()
     agent.supports_live_control.return_value = True
     agent.get_dag_pattern.return_value = None
-    agent.post_user_message = AsyncMock(side_effect=post_user_message)
+    agent.post_user_message = AsyncMock(side_effect=_injecting_through(runner))
     ws_manager = MagicMock(
         broadcast_to_task=AsyncMock(),
         send_personal_message=AsyncMock(),
@@ -5644,32 +5712,38 @@ async def test_live_injection_rejected_by_fence_is_retryable_not_unknown(
     bg_mgr.running_tasks.get.return_value = None
     resume_background_mock = AsyncMock()
 
-    with (
-        patch(
-            "xagent.web.services.agent_service_manager.get_agent_manager",
-            return_value=MagicMock(get_agent_for_task=AsyncMock(return_value=agent)),
-        ),
-        patch("xagent.web.api.websocket.manager", ws_manager),
-        patch("xagent.web.services.task_execution.background_task_manager", bg_mgr),
-        patch(
-            "xagent.web.services.task_execution.execute_resume_background",
-            resume_background_mock,
-        ),
-        patch(
-            "xagent.web.services.task_command_execution.close_legacy_resume_interaction_sync",
-        ) as close_mock,
-    ):
-        await handle_task_message(
-            _make_command_reply(MagicMock()),
-            int(task.id),
-            {
-                "message": "Fenced input",
-                "client_message_id": "fenced-reject-turn",
-                "user": owner,
-                "files": [],
-            },
-        )
+    try:
+        with (
+            patch(
+                "xagent.web.services.agent_service_manager.get_agent_manager",
+                return_value=MagicMock(
+                    get_agent_for_task=AsyncMock(return_value=agent)
+                ),
+            ),
+            patch("xagent.web.api.websocket.manager", ws_manager),
+            patch("xagent.web.services.task_execution.background_task_manager", bg_mgr),
+            patch(
+                "xagent.web.services.task_execution.execute_resume_background",
+                resume_background_mock,
+            ),
+            patch(
+                "xagent.web.services.task_command_execution.close_legacy_resume_interaction_sync",
+            ) as close_mock,
+        ):
+            await handle_task_message(
+                _make_command_reply(MagicMock()),
+                int(task.id),
+                {
+                    "message": "Fenced input",
+                    "client_message_id": "fenced-reject-turn",
+                    "user": owner,
+                    "files": [],
+                },
+            )
+    finally:
+        context_manager._contexts.clear()
 
+    agent.post_user_message.assert_awaited_once()
     close_mock.assert_not_called()
     bg_mgr.register_reserved_resume.assert_not_called()
     bg_mgr.release_resume_reservation.assert_called_once_with(int(task.id))
