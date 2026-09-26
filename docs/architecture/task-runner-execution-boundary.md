@@ -129,9 +129,16 @@ The injection checkpoint is the acceptance boundary. Reading or preparing a
 message can fail before any write; such a failure is not an unknown write.
 After a write starts, a failed acknowledgement requires an authoritative
 read-back. If acceptance cannot be determined, the existing delivery receipt
-records `outcome_unknown` and the owned execution pauses. There is no automatic
-reinjection or execution restart. Already generated answers remain in history;
-a genuine execution failure retains its original diagnostic.
+records `outcome_unknown` and the owned execution pauses. While the process
+lives there is no automatic reinjection or execution restart. Already generated
+answers remain in history; a genuine execution failure retains its original
+diagnostic.
+
+A crash is different: a durable command retry whose delivery row is still
+pending posts the message again under the same `turn_id`. The runner reconciles
+that `turn_id` against the checkpoint it rebuilds from, so a turn that was
+written replays instead of being applied twice, and one that was not written is
+applied once.
 
 The runtime records acceptance separately from later tracing and notification
 work, so an exception after a confirmed write cannot mean “not accepted”.

@@ -1685,9 +1685,12 @@ def _finalize_task_execution_result_isolated(
                     or result.get("status") == "waiting_for_user"
                 )
             ) or result.get("status") == "interrupted":
+                # Unknown input never resumes on its own, even when a resume
+                # was requested mid-run; the resumed finalizer does the same.
                 next_control_state = (
                     TaskControlState.RESUME_REQUESTED
-                    if task_updated.control_state
+                    if not result.get("injection_outcome_unknown")
+                    and task_updated.control_state
                     == TaskControlState.RESUME_REQUESTED.value
                     else TaskControlState.PAUSED
                 )
@@ -3594,7 +3597,14 @@ async def execute_resume_background(
                         if pause_for_input and not explicit_cancel:
                             from .task_orchestrator import pause_unknown_task_lease
 
-                            settled = await pause_unknown_task_lease(lease)
+                            settled = await pause_unknown_task_lease(
+                                lease,
+                                message=(
+                                    "Input outcome unknown; execution paused"
+                                    if delivery_outcome_unknown
+                                    else "Input was not accepted; execution paused"
+                                ),
+                            )
                         else:
                             settled = await run_db_io_cancellation_safe(
                                 lambda: _settle_resumed_task_lease(
