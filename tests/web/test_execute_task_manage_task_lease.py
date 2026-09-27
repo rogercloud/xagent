@@ -1058,8 +1058,10 @@ async def test_execute_task_rejects_dirty_caller_session_before_worker_io(
 
 
 @pytest.mark.asyncio
+# Shared execution accepts a run whose lease execute_task acquires itself.
+@pytest.mark.parametrize("shared", [False, True])
 async def test_execute_task_acquires_and_releases_lease_when_manage_true(
-    db_session,
+    db_session, shared: bool
 ) -> None:
     user = User(username="lease-user", password_hash="hash", is_admin=False)
     db_session.add(user)
@@ -1083,6 +1085,11 @@ async def test_execute_task_acquires_and_releases_lease_when_manage_true(
     manager = AgentServiceManager()
 
     with (
+        patch(
+            "xagent.web.services.agent_service_manager."
+            "get_shared_task_execution_enabled",
+            return_value=shared,
+        ),
         patch(
             "xagent.web.services.agent_service_manager.acquire_task_lease_isolated",
             return_value=fake_lease,
