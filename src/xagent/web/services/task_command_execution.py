@@ -873,6 +873,10 @@ class _TaskCommandRoutingSnapshot:
     status: TaskStatus
     control_state: str | None
     run_id: str | None
+    # Carried so a write decided on this snapshot can fence on it: a reply
+    # or A2A resume prelease moves a resting row to RUNNING under the same
+    # ``run_id`` and bumps only this.
+    state_version: int
     task_lease: TaskLease | None
     task_input: str
     task_info: dict[str, Any]
@@ -975,6 +979,7 @@ def _load_task_command_routing_snapshot(
             status=status,
             control_state=_task_control_state_value(task),
             run_id=_task_run_id(task),
+            state_version=int(task.state_version or 0),
             task_lease=_task_lease_snapshot(task),
             task_input=str(task.input or ""),
             task_info={
@@ -2495,25 +2500,53 @@ async def handle_task_message(
                             # passes: the local run may have settled itself in
                             # the meantime -- possibly paused by this very
                             # message's interrupt -- and a non-shared release
-                            # clears the owner but keeps the run. Rows routed as
-                            # not RUNNING keep the run fence alone: a shared
-                            # coordinator keeps owning a settled task, and a
-                            # resting row has no run for a successor to take.
+                            # clears the owner but keeps the run.
+                            #
+                            # A row routed as not RUNNING is fenced on the
+                            # routing snapshot's ``state_version`` instead of
+                            # its owner (a shared coordinator keeps owning a
+                            # settled task). A resting row can still be taken:
+                            # the HTTP reply and A2A resume preleases
+                            # (``_acquire_reply_prelease_sync`` /
+                            # ``_acquire_a2a_resume_prelease_sync``) bypass the
+                            # durable queue and move it to RUNNING keeping its
+                            # run id, so the run fence alone would land this
+                            # handoff on the run they just started. Nothing
+                            # this handler does between routing and here bumps
+                            # the version (the delivery claim writes only the
+                            # message row, the admission check only reads, and
+                            # no injection is attempted without a live lease),
+                            # so a moved version is always another writer. A
+                            # RUNNING row takes no version fence: this very
+                            # message's interrupt may legitimately move it.
                             fence_live_owner=task_status == TaskStatus.RUNNING,
                             owner_lease=live_task_lease,
+                            expected_state_version=(
+                                None
+                                if task_status == TaskStatus.RUNNING
+                                else routing.state_version
+                            ),
                             # A run that ended after the routing snapshot is
                             # never resumed, whether the message is fresh or
                             # recovered; the refusal is answered below.
                             refuse_terminal_status=True,
                         )
-                    except (TaskStatusRefusedError, StaleTaskRunError) as handoff_error:
+                    except (
+                        TaskStatusRefusedError,
+                        # A subclass of StaleTaskRunError, named for the
+                        # reader: the version fence on a row routed as not
+                        # RUNNING.
+                        StaleTaskStateVersionError,
+                        StaleTaskRunError,
+                    ) as handoff_error:
                         task_execution_service.background_task_manager.release_resume_reservation(
                             task_id
                         )
                         reservation_released = True
                         if delivery_recovered_claim:
-                            # The run ended, was replaced, or is owned by an
-                            # acquisition this process does not hold, after
+                            # The run ended, was replaced, is owned by an
+                            # acquisition this process does not hold, or a
+                            # resting row was taken by another writer, after
                             # the routing snapshot. A recovered claim may
                             # already have been applied, so it is never
                             # failed: same answer as the early refusal above,
@@ -2597,7 +2630,8 @@ async def handle_task_message(
                                 return
                             await start_new_turn(ended_routing, after_withdrawal=True)
                             return
-                        # What reaches here is a run or owner mismatch.
+                        # What reaches here is a run, owner or state
+                        # version mismatch.
                         current_control = await task_execution_controller.snapshot(
                             task_id
                         )
@@ -2610,12 +2644,15 @@ async def handle_task_message(
                         # not hold owns it: a successor, or this runner's own
                         # attempt in a window where its heartbeat is not
                         # registered (start-up, or between heartbeat stop and
-                        # settlement). Nothing about the task failed, so no
-                        # task-wide failure is broadcast.
+                        # settlement). For a row routed as not RUNNING, the
+                        # same run moved under another writer since routing
+                        # (a reply or A2A resume prelease started it). Nothing
+                        # about the task failed, so no task-wide failure is
+                        # broadcast.
                         logger.info(
                             "task %s run %s is owned by a lease acquisition "
-                            "this process does not hold; not handing off "
-                            "message %s here",
+                            "this process does not hold, or moved since "
+                            "routing; not handing off message %s here",
                             task_id,
                             task_run_id,
                             turn_id,
