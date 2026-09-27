@@ -154,6 +154,7 @@ from .task_execution_controller import (
     StaleTaskStateVersionError,
     TaskControlSnapshot,
     TaskControlState,
+    TaskStatusRefusedError,
     control_state_for_status,
     task_execution_controller,
 )
@@ -1761,6 +1762,21 @@ async def handle_task_message(
                 # it already holds.
                 await settle_accepted_outcome_unknown()
                 return
+            if (
+                delivery_recovered_claim
+                and task_uses_live_control
+                and task_status == TaskStatus.FAILED
+            ):
+                # A recovered claim on its own run is redriven live even when
+                # the task is no longer live, so that a paused run replays the
+                # turn id against its checkpoint. A FAILED run is never
+                # resumed: recovery settled it for good, and an earlier
+                # attempt may already have applied the turn. A fresh message
+                # still reaches a FAILED task through APPEND as a new run.
+                # The snapshot can be stale; the RESUME_REQUESTED transition
+                # and the resume lease claim below fence the same status.
+                await settle_accepted_outcome_unknown()
+                return
             agent_service = None
             supports_live_control = False
             if task_uses_live_control:
@@ -2073,11 +2089,24 @@ async def handle_task_message(
                         await run_db_io_cancellation_safe(
                             lambda: require_execution_admission_isolated(task_id)
                         )
-                    handoff_snapshot = await task_execution_controller.transition(
-                        task_id,
-                        TaskControlState.RESUME_REQUESTED,
-                        expected_run_id=task_run_id,
-                    )
+                    try:
+                        handoff_snapshot = await task_execution_controller.transition(
+                            task_id,
+                            TaskControlState.RESUME_REQUESTED,
+                            expected_run_id=task_run_id,
+                            refused_statuses=(
+                                (TaskStatus.FAILED,) if delivery_recovered_claim else ()
+                            ),
+                        )
+                    except TaskStatusRefusedError:
+                        # The task became FAILED after the routing snapshot:
+                        # same answer as the early refusal above, and the
+                        # task's status, control state and run are untouched.
+                        task_execution_service.background_task_manager.release_resume_reservation(
+                            task_id
+                        )
+                        await settle_accepted_outcome_unknown()
+                        return
 
                     previous_task = task_execution_service.background_task_manager.running_tasks.get(
                         task_id
@@ -2111,6 +2140,10 @@ async def handle_task_message(
                             trusted_task_source=routing.task_source,
                             previous_task=previous_task,
                             resolved_execution_scope=resolved_execution_scope,
+                            # Covers a FAILED committed between the transition
+                            # above and the lease claim (lease recovery can
+                            # still act on an expired RUNNING row here).
+                            refuse_failed_status=delivery_recovered_claim,
                             pending_user_message=(
                                 None
                                 if posted

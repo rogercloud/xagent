@@ -54,7 +54,7 @@ from typing import (
 )
 from urllib.parse import unquote
 
-from sqlalchemy import case, func, or_, update
+from sqlalchemy import case, func, or_, select, update
 from sqlalchemy.orm import Session
 
 from ...config import (
@@ -82,7 +82,7 @@ from ..models.database import (
     get_db,
     get_session_local,
 )
-from ..models.task import Task, TaskStatus
+from ..models.task import Task, TaskStatus, task_status_predicate
 from ..models.uploaded_file import UploadedFile
 from .llm_utils import AutoModelUnavailableError
 from .task_events import DeliveryNotifier, publish_task_event
@@ -2269,6 +2269,8 @@ def _acquire_resume_task_lease(
     expected_run_id: str | None,
     *,
     prior_status_out: list[TaskStatus] | None = None,
+    refuse_failed_status: bool = False,
+    status_refused_out: list[bool] | None = None,
 ) -> TaskLease | None:
     """Validate and claim a resume lease in one worker transaction.
 
@@ -2279,6 +2281,13 @@ def _acquire_resume_task_lease(
     is an out parameter rather than part of the return value because this
     function is called through ``acquire_task_lease_cancellation_safe``,
     whose acquire/cleanup pair is typed for a bare ``TaskLease``.
+
+    ``refuse_failed_status`` adds ``status != FAILED`` to the claim UPDATE,
+    so a task that recovery settled FAILED after the caller's snapshot is
+    never flipped back to RUNNING. When the claim is refused and the row is
+    FAILED or on another run -- the fenced run is not resumable either way
+    -- ``status_refused_out`` receives ``True``; a refusal by a live owner
+    of the same run leaves it empty.
     """
     SessionLocal = get_session_local()
     with SessionLocal() as db:
@@ -2300,8 +2309,21 @@ def _acquire_resume_task_lease(
             db,
             task_id,
             expected_run_id=expected_run_id,
+            claim_predicates=(
+                (task_status_predicate.ne(TaskStatus.FAILED),)
+                if refuse_failed_status
+                else ()
+            ),
         )
         if lease is None:
+            if refuse_failed_status and status_refused_out is not None:
+                current = db.execute(
+                    select(Task.status, Task.run_id).where(Task.id == task_id)
+                ).first()
+                if current is not None and (
+                    current[0] == TaskStatus.FAILED or current[1] != expected_run_id
+                ):
+                    status_refused_out.append(True)
             db.commit()
             return None
         if task is not None:
@@ -2590,6 +2612,11 @@ async def execute_resume_background(
     # value", never "this task has no source": the runner's overlay ignores a
     # None and keeps whatever the checkpoint carries.
     trusted_task_source: str | None = None,
+    # Appended for the same reason. True for a recovered delivery (a retried
+    # command whose pending row an earlier attempt claimed): its run must
+    # never be resumed out of FAILED, so the lease claim refuses that status
+    # atomically and the delivery settles as outcome unknown instead.
+    refuse_failed_status: bool = False,
 ) -> None:
     """Resume an agent execution after an interrupt/user-message checkpoint.
 
@@ -2786,12 +2813,15 @@ async def execute_resume_background(
 
         if lease is None:
             prior_status_box: list[TaskStatus] = []
+            status_refused_box: list[bool] = []
             lease = await acquire_task_lease_cancellation_safe(
                 lambda: _acquire_resume_task_lease(
                     task_id,
                     task_owner_user_id,
                     expected_run_id,
                     prior_status_out=prior_status_box,
+                    refuse_failed_status=refuse_failed_status,
+                    status_refused_out=status_refused_box,
                 ),
                 lambda acquired: _settle_resumed_task_lease(
                     acquired,
@@ -2800,6 +2830,31 @@ async def execute_resume_background(
             )
             if prior_status_box:
                 resume_prior_status = prior_status_box[0]
+            if lease is None and status_refused_box:
+                # The run this recovered delivery targeted was settled FAILED
+                # (or replaced) after the handoff. It is not resumed, and an
+                # earlier attempt may already have applied the turn, so the
+                # row records outcome unknown -- never failed, which would
+                # invite a resend. The retried command answers the sender
+                # from that row; the task keeps the state recovery gave it.
+                logger.warning(
+                    "Task %s resume refused: run %s is no longer resumable; "
+                    "recording delivery %s as outcome unknown",
+                    task_id,
+                    expected_run_id,
+                    delivery_turn_id,
+                )
+                if delivery_turn_id is not None and not delivery_was_dispatched:
+                    delivery_outcome_unknown = True
+                    await run_db_io_cancellation_safe(
+                        lambda: mark_user_message_delivery_sync(
+                            task_id,
+                            delivery_turn_id,
+                            DELIVERY_OUTCOME_UNKNOWN,
+                        )
+                    )
+                    await notify_deferred_delivery(False)
+                return
             if lease is None:
                 logger.info(
                     "Task %s resume skipped; another runner owns the lease", task_id

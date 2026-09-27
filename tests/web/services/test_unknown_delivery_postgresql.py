@@ -9,12 +9,15 @@ turn.
 
 from __future__ import annotations
 
+import time
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 from datetime import timedelta
 from typing import Iterator
 from unittest.mock import AsyncMock, patch
 
 import pytest
+from sqlalchemy import text
 from sqlalchemy.orm import Session, sessionmaker
 
 from tests.shared.postgres_disposable import disposable_database_factory
@@ -46,8 +49,20 @@ from xagent.web.services.chat_history_service import (
     mark_user_message_delivery,
 )
 from xagent.web.services.task_command_execution import execute_durable_task_command
-from xagent.web.services.task_execution import ResumeReservationOutcome
-from xagent.web.services.task_lease_service import utc_now
+from xagent.web.services.task_execution import (
+    ResumeReservationOutcome,
+    _acquire_resume_task_lease,
+)
+from xagent.web.services.task_execution_controller import (
+    TaskControlState,
+    TaskStatusRefusedError,
+    transition_task_control_state_sync,
+)
+from xagent.web.services.task_lease_service import (
+    get_expired_task_lease_candidates,
+    recover_expired_task_lease_no_commit,
+    utc_now,
+)
 from xagent.web.services.task_orchestrator import (
     TaskTurnOrchestrator,
     TaskTurnPayload,
@@ -262,3 +277,147 @@ def test_lease_recovery_concurrent_with_completion_never_regresses(
     assert _status(pg_sessions, row_id) == DELIVERY_COMPLETED
     with pg_sessions() as db:
         assert db.get(Task, int(task.id)).status == TaskStatus.FAILED
+
+
+def _recovery_holding_failed(sessions: sessionmaker[Session], task_id: int) -> Session:
+    """Stage lease recovery's FAILED settlement and keep its row lock."""
+
+    recovering = sessions()
+    now = utc_now()
+    candidate = next(
+        candidate
+        for candidate in get_expired_task_lease_candidates(
+            recovering, cutoff=now, limit=10
+        )
+        if candidate.task_id == task_id
+    )
+    assert recover_expired_task_lease_no_commit(
+        recovering,
+        candidate,
+        status=TaskStatus.FAILED,
+        recovered_at=now,
+        error_message="not recoverable",
+    )
+    return recovering
+
+
+def _wait_until_blocked_on_a_lock(sessions: sessionmaker[Session]) -> None:
+    deadline = time.monotonic() + _BLOCKED_SECONDS
+    while time.monotonic() < deadline:
+        with sessions() as db:
+            waiting = db.execute(
+                text(
+                    "SELECT count(*) FROM pg_stat_activity "
+                    "WHERE datname = current_database() "
+                    "AND wait_event_type = 'Lock'"
+                )
+            ).scalar_one()
+        if waiting:
+            return
+        time.sleep(0.02)
+    raise AssertionError("the fenced write never waited on the recovery lock")
+
+
+@pytest.mark.asyncio
+async def test_recovered_delivery_on_failed_run_settles_outcome_unknown_pg(
+    pg_sessions: sessionmaker[Session],
+    db_session: Session,
+) -> None:
+    owner = _user(db_session, "pg-failed-run")
+    task = _expired_task(db_session, int(owner.id), suffix="failed-run")
+    task_id = int(task.id)
+    _pending_row(db_session, task, int(owner.id))
+    recovering = _recovery_holding_failed(pg_sessions, task_id)
+    recovering.commit()
+    recovering.close()
+    reply = _RecordingReply()
+    command = replace(_recovered_command(task, owner), target_run_id="run-failed-run")
+
+    with (
+        _live_control_environment(outcome=ResumeReservationOutcome.RESERVED) as (
+            agent,
+            _,
+        ),
+        patch.object(command_execution_service, "command_reply", return_value=reply),
+    ):
+        result = await execute_durable_task_command(command)
+
+    assert result == _outcome_unknown_result(task)
+    agent.post_user_message.assert_not_awaited()
+    assert _row_status(db_session, task_id) == DELIVERY_DISPATCHED
+    db_session.expire_all()
+    stored = db_session.get(Task, task_id)
+    assert stored.status == TaskStatus.FAILED
+    assert stored.control_state == TaskControlState.FAILED.value
+    assert stored.error_message == "not recoverable"
+    assert stored.run_id == "run-failed-run"
+    _assert_outcome_unknown_frames(reply)
+
+
+def test_resume_transition_waits_on_recovery_and_refuses_failed_pg(
+    pg_sessions: sessionmaker[Session],
+    db_session: Session,
+) -> None:
+    """READ COMMITTED re-evaluates the fenced UPDATE on the recovered row."""
+
+    owner = _user(db_session, "pg-transition-fence")
+    task = _expired_task(db_session, int(owner.id), suffix="transition-fence")
+    task_id = int(task.id)
+
+    recovering = _recovery_holding_failed(pg_sessions, task_id)
+    try:
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            transition = pool.submit(
+                transition_task_control_state_sync,
+                task_id,
+                TaskControlState.RESUME_REQUESTED,
+                expected_run_id="run-transition-fence",
+                refused_statuses=(TaskStatus.FAILED,),
+            )
+            _wait_until_blocked_on_a_lock(pg_sessions)
+            recovering.commit()
+            with pytest.raises(TaskStatusRefusedError):
+                transition.result(timeout=_BLOCKED_SECONDS)
+    finally:
+        recovering.rollback()
+        recovering.close()
+
+    with pg_sessions() as db:
+        stored = db.get(Task, task_id)
+        assert stored.status == TaskStatus.FAILED
+        assert stored.control_state == TaskControlState.FAILED.value
+
+
+def test_resume_lease_claim_waits_on_recovery_and_refuses_failed_pg(
+    pg_sessions: sessionmaker[Session],
+    db_session: Session,
+) -> None:
+    owner = _user(db_session, "pg-claim-fence")
+    task = _expired_task(db_session, int(owner.id), suffix="claim-fence")
+    task_id = int(task.id)
+    refused: list[bool] = []
+
+    recovering = _recovery_holding_failed(pg_sessions, task_id)
+    try:
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            claim = pool.submit(
+                _acquire_resume_task_lease,
+                task_id,
+                int(owner.id),
+                "run-claim-fence",
+                refuse_failed_status=True,
+                status_refused_out=refused,
+            )
+            _wait_until_blocked_on_a_lock(pg_sessions)
+            recovering.commit()
+            assert claim.result(timeout=_BLOCKED_SECONDS) is None
+    finally:
+        recovering.rollback()
+        recovering.close()
+
+    assert refused == [True]
+    with pg_sessions() as db:
+        stored = db.get(Task, task_id)
+        assert stored.status == TaskStatus.FAILED
+        assert stored.runner_id is None
+        assert stored.error_message == "not recoverable"
