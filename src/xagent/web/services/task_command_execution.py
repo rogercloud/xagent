@@ -67,6 +67,7 @@ from .task_interaction_close import (
     ActiveInteractionUnavailable,
 )
 from .task_lease_service import (
+    get_runner_id,
     local_task_lease_holders,
     registered_task_lease,
     task_lease_holder_predicate,
@@ -2079,26 +2080,87 @@ async def handle_task_message(
                         await run_db_io_cancellation_safe(
                             lambda: require_execution_admission_isolated(task_id)
                         )
-                    handoff_snapshot = await task_execution_controller.transition(
-                        task_id,
-                        TaskControlState.RESUME_REQUESTED,
-                        expected_run_id=task_run_id,
-                        # An expired-lease takeover keeps the run id, so the
-                        # run fence alone would let this handoff land on a
-                        # successor's running run. For a row routed as
-                        # RUNNING, refuse while a live acquisition other than
-                        # the one this process routed through (``None`` when
-                        # it holds none) owns the row. An owner-free row
-                        # passes: the local run may have settled itself in
-                        # the meantime -- possibly paused by this very
-                        # message's interrupt -- and a non-shared release
-                        # clears the owner but keeps the run. Rows routed as
-                        # not RUNNING keep the run fence alone: a shared
-                        # coordinator keeps owning a settled task, and a
-                        # resting row has no run for a successor to take.
-                        fence_live_owner=task_status == TaskStatus.RUNNING,
-                        owner_lease=live_task_lease,
-                    )
+                    try:
+                        handoff_snapshot = await task_execution_controller.transition(
+                            task_id,
+                            TaskControlState.RESUME_REQUESTED,
+                            expected_run_id=task_run_id,
+                            # An expired-lease takeover keeps the run id, so the
+                            # run fence alone would let this handoff land on a
+                            # successor's running run. For a row routed as
+                            # RUNNING, refuse while a live acquisition other than
+                            # the one this process routed through (``None`` when
+                            # it holds none) owns the row. An owner-free row
+                            # passes: the local run may have settled itself in
+                            # the meantime -- possibly paused by this very
+                            # message's interrupt -- and a non-shared release
+                            # clears the owner but keeps the run. Rows routed as
+                            # not RUNNING keep the run fence alone: a shared
+                            # coordinator keeps owning a settled task, and a
+                            # resting row has no run for a successor to take.
+                            fence_live_owner=task_status == TaskStatus.RUNNING,
+                            owner_lease=live_task_lease,
+                        )
+                    except StaleTaskRunError:
+                        current_control = await task_execution_controller.snapshot(
+                            task_id
+                        )
+                        if current_control is None or (
+                            current_control.run_id != task_run_id
+                        ):
+                            # A rotated run keeps its existing handling.
+                            raise
+                        # Same run, but a live acquisition this process does
+                        # not hold owns it: a successor, or this runner's own
+                        # attempt in a window where its heartbeat is not
+                        # registered (start-up, or between heartbeat stop and
+                        # settlement). Nothing about the task failed, so no
+                        # task-wide failure is broadcast.
+                        logger.info(
+                            "task %s run %s is owned by a lease acquisition "
+                            "this process does not hold; not handing off "
+                            "message %s here",
+                            task_id,
+                            task_run_id,
+                            turn_id,
+                        )
+                        task_execution_service.background_task_manager.release_resume_reservation(
+                            task_id
+                        )
+                        if posted or delivery_recovered_claim:
+                            # Posted: the injection was accepted, so only its
+                            # handoff is uncertain. Recovered: an earlier
+                            # attempt may have applied the turn. Neither may
+                            # invite a resend.
+                            if not posted:
+                                delivery_outcome_unknown = True
+                            await finish_delivery_failure(
+                                client_error_message(
+                                    ClientErrorCode.MESSAGE_OUTCOME_UNKNOWN
+                                ),
+                                error_code=ClientErrorCode.MESSAGE_OUTCOME_UNKNOWN.value,
+                            )
+                            return
+                        if suppress_delivery_ack:
+                            # A durable command retries once the owner is
+                            # settled or its heartbeat is registered. The
+                            # claimed delivery row stays pending, so the retry
+                            # takes the recovered path and no resend is safe.
+                            message_data["_durable_command_defer"] = turn_id
+                            message_data["_durable_command_defer_reason"] = (
+                                f"Message {turn_id} is waiting for the active "
+                                "task lease owner"
+                            )
+                            message_data["_durable_command_defer_unsafe"] = turn_id
+                            return
+                        await finish_delivery_failure(
+                            client_error_message(
+                                ClientErrorCode.MESSAGE_DELIVERY_FAILED
+                            ),
+                            error_code=ClientErrorCode.MESSAGE_DELIVERY_FAILED.value,
+                            retry_with_new_id=True,
+                        )
+                        return
 
                     previous_task = task_execution_service.background_task_manager.running_tasks.get(
                         task_id
@@ -2659,6 +2721,11 @@ async def handle_task_message(
             # gets the message-processing code while task subscribers get the
             # neutral task-failure code.
             logger.error("Runtime error in agent execution: %s", e, exc_info=True)
+            if delivery_recovered_claim:
+                # As in the generic arm below: an earlier attempt may have
+                # applied this recovered turn, so a failure here cannot prove
+                # it was not accepted, and a resend could duplicate it.
+                delivery_outcome_unknown = True
             if not await answer_durable_turn_failure(
                 ClientErrorCode.MESSAGE_PROCESSING_FAILED
             ):
@@ -3811,6 +3878,55 @@ async def _answer_message_outcome_unknown(
     }
 
 
+def _load_live_self_owned_attempt(task_id: int) -> tuple[str, str] | None:
+    """The run and attempt when this runner owns the RUNNING row unexpired."""
+
+    SessionLocal = get_session_local()
+    with SessionLocal() as db:
+        row = (
+            db.query(Task.run_id, Task.lease_attempt_id)
+            .filter(
+                Task.id == task_id,
+                Task.status == TaskStatus.RUNNING,
+                Task.runner_id == get_runner_id(),
+                Task.run_id.is_not(None),
+                Task.lease_attempt_id.is_not(None),
+                Task.lease_expires_at.is_not(None),
+                Task.lease_expires_at >= utc_now(),
+            )
+            .first()
+        )
+    if row is None:
+        return None
+    return str(row[0]), str(row[1])
+
+
+async def _message_delivery_absent(command: ClaimedTaskCommand) -> bool:
+    """Whether no attempt has claimed this MESSAGE's delivery row yet."""
+
+    status = await run_db_io_cancellation_safe(
+        lambda: _load_command_message_delivery_status(
+            command.task_id, command.command_id
+        )
+    )
+    return status is None
+
+
+async def _message_never_reached_delivery(command: ClaimedTaskCommand) -> bool:
+    """Whether a deferred MESSAGE provably never reached delivery.
+
+    ``attempt_count == defer_count + 1`` proves every earlier attempt ended in
+    a settled deferral (claiming is the only writer of ``attempt_count``,
+    deferral the only writer of ``defer_count``; an operator retry resets only
+    the latter, the safe direction). A deferral can still follow a delivery
+    claim, so the absence of the turn's delivery row is required as well.
+    """
+
+    if command.attempt_count != command.defer_count + 1:
+        return False
+    return await _message_delivery_absent(command)
+
+
 async def _execute_durable_task_command(
     command: ClaimedTaskCommand,
 ) -> dict[str, Any] | None | SettledTaskCommand:
@@ -3885,10 +4001,40 @@ async def _execute_durable_task_command(
     } and await run_db_io_cancellation_safe(
         lambda: task_has_live_foreign_runner(command.task_id)
     ):
-        raise ClientVisibleTaskCommandDeferred(
+        deferral = ClientVisibleTaskCommandDeferred(
             f"{command.kind.value.title()} command {command.command_id} is waiting "
             "for the active task lease owner"
         )
+        if command.kind == TaskCommandKind.MESSAGE:
+            deferral.resend_safe = await _message_never_reached_delivery(command)
+        raise deferral
+    if command.kind == TaskCommandKind.MESSAGE and (
+        await _message_delivery_absent(command)
+    ):
+        # This runner owns the RUNNING row live, but under an attempt no
+        # heartbeat or coordinator here holds: its own run between heartbeat
+        # stop and settlement, before its heartbeat registered, or a newer
+        # attempt of this runner. The foreign-owner check above cannot see it,
+        # and the live handoff would refuse it only after claiming the
+        # delivery. Only a message no attempt has claimed yet waits here; a
+        # recovered claim keeps its own settlement (it may belong to a turn
+        # the earlier attempt started), and a refusal at the handoff settles
+        # it as outcome unknown.
+        self_owned = await run_db_io_cancellation_safe(
+            lambda: _load_live_self_owned_attempt(command.task_id)
+        )
+        if self_owned is not None:
+            run_id, attempt_id = self_owned
+            if not any(
+                holder.attempt_id == attempt_id
+                for holder in local_task_lease_holders(command.task_id, run_id)
+            ):
+                deferral = ClientVisibleTaskCommandDeferred(
+                    f"Message command {command.command_id} is waiting for the "
+                    "active task lease owner"
+                )
+                deferral.resend_safe = await _message_never_reached_delivery(command)
+                raise deferral
 
     resume_result: ResumeCommandResult | None = None
     if command.kind == TaskCommandKind.MESSAGE:

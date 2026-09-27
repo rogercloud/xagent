@@ -263,8 +263,14 @@ control writes a live run makes mid-flight carry the same fence:
   have settled itself meanwhile (a non-shared release clears the owner but
   keeps the run), and so does an expired one, which the resume may take
   over. A refusal is treated like a rotated run.
+  Such a refusal defers a durable command for retry when nothing was
+  accepted, settles a recovered claim as outcome unknown, and keeps an
+  accepted injection outcome unknown. It never reports a task failure.
 - PAUSE, CANCEL and MESSAGE commands defer while another runner holds a live
-  lease on the task, so the owner applies them.
+  lease on the task, so the owner applies them. A MESSAGE whose delivery no
+  attempt has claimed also defers while this runner owns the RUNNING row
+  under an attempt it does not hold locally, for example between its
+  heartbeat stopping and its settlement.
 
 A result that arrives after its row already settled COMPLETED or FAILED, for
 example after an external cancel that timed out waiting for the runner, is

@@ -10,9 +10,10 @@ resurrect a row that already settled terminal either.
 
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 import pytest
 from sqlalchemy import update
@@ -25,6 +26,11 @@ from tests.web.api.test_durable_message_resume_contention import (
 )
 from tests.web.api.test_durable_message_resume_contention import (
     db_session as db_session_fixture,
+)
+from tests.web.api.test_recovered_delivery_outcome_unknown import (
+    TURN_ID,
+    _pending_row,
+    _row_status,
 )
 from tests.web.services.task_lease_shared import (
     live_task_lease as live_task_lease_fixture,
@@ -39,6 +45,11 @@ from xagent.web.services import task_coordinator_runtime
 from xagent.web.services import task_execution as execution
 from xagent.web.services import task_lease_service as leases
 from xagent.web.services import task_setup_snapshot
+from xagent.web.services.chat_history_service import (
+    DELIVERY_OUTCOME_UNKNOWN,
+    DELIVERY_PENDING,
+)
+from xagent.web.services.client_error_messages import ClientErrorCode
 from xagent.web.services.task_command_execution import (
     ClientVisibleTaskCommandDeferred,
 )
@@ -46,9 +57,9 @@ from xagent.web.services.task_command_transport import (
     ClaimedTaskCommand,
     TaskCommandDeferred,
     TaskCommandKind,
-    TaskCommandRejected,
 )
 from xagent.web.services.task_coordinator_service import TaskLease as CoordinatorLease
+from xagent.web.services.task_execution import ResumeReservationOutcome
 from xagent.web.services.task_execution_controller import (
     StaleTaskRunError,
     TaskControlState,
@@ -569,29 +580,188 @@ async def test_message_defers_while_a_successor_holds_the_run(
     assert stored.lease_attempt_id == SUCCESSOR_ATTEMPT
 
 
-@pytest.mark.asyncio
-async def test_message_without_a_local_holder_does_not_stamp_a_live_run(
-    db_session,
-) -> None:
-    """Same runner, other attempt: invisible to the pre-check, not the fence."""
+def _holderless_task(db_session, attempt: str) -> Task:
+    """This runner owns the RUNNING row live, but no heartbeat here holds it."""
     task = _leased_task(db_session)
-    task.lease_attempt_id = SUCCESSOR_ATTEMPT
+    task.lease_attempt_id = attempt
     db_session.commit()
+    return task
+
+
+def _task_failure_broadcasts(publish: AsyncMock) -> list[dict]:
+    return [
+        call.args[0]
+        for call in publish.await_args_list
+        if call.args[0].get("error_code") == ClientErrorCode.TASK_EXECUTION_FAILED.value
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "attempt",
+    # Its own attempt between heartbeat stop and settlement (or before its
+    # heartbeat registered), and a newer attempt of this same runner.
+    ["own-unregistered-attempt", SUCCESSOR_ATTEMPT],
+)
+async def test_message_to_a_self_owned_run_without_a_holder_defers(
+    db_session, monkeypatch, attempt: str
+) -> None:
+    task = _holderless_task(db_session, attempt)
     owner = db_session.get(User, int(task.user_id))
+    publish = AsyncMock()
+    monkeypatch.setattr(commands, "publish_task_event", publish)
     with _live_control_environment(
         background_manager=execution.BackgroundTaskManager()
     ) as (agent, _):
-        # Nothing was injected, so the refusal is an ordinary known failure.
-        with pytest.raises(TaskCommandRejected):
+        with pytest.raises(
+            ClientVisibleTaskCommandDeferred, match="waiting for the active task lease"
+        ) as deferred:
             await commands.execute_durable_task_command(
                 _message_command(task, owner, "holderless-message")
             )
         agent.post_user_message.assert_not_awaited()
         execution.execute_resume_background.assert_not_called()
 
+    # Deferred before any delivery claim: a budget exhausted here can safely
+    # tell the sender to resend.
+    assert deferred.value.resend_safe is True
+    assert (
+        commands._load_command_message_delivery_status(
+            int(task.id), "holderless-message"
+        )
+        is None
+    )
+    assert _task_failure_broadcasts(publish) == []
     stored = _row(db_session, int(task.id))
     assert stored.control_state == TaskControlState.RUNNING.value
     assert stored.state_version == 3
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("attempt_count", "defer_count", "resend_safe"),
+    [
+        (1, 0, True),
+        (3, 2, True),
+        # An attempt that ended some other way may still inject.
+        (2, 0, False),
+    ],
+)
+async def test_message_pre_check_deferral_is_resend_safe_only_when_never_delivered(
+    db_session, attempt_count, defer_count, resend_safe
+) -> None:
+    # A claimed delivery row skips this pre-check altogether (see the
+    # recovered handoff test below), so only the counters decide here.
+    task = _holderless_task(db_session, "own-unregistered-attempt")
+    owner = db_session.get(User, int(task.user_id))
+    command = replace(
+        _message_command(task, owner, TURN_ID, attempt_count=attempt_count),
+        defer_count=defer_count,
+    )
+
+    with pytest.raises(ClientVisibleTaskCommandDeferred) as deferred:
+        await commands._execute_durable_task_command(command)
+
+    assert deferred.value.resend_safe is resend_safe
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("recovered", [False, True], ids=["fresh", "recovered"])
+async def test_handoff_refused_after_routing_defers_or_settles_unknown(
+    db_session, monkeypatch, recovered: bool
+) -> None:
+    """The race the pre-check cannot close: the refusal lands at the handoff."""
+    task = _holderless_task(db_session, "own-unregistered-attempt")
+    owner = db_session.get(User, int(task.user_id))
+    if recovered:
+        _pending_row(db_session, task, int(owner.id))
+    # The pre-check read happened before this runner's attempt took the row.
+    monkeypatch.setattr(commands, "_load_live_self_owned_attempt", lambda _: None)
+    publish = AsyncMock()
+    monkeypatch.setattr(commands, "publish_task_event", publish)
+    background_manager = execution.BackgroundTaskManager()
+    command = (
+        _message_command(task, owner, TURN_ID, attempt_count=2)
+        if recovered
+        else _message_command(task, owner, TURN_ID)
+    )
+    with _live_control_environment(background_manager=background_manager) as (
+        agent,
+        _,
+    ):
+        if recovered:
+            # An earlier attempt may have applied it: never resendable.
+            result = await commands.execute_durable_task_command(command)
+            assert result["delivery_outcome"] == DELIVERY_OUTCOME_UNKNOWN
+        else:
+            with pytest.raises(
+                TaskCommandDeferred, match="waiting for the active task lease"
+            ) as deferred:
+                await commands.execute_durable_task_command(command)
+            # The claimed delivery row survives for the retry to recover.
+            assert deferred.value.resend_safe is False
+        agent.post_user_message.assert_not_awaited()
+        execution.execute_resume_background.assert_not_called()
+        assert background_manager.resume_holder_age_seconds(int(task.id)) is None
+
+    assert _row_status(db_session, int(task.id)) == (
+        DELIVERY_OUTCOME_UNKNOWN if recovered else DELIVERY_PENDING
+    )
+    # A healthy running task is never announced as failed.
+    assert _task_failure_broadcasts(publish) == []
+    stored = _row(db_session, int(task.id))
+    assert stored.control_state == TaskControlState.RUNNING.value
+    assert stored.state_version == 3
+
+
+@pytest.mark.asyncio
+async def test_runtime_error_on_recovered_claim_records_outcome_unknown(
+    db_session,
+) -> None:
+    owner = _user(db_session, "runtime-error-owner")
+    task = _live_task(db_session, int(owner.id))
+    _pending_row(db_session, task, int(owner.id))
+
+    with (
+        _live_control_environment(outcome=ResumeReservationOutcome.RESERVED),
+        patch(
+            "xagent.web.services.agent_service_manager.get_agent_manager",
+            side_effect=RuntimeError("agent manager exploded"),
+        ),
+    ):
+        await commands.execute_durable_task_command(
+            _message_command(task, owner, TURN_ID, attempt_count=2)
+        )
+
+    # Not DELIVERY_FAILED: a resend could duplicate an applied turn.
+    assert _row_status(db_session, int(task.id)) == DELIVERY_OUTCOME_UNKNOWN
+
+
+@pytest.mark.asyncio
+async def test_pause_retry_through_the_dispatcher_settles_as_applied(
+    db_session, monkeypatch
+) -> None:
+    task = _paused_row(db_session)
+    _patch_paused_runtime(monkeypatch, task)
+    command = ClaimedTaskCommand(
+        id=1,
+        task_id=int(task.id),
+        actor_user_id=int(task.user_id),
+        command_id="pause-retry",
+        kind=TaskCommandKind.PAUSE,
+        payload={},
+        target_run_id=str(task.run_id),
+        attempt_count=2,
+        defer_count=1,
+    )
+
+    result = await commands._execute_durable_task_command(command)
+
+    assert result == {
+        "task_id": int(task.id),
+        "command_id": "pause-retry",
+        "kind": "pause",
+    }
 
 
 # ---------------------------------------------------------------------------
