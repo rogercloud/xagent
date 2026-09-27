@@ -3790,16 +3790,15 @@ def _record_command_outcome_unknown_sync(
 def _command_recorded_outcome_unknown(task_id: int, command_id: str) -> bool:
     SessionLocal = get_session_local()
     with SessionLocal() as db:
-        row = (
+        result = (
             db.query(TaskExecutionCommand.result)
             .filter(
                 TaskExecutionCommand.task_id == task_id,
                 TaskExecutionCommand.command_id == command_id,
                 TaskExecutionCommand.kind == TaskCommandKind.MESSAGE.value,
             )
-            .first()
+            .scalar()
         )
-    result = row[0] if row is not None else None
     return (
         isinstance(result, dict)
         and result.get("delivery_outcome") == DELIVERY_OUTCOME_UNKNOWN

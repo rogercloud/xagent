@@ -2323,8 +2323,8 @@ def _acquire_resume_task_lease(
                     select(Task.status, Task.run_id).where(Task.id == task_id)
                 ).first()
                 if current is not None and (
-                    current[0] in NON_RESUMABLE_STATUSES
-                    or current[1] != expected_run_id
+                    current.status in NON_RESUMABLE_STATUSES
+                    or current.run_id != expected_run_id
                 ):
                     run_not_resumable_out.append(True)
             db.commit()
