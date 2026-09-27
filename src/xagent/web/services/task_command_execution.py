@@ -15,6 +15,7 @@ from typing import (
     Iterator,
     Literal,
     Optional,
+    Sequence,
     Union,
     assert_never,
     cast,
@@ -65,7 +66,12 @@ from .task_interaction_close import (
     ActiveInteractionFound,
     ActiveInteractionUnavailable,
 )
-from .task_lease_service import registered_task_lease
+from .task_lease_service import (
+    local_task_lease_holders,
+    registered_task_lease,
+    task_lease_holder_predicate,
+    utc_now,
+)
 
 if TYPE_CHECKING:
     from .task_orchestrator import TaskTurnPayload, _PreparedTurn
@@ -2077,6 +2083,13 @@ async def handle_task_message(
                         task_id,
                         TaskControlState.RESUME_REQUESTED,
                         expected_run_id=task_run_id,
+                        # A live RUNNING row keeps its run id across an
+                        # expired-lease takeover, so the run fence alone
+                        # would let this process stamp the handoff onto a
+                        # successor's run. Fence on the exact acquisition it
+                        # routed through; a non-running row has no live
+                        # owner and keeps the run fence alone.
+                        owner_lease=live_task_lease,
                     )
 
                     previous_task = task_execution_service.background_task_manager.running_tasks.get(
@@ -2779,8 +2792,23 @@ def _apply_pause_requested_isolated(
     task_id: int,
     *,
     expected_run_id: str | None,
+    owner_leases: Sequence[TaskLease],
 ) -> bool:
-    """Persist PAUSE_REQUESTED for the exact RUNNING run in a short Session."""
+    """Persist PAUSE_REQUESTED for the exact RUNNING run in a short Session.
+
+    ``owner_leases`` are the acquisitions this process holds for the run
+    (``local_task_lease_holders``). The write is fenced on one of them still
+    owning the row, unexpired: an expired RUNNING takeover keeps ``run_id``
+    and mints only a new ``lease_attempt_id``, so a run id fence alone would
+    let a zombie of the earlier attempt -- whose local run just accepted the
+    interrupt -- stamp the pause onto its successor's run, where nothing acts
+    on it. A refusal on a row that is still this RUNNING run therefore means
+    another acquisition owns it: the command is deferred so the retry reaches
+    that owner instead of reporting a pause that nothing will honour.
+
+    A legacy RUNNING row with no run id is left unfenced: every acquisition
+    assigns a run id, so ``run_id IS NULL`` already excludes any leased owner.
+    """
 
     SessionLocal = get_session_local()
     with SessionLocal() as db:
@@ -2800,7 +2828,10 @@ def _apply_pause_requested_isolated(
         statement = (
             statement.where(Task.run_id.is_(None))
             if expected_run_id is None
-            else statement.where(Task.run_id == expected_run_id)
+            else statement.where(
+                Task.run_id == expected_run_id,
+                task_lease_holder_predicate(owner_leases, now=utc_now()),
+            )
         )
         result = db.execute(
             statement.values(**values).execution_options(synchronize_session=False)
@@ -2816,6 +2847,16 @@ def _apply_pause_requested_isolated(
                 raise StaleTaskRunError(
                     f"task {task_id} run changed from {expected_run_id} "
                     f"to {current_run_id}"
+                )
+            if expected_run_id is not None and current[1] == TaskStatus.RUNNING:
+                logger.warning(
+                    "task %s run %s is owned by another lease acquisition; "
+                    "deferring the pause for that owner",
+                    task_id,
+                    expected_run_id,
+                )
+                raise ClientVisibleTaskCommandDeferred(
+                    "Pause command is waiting for the active task lease owner"
                 )
         return False
 
@@ -2892,6 +2933,17 @@ async def pause_task(reply: CommandReply, task_id: int, message_data: dict) -> N
 
         # Check if agent supports pause functionality
         if hasattr(agent_service, "pause_execution"):
+            # Read which acquisitions this process holds before interrupting:
+            # a run that settles quickly after the interrupt unregisters its
+            # heartbeat, and the fenced write below only needs to know whose
+            # run this process was driving. The interrupt itself stays
+            # unconditional -- a zombie of an earlier attempt has no business
+            # continuing either, and its settlement is attempt-fenced.
+            owner_leases = (
+                local_task_lease_holders(task_id, expected_run_id)
+                if expected_run_id is not None
+                else ()
+            )
             logger.info("Agent supports pause_execution, calling it...")
             pause_result = await agent_service.pause_execution()
             if pause_result is False:
@@ -2933,6 +2985,7 @@ async def pause_task(reply: CommandReply, task_id: int, message_data: dict) -> N
                 lambda: _apply_pause_requested_isolated(
                     task_id,
                     expected_run_id=expected_run_id,
+                    owner_leases=owner_leases,
                 )
             )
             if not pause_applied:

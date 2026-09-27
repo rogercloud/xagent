@@ -1654,6 +1654,21 @@ def _finalize_task_execution_result_isolated(
                     "ignoring the late result",
                     task_id,
                 )
+            elif task_updated.status in {TaskStatus.COMPLETED, TaskStatus.FAILED}:
+                # Settled terminal while this run was still in flight, without
+                # the A2A marker above -- an external cancel that finalized
+                # FAILED after its wait for the runner timed out, for one. The
+                # lease fence still matches in coordinator context, where
+                # settlement leaves ownership to the coordinator, so a late
+                # interrupt must not resurrect the row as PAUSED, nor a late
+                # success rewrite FAILED as COMPLETED.
+                waiting_for_control = True
+                logger.info(
+                    "Task %s already settled %s; ignoring the late %s result",
+                    task_id,
+                    task_updated.status.value,
+                    result.get("status") or "execution",
+                )
             elif result.get("status") == "waiting_for_user" and not result.get(
                 "injection_outcome_unknown"
             ):
@@ -2409,11 +2424,12 @@ def _finalize_resumed_task(
         if task is None:
             finalized["late_result"] = True
             return finalized
-        if result.get("injection_outcome_unknown") and task.status == TaskStatus.FAILED:
-            # Explicit cancellation/failure already owns the terminal result.
-            if not release_task_lease_no_commit(
-                db, task_lease, status=TaskStatus.FAILED
-            ):
+        if task.status in {TaskStatus.COMPLETED, TaskStatus.FAILED}:
+            # Explicit cancellation/failure already owns the terminal result,
+            # whatever this run returned -- including a late interrupt, which
+            # must not turn the row back into PAUSED (see the same guard in
+            # ``_finalize_task_execution_result_isolated``).
+            if not release_task_lease_no_commit(db, task_lease, status=task.status):
                 db.rollback()
                 finalized["late_result"] = True
                 return finalized

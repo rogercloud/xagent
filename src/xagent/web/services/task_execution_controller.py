@@ -13,13 +13,16 @@ import enum
 from contextlib import asynccontextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
-from typing import Any, AsyncIterator
+from typing import TYPE_CHECKING, Any, AsyncIterator
 from uuid import uuid4
 
-from sqlalchemy import func, update
+from sqlalchemy import false, func, update
 from sqlalchemy.orm import object_session
 
 from ..models.task import Task, TaskStatus
+
+if TYPE_CHECKING:
+    from .task_lease_service import TaskLease
 
 
 class TaskControlState(str, enum.Enum):
@@ -110,11 +113,18 @@ def apply_task_control_transition(
     new_run: bool = False,
     expected_run_id: str | None = None,
     expected_state_version: int | None = None,
+    owner_lease: "TaskLease | None" = None,
 ) -> TaskControlSnapshot:
     """Mutate one ORM task with a monotonic control-state transition.
 
     The caller owns the transaction. This lets terminal task status and its
     assistant transcript row continue to commit atomically.
+
+    ``owner_lease`` additionally requires the row to still belong to that
+    exact acquisition (runner and attempt). An expired RUNNING takeover keeps
+    ``run_id``, so a caller writing on behalf of its own live run needs this
+    to keep the write off a successor's run; a mismatch raises
+    :class:`StaleTaskRunError`, as a rotated run does.
     """
 
     current_run_id = getattr(task, "run_id", None)
@@ -130,6 +140,15 @@ def apply_task_control_transition(
         raise StaleTaskStateVersionError(
             f"task {task.id} state changed from version "
             f"{expected_state_version} to {current_state_version}"
+        )
+    if owner_lease is not None and (
+        owner_lease.attempt_id is None
+        or getattr(task, "runner_id", None) != owner_lease.runner_id
+        or getattr(task, "lease_attempt_id", None) != owner_lease.attempt_id
+    ):
+        raise StaleTaskRunError(
+            f"task {task.id} run {current_run_id} is no longer owned by "
+            f"lease attempt {owner_lease.attempt_id}"
         )
 
     if new_run:
@@ -162,6 +181,15 @@ def apply_task_control_transition(
         if expected_state_version is not None:
             statement = statement.where(
                 func.coalesce(Task.state_version, 0) == expected_state_version
+            )
+        if owner_lease is not None:
+            statement = statement.where(
+                Task.runner_id == owner_lease.runner_id,
+                (
+                    false()
+                    if owner_lease.attempt_id is None
+                    else Task.lease_attempt_id == owner_lease.attempt_id
+                ),
             )
         # Keep unrelated caller-owned pending objects out of this helper's
         # atomic UPDATE and refresh. ``Session.execute`` and ``refresh`` can
@@ -209,6 +237,7 @@ def transition_task_control_state_sync(
     new_run: bool = False,
     expected_run_id: str | None = None,
     expected_state_version: int | None = None,
+    owner_lease: "TaskLease | None" = None,
 ) -> TaskControlSnapshot:
     from ..models.database import get_session_local
 
@@ -224,6 +253,7 @@ def transition_task_control_state_sync(
             new_run=new_run,
             expected_run_id=expected_run_id,
             expected_state_version=expected_state_version,
+            owner_lease=owner_lease,
         )
         db.commit()
         return snapshot
@@ -339,6 +369,7 @@ class TaskExecutionController:
         new_run: bool = False,
         expected_run_id: str | None = None,
         expected_state_version: int | None = None,
+        owner_lease: "TaskLease | None" = None,
     ) -> TaskControlSnapshot:
         """Apply one control transition, optionally fenced on an exact row.
 
@@ -361,6 +392,7 @@ class TaskExecutionController:
             new_run=new_run,
             expected_run_id=expected_run_id,
             expected_state_version=expected_state_version,
+            owner_lease=owner_lease,
         )
 
     async def snapshot(self, task_id: int) -> TaskControlSnapshot | None:

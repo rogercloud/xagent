@@ -235,6 +235,34 @@ nonshared error correlates with the original `messageId`. Nonshared SDK replies
 return a correlation ID, not a new durable deduplication guarantee. Check task
 state before deciding whether to resume or send new input.
 
+## Live-control writes and lease takeover
+
+Taking over an expired RUNNING lease keeps the row's `run_id` and mints only a
+new `lease_attempt_id`. A process whose lease was taken over while its local
+run kept going (a zombie of the earlier attempt) therefore still matches a run
+id fence. Settlement is already fenced on runner, attempt and run. The two
+control writes a live run makes mid-flight carry the same fence:
+
+- PAUSE interrupts the local run first, unconditionally: a zombie has no
+  business continuing, and its settlement is discarded anyway. It then writes
+  `pause_requested` only if the row is still held, unexpired, by an
+  acquisition this process holds for that run: the coordinator's lease in
+  shared execution, or a live heartbeat registration otherwise
+  (`local_task_lease_holders`). When the row is still this RUNNING run but
+  another acquisition owns it, the command is deferred rather than rejected
+  or acknowledged. The current lease owner can claim the retry (the row names
+  it as runner) and applies the pause to its own run; the zombie, if it
+  claims the retry instead, defers again while that owner's lease is live. A pause refused only because the
+  holder's own lease had expired can find the run already paused by its own
+  settlement on retry, and then reports that the task is already paused.
+- The live-message `resume_requested` handoff is fenced on the exact
+  acquisition it routed through. A refusal is treated like a rotated run.
+
+A result that arrives after its row already settled COMPLETED or FAILED, for
+example after an external cancel that timed out waiting for the runner, is
+ignored. It never turns the row back into PAUSED or rewrites FAILED as
+COMPLETED.
+
 ## Context cache lifetime
 
 `ContextManager` is a process-wide cache keyed by the execution id, which stays
