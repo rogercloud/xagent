@@ -316,18 +316,39 @@ async def test_record_is_written_in_the_accepting_checkpoint(atomic_live) -> Non
     assert "turn" in _recorded_ids(context)
 
 
+def _seed_one_accepted_turn(context: ExecutionContext) -> list[list[str]]:
+    """Give the live context an already-recorded turn, as production has by
+    the time a real retry happens (``run()`` records the first turn).
+
+    Returns the seeded entries so callers can assert the record came through
+    a failed write untouched. The value is a fresh list object each call so a
+    buggy in-place mutation of the *shared* list under ``context.metadata``
+    (rather than a rebind) shows up as a changed record here.
+    """
+    seeded = [["turn-0", AgentRunner._turn_content_digest("original")]]
+    context.metadata[ACCEPTED_TURN_IDS_METADATA_KEY] = seeded
+    return [list(entry) for entry in seeded]
+
+
 @pytest.mark.asyncio
 async def test_rejected_write_leaves_no_record(atomic_live) -> None:
     runner, context, tracer = atomic_live
+    seeded = _seed_one_accepted_turn(context)
     tracer.checkpoint.side_effect = RuntimeError("write failed")
 
     with pytest.raises(UserMessageInjectionRejectedError):
         await runner.inject_user_message("atomic", "new", turn_id="turn")
 
-    assert ACCEPTED_TURN_IDS_METADATA_KEY not in context.metadata
+    # The rejected write must not touch the record already on the live
+    # context -- not even the shared list object underneath it.
+    assert context.metadata[ACCEPTED_TURN_IDS_METADATA_KEY] == seeded
     tracer.checkpoint.side_effect = None
     result = await runner.inject_user_message("atomic", "new", turn_id="turn")
     assert result.outcome is UserMessageInjectionOutcome.POSTED_FRESH
+    assert context.metadata[ACCEPTED_TURN_IDS_METADATA_KEY] == [
+        *seeded,
+        ["turn", AgentRunner._turn_content_digest("new")],
+    ]
 
 
 @pytest.mark.asyncio
@@ -352,6 +373,7 @@ async def test_readback_confirmed_write_publishes_record(atomic_live) -> None:
 async def test_unknown_write_outcome_leaves_no_record(atomic_live) -> None:
     runner, context, tracer = atomic_live
     runner.pause = MagicMock(return_value=True)
+    seeded = _seed_one_accepted_turn(context)
 
     async def write(**payload: Any) -> None:
         tracer.load_latest_checkpoint.side_effect = RuntimeError("read unavailable")
@@ -361,13 +383,16 @@ async def test_unknown_write_outcome_leaves_no_record(atomic_live) -> None:
     result = await runner.inject_user_message("atomic", "new", turn_id="turn")
 
     assert result.outcome is UserMessageInjectionOutcome.OUTCOME_UNKNOWN
-    assert ACCEPTED_TURN_IDS_METADATA_KEY not in context.metadata
+    # An unconfirmed write must not touch the record already on the live
+    # context -- not even the shared list object underneath it.
+    assert context.metadata[ACCEPTED_TURN_IDS_METADATA_KEY] == seeded
 
 
 @pytest.mark.asyncio
 async def test_cancelled_write_leaves_no_record(atomic_live) -> None:
     runner, context, tracer = atomic_live
     runner.pause = MagicMock(return_value=True)
+    seeded = _seed_one_accepted_turn(context)
     entered = asyncio.Event()
 
     async def write(**payload: Any) -> None:
@@ -383,7 +408,9 @@ async def test_cancelled_write_leaves_no_record(atomic_live) -> None:
     with pytest.raises(asyncio.CancelledError):
         await task
 
-    assert ACCEPTED_TURN_IDS_METADATA_KEY not in context.metadata
+    # The cancelled write must not touch the record already on the live
+    # context -- not even the shared list object underneath it.
+    assert context.metadata[ACCEPTED_TURN_IDS_METADATA_KEY] == seeded
 
 
 def _jsonb_like(value: Any) -> Any:
