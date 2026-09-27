@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import inspect
 import logging
 from collections.abc import Iterator
@@ -59,7 +60,24 @@ logger = logging.getLogger(__name__)
 # that merge point reaches neither surface: it carries only the modality
 # preference over and drops the rest of the current run's metadata, so no client
 # key reaches a context rebuilt from a checkpoint.
-RESERVED_ENGINE_METADATA_KEYS = frozenset({TOOL_EVIDENCE_REMOVED_METADATA_KEY})
+# Turn ids of every user message this execution has durably accepted, mapped
+# to a digest of the accepted execution text. Context compaction drops old
+# messages but never ``context.metadata``, so this record is what recognises a
+# retried turn after its message was compacted away. It is written into the
+# same context snapshot as the message it records, so it becomes durable in the
+# very checkpoint that accepts the turn. Engine-owned: never seeded by callers.
+ACCEPTED_TURN_IDS_METADATA_KEY = "_accepted_user_turn_ids"
+# Retries of one turn arrive within a delivery retry window, not hundreds of
+# turns later, so the most recent ids suffice; the bound keeps every checkpoint
+# of a long-lived execution from growing without limit (~80 bytes per entry).
+MAX_ACCEPTED_TURN_IDS = 1024
+# Mirrors ``core.agent.tracing.TRACE_TURN_IDS_KEY`` (not imported: cycle). The
+# fallback record for checkpoints written before the accepted record existed.
+_TRACED_TURN_IDS_METADATA_KEY = "_user_message_trace_turn_ids"
+
+RESERVED_ENGINE_METADATA_KEYS = frozenset(
+    {TOOL_EVIDENCE_REMOVED_METADATA_KEY, ACCEPTED_TURN_IDS_METADATA_KEY}
+)
 
 
 @dataclass
@@ -384,11 +402,12 @@ class AgentRunner:
                             tool_call_id=message.get("tool_call_id"),
                         )
                 if task:
-                    context.add_user_message(
+                    initial = context.add_user_message(
                         task,
                         metadata=self._initial_user_message_metadata(context),
                         context_refs=task_context_refs,
                     )
+                    self._record_accepted_turn(context, initial)
 
             # A runner registered by post_user_message before the host installed
             # its handler would otherwise resume handler-less (#1328); an
@@ -913,16 +932,27 @@ class AgentRunner:
                             raise UserMessageInjectionConflictError(
                                 "turn_id is already associated with a different user message"
                             )
-                        if request_interrupt:
-                            self.pause(
-                                execution_id, reason=reason or "new user message"
-                            )
-                        _record_injection_outcome(
-                            UserMessageInjectionOutcome.POSTED_REPLAY
+                        return self._replay_accepted_turn(
+                            execution_id,
+                            context,
+                            request_interrupt=request_interrupt,
+                            reason=reason,
                         )
-                        return UserMessageInjectionResult(
-                            context=context,
-                            outcome=UserMessageInjectionOutcome.POSTED_REPLAY,
+                    # Compaction may have dropped the message itself; the
+                    # metadata record of accepted turns survives it.
+                    accepted = self._accepted_turn_digest(context, requested_turn_id)
+                    if accepted is not None:
+                        if accepted and accepted != self._turn_content_digest(
+                            resolved_execution_message
+                        ):
+                            raise UserMessageInjectionConflictError(
+                                "turn_id is already associated with a different user message"
+                            )
+                        return self._replay_accepted_turn(
+                            execution_id,
+                            context,
+                            request_interrupt=request_interrupt,
+                            reason=reason,
                         )
 
                 # Resolve the checkpoint-merge baseline before any context mutation
@@ -975,6 +1005,7 @@ class AgentRunner:
                 # would treat any missing-watermark checkpoint as "everything
                 # untraced" and re-render historical user messages on resume.
                 self._set_pending_user_message_marker(candidate, added)
+                self._record_accepted_turn(candidate, added)
                 # Persist BEFORE emitting the trace so the message is durable even
                 # if the trace dispatch fails — the resume path's catch-up logic
                 # in TraceEventCallback.on_run_start will replay the marked turn.
@@ -1020,6 +1051,9 @@ class AgentRunner:
                 _record_injection_outcome(UserMessageInjectionOutcome.POSTED_FRESH)
                 context.messages.append(added)
                 self._set_pending_user_message_marker(context, added)
+                context.metadata[ACCEPTED_TURN_IDS_METADATA_KEY] = candidate.metadata[
+                    ACCEPTED_TURN_IDS_METADATA_KEY
+                ]
             break
         # Preserve callback-before-interrupt ordering on success, but never
         # skip the interruption when tracing or watermark persistence cancels.
@@ -1107,6 +1141,74 @@ class AgentRunner:
             context=context,
             outcome=UserMessageInjectionOutcome.POSTED_FRESH,
         )
+
+    def _replay_accepted_turn(
+        self,
+        execution_id: str,
+        context: ExecutionContext,
+        *,
+        request_interrupt: bool,
+        reason: str | None,
+    ) -> UserMessageInjectionResult:
+        if request_interrupt:
+            self.pause(execution_id, reason=reason or "new user message")
+        _record_injection_outcome(UserMessageInjectionOutcome.POSTED_REPLAY)
+        return UserMessageInjectionResult(
+            context=context,
+            outcome=UserMessageInjectionOutcome.POSTED_REPLAY,
+        )
+
+    @staticmethod
+    def _turn_content_digest(content: str) -> str:
+        return hashlib.sha256(content.encode("utf-8")).hexdigest()[:32]
+
+    @staticmethod
+    def _accepted_turn_digest(context: ExecutionContext, turn_id: str) -> str | None:
+        """Digest of an accepted turn's text; "" if accepted with no digest.
+
+        None means the turn is not on record. A legacy checkpoint carries only
+        the traced turn ids, which prove acceptance but not the content.
+        """
+        metadata = getattr(context, "metadata", None)
+        if not isinstance(metadata, dict):
+            return None
+        accepted = metadata.get(ACCEPTED_TURN_IDS_METADATA_KEY)
+        if isinstance(accepted, dict) and turn_id in accepted:
+            digest = accepted[turn_id]
+            return digest if isinstance(digest, str) else ""
+        traced = metadata.get(_TRACED_TURN_IDS_METADATA_KEY)
+        if isinstance(traced, list) and turn_id in traced:
+            return ""
+        return None
+
+    @staticmethod
+    def _record_accepted_turn(context: ExecutionContext, message: Any) -> None:
+        """Record ``message``'s turn id on ``context.metadata``.
+
+        Rebinds a fresh dict rather than mutating in place: an injection
+        candidate shares the live context's nested metadata values, and the
+        live context must not see the record before the candidate persists.
+        """
+        turn_id = AgentRunner._message_turn_id(message)
+        metadata = getattr(context, "metadata", None)
+        if turn_id is None or not isinstance(metadata, dict):
+            return
+        existing = metadata.get(ACCEPTED_TURN_IDS_METADATA_KEY)
+        accepted = (
+            {
+                key: value
+                for key, value in existing.items()
+                if isinstance(key, str) and key != turn_id
+            }
+            if isinstance(existing, dict)
+            else {}
+        )
+        accepted[turn_id] = AgentRunner._turn_content_digest(
+            str(getattr(message, "content", "") or "")
+        )
+        while len(accepted) > MAX_ACCEPTED_TURN_IDS:
+            del accepted[next(iter(accepted))]
+        metadata[ACCEPTED_TURN_IDS_METADATA_KEY] = accepted
 
     @staticmethod
     def _read_trace_watermark(context: ExecutionContext) -> str | None:
