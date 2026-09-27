@@ -23,14 +23,17 @@ from typing import Any, Iterator
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from sqlalchemy.exc import OperationalError
 
 from tests.web.api.test_durable_message_resume_contention import (
     _live_control_environment,
     _live_task,
     _message_command,
     _user,
+    live_task_lease,
 )
 from tests.web.api.test_recovered_delivery_outcome_unknown import (
+    MESSAGE,
     TURN_ID,
     _assert_outcome_unknown_frames,
     _enqueue_settled_unknown_command,
@@ -50,22 +53,26 @@ from xagent.web.models.database import (
     init_db,
 )
 from xagent.web.models.task import Task, TaskStatus
+from xagent.web.models.task_command import TaskExecutionCommand
 from xagent.web.services import task_command_execution as command_execution_service
 from xagent.web.services import task_execution as task_execution_service
 from xagent.web.services import task_execution_controller as controller_module
 from xagent.web.services.chat_history_service import (
     DELIVERY_DISPATCHED,
     DELIVERY_OUTCOME_UNKNOWN,
+    DELIVERY_PENDING,
 )
 from xagent.web.services.client_error_messages import ClientErrorCode
 from xagent.web.services.task_command_execution import execute_durable_task_command
 from xagent.web.services.task_command_transport import (
+    COMMAND_PROCESSING,
     TaskCommandDeferred,
     TaskCommandKind,
+    enqueue_task_command,
+    get_runner_id,
 )
 from xagent.web.services.task_execution import ResumeReservationOutcome
 from xagent.web.services.task_execution_controller import (
-    NON_RESUMABLE_STATUSES,
     StaleTaskRunError,
     TaskControlState,
     TaskStatusRefusedError,
@@ -78,6 +85,9 @@ from xagent.web.services.task_lease_service import (
     release_task_lease_no_commit,
 )
 from xagent.web.services.task_orchestrator import TaskTurnOrchestrator, TurnKind
+
+# Re-exported fixture from the contention suite.
+live_task_lease = live_task_lease
 
 RECOVERY_ERROR = "not recoverable: checkpoint missing"
 FINAL_OUTPUT = "the run's final answer"
@@ -210,7 +220,7 @@ async def test_recovered_delivery_on_ended_run_settles_outcome_unknown(
             agent,
             background_manager,
         ),
-        patch.object(command_execution_service, "publish_task_event", publish),
+        patch.object(task_execution_service, "publish_task_event", publish),
     ):
         result = await execute_durable_task_command(
             _message_command(task, owner, TURN_ID, attempt_count=2)
@@ -287,7 +297,7 @@ async def test_run_ended_after_routing_snapshot_is_caught_by_the_transition(
         task_execution_service.execute_resume_background.assert_not_called()
 
     assert raced.call_count == 1
-    assert raced.call_args.kwargs["refused_statuses"] == NON_RESUMABLE_STATUSES
+    assert raced.call_args.kwargs["refuse_terminal_status"] is True
     assert result == _outcome_unknown_result(task)
     background_manager.release_resume_reservation.assert_called_with(task_id)
     background_manager.register_reserved_resume.assert_not_called()
@@ -467,9 +477,9 @@ def test_refused_status_transition_leaves_the_row_untouched(
             task,
             TaskControlState.RESUME_REQUESTED,
             expected_run_id="live-run",
-            refused_statuses=NON_RESUMABLE_STATUSES,
+            refuse_terminal_status=True,
         )
-    assert exc_info.value.status == ended_status
+    assert ended_status.value in str(exc_info.value)
     db_session.rollback()
     _assert_still_ended(db_session, task_id, ended_status, state_version=state_version)
 
@@ -483,7 +493,7 @@ def test_refused_status_transition_leaves_the_row_untouched(
             task,
             TaskControlState.RESUME_REQUESTED,
             expected_run_id="another-run",
-            refused_statuses=NON_RESUMABLE_STATUSES,
+            refuse_terminal_status=True,
         )
     assert not isinstance(stale_info.value, TaskStatusRefusedError)
 
@@ -504,7 +514,7 @@ def test_resume_lease_claim_status_fence_is_opt_in(
         int(owner.id),
         "live-run",
         refuse_terminal_status=refuse,
-        status_refused_out=refused,
+        run_not_resumable_out=refused,
     )
 
     if refuse:
@@ -535,7 +545,7 @@ def test_resume_lease_claim_refused_by_a_live_owner_is_not_a_status_refusal(
         int(owner.id),
         "live-run",
         refuse_terminal_status=True,
-        status_refused_out=refused,
+        run_not_resumable_out=refused,
     )
 
     assert lease is None
@@ -590,10 +600,507 @@ async def test_recovered_delivery_on_completed_run_is_never_resumed(
             int(owner.id),
             "live-run",
             refuse_terminal_status=True,
-            status_refused_out=refused,
+            run_not_resumable_out=refused,
         )
         is None
     )
     assert refused == [True]
     db_session.expire_all()
     assert db_session.get(Task, task_id).status == TaskStatus.COMPLETED
+
+
+def _update_task(task_id: int, **values: Any) -> None:
+    with get_session_local()() as db:
+        db.query(Task).filter(Task.id == task_id).update(
+            values, synchronize_session=False
+        )
+        db.commit()
+
+
+def _end_run_directly(task_id: int, ended_status: TaskStatus) -> None:
+    """End the run whatever lease holds it (the run's own terminal write)."""
+
+    values: dict[Any, Any] = {
+        Task.status: ended_status,
+        Task.control_state: ended_status.value.lower(),
+        Task.runner_id: None,
+        Task.lease_expires_at: None,
+        Task.lease_attempt_id: None,
+        Task.state_version: Task.state_version + 1,
+    }
+    if ended_status == TaskStatus.FAILED:
+        values[Task.error_message] = RECOVERY_ERROR
+    else:
+        values[Task.output] = FINAL_OUTPUT
+    with get_session_local()() as db:
+        db.query(Task).filter(Task.id == task_id).update(
+            values, synchronize_session=False
+        )
+        db.commit()
+
+
+def _real_resume_environment(agent: MagicMock, background_manager: Any):
+    """Run the real resume coordinator; only the agent is a stand-in."""
+
+    return (
+        patch(
+            "xagent.web.services.agent_service_manager.get_agent_manager",
+            return_value=MagicMock(get_agent_for_task=AsyncMock(return_value=agent)),
+        ),
+        patch.object(
+            task_execution_service, "background_task_manager", background_manager
+        ),
+    )
+
+
+async def _wait_for_resume_to_finish(background_manager: Any, task_id: int) -> None:
+    for _ in range(300):
+        if task_id not in background_manager.running_tasks:
+            return
+        await asyncio.sleep(0.01)
+    raise AssertionError("the resume coordinator never finished")
+
+
+@pytest.mark.asyncio
+@ENDED_STATUSES
+async def test_posted_recovered_claim_whose_run_ends_before_the_claim_is_announced(
+    live_task_lease,
+    db_session,
+    ended_status: TaskStatus,
+) -> None:
+    """The live injection was accepted, then the run ended before resuming.
+
+    The ended run is still not resumed. The sender was already told the turn
+    was accepted and no resume will answer it, so the task's audience gets a
+    task-wide outcome-unknown notice; the row stays ``dispatched``.
+    """
+
+    owner = _user(db_session, f"posted-owner-{ended_status.value}")
+    task = _live_task(db_session, int(owner.id))
+    task.runner_id = get_runner_id()
+    task.lease_expires_at = datetime.now(timezone.utc) + timedelta(minutes=1)
+    db_session.commit()
+    live_task_lease(db_session, task)
+    task_id = int(task.id)
+    _pending_row(db_session, task, int(owner.id))
+    real_sync = controller_module.transition_task_control_state_sync
+
+    def transition_then_end(*args: Any, **kwargs: Any):
+        snapshot = real_sync(*args, **kwargs)
+        _end_run_directly(task_id, ended_status)
+        return snapshot
+
+    agent = MagicMock()
+    agent.supports_live_control.return_value = True
+    agent.post_user_message = AsyncMock(
+        return_value=task_execution_service.UserMessageInjectionOutcome.POSTED_FRESH
+    )
+    background_manager = task_execution_service.BackgroundTaskManager()
+    resume_spy = AsyncMock(wraps=task_execution_service.execute_resume_background)
+    publish = AsyncMock()
+    agent_patch, manager_patch = _real_resume_environment(agent, background_manager)
+    with (
+        agent_patch,
+        manager_patch,
+        patch.object(task_execution_service, "execute_resume_background", resume_spy),
+        patch.object(task_execution_service, "publish_task_event", publish),
+        patch.object(
+            controller_module,
+            "transition_task_control_state_sync",
+            side_effect=transition_then_end,
+        ),
+    ):
+        result = await execute_durable_task_command(
+            _message_command(task, owner, TURN_ID, attempt_count=2)
+        )
+        assert resume_spy.await_count == 1
+        assert resume_spy.await_args.kwargs["refuse_terminal_status"] is True
+        assert resume_spy.await_args.kwargs["delivery_already_dispatched"] is True
+        await _wait_for_resume_to_finish(background_manager, task_id)
+
+    # The live injection was accepted and answered as such.
+    assert result is not None and "delivery_outcome" not in result
+    agent.post_user_message.assert_awaited_once()
+    assert _row_status(db_session, task_id) == DELIVERY_DISPATCHED
+    db_session.expire_all()
+    stored = db_session.get(Task, task_id)
+    assert stored.status == ended_status
+    assert stored.control_state == ended_status.value.lower()
+    assert stored.run_id == "live-run"
+    assert stored.runner_id is None
+    notices = [
+        call.args[0]
+        for call in publish.await_args_list
+        if call.args[0].get("error_code")
+        == ClientErrorCode.MESSAGE_OUTCOME_UNKNOWN.value
+    ]
+    assert len(notices) == 1
+    notice = notices[0]
+    assert notice["type"] == "error"
+    assert notice["task_id"] == task_id
+    assert notice["turn_id"] == TURN_ID
+    assert notice["client_message_id"] == TURN_ID
+    assert MESSAGE not in str(notice)
+    assert not any(
+        call.args[0].get("error_code") == ClientErrorCode.TASK_BUSY.value
+        for call in publish.await_args_list
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("change", ["run_rotated", "foreign_live_owner"])
+async def test_recovered_claim_refused_for_a_live_run_records_outcome_unknown(
+    db_session,
+    recording_reply: _RecordingReply,
+    change: str,
+) -> None:
+    """The claim is refused although the run did not end.
+
+    ``run_rotated``: the task moved to another run (non-terminal) between the
+    transition and the claim -- the classifier's run-changed arm.
+    ``foreign_live_owner``: a live foreign runner holds the same run. An
+    ordinary resume records that as a failed delivery; a recovered claim may
+    already have been applied, so it records outcome unknown instead.
+    """
+
+    owner = _user(db_session, f"live-refusal-{change}")
+    task = _expired_running_task(db_session, int(owner.id))
+    task_id = int(task.id)
+    _pending_row(db_session, task, int(owner.id))
+    real_sync = controller_module.transition_task_control_state_sync
+
+    def transition_then_change(*args: Any, **kwargs: Any):
+        snapshot = real_sync(*args, **kwargs)
+        if change == "run_rotated":
+            _update_task(
+                task_id,
+                status=TaskStatus.PAUSED,
+                control_state=TaskControlState.PAUSED.value,
+                run_id="rotated-run",
+                runner_id=None,
+                lease_expires_at=None,
+                lease_attempt_id=None,
+            )
+        else:
+            _update_task(
+                task_id,
+                runner_id="foreign-runner",
+                lease_attempt_id="foreign-attempt",
+                lease_expires_at=datetime.now(timezone.utc) + timedelta(minutes=5),
+            )
+        return snapshot
+
+    agent = MagicMock()
+    agent.supports_live_control.return_value = True
+    agent.post_user_message = AsyncMock()
+    background_manager = task_execution_service.BackgroundTaskManager()
+    publish = AsyncMock()
+    agent_patch, manager_patch = _real_resume_environment(agent, background_manager)
+    with (
+        agent_patch,
+        manager_patch,
+        patch.object(task_execution_service, "publish_task_event", publish),
+        patch.object(
+            controller_module,
+            "transition_task_control_state_sync",
+            side_effect=transition_then_change,
+        ),
+    ):
+        try:
+            first = await execute_durable_task_command(
+                _message_command(task, owner, TURN_ID, attempt_count=2)
+            )
+        except TaskCommandDeferred:
+            first = None
+        await _wait_for_resume_to_finish(background_manager, task_id)
+        assert _row_status(db_session, task_id) == DELIVERY_OUTCOME_UNKNOWN
+        recording_reply.frames.clear()
+        result = (
+            first
+            if first is not None
+            else await execute_durable_task_command(
+                _message_command(task, owner, TURN_ID, attempt_count=3)
+            )
+        )
+
+    assert result == _outcome_unknown_result(task)
+    agent.post_user_message.assert_not_awaited()
+    assert not any(
+        call.args[0].get("error_code") == ClientErrorCode.TASK_BUSY.value
+        for call in publish.await_args_list
+    )
+    db_session.expire_all()
+    stored = db_session.get(Task, task_id)
+    if change == "run_rotated":
+        assert stored.status == TaskStatus.PAUSED
+        assert stored.run_id == "rotated-run"
+    else:
+        assert stored.status == TaskStatus.RUNNING
+        assert stored.runner_id == "foreign-runner"
+        assert stored.run_id == "live-run"
+
+
+def test_resume_lease_claim_classifies_a_rotated_run_as_not_resumable(
+    db_session,
+) -> None:
+    owner = _user(db_session, "claim-rotated-owner")
+    task = _settled_task(
+        db_session, int(owner.id), status=TaskStatus.PAUSED, run_id="rotated-run"
+    )
+    not_resumable: list[bool] = []
+
+    lease = task_execution_service._acquire_resume_task_lease(
+        int(task.id),
+        int(owner.id),
+        "live-run",
+        refuse_terminal_status=True,
+        run_not_resumable_out=not_resumable,
+    )
+
+    assert lease is None
+    assert not_resumable == [True]
+    db_session.expire_all()
+    stored = db_session.get(Task, int(task.id))
+    assert stored.status == TaskStatus.PAUSED
+    assert stored.run_id == "rotated-run"
+
+
+@pytest.mark.asyncio
+async def test_run_rotated_at_the_transition_settles_a_recovered_claim_unknown(
+    db_session,
+    recording_reply: _RecordingReply,
+) -> None:
+    """A stale run at RESUME_REQUESTED never fails a recovered claim."""
+
+    owner = _user(db_session, "transition-rotated-owner")
+    task = _expired_running_task(db_session, int(owner.id))
+    task_id = int(task.id)
+    _pending_row(db_session, task, int(owner.id))
+    real_sync = controller_module.transition_task_control_state_sync
+
+    def rotate_then_transition(*args: Any, **kwargs: Any):
+        _update_task(task_id, run_id="rotated-run")
+        return real_sync(*args, **kwargs)
+
+    with (
+        _live_control_environment(outcome=ResumeReservationOutcome.RESERVED) as (
+            agent,
+            background_manager,
+        ),
+        patch.object(
+            controller_module,
+            "transition_task_control_state_sync",
+            side_effect=rotate_then_transition,
+        ),
+    ):
+        result = await execute_durable_task_command(
+            _message_command(task, owner, TURN_ID, attempt_count=2)
+        )
+        task_execution_service.execute_resume_background.assert_not_called()
+
+    assert result == _outcome_unknown_result(task)
+    background_manager.release_resume_reservation.assert_called_with(task_id)
+    assert _row_status(db_session, task_id) == DELIVERY_DISPATCHED
+    _assert_outcome_unknown_frames(recording_reply)
+    db_session.expire_all()
+    stored = db_session.get(Task, task_id)
+    assert stored.run_id == "rotated-run"
+    assert stored.status == TaskStatus.RUNNING
+    agent.post_user_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", [TaskStatus.RUNNING, TaskStatus.WAITING_FOR_USER])
+async def test_fresh_live_message_passes_no_status_fence(
+    db_session,
+    status: TaskStatus,
+) -> None:
+    """Only a recovered claim opts into the terminal-status fences."""
+
+    owner = _user(db_session, f"fresh-live-owner-{status.value}")
+    task = _expired_running_task(db_session, int(owner.id))
+    task.status = status
+    task.control_state = status.value.lower()
+    db_session.commit()
+    real_sync = controller_module.transition_task_control_state_sync
+    transition_spy = MagicMock(side_effect=real_sync)
+
+    with (
+        _live_control_environment(outcome=ResumeReservationOutcome.RESERVED),
+        patch.object(
+            controller_module, "transition_task_control_state_sync", transition_spy
+        ),
+    ):
+        with pytest.raises(TaskCommandDeferred):
+            # A deferred delivery waits for the (mocked) resume to inject it.
+            await execute_durable_task_command(
+                _message_command(task, owner, "fresh-live-turn", attempt_count=1)
+            )
+        resume = task_execution_service.execute_resume_background
+        assert resume.call_count == 1
+        assert resume.call_args.kwargs["refuse_terminal_status"] is False
+
+    assert transition_spy.call_count == 1
+    assert transition_spy.call_args.kwargs["refuse_terminal_status"] is False
+
+
+def _processing_command_row(db, task: Task, owner, command) -> None:
+    enqueued = enqueue_task_command(
+        db,
+        task_id=int(task.id),
+        actor_user_id=int(owner.id),
+        command_id=command.command_id,
+        kind=TaskCommandKind.MESSAGE,
+        payload=dict(command.payload),
+    )
+    stored = db.get(TaskExecutionCommand, enqueued.command_id)
+    stored.status = COMMAND_PROCESSING
+    db.commit()
+
+
+def _stored_command_result(db, task_id: int, command_id: str) -> Any:
+    db.expire_all()
+    row = (
+        db.query(TaskExecutionCommand)
+        .filter(
+            TaskExecutionCommand.task_id == task_id,
+            TaskExecutionCommand.command_id == command_id,
+        )
+        .one()
+    )
+    return row.result
+
+
+@pytest.mark.asyncio
+async def test_retry_after_an_unrecorded_unknown_settlement_still_answers_unknown(
+    db_session,
+    recording_reply: _RecordingReply,
+) -> None:
+    """The attempt that settled the turn crashed before storing its result.
+
+    The row is ``dispatched`` and the in-memory marker is gone; the durable
+    record on the command row keeps the retry from reading it as accepted.
+    """
+
+    owner = _user(db_session, "unrecorded-unknown-owner")
+    task = _ended_task(db_session, int(owner.id), TaskStatus.COMPLETED)
+    task_id = int(task.id)
+    _pending_row(db_session, task, int(owner.id))
+    command = _message_command(task, owner, TURN_ID, attempt_count=2)
+    _processing_command_row(db_session, task, owner, command)
+
+    with _live_control_environment(outcome=ResumeReservationOutcome.RESERVED):
+        first = await execute_durable_task_command(command)
+    assert first == _outcome_unknown_result(task)
+    assert _row_status(db_session, task_id) == DELIVERY_DISPATCHED
+    # Recorded before the row write, so a crash after it loses nothing.
+    assert _stored_command_result(db_session, task_id, TURN_ID) == first
+
+    # The transport never stored the result; a later attempt runs again.
+    recording_reply.frames.clear()
+    with _live_control_environment(outcome=ResumeReservationOutcome.RESERVED):
+        retried = await execute_durable_task_command(
+            _message_command(task, owner, TURN_ID, attempt_count=3)
+        )
+
+    assert retried == _outcome_unknown_result(task)
+    _assert_outcome_unknown_frames(recording_reply)
+    assert _row_status(db_session, task_id) == DELIVERY_DISPATCHED
+
+
+@pytest.mark.asyncio
+async def test_retry_of_an_ordinary_dispatched_turn_is_still_accepted(
+    db_session,
+    recording_reply: _RecordingReply,
+) -> None:
+    owner = _user(db_session, "ordinary-dispatched-owner")
+    task = _ended_task(db_session, int(owner.id), TaskStatus.COMPLETED)
+    task_id = int(task.id)
+    _pending_row(db_session, task, int(owner.id))
+    command = _message_command(task, owner, TURN_ID, attempt_count=3)
+    _processing_command_row(db_session, task, owner, command)
+    with get_session_local()() as db:
+        db.query(command_execution_service.TaskChatMessage).filter(
+            command_execution_service.TaskChatMessage.task_id == task_id
+        ).update({"delivery_status": DELIVERY_DISPATCHED}, synchronize_session=False)
+        db.commit()
+
+    with _live_control_environment(outcome=ResumeReservationOutcome.RESERVED):
+        result = await execute_durable_task_command(command)
+
+    assert result == {
+        "task_id": task_id,
+        "command_id": TURN_ID,
+        "kind": TaskCommandKind.MESSAGE.value,
+    }
+    assert not any(
+        frame.get("error_code") == ClientErrorCode.MESSAGE_OUTCOME_UNKNOWN.value
+        for frame in recording_reply.frames
+    )
+
+
+@pytest.mark.asyncio
+async def test_refused_resume_whose_unknown_record_fails_does_not_report_a_failure(
+    db_session,
+) -> None:
+    """A DB error recording the refusal is logged; the run is not failed."""
+
+    owner = _user(db_session, "record-fails-owner")
+    task = _expired_running_task(db_session, int(owner.id))
+    task_id = int(task.id)
+    _pending_row(db_session, task, int(owner.id))
+    real_sync = controller_module.transition_task_control_state_sync
+
+    def transition_then_complete(*args: Any, **kwargs: Any):
+        snapshot = real_sync(*args, **kwargs)
+        _end_run_directly(task_id, TaskStatus.COMPLETED)
+        return snapshot
+
+    real_mark = task_execution_service.mark_user_message_delivery_sync
+    marks: list[str] = []
+
+    def failing_mark(task_id_arg: int, turn_id: str, status: str):
+        # Only the first write fails, so a fall-through into the generic
+        # failure handler would get its own delivery write through and then
+        # announce a task failure.
+        marks.append(status)
+        if len(marks) == 1:
+            raise OperationalError("UPDATE", {}, Exception("database went away"))
+        return real_mark(task_id_arg, turn_id, status)
+
+    agent = MagicMock()
+    agent.supports_live_control.return_value = True
+    agent.post_user_message = AsyncMock()
+    background_manager = task_execution_service.BackgroundTaskManager()
+    publish = AsyncMock()
+    agent_patch, manager_patch = _real_resume_environment(agent, background_manager)
+    with (
+        agent_patch,
+        manager_patch,
+        patch.object(task_execution_service, "publish_task_event", publish),
+        patch.object(
+            task_execution_service,
+            "mark_user_message_delivery_sync",
+            side_effect=failing_mark,
+        ),
+        patch.object(
+            controller_module,
+            "transition_task_control_state_sync",
+            side_effect=transition_then_complete,
+        ),
+    ):
+        with pytest.raises(TaskCommandDeferred):
+            await execute_durable_task_command(
+                _message_command(task, owner, TURN_ID, attempt_count=2)
+            )
+        await _wait_for_resume_to_finish(background_manager, task_id)
+
+    assert marks == [DELIVERY_OUTCOME_UNKNOWN]
+    publish.assert_not_awaited()
+    agent.post_user_message.assert_not_awaited()
+    # Still pending: the retried command settles it through the early refusal.
+    assert _row_status(db_session, task_id) == DELIVERY_PENDING
+    db_session.expire_all()
+    stored = db_session.get(Task, task_id)
+    assert stored.status == TaskStatus.COMPLETED
+    assert stored.output == FINAL_OUTPUT

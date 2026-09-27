@@ -13,7 +13,7 @@ import enum
 from contextlib import asynccontextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
-from typing import Any, AsyncIterator, Collection
+from typing import Any, AsyncIterator
 from uuid import uuid4
 
 from sqlalchemy import func, select, update
@@ -63,18 +63,14 @@ NON_RESUMABLE_STATUSES: tuple[TaskStatus, ...] = (
 
 
 class TaskStatusRefusedError(RuntimeError):
-    """The row holds a status the caller asked this transition to refuse.
+    """The row's run has ended, and the caller asked not to transition it.
 
     Not a stale-run error: the run may still match. A caller opts in with
-    ``refused_statuses`` when the target state must never be entered from
-    that status (a recovered message must not resume an ended run), and the
-    refusal is part of the same conditional UPDATE, so a status committed
-    after the caller's snapshot is still caught.
+    ``refuse_terminal_status`` when the target state must never be entered
+    from a :data:`NON_RESUMABLE_STATUSES` row (a recovered message must not
+    resume an ended run), and the refusal is part of the same conditional
+    UPDATE, so a status committed after the caller's snapshot is still caught.
     """
-
-    def __init__(self, message: str, *, status: TaskStatus) -> None:
-        super().__init__(message)
-        self.status = status
 
 
 @dataclass(frozen=True)
@@ -134,24 +130,24 @@ def apply_task_control_transition(
     new_run: bool = False,
     expected_run_id: str | None = None,
     expected_state_version: int | None = None,
-    refused_statuses: Collection[TaskStatus] = (),
+    refuse_terminal_status: bool = False,
 ) -> TaskControlSnapshot:
     """Mutate one ORM task with a monotonic control-state transition.
 
     The caller owns the transaction. This lets terminal task status and its
     assistant transcript row continue to commit atomically.
 
-    ``refused_statuses`` raises :class:`TaskStatusRefusedError` instead of
-    transitioning a row that holds one of them, checked in the UPDATE itself.
+    ``refuse_terminal_status`` raises :class:`TaskStatusRefusedError` instead
+    of transitioning a :data:`NON_RESUMABLE_STATUSES` row, checked in the
+    UPDATE itself.
     """
 
     current_run_id = getattr(task, "run_id", None)
     current_state_version = int(getattr(task, "state_version", 0) or 0)
-    refused = frozenset(refused_statuses)
+    refused = frozenset(NON_RESUMABLE_STATUSES if refuse_terminal_status else ())
     if task.status in refused:
         raise TaskStatusRefusedError(
-            f"task {task.id} is {task.status.value}; refusing {control_state.value}",
-            status=task.status,
+            f"task {task.id} is {task.status.value}; refusing {control_state.value}"
         )
     if expected_run_id is not None and current_run_id != expected_run_id:
         raise StaleTaskRunError(
@@ -217,8 +213,7 @@ def apply_task_control_transition(
                     if raced_status in refused:
                         raise TaskStatusRefusedError(
                             f"task {task_id} became {raced_status.value}; "
-                            f"refusing {control_state.value}",
-                            status=raced_status,
+                            f"refusing {control_state.value}"
                         )
                 # The Python pre-check above reads the row before this
                 # UPDATE, so a commit landing in between arrives here
@@ -258,7 +253,7 @@ def transition_task_control_state_sync(
     new_run: bool = False,
     expected_run_id: str | None = None,
     expected_state_version: int | None = None,
-    refused_statuses: Collection[TaskStatus] = (),
+    refuse_terminal_status: bool = False,
 ) -> TaskControlSnapshot:
     from ..models.database import get_session_local
 
@@ -274,7 +269,7 @@ def transition_task_control_state_sync(
             new_run=new_run,
             expected_run_id=expected_run_id,
             expected_state_version=expected_state_version,
-            refused_statuses=refused_statuses,
+            refuse_terminal_status=refuse_terminal_status,
         )
         db.commit()
         return snapshot
@@ -390,7 +385,7 @@ class TaskExecutionController:
         new_run: bool = False,
         expected_run_id: str | None = None,
         expected_state_version: int | None = None,
-        refused_statuses: Collection[TaskStatus] = (),
+        refuse_terminal_status: bool = False,
     ) -> TaskControlSnapshot:
         """Apply one control transition, optionally fenced on an exact row.
 
@@ -413,7 +408,7 @@ class TaskExecutionController:
             new_run=new_run,
             expected_run_id=expected_run_id,
             expected_state_version=expected_state_version,
-            refused_statuses=refused_statuses,
+            refuse_terminal_status=refuse_terminal_status,
         )
 
     async def snapshot(self, task_id: int) -> TaskControlSnapshot | None:

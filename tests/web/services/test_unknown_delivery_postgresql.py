@@ -301,6 +301,33 @@ def _recovery_holding_failed(sessions: sessionmaker[Session], task_id: int) -> S
     return recovering
 
 
+def _completion_holding(sessions: sessionmaker[Session], task_id: int) -> Session:
+    """Stage the run finalizer's COMPLETED write and keep its row lock."""
+
+    finishing = sessions()
+    finishing.execute(
+        update(Task)
+        .where(Task.id == task_id)
+        .values(
+            status=TaskStatus.COMPLETED,
+            control_state=TaskControlState.COMPLETED.value,
+            runner_id=None,
+            lease_expires_at=None,
+            output="final answer",
+            state_version=Task.state_version + 1,
+        )
+    )
+    return finishing
+
+
+def _ending_writer(
+    sessions: sessionmaker[Session], task_id: int, ended_status: TaskStatus
+) -> Session:
+    if ended_status == TaskStatus.FAILED:
+        return _recovery_holding_failed(sessions, task_id)
+    return _completion_holding(sessions, task_id)
+
+
 def _wait_until_blocked_on_a_lock(sessions: sessionmaker[Session]) -> None:
     deadline = time.monotonic() + _BLOCKED_SECONDS
     while time.monotonic() < deadline:
@@ -354,17 +381,19 @@ async def test_recovered_delivery_on_failed_run_settles_outcome_unknown_pg(
     _assert_outcome_unknown_frames(reply)
 
 
-def test_resume_transition_waits_on_recovery_and_refuses_failed_pg(
+@pytest.mark.parametrize("ended_status", [TaskStatus.FAILED, TaskStatus.COMPLETED])
+def test_resume_transition_waits_on_the_ending_write_and_refuses_it_pg(
     pg_sessions: sessionmaker[Session],
     db_session: Session,
+    ended_status: TaskStatus,
 ) -> None:
-    """READ COMMITTED re-evaluates the fenced UPDATE on the recovered row."""
+    """READ COMMITTED re-evaluates the fenced UPDATE on the ended row."""
 
-    owner = _user(db_session, "pg-transition-fence")
+    owner = _user(db_session, f"pg-transition-fence-{ended_status.value}")
     task = _expired_task(db_session, int(owner.id), suffix="transition-fence")
     task_id = int(task.id)
 
-    recovering = _recovery_holding_failed(pg_sessions, task_id)
+    recovering = _ending_writer(pg_sessions, task_id, ended_status)
     try:
         with ThreadPoolExecutor(max_workers=1) as pool:
             transition = pool.submit(
@@ -372,7 +401,7 @@ def test_resume_transition_waits_on_recovery_and_refuses_failed_pg(
                 task_id,
                 TaskControlState.RESUME_REQUESTED,
                 expected_run_id="run-transition-fence",
-                refused_statuses=(TaskStatus.FAILED,),
+                refuse_terminal_status=True,
             )
             _wait_until_blocked_on_a_lock(pg_sessions)
             recovering.commit()
@@ -384,8 +413,9 @@ def test_resume_transition_waits_on_recovery_and_refuses_failed_pg(
 
     with pg_sessions() as db:
         stored = db.get(Task, task_id)
-        assert stored.status == TaskStatus.FAILED
-        assert stored.control_state == TaskControlState.FAILED.value
+        assert stored.status == ended_status
+        assert stored.control_state == ended_status.value.lower()
+        assert stored.run_id == "run-transition-fence"
 
 
 def test_resume_lease_claim_waits_on_recovery_and_refuses_failed_pg(
@@ -406,7 +436,7 @@ def test_resume_lease_claim_waits_on_recovery_and_refuses_failed_pg(
                 int(owner.id),
                 "run-claim-fence",
                 refuse_terminal_status=True,
-                status_refused_out=refused,
+                run_not_resumable_out=refused,
             )
             _wait_until_blocked_on_a_lock(pg_sessions)
             recovering.commit()
@@ -434,21 +464,8 @@ def test_resume_lease_claim_waits_on_completion_and_refuses_completed_pg(
     task_id = int(task.id)
     refused: list[bool] = []
 
-    finishing = pg_sessions()
+    finishing = _completion_holding(pg_sessions, task_id)
     try:
-        # The finalizer's terminal write, holding the task row lock.
-        finishing.execute(
-            update(Task)
-            .where(Task.id == task_id)
-            .values(
-                status=TaskStatus.COMPLETED,
-                control_state=TaskControlState.COMPLETED.value,
-                runner_id=None,
-                lease_expires_at=None,
-                output="final answer",
-                state_version=Task.state_version + 1,
-            )
-        )
         with ThreadPoolExecutor(max_workers=1) as pool:
             claim = pool.submit(
                 _acquire_resume_task_lease,
@@ -456,7 +473,7 @@ def test_resume_lease_claim_waits_on_completion_and_refuses_completed_pg(
                 int(owner.id),
                 "run-claim-completed",
                 refuse_terminal_status=True,
-                status_refused_out=refused,
+                run_not_resumable_out=refused,
             )
             _wait_until_blocked_on_a_lock(pg_sessions)
             finishing.commit()

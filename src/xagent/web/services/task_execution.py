@@ -2271,7 +2271,7 @@ def _acquire_resume_task_lease(
     *,
     prior_status_out: list[TaskStatus] | None = None,
     refuse_terminal_status: bool = False,
-    status_refused_out: list[bool] | None = None,
+    run_not_resumable_out: list[bool] | None = None,
 ) -> TaskLease | None:
     """Validate and claim a resume lease in one worker transaction.
 
@@ -2287,8 +2287,9 @@ def _acquire_resume_task_lease(
     the claim UPDATE, so a run that ended after the caller's snapshot is
     never flipped back to RUNNING. When the claim is refused and the row is
     in one of those statuses or on another run -- the fenced run is not
-    resumable either way -- ``status_refused_out`` receives ``True``; a
-    refusal by a live owner of the same run leaves it empty.
+    resumable either way -- ``run_not_resumable_out`` receives ``True``; a
+    refusal by a live owner of the same run leaves it empty. The caller only
+    uses the distinction to say which one it was.
     """
     SessionLocal = get_session_local()
     with SessionLocal() as db:
@@ -2317,7 +2318,7 @@ def _acquire_resume_task_lease(
             ),
         )
         if lease is None:
-            if refuse_terminal_status and status_refused_out is not None:
+            if refuse_terminal_status and run_not_resumable_out is not None:
                 current = db.execute(
                     select(Task.status, Task.run_id).where(Task.id == task_id)
                 ).first()
@@ -2325,7 +2326,7 @@ def _acquire_resume_task_lease(
                     current[0] in NON_RESUMABLE_STATUSES
                     or current[1] != expected_run_id
                 ):
-                    status_refused_out.append(True)
+                    run_not_resumable_out.append(True)
             db.commit()
             return None
         if task is not None:
@@ -2580,6 +2581,36 @@ def _settle_resumed_task_lease(
     )
 
 
+async def publish_message_outcome_unknown_notice(task_id: int, turn_id: str) -> None:
+    """Tell every subscriber of the task a message's outcome is unknown.
+
+    For when the sender cannot be answered personally. It carries only ids,
+    the error code and the generic client-safe text, never the message body.
+    Best effort: a failure is logged, never raised.
+    """
+
+    notice = {
+        "type": "error",
+        "task_id": task_id,
+        "client_message_id": turn_id,
+        "turn_id": turn_id,
+        "error_code": ClientErrorCode.MESSAGE_OUTCOME_UNKNOWN.value,
+        "message": client_error_message(ClientErrorCode.MESSAGE_OUTCOME_UNKNOWN),
+    }
+    try:
+        await publish_task_event(
+            {**notice, "timestamp": datetime.now(timezone.utc).timestamp()},
+            task_id,
+        )
+    except Exception:
+        logger.warning(
+            "task %s outcome-unknown notice for message %s was not published",
+            task_id,
+            turn_id,
+            exc_info=True,
+        )
+
+
 async def execute_resume_background(
     task_id: int,
     agent_service: Any,
@@ -2816,7 +2847,7 @@ async def execute_resume_background(
 
         if lease is None:
             prior_status_box: list[TaskStatus] = []
-            status_refused_box: list[bool] = []
+            run_not_resumable_box: list[bool] = []
             lease = await acquire_task_lease_cancellation_safe(
                 lambda: _acquire_resume_task_lease(
                     task_id,
@@ -2824,7 +2855,7 @@ async def execute_resume_background(
                     expected_run_id,
                     prior_status_out=prior_status_box,
                     refuse_terminal_status=refuse_terminal_status,
-                    status_refused_out=status_refused_box,
+                    run_not_resumable_out=run_not_resumable_box,
                 ),
                 lambda acquired: _settle_resumed_task_lease(
                     acquired,
@@ -2833,29 +2864,72 @@ async def execute_resume_background(
             )
             if prior_status_box:
                 resume_prior_status = prior_status_box[0]
-            if lease is None and status_refused_box:
-                # The run this recovered delivery targeted ended (FAILED or
-                # COMPLETED) or was replaced after the handoff. It is not resumed, and an
-                # earlier attempt may already have applied the turn, so the
-                # row records outcome unknown -- never failed, which would
-                # invite a resend. The retried command answers the sender
-                # from that row; the task keeps the state recovery gave it.
-                logger.warning(
-                    "Task %s resume refused: run %s is no longer resumable; "
-                    "recording delivery %s as outcome unknown",
-                    task_id,
-                    expected_run_id,
-                    delivery_turn_id,
+            if lease is None and refuse_terminal_status:
+                # A recovered delivery: an earlier attempt claimed its row and
+                # may already have applied the turn, so a refused resume is
+                # never recorded as failed, which would invite a resend. The
+                # run is not resumed either way; the task keeps the state its
+                # last writer gave it.
+                refusal = (
+                    "its run ended or was replaced"
+                    if run_not_resumable_box
+                    else "another runner owns the lease"
                 )
-                if delivery_turn_id is not None and not delivery_was_dispatched:
-                    delivery_outcome_unknown = True
-                    await run_db_io_cancellation_safe(
-                        lambda: mark_user_message_delivery_sync(
-                            task_id,
-                            delivery_turn_id,
-                            DELIVERY_OUTCOME_UNKNOWN,
-                        )
+                if delivery_turn_id is None:
+                    logger.warning(
+                        "Task %s resume of run %s refused: %s",
+                        task_id,
+                        expected_run_id,
+                        refusal,
                     )
+                elif delivery_was_dispatched:
+                    # The injection already landed in the run's checkpoint
+                    # and the sender was told it was accepted, but no resume
+                    # will answer it. Tell the task's audience its outcome is
+                    # unknown, as the durable answer does for a lost origin.
+                    logger.warning(
+                        "Task %s resume of run %s refused: %s; delivery %s was "
+                        "already accepted, publishing an outcome-unknown notice",
+                        task_id,
+                        expected_run_id,
+                        refusal,
+                        delivery_turn_id,
+                    )
+                    await publish_message_outcome_unknown_notice(
+                        task_id, delivery_turn_id
+                    )
+                else:
+                    delivery_outcome_unknown = True
+                    try:
+                        await run_db_io_cancellation_safe(
+                            lambda: mark_user_message_delivery_sync(
+                                task_id,
+                                delivery_turn_id,
+                                DELIVERY_OUTCOME_UNKNOWN,
+                            )
+                        )
+                    except Exception:
+                        # Returning here keeps a possibly COMPLETED task out
+                        # of the generic failure handler below. The row stays
+                        # pending, so the retried command settles it again.
+                        logger.warning(
+                            "Task %s resume of run %s refused: %s; could not "
+                            "record delivery %s as outcome unknown",
+                            task_id,
+                            expected_run_id,
+                            refusal,
+                            delivery_turn_id,
+                            exc_info=True,
+                        )
+                    else:
+                        logger.warning(
+                            "Task %s resume of run %s refused: %s; recorded "
+                            "delivery %s as outcome unknown",
+                            task_id,
+                            expected_run_id,
+                            refusal,
+                            delivery_turn_id,
+                        )
                     await notify_deferred_delivery(False)
                 return
             if lease is None:
