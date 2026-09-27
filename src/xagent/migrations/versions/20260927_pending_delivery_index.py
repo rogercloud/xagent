@@ -32,7 +32,7 @@ extra non-HOT update per user turn -- the write that flips a row from
 row the index exists to make cheap to find in the first place.
 
 Revision ID: 20260927_pending_delivery_index
-Revises: 20260916_durable_create_operations
+Revises: 20260926_expired_task_tombstones
 Create Date: 2026-09-27
 
 """
@@ -44,7 +44,7 @@ import sqlalchemy as sa
 from alembic import op
 
 revision: str = "20260927_pending_delivery_index"
-down_revision: Union[str, None] = "20260916_durable_create_operations"
+down_revision: Union[str, None] = "20260926_expired_task_tombstones"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 

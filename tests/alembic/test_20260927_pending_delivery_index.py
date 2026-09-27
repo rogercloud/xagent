@@ -38,7 +38,7 @@ from xagent.web.services.task_lease_recovery import (
 )
 
 REVISION = "20260927_pending_delivery_index"
-DOWN_REVISION = "20260916_durable_create_operations"
+DOWN_REVISION = "20260926_expired_task_tombstones"
 TABLE = "task_chat_messages"
 INDEX = "ix_task_chat_messages_pending_delivery"
 INDEX_COLUMNS = ("task_id", "created_at")
