@@ -1714,6 +1714,10 @@ def task_lease_holder_predicate(
     """SQL fence: the row is still owned, unexpired, by one of ``holders``.
 
     Missing run or attempt tokens never match, and no holders never matches.
+    A lease is live through ``lease_expires_at == now``, matching takeover
+    and the live-owner fence, which only treat ``lease_expires_at < now`` as
+    expired -- otherwise a row at exactly that instant would be neither
+    takeable nor pausable by its holder.
     """
     fences = [
         and_(
@@ -1729,7 +1733,7 @@ def task_lease_holder_predicate(
     return and_(
         or_(*fences),
         Task.lease_expires_at.is_not(None),
-        Task.lease_expires_at > now,
+        Task.lease_expires_at >= now,
     )
 
 

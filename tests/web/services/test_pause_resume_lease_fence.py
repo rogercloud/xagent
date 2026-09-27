@@ -16,7 +16,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 import pytest
-from sqlalchemy import update
+from sqlalchemy import select, update
 
 from tests.web.api.test_durable_message_resume_contention import (
     _live_control_environment,
@@ -283,6 +283,39 @@ def test_pause_fence_still_reports_a_settled_run_as_finished(db_session) -> None
     )
 
     assert applied is False
+
+
+@pytest.mark.parametrize(
+    ("offset", "held"),
+    [
+        (timedelta(seconds=1), True),
+        (timedelta(0), True),
+        (-timedelta(seconds=1), False),
+    ],
+    ids=["before-expiry", "at-expiry", "after-expiry"],
+)
+def test_holder_fence_treats_the_expiry_instant_as_live(
+    db_session, offset: timedelta, held: bool
+) -> None:
+    """Takeover and the live-owner fence expire a lease only at ``< now``;
+    the holder fence must agree, or a row at exactly ``lease_expires_at``
+    would be neither takeable nor pausable by its holder."""
+    expires_at = datetime(2030, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
+    task = _leased_task(db_session)
+    task.lease_attempt_id = "own-attempt"
+    task.lease_expires_at = expires_at
+    db_session.commit()
+    own = TaskLease(int(task.id), str(task.runner_id), str(task.run_id), "own-attempt")
+
+    with get_session_local()() as db:
+        matched = db.scalar(
+            select(Task.id).where(
+                Task.id == int(task.id),
+                leases.task_lease_holder_predicate((own,), now=expires_at - offset),
+            )
+        )
+
+    assert (matched is not None) is held
 
 
 class _FakeCoordinator:
@@ -716,6 +749,120 @@ async def test_handoff_refused_after_routing_defers_or_settles_unknown(
     stored = _row(db_session, int(task.id))
     assert stored.control_state == TaskControlState.RUNNING.value
     assert stored.state_version == 3
+
+
+def _waiting_row(db_session) -> Task:
+    """A resting row: waiting for the user, owner-free, run kept."""
+    task = _leased_task(db_session)
+    task.status = TaskStatus.WAITING_FOR_USER
+    task.control_state = TaskControlState.WAITING_FOR_USER.value
+    task.runner_id = None
+    task.lease_attempt_id = None
+    task.lease_expires_at = None
+    db_session.commit()
+    return task
+
+
+def _reply_prelease(task_id: int) -> None:
+    """What the HTTP reply / A2A resume prelease leaves: RUNNING, same run,
+    another live acquisition, and only ``state_version`` bumped."""
+    with get_session_local()() as db:
+        db.execute(
+            update(Task)
+            .where(Task.id == task_id)
+            .values(
+                status=TaskStatus.RUNNING,
+                control_state=TaskControlState.RUNNING.value,
+                runner_id=SUCCESSOR_RUNNER,
+                lease_attempt_id=SUCCESSOR_ATTEMPT,
+                lease_expires_at=datetime.now(timezone.utc) + timedelta(minutes=5),
+                state_version=Task.state_version + 1,
+            )
+        )
+        db.commit()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("recovered", [False, True], ids=["fresh", "recovered"])
+async def test_handoff_to_a_resting_row_taken_after_routing_is_refused(
+    db_session, monkeypatch, recovered: bool
+) -> None:
+    """A prelease bypassing the durable queue starts the same run between
+    this message's routing snapshot and its handoff; the run fence alone
+    would land RESUME_REQUESTED on that run."""
+    task = _waiting_row(db_session)
+    owner = db_session.get(User, int(task.user_id))
+    if recovered:
+        _pending_row(db_session, task, int(owner.id))
+    # The admission check runs after routing and right before the handoff.
+    monkeypatch.setattr(
+        commands,
+        "require_execution_admission_isolated",
+        lambda task_id: _reply_prelease(task_id),
+    )
+    publish = AsyncMock()
+    monkeypatch.setattr(commands, "publish_task_event", publish)
+    background_manager = execution.BackgroundTaskManager()
+    command = _message_command(
+        task, owner, TURN_ID, attempt_count=2 if recovered else 1
+    )
+    with _live_control_environment(background_manager=background_manager) as (
+        agent,
+        _,
+    ):
+        if recovered:
+            result = await commands.execute_durable_task_command(command)
+            assert result["delivery_outcome"] == DELIVERY_OUTCOME_UNKNOWN
+        else:
+            with pytest.raises(
+                TaskCommandDeferred, match="waiting for the active task lease"
+            ) as deferred:
+                await commands.execute_durable_task_command(command)
+            assert deferred.value.resend_safe is False
+        agent.post_user_message.assert_not_awaited()
+        execution.execute_resume_background.assert_not_called()
+        assert background_manager.resume_holder_age_seconds(int(task.id)) is None
+
+    assert _row_status(db_session, int(task.id)) == (
+        DELIVERY_DISPATCHED if recovered else DELIVERY_PENDING
+    )
+    assert _task_failure_broadcasts(publish) == []
+    # The prelease's run is untouched: no RESUME_REQUESTED stamped onto it.
+    stored = _row(db_session, int(task.id))
+    assert stored.status == TaskStatus.RUNNING
+    assert stored.control_state == TaskControlState.RUNNING.value
+    assert stored.state_version == 4
+    assert stored.runner_id == SUCCESSOR_RUNNER
+    assert stored.lease_attempt_id == SUCCESSOR_ATTEMPT
+
+
+@pytest.mark.asyncio
+async def test_handoff_to_an_unmoved_resting_row_still_lands(
+    db_session, monkeypatch
+) -> None:
+    """The version fence does not refuse a row nobody else touched."""
+    task = _waiting_row(db_session)
+    owner = db_session.get(User, int(task.user_id))
+    monkeypatch.setattr(
+        commands, "require_execution_admission_isolated", lambda task_id: None
+    )
+    background_manager = execution.BackgroundTaskManager()
+    with _live_control_environment(background_manager=background_manager) as (
+        agent,
+        _,
+    ):
+        # The deferred message waits for the (stubbed) resume owner to
+        # dispatch it; what matters here is that the handoff was made.
+        with pytest.raises(TaskCommandDeferred, match="waiting for runtime injection"):
+            await commands.execute_durable_task_command(
+                _message_command(task, owner, TURN_ID)
+            )
+        execution.execute_resume_background.assert_called_once()
+        await background_manager.wait_for_previous(int(task.id))
+
+    stored = _row(db_session, int(task.id))
+    assert stored.control_state == TaskControlState.RESUME_REQUESTED.value
+    assert stored.state_version == 4
 
 
 @pytest.mark.asyncio
