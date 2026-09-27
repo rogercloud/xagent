@@ -1670,9 +1670,9 @@ async def handle_task_message(
             )
         )
         if transition.status is None:
-            # No row: the only writer that removes one is a withdrawal, by a
-            # handoff that found its run ended before the message was written
-            # into it. Never applied, so it is not answered unknown; the retry
+            # No row: while the task exists, only a withdrawal removes a
+            # single delivery row, by a handoff that found its run ended
+            # before the message was written into it. Never applied, so it is not answered unknown; the retry
             # finds no row and accepts it as a new turn.
             delivery_outcome_unknown = False
             delivery_claimed = False

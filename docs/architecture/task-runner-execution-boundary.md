@@ -209,7 +209,8 @@ refusal means depends on whether the message reached the run:
   outcome unknown; after the handoff, the posted-claim notice above applies.
 
 An outcome-unknown settlement whose row write finds the row gone treats it
-as withdrawn: only a withdrawal deletes a delivery row, and a withdrawn
+as withdrawn: while the task exists, only a withdrawal removes a single
+delivery row (deleting a user bulk-deletes its tasks' rows), and a withdrawn
 message was never delivered. It is not answered unknown; the unknown
 record written just before is dropped, the command defers, and the retry
 appends the message. This covers a retry that read the row still pending

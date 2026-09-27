@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import threading
 import time
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
@@ -782,6 +783,67 @@ async def test_resume_that_cannot_withdraw_the_row_settles_it_unknown(
 
 
 @pytest.mark.asyncio
+async def test_resume_withdrawal_that_commits_but_raises_records_nothing(
+    db_session,
+    recording_reply: _RecordingReply,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The withdrawal's DELETE commits; only its acknowledgement is lost.
+
+    The raise does not prove the row still pending: the outcome-unknown write
+    that follows finds no row and records nothing, and says so rather than
+    claiming a record. The message was never injected, so the retry finds no
+    row and appends it as a new turn.
+    """
+
+    owner = _user(db_session, "fresh-claim-withdraw-lost-ack")
+    task = _expired_running_task(db_session, int(owner.id))
+    task_id = int(task.id)
+    agent = _deferred_resume_agent()
+    background_manager = task_execution_service.BackgroundTaskManager()
+    real_withdraw = withdraw_pending_user_message_delivery_sync
+
+    def withdraw_then_lose_the_ack(task_id_arg: int, turn_id: str) -> bool:
+        assert real_withdraw(task_id_arg, turn_id)
+        raise OperationalError("DELETE", {}, Exception("connection reset"))
+
+    release = _hold_previous_run(background_manager, task_id)
+    agent_patch, manager_patch = _real_resume_environment(agent, background_manager)
+    with (
+        caplog.at_level(logging.WARNING, logger=task_execution_service.logger.name),
+        agent_patch,
+        manager_patch,
+        patch.object(task_execution_service, "publish_task_event", AsyncMock()),
+        _end_after_transition(task_id, lambda: _end_run(task_id, TaskStatus.FAILED)),
+        patch.object(
+            task_execution_service,
+            "withdraw_pending_user_message_delivery_sync",
+            side_effect=withdraw_then_lose_the_ack,
+        ),
+    ):
+        with pytest.raises(TaskCommandDeferred):
+            await _run_command(db_session, task, owner)
+        release.set()
+        await _wait_for_resume_to_finish(background_manager, task_id)
+
+    messages = [record.getMessage() for record in caplog.records]
+    assert any("no row left to record as outcome unknown" in m for m in messages)
+    assert not any("recorded delivery" in m for m in messages)
+    assert _user_rows(db_session, task_id) == []
+    _assert_run_not_resumed(db_session, task_id, TaskStatus.FAILED)
+
+    begin_turn = AsyncMock(wraps=TaskTurnOrchestrator.begin_turn)
+    with (
+        _live_control_environment(outcome=ResumeReservationOutcome.RESERVED),
+        patch.object(TaskTurnOrchestrator, "begin_turn", begin_turn),
+    ):
+        result = await _run_command(db_session, task, owner, attempt=2)
+    assert result == _accepted_result(task_id)
+    _assert_started_a_new_turn(db_session, task_id, begin_turn)
+    assert _no_outcome_unknown(recording_reply)
+
+
+@pytest.mark.asyncio
 async def test_retry_that_finds_its_row_withdrawn_mid_settlement_appends_later(
     db_session,
     recording_reply: _RecordingReply,
@@ -987,6 +1049,108 @@ async def test_posted_message_whose_run_ends_before_the_claim_keeps_its_notice(
     assert len(notices) == 1
     assert notices[0]["turn_id"] == TURN_ID
     assert MESSAGE not in str(notices[0])
+
+
+@pytest.mark.asyncio
+@ENDED_STATUSES
+@pytest.mark.parametrize("marker", ["fails", "commits_after_the_claim"])
+async def test_posted_message_whose_marker_is_missing_at_the_claim_is_not_withdrawn(
+    live_task_lease,
+    db_session,
+    begin_turn_spy: AsyncMock,
+    ended_status: TaskStatus,
+    marker: str,
+) -> None:
+    """Injected and handed off, but the row still reads ``pending``.
+
+    The handler's ``dispatched`` marker after a posted handoff is best effort:
+    it can fail, or the resume can reach its refused claim before it commits.
+    The row then reads ``pending`` although the run already has the message,
+    so it must not be withdrawn as never injected (which would let a retry
+    append it again). The resume keeps the posted-claim notice instead.
+    """
+
+    owner = _user(db_session, f"posted-claim-marker-{marker}-{ended_status.value}")
+    task = _live_owned_task(db_session, owner, live_task_lease)
+    task_id = int(task.id)
+    agent = MagicMock()
+    agent.supports_live_control.return_value = True
+    agent.post_user_message = AsyncMock(
+        return_value=task_execution_service.UserMessageInjectionOutcome.POSTED_FRESH
+    )
+    background_manager = task_execution_service.BackgroundTaskManager()
+    resume_spy = AsyncMock(wraps=task_execution_service.execute_resume_background)
+    resume_settled = threading.Event()
+    real_mark = command_execution_service.mark_user_message_delivery_sync
+    real_withdraw = task_execution_service.withdraw_pending_user_message_delivery_sync
+
+    def handler_marker(task_id_arg: int, turn_id: str, status: str):
+        if status != DELIVERY_DISPATCHED:
+            return real_mark(task_id_arg, turn_id, status)
+        if marker == "fails":
+            raise OperationalError("UPDATE", {}, Exception("connection reset"))
+        # Commit only once the resume has settled its refused claim.
+        assert resume_settled.wait(timeout=5)
+        return real_mark(task_id_arg, turn_id, status)
+
+    def recording_withdraw(task_id_arg: int, turn_id: str) -> bool:
+        try:
+            return real_withdraw(task_id_arg, turn_id)
+        finally:
+            resume_settled.set()
+
+    async def recording_publish(event: dict[str, Any], *args: Any) -> None:
+        if event.get("error_code") == ClientErrorCode.MESSAGE_OUTCOME_UNKNOWN.value:
+            resume_settled.set()
+
+    publish = AsyncMock(side_effect=recording_publish)
+    agent_patch, manager_patch = _real_resume_environment(agent, background_manager)
+    with (
+        agent_patch,
+        manager_patch,
+        patch.object(task_execution_service, "execute_resume_background", resume_spy),
+        patch.object(task_execution_service, "publish_task_event", publish),
+        patch.object(
+            task_execution_service,
+            "withdraw_pending_user_message_delivery_sync",
+            side_effect=recording_withdraw,
+        ),
+        patch.object(
+            command_execution_service,
+            "mark_user_message_delivery_sync",
+            side_effect=handler_marker,
+        ),
+        _end_after_transition(
+            task_id, lambda: _end_run_directly(task_id, ended_status)
+        ),
+    ):
+        result = await _run_command(db_session, task, owner)
+        # Derived from ``posted``, not from the best-effort marker write.
+        assert resume_spy.await_args.kwargs["delivery_already_dispatched"] is True
+        assert resume_spy.await_args.kwargs["delivery_claimed_fresh"] is True
+        await _wait_for_resume_to_finish(background_manager, task_id)
+
+    # The command answered from the posted handoff (the documented
+    # limitation: it completed as accepted before the claim was refused).
+    assert result == _accepted_result(task_id)
+    # Not withdrawn: the row the run already holds is still there.
+    rows = [row for row in _user_rows(db_session, task_id) if row.turn_id == TURN_ID]
+    assert len(rows) == 1
+    assert _row_status(db_session, task_id) == (
+        DELIVERY_PENDING if marker == "fails" else DELIVERY_DISPATCHED
+    )
+    _assert_run_not_resumed(db_session, task_id, ended_status)
+    notices = [
+        call.args[0]
+        for call in publish.await_args_list
+        if call.args[0].get("error_code")
+        == ClientErrorCode.MESSAGE_OUTCOME_UNKNOWN.value
+    ]
+    assert len(notices) == 1
+    assert notices[0]["turn_id"] == TURN_ID
+
+    # Never appended as a new turn.
+    begin_turn_spy.assert_not_awaited()
 
 
 # --- runs that did not end are unaffected --------------------------------

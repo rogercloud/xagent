@@ -3017,7 +3017,7 @@ async def execute_resume_background(
                 else:
                     delivery_outcome_unknown = True
                     try:
-                        await run_db_io_cancellation_safe(
+                        unknown_transition = await run_db_io_cancellation_safe(
                             lambda: mark_user_message_delivery_sync(
                                 task_id,
                                 delivery_turn_id,
@@ -3038,14 +3038,31 @@ async def execute_resume_background(
                             exc_info=True,
                         )
                     else:
-                        logger.warning(
-                            "Task %s resume of run %s refused: %s; recorded "
-                            "delivery %s as outcome unknown",
-                            task_id,
-                            expected_run_id,
-                            refusal,
-                            delivery_turn_id,
-                        )
+                        if unknown_transition.status is None:
+                            # No row to record, so nothing was recorded. A
+                            # raised withdrawal above does not prove the row
+                            # still pending: its DELETE can commit with only
+                            # the acknowledgement lost. That message was never
+                            # injected; the retry finds no row and appends it
+                            # as a new turn.
+                            logger.warning(
+                                "Task %s resume of run %s refused: %s; "
+                                "delivery %s has no row left to record as "
+                                "outcome unknown (already withdrawn)",
+                                task_id,
+                                expected_run_id,
+                                refusal,
+                                delivery_turn_id,
+                            )
+                        else:
+                            logger.warning(
+                                "Task %s resume of run %s refused: %s; recorded "
+                                "delivery %s as outcome unknown",
+                                task_id,
+                                expected_run_id,
+                                refusal,
+                                delivery_turn_id,
+                            )
                     await notify_deferred_delivery(False)
                 return
             if lease is None:
