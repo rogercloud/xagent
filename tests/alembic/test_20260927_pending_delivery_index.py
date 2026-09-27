@@ -11,6 +11,7 @@ check would not catch a PostgreSQL-side regression (and vice versa).
 from __future__ import annotations
 
 from contextlib import nullcontext
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
@@ -18,7 +19,9 @@ import sqlalchemy as sa
 from alembic import command
 from alembic.migration import MigrationContext
 from alembic.operations import Operations
-from sqlalchemy import create_engine, inspect, text
+from sqlalchemy import create_engine, inspect, select, text
+from sqlalchemy import update as sa_update
+from sqlalchemy.orm import Session
 
 from tests.shared.postgres_disposable import (
     disposable_database_factory,
@@ -26,6 +29,13 @@ from tests.shared.postgres_disposable import (
 )
 from xagent.db.config import create_alembic_config
 from xagent.web.models.chat_message import TaskChatMessage
+from xagent.web.models.database import Base
+from xagent.web.models.task import Task, TaskStatus
+from xagent.web.models.user import User
+from xagent.web.services.chat_history_service import DELIVERY_DISPATCHED
+from xagent.web.services.task_lease_recovery import (
+    _orphaned_pending_delivery_predicates,
+)
 
 REVISION = "20260927_pending_delivery_index"
 DOWN_REVISION = "20260916_durable_create_operations"
@@ -127,13 +137,17 @@ def _seed_rows(connection, *, dialect: str) -> None:
 #   :cutoff ORDER BY task_id LIMIT :n`` (see
 #   ``_orphaned_pending_delivery_predicates`` composed in that function).
 #
-# Both are reproduced below. Neither reproduces the three correlated
+# Both are reproduced below, but neither reproduces the three correlated
 # EXISTS/NOT EXISTS subqueries against ``tasks``/``task_execution_commands``
-# that ``_orphaned_pending_delivery_predicates`` also adds: those constrain
-# which rows qualify but are evaluated per-row against the outer scan, so
-# they do not change which index the planner picks for scanning
-# ``task_chat_messages`` itself. This asserts the partial index is used for
-# that outer scan, not that the two-table joins are separately optimal.
+# that ``_orphaned_pending_delivery_predicates`` also adds. On PostgreSQL a
+# top-level EXISTS/NOT EXISTS is not necessarily evaluated per-row against
+# the outer scan the way it is here on SQLite -- the planner commonly pulls
+# it into a semi/anti join instead -- so these two queries only prove the
+# index is chosen when the equality/range predicates are the only ones
+# present. test_postgresql_real_sweep_statements_use_the_partial_index below
+# compiles and EXPLAINs the actual statements
+# ``_orphaned_pending_delivery_predicates`` builds, EXISTS clauses included,
+# and settles the question for the full query.
 EQUALITY_LOOKUP_SQL = (
     "SELECT * FROM task_chat_messages WHERE delivery_status = 'pending' AND task_id = 7"
 )
@@ -396,6 +410,111 @@ def test_postgresql_upgrade_adds_partial_index_used_by_the_sweep_query(
         }
 
 
+@pytest.mark.postgresql
+def test_postgresql_real_sweep_statements_use_the_partial_index(
+    postgresql_engine_factory,
+) -> None:
+    """EXPLAIN the actual statements the sweep builds, EXISTS/NOT EXISTS
+    clauses included, against the real ORM schema -- not the two-predicate
+    approximation ``test_postgresql_upgrade_adds_partial_index_used_by_the_sweep_query``
+    reproduces by hand.
+
+    Built from ``xagent.web.models`` metadata (``Task``, ``TaskChatMessage``,
+    ``TaskExecutionCommand``, ``User``) via ``Base.metadata.create_all``, so
+    the index under test, every FK, and every column the real predicates
+    touch are the genuine ones, not a hand-copied subset. Data is seeded (and
+    ``ANALYZE``d) at the same 4000-row, 20-task_id scale as the sweep-shaped
+    tests above so the planner has real statistics to cost a seq scan
+    against, matching those tests' own reasoning for why a single-task_id
+    fixture would not be a meaningful check. ``task_execution_commands`` is
+    left empty and every task is ``COMPLETED`` with no live lease, so the
+    correlated EXISTS/NOT EXISTS predicates are satisfied (or vacuously true)
+    for every row and cannot, by construction, be what keeps the index from
+    being chosen.
+    """
+
+    engine = postgresql_engine_factory("real_sweep")
+    Base.metadata.create_all(engine)
+
+    now = datetime(2026, 9, 27, tzinfo=timezone.utc)
+    created_before = datetime(2026, 12, 1, tzinfo=timezone.utc)
+
+    with Session(engine) as session:
+        user = User(username="sweep-user", password_hash="hash", is_admin=False)
+        session.add(user)
+        session.flush()
+
+        # Explicit ids 1..20 so the bulk INSERT below (SELECT (g % 20) + 1 AS
+        # task_id) references real, matching tasks rather than assuming
+        # fresh-database id allocation happens to line up.
+        for task_id in range(1, 21):
+            session.add(
+                Task(
+                    id=task_id,
+                    user_id=user.id,
+                    title=f"sweep task {task_id}",
+                    status=TaskStatus.COMPLETED,
+                    control_state=None,
+                    runner_id=None,
+                    lease_expires_at=None,
+                )
+            )
+        session.commit()
+        user_id = user.id
+
+    with engine.connect() as connection:
+        connection.execute(
+            text(
+                "INSERT INTO task_chat_messages "
+                "(task_id, user_id, role, content, message_type, turn_id, "
+                "delivery_status, created_at) "
+                "SELECT (g % 20) + 1, :user_id, 'user', 'body', 'text', "
+                "'t' || g, "
+                "CASE WHEN g % 7 = 0 THEN 'pending' ELSE 'dispatched' END, "
+                "TIMESTAMP '2026-09-01 00:00:00' + (g || ' seconds')::interval "
+                "FROM generate_series(1, 4000) AS g"
+            ),
+            {"user_id": user_id},
+        )
+        connection.execute(text("ANALYZE task_chat_messages"))
+        connection.commit()
+
+        # reconcile_orphaned_pending_deliveries_no_commit's own statement:
+        # close one task's rows inside its own recovery transaction.
+        equality_stmt = (
+            sa_update(TaskChatMessage)
+            .where(
+                *_orphaned_pending_delivery_predicates(
+                    now=now, task_id=7, created_before=None
+                )
+            )
+            .values(delivery_status=DELIVERY_DISPATCHED)
+        )
+        # reconcile_orphaned_pending_deliveries_isolated's own scan: page
+        # task_ids with orphaned pending rows across the whole table.
+        tick_stmt = (
+            select(TaskChatMessage.task_id)
+            .where(
+                *_orphaned_pending_delivery_predicates(
+                    now=now, task_id=None, created_before=created_before
+                )
+            )
+            .distinct()
+            .order_by(TaskChatMessage.task_id)
+            .limit(50)
+        )
+
+        for stmt in (equality_stmt, tick_stmt):
+            compiled = stmt.compile(connection, compile_kwargs={"literal_binds": True})
+            plan = "\n".join(
+                row[0]
+                for row in connection.execute(
+                    text(f"EXPLAIN (FORMAT TEXT) {compiled}")
+                ).all()
+            )
+            assert INDEX in plan, plan
+
+
 def test_postgresql_online_upgrade_retries_an_invalid_concurrent_index(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -493,6 +612,86 @@ def test_postgresql_online_upgrade_replaces_valid_wrong_index_definition(
         migration.upgrade()
 
     assert calls == ["drop", "create"]
+
+
+def test_postgresql_online_upgrade_replaces_index_without_the_partial_predicate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A same-named, same-column index missing (or with the wrong) partial
+    predicate must be treated as out of date, not as "already correct".
+
+    ``_index_columns`` alone cannot distinguish a plain ``(task_id,
+    created_at)`` index -- e.g. left behind by a manual DBA fix, or a
+    same-named index some other migration created without the predicate --
+    from the partial one this migration means to build; both report the
+    same column list. This drives the check that additionally compares
+    ``pg_get_expr(indpred, indrelid)`` against ``PREDICATE``.
+    """
+
+    migration = load_migration_module(
+        MIGRATION_PATH, "pending_delivery_index_wrong_predicate"
+    )
+    context = MigrationContext.configure(dialect_name="postgresql")
+    operations = Operations(context)
+    calls: list[str] = []
+
+    monkeypatch.setattr(migration, "_inspector", lambda: object())
+    monkeypatch.setattr(
+        migration, "_columns", lambda _inspector: set(migration.REQUIRED_COLUMNS)
+    )
+    monkeypatch.setattr(migration, "_postgres_index_validity", lambda: True)
+    monkeypatch.setattr(
+        migration, "_index_columns", lambda _inspector, _name: migration.INDEX_COLUMNS
+    )
+    # No predicate at all (a plain, non-partial index sharing the name and
+    # columns) must be rejected just like a wrong one.
+    monkeypatch.setattr(migration, "_postgres_index_predicate", lambda: None)
+    monkeypatch.setattr(context, "autocommit_block", nullcontext)
+    monkeypatch.setattr(
+        operations,
+        "drop_index",
+        lambda *_args, **_kwargs: calls.append("drop"),
+    )
+    monkeypatch.setattr(
+        operations,
+        "create_index",
+        lambda *_args, **_kwargs: calls.append("create"),
+    )
+
+    with Operations.context(context):
+        monkeypatch.setattr(migration, "op", operations)
+        migration.upgrade()
+
+    assert calls == ["drop", "create"]
+
+    # A wrong predicate (scoped to a different value) is rejected the same
+    # way as a missing one.
+    calls.clear()
+    monkeypatch.setattr(
+        migration,
+        "_postgres_index_predicate",
+        lambda: "(delivery_status = 'dispatched'::text)",
+    )
+    with Operations.context(context):
+        monkeypatch.setattr(migration, "op", operations)
+        migration.upgrade()
+
+    assert calls == ["drop", "create"]
+
+    # The differently-cast, differently-parenthesized rendering Postgres
+    # actually produces for our own predicate must still be recognized as
+    # matching -- i.e. a no-op, not a rebuild.
+    calls.clear()
+    monkeypatch.setattr(
+        migration,
+        "_postgres_index_predicate",
+        lambda: "((delivery_status)::text = 'pending'::text)",
+    )
+    with Operations.context(context):
+        monkeypatch.setattr(migration, "op", operations)
+        migration.upgrade()
+
+    assert calls == []
 
 
 def test_postgresql_offline_upgrade_and_downgrade_emit_concurrent_index_sql() -> None:

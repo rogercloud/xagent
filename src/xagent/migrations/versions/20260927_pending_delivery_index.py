@@ -37,6 +37,7 @@ Create Date: 2026-09-27
 
 """
 
+import re
 from typing import Sequence, Union
 
 import sqlalchemy as sa
@@ -60,6 +61,21 @@ PREDICATE = sa.text("delivery_status = 'pending'")
 POSTGRES_INDEX_VALIDITY_SQL = sa.text(
     """
     SELECT i.indisvalid
+    FROM pg_catalog.pg_index AS i
+    WHERE i.indexrelid = pg_catalog.to_regclass(:index_name)
+    """
+)
+
+# A same-named (task_id, created_at) index that lacks -- or has a stale --
+# partial predicate is column-list-identical to a correct one, so the column
+# check above cannot tell them apart. ``pg_get_expr(indpred, indrelid)``
+# deparses the stored predicate back into SQL text (NULL when the index is
+# not partial at all); comparing that against our own PREDICATE catches both
+# a plain, non-partial (task_id, created_at) index and one scoped to the
+# wrong value.
+POSTGRES_INDEX_PREDICATE_SQL = sa.text(
+    """
+    SELECT pg_catalog.pg_get_expr(i.indpred, i.indrelid)
     FROM pg_catalog.pg_index AS i
     WHERE i.indexrelid = pg_catalog.to_regclass(:index_name)
     """
@@ -108,6 +124,50 @@ def _postgres_index_validity() -> bool | None:
     )
 
 
+def _postgres_index_predicate() -> str | None:
+    """Return the current-schema index's deparsed predicate, if any."""
+
+    return (
+        op.get_bind()
+        .execute(
+            POSTGRES_INDEX_PREDICATE_SQL,
+            {"index_name": INDEX},
+        )
+        .scalar_one_or_none()
+    )
+
+
+def _normalize_pg_predicate(expression: str) -> str:
+    """Normalize a Postgres-deparsed predicate for structural comparison.
+
+    ``pg_get_expr()`` reformats the predicate it stored: it wraps the
+    column reference in parentheses, casts the column and/or literal to
+    match the operator's resolved type (this migration's own
+    ``delivery_status = 'pending'`` comes back as
+    ``((delivery_status)::text = 'pending'::text)``), and does not
+    guarantee whitespace. None of that changes what the predicate selects,
+    so comparison lowercases and strips casts, parentheses, and whitespace
+    rather than requiring an exact string match.
+    """
+
+    normalized = expression.lower()
+    normalized = re.sub(r"::[a-z_ ]+(\([0-9]+\))?", "", normalized)
+    normalized = re.sub(r"[()]", "", normalized)
+    normalized = re.sub(r"\s+", "", normalized)
+    return normalized
+
+
+def _postgres_predicate_matches_expected(expression: str | None) -> bool:
+    """Whether ``expression`` is our own PREDICATE (a non-partial index,
+    ``expression is None``, never matches)."""
+
+    if expression is None:
+        return False
+    return _normalize_pg_predicate(expression) == _normalize_pg_predicate(
+        str(PREDICATE)
+    )
+
+
 def _upgrade_postgresql() -> None:
     """Build the pending-delivery index without blocking table writes."""
 
@@ -117,7 +177,12 @@ def _upgrade_postgresql() -> None:
 
     validity = _postgres_index_validity()
     existing_columns = _index_columns(inspector, INDEX)
-    if validity is True and existing_columns == INDEX_COLUMNS:
+    is_up_to_date = (
+        validity is True
+        and existing_columns == INDEX_COLUMNS
+        and _postgres_predicate_matches_expected(_postgres_index_predicate())
+    )
+    if is_up_to_date:
         return
 
     with op.get_context().autocommit_block():
