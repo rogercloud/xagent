@@ -34,6 +34,7 @@ from .checkpoint import (
 )
 from .context import ContextManager, ExecutionContext
 from .context.execution import (
+    ACCEPTED_TURN_IDS_METADATA_KEY,
     COMPACT_THRESHOLD_SOURCE_DEFAULT,
     TOOL_EVIDENCE_REMOVED_METADATA_KEY,
     context_checkpoint_gate,
@@ -53,6 +54,33 @@ from .runtime import (
 
 logger = logging.getLogger(__name__)
 
+# ``ACCEPTED_TURN_IDS_METADATA_KEY`` (defined in ``context.execution`` so child
+# contexts can drop it) holds the turn ids of the user messages this execution
+# has durably accepted, as a list of ``[turn_id, digest]`` pairs (oldest
+# first) where digest hashes the accepted execution text ("" when only
+# acceptance is known). Context
+# compaction drops old messages but never ``context.metadata``, so this record
+# is what recognises a retried turn after its message was compacted away. It is
+# written into the same context snapshot as the message it records, so it
+# becomes durable in the very checkpoint that accepts the turn. A list rather
+# than a mapping because checkpoints may land in PostgreSQL JSONB, which does
+# not keep object key order, and eviction needs the acceptance order.
+#
+# Scope: the record lives in one checkpoint lineage. A retry the host routes
+# into a fresh run (execute/start without resume) starts a new context with no
+# record; de-duplicating that case is the job of the host's delivery rows.
+# Engine-owned: never seeded by callers.
+# Retries of one turn arrive within a delivery retry window, not hundreds of
+# turns later, so the most recent ids suffice. The bound caps this record's
+# share of every checkpoint (~80 bytes per entry); it does not bound the
+# traced-turn-id list, which tracing keeps unbounded as before.
+MAX_ACCEPTED_TURN_IDS = 1024
+# Mirrors ``core.agent.tracing.TRACE_TURN_IDS_KEY`` (not imported: cycle). On a
+# checkpoint written before the accepted record existed, these ids seed the
+# record (acceptance known, content not); once the record exists they are no
+# longer consulted for de-duplication.
+_TRACED_TURN_IDS_METADATA_KEY = "_user_message_trace_turn_ids"
+
 # Metadata keys the engine writes as run facts. Client input reaches
 # ``context.metadata`` verbatim through two surfaces -- the top-level metadata
 # dict and the nested request_context -- so both are filtered at the single
@@ -60,23 +88,12 @@ logger = logging.getLogger(__name__)
 # that merge point reaches neither surface: it carries only the modality
 # preference over and drops the rest of the current run's metadata, so no client
 # key reaches a context rebuilt from a checkpoint.
-# Turn ids of every user message this execution has durably accepted, mapped
-# to a digest of the accepted execution text. Context compaction drops old
-# messages but never ``context.metadata``, so this record is what recognises a
-# retried turn after its message was compacted away. It is written into the
-# same context snapshot as the message it records, so it becomes durable in the
-# very checkpoint that accepts the turn. Engine-owned: never seeded by callers.
-ACCEPTED_TURN_IDS_METADATA_KEY = "_accepted_user_turn_ids"
-# Retries of one turn arrive within a delivery retry window, not hundreds of
-# turns later, so the most recent ids suffice; the bound keeps every checkpoint
-# of a long-lived execution from growing without limit (~80 bytes per entry).
-MAX_ACCEPTED_TURN_IDS = 1024
-# Mirrors ``core.agent.tracing.TRACE_TURN_IDS_KEY`` (not imported: cycle). The
-# fallback record for checkpoints written before the accepted record existed.
-_TRACED_TURN_IDS_METADATA_KEY = "_user_message_trace_turn_ids"
-
 RESERVED_ENGINE_METADATA_KEYS = frozenset(
-    {TOOL_EVIDENCE_REMOVED_METADATA_KEY, ACCEPTED_TURN_IDS_METADATA_KEY}
+    {
+        TOOL_EVIDENCE_REMOVED_METADATA_KEY,
+        ACCEPTED_TURN_IDS_METADATA_KEY,
+        _TRACED_TURN_IDS_METADATA_KEY,
+    }
 )
 
 
@@ -1163,52 +1180,92 @@ class AgentRunner:
         return hashlib.sha256(content.encode("utf-8")).hexdigest()[:32]
 
     @staticmethod
+    def _accepted_turn_entries(
+        metadata: dict[str, Any],
+    ) -> list[list[str]] | None:
+        """The accepted-turn record as fresh ``[turn_id, digest]`` lists.
+
+        None when the context carries no record (a checkpoint written before
+        it existed); malformed entries are dropped.
+        """
+        value = metadata.get(ACCEPTED_TURN_IDS_METADATA_KEY)
+        if not isinstance(value, list):
+            return None
+        return [
+            [entry[0], entry[1]]
+            for entry in value
+            if isinstance(entry, (list, tuple))
+            and len(entry) == 2
+            and isinstance(entry[0], str)
+            and entry[0]
+            and isinstance(entry[1], str)
+        ]
+
+    @staticmethod
     def _accepted_turn_digest(context: ExecutionContext, turn_id: str) -> str | None:
         """Digest of an accepted turn's text; "" if accepted with no digest.
 
-        None means the turn is not on record. A legacy checkpoint carries only
-        the traced turn ids, which prove acceptance but not the content.
+        None means the turn is not on record. Only a context that has no
+        record yet (a legacy checkpoint) falls back to the traced turn ids,
+        which prove acceptance but not the content; once the record exists it
+        was seeded from them and is the sole authority.
         """
         metadata = getattr(context, "metadata", None)
         if not isinstance(metadata, dict):
             return None
-        accepted = metadata.get(ACCEPTED_TURN_IDS_METADATA_KEY)
-        if isinstance(accepted, dict) and turn_id in accepted:
-            digest = accepted[turn_id]
-            return digest if isinstance(digest, str) else ""
-        traced = metadata.get(_TRACED_TURN_IDS_METADATA_KEY)
-        if isinstance(traced, list) and turn_id in traced:
-            return ""
+        entries = AgentRunner._accepted_turn_entries(metadata)
+        if entries is None:
+            traced = metadata.get(_TRACED_TURN_IDS_METADATA_KEY)
+            if isinstance(traced, list) and turn_id in traced:
+                return ""
+            return None
+        for recorded_id, digest in reversed(entries):
+            if recorded_id == turn_id:
+                return digest
         return None
 
     @staticmethod
     def _record_accepted_turn(context: ExecutionContext, message: Any) -> None:
-        """Record ``message``'s turn id on ``context.metadata``.
+        """Append ``message``'s turn id to the record on ``context.metadata``.
 
-        Rebinds a fresh dict rather than mutating in place: an injection
+        Rebinds a fresh list rather than mutating in place: an injection
         candidate shares the live context's nested metadata values, and the
         live context must not see the record before the candidate persists.
+        The first record on a context seeds itself from what the context
+        already proves accepted: traced turn ids (no digest) and user messages
+        still present (their text's digest).
         """
         turn_id = AgentRunner._message_turn_id(message)
         metadata = getattr(context, "metadata", None)
         if turn_id is None or not isinstance(metadata, dict):
             return
-        existing = metadata.get(ACCEPTED_TURN_IDS_METADATA_KEY)
-        accepted = (
-            {
-                key: value
-                for key, value in existing.items()
-                if isinstance(key, str) and key != turn_id
-            }
-            if isinstance(existing, dict)
-            else {}
+        entries = AgentRunner._accepted_turn_entries(metadata)
+        if entries is None:
+            seed: dict[str, str] = {}
+            traced = metadata.get(_TRACED_TURN_IDS_METADATA_KEY)
+            if isinstance(traced, list):
+                for traced_id in traced:
+                    if isinstance(traced_id, str) and traced_id:
+                        seed[traced_id] = ""
+            for existing in getattr(context, "messages", None) or ():
+                existing_id = AgentRunner._message_turn_id(existing)
+                if existing_id is None or getattr(existing, "role", None) != "user":
+                    continue
+                seed.pop(existing_id, None)
+                seed[existing_id] = AgentRunner._turn_content_digest(
+                    str(getattr(existing, "content", "") or "")
+                )
+            entries = [[key, value] for key, value in seed.items()]
+        entries = [entry for entry in entries if entry[0] != turn_id]
+        entries.append(
+            [
+                turn_id,
+                AgentRunner._turn_content_digest(
+                    str(getattr(message, "content", "") or "")
+                ),
+            ]
         )
-        accepted[turn_id] = AgentRunner._turn_content_digest(
-            str(getattr(message, "content", "") or "")
-        )
-        while len(accepted) > MAX_ACCEPTED_TURN_IDS:
-            del accepted[next(iter(accepted))]
-        metadata[ACCEPTED_TURN_IDS_METADATA_KEY] = accepted
+        metadata[ACCEPTED_TURN_IDS_METADATA_KEY] = entries[-MAX_ACCEPTED_TURN_IDS:]
 
     @staticmethod
     def _read_trace_watermark(context: ExecutionContext) -> str | None:
