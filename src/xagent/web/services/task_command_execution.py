@@ -42,6 +42,7 @@ from ...core.file_ref import FILE_REF_MODEL_INSTRUCTIONS
 from ..models.chat_message import TaskChatMessage
 from ..models.database import get_session_local
 from ..models.task import Task, TaskStatus
+from ..models.task_command import TaskExecutionCommand
 from ..models.uploaded_file import UploadedFile
 from ..models.user import User
 from . import task_execution as task_execution_service
@@ -138,6 +139,7 @@ from .task_command_terminal_events import (
 )
 from .task_command_transport import (
     COMMAND_ID_PATTERN,
+    COMMAND_PROCESSING,
     MAX_COMMAND_FAILURES,
     ClaimedTaskCommand,
     SettledTaskCommand,
@@ -157,10 +159,12 @@ from .task_events import (
     publish_task_event,
 )
 from .task_execution_controller import (
+    NON_RESUMABLE_STATUSES,
     StaleTaskRunError,
     StaleTaskStateVersionError,
     TaskControlSnapshot,
     TaskControlState,
+    TaskStatusRefusedError,
     control_state_for_status,
     task_execution_controller,
 )
@@ -1596,6 +1600,29 @@ async def handle_task_message(
         # First, so any failure below reaches finish_delivery_failure as
         # outcome unknown and can never persist the row as failed.
         delivery_outcome_unknown = True
+        if suppress_delivery_ack:
+            # Before the row write: ``dispatched`` alone reads as accepted,
+            # so a retry after a crash between that write and the command's
+            # own settlement needs this durable record to answer the same.
+            attempt_count = int(message_data.get("_durable_attempt_count") or 0)
+            owns_command = await run_db_io_cancellation_safe(
+                lambda: _record_command_outcome_unknown_sync(
+                    task_id, turn_id, attempt_count=attempt_count
+                )
+            )
+            if not owns_command:
+                # This attempt lost its claim and a later attempt owns the
+                # command. Advancing the row without the record would make
+                # that attempt read ``dispatched`` as accepted; leave the row
+                # pending so the owner settles it itself.
+                logger.warning(
+                    "task %s turn %s: attempt %s no longer owns its command; "
+                    "leaving the delivery for the owning attempt to settle",
+                    task_id,
+                    turn_id,
+                    attempt_count,
+                )
+                return
         transition = await run_db_io_cancellation_safe(
             lambda: mark_user_message_delivery_sync(
                 task_id,
@@ -1766,6 +1793,21 @@ async def handle_task_message(
                 # turn an earlier attempt may already have started. A live
                 # local run keeps the live path: its injection replays a turn
                 # it already holds.
+                await settle_accepted_outcome_unknown()
+                return
+            if (
+                delivery_recovered_claim
+                and task_uses_live_control
+                and task_status in NON_RESUMABLE_STATUSES
+            ):
+                # A recovered claim on its own run is redriven live even when
+                # the task is no longer live, so that a paused run replays the
+                # turn id against its checkpoint. A FAILED or COMPLETED run is
+                # never resumed: it ended for good, and an earlier attempt may
+                # already have applied the turn. A fresh message still reaches
+                # such a task through APPEND as a new run. The snapshot can be
+                # stale; the RESUME_REQUESTED transition and the resume lease
+                # claim below fence the same statuses.
                 await settle_accepted_outcome_unknown()
                 return
             agent_service = None
@@ -2100,8 +2142,24 @@ async def handle_task_message(
                             # resting row has no run for a successor to take.
                             fence_live_owner=task_status == TaskStatus.RUNNING,
                             owner_lease=live_task_lease,
+                            refuse_terminal_status=delivery_recovered_claim,
                         )
-                    except StaleTaskRunError:
+                    except (TaskStatusRefusedError, StaleTaskRunError):
+                        task_execution_service.background_task_manager.release_resume_reservation(
+                            task_id
+                        )
+                        if delivery_recovered_claim:
+                            # The run ended, was replaced, or is owned by an
+                            # acquisition this process does not hold, after
+                            # the routing snapshot. A recovered claim may
+                            # already have been applied, so it is never
+                            # failed: same answer as the early refusal above,
+                            # and the task's status, control state and run are
+                            # untouched.
+                            await settle_accepted_outcome_unknown()
+                            return
+                        # Only a recovered claim opts into the status fence,
+                        # so what reaches here is a run or owner mismatch.
                         current_control = await task_execution_controller.snapshot(
                             task_id
                         )
@@ -2124,16 +2182,9 @@ async def handle_task_message(
                             task_run_id,
                             turn_id,
                         )
-                        task_execution_service.background_task_manager.release_resume_reservation(
-                            task_id
-                        )
-                        if posted or delivery_recovered_claim:
-                            # Posted: the injection was accepted, so only its
-                            # handoff is uncertain. Recovered: an earlier
-                            # attempt may have applied the turn. Neither may
-                            # invite a resend.
-                            if not posted:
-                                delivery_outcome_unknown = True
+                        if posted:
+                            # The injection was accepted; only its handoff is
+                            # uncertain, so it must not invite a resend.
                             await finish_delivery_failure(
                                 client_error_message(
                                     ClientErrorCode.MESSAGE_OUTCOME_UNKNOWN
@@ -2194,6 +2245,10 @@ async def handle_task_message(
                             trusted_task_source=routing.task_source,
                             previous_task=previous_task,
                             resolved_execution_scope=resolved_execution_scope,
+                            # Covers a run ending between the transition above
+                            # and the lease claim (lease recovery or the run's
+                            # own finalizer can still settle the row here).
+                            refuse_terminal_status=delivery_recovered_claim,
                             pending_user_message=(
                                 None
                                 if posted
@@ -3856,24 +3911,19 @@ async def _answer_message_outcome_unknown(
     # personal error channel still displays later delivery results.
     await reply(error_frame)
     if reply is discard_command_reply:
-        try:
-            await publish_task_event(
-                {**error_frame, "timestamp": datetime.now(timezone.utc).timestamp()},
-                command.task_id,
-            )
-        except Exception:
-            # Best effort: the durable result below still records the outcome
-            # and a same-id resend is answered from it.
-            logger.warning(
-                "task %s outcome-unknown notice for message %s was not published",
-                command.task_id,
-                command.command_id,
-                exc_info=True,
-            )
+        # Best effort: the durable result below still records the outcome
+        # and a same-id resend is answered from it.
+        await task_execution_service.publish_message_outcome_unknown_notice(
+            command.task_id, command.command_id
+        )
+    return _message_outcome_unknown_result(command.task_id, command.command_id)
+
+
+def _message_outcome_unknown_result(task_id: int, command_id: str) -> dict[str, Any]:
     return {
-        "task_id": command.task_id,
-        "command_id": command.command_id,
-        "kind": command.kind.value,
+        "task_id": task_id,
+        "command_id": command_id,
+        "kind": TaskCommandKind.MESSAGE.value,
         "delivery_outcome": DELIVERY_OUTCOME_UNKNOWN,
     }
 
@@ -3901,18 +3951,9 @@ def _load_live_self_owned_attempt(task_id: int) -> tuple[str, str] | None:
     return str(row[0]), str(row[1])
 
 
-async def _message_delivery_absent(command: ClaimedTaskCommand) -> bool:
-    """Whether no attempt has claimed this MESSAGE's delivery row yet."""
-
-    status = await run_db_io_cancellation_safe(
-        lambda: _load_command_message_delivery_status(
-            command.task_id, command.command_id
-        )
-    )
-    return status is None
-
-
-async def _message_never_reached_delivery(command: ClaimedTaskCommand) -> bool:
+def _message_never_reached_delivery(
+    command: ClaimedTaskCommand, delivery_status: str | None
+) -> bool:
     """Whether a deferred MESSAGE provably never reached delivery.
 
     ``attempt_count == defer_count + 1`` proves every earlier attempt ended in
@@ -3922,9 +3963,78 @@ async def _message_never_reached_delivery(command: ClaimedTaskCommand) -> bool:
     claim, so the absence of the turn's delivery row is required as well.
     """
 
-    if command.attempt_count != command.defer_count + 1:
-        return False
-    return await _message_delivery_absent(command)
+    return command.attempt_count == command.defer_count + 1 and delivery_status is None
+
+
+def _record_command_outcome_unknown_sync(
+    task_id: int, command_id: str, *, attempt_count: int
+) -> bool:
+    """Store the outcome-unknown result on the in-flight MESSAGE command.
+
+    The transport overwrites it with the same result when the command
+    completes, and keeps it when the attempt fails; until then it is the only
+    durable trace that this turn's ``dispatched`` row means "outcome unknown",
+    not "accepted". Fenced on this attempt: every claim bumps
+    ``attempt_count``, so an expired attempt that was reclaimed cannot stamp
+    a turn a later attempt delivers.
+
+    The record can outlive its meaning: it is written before the row, another
+    writer may then settle the row completed or failed, and a failed attempt
+    keeps it. That is harmless because every reader consults it only next to
+    a ``dispatched`` row.
+
+    Returns ``False`` only when the command exists but this attempt no longer
+    owns it (not processing, or reclaimed under a later attempt). A command
+    with no row at all -- not a durable-inbox command -- has no owner to
+    defer to and returns ``True``.
+    """
+
+    SessionLocal = get_session_local()
+    with SessionLocal() as db:
+        command = db.query(TaskExecutionCommand).filter(
+            TaskExecutionCommand.task_id == task_id,
+            TaskExecutionCommand.command_id == command_id,
+            TaskExecutionCommand.kind == TaskCommandKind.MESSAGE.value,
+        )
+        updated = command.filter(
+            TaskExecutionCommand.status == COMMAND_PROCESSING,
+            TaskExecutionCommand.attempt_count == attempt_count,
+        ).update(
+            {
+                TaskExecutionCommand.result: _message_outcome_unknown_result(
+                    task_id, command_id
+                )
+            },
+            synchronize_session=False,
+        )
+        owned = updated == 1 or command.first() is None
+        db.commit()
+        return owned
+
+
+def _command_recorded_outcome_unknown(task_id: int, command_id: str) -> bool:
+    """Whether a settlement recorded this command's turn as outcome unknown.
+
+    Meaningful only next to a ``dispatched`` row; see
+    :func:`_record_command_outcome_unknown_sync` for why a stale record is
+    harmless there.
+    """
+
+    SessionLocal = get_session_local()
+    with SessionLocal() as db:
+        result = (
+            db.query(TaskExecutionCommand.result)
+            .filter(
+                TaskExecutionCommand.task_id == task_id,
+                TaskExecutionCommand.command_id == command_id,
+                TaskExecutionCommand.kind == TaskCommandKind.MESSAGE.value,
+            )
+            .scalar()
+        )
+    return (
+        isinstance(result, dict)
+        and result.get("delivery_outcome") == DELIVERY_OUTCOME_UNKNOWN
+    )
 
 
 async def _execute_durable_task_command(
@@ -3988,17 +4098,28 @@ async def _execute_durable_task_command(
                 f"{command.command_id} was applied",
                 reason="stale_run",
             )
+    # A MESSAGE whose delivery row already settled is answered from that row
+    # without touching the run, whoever owns it; only an unclaimed or pending
+    # one still has to reach the run, and so waits for its owner below.
+    message_delivery_status: str | None = None
+    message_needs_run = False
+    if command.kind == TaskCommandKind.MESSAGE:
+        message_delivery_status = await run_db_io_cancellation_safe(
+            lambda: _load_command_message_delivery_status(
+                command.task_id, command.command_id
+            )
+        )
+        message_needs_run = message_delivery_status in {None, DELIVERY_PENDING}
     # A live foreign owner applies its own control and live input; routing
     # lets it claim the retry because the row names it as runner. MESSAGE is
     # included because an expired-lease takeover keeps the run id, so a
     # message routed here would otherwise hand a resume to a run this process
     # cannot acquire. Expired or absent owners are not "live", so recovery of
     # an abandoned run (the recovered-delivery paths) still proceeds here.
-    if command.kind in {
-        TaskCommandKind.MESSAGE,
-        TaskCommandKind.PAUSE,
-        TaskCommandKind.CANCEL,
-    } and await run_db_io_cancellation_safe(
+    if (
+        command.kind in {TaskCommandKind.PAUSE, TaskCommandKind.CANCEL}
+        or message_needs_run
+    ) and await run_db_io_cancellation_safe(
         lambda: task_has_live_foreign_runner(command.task_id)
     ):
         deferral = ClientVisibleTaskCommandDeferred(
@@ -4006,11 +4127,11 @@ async def _execute_durable_task_command(
             "for the active task lease owner"
         )
         if command.kind == TaskCommandKind.MESSAGE:
-            deferral.resend_safe = await _message_never_reached_delivery(command)
+            deferral.resend_safe = _message_never_reached_delivery(
+                command, message_delivery_status
+            )
         raise deferral
-    if command.kind == TaskCommandKind.MESSAGE and (
-        await _message_delivery_absent(command)
-    ):
+    if command.kind == TaskCommandKind.MESSAGE and message_delivery_status is None:
         # This runner owns the RUNNING row live, but under an attempt no
         # heartbeat or coordinator here holds: its own run between heartbeat
         # stop and settlement, before its heartbeat registered, or a newer
@@ -4033,7 +4154,9 @@ async def _execute_durable_task_command(
                     f"Message command {command.command_id} is waiting for the "
                     "active task lease owner"
                 )
-                deferral.resend_safe = await _message_never_reached_delivery(command)
+                deferral.resend_safe = _message_never_reached_delivery(
+                    command, message_delivery_status
+                )
                 raise deferral
 
     resume_result: ResumeCommandResult | None = None
@@ -4087,6 +4210,15 @@ async def _execute_durable_task_command(
                 f"Message {command.command_id} is waiting for runtime injection"
             )
         if delivery_status == DELIVERY_OUTCOME_UNKNOWN:
+            return await _answer_message_outcome_unknown(reply, command)
+        if delivery_status == DELIVERY_DISPATCHED and await run_db_io_cancellation_safe(
+            lambda: _command_recorded_outcome_unknown(
+                command.task_id, command.command_id
+            )
+        ):
+            # An earlier attempt settled this turn as outcome unknown (row
+            # advanced to ``dispatched``) and did not live to store its own
+            # result; an ordinary accepted turn never carries the record.
             return await _answer_message_outcome_unknown(reply, command)
         if delivery_status == DELIVERY_FAILED:
             raise TaskCommandRejected(

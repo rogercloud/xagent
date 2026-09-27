@@ -154,6 +154,40 @@ it reports the unknown outcome instead of success. A new-turn claim that finds
 the turn already in the transcript (`TaskTurnAlreadyAccepted`) settles the
 same way instead of failing on the unique index.
 
+A recovered claim on the command's own run is redriven through a resume even
+when the task is no longer live, so that a paused run replays the `turn_id`.
+A run that has ended -- settled FAILED by lease recovery, or COMPLETED by its
+runner -- is never resumed that way: the retry settles the same
+outcome-unknown answer and the task keeps its terminal status, control state,
+run, diagnostic and result. The routing snapshot can be stale, so the
+`resume_requested` transition and the resume lease claim for a recovered
+claim each refuse a FAILED or COMPLETED row in their own conditional UPDATE.
+A refusal at the transition (including a run replaced since the snapshot, or
+one owned by another live lease acquisition) advances the row to
+`dispatched` like the case above. A refused lease claim
+happens after the command handed off; for a recovered claim every refusal,
+including one by a live owner of the same run, records the row as
+`outcome_unknown`, from which the retried command gives the same answer. If
+the live injection had already been accepted (the sender was told so), the
+row stays `dispatched` and a task-wide outcome-unknown notice is published
+instead, because no resume will answer that turn. That notice is best
+effort, and the command already completed as accepted, so a same-id resend of
+that message is still answered accepted. A fresh message to a FAILED
+or COMPLETED task still opens a new run through APPEND.
+
+Because `dispatched` alone reads as accepted, the outcome-unknown settlement
+first records the unknown result on the in-flight MESSAGE command, fenced on
+the current attempt. A failed attempt keeps that record, and a retry after a
+crash or a lost write acknowledgement between the row write and the
+command's own settlement answers from it instead of reporting the turn
+accepted.
+
+Known gaps, not closed here: a fresh (non-recovered) message whose run ends
+FAILED or COMPLETED between routing and the resume lease claim can still
+resume that run, because only recovered claims opt into the status fences.
+And the check is a denylist of FAILED and COMPLETED: a terminal status added
+later is not refused until it joins that list.
+
 Rows that no owner can settle any more are reconciled by lease recovery,
 which never redrives the turn. Recovering an expired lease advances that
 task's `pending` user rows to `dispatched` in the recovery transaction, and a
@@ -263,14 +297,16 @@ control writes a live run makes mid-flight carry the same fence:
   have settled itself meanwhile (a non-shared release clears the owner but
   keeps the run), and so does an expired one, which the resume may take
   over. A refusal is treated like a rotated run.
-  Such a refusal defers a durable command for retry when nothing was
-  accepted, settles a recovered claim as outcome unknown, and keeps an
-  accepted injection outcome unknown. It never reports a task failure.
+  Such a refusal settles a recovered claim as outcome unknown, the same way
+  as the recovered-claim status refusal described earlier; keeps an accepted
+  injection outcome unknown; and otherwise defers a durable command for
+  retry. It never reports a task failure.
 - PAUSE, CANCEL and MESSAGE commands defer while another runner holds a live
-  lease on the task, so the owner applies them. A MESSAGE whose delivery no
-  attempt has claimed also defers while this runner owns the RUNNING row
-  under an attempt it does not hold locally, for example between its
-  heartbeat stopping and its settlement.
+  lease on the task, so the owner applies them; a MESSAGE whose delivery row
+  already settled is answered from that row instead. A MESSAGE whose
+  delivery no attempt has claimed also defers while this runner owns the
+  RUNNING row under an attempt it does not hold locally, for example between
+  its heartbeat stopping and its settlement.
 
 A result that arrives after its row already settled COMPLETED or FAILED, for
 example after an external cancel that timed out waiting for the runner, is

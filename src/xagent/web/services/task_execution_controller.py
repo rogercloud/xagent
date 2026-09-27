@@ -16,10 +16,10 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, AsyncIterator
 from uuid import uuid4
 
-from sqlalchemy import and_, false, func, or_, update
+from sqlalchemy import and_, false, func, or_, select, update
 from sqlalchemy.orm import object_session
 
-from ..models.task import Task, TaskStatus
+from ..models.task import Task, TaskStatus, task_status_predicate
 
 if TYPE_CHECKING:
     from .task_lease_service import TaskLease
@@ -53,6 +53,26 @@ class StaleTaskStateVersionError(StaleTaskRunError):
     fences and cannot say which one rejected it, and deferring is the safe
     half of that ambiguity: the retry reads a fresh row, and a genuinely
     rotated run is then caught precisely by the run check above.
+    """
+
+
+# Statuses a recovered message delivery must never resume its original run
+# out of: the run ended for good (settled FAILED by recovery, or finished).
+# A fresh message still reaches such a task through APPEND as a new run.
+NON_RESUMABLE_STATUSES: tuple[TaskStatus, ...] = (
+    TaskStatus.FAILED,
+    TaskStatus.COMPLETED,
+)
+
+
+class TaskStatusRefusedError(RuntimeError):
+    """The row's run has ended, and the caller asked not to transition it.
+
+    Not a stale-run error: the run may still match. A caller opts in with
+    ``refuse_terminal_status`` when the target state must never be entered
+    from a :data:`NON_RESUMABLE_STATUSES` row (a recovered message must not
+    resume an ended run), and the refusal is part of the same conditional
+    UPDATE, so a status committed after the caller's snapshot is still caught.
     """
 
 
@@ -144,6 +164,7 @@ def apply_task_control_transition(
     expected_state_version: int | None = None,
     fence_live_owner: bool = False,
     owner_lease: "TaskLease | None" = None,
+    refuse_terminal_status: bool = False,
 ) -> TaskControlSnapshot:
     """Mutate one ORM task with a monotonic control-state transition.
 
@@ -156,10 +177,19 @@ def apply_task_control_transition(
     RUNNING takeover keeps ``run_id``, so the run fence alone would let a
     caller stamp the write onto a successor's run. A refusal raises
     :class:`StaleTaskRunError`, as a rotated run does.
+
+    ``refuse_terminal_status`` raises :class:`TaskStatusRefusedError` instead
+    of transitioning a :data:`NON_RESUMABLE_STATUSES` row, checked in the
+    UPDATE itself.
     """
 
     current_run_id = getattr(task, "run_id", None)
     current_state_version = int(getattr(task, "state_version", 0) or 0)
+    refused = frozenset(NON_RESUMABLE_STATUSES if refuse_terminal_status else ())
+    if task.status in refused:
+        raise TaskStatusRefusedError(
+            f"task {task.id} is {task.status.value}; refusing {control_state.value}"
+        )
     if expected_run_id is not None and current_run_id != expected_run_id:
         raise StaleTaskRunError(
             f"task {task.id} run changed from {expected_run_id} to {current_run_id}"
@@ -205,6 +235,8 @@ def apply_task_control_transition(
             )
         if fence_live_owner:
             statement = statement.where(live_foreign_owner_absent(owner_lease))
+        if refused:
+            statement = statement.where(task_status_predicate.not_in(refused))
         # Keep unrelated caller-owned pending objects out of this helper's
         # atomic UPDATE and refresh. ``Session.execute`` and ``refresh`` can
         # otherwise trigger another session-wide autoflush.
@@ -213,6 +245,18 @@ def apply_task_control_transition(
                 statement.values(values).execution_options(synchronize_session=False)
             )
             if int(getattr(result, "rowcount", 0) or 0) != 1:
+                if refused:
+                    # Name the status fence when it is what tripped: a
+                    # status committed after the pre-check above means
+                    # something different to the caller than a moved run.
+                    raced_status = session.scalar(
+                        select(Task.status).where(Task.id == int(task_id))
+                    )
+                    if raced_status in refused:
+                        raise TaskStatusRefusedError(
+                            f"task {task_id} became {raced_status.value}; "
+                            f"refusing {control_state.value}"
+                        )
                 # The Python pre-check above reads the row before this
                 # UPDATE, so a commit landing in between arrives here
                 # instead. Name both fences rather than only the run id:
@@ -258,6 +302,7 @@ def transition_task_control_state_sync(
     expected_state_version: int | None = None,
     fence_live_owner: bool = False,
     owner_lease: "TaskLease | None" = None,
+    refuse_terminal_status: bool = False,
 ) -> TaskControlSnapshot:
     from ..models.database import get_session_local
 
@@ -275,6 +320,7 @@ def transition_task_control_state_sync(
             expected_state_version=expected_state_version,
             fence_live_owner=fence_live_owner,
             owner_lease=owner_lease,
+            refuse_terminal_status=refuse_terminal_status,
         )
         db.commit()
         return snapshot
@@ -392,6 +438,7 @@ class TaskExecutionController:
         expected_state_version: int | None = None,
         fence_live_owner: bool = False,
         owner_lease: "TaskLease | None" = None,
+        refuse_terminal_status: bool = False,
     ) -> TaskControlSnapshot:
         """Apply one control transition, optionally fenced on an exact row.
 
@@ -416,6 +463,7 @@ class TaskExecutionController:
             expected_state_version=expected_state_version,
             fence_live_owner=fence_live_owner,
             owner_lease=owner_lease,
+            refuse_terminal_status=refuse_terminal_status,
         )
 
     async def snapshot(self, task_id: int) -> TaskControlSnapshot | None:

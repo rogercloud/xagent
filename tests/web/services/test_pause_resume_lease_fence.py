@@ -46,6 +46,7 @@ from xagent.web.services import task_execution as execution
 from xagent.web.services import task_lease_service as leases
 from xagent.web.services import task_setup_snapshot
 from xagent.web.services.chat_history_service import (
+    DELIVERY_DISPATCHED,
     DELIVERY_OUTCOME_UNKNOWN,
     DELIVERY_PENDING,
 )
@@ -704,8 +705,11 @@ async def test_handoff_refused_after_routing_defers_or_settles_unknown(
         execution.execute_resume_background.assert_not_called()
         assert background_manager.resume_holder_age_seconds(int(task.id)) is None
 
+    # A recovered claim settles like the recovered-claim status refusal:
+    # ``dispatched`` ("do not resend") next to the command's recorded
+    # outcome-unknown result.
     assert _row_status(db_session, int(task.id)) == (
-        DELIVERY_OUTCOME_UNKNOWN if recovered else DELIVERY_PENDING
+        DELIVERY_DISPATCHED if recovered else DELIVERY_PENDING
     )
     # A healthy running task is never announced as failed.
     assert _task_failure_broadcasts(publish) == []
