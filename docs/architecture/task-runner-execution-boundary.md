@@ -169,13 +169,17 @@ including one by a live owner of the same run, records the row as
 `outcome_unknown`, from which the retried command gives the same answer. If
 the live injection had already been accepted (the sender was told so), the
 row stays `dispatched` and a task-wide outcome-unknown notice is published
-instead, because no resume will answer that turn. A fresh message to a FAILED
+instead, because no resume will answer that turn. That notice is best
+effort, and the command already completed as accepted, so a same-id resend of
+that message is still answered accepted. A fresh message to a FAILED
 or COMPLETED task still opens a new run through APPEND.
 
 Because `dispatched` alone reads as accepted, the outcome-unknown settlement
-first records the unknown result on the in-flight MESSAGE command. A retry
-after a crash between the row write and the command's own settlement answers
-from that record instead of reporting the turn accepted.
+first records the unknown result on the in-flight MESSAGE command, fenced on
+the current attempt. A failed attempt keeps that record, and a retry after a
+crash or a lost write acknowledgement between the row write and the
+command's own settlement answers from it instead of reporting the turn
+accepted.
 
 Known gaps, not closed here: a fresh (non-recovered) message whose run ends
 FAILED or COMPLETED between routing and the resume lease claim can still

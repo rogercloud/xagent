@@ -1597,8 +1597,11 @@ async def handle_task_message(
             # Before the row write: ``dispatched`` alone reads as accepted,
             # so a retry after a crash between that write and the command's
             # own settlement needs this durable record to answer the same.
+            attempt_count = int(message_data.get("_durable_attempt_count") or 0)
             await run_db_io_cancellation_safe(
-                lambda: _record_command_outcome_unknown_sync(task_id, turn_id)
+                lambda: _record_command_outcome_unknown_sync(
+                    task_id, turn_id, attempt_count=attempt_count
+                )
             )
         transition = await run_db_io_cancellation_safe(
             lambda: mark_user_message_delivery_sync(
@@ -3752,12 +3755,17 @@ def _message_outcome_unknown_result(task_id: int, command_id: str) -> dict[str, 
     }
 
 
-def _record_command_outcome_unknown_sync(task_id: int, command_id: str) -> None:
+def _record_command_outcome_unknown_sync(
+    task_id: int, command_id: str, *, attempt_count: int
+) -> None:
     """Store the outcome-unknown result on the in-flight MESSAGE command.
 
     The transport overwrites it with the same result when the command
-    completes; until then it is the only durable trace that this turn's
-    ``dispatched`` row means "outcome unknown", not "accepted".
+    completes, and keeps it when the attempt fails; until then it is the only
+    durable trace that this turn's ``dispatched`` row means "outcome unknown",
+    not "accepted". Fenced on this attempt: every claim bumps
+    ``attempt_count``, so an expired attempt that was reclaimed cannot stamp
+    a turn a later attempt delivers.
     """
 
     SessionLocal = get_session_local()
@@ -3767,6 +3775,7 @@ def _record_command_outcome_unknown_sync(task_id: int, command_id: str) -> None:
             TaskExecutionCommand.command_id == command_id,
             TaskExecutionCommand.kind == TaskCommandKind.MESSAGE.value,
             TaskExecutionCommand.status == COMMAND_PROCESSING,
+            TaskExecutionCommand.attempt_count == attempt_count,
         ).update(
             {
                 TaskExecutionCommand.result: _message_outcome_unknown_result(

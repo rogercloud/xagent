@@ -2887,6 +2887,9 @@ async def execute_resume_background(
                     # and the sender was told it was accepted, but no resume
                     # will answer it. Tell the task's audience its outcome is
                     # unknown, as the durable answer does for a lost origin.
+                    # Known limitation: the notice is best effort, and the
+                    # command already completed as accepted, so a same-id
+                    # resend is still answered accepted.
                     logger.warning(
                         "Task %s resume of run %s refused: %s; delivery %s was "
                         "already accepted, publishing an outcome-unknown notice",

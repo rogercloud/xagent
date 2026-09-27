@@ -65,9 +65,12 @@ from xagent.web.services.chat_history_service import (
 from xagent.web.services.client_error_messages import ClientErrorCode
 from xagent.web.services.task_command_execution import execute_durable_task_command
 from xagent.web.services.task_command_transport import (
+    COMMAND_COMPLETED,
+    COMMAND_PENDING,
     COMMAND_PROCESSING,
     TaskCommandDeferred,
     TaskCommandKind,
+    dispatch_one_task_command,
     enqueue_task_command,
     get_runner_id,
 )
@@ -955,6 +958,8 @@ def _processing_command_row(db, task: Task, owner, command) -> None:
     )
     stored = db.get(TaskExecutionCommand, enqueued.command_id)
     stored.status = COMMAND_PROCESSING
+    # The attempt that is executing it.
+    stored.attempt_count = command.attempt_count
     db.commit()
 
 
@@ -1104,3 +1109,140 @@ async def test_refused_resume_whose_unknown_record_fails_does_not_report_a_failu
     stored = db_session.get(Task, task_id)
     assert stored.status == TaskStatus.COMPLETED
     assert stored.output == FINAL_OUTPUT
+
+
+@pytest.mark.asyncio
+async def test_unknown_record_is_written_before_the_row_write(
+    db_session,
+    recording_reply: _RecordingReply,
+) -> None:
+    owner = _user(db_session, "record-order-owner")
+    task = _ended_task(db_session, int(owner.id), TaskStatus.COMPLETED)
+    task_id = int(task.id)
+    _pending_row(db_session, task, int(owner.id))
+    command = _message_command(task, owner, TURN_ID, attempt_count=2)
+    _processing_command_row(db_session, task, owner, command)
+    real_mark = command_execution_service.mark_user_message_delivery_sync
+    seen_at_row_write: list[Any] = []
+
+    def mark_checking_record(task_id_arg: int, turn_id: str, status: str):
+        if status == DELIVERY_DISPATCHED:
+            with get_session_local()() as db:
+                seen_at_row_write.append(
+                    db.query(TaskExecutionCommand.result)
+                    .filter(TaskExecutionCommand.task_id == task_id_arg)
+                    .scalar()
+                )
+        return real_mark(task_id_arg, turn_id, status)
+
+    with (
+        _live_control_environment(outcome=ResumeReservationOutcome.RESERVED),
+        patch.object(
+            command_execution_service,
+            "mark_user_message_delivery_sync",
+            side_effect=mark_checking_record,
+        ),
+    ):
+        result = await execute_durable_task_command(command)
+
+    assert result == _outcome_unknown_result(task)
+    assert seen_at_row_write == [_outcome_unknown_result(task)]
+    assert _row_status(db_session, task_id) == DELIVERY_DISPATCHED
+
+
+def test_unknown_record_from_a_reclaimed_attempt_is_not_written(db_session) -> None:
+    owner = _user(db_session, "stale-record-owner")
+    task = _ended_task(db_session, int(owner.id), TaskStatus.COMPLETED)
+    task_id = int(task.id)
+    # The command was reclaimed: attempt 3 now owns it.
+    _processing_command_row(
+        db_session,
+        task,
+        owner,
+        _message_command(task, owner, TURN_ID, attempt_count=3),
+    )
+
+    command_execution_service._record_command_outcome_unknown_sync(
+        task_id, TURN_ID, attempt_count=2
+    )
+    assert _stored_command_result(db_session, task_id, TURN_ID) is None
+
+    command_execution_service._record_command_outcome_unknown_sync(
+        task_id, TURN_ID, attempt_count=3
+    )
+    assert _stored_command_result(db_session, task_id, TURN_ID) == (
+        _outcome_unknown_result(task)
+    )
+
+
+@pytest.mark.asyncio
+async def test_lost_row_write_ack_keeps_the_unknown_record_across_the_retry(
+    db_session,
+    recording_reply: _RecordingReply,
+) -> None:
+    """The ``dispatched`` write commits but its acknowledgement is lost.
+
+    The attempt fails; ``dispatched`` cannot become ``outcome_unknown``, so
+    the command row's record is the only trace. The transport's failure
+    handling must keep it, and the retry answers outcome unknown.
+    """
+
+    owner = _user(db_session, "lost-ack-record-owner")
+    task = _ended_task(db_session, int(owner.id), TaskStatus.COMPLETED)
+    task_id = int(task.id)
+    _pending_row(db_session, task, int(owner.id))
+    enqueued = enqueue_task_command(
+        db_session,
+        task_id=task_id,
+        actor_user_id=int(owner.id),
+        command_id=TURN_ID,
+        kind=TaskCommandKind.MESSAGE,
+        payload=dict(_message_command(task, owner, TURN_ID).payload),
+    )
+    stored = db_session.get(TaskExecutionCommand, enqueued.command_id)
+    # An earlier attempt claimed the row and crashed; the next claim is #2.
+    stored.attempt_count = 1
+    db_session.commit()
+    real_mark = command_execution_service.mark_user_message_delivery_sync
+
+    def lose_ack(task_id_arg: int, turn_id: str, status: str):
+        transition = real_mark(task_id_arg, turn_id, status)
+        if status == DELIVERY_DISPATCHED:
+            raise OperationalError("COMMIT", {}, Exception("connection reset"))
+        return transition
+
+    with (
+        _live_control_environment(outcome=ResumeReservationOutcome.RESERVED),
+        patch.object(
+            command_execution_service,
+            "mark_user_message_delivery_sync",
+            side_effect=lose_ack,
+        ),
+    ):
+        assert await dispatch_one_task_command(
+            execute_durable_task_command, command_db_id=enqueued.command_id
+        )
+
+    db_session.expire_all()
+    stored = db_session.get(TaskExecutionCommand, enqueued.command_id)
+    assert stored.status == COMMAND_PENDING
+    assert stored.attempt_count == 2
+    assert stored.result == _outcome_unknown_result(task)
+    assert _row_status(db_session, task_id) == DELIVERY_DISPATCHED
+
+    stored.claim_expires_at = None
+    stored.retry_available_at = None
+    db_session.commit()
+    recording_reply.frames.clear()
+    with _live_control_environment(outcome=ResumeReservationOutcome.RESERVED):
+        assert await dispatch_one_task_command(
+            execute_durable_task_command, command_db_id=enqueued.command_id
+        )
+
+    db_session.expire_all()
+    stored = db_session.get(TaskExecutionCommand, enqueued.command_id)
+    assert stored.status == COMMAND_COMPLETED
+    assert stored.result == _outcome_unknown_result(task)
+    _assert_outcome_unknown_frames(recording_reply)
+    db_session.expire_all()
+    assert db_session.get(Task, task_id).status == TaskStatus.COMPLETED
