@@ -1598,11 +1598,24 @@ async def handle_task_message(
             # so a retry after a crash between that write and the command's
             # own settlement needs this durable record to answer the same.
             attempt_count = int(message_data.get("_durable_attempt_count") or 0)
-            await run_db_io_cancellation_safe(
+            owns_command = await run_db_io_cancellation_safe(
                 lambda: _record_command_outcome_unknown_sync(
                     task_id, turn_id, attempt_count=attempt_count
                 )
             )
+            if not owns_command:
+                # This attempt lost its claim and a later attempt owns the
+                # command. Advancing the row without the record would make
+                # that attempt read ``dispatched`` as accepted; leave the row
+                # pending so the owner settles it itself.
+                logger.warning(
+                    "task %s turn %s: attempt %s no longer owns its command; "
+                    "leaving the delivery for the owning attempt to settle",
+                    task_id,
+                    turn_id,
+                    attempt_count,
+                )
+                return
         transition = await run_db_io_cancellation_safe(
             lambda: mark_user_message_delivery_sync(
                 task_id,
@@ -3757,7 +3770,7 @@ def _message_outcome_unknown_result(task_id: int, command_id: str) -> dict[str, 
 
 def _record_command_outcome_unknown_sync(
     task_id: int, command_id: str, *, attempt_count: int
-) -> None:
+) -> bool:
     """Store the outcome-unknown result on the in-flight MESSAGE command.
 
     The transport overwrites it with the same result when the command
@@ -3766,14 +3779,26 @@ def _record_command_outcome_unknown_sync(
     not "accepted". Fenced on this attempt: every claim bumps
     ``attempt_count``, so an expired attempt that was reclaimed cannot stamp
     a turn a later attempt delivers.
+
+    The record can outlive its meaning: it is written before the row, another
+    writer may then settle the row completed or failed, and a failed attempt
+    keeps it. That is harmless because every reader consults it only next to
+    a ``dispatched`` row.
+
+    Returns ``False`` only when the command exists but this attempt no longer
+    owns it (not processing, or reclaimed under a later attempt). A command
+    with no row at all -- not a durable-inbox command -- has no owner to
+    defer to and returns ``True``.
     """
 
     SessionLocal = get_session_local()
     with SessionLocal() as db:
-        db.query(TaskExecutionCommand).filter(
+        command = db.query(TaskExecutionCommand).filter(
             TaskExecutionCommand.task_id == task_id,
             TaskExecutionCommand.command_id == command_id,
             TaskExecutionCommand.kind == TaskCommandKind.MESSAGE.value,
+        )
+        updated = command.filter(
             TaskExecutionCommand.status == COMMAND_PROCESSING,
             TaskExecutionCommand.attempt_count == attempt_count,
         ).update(
@@ -3784,10 +3809,19 @@ def _record_command_outcome_unknown_sync(
             },
             synchronize_session=False,
         )
+        owned = updated == 1 or command.first() is None
         db.commit()
+        return owned
 
 
 def _command_recorded_outcome_unknown(task_id: int, command_id: str) -> bool:
+    """Whether a settlement recorded this command's turn as outcome unknown.
+
+    Meaningful only next to a ``dispatched`` row; see
+    :func:`_record_command_outcome_unknown_sync` for why a stale record is
+    harmless there.
+    """
+
     SessionLocal = get_session_local()
     with SessionLocal() as db:
         result = (

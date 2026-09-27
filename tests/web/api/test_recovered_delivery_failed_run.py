@@ -1246,3 +1246,53 @@ async def test_lost_row_write_ack_keeps_the_unknown_record_across_the_retry(
     _assert_outcome_unknown_frames(recording_reply)
     db_session.expire_all()
     assert db_session.get(Task, task_id).status == TaskStatus.COMPLETED
+
+
+@pytest.mark.asyncio
+async def test_settlement_by_a_reclaimed_attempt_leaves_the_row_to_the_owner(
+    db_session,
+    recording_reply: _RecordingReply,
+) -> None:
+    """Attempt 2 lost its claim while its handler ran; attempt 3 owns it.
+
+    Attempt 2 may not write the record, so it must not advance the row
+    either: a ``dispatched`` row without the record reads as accepted.
+    """
+
+    owner = _user(db_session, "reclaimed-settle-owner")
+    task = _ended_task(db_session, int(owner.id), TaskStatus.COMPLETED)
+    task_id = int(task.id)
+    _pending_row(db_session, task, int(owner.id))
+    _processing_command_row(
+        db_session,
+        task,
+        owner,
+        _message_command(task, owner, TURN_ID, attempt_count=3),
+    )
+
+    with (
+        _live_control_environment(outcome=ResumeReservationOutcome.RESERVED),
+        pytest.raises(TaskCommandDeferred),
+    ):
+        # Answered from the still-pending row; the transport's deferral of
+        # this stale attempt is fenced out.
+        await execute_durable_task_command(
+            _message_command(task, owner, TURN_ID, attempt_count=2)
+        )
+
+    assert _row_status(db_session, task_id) == DELIVERY_PENDING
+    assert _stored_command_result(db_session, task_id, TURN_ID) is None
+    assert not any(
+        frame.get("error_code") == ClientErrorCode.MESSAGE_OUTCOME_UNKNOWN.value
+        for frame in recording_reply.frames
+    )
+
+    with _live_control_environment(outcome=ResumeReservationOutcome.RESERVED):
+        result = await execute_durable_task_command(
+            _message_command(task, owner, TURN_ID, attempt_count=3)
+        )
+
+    assert result == _outcome_unknown_result(task)
+    assert _row_status(db_session, task_id) == DELIVERY_DISPATCHED
+    assert _stored_command_result(db_session, task_id, TURN_ID) == result
+    _assert_outcome_unknown_frames(recording_reply)
