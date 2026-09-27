@@ -598,3 +598,39 @@ async def test_fresh_message_whose_run_ends_at_the_transition_appends_pg(
     assert stored.status == TaskStatus.RUNNING
     assert stored.run_id not in {None, "live-run"}
     assert stored.error_message is None
+
+
+def test_withdrawal_waits_on_a_concurrent_row_write_and_then_refuses_pg(
+    pg_sessions: sessionmaker[Session],
+    db_session: Session,
+) -> None:
+    """A withdrawal racing another writer of the same row never forces it.
+
+    The DELETE waits on the uncommitted write's row lock; once it commits
+    ``dispatched``, READ COMMITTED re-evaluates the ``pending`` predicate,
+    nothing is deleted, and the caller settles conservatively.
+    """
+
+    owner = _user(db_session, "pg-withdraw-race")
+    task = _expired_task(db_session, int(owner.id), suffix="withdraw-race")
+    task_id = int(task.id)
+    row_id = _add_row(db_session, task, TURN_ID)
+
+    writing = pg_sessions()
+    try:
+        transition = mark_user_message_delivery(
+            writing, task_id=task_id, turn_id=TURN_ID, status=DELIVERY_DISPATCHED
+        )
+        assert transition.status == DELIVERY_DISPATCHED
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            withdrawal = pool.submit(
+                withdraw_pending_user_message_delivery_sync, task_id, TURN_ID
+            )
+            _wait_until_blocked_on_a_lock(pg_sessions)
+            writing.commit()
+            assert withdrawal.result(timeout=_BLOCKED_SECONDS) is False
+    finally:
+        writing.rollback()
+        writing.close()
+
+    assert _status(pg_sessions, row_id) == DELIVERY_DISPATCHED

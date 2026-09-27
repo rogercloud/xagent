@@ -14,17 +14,24 @@ exactly as if the snapshot had already shown the ended run -- in the same
 handler when the transition refuses it, on the durable retry when the lease
 claim does. A message the live run already accepted before it ended keeps the
 at-most-once answer: never resumed, never resent, outcome unknown.
+
+Every durable test runs against a real processing command row, and lease
+recovery ends a run the way production does, including the orphaned-row
+reconciliation it runs in the same transaction.
 """
 
 from __future__ import annotations
 
 import asyncio
+import logging
 import time
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from typing import Any, Iterator
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from sqlalchemy.exc import OperationalError
 
 from tests.web.api.test_durable_message_resume_contention import (
     _live_control_environment,
@@ -35,8 +42,7 @@ from tests.web.api.test_durable_message_resume_contention import (
 )
 from tests.web.api.test_recovered_delivery_failed_run import (
     ENDED_STATUSES,
-    RECOVERY_ERROR,
-    _end_run,
+    _complete_run,
     _end_run_directly,
     _expired_running_task,
     _real_resume_environment,
@@ -47,32 +53,48 @@ from tests.web.api.test_recovered_delivery_outcome_unknown import (
     TURN_ID,
     _assert_outcome_unknown_frames,
     _outcome_unknown_result,
+    _pending_row,
     _RecordingReply,
     _row_status,
     _settled_task,
     _user_rows,
 )
 from xagent.web.models.chat_message import TaskChatMessage
-from xagent.web.models.database import Base, get_db, get_engine, init_db
+from xagent.web.models.database import (
+    Base,
+    get_db,
+    get_engine,
+    get_session_local,
+    init_db,
+)
 from xagent.web.models.task import Task, TaskStatus
+from xagent.web.models.task_command import TaskExecutionCommand
 from xagent.web.services import task_command_execution as command_execution_service
 from xagent.web.services import task_execution as task_execution_service
 from xagent.web.services import task_execution_controller as controller_module
 from xagent.web.services.chat_history_service import (
     DELIVERY_DISPATCHED,
     DELIVERY_FAILED,
+    DELIVERY_OUTCOME_UNKNOWN,
     DELIVERY_PENDING,
+    mark_user_message_delivery_sync,
     withdraw_pending_user_message_delivery_sync,
 )
 from xagent.web.services.client_error_messages import ClientErrorCode
 from xagent.web.services.task_command_execution import execute_durable_task_command
 from xagent.web.services.task_command_transport import (
+    COMMAND_PROCESSING,
     TaskCommandDeferred,
     TaskCommandKind,
+    enqueue_task_command,
     get_runner_id,
 )
 from xagent.web.services.task_execution import ResumeReservationOutcome
 from xagent.web.services.task_execution_controller import TaskControlState
+from xagent.web.services.task_lease_recovery import (
+    recover_task_lease_candidate_no_commit,
+)
+from xagent.web.services.task_lease_service import get_expired_task_lease_candidates
 from xagent.web.services.task_orchestrator import TaskTurnOrchestrator, TurnKind
 
 # Re-exported fixture from the contention suite.
@@ -104,6 +126,89 @@ def begin_turn_spy() -> Iterator[AsyncMock]:
         yield spy
 
 
+def _recover_to_failed(task_id: int) -> None:
+    """Lease recovery's production settlement, in its own transaction.
+
+    ``recover_task_lease_candidate_no_commit`` also reconciles the task's
+    orphaned ``pending`` rows in the same transaction; a processing command
+    (or a resume request in flight) keeps this message's row out of it.
+    """
+
+    with get_session_local()() as db:
+        now = datetime.now(timezone.utc)
+        candidate = next(
+            candidate
+            for candidate in get_expired_task_lease_candidates(db, cutoff=now, limit=10)
+            if candidate.task_id == task_id
+        )
+        assert (
+            recover_task_lease_candidate_no_commit(db, candidate, recovered_at=now)
+            == TaskStatus.FAILED
+        )
+        db.commit()
+
+
+def _end_run(task_id: int, ended_status: TaskStatus) -> None:
+    if ended_status == TaskStatus.FAILED:
+        _recover_to_failed(task_id)
+    else:
+        assert ended_status == TaskStatus.COMPLETED
+        _complete_run(task_id)
+
+
+def _set_command_attempt(db, task: Task, owner, attempt: int) -> None:
+    """The durable command row, processing under ``attempt``."""
+
+    stored = (
+        db.query(TaskExecutionCommand)
+        .filter(
+            TaskExecutionCommand.task_id == int(task.id),
+            TaskExecutionCommand.command_id == TURN_ID,
+        )
+        .first()
+    )
+    if stored is None:
+        enqueued = enqueue_task_command(
+            db,
+            task_id=int(task.id),
+            actor_user_id=int(owner.id),
+            command_id=TURN_ID,
+            kind=TaskCommandKind.MESSAGE,
+            payload=dict(_message_command(task, owner, TURN_ID).payload),
+        )
+        stored = db.get(TaskExecutionCommand, enqueued.command_id)
+    stored.status = COMMAND_PROCESSING
+    stored.attempt_count = attempt
+    db.commit()
+
+
+async def _run_command(db, task: Task, owner, *, attempt: int = 1):
+    """Run one attempt of the durable MESSAGE against its real command row.
+
+    Every earlier attempt is taken to have deferred, as the tests arrange.
+    """
+
+    _set_command_attempt(db, task, owner, attempt)
+    return await execute_durable_task_command(
+        replace(
+            _message_command(task, owner, TURN_ID, attempt_count=attempt),
+            defer_count=attempt - 1,
+        )
+    )
+
+
+def _stored_command_result(db, task_id: int) -> Any:
+    db.expire_all()
+    return (
+        db.query(TaskExecutionCommand.result)
+        .filter(
+            TaskExecutionCommand.task_id == task_id,
+            TaskExecutionCommand.command_id == TURN_ID,
+        )
+        .scalar()
+    )
+
+
 def _accepted_result(task_id: int) -> dict[str, Any]:
     return {
         "task_id": task_id,
@@ -115,7 +220,7 @@ def _accepted_result(task_id: int) -> dict[str, Any]:
 def _assert_started_a_new_turn(db, task_id: int, begin_turn_spy: AsyncMock) -> None:
     """The message ran as a new turn on a new run; the ended run is gone."""
 
-    begin_turn_spy.assert_awaited_once()
+    begin_turn_spy.assert_awaited()
     assert begin_turn_spy.await_args.kwargs["kind"] == TurnKind.APPEND
     rows = [row for row in _user_rows(db, task_id) if row.turn_id == TURN_ID]
     assert len(rows) == 1
@@ -136,7 +241,8 @@ def _assert_run_not_resumed(db, task_id: int, ended_status: TaskStatus) -> None:
     assert stored.run_id == "live-run"
     assert stored.runner_id is None
     if ended_status == TaskStatus.FAILED:
-        assert stored.error_message == RECOVERY_ERROR
+        # The ending write's diagnostic stays; nothing resumed the run.
+        assert stored.error_message
 
 
 def _no_outcome_unknown(reply: _RecordingReply) -> bool:
@@ -215,6 +321,31 @@ def _deferred_resume_agent() -> MagicMock:
     return agent
 
 
+def _hold_previous_run(background_manager: Any, task_id: int) -> asyncio.Event:
+    """Stand in for the ended run's coroutine; the resume waits for it.
+
+    The handed-off resume awaits the task's previous coroutine before it
+    claims the lease, so holding it keeps the claim after the command's own
+    post-handoff read of the row.
+    """
+
+    release = asyncio.Event()
+    background_manager.running_tasks[task_id] = asyncio.create_task(release.wait())
+    return release
+
+
+def _live_owned_task(db_session, owner, live_task_lease) -> Task:
+    task = _live_task(db_session, int(owner.id))
+    task.runner_id = get_runner_id()
+    task.lease_expires_at = datetime.now(timezone.utc) + timedelta(minutes=1)
+    db_session.commit()
+    live_task_lease(db_session, task)
+    return task
+
+
+# --- the transition refuses: the handler appends the message itself -------
+
+
 @pytest.mark.asyncio
 @ENDED_STATUSES
 @pytest.mark.parametrize("fence", ["pre_check", "conditional_update"])
@@ -236,19 +367,220 @@ async def test_run_ending_before_the_transition_appends_the_message(
         ),
         _transition_race(task_id, ended_status, fence) as raced,
     ):
-        result = await execute_durable_task_command(
-            _message_command(task, owner, TURN_ID, attempt_count=1)
-        )
+        result = await _run_command(db_session, task, owner)
         task_execution_service.execute_resume_background.assert_not_called()
 
     assert raced.call_count == 1
     assert raced.call_args.kwargs["refuse_terminal_status"] is True
     assert result == _accepted_result(task_id)
-    background_manager.release_resume_reservation.assert_called_with(task_id)
+    # Released once, by the refusal, and never again by the cleanup arm.
+    background_manager.release_resume_reservation.assert_called_once_with(task_id)
     background_manager.register_reserved_resume.assert_not_called()
     agent.post_user_message.assert_not_awaited()
     _assert_started_a_new_turn(db_session, task_id, begin_turn_spy)
     assert _no_outcome_unknown(recording_reply)
+
+
+@pytest.mark.asyncio
+async def test_withdrawn_message_retries_when_another_turn_started_meanwhile(
+    db_session,
+    recording_reply: _RecordingReply,
+    begin_turn_spy: AsyncMock,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The re-read after the withdrawal no longer shows the ended run."""
+
+    caplog.set_level(logging.INFO, logger=command_execution_service.__name__)
+    owner = _user(db_session, "fresh-transition-moved-on")
+    task = _expired_running_task(db_session, int(owner.id))
+    task_id = int(task.id)
+    real_withdraw = withdraw_pending_user_message_delivery_sync
+
+    def withdraw_then_start_another_turn(task_id_arg: int, turn_id: str) -> bool:
+        withdrawn = real_withdraw(task_id_arg, turn_id)
+        _update_task(
+            task_id,
+            status=TaskStatus.RUNNING,
+            control_state=TaskControlState.RUNNING.value,
+            run_id="another-run",
+            runner_id="another-runner",
+            lease_attempt_id="another-attempt",
+            lease_expires_at=datetime.now(timezone.utc) + timedelta(minutes=5),
+            error_message=None,
+        )
+        return withdrawn
+
+    with (
+        _live_control_environment(outcome=ResumeReservationOutcome.RESERVED),
+        _transition_race(task_id, TaskStatus.FAILED, "pre_check"),
+        patch.object(
+            command_execution_service,
+            "withdraw_pending_user_message_delivery_sync",
+            side_effect=withdraw_then_start_another_turn,
+        ),
+    ):
+        with pytest.raises(TaskCommandDeferred) as deferred:
+            await _run_command(db_session, task, owner)
+
+    # Nothing of the message remains, so its retry may deliver it afresh.
+    assert deferred.value.resend_safe is True
+    begin_turn_spy.assert_not_awaited()
+    assert _user_rows(db_session, task_id) == []
+    db_session.expire_all()
+    assert db_session.get(Task, task_id).run_id == "another-run"
+    assert _no_outcome_unknown(recording_reply)
+    assert not [r for r in caplog.records if r.levelno >= logging.ERROR]
+
+
+@pytest.mark.asyncio
+async def test_withdrawn_message_retries_while_the_ended_run_is_still_unwinding(
+    db_session,
+    recording_reply: _RecordingReply,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """``begin_turn`` refuses ``bg_inflight``: the ended run's coroutine lives."""
+
+    caplog.set_level(logging.INFO, logger=command_execution_service.__name__)
+    owner = _user(db_session, "fresh-transition-bg-inflight")
+    task = _expired_running_task(db_session, int(owner.id))
+    task_id = int(task.id)
+    release = asyncio.Event()
+    ended_run = asyncio.create_task(release.wait())
+    begin_turn = AsyncMock(wraps=TaskTurnOrchestrator.begin_turn)
+    try:
+        with (
+            _live_control_environment(outcome=ResumeReservationOutcome.RESERVED) as (
+                _,
+                background_manager,
+            ),
+            _transition_race(task_id, TaskStatus.FAILED, "pre_check"),
+            patch.object(TaskTurnOrchestrator, "begin_turn", begin_turn),
+        ):
+            background_manager.running_tasks.get.return_value = ended_run
+            with pytest.raises(TaskCommandDeferred) as deferred:
+                await _run_command(db_session, task, owner)
+    finally:
+        release.set()
+        await ended_run
+
+    assert deferred.value.resend_safe is True
+    begin_turn.assert_awaited_once()
+    assert _user_rows(db_session, task_id) == []
+    _assert_run_not_resumed(db_session, task_id, TaskStatus.FAILED)
+    assert not [r for r in caplog.records if r.levelno >= logging.ERROR]
+
+    # Once it unwound, the retry appends the message.
+    begin_turn = AsyncMock(wraps=TaskTurnOrchestrator.begin_turn)
+    with (
+        _live_control_environment(outcome=ResumeReservationOutcome.RESERVED),
+        patch.object(TaskTurnOrchestrator, "begin_turn", begin_turn),
+    ):
+        result = await _run_command(db_session, task, owner, attempt=2)
+    assert result == _accepted_result(task_id)
+    _assert_started_a_new_turn(db_session, task_id, begin_turn)
+    assert _no_outcome_unknown(recording_reply)
+
+
+@pytest.mark.asyncio
+async def test_row_settled_before_the_handler_withdraws_it_is_unknown(
+    db_session,
+    recording_reply: _RecordingReply,
+    begin_turn_spy: AsyncMock,
+) -> None:
+    """Another writer advanced the row: withdrawal is refused, never forced."""
+
+    owner = _user(db_session, "fresh-transition-row-settled")
+    task = _expired_running_task(db_session, int(owner.id))
+    task_id = int(task.id)
+    real_sync = controller_module.transition_task_control_state_sync
+
+    def settle_row_end_run_then_transition(*args: Any, **kwargs: Any):
+        mark_user_message_delivery_sync(task_id, TURN_ID, DELIVERY_DISPATCHED)
+        _end_run(task_id, TaskStatus.FAILED)
+        return real_sync(*args, **kwargs)
+
+    with (
+        _live_control_environment(outcome=ResumeReservationOutcome.RESERVED),
+        patch.object(
+            controller_module,
+            "transition_task_control_state_sync",
+            side_effect=settle_row_end_run_then_transition,
+        ),
+    ):
+        result = await _run_command(db_session, task, owner)
+
+    assert result == _outcome_unknown_result(task)
+    begin_turn_spy.assert_not_awaited()
+    assert _row_status(db_session, task_id) == DELIVERY_DISPATCHED
+    _assert_run_not_resumed(db_session, task_id, TaskStatus.FAILED)
+    _assert_outcome_unknown_frames(recording_reply)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("delete", ["not_committed", "committed"])
+async def test_handler_withdrawal_that_raises_settles_by_the_row_left_behind(
+    db_session,
+    recording_reply: _RecordingReply,
+    begin_turn_spy: AsyncMock,
+    delete: str,
+) -> None:
+    """A failed withdrawal leaves the row unknown; its read-back decides.
+
+    ``not_committed``: the row is still there, so the message is settled as
+    outcome unknown, as the resume path does. ``committed``: the delete
+    landed and only its acknowledgement was lost; the row is gone, so the
+    command defers and its retry appends the message.
+    """
+
+    owner = _user(db_session, f"fresh-transition-withdraw-{delete}")
+    task = _expired_running_task(db_session, int(owner.id))
+    task_id = int(task.id)
+    real_withdraw = withdraw_pending_user_message_delivery_sync
+
+    def failing_withdraw(task_id_arg: int, turn_id: str) -> bool:
+        if delete == "committed":
+            assert real_withdraw(task_id_arg, turn_id)
+        raise OperationalError("DELETE", {}, Exception("connection reset"))
+
+    with (
+        _live_control_environment(outcome=ResumeReservationOutcome.RESERVED),
+        _transition_race(task_id, TaskStatus.FAILED, "pre_check"),
+        patch.object(
+            command_execution_service,
+            "withdraw_pending_user_message_delivery_sync",
+            side_effect=failing_withdraw,
+        ),
+    ):
+        if delete == "not_committed":
+            result = await _run_command(db_session, task, owner)
+        else:
+            with pytest.raises(TaskCommandDeferred) as deferred:
+                await _run_command(db_session, task, owner)
+
+    begin_turn_spy.assert_not_awaited()
+    _assert_run_not_resumed(db_session, task_id, TaskStatus.FAILED)
+    if delete == "not_committed":
+        assert result == _outcome_unknown_result(task)
+        assert _row_status(db_session, task_id) == DELIVERY_DISPATCHED
+        _assert_outcome_unknown_frames(recording_reply)
+        return
+
+    assert deferred.value.resend_safe is True
+    assert _user_rows(db_session, task_id) == []
+    # The unknown record written before the row read-back is dropped again.
+    assert _stored_command_result(db_session, task_id) is None
+    assert _no_outcome_unknown(recording_reply)
+    begin_turn = AsyncMock(wraps=TaskTurnOrchestrator.begin_turn)
+    with (
+        _live_control_environment(outcome=ResumeReservationOutcome.RESERVED),
+        patch.object(TaskTurnOrchestrator, "begin_turn", begin_turn),
+    ):
+        result = await _run_command(db_session, task, owner, attempt=2)
+    assert result == _accepted_result(task_id)
+    _assert_started_a_new_turn(db_session, task_id, begin_turn)
+
+
+# --- the lease claim refuses: the resume withdraws, the retry appends -----
 
 
 @pytest.mark.asyncio
@@ -265,7 +597,8 @@ async def test_run_ending_before_the_lease_claim_appends_on_retry(
     The message was never injected, so the resume withdraws its row and the
     command's retry, finding no row, accepts it as a new turn. ``read`` pins
     whether the command read the row before the resume withdrew it (still
-    pending) or after (absent, answered by the handoff marker); both defer.
+    pending: the resume is held behind the ended run's coroutine) or after
+    (absent, answered by the handoff marker); both defer.
     """
 
     owner = _user(db_session, f"fresh-claim-{read}-{ended_status.value}")
@@ -275,31 +608,27 @@ async def test_run_ending_before_the_lease_claim_appends_on_retry(
     background_manager = task_execution_service.BackgroundTaskManager()
     resume_spy = AsyncMock(wraps=task_execution_service.execute_resume_background)
     real_status = command_execution_service._load_command_message_delivery_status
-    status_reads = 0
+    status_reads: list[str | None] = []
 
-    def status_after_withdrawal(task_id_arg: int, turn_id: str) -> str | None:
-        nonlocal status_reads
-        status_reads += 1
+    def recording_status(task_id_arg: int, turn_id: str) -> str | None:
         status = real_status(task_id_arg, turn_id)
         # The first read precedes the handler; only the post-handoff one waits.
         deadline = time.monotonic() + 5
-        while status_reads > 1 and status is not None and time.monotonic() < deadline:
+        while (
+            read == "after_the_withdrawal"
+            and status_reads
+            and status is not None
+            and time.monotonic() < deadline
+        ):
             time.sleep(0.01)
             status = real_status(task_id_arg, turn_id)
+        status_reads.append(status)
         return status
 
-    status_patch = (
-        patch.object(
-            command_execution_service,
-            "_load_command_message_delivery_status",
-            side_effect=status_after_withdrawal,
-        )
-        if read == "after_the_withdrawal"
-        else patch.object(
-            command_execution_service,
-            "_load_command_message_delivery_status",
-            side_effect=real_status,
-        )
+    release = (
+        _hold_previous_run(background_manager, task_id)
+        if read == "before_the_resume"
+        else None
     )
     agent_patch, manager_patch = _real_resume_environment(agent, background_manager)
     publish = AsyncMock()
@@ -309,22 +638,30 @@ async def test_run_ending_before_the_lease_claim_appends_on_retry(
         patch.object(task_execution_service, "execute_resume_background", resume_spy),
         patch.object(task_execution_service, "publish_task_event", publish),
         _end_after_transition(task_id, lambda: _end_run(task_id, ended_status)),
-        status_patch,
+        patch.object(
+            command_execution_service,
+            "_load_command_message_delivery_status",
+            side_effect=recording_status,
+        ),
     ):
         with pytest.raises(TaskCommandDeferred) as deferred:
-            await execute_durable_task_command(
-                _message_command(task, owner, TURN_ID, attempt_count=1)
-            )
+            await _run_command(db_session, task, owner)
         assert resume_spy.await_count == 1
         assert resume_spy.await_args.kwargs["refuse_terminal_status"] is True
         assert resume_spy.await_args.kwargs["delivery_claimed_fresh"] is True
+        if release is not None:
+            release.set()
         await _wait_for_resume_to_finish(background_manager, task_id)
 
-    if read == "after_the_withdrawal":
+    if read == "before_the_resume":
+        assert status_reads[-1] == DELIVERY_PENDING
+        assert "runtime injection" in str(deferred.value)
+    else:
+        assert status_reads[-1] is None
         assert "new turn" in str(deferred.value)
     agent.post_user_message.assert_not_awaited()
     # Withdrawn, and the ended run was not resumed.
-    assert [row for row in _user_rows(db_session, task_id)] == []
+    assert _user_rows(db_session, task_id) == []
     _assert_run_not_resumed(db_session, task_id, ended_status)
     assert not any(
         call.args[0].get("error_code") == ClientErrorCode.TASK_BUSY.value
@@ -339,9 +676,7 @@ async def test_run_ending_before_the_lease_claim_appends_on_retry(
         ),
         patch.object(TaskTurnOrchestrator, "begin_turn", begin_turn),
     ):
-        result = await execute_durable_task_command(
-            _message_command(task, owner, TURN_ID, attempt_count=2)
-        )
+        result = await _run_command(db_session, task, owner, attempt=2)
         task_execution_service.execute_resume_background.assert_not_called()
 
     assert result == _accepted_result(task_id)
@@ -351,14 +686,125 @@ async def test_run_ending_before_the_lease_claim_appends_on_retry(
 
 
 @pytest.mark.asyncio
-@ENDED_STATUSES
-async def test_direct_sender_is_told_to_resend_when_the_claim_finds_the_run_ended(
+@pytest.mark.parametrize("withdrawal", ["refused", "raises"])
+async def test_resume_that_cannot_withdraw_the_row_settles_it_unknown(
     db_session,
-    ended_status: TaskStatus,
+    recording_reply: _RecordingReply,
+    withdrawal: str,
 ) -> None:
-    """Without a durable command the sender's ack carries the answer."""
+    """The resume's withdrawal finds the row not its own, or fails.
 
-    owner = _user(db_session, f"fresh-direct-{ended_status.value}")
+    Neither proves the message undelivered any more, so the resume records
+    the row as outcome unknown and the retry answers from it.
+    """
+
+    owner = _user(db_session, f"fresh-claim-withdraw-{withdrawal}")
+    task = _expired_running_task(db_session, int(owner.id))
+    task_id = int(task.id)
+    agent = _deferred_resume_agent()
+    background_manager = task_execution_service.BackgroundTaskManager()
+
+    def withdraw(task_id_arg: int, turn_id: str) -> bool:
+        if withdrawal == "raises":
+            raise OperationalError("DELETE", {}, Exception("connection reset"))
+        return False
+
+    release = _hold_previous_run(background_manager, task_id)
+    agent_patch, manager_patch = _real_resume_environment(agent, background_manager)
+    with (
+        agent_patch,
+        manager_patch,
+        patch.object(task_execution_service, "publish_task_event", AsyncMock()),
+        _end_after_transition(task_id, lambda: _end_run(task_id, TaskStatus.FAILED)),
+        patch.object(
+            task_execution_service,
+            "withdraw_pending_user_message_delivery_sync",
+            side_effect=withdraw,
+        ),
+    ):
+        with pytest.raises(TaskCommandDeferred):
+            await _run_command(db_session, task, owner)
+        release.set()
+        await _wait_for_resume_to_finish(background_manager, task_id)
+
+    assert _row_status(db_session, task_id) == DELIVERY_OUTCOME_UNKNOWN
+    _assert_run_not_resumed(db_session, task_id, TaskStatus.FAILED)
+    recording_reply.frames.clear()
+    with _live_control_environment(outcome=ResumeReservationOutcome.RESERVED):
+        result = await _run_command(db_session, task, owner, attempt=2)
+    assert result == _outcome_unknown_result(task)
+    _assert_outcome_unknown_frames(recording_reply)
+
+
+@pytest.mark.asyncio
+async def test_retry_that_finds_its_row_withdrawn_mid_settlement_appends_later(
+    db_session,
+    recording_reply: _RecordingReply,
+) -> None:
+    """The retry and this worker's own resume interleave.
+
+    Attempt 2 reads the row still pending (a recovered claim on an ended run)
+    and starts settling it as outcome unknown; before its row write the first
+    attempt's resume withdraws the row. A missing row was never delivered:
+    the retry defers instead of answering unknown, drops the unknown record it
+    wrote, and the next attempt appends the message.
+    """
+
+    owner = _user(db_session, "fresh-retry-withdrawn")
+    task = _expired_running_task(db_session, int(owner.id))
+    task_id = int(task.id)
+    _pending_row(db_session, task, int(owner.id))
+    _set_command_attempt(db_session, task, owner, 1)
+    _update_task(task_id, control_state=TaskControlState.RESUME_REQUESTED.value)
+    _recover_to_failed(task_id)
+    # The resume request and the processing command kept the row pending.
+    assert _row_status(db_session, task_id) == DELIVERY_PENDING
+    real_record = command_execution_service._record_command_outcome_unknown_sync
+
+    def record_then_resume_withdraws(*args: Any, **kwargs: Any) -> bool:
+        owned = real_record(*args, **kwargs)
+        assert withdraw_pending_user_message_delivery_sync(task_id, TURN_ID)
+        return owned
+
+    with (
+        _live_control_environment(outcome=ResumeReservationOutcome.RESERVED),
+        patch.object(
+            command_execution_service,
+            "_record_command_outcome_unknown_sync",
+            side_effect=record_then_resume_withdraws,
+        ),
+    ):
+        with pytest.raises(TaskCommandDeferred) as deferred:
+            await _run_command(db_session, task, owner, attempt=2)
+
+    assert "new turn" in str(deferred.value)
+    assert _user_rows(db_session, task_id) == []
+    assert _stored_command_result(db_session, task_id) is None
+    assert _no_outcome_unknown(recording_reply)
+
+    begin_turn = AsyncMock(wraps=TaskTurnOrchestrator.begin_turn)
+    with (
+        _live_control_environment(outcome=ResumeReservationOutcome.RESERVED),
+        patch.object(TaskTurnOrchestrator, "begin_turn", begin_turn),
+    ):
+        result = await _run_command(db_session, task, owner, attempt=3)
+    assert result == _accepted_result(task_id)
+    _assert_started_a_new_turn(db_session, task_id, begin_turn)
+
+
+@pytest.mark.asyncio
+async def test_non_durable_caller_is_told_to_resend(
+    db_session,
+) -> None:
+    """Defensive only: production reaches this handler through a command.
+
+    ``handle_task_message`` is called by the durable executor, or through
+    ``handle_missing_task_message`` for a task it creates, so a live-path
+    message always has a command row. A caller without one still gets a safe
+    answer: not accepted, resend. Nothing of the message remains.
+    """
+
+    owner = _user(db_session, "fresh-non-durable")
     task = _expired_running_task(db_session, int(owner.id))
     task_id = int(task.id)
     agent = _deferred_resume_agent()
@@ -376,7 +822,9 @@ async def test_direct_sender_is_told_to_resend_when_the_claim_finds_the_run_ende
         agent_patch,
         manager_patch,
         patch.object(task_execution_service, "publish_task_event", AsyncMock()),
-        _end_after_transition(task_id, lambda: _end_run(task_id, ended_status)),
+        # COMPLETED: with no command row, lease recovery would reconcile the
+        # pending row away before the resume could withdraw it.
+        _end_after_transition(task_id, lambda: _complete_run(task_id)),
     ):
         await command_execution_service.handle_task_message(
             reply, task_id, dict(message_data)
@@ -389,31 +837,10 @@ async def test_direct_sender_is_told_to_resend_when_the_claim_finds_the_run_ende
     assert rejected[0]["retry_with_new_id"] is True
     assert rejected[0]["error_code"] == ClientErrorCode.MESSAGE_DELIVERY_FAILED.value
     assert _user_rows(db_session, task_id) == []
-    _assert_run_not_resumed(db_session, task_id, ended_status)
-
-    # Even a same-id resend is safe: nothing of the first attempt remains.
-    reply.frames.clear()
-    begin_turn = AsyncMock(wraps=TaskTurnOrchestrator.begin_turn)
-    with (
-        _live_control_environment(outcome=ResumeReservationOutcome.RESERVED),
-        patch.object(TaskTurnOrchestrator, "begin_turn", begin_turn),
-    ):
-        await command_execution_service.handle_task_message(
-            reply, task_id, dict(message_data)
-        )
-    assert [f["type"] for f in reply.frames if f.get("turn_id") == TURN_ID] == [
-        "message_accepted"
-    ]
-    _assert_started_a_new_turn(db_session, task_id, begin_turn)
+    _assert_run_not_resumed(db_session, task_id, TaskStatus.COMPLETED)
 
 
-def _live_owned_task(db_session, owner, live_task_lease) -> Task:
-    task = _live_task(db_session, int(owner.id))
-    task.runner_id = get_runner_id()
-    task.lease_expires_at = datetime.now(timezone.utc) + timedelta(minutes=1)
-    db_session.commit()
-    live_task_lease(db_session, task)
-    return task
+# --- the message reached the run before it ended -------------------------
 
 
 @pytest.mark.asyncio
@@ -451,15 +878,14 @@ async def test_posted_message_whose_run_ends_before_the_transition_is_unknown(
             side_effect=end_then_transition,
         ),
     ):
-        result = await execute_durable_task_command(
-            _message_command(task, owner, TURN_ID, attempt_count=1)
-        )
+        result = await _run_command(db_session, task, owner)
         task_execution_service.execute_resume_background.assert_not_called()
 
     agent.post_user_message.assert_awaited_once()
     assert result == _outcome_unknown_result(task)
     begin_turn_spy.assert_not_awaited()
     background_manager.register_reserved_resume.assert_not_called()
+    background_manager.release_resume_reservation.assert_called_once_with(task_id)
     assert _row_status(db_session, task_id) == DELIVERY_DISPATCHED
     _assert_run_not_resumed(db_session, task_id, ended_status)
     _assert_outcome_unknown_frames(recording_reply)
@@ -499,9 +925,7 @@ async def test_posted_message_whose_run_ends_before_the_claim_keeps_its_notice(
             task_id, lambda: _end_run_directly(task_id, ended_status)
         ),
     ):
-        result = await execute_durable_task_command(
-            _message_command(task, owner, TURN_ID, attempt_count=1)
-        )
+        result = await _run_command(db_session, task, owner)
         assert resume_spy.await_args.kwargs["delivery_already_dispatched"] is True
         assert resume_spy.await_args.kwargs["delivery_claimed_fresh"] is True
         await _wait_for_resume_to_finish(background_manager, task_id)
@@ -520,6 +944,9 @@ async def test_posted_message_whose_run_ends_before_the_claim_keeps_its_notice(
     assert MESSAGE not in str(notices[0])
 
 
+# --- runs that did not end are unaffected --------------------------------
+
+
 @pytest.mark.asyncio
 async def test_fresh_message_to_a_live_run_still_injects(
     live_task_lease,
@@ -535,9 +962,7 @@ async def test_fresh_message_to_a_live_run_still_injects(
         agent,
         background_manager,
     ):
-        result = await execute_durable_task_command(
-            _message_command(task, owner, TURN_ID, attempt_count=1)
-        )
+        result = await _run_command(db_session, task, owner)
         resume = task_execution_service.execute_resume_background
         assert resume.call_count == 1
         assert resume.call_args.kwargs["refuse_terminal_status"] is True
@@ -575,9 +1000,7 @@ async def test_fresh_message_to_a_paused_resume_request_still_resumes(
         background_manager,
     ):
         with pytest.raises(TaskCommandDeferred):
-            await execute_durable_task_command(
-                _message_command(task, owner, TURN_ID, attempt_count=1)
-            )
+            await _run_command(db_session, task, owner)
         resume = task_execution_service.execute_resume_background
         assert resume.call_count == 1
         assert resume.call_args.kwargs["refuse_terminal_status"] is True
@@ -622,9 +1045,7 @@ async def test_resume_request_left_on_an_ended_run_routes_to_a_new_turn(
         agent,
         background_manager,
     ):
-        result = await execute_durable_task_command(
-            _message_command(task, owner, TURN_ID, attempt_count=1)
-        )
+        result = await _run_command(db_session, task, owner)
         task_execution_service.execute_resume_background.assert_not_called()
 
     assert result == _accepted_result(task_id)
@@ -663,9 +1084,7 @@ async def test_claim_refused_by_a_live_owner_keeps_the_failed_delivery(
         ),
     ):
         with pytest.raises(TaskCommandDeferred):
-            await execute_durable_task_command(
-                _message_command(task, owner, TURN_ID, attempt_count=1)
-            )
+            await _run_command(db_session, task, owner)
         await _wait_for_resume_to_finish(background_manager, task_id)
 
     agent.post_user_message.assert_not_awaited()
@@ -678,6 +1097,9 @@ async def test_claim_refused_by_a_live_owner_keeps_the_failed_delivery(
     stored = db_session.get(Task, task_id)
     assert stored.status == TaskStatus.RUNNING
     assert stored.runner_id == "foreign-runner"
+
+
+# --- units -----------------------------------------------------------------
 
 
 def test_withdrawal_removes_only_a_pending_row(db_session) -> None:

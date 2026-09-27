@@ -2928,8 +2928,9 @@ async def execute_resume_background(
                 # was claimed by this very handoff and the message was never
                 # written into the run, so withdrawing the row is safe and
                 # lets the message be accepted as a new turn: a durable
-                # command's retry finds no row and appends it, and a direct
-                # sender is told to resend. The ended run is not resumed.
+                # command's retry finds no row and appends it (a caller with
+                # a delivery notifier, which production does not route here,
+                # is told to resend). The ended run is not resumed.
                 fresh_turn_id = delivery_turn_id
                 withdrawn = False
                 try:

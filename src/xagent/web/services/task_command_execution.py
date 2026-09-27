@@ -21,7 +21,9 @@ from typing import (
     cast,
 )
 
-from sqlalchemy import func, or_, update
+from sqlalchemy import func
+from sqlalchemy import null as sql_null
+from sqlalchemy import or_, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -189,6 +191,13 @@ _TURN_REJECTION_CODES = {
     "workforce_run_not_found": ClientErrorCode.WORKFORCE_UNAVAILABLE,
     "workforce_run_not_active": ClientErrorCode.WORKFORCE_UNAVAILABLE,
 }
+
+
+# ``begin_turn`` refusals that only mean "not yet" for a message withdrawn
+# from an ended run: its retry routes afresh instead of failing it.
+_WITHDRAWN_TURN_RETRY_REASONS = frozenset(
+    {"bg_inflight", "busy", "interaction_response_required"}
+)
 
 
 EXTERNAL_COMMAND_SCOPE_ABSENT = object()
@@ -1587,6 +1596,30 @@ async def handle_task_message(
         else:
             await finish_delivery(True)
 
+    async def retry_withdrawn_turn() -> None:
+        """Answer a message whose never-injected row was withdrawn, not run.
+
+        Nothing of the message remains, so it is safe to deliver again. A
+        durable command defers: its retry routes afresh and, finding no row,
+        accepts the message as a new turn. A caller without a durable command
+        (defensive: production always has one on the live path) is told it
+        was not accepted and to resend.
+        """
+
+        if suppress_delivery_ack:
+            message_data["_durable_command_defer"] = turn_id
+            message_data["_durable_command_defer_reason"] = (
+                f"Message {turn_id} will start a new turn because its run ended"
+            )
+            return
+        await finish_delivery(
+            False,
+            client_error_message(ClientErrorCode.MESSAGE_DELIVERY_FAILED),
+            error_code=ClientErrorCode.MESSAGE_DELIVERY_FAILED.value,
+            retry_with_new_id=True,
+            rejection_outcome="not_accepted",
+        )
+
     async def settle_accepted_outcome_unknown() -> None:
         """Settle a turn an earlier attempt accepted but never settled.
 
@@ -1597,15 +1630,15 @@ async def handle_task_message(
         call ``finish_delivery``.
         """
 
-        nonlocal delivery_outcome_unknown, delivery_dispatched
+        nonlocal delivery_outcome_unknown, delivery_dispatched, delivery_claimed
         # First, so any failure below reaches finish_delivery_failure as
         # outcome unknown and can never persist the row as failed.
         delivery_outcome_unknown = True
+        attempt_count = int(message_data.get("_durable_attempt_count") or 0)
         if suppress_delivery_ack:
             # Before the row write: ``dispatched`` alone reads as accepted,
             # so a retry after a crash between that write and the command's
             # own settlement needs this durable record to answer the same.
-            attempt_count = int(message_data.get("_durable_attempt_count") or 0)
             owns_command = await run_db_io_cancellation_safe(
                 lambda: _record_command_outcome_unknown_sync(
                     task_id, turn_id, attempt_count=attempt_count
@@ -1631,7 +1664,30 @@ async def handle_task_message(
                 DELIVERY_DISPATCHED,
             )
         )
-        if transition.status in {DELIVERY_DISPATCHED, None}:
+        if transition.status is None:
+            # No row: the only writer that removes one is a withdrawal, by a
+            # handoff that found its run ended before the message was written
+            # into it. Never applied, so it is not answered unknown; the retry
+            # finds no row and accepts it as a new turn.
+            delivery_outcome_unknown = False
+            delivery_claimed = False
+            if suppress_delivery_ack:
+                # The record just written would read a later ``dispatched``
+                # row of that new turn as unknown.
+                await run_db_io_cancellation_safe(
+                    lambda: _clear_command_outcome_unknown_sync(
+                        task_id, turn_id, attempt_count=attempt_count
+                    )
+                )
+            logger.info(
+                "task %s turn %s was withdrawn from an ended run before it was "
+                "delivered; retrying it as a new turn",
+                task_id,
+                turn_id,
+            )
+            await retry_withdrawn_turn()
+            return
+        if transition.status == DELIVERY_DISPATCHED:
             delivery_dispatched = True
             message_data["_recovered_delivery_outcome_unknown"] = turn_id
             logger.warning(
@@ -1819,12 +1875,19 @@ async def handle_task_message(
                 # after this snapshot.
                 task_uses_live_control = False
 
-            async def start_new_turn(routing: _TaskCommandRoutingSnapshot) -> None:
+            async def start_new_turn(
+                routing: _TaskCommandRoutingSnapshot,
+                *,
+                after_withdrawal: bool = False,
+            ) -> None:
                 """Accept the message as a new turn through ``begin_turn``.
 
                 The routed path for a task that is not live, and the fallback
                 for a fresh live message whose run ended before its handoff
                 (its withdrawn row was never injected, so a new turn is safe).
+                ``after_withdrawal`` marks that fallback: a task that moved on
+                again, or is still busy settling the ended run, is not a
+                failure there, and the message is retried afresh instead.
                 """
 
                 if pause_accepted and routing.status in {
@@ -1950,6 +2013,12 @@ async def handle_task_message(
                 elif routing.status == TaskStatus.PAUSED:
                     turn_kind = TurnKind.APPEND
                     turn_force_fresh = False
+                elif after_withdrawal:
+                    # The task moved on after the refused handoff (another
+                    # turn started). Nothing of this message remains, so it
+                    # routes afresh against whatever the task now is.
+                    await retry_withdrawn_turn()
+                    return
                 else:
                     logger.error(
                         f"WS schedule reached for task {task_id} with "
@@ -2043,6 +2112,22 @@ async def handle_task_message(
                     # settling. The claim rolled back, so nothing new ran.
                     await settle_accepted_outcome_unknown()
                 except TaskTurnError as busy_err:
+                    if (
+                        after_withdrawal
+                        and busy_err.reason in _WITHDRAWN_TURN_RETRY_REASONS
+                    ):
+                        # Typically the ended run's own coroutine has not
+                        # unwound yet (``bg_inflight``). The claim rolled
+                        # back, so the withdrawn message retries afresh.
+                        logger.info(
+                            "task %s not ready for withdrawn message %s (%s); "
+                            "retrying it",
+                            task_id,
+                            turn_id,
+                            busy_err.reason,
+                        )
+                        await retry_withdrawn_turn()
+                        return
                     # begin_turn's atomic transaction rolls back on
                     # bg_inflight / busy — neither the status flip
                     # nor the user message persists, so no transcript
@@ -2175,6 +2260,10 @@ async def handle_task_message(
                 # emission point. Do not emit a second user-message trace.
                 bg_task: asyncio.Task[None] | None = None
                 handoff_registered = False
+                # Set by every release of the reservation above, so the
+                # cleanup below never releases it twice: after a release
+                # another resume may already hold the slot for this task.
+                reservation_released = False
                 try:
                     if recovered_delivery is not None:
                         delivery_claim = recovered_delivery
@@ -2196,6 +2285,7 @@ async def handle_task_message(
                         task_execution_service.background_task_manager.release_resume_reservation(
                             task_id
                         )
+                        reservation_released = True
                         await finish_existing_delivery(delivery_claim)
                         return
                     delivery_claimed = True
@@ -2306,6 +2396,7 @@ async def handle_task_message(
                                         task_execution_service.background_task_manager.release_resume_reservation(
                                             task_id
                                         )
+                                        reservation_released = True
                                         await answer_durable_turn_failure(
                                             ClientErrorCode.TASK_CHECKPOINT_UNREADABLE
                                         )
@@ -2355,6 +2446,7 @@ async def handle_task_message(
                         task_execution_service.background_task_manager.release_resume_reservation(
                             task_id
                         )
+                        reservation_released = True
                         await finish_delivery_failure(
                             client_error_message(
                                 ClientErrorCode.MESSAGE_DELIVERY_FAILED
@@ -2367,6 +2459,7 @@ async def handle_task_message(
                         task_execution_service.background_task_manager.release_resume_reservation(
                             task_id
                         )
+                        reservation_released = True
                         await finish_delivery_failure(
                             client_error_message(
                                 ClientErrorCode.MESSAGE_OUTCOME_UNKNOWN
@@ -2417,6 +2510,7 @@ async def handle_task_message(
                         task_execution_service.background_task_manager.release_resume_reservation(
                             task_id
                         )
+                        reservation_released = True
                         if delivery_recovered_claim:
                             # The run ended, was replaced, or is owned by an
                             # acquisition this process does not hold, after
@@ -2441,14 +2535,30 @@ async def handle_task_message(
                             # shown the ended run. Withdraw the row first so
                             # the new turn inserts its own (the turn id is
                             # unique per task).
-                            withdrawn = await run_db_io_cancellation_safe(
-                                lambda: withdraw_pending_user_message_delivery_sync(
-                                    task_id, turn_id
+                            try:
+                                withdrawn = await run_db_io_cancellation_safe(
+                                    lambda: withdraw_pending_user_message_delivery_sync(
+                                        task_id, turn_id
+                                    )
                                 )
-                            )
+                            except Exception:
+                                # The delete may or may not have committed, so
+                                # the row's state is unknown. Settle it the
+                                # conservative way, as the resume path does;
+                                # a row that is in fact gone is retried below.
+                                logger.warning(
+                                    "task %s: could not withdraw undelivered "
+                                    "message %s from its ended run",
+                                    task_id,
+                                    turn_id,
+                                    exc_info=True,
+                                )
+                                withdrawn = False
                             if not withdrawn:
-                                # Another writer settled the row meanwhile;
-                                # delivery is no longer this attempt's to prove.
+                                # Another writer settled the row meanwhile, or
+                                # the withdrawal failed: delivery is no longer
+                                # this attempt's to prove. A row that turns
+                                # out to be gone is retried as a new turn.
                                 await settle_accepted_outcome_unknown()
                                 return
                             delivery_claimed = False
@@ -2471,7 +2581,21 @@ async def handle_task_message(
                                 raise ValueError(
                                     f"Task {task_id} is no longer available"
                                 )
-                            await start_new_turn(ended_routing)
+                            appendable = ended_routing.status in (
+                                NON_RESUMABLE_STATUSES
+                            ) or (
+                                ended_routing.status == TaskStatus.PAUSED
+                                and not _task_status_uses_live_control(
+                                    ended_routing.status,
+                                    control_state=ended_routing.control_state,
+                                )
+                            )
+                            if not appendable:
+                                # Another turn started meanwhile. Route the
+                                # withdrawn message afresh against it.
+                                await retry_withdrawn_turn()
+                                return
+                            await start_new_turn(ended_routing, after_withdrawal=True)
                             return
                         # What reaches here is a run or owner mismatch.
                         current_control = await task_execution_controller.snapshot(
@@ -2708,7 +2832,7 @@ async def handle_task_message(
                 except BaseException:
                     if bg_task is not None and not handoff_registered:
                         bg_task.cancel()
-                    if not handoff_registered:
+                    if not handoff_registered and not reservation_released:
                         task_execution_service.background_task_manager.release_resume_reservation(
                             task_id
                         )
@@ -4087,6 +4211,35 @@ def _record_command_outcome_unknown_sync(
         owned = updated == 1 or command.first() is None
         db.commit()
         return owned
+
+
+def _clear_command_outcome_unknown_sync(
+    task_id: int, command_id: str, *, attempt_count: int
+) -> None:
+    """Drop this attempt's outcome-unknown record once it proved wrong.
+
+    Written before the row write, it turns out not to apply when that write
+    finds the row withdrawn: the message was never delivered and its retry
+    starts a new turn, whose ``dispatched`` row must read as accepted. Fenced
+    on the same attempt as the record; a record from another attempt is left.
+    """
+
+    SessionLocal = get_session_local()
+    with SessionLocal() as db:
+        owned = db.query(TaskExecutionCommand).filter(
+            TaskExecutionCommand.task_id == task_id,
+            TaskExecutionCommand.command_id == command_id,
+            TaskExecutionCommand.kind == TaskCommandKind.MESSAGE.value,
+            TaskExecutionCommand.status == COMMAND_PROCESSING,
+            TaskExecutionCommand.attempt_count == attempt_count,
+        )
+        recorded = owned.with_entities(TaskExecutionCommand.result).scalar()
+        if recorded == _message_outcome_unknown_result(task_id, command_id):
+            owned.update(
+                {TaskExecutionCommand.result: sql_null()},
+                synchronize_session=False,
+            )
+            db.commit()
 
 
 def _command_recorded_outcome_unknown(task_id: int, command_id: str) -> bool:
