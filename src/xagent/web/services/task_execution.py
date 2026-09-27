@@ -2092,7 +2092,11 @@ async def execute_task_background(
                     ),
                     task_id,
                 )
-                logger.info(f"Background task {task_id} paused for v2 control")
+                logger.info(
+                    "Background task %s left %s for v2 control",
+                    task_id,
+                    final_task_status,
+                )
                 return
 
             # Send task completion event (includes agent response info)
@@ -2429,6 +2433,12 @@ def _finalize_resumed_task(
             # whatever this run returned -- including a late interrupt, which
             # must not turn the row back into PAUSED (see the same guard in
             # ``_finalize_task_execution_result_isolated``).
+            #
+            # As a late result, the caller leaves a carried delivery where it
+            # is rather than marking it completed: this run's result was
+            # discarded, so "applied" is not proven. DISPATCHED already means
+            # "do not resend"; a still-PENDING row is advanced to that by the
+            # orphan sweep once the task is quiescent.
             if not release_task_lease_no_commit(db, task_lease, status=task.status):
                 db.rollback()
                 finalized["late_result"] = True

@@ -110,6 +110,7 @@ def _handoff(lease: TaskLease) -> Callable[[], Any]:
         lease.task_id,
         TaskControlState.RESUME_REQUESTED,
         expected_run_id=lease.run_id,
+        fence_live_owner=True,
         owner_lease=lease,
     )
 

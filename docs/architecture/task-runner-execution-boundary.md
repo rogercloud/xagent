@@ -252,11 +252,19 @@ control writes a live run makes mid-flight carry the same fence:
   another acquisition owns it, the command is deferred rather than rejected
   or acknowledged. The current lease owner can claim the retry (the row names
   it as runner) and applies the pause to its own run; the zombie, if it
-  claims the retry instead, defers again while that owner's lease is live. A pause refused only because the
-  holder's own lease had expired can find the run already paused by its own
-  settlement on retry, and then reports that the task is already paused.
-- The live-message `resume_requested` handoff is fenced on the exact
-  acquisition it routed through. A refusal is treated like a rotated run.
+  claims the retry instead, defers again while that owner's lease is live.
+  A retry that finds the targeted run already PAUSED settles as applied: an
+  earlier attempt interrupted it, for example a holder whose own lease had
+  expired, whose run then paused through its own settlement. A first attempt
+  that finds the task paused still reports that it is already paused.
+- The live-message `resume_requested` handoff, for a row routed as RUNNING,
+  is refused while a live acquisition other than the one this process routed
+  through owns the row. An owner-free row passes, because the local run may
+  have settled itself meanwhile (a non-shared release clears the owner but
+  keeps the run), and so does an expired one, which the resume may take
+  over. A refusal is treated like a rotated run.
+- PAUSE, CANCEL and MESSAGE commands defer while another runner holds a live
+  lease on the task, so the owner applies them.
 
 A result that arrives after its row already settled COMPLETED or FAILED, for
 example after an external cancel that timed out waiting for the runner, is

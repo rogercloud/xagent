@@ -46,6 +46,7 @@ from xagent.web.services.task_command_transport import (
     ClaimedTaskCommand,
     TaskCommandDeferred,
     TaskCommandKind,
+    TaskCommandRejected,
 )
 from xagent.web.services.task_coordinator_service import TaskLease as CoordinatorLease
 from xagent.web.services.task_execution_controller import (
@@ -328,39 +329,140 @@ async def test_local_holders_follow_registration_and_run(
     assert leases.local_task_lease_holders(int(task.id), "other-run") == ()
     assert leases.local_task_lease_holders(int(task.id) + 1, str(task.run_id)) == ()
 
+    # A registration whose heartbeat already ended no longer holds the run.
+    manager = leases._get_task_lease_heartbeat_manager()
+    entry = manager._entries[leases._task_lease_key(lease)]
+    entry.terminal_event.set()
+    try:
+        assert leases.local_task_lease_holders(int(task.id), str(task.run_id)) == ()
+    finally:
+        entry.terminal_event.clear()
+
+
+def _paused_row(db_session) -> Task:
+    task = _leased_task(db_session)
+    task.status = TaskStatus.PAUSED
+    task.control_state = TaskControlState.PAUSED.value
+    task.runner_id = None
+    task.lease_expires_at = None
+    db_session.commit()
+    return task
+
+
+def _patch_paused_runtime(monkeypatch, task: Task) -> AsyncMock:
+    snapshot_task = SimpleNamespace(
+        user_id=int(task.user_id), run_id=str(task.run_id), status=TaskStatus.PAUSED
+    )
+    monkeypatch.setattr(
+        task_setup_snapshot,
+        "load_task_setup_snapshot_sync",
+        lambda *a, **k: SimpleNamespace(task=snapshot_task, runtime_user=object()),
+    )
+    monkeypatch.setattr(commands, "resolve_execution_scope_off_turn", lambda *a: None)
+    service = SimpleNamespace(pause_execution=AsyncMock(return_value=False))
+    monkeypatch.setattr(
+        agent_service_manager,
+        "get_agent_manager",
+        lambda: SimpleNamespace(get_agent_for_task=AsyncMock(return_value=service)),
+    )
+    publish = AsyncMock()
+    monkeypatch.setattr(commands, "publish_task_event", publish)
+    return publish
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("attempt_count", "same_run", "applied"),
+    [(2, True, True), (1, True, False), (2, False, False)],
+    ids=["retry-same-run", "first-attempt", "retry-other-run"],
+)
+async def test_pause_retry_that_finds_its_run_paused_settles_as_applied(
+    db_session, monkeypatch, attempt_count: int, same_run: bool, applied: bool
+) -> None:
+    task = _paused_row(db_session)
+    publish = _patch_paused_runtime(monkeypatch, task)
+    reply = AsyncMock()
+    message = {
+        **_pause_message(task),
+        "_durable_attempt_count": attempt_count,
+        "_durable_target_run_id": str(task.run_id) if same_run else "earlier-run",
+    }
+
+    await commands.pause_task(reply, int(task.id), message)
+
+    if applied:
+        # The run's own settlement already announced PAUSED.
+        assert "_durable_command_error" not in message
+        reply.assert_not_awaited()
+        publish.assert_not_awaited()
+        assert not execution._is_task_pause_accepted(int(task.id))
+    else:
+        assert message["_durable_command_error"] == "Task is already paused"
+        reply.assert_awaited_once()
+
 
 # ---------------------------------------------------------------------------
 # RESUME_REQUESTED (live message into a running run)
 # ---------------------------------------------------------------------------
 
 
-def test_owner_lease_transition_matches_only_the_exact_acquisition(
-    db_session,
+@pytest.mark.parametrize(
+    ("row", "own", "allowed"),
+    [
+        ("own", True, True),
+        ("successor-live", True, False),
+        ("successor-live", False, False),
+        ("owner-free", True, True),
+        ("owner-free", False, True),
+        ("successor-expired", False, True),
+    ],
+)
+def test_live_owner_fence_refuses_only_another_live_acquisition(
+    db_session, row: str, own: bool, allowed: bool
 ) -> None:
     task = _leased_task(db_session)
     task.lease_attempt_id = "own-attempt"
     db_session.commit()
-    own = TaskLease(int(task.id), str(task.runner_id), str(task.run_id), "own-attempt")
-
-    snapshot = transition_task_control_state_sync(
-        int(task.id),
-        TaskControlState.RESUME_REQUESTED,
-        expected_run_id=str(task.run_id),
-        owner_lease=own,
+    own_lease = TaskLease(
+        int(task.id), str(task.runner_id), str(task.run_id), "own-attempt"
     )
-    assert snapshot.control_state is TaskControlState.RESUME_REQUESTED
+    if row == "successor-live":
+        _take_over(int(task.id))
+    elif row == "owner-free":
+        # A non-shared release keeps the run and clears the owner.
+        task.runner_id = None
+        task.lease_attempt_id = None
+        task.lease_expires_at = None
+        db_session.commit()
+    elif row == "successor-expired":
+        _take_over(int(task.id))
+        with get_session_local()() as db:
+            db.execute(
+                update(Task)
+                .where(Task.id == int(task.id))
+                .values(
+                    lease_expires_at=datetime.now(timezone.utc) - timedelta(seconds=1)
+                )
+            )
+            db.commit()
 
-    _take_over(int(task.id))
-    with pytest.raises(StaleTaskRunError, match="no longer owned"):
-        transition_task_control_state_sync(
+    def transition():
+        return transition_task_control_state_sync(
             int(task.id),
-            TaskControlState.RUNNING,
+            TaskControlState.RESUME_REQUESTED,
             expected_run_id=str(task.run_id),
-            owner_lease=own,
+            fence_live_owner=True,
+            owner_lease=own_lease if own else None,
         )
-    stored = _row(db_session, int(task.id))
-    assert stored.control_state == TaskControlState.RESUME_REQUESTED.value
-    assert stored.state_version == snapshot.state_version
+
+    if allowed:
+        assert transition().control_state is TaskControlState.RESUME_REQUESTED
+    else:
+        with pytest.raises(StaleTaskRunError, match="another live lease"):
+            transition()
+        stored = _row(db_session, int(task.id))
+        assert stored.control_state == TaskControlState.RUNNING.value
+        assert stored.state_version == 3
 
 
 @pytest.mark.asyncio
@@ -401,18 +503,114 @@ async def test_live_message_handoff_stays_off_a_successor_run(
     assert stored.lease_attempt_id == SUCCESSOR_ATTEMPT
 
 
+@pytest.mark.asyncio
+async def test_live_message_handoff_follows_a_run_that_paused_itself(
+    live_task_lease, db_session
+) -> None:
+    """The message's own interrupt can settle the local run first."""
+    task = _leased_task(db_session)
+    lease = live_task_lease(db_session, task)
+    owner = db_session.get(User, int(task.user_id))
+    background_manager = execution.BackgroundTaskManager()
+    with _live_control_environment(background_manager=background_manager) as (
+        agent,
+        _,
+    ):
+
+        async def inject_then_settle_paused(*args, **kwargs):
+            # The interrupt requested by this message pauses the run, which
+            # releases its lease the non-shared way: owner cleared, run kept.
+            with get_session_local()() as db:
+                assert leases.release_task_lease_no_commit(
+                    db, lease, status=TaskStatus.PAUSED
+                )
+                db.commit()
+            return UserMessageInjectionOutcome.POSTED_FRESH
+
+        agent.post_user_message = AsyncMock(side_effect=inject_then_settle_paused)
+
+        result = await commands.execute_durable_task_command(
+            _message_command(task, owner, "self-paused-handoff")
+        )
+        assert result["kind"] == "message"
+        # The resume carries the message instead of failing it.
+        execution.execute_resume_background.assert_called_once()
+        await background_manager.wait_for_previous(int(task.id))
+
+    stored = _row(db_session, int(task.id))
+    assert stored.status == TaskStatus.PAUSED
+    assert stored.control_state == TaskControlState.RESUME_REQUESTED.value
+    assert stored.runner_id is None
+
+
+@pytest.mark.asyncio
+async def test_message_defers_while_a_successor_holds_the_run(
+    live_task_lease, db_session
+) -> None:
+    """A takeover before routing leaves the message to the live owner."""
+    task = _leased_task(db_session)
+    live_task_lease(db_session, task)
+    _take_over(int(task.id))
+    owner = db_session.get(User, int(task.user_id))
+    with _live_control_environment(
+        background_manager=execution.BackgroundTaskManager()
+    ) as (agent, _):
+        with pytest.raises(
+            ClientVisibleTaskCommandDeferred, match="waiting for the active task lease"
+        ):
+            await commands.execute_durable_task_command(
+                _message_command(task, owner, "successor-message")
+            )
+        agent.post_user_message.assert_not_awaited()
+
+    stored = _row(db_session, int(task.id))
+    assert stored.control_state == TaskControlState.RUNNING.value
+    assert stored.state_version == 3
+    assert stored.lease_attempt_id == SUCCESSOR_ATTEMPT
+
+
+@pytest.mark.asyncio
+async def test_message_without_a_local_holder_does_not_stamp_a_live_run(
+    db_session,
+) -> None:
+    """Same runner, other attempt: invisible to the pre-check, not the fence."""
+    task = _leased_task(db_session)
+    task.lease_attempt_id = SUCCESSOR_ATTEMPT
+    db_session.commit()
+    owner = db_session.get(User, int(task.user_id))
+    with _live_control_environment(
+        background_manager=execution.BackgroundTaskManager()
+    ) as (agent, _):
+        # Nothing was injected, so the refusal is an ordinary known failure.
+        with pytest.raises(TaskCommandRejected):
+            await commands.execute_durable_task_command(
+                _message_command(task, owner, "holderless-message")
+            )
+        agent.post_user_message.assert_not_awaited()
+        execution.execute_resume_background.assert_not_called()
+
+    stored = _row(db_session, int(task.id))
+    assert stored.control_state == TaskControlState.RUNNING.value
+    assert stored.state_version == 3
+
+
 # ---------------------------------------------------------------------------
 # Late results on a row that already settled terminal
 # ---------------------------------------------------------------------------
 
 
-def _owned_failed_task(db_session) -> tuple[Task, TaskLease]:
-    """FAILED while the lease fence still matches, as in coordinator context."""
+def _owned_settled_task(db_session, status: TaskStatus) -> tuple[Task, TaskLease]:
+    """Terminal while the lease fence still matches, as in coordinator context."""
     task = _leased_task(db_session)
     task.lease_attempt_id = "own-attempt"
-    task.status = TaskStatus.FAILED
-    task.control_state = TaskControlState.FAILED.value
-    task.error_message = "cancelled externally"
+    task.status = status
+    task.control_state = (
+        TaskControlState.FAILED.value
+        if status == TaskStatus.FAILED
+        else TaskControlState.COMPLETED.value
+    )
+    task.error_message = "cancelled externally" if status == TaskStatus.FAILED else None
+    task.output = "first answer" if status == TaskStatus.COMPLETED else None
     db_session.commit()
     return task, TaskLease(
         int(task.id), str(task.runner_id), str(task.run_id), "own-attempt"
@@ -422,12 +620,30 @@ def _owned_failed_task(db_session) -> tuple[Task, TaskLease]:
 _LATE_RESULTS = {
     "interrupted": {"status": "interrupted", "success": False, "output": "stopped"},
     "success": {"status": "completed", "success": True, "output": "late answer"},
+    "failure": {"status": "failed", "success": False, "output": "late failure"},
 }
+_SETTLED = [TaskStatus.FAILED, TaskStatus.COMPLETED]
 
 
+def _assert_settled_unchanged(stored: Task, status: TaskStatus) -> None:
+    assert stored.status == status
+    assert stored.control_state == (
+        TaskControlState.FAILED.value
+        if status == TaskStatus.FAILED
+        else TaskControlState.COMPLETED.value
+    )
+    if status == TaskStatus.FAILED:
+        assert stored.error_message == "cancelled externally"
+    else:
+        assert stored.output == "first answer"
+
+
+@pytest.mark.parametrize("status", _SETTLED, ids=lambda s: s.value)
 @pytest.mark.parametrize("kind", sorted(_LATE_RESULTS))
-def test_late_result_keeps_a_failed_row_failed(db_session, kind: str) -> None:
-    task, lease = _owned_failed_task(db_session)
+def test_late_result_keeps_a_settled_row(
+    db_session, kind: str, status: TaskStatus
+) -> None:
+    task, lease = _owned_settled_task(db_session, status)
 
     finalized = execution._finalize_task_execution_result_isolated(
         task_id=int(task.id),
@@ -440,18 +656,21 @@ def test_late_result_keeps_a_failed_row_failed(db_session, kind: str) -> None:
         prepared_outputs=execution._PreparedTaskFileOutputs((), (), ()),
     )
 
-    assert finalized.final_task_status == TaskStatus.FAILED.value
+    # The broadcast carries the row's actual status, not the pre-run one.
+    assert finalized.final_task_status == status.value
+    assert finalized.waiting_for_control is True
     assert finalized.final_control_snapshot is None
     stored = _row(db_session, int(task.id))
-    assert stored.status == TaskStatus.FAILED
-    assert stored.control_state == TaskControlState.FAILED.value
-    assert stored.error_message == "cancelled externally"
+    _assert_settled_unchanged(stored, status)
     assert stored.state_version == 3
 
 
+@pytest.mark.parametrize("status", _SETTLED, ids=lambda s: s.value)
 @pytest.mark.parametrize("kind", sorted(_LATE_RESULTS))
-def test_late_resumed_result_keeps_a_failed_row_failed(db_session, kind: str) -> None:
-    task, lease = _owned_failed_task(db_session)
+def test_late_resumed_result_keeps_a_settled_row(
+    db_session, kind: str, status: TaskStatus
+) -> None:
+    task, lease = _owned_settled_task(db_session, status)
     result = dict(_LATE_RESULTS[kind])
 
     finalized = execution._finalize_resumed_task(
@@ -467,6 +686,8 @@ def test_late_resumed_result_keeps_a_failed_row_failed(db_session, kind: str) ->
 
     assert finalized["late_result"] is True
     stored = _row(db_session, int(task.id))
-    assert stored.status == TaskStatus.FAILED
-    assert stored.control_state == TaskControlState.FAILED.value
-    assert stored.error_message == "cancelled externally"
+    _assert_settled_unchanged(stored, status)
+    # The resumed run's lease is still released, under the row's own status.
+    assert stored.runner_id is None
+    assert stored.lease_attempt_id is None
+    assert stored.lease_expires_at is None

@@ -2083,12 +2083,20 @@ async def handle_task_message(
                         task_id,
                         TaskControlState.RESUME_REQUESTED,
                         expected_run_id=task_run_id,
-                        # A live RUNNING row keeps its run id across an
-                        # expired-lease takeover, so the run fence alone
-                        # would let this process stamp the handoff onto a
-                        # successor's run. Fence on the exact acquisition it
-                        # routed through; a non-running row has no live
-                        # owner and keeps the run fence alone.
+                        # An expired-lease takeover keeps the run id, so the
+                        # run fence alone would let this handoff land on a
+                        # successor's running run. For a row routed as
+                        # RUNNING, refuse while a live acquisition other than
+                        # the one this process routed through (``None`` when
+                        # it holds none) owns the row. An owner-free row
+                        # passes: the local run may have settled itself in
+                        # the meantime -- possibly paused by this very
+                        # message's interrupt -- and a non-shared release
+                        # clears the owner but keeps the run. Rows routed as
+                        # not RUNNING keep the run fence alone: a shared
+                        # coordinator keeps owning a settled task, and a
+                        # resting row has no run for a successor to take.
+                        fence_live_owner=task_status == TaskStatus.RUNNING,
                         owner_lease=live_task_lease,
                     )
 
@@ -2861,6 +2869,29 @@ def _apply_pause_requested_isolated(
         return False
 
 
+def _pause_retry_found_its_run_paused(
+    status: TaskStatus, run_id: str | None, message_data: dict
+) -> bool:
+    """Whether a durable PAUSE retry finds the run it targeted paused.
+
+    The discriminator is a prior attempt of the same command
+    (``attempt_count > 1``) plus the row resting PAUSED on exactly the run the
+    command targeted. A first attempt that finds the task paused keeps
+    reporting "already paused": the pause predates the command. Any earlier
+    attempt -- deferred after interrupting, or crashed mid-handler -- may have
+    been what paused it, and either way the targeted run is paused as asked.
+    ``defer_count`` alone would miss the crashed-attempt case.
+    """
+
+    target_run_id = message_data.get("_durable_target_run_id")
+    return (
+        status == TaskStatus.PAUSED
+        and target_run_id is not None
+        and run_id == target_run_id
+        and int(message_data.get("_durable_attempt_count") or 1) > 1
+    )
+
+
 async def pause_task(reply: CommandReply, task_id: int, message_data: dict) -> None:
     """Handle task pause request"""
     try:
@@ -2961,6 +2992,23 @@ async def pause_task(reply: CommandReply, task_id: int, message_data: dict) -> N
                     # START registers its outer handle before AgentRunner is
                     # ready. Preserve a queued pause through that startup gap.
                     raise TaskCommandDeferred("Task execution is still starting")
+                if _pause_retry_found_its_run_paused(
+                    task_fields.status, task_fields.run_id, message_data
+                ):
+                    # An earlier attempt of this command already interrupted
+                    # the run -- typically a lease holder whose fenced write
+                    # was deferred, whose run then settled PAUSED on its own.
+                    # The user's pause took effect; that settlement already
+                    # published the durable PAUSED ``task_info``, so answer
+                    # success without a second pause event. The pause marker
+                    # is not set: nothing is pending for it to hold back.
+                    logger.info(
+                        "Task %s run %s is paused; pause command retry settles "
+                        "as applied",
+                        task_id,
+                        task_fields.run_id,
+                    )
+                    return
                 # ``pause_execution`` reports on the live run only, so it says
                 # "no" both for a task that is already paused and for one that
                 # is not running at all. Those read very differently to a user,
@@ -3824,7 +3872,14 @@ async def _execute_durable_task_command(
                 f"{command.command_id} was applied",
                 reason="stale_run",
             )
+    # A live foreign owner applies its own control and live input; routing
+    # lets it claim the retry because the row names it as runner. MESSAGE is
+    # included because an expired-lease takeover keeps the run id, so a
+    # message routed here would otherwise hand a resume to a run this process
+    # cannot acquire. Expired or absent owners are not "live", so recovery of
+    # an abandoned run (the recovered-delivery paths) still proceeds here.
     if command.kind in {
+        TaskCommandKind.MESSAGE,
         TaskCommandKind.PAUSE,
         TaskCommandKind.CANCEL,
     } and await run_db_io_cancellation_safe(
