@@ -1,13 +1,14 @@
-"""A recovered delivery never resumes a run that recovery settled FAILED.
+"""A recovered delivery never resumes a run that has ended.
 
 A durable MESSAGE command claimed its delivery row on the task's own run and
-crashed before settling it. Lease recovery then found the run not recoverable
-and settled the task FAILED. The retry finds the pending row as a recovered
-claim on the command's own run, which is normally redriven through a resume
-so the run replays the turn id against its checkpoint. A FAILED run must not
-be resumed: the retry settles the command as accepted with an unknown outcome,
-advances the row out of ``pending`` without running the turn, and leaves the
-task FAILED with its status, control state, run and diagnostic untouched.
+crashed before settling it. The run then ended: lease recovery found it not
+recoverable and settled the task FAILED, or its runner finished it COMPLETED.
+The retry finds the pending row as a recovered claim on the command's own
+run, which is normally redriven through a resume so the run replays the turn
+id against its checkpoint. An ended run must not be resumed: the retry
+settles the command as accepted with an unknown outcome, advances the row out
+of ``pending`` without running the turn, and leaves the task in its terminal
+status with its control state, run, diagnostic and result untouched.
 
 The routing snapshot can be stale, so the refusal is also enforced by the
 RESUME_REQUESTED transition and by the resume lease claim, each as part of
@@ -37,6 +38,7 @@ from tests.web.api.test_recovered_delivery_outcome_unknown import (
     _pending_row,
     _RecordingReply,
     _row_status,
+    _settled_task,
     _user_rows,
 )
 from xagent.web.api import websocket as websocket_api
@@ -63,18 +65,25 @@ from xagent.web.services.task_command_transport import (
 )
 from xagent.web.services.task_execution import ResumeReservationOutcome
 from xagent.web.services.task_execution_controller import (
+    NON_RESUMABLE_STATUSES,
     StaleTaskRunError,
     TaskControlState,
     TaskStatusRefusedError,
     apply_task_control_transition,
 )
 from xagent.web.services.task_lease_service import (
+    TaskLease,
     get_expired_task_lease_candidates,
     recover_expired_task_lease_no_commit,
+    release_task_lease_no_commit,
 )
 from xagent.web.services.task_orchestrator import TaskTurnOrchestrator, TurnKind
 
 RECOVERY_ERROR = "not recoverable: checkpoint missing"
+FINAL_OUTPUT = "the run's final answer"
+ENDED_STATUSES = pytest.mark.parametrize(
+    "ended_status", [TaskStatus.FAILED, TaskStatus.COMPLETED]
+)
 
 
 @pytest.fixture()
@@ -128,33 +137,69 @@ def _recover_to_failed(task_id: int) -> None:
         db.commit()
 
 
-def _failed_task(db, owner_id: int) -> Task:
+def _complete_run(task_id: int) -> None:
+    """The run's own runner finishes it COMPLETED, in its own session."""
+
+    with get_session_local()() as db:
+        db.query(Task).filter(Task.id == task_id).update(
+            {Task.output: FINAL_OUTPUT}, synchronize_session=False
+        )
+        assert release_task_lease_no_commit(
+            db,
+            TaskLease(
+                task_id=task_id,
+                runner_id="dead-runner",
+                run_id="live-run",
+                attempt_id="dead-attempt",
+            ),
+            status=TaskStatus.COMPLETED,
+        )
+        db.commit()
+
+
+def _end_run(task_id: int, ended_status: TaskStatus) -> None:
+    if ended_status == TaskStatus.FAILED:
+        _recover_to_failed(task_id)
+    else:
+        assert ended_status == TaskStatus.COMPLETED
+        _complete_run(task_id)
+
+
+def _ended_task(db, owner_id: int, ended_status: TaskStatus) -> Task:
     task = _expired_running_task(db, owner_id)
-    _recover_to_failed(int(task.id))
+    _end_run(int(task.id), ended_status)
     db.expire_all()
     task = db.get(Task, int(task.id))
-    assert task.status == TaskStatus.FAILED
+    assert task.status == ended_status
     return task
 
 
-def _assert_still_failed(db, task_id: int, *, state_version: int) -> None:
+def _assert_still_ended(
+    db, task_id: int, ended_status: TaskStatus, *, state_version: int
+) -> None:
     db.expire_all()
     stored = db.get(Task, task_id)
-    assert stored.status == TaskStatus.FAILED
-    assert stored.control_state == TaskControlState.FAILED.value
-    assert stored.error_message == RECOVERY_ERROR
+    assert stored.status == ended_status
+    assert stored.control_state == ended_status.value.lower()
+    if ended_status == TaskStatus.FAILED:
+        assert stored.error_message == RECOVERY_ERROR
+    else:
+        assert stored.output == FINAL_OUTPUT
+        assert stored.error_message is None
     assert stored.run_id == "live-run"
     assert stored.runner_id is None
     assert int(stored.state_version or 0) == state_version
 
 
 @pytest.mark.asyncio
-async def test_recovered_delivery_on_failed_run_settles_outcome_unknown(
+@ENDED_STATUSES
+async def test_recovered_delivery_on_ended_run_settles_outcome_unknown(
     db_session,
     recording_reply: _RecordingReply,
+    ended_status: TaskStatus,
 ) -> None:
-    owner = _user(db_session, "failed-run-owner")
-    task = _failed_task(db_session, int(owner.id))
+    owner = _user(db_session, f"ended-run-owner-{ended_status.value}")
+    task = _ended_task(db_session, int(owner.id), ended_status)
     task_id = int(task.id)
     state_version = int(task.state_version or 0)
     _pending_row(db_session, task, int(owner.id))
@@ -177,26 +222,28 @@ async def test_recovered_delivery_on_failed_run_settles_outcome_unknown(
     background_manager.try_reserve_resume.assert_not_called()
     assert _row_status(db_session, task_id) == DELIVERY_DISPATCHED
     assert len(_user_rows(db_session, task_id)) == 1
-    _assert_still_failed(db_session, task_id, state_version=state_version)
+    _assert_still_ended(db_session, task_id, ended_status, state_version=state_version)
     _assert_outcome_unknown_frames(recording_reply)
     publish.assert_not_awaited()
 
 
 @pytest.mark.asyncio
+@ENDED_STATUSES
 @pytest.mark.parametrize("fence", ["pre_check", "conditional_update"])
-async def test_task_failed_after_routing_snapshot_is_caught_by_the_transition(
+async def test_run_ended_after_routing_snapshot_is_caught_by_the_transition(
     db_session,
     recording_reply: _RecordingReply,
     fence: str,
+    ended_status: TaskStatus,
 ) -> None:
-    """Recovery commits FAILED after the handler routed on a RUNNING row.
+    """The run ends after the handler routed on a RUNNING row.
 
     ``pre_check`` lands it before the transition loads the row;
     ``conditional_update`` lands it after the load, so only the UPDATE's own
     status predicate can refuse it.
     """
 
-    owner = _user(db_session, f"transition-race-{fence}")
+    owner = _user(db_session, f"transition-race-{fence}-{ended_status.value}")
     task = _expired_running_task(db_session, int(owner.id))
     task_id = int(task.id)
     _pending_row(db_session, task, int(owner.id))
@@ -205,7 +252,7 @@ async def test_task_failed_after_routing_snapshot_is_caught_by_the_transition(
         real_sync = controller_module.transition_task_control_state_sync
 
         def recover_then_transition(*args: Any, **kwargs: Any):
-            _recover_to_failed(task_id)
+            _end_run(task_id, ended_status)
             return real_sync(*args, **kwargs)
 
         race = patch.object(
@@ -218,7 +265,7 @@ async def test_task_failed_after_routing_snapshot_is_caught_by_the_transition(
 
         def recover_then_apply(task_row: Task, *args: Any, **kwargs: Any):
             assert task_row.status == TaskStatus.RUNNING
-            _recover_to_failed(task_id)
+            _end_run(task_id, ended_status)
             return real_apply(task_row, *args, **kwargs)
 
         race = patch.object(
@@ -240,26 +287,28 @@ async def test_task_failed_after_routing_snapshot_is_caught_by_the_transition(
         task_execution_service.execute_resume_background.assert_not_called()
 
     assert raced.call_count == 1
-    assert raced.call_args.kwargs["refused_statuses"] == (TaskStatus.FAILED,)
+    assert raced.call_args.kwargs["refused_statuses"] == NON_RESUMABLE_STATUSES
     assert result == _outcome_unknown_result(task)
     background_manager.release_resume_reservation.assert_called_with(task_id)
     background_manager.register_reserved_resume.assert_not_called()
     assert _row_status(db_session, task_id) == DELIVERY_DISPATCHED
     db_session.expire_all()
-    recovered_version = int(db_session.get(Task, task_id).state_version or 0)
-    _assert_still_failed(db_session, task_id, state_version=recovered_version)
+    ended_version = int(db_session.get(Task, task_id).state_version or 0)
+    _assert_still_ended(db_session, task_id, ended_status, state_version=ended_version)
     _assert_outcome_unknown_frames(recording_reply)
     agent.post_user_message.assert_not_awaited()
 
 
 @pytest.mark.asyncio
-async def test_task_failed_after_the_transition_is_caught_by_the_lease_claim(
+@ENDED_STATUSES
+async def test_run_ended_after_the_transition_is_caught_by_the_lease_claim(
     db_session,
     recording_reply: _RecordingReply,
+    ended_status: TaskStatus,
 ) -> None:
-    """Recovery commits FAILED after RESUME_REQUESTED, before the claim."""
+    """The run ends after RESUME_REQUESTED, before the resume claims it."""
 
-    owner = _user(db_session, "claim-race-owner")
+    owner = _user(db_session, f"claim-race-owner-{ended_status.value}")
     task = _expired_running_task(db_session, int(owner.id))
     task_id = int(task.id)
     _pending_row(db_session, task, int(owner.id))
@@ -267,7 +316,7 @@ async def test_task_failed_after_the_transition_is_caught_by_the_lease_claim(
 
     def transition_then_recover(*args: Any, **kwargs: Any):
         snapshot = real_sync(*args, **kwargs)
-        _recover_to_failed(task_id)
+        _end_run(task_id, ended_status)
         return snapshot
 
     agent = MagicMock()
@@ -300,7 +349,7 @@ async def test_task_failed_after_the_transition_is_caught_by_the_lease_claim(
             # still pending when the command read it.
             first = None
         assert resume_spy.await_count == 1
-        assert resume_spy.await_args.kwargs["refuse_failed_status"] is True
+        assert resume_spy.await_args.kwargs["refuse_terminal_status"] is True
         for _ in range(200):
             if task_id not in background_manager.running_tasks:
                 break
@@ -321,18 +370,20 @@ async def test_task_failed_after_the_transition_is_caught_by_the_lease_claim(
     agent.post_user_message.assert_not_awaited()
     assert _row_status(db_session, task_id) == DELIVERY_OUTCOME_UNKNOWN
     db_session.expire_all()
-    recovered_version = int(db_session.get(Task, task_id).state_version or 0)
-    _assert_still_failed(db_session, task_id, state_version=recovered_version)
+    ended_version = int(db_session.get(Task, task_id).state_version or 0)
+    _assert_still_ended(db_session, task_id, ended_status, state_version=ended_version)
     if first is None:
         _assert_outcome_unknown_frames(recording_reply)
 
 
 @pytest.mark.asyncio
-async def test_fresh_message_on_failed_task_still_appends_a_new_run(
+@ENDED_STATUSES
+async def test_fresh_message_on_ended_task_still_appends_a_new_run(
     db_session,
+    ended_status: TaskStatus,
 ) -> None:
-    owner = _user(db_session, "fresh-append-owner")
-    task = _failed_task(db_session, int(owner.id))
+    owner = _user(db_session, f"fresh-append-owner-{ended_status.value}")
+    task = _ended_task(db_session, int(owner.id), ended_status)
     task_id = int(task.id)
 
     begin_turn = AsyncMock(wraps=TaskTurnOrchestrator.begin_turn)
@@ -363,12 +414,14 @@ async def test_fresh_message_on_failed_task_still_appends_a_new_run(
 
 
 @pytest.mark.asyncio
-async def test_same_id_resend_after_failed_run_refusal_reports_outcome_unknown(
+@ENDED_STATUSES
+async def test_same_id_resend_after_ended_run_refusal_reports_outcome_unknown(
     db_session,
     recording_reply: _RecordingReply,
+    ended_status: TaskStatus,
 ) -> None:
-    owner = _user(db_session, "failed-resend-owner")
-    task = _failed_task(db_session, int(owner.id))
+    owner = _user(db_session, f"ended-resend-owner-{ended_status.value}")
+    task = _ended_task(db_session, int(owner.id), ended_status)
     task_id = int(task.id)
     _pending_row(db_session, task, int(owner.id))
     command = _message_command(task, owner, TURN_ID, attempt_count=2)
@@ -400,9 +453,12 @@ async def test_same_id_resend_after_failed_run_refusal_reports_outcome_unknown(
     }
 
 
-def test_refused_status_transition_leaves_the_row_untouched(db_session) -> None:
-    owner = _user(db_session, "transition-unit-owner")
-    task = _failed_task(db_session, int(owner.id))
+@ENDED_STATUSES
+def test_refused_status_transition_leaves_the_row_untouched(
+    db_session, ended_status: TaskStatus
+) -> None:
+    owner = _user(db_session, f"transition-unit-owner-{ended_status.value}")
+    task = _ended_task(db_session, int(owner.id), ended_status)
     task_id = int(task.id)
     state_version = int(task.state_version or 0)
 
@@ -411,11 +467,11 @@ def test_refused_status_transition_leaves_the_row_untouched(db_session) -> None:
             task,
             TaskControlState.RESUME_REQUESTED,
             expected_run_id="live-run",
-            refused_statuses=(TaskStatus.FAILED,),
+            refused_statuses=NON_RESUMABLE_STATUSES,
         )
-    assert exc_info.value.status == TaskStatus.FAILED
+    assert exc_info.value.status == ended_status
     db_session.rollback()
-    _assert_still_failed(db_session, task_id, state_version=state_version)
+    _assert_still_ended(db_session, task_id, ended_status, state_version=state_version)
 
     # A stale run is still reported as a stale run, not as a status refusal.
     task = db_session.get(Task, task_id)
@@ -427,15 +483,18 @@ def test_refused_status_transition_leaves_the_row_untouched(db_session) -> None:
             task,
             TaskControlState.RESUME_REQUESTED,
             expected_run_id="another-run",
-            refused_statuses=(TaskStatus.FAILED,),
+            refused_statuses=NON_RESUMABLE_STATUSES,
         )
     assert not isinstance(stale_info.value, TaskStatusRefusedError)
 
 
+@ENDED_STATUSES
 @pytest.mark.parametrize("refuse", [False, True])
-def test_resume_lease_claim_status_fence_is_opt_in(db_session, refuse: bool) -> None:
-    owner = _user(db_session, f"claim-unit-owner-{refuse}")
-    task = _failed_task(db_session, int(owner.id))
+def test_resume_lease_claim_status_fence_is_opt_in(
+    db_session, refuse: bool, ended_status: TaskStatus
+) -> None:
+    owner = _user(db_session, f"claim-unit-owner-{refuse}-{ended_status.value}")
+    task = _ended_task(db_session, int(owner.id), ended_status)
     task_id = int(task.id)
     state_version = int(task.state_version or 0)
     refused: list[bool] = []
@@ -444,14 +503,16 @@ def test_resume_lease_claim_status_fence_is_opt_in(db_session, refuse: bool) -> 
         task_id,
         int(owner.id),
         "live-run",
-        refuse_failed_status=refuse,
+        refuse_terminal_status=refuse,
         status_refused_out=refused,
     )
 
     if refuse:
         assert lease is None
         assert refused == [True]
-        _assert_still_failed(db_session, task_id, state_version=state_version)
+        _assert_still_ended(
+            db_session, task_id, ended_status, state_version=state_version
+        )
     else:
         # Every other resume caller keeps the claim it had.
         assert lease is not None
@@ -473,9 +534,66 @@ def test_resume_lease_claim_refused_by_a_live_owner_is_not_a_status_refusal(
         int(task.id),
         int(owner.id),
         "live-run",
-        refuse_failed_status=True,
+        refuse_terminal_status=True,
         status_refused_out=refused,
     )
 
     assert lease is None
     assert refused == []
+
+
+@pytest.mark.asyncio
+async def test_recovered_delivery_on_completed_run_is_never_resumed(
+    db_session,
+    recording_reply: _RecordingReply,
+) -> None:
+    """Regression for the probe that reproduced the COMPLETED hole.
+
+    Before the fix the retry deferred as "waiting for runtime injection",
+    handed the turn to ``execute_resume_background`` under the finished run,
+    left the task ``completed / resume_requested``, and the resume claim then
+    flipped COMPLETED back to RUNNING.
+    """
+
+    owner = _user(db_session, "completed-probe-owner")
+    task = _settled_task(
+        db_session, int(owner.id), status=TaskStatus.COMPLETED, run_id="live-run"
+    )
+    task.output = FINAL_OUTPUT
+    db_session.commit()
+    task_id = int(task.id)
+    state_version = int(task.state_version or 0)
+    _pending_row(db_session, task, int(owner.id))
+
+    with _live_control_environment(outcome=ResumeReservationOutcome.RESERVED):
+        result = await execute_durable_task_command(
+            _message_command(task, owner, TURN_ID, attempt_count=2)
+        )
+        task_execution_service.execute_resume_background.assert_not_called()
+
+    assert result == _outcome_unknown_result(task)
+    assert _row_status(db_session, task_id) == DELIVERY_DISPATCHED
+    _assert_outcome_unknown_frames(recording_reply)
+    db_session.expire_all()
+    stored = db_session.get(Task, task_id)
+    assert stored.status == TaskStatus.COMPLETED
+    assert stored.control_state == TaskControlState.COMPLETED.value
+    assert stored.output == FINAL_OUTPUT
+    assert stored.run_id == "live-run"
+    assert int(stored.state_version or 0) == state_version
+
+    # Even a resume handed this run anyway cannot claim it.
+    refused: list[bool] = []
+    assert (
+        task_execution_service._acquire_resume_task_lease(
+            task_id,
+            int(owner.id),
+            "live-run",
+            refuse_terminal_status=True,
+            status_refused_out=refused,
+        )
+        is None
+    )
+    assert refused == [True]
+    db_session.expire_all()
+    assert db_session.get(Task, task_id).status == TaskStatus.COMPLETED

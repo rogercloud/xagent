@@ -53,12 +53,21 @@ class StaleTaskStateVersionError(StaleTaskRunError):
     """
 
 
+# Statuses a recovered message delivery must never resume its original run
+# out of: the run ended for good (settled FAILED by recovery, or finished).
+# A fresh message still reaches such a task through APPEND as a new run.
+NON_RESUMABLE_STATUSES: tuple[TaskStatus, ...] = (
+    TaskStatus.FAILED,
+    TaskStatus.COMPLETED,
+)
+
+
 class TaskStatusRefusedError(RuntimeError):
     """The row holds a status the caller asked this transition to refuse.
 
     Not a stale-run error: the run may still match. A caller opts in with
     ``refused_statuses`` when the target state must never be entered from
-    that status (a recovered message must not resume a FAILED run), and the
+    that status (a recovered message must not resume an ended run), and the
     refusal is part of the same conditional UPDATE, so a status committed
     after the caller's snapshot is still caught.
     """

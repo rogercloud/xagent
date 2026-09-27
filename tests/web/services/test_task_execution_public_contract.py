@@ -99,9 +99,9 @@ EXPECTED_RESUME_PARAMETERS: list[tuple[str, Any]] = [
     # should start passing it once it has an authoritative row to read.
     ("trusted_task_source", None),
     # Appended for the same reason: set only by the first-party handler for
-    # a recovered delivery, so its lease claim refuses a FAILED row. The
-    # default keeps every other caller's claim unchanged.
-    ("refuse_failed_status", False),
+    # a recovered delivery, so its lease claim refuses a FAILED or COMPLETED
+    # row. The default keeps every other caller's claim unchanged.
+    ("refuse_terminal_status", False),
 ]
 
 EXPECTED_EXECUTE_PARAMETERS: list[tuple[str, Any]] = [

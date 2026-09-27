@@ -138,6 +138,7 @@ from .mcp_runtime import (
     MCPBuiltinOAuthActorPolicy,
 )
 from .task_execution_controller import (
+    NON_RESUMABLE_STATUSES,
     TaskControlSnapshot,
     TaskControlState,
     apply_task_control_transition,
@@ -2269,7 +2270,7 @@ def _acquire_resume_task_lease(
     expected_run_id: str | None,
     *,
     prior_status_out: list[TaskStatus] | None = None,
-    refuse_failed_status: bool = False,
+    refuse_terminal_status: bool = False,
     status_refused_out: list[bool] | None = None,
 ) -> TaskLease | None:
     """Validate and claim a resume lease in one worker transaction.
@@ -2282,12 +2283,12 @@ def _acquire_resume_task_lease(
     function is called through ``acquire_task_lease_cancellation_safe``,
     whose acquire/cleanup pair is typed for a bare ``TaskLease``.
 
-    ``refuse_failed_status`` adds ``status != FAILED`` to the claim UPDATE,
-    so a task that recovery settled FAILED after the caller's snapshot is
+    ``refuse_terminal_status`` adds ``status NOT IN (FAILED, COMPLETED)`` to
+    the claim UPDATE, so a run that ended after the caller's snapshot is
     never flipped back to RUNNING. When the claim is refused and the row is
-    FAILED or on another run -- the fenced run is not resumable either way
-    -- ``status_refused_out`` receives ``True``; a refusal by a live owner
-    of the same run leaves it empty.
+    in one of those statuses or on another run -- the fenced run is not
+    resumable either way -- ``status_refused_out`` receives ``True``; a
+    refusal by a live owner of the same run leaves it empty.
     """
     SessionLocal = get_session_local()
     with SessionLocal() as db:
@@ -2310,18 +2311,19 @@ def _acquire_resume_task_lease(
             task_id,
             expected_run_id=expected_run_id,
             claim_predicates=(
-                (task_status_predicate.ne(TaskStatus.FAILED),)
-                if refuse_failed_status
+                (task_status_predicate.not_in(NON_RESUMABLE_STATUSES),)
+                if refuse_terminal_status
                 else ()
             ),
         )
         if lease is None:
-            if refuse_failed_status and status_refused_out is not None:
+            if refuse_terminal_status and status_refused_out is not None:
                 current = db.execute(
                     select(Task.status, Task.run_id).where(Task.id == task_id)
                 ).first()
                 if current is not None and (
-                    current[0] == TaskStatus.FAILED or current[1] != expected_run_id
+                    current[0] in NON_RESUMABLE_STATUSES
+                    or current[1] != expected_run_id
                 ):
                     status_refused_out.append(True)
             db.commit()
@@ -2614,9 +2616,10 @@ async def execute_resume_background(
     trusted_task_source: str | None = None,
     # Appended for the same reason. True for a recovered delivery (a retried
     # command whose pending row an earlier attempt claimed): its run must
-    # never be resumed out of FAILED, so the lease claim refuses that status
-    # atomically and the delivery settles as outcome unknown instead.
-    refuse_failed_status: bool = False,
+    # never be resumed once it ended (FAILED or COMPLETED), so the lease claim
+    # refuses those statuses atomically and the delivery settles as outcome
+    # unknown instead.
+    refuse_terminal_status: bool = False,
 ) -> None:
     """Resume an agent execution after an interrupt/user-message checkpoint.
 
@@ -2820,7 +2823,7 @@ async def execute_resume_background(
                     task_owner_user_id,
                     expected_run_id,
                     prior_status_out=prior_status_box,
-                    refuse_failed_status=refuse_failed_status,
+                    refuse_terminal_status=refuse_terminal_status,
                     status_refused_out=status_refused_box,
                 ),
                 lambda acquired: _settle_resumed_task_lease(
@@ -2831,8 +2834,8 @@ async def execute_resume_background(
             if prior_status_box:
                 resume_prior_status = prior_status_box[0]
             if lease is None and status_refused_box:
-                # The run this recovered delivery targeted was settled FAILED
-                # (or replaced) after the handoff. It is not resumed, and an
+                # The run this recovered delivery targeted ended (FAILED or
+                # COMPLETED) or was replaced after the handoff. It is not resumed, and an
                 # earlier attempt may already have applied the turn, so the
                 # row records outcome unknown -- never failed, which would
                 # invite a resend. The retried command answers the sender

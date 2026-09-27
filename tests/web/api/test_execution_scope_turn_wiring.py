@@ -1408,7 +1408,7 @@ def _fake_acquire_with_prior_status(lease: TaskLease, prior_status: TaskStatus):
         expected_run_id_arg: str | None,
         *,
         prior_status_out: list[Any] | None = None,
-        refuse_failed_status: bool = False,
+        refuse_terminal_status: bool = False,
         status_refused_out: list[bool] | None = None,
     ) -> TaskLease:
         if prior_status_out is not None:

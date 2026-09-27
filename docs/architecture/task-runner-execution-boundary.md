@@ -156,15 +156,17 @@ same way instead of failing on the unique index.
 
 A recovered claim on the command's own run is redriven through a resume even
 when the task is no longer live, so that a paused run replays the `turn_id`.
-A run that lease recovery settled FAILED is never resumed that way: the retry
-settles the same outcome-unknown answer and the task keeps its FAILED status,
-control state, run and diagnostic. The routing snapshot can be stale, so the
+A run that has ended -- settled FAILED by lease recovery, or COMPLETED by its
+runner -- is never resumed that way: the retry settles the same
+outcome-unknown answer and the task keeps its terminal status, control state,
+run, diagnostic and result. The routing snapshot can be stale, so the
 `resume_requested` transition and the resume lease claim for a recovered
-claim each refuse a FAILED row in their own conditional UPDATE. A refusal at
-the transition advances the row to `dispatched` like the case above; one at
-the lease claim happens after the command handed off, so it records the row
-as `outcome_unknown`, from which the retried command gives the same answer.
-A fresh message to a FAILED task still opens a new run through APPEND.
+claim each refuse a FAILED or COMPLETED row in their own conditional UPDATE.
+A refusal at the transition advances the row to `dispatched` like the case
+above; one at the lease claim happens after the command handed off, so it
+records the row as `outcome_unknown`, from which the retried command gives
+the same answer. A fresh message to a FAILED or COMPLETED task still opens a
+new run through APPEND.
 
 Rows that no owner can settle any more are reconciled by lease recovery,
 which never redrives the turn. Recovering an expired lease advances that

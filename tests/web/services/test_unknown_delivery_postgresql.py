@@ -17,7 +17,7 @@ from typing import Iterator
 from unittest.mock import AsyncMock, patch
 
 import pytest
-from sqlalchemy import text
+from sqlalchemy import text, update
 from sqlalchemy.orm import Session, sessionmaker
 
 from tests.shared.postgres_disposable import disposable_database_factory
@@ -405,7 +405,7 @@ def test_resume_lease_claim_waits_on_recovery_and_refuses_failed_pg(
                 task_id,
                 int(owner.id),
                 "run-claim-fence",
-                refuse_failed_status=True,
+                refuse_terminal_status=True,
                 status_refused_out=refused,
             )
             _wait_until_blocked_on_a_lock(pg_sessions)
@@ -421,3 +421,54 @@ def test_resume_lease_claim_waits_on_recovery_and_refuses_failed_pg(
         assert stored.status == TaskStatus.FAILED
         assert stored.runner_id is None
         assert stored.error_message == "not recoverable"
+
+
+def test_resume_lease_claim_waits_on_completion_and_refuses_completed_pg(
+    pg_sessions: sessionmaker[Session],
+    db_session: Session,
+) -> None:
+    """The run's own finalizer commits COMPLETED while the claim waits."""
+
+    owner = _user(db_session, "pg-claim-completed")
+    task = _expired_task(db_session, int(owner.id), suffix="claim-completed")
+    task_id = int(task.id)
+    refused: list[bool] = []
+
+    finishing = pg_sessions()
+    try:
+        # The finalizer's terminal write, holding the task row lock.
+        finishing.execute(
+            update(Task)
+            .where(Task.id == task_id)
+            .values(
+                status=TaskStatus.COMPLETED,
+                control_state=TaskControlState.COMPLETED.value,
+                runner_id=None,
+                lease_expires_at=None,
+                output="final answer",
+                state_version=Task.state_version + 1,
+            )
+        )
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            claim = pool.submit(
+                _acquire_resume_task_lease,
+                task_id,
+                int(owner.id),
+                "run-claim-completed",
+                refuse_terminal_status=True,
+                status_refused_out=refused,
+            )
+            _wait_until_blocked_on_a_lock(pg_sessions)
+            finishing.commit()
+            assert claim.result(timeout=_BLOCKED_SECONDS) is None
+    finally:
+        finishing.rollback()
+        finishing.close()
+
+    assert refused == [True]
+    with pg_sessions() as db:
+        stored = db.get(Task, task_id)
+        assert stored.status == TaskStatus.COMPLETED
+        assert stored.control_state == TaskControlState.COMPLETED.value
+        assert stored.output == "final answer"
+        assert stored.runner_id is None
