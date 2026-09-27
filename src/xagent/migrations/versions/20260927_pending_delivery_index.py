@@ -11,6 +11,26 @@ index scoped to that one value stays small regardless of table growth.
 per-task equality lookup both call sites use, and created_at backs the
 sweep's additional "created_at < created_before" filter over the same rows.
 
+On PostgreSQL, ``CREATE INDEX`` alone takes a SHARE lock that blocks writes
+to the table for as long as the build runs -- unacceptable on the hot
+``task_chat_messages`` table, which every user turn and every recovery sweep
+tick writes to. This mirrors 20260725_add_task_lease_recovery_index.py:
+build the index with ``CONCURRENTLY`` outside the migration's own
+transaction (``autocommit_block()``), detect and rebuild a leftover
+``INVALID`` index from an interrupted prior attempt (Postgres marks a
+concurrent build that failed partway as invalid rather than rolling it back),
+and keep the operation idempotent so a re-run of the migration is safe.
+Non-PostgreSQL dialects (SQLite in tests, the only other dialect this app
+runs on) keep the plain, transactional ``CREATE INDEX`` path.
+
+Accepted cost: a partial index whose predicate reads ``delivery_status``
+disables Postgres's HOT (heap-only tuple) update optimization for any row
+whose ``delivery_status`` changes, because the index must be maintained
+whenever the predicate's outcome could change. In practice this means one
+extra non-HOT update per user turn -- the write that flips a row from
+``pending`` to ``dispatched`` or its terminal state -- which is exactly the
+row the index exists to make cheap to find in the first place.
+
 Revision ID: 20260927_pending_delivery_index
 Revises: 20260916_durable_create_operations
 Create Date: 2026-09-27
@@ -37,44 +57,151 @@ INDEX_COLUMNS = ("task_id", "created_at")
 REQUIRED_COLUMNS = (*INDEX_COLUMNS, "delivery_status")
 PREDICATE = sa.text("delivery_status = 'pending'")
 
+POSTGRES_INDEX_VALIDITY_SQL = sa.text(
+    """
+    SELECT i.indisvalid
+    FROM pg_catalog.pg_index AS i
+    WHERE i.indexrelid = pg_catalog.to_regclass(:index_name)
+    """
+)
 
-def _columns() -> set[str]:
-    inspector = sa.inspect(op.get_bind())
+
+def _inspector() -> sa.Inspector:
+    return sa.inspect(op.get_bind())
+
+
+def _columns(inspector: sa.Inspector) -> set[str]:
     if TABLE not in inspector.get_table_names():
         return set()
     return {column["name"] for column in inspector.get_columns(TABLE)}
 
 
-def _indexes() -> set[str]:
-    inspector = sa.inspect(op.get_bind())
+def _indexes(inspector: sa.Inspector) -> set[str]:
     if TABLE not in inspector.get_table_names():
         return set()
-    return {index["name"] for index in inspector.get_indexes(TABLE)}
+    return {
+        name
+        for item in inspector.get_indexes(TABLE)
+        if (name := item.get("name")) is not None
+    }
+
+
+def _index_columns(inspector: sa.Inspector, index_name: str) -> tuple[str, ...] | None:
+    if TABLE not in inspector.get_table_names():
+        return None
+    for item in inspector.get_indexes(TABLE):
+        if item.get("name") == index_name:
+            return tuple(str(name) for name in item.get("column_names") or ())
+    return None
+
+
+def _postgres_index_validity() -> bool | None:
+    """Return whether the current-schema index exists and is usable."""
+
+    return (
+        op.get_bind()
+        .execute(
+            POSTGRES_INDEX_VALIDITY_SQL,
+            {"index_name": INDEX},
+        )
+        .scalar_one_or_none()
+    )
+
+
+def _upgrade_postgresql() -> None:
+    """Build the pending-delivery index without blocking table writes."""
+
+    inspector = _inspector()
+    if not set(REQUIRED_COLUMNS) <= _columns(inspector):
+        return
+
+    validity = _postgres_index_validity()
+    existing_columns = _index_columns(inspector, INDEX)
+    if validity is True and existing_columns == INDEX_COLUMNS:
+        return
+
+    with op.get_context().autocommit_block():
+        if validity is not None or existing_columns is not None:
+            op.drop_index(
+                INDEX,
+                table_name=TABLE,
+                if_exists=True,
+                postgresql_concurrently=True,
+            )
+        op.create_index(
+            INDEX,
+            TABLE,
+            list(INDEX_COLUMNS),
+            if_not_exists=True,
+            postgresql_concurrently=True,
+            postgresql_where=PREDICATE,
+        )
 
 
 def upgrade() -> None:
-    columns = _columns()
-    if not columns:
+    context = op.get_context()
+    if context.as_sql:
+        if context.dialect.name == "postgresql":
+            with context.autocommit_block():
+                op.create_index(
+                    INDEX,
+                    TABLE,
+                    list(INDEX_COLUMNS),
+                    postgresql_concurrently=True,
+                    postgresql_where=PREDICATE,
+                )
+        elif context.dialect.name == "sqlite":
+            op.create_index(INDEX, TABLE, list(INDEX_COLUMNS), sqlite_where=PREDICATE)
+        else:
+            op.create_index(INDEX, TABLE, list(INDEX_COLUMNS))
         return
+
+    if context.dialect.name == "postgresql":
+        _upgrade_postgresql()
+        return
+
+    inspector = _inspector()
     # A database whose task_chat_messages predates one of these columns (an
     # Alembic-only install stopped short of the migration that added it, or a
     # legacy fixture in a test) cannot support this predicate or these index
     # columns yet; skip rather than fail the whole chain, matching the
     # guard-clause convention 20260922_task_last_activity_at.py and
     # 20260710_add_chat_message_delivery_state.py use for the same table.
-    if not set(REQUIRED_COLUMNS) <= columns:
+    if not set(REQUIRED_COLUMNS) <= _columns(inspector):
         return
-    if INDEX in _indexes():
+    if INDEX in _indexes(inspector):
         return
-    dialect = op.get_bind().dialect.name
     kwargs: dict[str, object] = {}
-    if dialect == "sqlite":
+    if context.dialect.name == "sqlite":
         kwargs["sqlite_where"] = PREDICATE
-    elif dialect == "postgresql":
-        kwargs["postgresql_where"] = PREDICATE
     op.create_index(INDEX, TABLE, list(INDEX_COLUMNS), **kwargs)
 
 
 def downgrade() -> None:
-    if INDEX in _indexes():
+    context = op.get_context()
+    is_postgresql = context.dialect.name == "postgresql"
+    if context.as_sql:
+        if is_postgresql:
+            with context.autocommit_block():
+                op.drop_index(
+                    INDEX,
+                    table_name=TABLE,
+                    postgresql_concurrently=True,
+                )
+        else:
+            op.drop_index(INDEX, table_name=TABLE)
+        return
+
+    if is_postgresql:
+        with context.autocommit_block():
+            op.drop_index(
+                INDEX,
+                table_name=TABLE,
+                if_exists=True,
+                postgresql_concurrently=True,
+            )
+        return
+
+    inspector = _inspector()
+    if INDEX in _indexes(inspector):
         op.drop_index(INDEX, table_name=TABLE)
