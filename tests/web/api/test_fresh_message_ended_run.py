@@ -580,6 +580,51 @@ async def test_handler_withdrawal_that_raises_settles_by_the_row_left_behind(
     _assert_started_a_new_turn(db_session, task_id, begin_turn)
 
 
+@pytest.mark.asyncio
+@ENDED_STATUSES
+async def test_waiting_run_ending_under_the_version_fence_still_appends(
+    db_session,
+    recording_reply: _RecordingReply,
+    begin_turn_spy: AsyncMock,
+    ended_status: TaskStatus,
+) -> None:
+    """A row routed as not RUNNING is also fenced on its state version.
+
+    The run's ending write bumps that version, but the terminal status is
+    checked first, so the refusal is the status one: the message is appended,
+    not deferred as a moved row.
+    """
+
+    owner = _user(db_session, f"fresh-waiting-ended-{ended_status.value}")
+    task = _expired_running_task(db_session, int(owner.id))
+    task.status = TaskStatus.WAITING_FOR_USER
+    task.control_state = TaskControlState.WAITING_FOR_USER.value
+    db_session.commit()
+    task_id = int(task.id)
+    real_sync = controller_module.transition_task_control_state_sync
+
+    def end_then_transition(*args: Any, **kwargs: Any):
+        _end_run_directly(task_id, ended_status)
+        return real_sync(*args, **kwargs)
+
+    with (
+        _live_control_environment(outcome=ResumeReservationOutcome.RESERVED),
+        patch.object(
+            controller_module,
+            "transition_task_control_state_sync",
+            side_effect=end_then_transition,
+        ) as raced,
+    ):
+        result = await _run_command(db_session, task, owner)
+        task_execution_service.execute_resume_background.assert_not_called()
+
+    assert raced.call_args.kwargs["expected_state_version"] is not None
+    assert raced.call_args.kwargs["refuse_terminal_status"] is True
+    assert result == _accepted_result(task_id)
+    _assert_started_a_new_turn(db_session, task_id, begin_turn_spy)
+    assert _no_outcome_unknown(recording_reply)
+
+
 # --- the lease claim refuses: the resume withdraws, the retry appends -----
 
 
