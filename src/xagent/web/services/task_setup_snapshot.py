@@ -195,6 +195,7 @@ def load_task_reconstruction_snapshot_sync(
     if uses_execution_events(session, task_id):
         from sqlalchemy import select
 
+        from ...core.agent.checkpoint import CheckpointCorruptError
         from ..models.task_execution_event import TaskExecutionEvent
         from .task_execution_event_recovery import event_checkpoint_data
 
@@ -214,11 +215,16 @@ def load_task_reconstruction_snapshot_sync(
         if event is None:
             return TaskReconstructionSnapshot()
         data = event_checkpoint_data(event)
+        protocol_event_id = event.payload.get("protocol_event_id")
+        if not isinstance(protocol_event_id, str) or not protocol_event_id:
+            raise CheckpointCorruptError(
+                "Recovery state has no valid protocol event ID"
+            )
         state = data["snapshot"].get("pattern_state") or {}
         return TaskReconstructionSnapshot(
             tracer_events=(
                 {
-                    "id": event.payload["protocol_event_id"],
+                    "id": protocol_event_id,
                     "event_type": "system_update_general",
                     "task_id": str(task_id),
                     "step_id": event.payload.get("step_id"),

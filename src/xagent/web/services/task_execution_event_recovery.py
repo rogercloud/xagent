@@ -283,4 +283,7 @@ def read_event_waiting_question(
             "Waiting message uses an unsupported event version"
         )
     data = event.payload["data"]
-    return data.get("message"), (data.get("metadata") or {}).get("interactions")
+    metadata = data.get("metadata")
+    if metadata is not None and not isinstance(metadata, dict):
+        raise CheckpointCorruptError("Waiting message has invalid metadata")
+    return data.get("message"), (metadata or {}).get("interactions")

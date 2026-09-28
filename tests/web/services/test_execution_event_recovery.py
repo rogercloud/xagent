@@ -613,3 +613,91 @@ async def test_terminal_status_after_read_blocks_return_with_same_lease(
             else:
                 await store.load_committed_tool_outcome(call)
     assert checks == 2
+
+
+@pytest.mark.parametrize("metadata", [None, []])
+def test_waiting_question_rejects_malformed_persisted_metadata(canonical, metadata):
+    from xagent.web.services.task_interaction_read import (
+        get_pending_interaction_question,
+    )
+
+    factory, tid = canonical
+    with factory() as db:
+        append_fact_no_commit(
+            db,
+            task_id=tid,
+            kind="agent_message",
+            key="question",
+            payload={
+                "data": {
+                    "message": "Choose?",
+                    "expect_response": True,
+                    "metadata": metadata,
+                }
+            },
+        )
+        db.commit()
+        if metadata is None:
+            assert get_pending_interaction_question(db, db.get(Task, tid)) == (
+                "Choose?",
+                None,
+            )
+        else:
+            with pytest.raises(CheckpointCorruptError, match="invalid metadata"):
+                get_pending_interaction_question(db, db.get(Task, tid))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("protocol_id", [None, 42])
+async def test_reconstruction_requires_persisted_protocol_identity(
+    canonical, protocol_id
+):
+    from xagent.web.services.task_setup_snapshot import (
+        load_task_reconstruction_snapshot_sync,
+    )
+
+    factory, tid = canonical
+    await TraceCheckpointStore(tracer_for(tid)).save(
+        {"execution_id": str(tid), "context": {"messages": []}}
+    )
+    with factory() as db:
+        event = next(row for row in facts(db, tid) if row.kind == "recovery_state")
+        payload = dict(event.payload)
+        if protocol_id is None:
+            payload.pop("protocol_event_id")
+        else:
+            payload["protocol_event_id"] = protocol_id
+        event.payload = payload
+        db.commit()
+        with pytest.raises(CheckpointCorruptError, match="protocol event ID"):
+            load_task_reconstruction_snapshot_sync(db, tid)
+
+
+@pytest.mark.asyncio
+async def test_missing_task_protocol_anchor_never_looks_up_literal_none(
+    canonical, monkeypatch
+):
+    from xagent.web.services import task_execution_event_recovery as recovery
+    from xagent.web.services.task_interaction_anchor import resolve_interaction_anchor
+    from xagent.web.services.task_lease_service import (
+        acquire_task_lease,
+        bind_task_lease_context,
+    )
+
+    factory, tid = canonical
+    with factory() as db:
+        lease = acquire_task_lease(db, tid, new_run=True)
+    with bind_task_lease_context(lease):
+        await TraceCheckpointStore(tracer_for(tid)).save(
+            {"execution_id": str(tid), "context": {"messages": []}}
+        )
+
+    def unexpected_lookup(*args, **kwargs):
+        raise AssertionError("No protocol ID is available for lookup")
+
+    monkeypatch.setattr(recovery, "find_event_checkpoint_anchor", unexpected_lookup)
+    with factory() as db:
+        task = db.get(Task, tid)
+        assert task.last_checkpoint_trace_event_id is not None
+        task.last_checkpoint_event_id = None
+        assert resolve_interaction_anchor(db, task) is None

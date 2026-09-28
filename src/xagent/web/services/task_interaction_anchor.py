@@ -423,6 +423,9 @@ def resolve_interaction_anchor(db: Session, task: Task) -> InteractionAnchor | N
         return None
 
     if task.conversation_storage_version == 2:
+        if task.last_checkpoint_event_id is None:
+            return None
+
         from ...core.agent.checkpoint import CheckpointCorruptError
         from .task_execution_event_recovery import find_event_checkpoint_anchor
 
