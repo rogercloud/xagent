@@ -3418,14 +3418,15 @@ async def test_durable_pause_after_run_settles_before_fenced_write(
     task_id = int(task.id)
     _captured, agent, mgr, ws_manager = _patched_manager_and_agent()
 
-    def run_settles_first(*_args, **_kwargs) -> bool:
-        # The interrupt reached the run, which settled before this write,
-        # so the RUNNING-only UPDATE matches no row.
+    async def interrupt_and_settle():
+        # The interrupt reaches the run, which settles before the fenced
+        # write, so the real RUNNING-only UPDATE matches no row.
         row = db_session.get(Task, task_id)
         row.status = settled_status
         db_session.commit()
-        return False
+        return {"status": "paused"}
 
+    agent.pause_execution = AsyncMock(side_effect=interrupt_and_settle)
     message_data = {"user": owner, "_durable_ack_sent": True}
     with (
         patch(
@@ -3434,13 +3435,21 @@ async def test_durable_pause_after_run_settles_before_fenced_write(
         ),
         patch("xagent.web.api.websocket.manager", ws_manager),
         patch(
-            "xagent.web.services.task_command_execution._apply_pause_requested_isolated",
-            side_effect=run_settles_first,
-        ),
+            "xagent.web.services.task_command_execution.publish_task_event",
+            new=AsyncMock(),
+        ) as published,
     ):
         await pause_task(_make_command_reply(MagicMock()), task_id, message_data)
 
     agent.pause_execution.assert_awaited_once()
+    # Nothing is left pending: the run has already ended, so a marker would
+    # hold back messages on a later resumed run.
+    assert not task_execution_service._is_task_pause_accepted(task_id)
+    assert not [
+        call
+        for call in published.await_args_list
+        if call.args[0].get("type") == "task_pause_requested"
+    ]
     if applied:
         assert "_durable_command_error" not in message_data
     else:
