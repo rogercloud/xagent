@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import os
+import shutil
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Optional, Set
+from typing import TYPE_CHECKING, Callable, List, Optional, Set
 
 from filelock import Timeout
 from sqlalchemy import or_
@@ -16,7 +18,11 @@ from ...config import get_uploads_dir
 from ..config import get_upload_path, sanitize_path_component
 from ..kb_physical_sync import collection_physical_lock, move_collection_dir_to_trash
 from ..models.uploaded_file import UploadedFile
-from .kb_file_service import _delete_uploaded_file_if_orphaned_impl
+from .kb_file_service import (
+    KB_RETAINED_DIR,
+    _delete_uploaded_file_if_orphaned_impl,
+    find_referenced_file_ids,
+)
 from .uploaded_file_store import UploadedFileStore
 
 if TYPE_CHECKING:
@@ -125,29 +131,128 @@ def _list_collection_uploaded_file_owner_ids_impl(
     return owner_ids
 
 
+class _RetentionError(Exception):
+    """Carries a reason safe to return to API callers; the cause is only logged."""
+
+
+def _retain_referenced_files(db: Session, collection_dir: Path) -> None:
+    """Repoint referenced rows under ``collection_dir`` outside it, linking files."""
+    # Rows store the composed or the resolved spelling; the exact check below
+    # drops what SQLite's case-insensitive LIKE over-matches.
+    prefixes = (str(collection_dir) + os.sep, str(collection_dir.resolve()) + os.sep)
+    try:
+        candidates = (
+            db.query(UploadedFile)
+            .filter(
+                or_(
+                    *(
+                        UploadedFile.storage_path.startswith(p, autoescape=True)
+                        for p in prefixes
+                    )
+                )
+            )
+            .all()
+        )
+        rows = [row for row in candidates if str(row.storage_path).startswith(prefixes)]
+        referenced = (
+            find_referenced_file_ids(str(row.file_id) for row in rows)
+            if rows
+            else set()
+        )
+    except Exception as exc:
+        raise _RetentionError(
+            "Could not check which files other documents still reference."
+        ) from exc
+    kept = [row for row in rows if str(row.file_id) in referenced]
+    if not kept:
+        return
+    targets: List[tuple[UploadedFile, Path]] = []
+    copies: List[Path] = []
+    linked: List[Path] = []
+    try:
+        for row in kept:
+            source = Path(str(row.storage_path))
+            target = (
+                get_upload_path("", user_id=int(row.user_id))
+                / KB_RETAINED_DIR
+                / str(row.file_id)
+                / source.name
+            )
+            targets.append((row, target))
+            if source.is_file():
+                target.parent.mkdir(parents=True, exist_ok=True)
+                copies.append(target)
+                target.unlink(missing_ok=True)
+                try:
+                    os.link(source, target)
+                    linked.append(source)
+                except OSError:
+                    # Known ceiling: this copy blocks the event loop under the lock.
+                    shutil.copy2(source, target)
+    except Exception as exc:
+        for copy in copies:
+            copy.unlink(missing_ok=True)
+            with contextlib.suppress(OSError):
+                copy.parent.rmdir()
+        raise _RetentionError(
+            "Could not copy out files other documents still reference."
+        ) from exc
+    # Only after every copy, so a failed copy leaves the caller's session alone.
+    for row, target in targets:
+        row.storage_path = str(target)  # type: ignore[assignment]
+    try:
+        # Before the move, so a later rollback cannot point rows into the trash.
+        db.commit()
+    except Exception as exc:
+        # A failed commit may still have landed; its copies stay.
+        db.rollback()
+        raise _RetentionError("Could not commit before moving the directory.") from exc
+    # Old names go only now, so an ingest into a directory that then fails to
+    # move cannot write through them into the retained files.
+    for source in linked:
+        try:
+            source.unlink()
+        except OSError:
+            logger.warning("Kept a second name for %s", source, exc_info=True)
+
+
 def _delete_collection_physical_dir_impl(
+    db: Session,
     *,
     user_id: int,
     collection_name: str,
 ) -> CollectionPhysicalDeleteResult:
-    """Move a collection directory to trash if it exists."""
+    """Move a collection directory to trash, keeping files documents still use."""
     collection_dir: Optional[Path] = None
     try:
         collection_dir = get_upload_path(
             "", user_id=user_id, collection=collection_name
         )
-        if not collection_dir.exists() or not collection_dir.is_dir():
-            logger.debug(
-                "Collection directory does not exist (or is not a directory): %s. "
-                "This is normal for collections without physical files.",
-                collection_dir,
-            )
-            return CollectionPhysicalDeleteResult(
-                status="not_found",
-                collection_dir=collection_dir,
-            )
-
         with collection_physical_lock(collection_dir):
+            try:
+                _retain_referenced_files(db, collection_dir)
+            except _RetentionError as exc:
+                logger.warning(
+                    "Kept collection directory %s: %s",
+                    collection_dir,
+                    exc,
+                    exc_info=True,
+                )
+                return CollectionPhysicalDeleteResult(
+                    status="failed",
+                    error=f"{exc} The directory was kept",
+                    collection_dir=collection_dir,
+                )
+            if not collection_dir.exists() or not collection_dir.is_dir():
+                logger.debug(
+                    "Collection directory does not exist (or is not a directory): %s. "
+                    "This is normal for collections without physical files.",
+                    collection_dir,
+                )
+                return CollectionPhysicalDeleteResult(
+                    status="not_found",
+                    collection_dir=collection_dir,
+                )
             move_collection_dir_to_trash(
                 collection_dir,
                 get_uploads_dir(),
@@ -196,6 +301,7 @@ def _delete_collection_uploaded_files_impl(
     collection_file_ids: Set[str],
     remaining_file_ids: Set[str],
     collection_dir: Optional[Path],
+    after_commit: List[tuple[str, Callable[[], None]]],
 ) -> int:
     """Delete orphan UploadedFile rows for a collection, with legacy path fallback."""
     deleted_uploaded_files = 0
@@ -207,18 +313,24 @@ def _delete_collection_uploaded_files_impl(
             file_id=current_file_id,
             user_id=user_id,
             remaining_file_ids=remaining_file_ids,
+            after_commit=after_commit,
         ):
             deleted_uploaded_files += 1
             deleted_file_ids.add(current_file_id)
 
     if collection_dir is not None:
-        prefix = str(collection_dir.resolve()) + os.sep
-        dir_str = str(collection_dir.resolve())
+        # Rows hold the composed or the resolved path; they differ behind a symlink.
+        dirs = {str(collection_dir), str(collection_dir.resolve())}
+        prefixes = tuple(d + os.sep for d in dirs)
         query = db.query(UploadedFile).filter(
             UploadedFile.user_id == user_id,
             or_(
-                UploadedFile.storage_path.startswith(prefix),
-                UploadedFile.storage_path == dir_str,
+                UploadedFile.storage_path.in_(dirs),
+                *(
+                    # PostgreSQL's LIKE would otherwise take a backslash as an escape.
+                    UploadedFile.storage_path.startswith(p, autoescape=True)
+                    for p in prefixes
+                ),
             ),
         )
         # Exclude file_ids already deleted in the first pass to avoid double-count
@@ -226,11 +338,12 @@ def _delete_collection_uploaded_files_impl(
             query = query.filter(UploadedFile.file_id.notin_(deleted_file_ids))
         store = UploadedFileStore(db)
         for file_record in query.all():
-            store.delete(file_record, delete_local=False)
+            path = str(file_record.storage_path)
+            # SQLite's LIKE ignores ASCII case.
+            if path not in dirs and not path.startswith(prefixes):
+                continue
+            store.delete(file_record, delete_local=False, after_commit=after_commit)
             deleted_uploaded_files += 1
-
-    if deleted_uploaded_files:
-        db.commit()
 
     return deleted_uploaded_files
 
@@ -419,12 +532,19 @@ def list_collection_uploaded_file_owner_ids(
 
 
 def delete_collection_physical_dir(
+    db: Session,
     *,
     user_id: int,
     collection_name: str,
 ) -> CollectionPhysicalDeleteResult:
-    """Move a collection directory to trash if it exists."""
+    """Move a collection directory to trash, keeping files documents still use.
+
+    Rows under it that a document references are repointed outside it, their
+    local files hard-linked or copied, and ``db`` committed before the move; if
+    that fails, nothing moves.
+    """
     return _get_file_compatibility_facade().delete_collection_physical_dir(
+        db,
         user_id=user_id,
         collection_name=collection_name,
     )
@@ -437,14 +557,19 @@ def delete_collection_uploaded_files(
     collection_file_ids: Set[str],
     remaining_file_ids: Set[str],
     collection_dir: Optional[Path],
+    after_commit: List[tuple[str, Callable[[], None]]],
 ) -> int:
-    """Delete orphan UploadedFile rows for a collection, with legacy path fallback."""
+    """Delete orphan UploadedFile rows for a collection, with legacy path fallback.
+
+    Never commits; the caller commits, then runs ``after_commit``.
+    """
     return _get_file_compatibility_facade().delete_collection_uploaded_files(
         db,
         user_id=user_id,
         collection_file_ids=collection_file_ids,
         remaining_file_ids=remaining_file_ids,
         collection_dir=collection_dir,
+        after_commit=after_commit,
     )
 
 

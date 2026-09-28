@@ -81,7 +81,10 @@ from ...core.tools.core.RAG_tools.kb import (
 from ...core.tools.core.RAG_tools.kb.config_merge import (
     merge_collection_config_json,
 )
-from ...core.tools.core.RAG_tools.kb.models import RollbackFailedUploadIngestionRequest
+from ...core.tools.core.RAG_tools.kb.models import (
+    KBDocumentRowsSnapshot,
+    RollbackFailedUploadIngestionRequest,
+)
 from ...core.tools.core.RAG_tools.management.status import clear_ingestion_status
 from ...core.tools.core.RAG_tools.pipelines.web_ingestion import FileHandlerResult
 from ...core.tools.core.RAG_tools.progress import get_progress_manager
@@ -136,10 +139,10 @@ from ..services.kb_file_service import (
     delete_uploaded_file_if_orphaned as _delete_uploaded_file_if_orphaned,
 )
 from ..services.kb_file_service import (
-    get_document_record_file_id as _get_document_record_file_id,
+    find_referenced_file_ids as _find_referenced_file_ids,
 )
 from ..services.kb_file_service import (
-    list_document_records_for_file_ids as _list_document_records_for_file_ids,
+    get_document_record_file_id as _get_document_record_file_id,
 )
 from ..services.kb_file_service import (
     list_documents_for_user as _list_documents_for_user,
@@ -830,7 +833,14 @@ async def _document_existed_before_ingest(
 ) -> bool:
     if existing_file_record is None:
         return False
-    file_id = str(existing_file_record.file_id)
+    return await _document_existed_before_ingest_for_file_id(
+        collection_name, str(existing_file_record.file_id)
+    )
+
+
+async def _document_existed_before_ingest_for_file_id(
+    collection_name: str, file_id: str
+) -> bool:
     try:
         return await asyncio.to_thread(
             _file_document_registered, collection_name, file_id
@@ -1161,152 +1171,11 @@ async def _cleanup_failed_new_collection_metadata(
     collection_name: str,
     user: User,
 ) -> None:
-    """Remove config rows left behind when a brand-new collection ingest fails.
-
-    Every caller reaches here from a stale `collection_existed_before`, so the
-    documents check is the last guard before a row a sibling ingest owns is
-    deleted by name.
-    """
-    # Read as the owner, and delete as the owner too: an admin-scoped delete
-    # bypasses owner scoping entirely and would wipe a metadata row another
-    # tenant owns under the same name, which the owner-scoped read never saw.
-    if _collection_holds_documents(
+    """API compatibility wrapper for failed-ingest collection metadata cleanup."""
+    await _get_api_compatibility_facade().cleanup_failed_new_collection_metadata(
         collection_name=collection_name,
         user_id=int(user.id),
-        context="failed-ingest metadata cleanup",
-        on_error=True,
-    ):
-        logger.info(
-            "Skipping failed-ingest collection metadata cleanup for %s/user_%s "
-            "because the collection holds documents",
-            collection_name,
-            int(user.id),
-        )
-        return
-
-    cleanup_result = await _get_api_compatibility_facade().delete_collection_metadata(
-        collection_name=collection_name,
-        user_id=int(user.id),
-        is_admin=False,
-        delete_orphaned_metadata=True,
     )
-    logger.info(
-        "Cleaned failed-ingest collection metadata for %s: %s",
-        collection_name,
-        cleanup_result,
-    )
-
-
-async def _collection_config_exists(
-    *,
-    collection_name: str,
-    user_id: int,
-    context: str,
-) -> bool:
-    """Whether a config row is already published for this collection."""
-    try:
-        config = await _get_api_compatibility_facade().get_collection_config(
-            collection=collection_name,
-            user_id=user_id,
-            is_admin=False,
-        )
-    except Exception as exc:  # noqa: BLE001
-        # Unreadable state must not authorize a destructive rollback.
-        logger.warning(
-            "Failed to read the collection config of %s/user_%s during %s: %s",
-            collection_name,
-            user_id,
-            context,
-            exc,
-        )
-        return True
-    return config is not None
-
-
-async def _rollback_may_delete_collection(
-    *,
-    collection_name: str,
-    user_id: int,
-    collection_existed_before: bool,
-    other_document_present: bool,
-    context: str,
-) -> bool:
-    """Whether a failed ingest may delete the whole collection.
-
-    `collection_existed_before` is stamped when the request or job is submitted,
-    so a sibling ingest into the same new collection may have landed a document
-    or published the config since. Either one makes the delete destructive, and
-    both are re-read here rather than inferred from the stamp.
-
-    The stamp itself cannot be re-read: `initialize_collection` creates the
-    collection metadata row at step 0 of the ingest (collection_manager.py:598),
-    so by rollback time the row exists for every run and says nothing about
-    whether the collection predated this one.
-
-    Caveat: these reads are not atomic with the delete that follows, so a
-    sibling that commits inside the window is still exposed. Closing it needs a
-    per-collection lock, which the codebase does not have anywhere yet — tracked
-    in https://github.com/xorbitsai/xagent/issues/1242 rather than invented here.
-
-    Caveat: when the config read itself fails, this fails safe and a brand-new
-    zero-document collection keeps its metadata row with no config — invisible
-    to its owner and still answering 409 for the name. That row is deliberately
-    not cleaned up on this branch: the cleanup deletes this owner's config row
-    first, so on the other reading of an unreadable state — a sibling published
-    it — it would drop settings that sibling just saved.
-    """
-    if collection_existed_before or other_document_present:
-        return False
-    return not await _collection_config_exists(
-        collection_name=collection_name,
-        user_id=user_id,
-        context=context,
-    )
-
-
-def _collection_holds_documents(
-    *,
-    collection_name: str,
-    user_id: int,
-    context: str,
-    on_error: bool,
-) -> bool:
-    """Whether the collection currently holds any document.
-
-    This is the single question behind both halves of the ingest lifecycle:
-    a collection with documents must be published and must never be cleaned up,
-    an empty one must be neither. Asking the store at decision time avoids
-    trusting `collection_existed_before`, which is stamped when the request or
-    job is submitted and goes stale while a sibling ingest runs.
-
-    The two halves need opposite behaviour when the store cannot be read, so
-    `on_error` is explicit: a cleanup passes `True` (unknown state must not
-    authorize a delete), a publish passes `False` (unknown state must not make
-    a possibly empty knowledge base visible).
-
-    Reads are owner-scoped: every decision it gates acts on the caller's own
-    rows, and an admin-wide read would match rows another tenant owns.
-
-    Callers that roll back their own document must do so before asking.
-    """
-    try:
-        records = list_document_records(
-            collection_name=collection_name,
-            user_id=user_id,
-            is_admin=False,
-            max_results=1,
-        )
-    except Exception as exc:  # noqa: BLE001
-        logger.warning(
-            "Failed to list documents of %s/user_%s during %s, assuming %s: %s",
-            collection_name,
-            user_id,
-            context,
-            "documents exist" if on_error else "no documents",
-            exc,
-        )
-        return on_error
-    return bool(records)
 
 
 async def _cleanup_collection_metadata_after_failed_ingest(
@@ -1392,6 +1261,21 @@ async def _cleanup_collection_metadata_after_failed_batch_api_ingest(
     )
 
 
+def _run_after_commit(actions: List[tuple[str, Callable[[], None]]]) -> None:
+    """Run every queued byte delete, log each failure, then raise the first."""
+    first_error: Optional[Exception] = None
+    for label, action in actions:
+        try:
+            action()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "Failed to delete file bytes for %s after commit", label, exc_info=True
+            )
+            first_error = first_error or exc
+    if first_error is not None:
+        raise first_error
+
+
 async def _rollback_failed_ingestion(
     *,
     db: Session,
@@ -1423,29 +1307,21 @@ async def _rollback_failed_ingestion(
     def _compensate_file() -> None:
         if uploaded_file_existed_before:
             return
+        after_commit: List[tuple[str, Callable[[], None]]] = []
         if register_created and doc_id:
-            remaining_records = _list_document_records_for_file_ids(
-                [file_record_id],
-                user_id=user_id,
-                is_admin=bool(user.is_admin),
-            )
-            remaining_file_ids = {
-                current_file_id
-                for current_file_id in (
-                    _get_document_record_file_id(record) for record in remaining_records
-                )
-                if current_file_id
-            }
             _delete_uploaded_file_if_orphaned(
                 db,
                 file_id=file_record_id,
                 user_id=user_id,
-                remaining_file_ids=remaining_file_ids,
+                remaining_file_ids=_find_referenced_file_ids([file_record_id]),
+                after_commit=after_commit,
             )
-            db.commit()
         else:
-            UploadedFileStore(db).delete(file_record, delete_local=False)
-            db.commit()
+            UploadedFileStore(db).delete(
+                file_record, delete_local=False, after_commit=after_commit
+            )
+        db.commit()
+        _run_after_commit(after_commit)
 
     try:
         collection_records = (
@@ -1477,6 +1353,7 @@ async def _rollback_failed_ingestion(
             )
 
             physical_cleanup = delete_collection_physical_dir(
+                db,
                 user_id=user_id,
                 collection_name=collection_name,
             )
@@ -1491,27 +1368,17 @@ async def _rollback_failed_ingestion(
             own_file_ids = (
                 set() if uploaded_file_existed_before else collection_file_ids
             )
-            remaining_records = _list_document_records_for_file_ids(
-                own_file_ids,
-                user_id=user_id,
-                is_admin=bool(user.is_admin),
-            )
-            remaining_file_ids = {
-                file_id
-                for file_id in (
-                    _get_document_record_file_id(record) for record in remaining_records
-                )
-                if file_id
-            }
+            after_commit: List[tuple[str, Callable[[], None]]] = []
             delete_collection_uploaded_files(
                 db,
                 user_id=user_id,
                 collection_file_ids=own_file_ids,
-                remaining_file_ids=remaining_file_ids,
+                remaining_file_ids=_find_referenced_file_ids(own_file_ids),
                 collection_dir=None,
+                after_commit=after_commit,
             )
             if not uploaded_file_existed_before:
-                # The collection cleanup above may already delete+commit the UploadedFile
+                # The collection cleanup above may already delete the UploadedFile
                 # row, so reuse the stable file_id instead of touching a deleted ORM instance.
                 refreshed_file_record = (
                     db.query(UploadedFile)
@@ -1520,31 +1387,27 @@ async def _rollback_failed_ingestion(
                 )
                 if refreshed_file_record is not None:
                     UploadedFileStore(db).delete(
-                        refreshed_file_record, delete_local=False
+                        refreshed_file_record,
+                        delete_local=False,
+                        after_commit=after_commit,
                     )
+            db.commit()
+            _run_after_commit(after_commit)
             await _cleanup_failed_new_collection_metadata(
                 collection_name=collection_name,
                 user=user,
             )
-            db.commit()
 
-        # Compare doc_ids, not file_ids (same-path ingests share a file_id); any
-        # record but the document this run created counts as another's.
-        delete_whole_collection = await _rollback_may_delete_collection(
-            collection_name=collection_name,
-            user_id=user_id,
-            collection_existed_before=collection_existed_before,
-            other_document_present=any(
-                not register_created
-                or (
-                    record.get("doc_id")
-                    if isinstance(record, dict)
-                    else getattr(record, "doc_id", None)
-                )
-                != doc_id
-                for record in collection_records
-            ),
-            context="failed-ingest rollback",
+        delete_whole_collection = (
+            await _get_api_compatibility_facade().failed_ingest_may_delete_collection(
+                collection_name=collection_name,
+                user_id=user_id,
+                collection_existed_before=collection_existed_before,
+                collection_records=collection_records,
+                register_created=register_created,
+                doc_id=doc_id,
+                context="failed-ingest rollback",
+            )
         )
         if delete_whole_collection:
             request = RollbackFailedUploadIngestionRequest(
@@ -1611,7 +1474,7 @@ async def _rollback_failed_cloud_ingestion(
     vector_store = get_vector_index_store()
 
     def _compensate_document() -> None:
-        # Must precede FILE's records query.
+        # Must precede FILE's reference lookup.
         _rollback_ingested_document(
             collection_name=collection_name,
             result=result,
@@ -1623,26 +1486,22 @@ async def _rollback_failed_cloud_ingestion(
     def _compensate_file() -> None:
         if uploaded_file_existed_before:
             return
-        remaining_records = _list_document_records_for_file_ids(
-            [file_record_id] if file_record_id is not None else [],
-            user_id=user_id,
-            is_admin=bool(user.is_admin),
+        remaining_file_ids = _find_referenced_file_ids(
+            [file_record_id] if file_record_id is not None else []
         )
-        remaining_file_ids = {
-            current_file_id
-            for current_file_id in (
-                _get_document_record_file_id(record) for record in remaining_records
-            )
-            if current_file_id
-        }
 
         if file_record_id is not None:
+            after_commit: List[tuple[str, Callable[[], None]]] = []
             _delete_uploaded_file_if_orphaned(
                 db,
                 file_id=file_record_id,
                 user_id=user_id,
                 remaining_file_ids=remaining_file_ids,
+                after_commit=after_commit,
             )
+            # Before COLLECTION awaits: /ingest-cloud siblings share this Session.
+            db.commit()
+            _run_after_commit(after_commit)
 
     async def _compensate_collection() -> None:
         collection_records = vector_store.list_document_records(
@@ -1651,11 +1510,13 @@ async def _rollback_failed_cloud_ingestion(
             is_admin=bool(user.is_admin),
             max_results=1,
         )
-        if await _rollback_may_delete_collection(
+        if await _get_api_compatibility_facade().failed_ingest_may_delete_collection(
             collection_name=collection_name,
             user_id=user_id,
             collection_existed_before=collection_existed_before,
-            other_document_present=bool(collection_records),
+            collection_records=collection_records,
+            register_created=False,
+            doc_id=None,
             context="failed-cloud-ingest rollback",
         ):
             collection_delete_result = delete_collection(
@@ -1888,46 +1749,8 @@ def _atomic_replace_file(source_path: Path, target_path: Path) -> None:
 def _mark_uploaded_file_for_reindex(file_id: str) -> bool:
     """Clear ingestion run markers so changed file can be re-indexed."""
     try:
-        from ...core.tools.core.RAG_tools.LanceDB.schema_manager import (
-            _safe_close_table,
-            ensure_documents_table,
-            ensure_ingestion_runs_table,
-        )
-        from ...core.tools.core.RAG_tools.utils.lancedb_query_utils import query_to_list
-        from ...core.tools.core.RAG_tools.utils.string_utils import (
-            escape_lancedb_string,
-        )
-        from ...providers.vector_store.lancedb import get_connection_from_env
-
-        conn = get_connection_from_env()
-        ensure_documents_table(conn)
-        ensure_ingestion_runs_table(conn)
-        documents_table = None
-        ingestion_runs_table = None
-        try:
-            documents_table = conn.open_table("documents")
-            ingestion_runs_table = conn.open_table("ingestion_runs")
-
-            safe_file_id = escape_lancedb_string(file_id)
-            rows = query_to_list(
-                documents_table.search()
-                .where(f"file_id = '{safe_file_id}'")
-                .select(["collection", "doc_id"])
-                .limit(-1)
-            )
-            for row in rows:
-                collection = str(row.get("collection") or "").strip()
-                doc_id = str(row.get("doc_id") or "").strip()
-                if not collection or not doc_id:
-                    continue
-                safe_collection = escape_lancedb_string(collection)
-                safe_doc_id = escape_lancedb_string(doc_id)
-                ingestion_runs_table.delete(
-                    f"collection = '{safe_collection}' and doc_id = '{safe_doc_id}'"
-                )
-        finally:
-            _safe_close_table(documents_table)
-            _safe_close_table(ingestion_runs_table)
+        for collection, doc_id in _list_document_refs_for_uploaded_file(file_id):
+            clear_ingestion_status(collection, doc_id, is_admin=True)
         return True
     except Exception as exc:  # noqa: BLE001
         logger.warning(
@@ -1939,18 +1762,6 @@ def _mark_uploaded_file_for_reindex(file_id: str) -> bool:
         return False
 
 
-_INGESTION_RUN_COLUMNS = (
-    "collection",
-    "doc_id",
-    "status",
-    "message",
-    "parse_hash",
-    "created_at",
-    "updated_at",
-    "user_id",
-)
-
-
 @dataclass
 class _IngestionRunsSnapshot:
     doc_refs: List[tuple[str, str]]
@@ -1960,64 +1771,7 @@ class _IngestionRunsSnapshot:
 @dataclass
 class _RagDocumentSnapshot:
     doc_refs: List[tuple[str, str]]
-    rows_by_table: Dict[str, List[Dict[str, Any]]]
-
-
-def _ingestion_run_filter(collection: str, doc_id: str) -> str:
-    from ...core.tools.core.RAG_tools.utils.string_utils import escape_lancedb_string
-
-    safe_collection = escape_lancedb_string(collection)
-    safe_doc_id = escape_lancedb_string(doc_id)
-    return f"collection = '{safe_collection}' and doc_id = '{safe_doc_id}'"
-
-
-def _table_has_user_id_column(table: Any) -> bool:
-    schema = getattr(table, "schema", None)
-    names = getattr(schema, "names", None) or []
-    return "user_id" in names
-
-
-def _rag_document_filter(
-    table: Any,
-    *,
-    collection: str,
-    doc_id: str,
-    user_id: int,
-    is_admin: bool,
-) -> str:
-    from ...core.tools.core.RAG_tools.utils.string_utils import escape_lancedb_string
-
-    safe_collection = escape_lancedb_string(collection)
-    safe_doc_id = escape_lancedb_string(doc_id)
-    expr = f"collection = '{safe_collection}' and doc_id = '{safe_doc_id}'"
-    if not is_admin and _table_has_user_id_column(table):
-        expr = f"{expr} and user_id = {int(user_id)}"
-    return expr
-
-
-def _combine_lancedb_filters(filters: List[str]) -> str:
-    return " or ".join(f"({filter_expr})" for filter_expr in filters)
-
-
-def _rag_document_refs_filter(
-    table: Any,
-    doc_refs: List[tuple[str, str]],
-    *,
-    user_id: int,
-    is_admin: bool,
-) -> str:
-    return _combine_lancedb_filters(
-        [
-            _rag_document_filter(
-                table,
-                collection=collection,
-                doc_id=doc_id,
-                user_id=user_id,
-                is_admin=is_admin,
-            )
-            for collection, doc_id in doc_refs
-        ]
-    )
+    collections: List[KBDocumentRowsSnapshot]
 
 
 def _snapshot_rag_documents_for_uploaded_file(
@@ -2028,68 +1782,20 @@ def _snapshot_rag_documents_for_uploaded_file(
 ) -> Optional[_RagDocumentSnapshot]:
     """Snapshot RAG rows for documents associated with an UploadedFile."""
     try:
-        from ...core.tools.core.RAG_tools.LanceDB.schema_manager import (
-            _safe_close_table,
-            ensure_chunks_table,
-            ensure_documents_table,
-            ensure_ingestion_runs_table,
-            ensure_main_pointers_table,
-            ensure_parses_table,
-        )
-        from ...core.tools.core.RAG_tools.utils.lancedb_query_utils import (
-            list_table_names,
-            query_to_list,
-        )
-        from ...providers.vector_store.lancedb import get_connection_from_env
-
         doc_refs = _list_document_refs_for_uploaded_file(file_id)
-        conn = get_connection_from_env()
-        ensure_documents_table(conn)
-        ensure_parses_table(conn)
-        ensure_chunks_table(conn)
-        ensure_main_pointers_table(conn)
-        ensure_ingestion_runs_table(conn)
-
-        table_names = set(list_table_names(conn))
-        target_tables = [
-            table_name
-            for table_name in (
-                "documents",
-                "parses",
-                "chunks",
-                "main_pointers",
-                "ingestion_runs",
-            )
-            if table_name in table_names
-        ]
-        target_tables.extend(
-            sorted(name for name in table_names if name.startswith("embeddings_"))
+        doc_ids_by_collection: Dict[str, List[str]] = {}
+        for collection, doc_id in doc_refs:
+            doc_ids_by_collection.setdefault(collection, []).append(doc_id)
+        coordinator = get_kb_coordinator()
+        return _RagDocumentSnapshot(
+            doc_refs=doc_refs,
+            collections=[
+                coordinator.capture_document_rows_sync(
+                    collection, doc_ids, user_id=user_id, is_admin=is_admin
+                )
+                for collection, doc_ids in doc_ids_by_collection.items()
+            ],
         )
-
-        rows_by_table: Dict[str, List[Dict[str, Any]]] = {}
-        for table_name in target_tables:
-            table = None
-            try:
-                table = conn.open_table(table_name)
-                if doc_refs:
-                    rows = query_to_list(
-                        table.search()
-                        .where(
-                            _rag_document_refs_filter(
-                                table,
-                                doc_refs,
-                                user_id=user_id,
-                                is_admin=is_admin,
-                            )
-                        )
-                        .limit(-1)
-                    )
-                else:
-                    rows = []
-                rows_by_table[table_name] = rows
-            finally:
-                _safe_close_table(table)
-        return _RagDocumentSnapshot(doc_refs=doc_refs, rows_by_table=rows_by_table)
     except Exception as exc:  # noqa: BLE001
         logger.warning(
             "Failed to snapshot RAG document rows before web file refresh: file_id=%s, error=%s",
@@ -2100,114 +1806,6 @@ def _snapshot_rag_documents_for_uploaded_file(
         return None
 
 
-def _rag_snapshot_key_columns(table_name: str) -> Optional[tuple[str, ...]]:
-    if table_name == "documents":
-        return ("collection", "doc_id")
-    if table_name == "parses":
-        return ("collection", "doc_id", "parse_hash")
-    if table_name == "chunks":
-        return ("collection", "doc_id", "parse_hash", "chunk_id")
-    if table_name == "main_pointers":
-        return ("collection", "doc_id", "step_type", "model_tag")
-    if table_name == "ingestion_runs":
-        return ("collection", "doc_id")
-    if table_name.startswith("embeddings_"):
-        return ("collection", "doc_id", "chunk_id", "parse_hash", "model")
-    return None
-
-
-def _rag_snapshot_row_key(
-    row: Dict[str, Any], key_columns: tuple[str, ...]
-) -> tuple[Any, ...]:
-    return tuple(row.get(column) for column in key_columns)
-
-
-def _lancedb_literal(value: Any) -> str:
-    from ...core.tools.core.RAG_tools.utils.string_utils import escape_lancedb_string
-
-    if isinstance(value, bool):
-        return "true" if value else "false"
-    if isinstance(value, (int, float)) and not isinstance(value, bool):
-        return str(value)
-    return f"'{escape_lancedb_string(str(value))}'"
-
-
-def _rag_snapshot_key_filter(
-    table: Any,
-    row: Dict[str, Any],
-    key_columns: tuple[str, ...],
-    *,
-    user_id: int,
-    is_admin: bool,
-) -> str:
-    clauses = []
-    for column in key_columns:
-        value = row.get(column)
-        if value is None:
-            clauses.append(f"{column} IS NULL")
-        else:
-            clauses.append(f"{column} = {_lancedb_literal(value)}")
-    if not is_admin and _table_has_user_id_column(table):
-        clauses.append(f"user_id = {int(user_id)}")
-    return " and ".join(clauses)
-
-
-def _restore_rag_snapshot_rows(
-    table: Any,
-    *,
-    table_name: str,
-    snapshot_rows: List[Dict[str, Any]],
-    current_rows: List[Dict[str, Any]],
-    user_id: int,
-    is_admin: bool,
-) -> None:
-    """Upsert old rows before deleting stale rows introduced by a failed refresh."""
-    key_columns = _rag_snapshot_key_columns(table_name)
-    if key_columns is None:
-        delete_filters = [
-            _rag_snapshot_key_filter(
-                table,
-                row,
-                ("collection", "doc_id"),
-                user_id=user_id,
-                is_admin=is_admin,
-            )
-            for row in current_rows
-        ]
-        if delete_filters:
-            table.delete(_combine_lancedb_filters(delete_filters))
-        if snapshot_rows:
-            table.add(snapshot_rows)
-        return
-
-    if snapshot_rows:
-        (
-            table.merge_insert(list(key_columns))
-            .when_matched_update_all()
-            .when_not_matched_insert_all()
-            .execute(snapshot_rows)
-        )
-
-    snapshot_keys = {_rag_snapshot_row_key(row, key_columns) for row in snapshot_rows}
-    stale_rows = [
-        row
-        for row in current_rows
-        if _rag_snapshot_row_key(row, key_columns) not in snapshot_keys
-    ]
-    delete_filters = [
-        _rag_snapshot_key_filter(
-            table,
-            row,
-            key_columns,
-            user_id=user_id,
-            is_admin=is_admin,
-        )
-        for row in stale_rows
-    ]
-    if delete_filters:
-        table.delete(_combine_lancedb_filters(delete_filters))
-
-
 def _restore_rag_document_snapshot(
     snapshot: _RagDocumentSnapshot,
     *,
@@ -2215,116 +1813,24 @@ def _restore_rag_document_snapshot(
     is_admin: bool,
 ) -> None:
     """Restore RAG document rows after a failed refresh of an existing web file."""
-    from ...core.tools.core.RAG_tools.LanceDB.schema_manager import (
-        _safe_close_table,
-        ensure_chunks_table,
-        ensure_documents_table,
-        ensure_ingestion_runs_table,
-        ensure_main_pointers_table,
-        ensure_parses_table,
-    )
-    from ...core.tools.core.RAG_tools.utils.lancedb_query_utils import (
-        list_table_names,
-        query_to_list,
-    )
-    from ...providers.vector_store.lancedb import get_connection_from_env
-
-    vector_store = get_vector_index_store()
-    conn = get_connection_from_env()
-    ensure_documents_table(conn)
-    ensure_parses_table(conn)
-    ensure_chunks_table(conn)
-    ensure_main_pointers_table(conn)
-    ensure_ingestion_runs_table(conn)
-
-    current_table_names = set(list_table_names(conn))
-    restore_table_names = [
-        table_name
-        for table_name in (
-            "documents",
-            "parses",
-            "chunks",
-            "main_pointers",
-            "ingestion_runs",
+    coordinator = get_kb_coordinator()
+    for collection_snapshot in snapshot.collections:
+        coordinator.restore_document_rows_sync(
+            collection_snapshot, user_id=user_id, is_admin=is_admin
         )
-        if table_name in current_table_names or table_name in snapshot.rows_by_table
-    ]
-    for table_name in sorted(current_table_names):
-        if table_name.startswith("embeddings_"):
-            restore_table_names.append(table_name)
-    for table_name in snapshot.rows_by_table:
-        if (
-            table_name.startswith("embeddings_")
-            and table_name not in restore_table_names
-        ):
-            restore_table_names.append(table_name)
-
-    for table_name in restore_table_names:
-        snapshot_rows = snapshot.rows_by_table.get(table_name, [])
-        table = None
-        try:
-            table = conn.open_table(table_name)
-            if snapshot.doc_refs:
-                current_rows = query_to_list(
-                    table.search()
-                    .where(
-                        _rag_document_refs_filter(
-                            table,
-                            snapshot.doc_refs,
-                            user_id=user_id,
-                            is_admin=is_admin,
-                        )
-                    )
-                    .limit(-1)
-                )
-            else:
-                current_rows = []
-            _restore_rag_snapshot_rows(
-                table,
-                table_name=table_name,
-                snapshot_rows=snapshot_rows,
-                current_rows=current_rows,
-                user_id=user_id,
-                is_admin=is_admin,
-            )
-        finally:
-            _safe_close_table(table)
-
-    invalidate_cache = getattr(vector_store, "invalidate_table_cache", None)
-    if callable(invalidate_cache):
-        invalidate_cache()
 
 
 def _list_document_refs_for_uploaded_file(file_id: str) -> List[tuple[str, str]]:
-    from ...core.tools.core.RAG_tools.LanceDB.schema_manager import (
-        _safe_close_table,
-        ensure_documents_table,
+    records = _get_api_compatibility_facade().list_document_records_by_file_ids(
+        [file_id]
     )
-    from ...core.tools.core.RAG_tools.utils.lancedb_query_utils import query_to_list
-    from ...core.tools.core.RAG_tools.utils.string_utils import escape_lancedb_string
-    from ...providers.vector_store.lancedb import get_connection_from_env
-
-    conn = get_connection_from_env()
-    ensure_documents_table(conn)
-    documents_table = None
-    try:
-        documents_table = conn.open_table("documents")
-        safe_file_id = escape_lancedb_string(file_id)
-        rows = query_to_list(
-            documents_table.search()
-            .where(f"file_id = '{safe_file_id}'")
-            .select(["collection", "doc_id"])
-            .limit(-1)
-        )
-        doc_refs: List[tuple[str, str]] = []
-        for row in rows:
-            collection = str(row.get("collection") or "").strip()
-            doc_id = str(row.get("doc_id") or "").strip()
-            if collection and doc_id:
-                doc_refs.append((collection, doc_id))
-        return doc_refs
-    finally:
-        _safe_close_table(documents_table)
+    doc_refs: List[tuple[str, str]] = []
+    for record in records:
+        collection = (record.collection or "").strip()
+        doc_id = record.doc_id.strip()
+        if collection and doc_id:
+            doc_refs.append((collection, doc_id))
+    return doc_refs
 
 
 def _snapshot_ingestion_runs_for_uploaded_file(
@@ -2332,37 +1838,9 @@ def _snapshot_ingestion_runs_for_uploaded_file(
 ) -> Optional[_IngestionRunsSnapshot]:
     """Snapshot current ingestion status rows before refreshing an existing file."""
     try:
-        from ...core.tools.core.RAG_tools.LanceDB.schema_manager import (
-            _safe_close_table,
-            ensure_ingestion_runs_table,
-        )
-        from ...core.tools.core.RAG_tools.utils.lancedb_query_utils import query_to_list
-        from ...providers.vector_store.lancedb import get_connection_from_env
-
         doc_refs = _list_document_refs_for_uploaded_file(file_id)
-        conn = get_connection_from_env()
-        ensure_ingestion_runs_table(conn)
-        ingestion_runs_table = None
-        try:
-            ingestion_runs_table = conn.open_table("ingestion_runs")
-            if doc_refs:
-                combined_filter = _combine_lancedb_filters(
-                    [
-                        _ingestion_run_filter(collection, doc_id)
-                        for collection, doc_id in doc_refs
-                    ]
-                )
-                rows = query_to_list(
-                    ingestion_runs_table.search()
-                    .where(combined_filter)
-                    .select(list(_INGESTION_RUN_COLUMNS))
-                    .limit(-1)
-                )
-            else:
-                rows = []
-            return _IngestionRunsSnapshot(doc_refs=doc_refs, rows=rows)
-        finally:
-            _safe_close_table(ingestion_runs_table)
+        rows = _get_api_compatibility_facade().load_ingestion_status_rows(doc_refs)
+        return _IngestionRunsSnapshot(doc_refs=doc_refs, rows=rows)
     except Exception as exc:  # noqa: BLE001
         logger.warning(
             "Failed to snapshot ingestion runs before web file refresh: file_id=%s, error=%s",
@@ -2375,29 +1853,9 @@ def _snapshot_ingestion_runs_for_uploaded_file(
 
 def _restore_ingestion_runs_snapshot(snapshot: _IngestionRunsSnapshot) -> None:
     """Restore ingestion status rows after a failed existing-file refresh."""
-    from ...core.tools.core.RAG_tools.LanceDB.schema_manager import (
-        _safe_close_table,
-        ensure_ingestion_runs_table,
+    _get_api_compatibility_facade().replace_ingestion_status_rows(
+        snapshot.doc_refs, snapshot.rows
     )
-    from ...providers.vector_store.lancedb import get_connection_from_env
-
-    conn = get_connection_from_env()
-    ensure_ingestion_runs_table(conn)
-    ingestion_runs_table = None
-    try:
-        ingestion_runs_table = conn.open_table("ingestion_runs")
-        if snapshot.doc_refs:
-            combined_filter = _combine_lancedb_filters(
-                [
-                    _ingestion_run_filter(collection, doc_id)
-                    for collection, doc_id in snapshot.doc_refs
-                ]
-            )
-            ingestion_runs_table.delete(combined_filter)
-        if snapshot.rows:
-            ingestion_runs_table.add(snapshot.rows)
-    finally:
-        _safe_close_table(ingestion_runs_table)
 
 
 _UPLOADED_FILE_ROLLBACK_FIELDS = (
@@ -2777,6 +2235,8 @@ def _refresh_existing_file_if_changed(
 
     # Mark succeeded - now atomically replace the file
     backup_path = _build_ingest_backup_path(existing_path)
+    # Setup failures from here are undone in place: the coordinator only gets
+    # the compensations this handler returns, and a failed setup returns none.
     try:
         shutil.copy2(existing_path, backup_path)
     except Exception:
@@ -2928,6 +2388,8 @@ def _recreate_missing_existing_file(
         backup_path = _build_ingest_backup_path(existing_path)
         shutil.copy2(existing_path, backup_path)
 
+    # Undone in place, as in the refresh: a failed setup returns no compensations,
+    # and every restore must run even when an earlier one fails.
     try:
         _atomic_replace_file(temp_file_path, existing_path)
         file_record = _upsert_uploaded_file_record(
@@ -3349,7 +2811,7 @@ async def _save_collection_config_after_ingest(
     """
     publishes_new_collection = not collection_existed_before and (
         documents_created > 0
-        or _collection_holds_documents(
+        or _get_api_compatibility_facade().collection_holds_documents(
             collection_name=collection,
             user_id=int(user.id),
             context=context,
@@ -4177,6 +3639,8 @@ async def ingest(
             if rollback_execution.error is not None:
                 raise rollback_execution.error
         else:
+            # No file_id: no document or upload row for the coordinator to undo.
+            # The bytes are route-owned, as in _rollback_failed_ingestion.
             rollback_api_result = KBApiOperationResult(
                 result=IngestionResult(
                     status="error",
@@ -4359,6 +3823,10 @@ async def create_ingest_job(
         _cleanup_background_ingest_staging_file(staged_file_path)
         return existing_job
 
+    # Checked even without a row: the uuid5 file_id can match an earlier document.
+    document_existed_before = await _document_existed_before_ingest_for_file_id(
+        safe_collection, file_id
+    )
     generation_id = str(uuid.uuid4())
 
     job_payload = {
@@ -4375,6 +3843,7 @@ async def create_ingest_job(
         "is_admin": bool(_user.is_admin),
         "ingestion_config": config.model_dump(mode="json"),
         "collection_existed_before": collection_existed_before,
+        "document_existed_before": document_existed_before,
     }
 
     try:
@@ -6542,11 +6011,14 @@ def _perform_kb_collection_delete(
         result = delete_collection(safe_collection, user_id, is_admin)
 
         physical_cleanup_by_owner = {}
-        for owner_id in sorted(mutation_scope.owner_user_ids):
-            physical_cleanup_by_owner[owner_id] = delete_collection_physical_dir(
-                user_id=owner_id,
-                collection_name=safe_collection,
-            )
+        # An error result deleted no document, so nothing under the directory moves.
+        if result.status != "error":
+            for owner_id in sorted(mutation_scope.owner_user_ids):
+                physical_cleanup_by_owner[owner_id] = delete_collection_physical_dir(
+                    db,
+                    user_id=owner_id,
+                    collection_name=safe_collection,
+                )
 
         if result.status == "error":
             cleanup_warnings = list(result.warnings) if result.warnings else []
@@ -6581,16 +6053,11 @@ def _perform_kb_collection_delete(
                 deleted_counts=result.deleted_counts,
             )
 
-        remaining_records = _list_document_records_for_file_ids(
-            set().union(*mutation_scope.file_ids_by_owner.values()),
-            user_id=user_id,
-            is_admin=is_admin,
-        )
-        remaining_file_ids_by_owner = _group_document_file_ids_by_owner(
-            remaining_records,
-            fallback_user_id=user_id,
+        remaining_file_ids = _find_referenced_file_ids(
+            set().union(*mutation_scope.file_ids_by_owner.values())
         )
         deleted_uploaded_files = 0
+        after_commit: List[tuple[str, Callable[[], None]]] = []
         for owner_id in sorted(mutation_scope.owner_user_ids):
             physical_cleanup = physical_cleanup_by_owner[owner_id]
             physical_cleanup_status = physical_cleanup.status
@@ -6604,8 +6071,9 @@ def _perform_kb_collection_delete(
                     collection_file_ids=mutation_scope.file_ids_by_owner.get(
                         owner_id, set()
                     ),
-                    remaining_file_ids=remaining_file_ids_by_owner.get(owner_id, set()),
+                    remaining_file_ids=remaining_file_ids,
                     collection_dir=collection_dir,
+                    after_commit=after_commit,
                 )
             else:
                 logger.warning(
@@ -6616,11 +6084,19 @@ def _perform_kb_collection_delete(
                     physical_cleanup_status,
                 )
         if deleted_uploaded_files:
+            db.commit()
             logger.info(
                 "Deleted %s UploadedFile record(s) for collection %s",
                 deleted_uploaded_files,
                 safe_collection,
             )
+            try:
+                _run_after_commit(after_commit)
+            except Exception:  # noqa: BLE001
+                logger.warning(
+                    "Left file bytes behind after deleting collection %s",
+                    safe_collection,
+                )
 
         cleanup_warnings = list(result.warnings) if result.warnings else []
         cleanup_info_messages: List[str] = []
@@ -7523,18 +6999,7 @@ async def delete_document_api(
 
     if cleanup_candidate_file_ids:
         try:
-            remaining_records = _list_document_records_for_file_ids(
-                cleanup_candidate_file_ids,
-                user_id=user_id_int,
-                is_admin=bool(_user.is_admin),
-            )
-            remaining_file_ids = {
-                current_file_id
-                for current_file_id in (
-                    _get_document_record_file_id(record) for record in remaining_records
-                )
-                if current_file_id
-            }
+            remaining_file_ids = _find_referenced_file_ids(cleanup_candidate_file_ids)
         except Exception as exc:
             logger.warning(
                 "Failed to refresh remaining docs for orphan cleanup; skipping orphan cleanup for %s file(s): %s",

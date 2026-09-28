@@ -23,6 +23,7 @@ from xagent.core.tools.core.RAG_tools.core.schemas import (
     IngestionConfig,
     IngestionResult,
 )
+from xagent.core.tools.core.RAG_tools.kb import KBApiCompatibilityFacade
 from xagent.core.tools.core.RAG_tools.utils.string_utils import (
     generate_deterministic_doc_id,
 )
@@ -41,6 +42,8 @@ FULL_CHAIN = [
     "delete_document",
     "refs:['file-1']",
     "orphan",
+    "commit",
+    "bytes:orphan",
     "list:coll",
     "may_delete",
     "delete_collection",
@@ -74,11 +77,15 @@ def _install_leaves(
     collection_error: Optional[Exception] = None,
     restore_error: Optional[Exception] = None,
     refs_error: Optional[Exception] = None,
+    records: tuple[Any, ...] = (),
 ) -> Any:
+    seen: dict[str, Any] = {}
+
     class _Store:
         def list_document_records(self, *, collection_name, user_id, is_admin, **_kw):
             calls.append(f"list:{collection_name}")
-            return []
+            seen["records"] = list(records)
+            return seen["records"]
 
     def _delete_document(collection, doc_id, user_id, is_admin):
         calls.append("delete_document")
@@ -87,16 +94,18 @@ def _install_leaves(
     def _clear_status(collection, doc_id, *, user_id, is_admin):
         calls.append("clear_status")
 
-    def _orphan(db, *, file_id, user_id, remaining_file_ids):
+    def _orphan(db, *, file_id, user_id, remaining_file_ids, after_commit):
         calls.append("orphan")
+        after_commit.append((file_id, lambda: calls.append("bytes:orphan")))
 
-    def _refs(file_ids, *, user_id, is_admin):
+    def _refs(file_ids):
         calls.append(f"refs:{sorted(file_ids)}")
         if refs_error is not None:
             raise refs_error
-        return []
+        return set()
 
-    async def _may_delete(**_kwargs):
+    async def _may_delete(**kwargs):
+        seen["may_delete"] = kwargs
         calls.append("may_delete")
         return may_delete
 
@@ -119,17 +128,22 @@ def _install_leaves(
         "delete_document": _delete_document,
         "clear_ingestion_status": _clear_status,
         "_delete_uploaded_file_if_orphaned": _orphan,
-        "_list_document_records_for_file_ids": _refs,
-        "_rollback_may_delete_collection": _may_delete,
+        "_find_referenced_file_ids": _refs,
         "delete_collection": _delete_collection,
         "_cleanup_failed_new_collection_metadata": _metadata_cleanup,
         "_restore_ingest_file_backup": _restore,
     }
     for name, fake in fakes.items():
         monkeypatch.setattr(kb_module, name, fake)
+    monkeypatch.setattr(
+        KBApiCompatibilityFacade,
+        "failed_ingest_may_delete_collection",
+        staticmethod(_may_delete),
+    )
     return SimpleNamespace(
         commit=lambda: calls.append("commit"),
         rollback=lambda: calls.append("rollback"),
+        seen=seen,
     )
 
 
@@ -172,14 +186,14 @@ async def _rollback(
             {},
             False,
             True,
-            [FULL_CHAIN[0], "refs:[]", *FULL_CHAIN[3:]],
-            id="no-file-record-still-lists",
+            [FULL_CHAIN[0], "refs:[]", *FULL_CHAIN[5:]],
+            id="no-file-record-still-looks-up",
         ),
         pytest.param(
             {},
             True,
             False,
-            [*FULL_CHAIN[:5], "commit", "restore"],
+            [*FULL_CHAIN[:7], "commit", "restore"],
             id="collection-kept",
         ),
     ],
@@ -197,14 +211,31 @@ async def test_rollback_runs_leaves_in_order(
     assert calls == expected
 
 
+async def test_collection_decision_counts_every_remaining_record(monkeypatch) -> None:
+    """DOCUMENT already removed this run's document, so a record under its doc_id
+    is a same-path sibling's and must count."""
+    calls: list[str] = []
+    db = _install_leaves(
+        monkeypatch, calls, records=(SimpleNamespace(doc_id="doc-1", file_id="f-1"),)
+    )
+
+    await _rollback(db)
+
+    decision = db.seen["may_delete"]
+    assert decision["collection_records"] is db.seen["records"]
+    assert [r.doc_id for r in decision["collection_records"]] == ["doc-1"]
+    assert decision["register_created"] is False
+    assert decision["doc_id"] is None
+
+
 @pytest.mark.parametrize(
     ("result_kwargs", "expected"),
     [
-        pytest.param({}, [FULL_CHAIN[0], *FULL_CHAIN[3:]], id="registered"),
+        pytest.param({}, [FULL_CHAIN[0], *FULL_CHAIN[5:]], id="registered"),
         pytest.param(
-            {"steps": []}, ["clear_status", *FULL_CHAIN[3:]], id="unregistered"
+            {"steps": []}, ["clear_status", *FULL_CHAIN[5:]], id="unregistered"
         ),
-        pytest.param({"doc_id": None}, FULL_CHAIN[3:], id="no-doc-id"),
+        pytest.param({"doc_id": None}, FULL_CHAIN[5:], id="no-doc-id"),
     ],
 )
 async def test_pre_existing_row_skips_the_file_step(
@@ -252,7 +283,7 @@ async def test_collection_failure_rolls_back_session_and_chains_the_exception(
     assert str(info.value) == (
         f"{PREFIX}: lance down. Original ingestion error: partial failure"
     )
-    assert calls == [*FULL_CHAIN[:6], "rollback", "restore"]
+    assert calls == [*FULL_CHAIN[:8], "rollback", "restore"]
 
 
 async def test_refs_failure_stops_before_orphan_and_collection(monkeypatch) -> None:

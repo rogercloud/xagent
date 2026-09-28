@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
 from sqlalchemy import text
-from sqlalchemy.exc import DBAPIError, IntegrityError
+from sqlalchemy.exc import DBAPIError
 from sqlalchemy.orm import Session
 from sqlalchemy.sql.elements import ColumnElement
 
@@ -175,73 +175,6 @@ def inspect_user_message_delivery(
     )
 
 
-def claim_user_message_delivery(
-    db: Session,
-    task_id: int,
-    user_id: int,
-    content: str,
-    *,
-    attachments: Optional[List[Dict[str, Any]]] = None,
-    turn_id: str,
-) -> UserMessageDeliveryClaim:
-    """Atomically claim a live-control turn before dispatching it.
-
-    The unique database index is the cross-worker serializer. A concurrent
-    loser rolls back its insert and returns the winner's durable row, so only
-    the claimant may inject the message into an active runtime.
-    Event-backed claims lock the task before checking for an existing row,
-    so projection reuse cannot turn a replay into a second delivery owner.
-    """
-
-    from .task_execution_event_store import lock_task_execution_events_no_commit
-    from .task_execution_event_writer import uses_execution_events
-
-    if uses_execution_events(db, task_id):
-        lock_task_execution_events_no_commit(db, task_id)
-    existing = inspect_user_message_delivery(
-        db,
-        task_id,
-        content,
-        attachments=attachments,
-        turn_id=turn_id,
-    )
-    if existing is not None:
-        return existing
-
-    message = TaskChatMessage(
-        task_id=task_id,
-        user_id=user_id,
-        role="user",
-        content=content.strip(),
-        message_type="user_message",
-        interactions=None,
-        turn_id=turn_id,
-        delivery_status=DELIVERY_PENDING,
-        attachments=attachments,
-    )
-    message = stage_chat_message_no_commit(db, message)
-    touch_task_last_activity(db, task_id)
-    try:
-        db.commit()
-        db.refresh(message)
-        return UserMessageDeliveryClaim(
-            message=message,
-            claimed=True,
-            payload_matches=True,
-        )
-    except IntegrityError:
-        db.rollback()
-        raced = inspect_user_message_delivery(
-            db,
-            task_id,
-            content,
-            attachments=attachments,
-            turn_id=turn_id,
-        )
-        if raced is None:
-            raise
-        return raced
-
 
 def claim_user_message_delivery_no_commit(
     db: Session,
@@ -252,7 +185,14 @@ def claim_user_message_delivery_no_commit(
     attachments: Optional[List[Dict[str, Any]]] = None,
     turn_id: str,
 ) -> UserMessageDeliveryClaim:
-    """Stage a delivery claim without committing the caller's transaction."""
+    """Stage a delivery claim without committing the caller's transaction.
+
+    The unique ``(task_id, role, turn_id)`` index rejects a second row for
+    the same turn. This helper does not recover from that: a racing insert
+    raises ``IntegrityError`` on flush or commit, and the caller rolls back
+    and re-inspects the winner. Which worker may run the turn at all is
+    decided by the task lease, not by this claim.
+    """
 
     from .task_execution_event_store import lock_task_execution_events_no_commit
     from .task_execution_event_writer import uses_execution_events
@@ -384,6 +324,37 @@ def mark_user_message_delivery_sync(
         )
         db.commit()
         return transition
+
+
+def withdraw_pending_user_message_delivery_sync(task_id: int, turn_id: str) -> bool:
+    """Delete a still-pending user row its claimant never injected.
+
+    For a live-control claim whose run ended before the message reached it:
+    removing the row lets the same turn id be accepted as a new turn, which
+    inserts its own row. Only a ``pending`` row is removed, in one conditional
+    DELETE, so a row another writer already settled is left alone. The caller
+    must know the message was never written into a run; a row an earlier
+    attempt may have injected is never withdrawn.
+
+    Returns whether the row was removed.
+    """
+
+    from ..models.database import get_session_local
+
+    SessionLocal = get_session_local()
+    with SessionLocal() as db:
+        removed = (
+            db.query(TaskChatMessage)
+            .filter(
+                TaskChatMessage.task_id == task_id,
+                TaskChatMessage.role == "user",
+                TaskChatMessage.turn_id == turn_id,
+                TaskChatMessage.delivery_status == DELIVERY_PENDING,
+            )
+            .delete(synchronize_session=False)
+        )
+        db.commit()
+        return removed == 1
 
 
 def supersede_legacy_question_rows(db: Session, *, task_id: int) -> int:

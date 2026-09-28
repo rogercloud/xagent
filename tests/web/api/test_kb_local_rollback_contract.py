@@ -20,6 +20,7 @@ from fastapi.testclient import TestClient
 
 from tests.web.api import test_kb_dir as kb_dir
 from xagent.core.tools.core.RAG_tools.core.schemas import IngestionResult
+from xagent.core.tools.core.RAG_tools.kb import KBApiCompatibilityFacade
 from xagent.core.tools.core.RAG_tools.utils.string_utils import (
     generate_deterministic_doc_id,
 )
@@ -39,8 +40,10 @@ WHOLE = [
     "del_coll_files",
     "query",
     "store.delete:refreshed",
-    "metadata",
     "commit",
+    "bytes:coll",
+    "bytes:refreshed",
+    "metadata",
     "restore",
 ]
 KEPT = [
@@ -50,6 +53,7 @@ KEPT = [
     "refs:['file-1']",
     "orphan",
     "commit",
+    "bytes:orphan",
     "restore",
 ]
 SHAPES = [
@@ -108,25 +112,34 @@ def _install_leaves(
         _hit("delete_collection")
         return SimpleNamespace(status=collection_status, message="boom")
 
-    def _physdir(*, user_id, collection_name):
+    def _physdir(_db, *, user_id, collection_name):
         _hit("physdir")
         return SimpleNamespace(
             status=physdir[0], error=physdir[1], collection_dir=Path("/uploads/coll")
         )
 
     def _del_coll_files(
-        db, *, user_id, collection_file_ids, remaining_file_ids, collection_dir
+        db,
+        *,
+        user_id,
+        collection_file_ids,
+        remaining_file_ids,
+        collection_dir,
+        after_commit,
     ):
         seen["collection_file_ids"] = collection_file_ids
+        seen["remaining_file_ids"] = remaining_file_ids
         seen["collection_dir"] = collection_dir
         _hit("del_coll_files")
+        after_commit.append(("coll", lambda: _hit("bytes:coll")))
 
     class _FileStore:
         def __init__(self, db):
             pass
 
-        def delete(self, record, *, delete_local):
+        def delete(self, record, *, delete_local, after_commit):
             _hit(f"store.delete:{record.tag}")
+            after_commit.append((record.tag, lambda: _hit(f"bytes:{record.tag}")))
 
     async def _metadata(*, collection_name, user):
         _hit("metadata")
@@ -135,12 +148,14 @@ def _install_leaves(
         _hit("delete_document")
         return SimpleNamespace(status=document_status, message="boom")
 
-    def _orphan(db, *, file_id, user_id, remaining_file_ids):
+    def _orphan(db, *, file_id, user_id, remaining_file_ids, after_commit):
         _hit("orphan")
+        after_commit.append((file_id, lambda: _hit("bytes:orphan")))
 
-    def _refs(file_ids, *, user_id, is_admin):
+    def _refs(file_ids):
         _hit(f"refs:{sorted(file_ids)}")
-        return []
+        seen["refs_answer"] = set(file_ids)
+        return seen["refs_answer"]
 
     def _clear_status(collection, doc_id, *, user_id, is_admin):
         _hit("clear_status")
@@ -150,7 +165,6 @@ def _install_leaves(
 
     fakes = {
         "get_vector_index_store": _Store,
-        "_rollback_may_delete_collection": _may_delete,
         "delete_collection": _delete_collection,
         "delete_collection_physical_dir": _physdir,
         "delete_collection_uploaded_files": _del_coll_files,
@@ -158,7 +172,7 @@ def _install_leaves(
         "_cleanup_failed_new_collection_metadata": _metadata,
         "delete_document": _delete_document,
         "_delete_uploaded_file_if_orphaned": _orphan,
-        "_list_document_records_for_file_ids": _refs,
+        "_find_referenced_file_ids": _refs,
         "clear_ingestion_status": _clear_status,
         "_restore_ingest_file_backup": _restore,
         "_delete_web_rag_side_effects_for_file_id": lambda **_kw: _hit("web_cleanup"),
@@ -166,6 +180,11 @@ def _install_leaves(
     }
     for name, fake in fakes.items():
         monkeypatch.setattr(kb_module, name, fake)
+    monkeypatch.setattr(
+        KBApiCompatibilityFacade,
+        "failed_ingest_may_delete_collection",
+        staticmethod(_may_delete),
+    )
 
     class _Db:
         def query(self, _model):
@@ -223,13 +242,21 @@ async def _rollback(
         pytest.param(
             {"may_delete": True},
             {"uploaded_file_existed_before": True},
-            [c for c in WHOLE if c not in {"query", "store.delete:refreshed"}],
+            [
+                c
+                for c in WHOLE
+                if c not in {"query", "store.delete:refreshed", "bytes:refreshed"}
+            ],
             id="whole-collection-existing-upload",
         ),
         pytest.param(
             {"may_delete": True, "refreshed": False},
             {},
-            [c for c in WHOLE if c != "store.delete:refreshed"],
+            [
+                c
+                for c in WHOLE
+                if c not in {"store.delete:refreshed", "bytes:refreshed"}
+            ],
             id="whole-collection-row-gone",
         ),
         pytest.param({}, {}, KEPT, id="registered-kept"),
@@ -243,7 +270,7 @@ async def _rollback(
             {},
             {"result": _result(steps=[])},
             ["list:coll", "may_delete", "clear_status", "store.delete:passed"]
-            + ["commit", "restore"],
+            + ["commit", "bytes:passed", "restore"],
             id="unregistered-new-upload",
         ),
         pytest.param(
@@ -255,7 +282,8 @@ async def _rollback(
         pytest.param(
             {},
             {"result": _result(doc_id=None)},
-            ["list:coll", "may_delete", "store.delete:passed", "commit", "restore"],
+            ["list:coll", "may_delete", "store.delete:passed", "commit"]
+            + ["bytes:passed", "restore"],
             id="no-doc-id",
         ),
         pytest.param(
@@ -284,28 +312,24 @@ async def test_rollback_runs_leaves_in_order(
 
 
 @pytest.mark.parametrize(
-    ("records", "other_present", "file_ids"),
+    ("records", "file_ids"),
     [
-        pytest.param([], False, set(), id="empty"),
-        pytest.param(
-            [{"doc_id": "doc-1", "file_id": "f-1"}], False, {"f-1"}, id="own-doc"
-        ),
+        pytest.param([], set(), id="empty"),
+        pytest.param([{"doc_id": "doc-1", "file_id": "f-1"}], {"f-1"}, id="own-doc"),
         pytest.param(
             [{"doc_id": "other", "file_id": "file-1"}],
-            True,
             {"file-1"},
             id="sibling-sharing-the-file-id",
         ),
         pytest.param(
             [SimpleNamespace(doc_id="other", file_id="f-2")],
-            True,
             {"f-2"},
             id="object-record",
         ),
     ],
 )
 async def test_collection_decision_compares_doc_ids(
-    monkeypatch, records, other_present, file_ids
+    monkeypatch, records, file_ids
 ) -> None:
     calls: list[str] = []
     db, seen = _install_leaves(monkeypatch, calls, records=records, may_delete=True)
@@ -316,7 +340,9 @@ async def test_collection_decision_compares_doc_ids(
         "collection_name": "coll",
         "user_id": 7,
         "collection_existed_before": False,
-        "other_document_present": other_present,
+        "collection_records": records,
+        "register_created": True,
+        "doc_id": "doc-1",
         "context": "failed-ingest rollback",
     }
     assert seen["collection_file_ids"] == file_ids
@@ -344,6 +370,7 @@ async def test_whole_collection_offers_only_a_row_this_run_created(
     await _rollback(db, uploaded_file_existed_before=existed)
 
     assert seen["collection_file_ids"] == offered
+    assert seen["remaining_file_ids"] is seen["refs_answer"]
     assert seen["collection_dir"] is None
     assert f"refs:{sorted(offered)}" in calls
 
@@ -355,7 +382,7 @@ async def test_collection_existed_before_still_asks_the_decision(monkeypatch) ->
     await _rollback(db, collection_existed_before=True)
 
     assert seen["may_delete"]["collection_existed_before"] is True
-    assert seen["may_delete"]["other_document_present"] is False
+    assert seen["may_delete"]["collection_records"] == []
 
 
 @pytest.mark.parametrize(
@@ -389,7 +416,7 @@ async def test_collection_existed_before_still_asks_the_decision(monkeypatch) ->
             {},
             WHOLE[:5],
             "list down",
-            id="remaining-records",
+            id="reference-lookup",
         ),
         pytest.param(
             {
@@ -414,9 +441,16 @@ async def test_collection_existed_before_still_asks_the_decision(monkeypatch) ->
         pytest.param(
             {"may_delete": True, "raises": {"metadata": RuntimeError("meta down")}},
             {},
-            WHOLE[:9],
+            WHOLE[:12],
             "meta down",
-            id="metadata-before-commit",
+            id="metadata-after-commit",
+        ),
+        pytest.param(
+            {"may_delete": True, "raises": {"bytes:coll": OSError("object store 503")}},
+            {},
+            WHOLE[:11],
+            "object store 503",
+            id="whole-bytes-after-commit",
         ),
         pytest.param(
             {"document_status": "error"},
@@ -431,6 +465,13 @@ async def test_collection_existed_before_still_asks_the_decision(monkeypatch) ->
             KEPT[:5],
             "disk",
             id="orphan-before-commit",
+        ),
+        pytest.param(
+            {"raises": {"bytes:orphan": OSError("object store 503")}},
+            {},
+            KEPT[:7],
+            "object store 503",
+            id="bytes-after-commit",
         ),
         pytest.param(
             {"raises": {"refs:['file-1']": RuntimeError("refs down")}},

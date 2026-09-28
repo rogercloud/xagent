@@ -9,7 +9,6 @@ import pytest
 
 from xagent.core.agent import (
     Agent,
-    ContextManager,
     ExecutionContext,
     ExecutionLifecycleStatus,
     PatternRuntime,
@@ -18,14 +17,6 @@ from xagent.core.agent import registry as registry_module
 from xagent.core.agent.checkpoint import CheckpointPersistenceError
 from xagent.core.agent.registry import ExecutionRegistry
 from xagent.core.agent.runner import AgentRunner, UserMessageInjectionOutcome
-
-
-@pytest.fixture(autouse=True)
-def reset_context_manager() -> None:
-    manager = ContextManager()
-    manager._contexts.clear()  # type: ignore[attr-defined]
-    yield
-    manager._contexts.clear()  # type: ignore[attr-defined]
 
 
 @dataclass
@@ -601,7 +592,8 @@ async def test_registry_post_user_message_reports_fresh_vs_replay(
             request_interrupt=False,
         )
         assert second.outcome is UserMessageInjectionOutcome.POSTED_REPLAY
-        assert second.context is first.context
+        # The idle context was evicted, so the replay is read from the checkpoint.
+        assert second.context is not None
         return
 
     assert scenario == "conflicting_content"
