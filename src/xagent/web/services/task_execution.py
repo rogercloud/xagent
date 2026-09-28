@@ -31,6 +31,7 @@ names must keep it importable from this module.
 
 import asyncio
 import enum
+import json
 import logging
 import re
 import shutil
@@ -593,6 +594,29 @@ def _stream_timestamp(timestamp: Optional[Any] = None) -> float:
     return float(timestamp)
 
 
+def _outbound_message_business_payload(data: Dict[str, Any]) -> Dict[str, Any]:
+    """Compare a message effect without attributing a replay to its new run."""
+    metadata = dict(data.get("metadata") or {})
+    for key in ("step_id", "dag_step_id", "turn_id"):
+        metadata.pop(key, None)
+    if "tool_calls" in metadata:
+        metadata["tool_calls"] = [
+            {
+                key: value
+                for key, value in source.items()
+                if key not in {"step_id", "dag_step_id", "turn_id"}
+            }
+            for source in metadata["tool_calls"]
+        ]
+    return {
+        "message": data.get("message"),
+        "message_type": data.get("message_type"),
+        "expect_response": data.get("expect_response"),
+        "visible": data.get("visible"),
+        "metadata": metadata,
+    }
+
+
 def _persist_agent_outbound_event(
     task_id: int, event: Dict[str, Any], *, authoritative: bool = False
 ) -> None:
@@ -602,6 +626,7 @@ def _persist_agent_outbound_event(
     from ..models.task import TraceEvent as DatabaseTraceEvent
     from .chat_history_service import persist_assistant_message_no_commit
 
+    execution_event_id: str | None = None
     db_gen = get_db()
     db = next(db_gen)
     try:
@@ -641,18 +666,68 @@ def _persist_agent_outbound_event(
         ):
             raise TaskLeaseLostError("Outbound event producer lost its task lease")
         if authoritative:
-            from .task_execution_event_store import lock_task_execution_events_no_commit
+            from ..models.task_execution_event import TaskExecutionEvent
+            from .task_execution_event_store import (
+                ExecutionEventConflict,
+                lock_task_execution_events_no_commit,
+            )
             from .task_execution_event_writer import append_fact_no_commit
 
             lock_task_execution_events_no_commit(db, task_id)
             task = db.get(DatabaseTask, task_id)
             assert task is not None
+            metadata = data.get("metadata") or {}
+            sources = metadata.get("tool_calls") or [metadata]
+            if all(source.get("tool_attempt_id") for source in sources):
+                existing = (
+                    db.query(TaskExecutionEvent)
+                    .filter(
+                        TaskExecutionEvent.task_id == task_id,
+                        TaskExecutionEvent.scope_id == "root",
+                        TaskExecutionEvent.idempotency_key
+                        == f"outbound:{trace_event.event_id}",
+                    )
+                    .first()
+                )
+                if existing is not None:
+                    original_payload = cast(Dict[str, Any], existing.payload)
+                    if existing.kind != trace_event.event_type or (
+                        json.dumps(
+                            _outbound_message_business_payload(
+                                original_payload["data"]
+                            ),
+                            sort_keys=True,
+                        )
+                        != json.dumps(
+                            _outbound_message_business_payload(data), sort_keys=True
+                        )
+                    ):
+                        raise ExecutionEventConflict(
+                            "Tool message identity identifies a different message"
+                        )
+                    # The fact and its projections committed together. Reuse
+                    # the envelope, but permit retransmission after a crash
+                    # between commit and broadcast. Do not execute a new send.
+                    event.clear()
+                    event.update(
+                        create_stream_event(
+                            str(existing.kind),
+                            task_id,
+                            original_payload["data"],
+                            timestamp=existing.occurred_at,
+                            event_id=original_payload["protocol_event_id"],
+                        )
+                    )
+                    db.commit()
+                    return
             fact = append_fact_no_commit(
                 db,
                 task_id=task_id,
                 kind=str(trace_event.event_type),
                 key=f"outbound:{trace_event.event_id}",
                 run_id=cast(str | None, task.run_id),
+                assistant_message_id=metadata.get("assistant_message_id"),
+                tool_attempt_id=metadata.get("tool_attempt_id"),
                 payload={"data": data, "protocol_event_id": trace_event.event_id},
                 occurred_at=event_time,
             )
@@ -660,7 +735,29 @@ def _persist_agent_outbound_event(
             if trace_event.event_type.startswith("final_answer_"):
                 db.commit()
                 return
-        db.add(trace_event)
+            execution_event_id = cast(str, fact.event_id)
+            data = cast(Dict[str, Any], fact.payload)["data"]
+            setattr(trace_event, "timestamp", fact.occurred_at)
+            # Protocol replay retains the original envelope as well as the
+            # same chat projection. The task lock serializes both lookups.
+            event.update(
+                create_stream_event(
+                    str(fact.kind),
+                    task_id,
+                    data,
+                    timestamp=fact.occurred_at,
+                    event_id=cast(Dict[str, Any], fact.payload)["protocol_event_id"],
+                )
+            )
+        if not authoritative or not (
+            db.query(DatabaseTraceEvent.id)
+            .filter(
+                DatabaseTraceEvent.task_id == task_id,
+                DatabaseTraceEvent.event_id == trace_event.event_id,
+            )
+            .first()
+        ):
+            db.add(trace_event)
 
         if bool(data.get("expect_response")):
             task = db.query(DatabaseTask).filter(DatabaseTask.id == task_id).first()
@@ -682,6 +779,7 @@ def _persist_agent_outbound_event(
                     message_type="question",
                     interactions=interactions,
                     source_event_id=str(trace_event.event_id),
+                    execution_event_id=execution_event_id,
                 )
 
         db.commit()
@@ -733,7 +831,7 @@ def _reconcile_streamed_final_answer(task_id: int, content: str) -> str:
 def make_agent_outbound_handler(task_id: int, *, authoritative: bool = False) -> Any:
     """Create a web bridge for agent agent-to-user messages."""
 
-    async def handle_outbound_message(payload: Dict[str, Any]) -> None:
+    async def handle_outbound_message(payload: Dict[str, Any]) -> Dict[str, Any] | None:
         payload_type = str(payload.get("type") or "")
         if payload_type in {
             "final_answer_start",
@@ -760,10 +858,10 @@ def make_agent_outbound_handler(task_id: int, *, authoritative: bool = False) ->
                     )
                 )
             await publish_task_event(final_answer_event, task_id)
-            return
+            return None
 
         if payload.get("visible") is False:
-            return
+            return None
 
         event_type = _agent_outbound_event_type(payload)
         event = create_stream_event(
@@ -788,6 +886,7 @@ def make_agent_outbound_handler(task_id: int, *, authoritative: bool = False) ->
             )
         )
         await publish_task_event(event, task_id)
+        return cast(Dict[str, Any], event["data"]) if authoritative else None
 
     return handle_outbound_message
 

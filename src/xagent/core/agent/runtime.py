@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import json
 import logging
 from collections.abc import Mapping
 from contextlib import nullcontext
 from dataclasses import dataclass, field
 from typing import Any, Callable
-from uuid import uuid4
+from uuid import NAMESPACE_URL, uuid4, uuid5
 
 from ...config import COMPACT_THRESHOLD_DEFAULT
 from ..agent.trace import (
@@ -995,14 +996,32 @@ class PatternRuntime:
             "visible": visible,
             "metadata": outbound_metadata,
         }
-        if expect_response or message_type == "question":
+        sources = outbound_metadata.get("tool_calls") or [outbound_metadata]
+        attempts = [source.get("tool_attempt_id") for source in sources]
+        if all(attempts):
+            # One direct message per control attempt; aggregated questions are
+            # a distinct effect of an ordered set of tool attempts. Neither
+            # current run/step nor message text defines occurrence identity.
+            purpose = (
+                "tool-question" if "tool_calls" in outbound_metadata else "tool-message"
+            )
+            payload["event_id"] = str(
+                uuid5(NAMESPACE_URL, json.dumps([purpose, attempts]))
+            )
+        elif expect_response or message_type == "question":
             payload["event_id"] = str(uuid4())
         if step_id:
             payload["step_id"] = str(step_id)
         self.outbound_messages.append(payload)
 
         if self.outbound_message_handler is not None:
-            await self._maybe_await(self.outbound_message_handler(payload))
+            committed = self.outbound_message_handler(payload)
+            if inspect.isawaitable(committed):
+                committed = await committed
+            if all(attempts) and isinstance(committed, dict):
+                # A replay returns the original committed message, including
+                # its source attribution, for waiting-state reconstruction.
+                payload.update(committed)
         elif expect_response or message_type == "question":
             # A dropped question parks the run waiting for a reply that can
             # never arrive, so this is worth a warning.

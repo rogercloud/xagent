@@ -175,7 +175,6 @@ def inspect_user_message_delivery(
     )
 
 
-
 def claim_user_message_delivery_no_commit(
     db: Session,
     task_id: int,
@@ -191,7 +190,8 @@ def claim_user_message_delivery_no_commit(
     the same turn. This helper does not recover from that: a racing insert
     raises ``IntegrityError`` on flush or commit, and the caller rolls back
     and re-inspects the winner. Which worker may run the turn at all is
-    decided by the task lease, not by this claim.
+    decided by the task lease, not by this claim. Event-backed claims lock
+    the task before the lookup so a reused projection is not a new claimant.
     """
 
     from .task_execution_event_store import lock_task_execution_events_no_commit
@@ -711,8 +711,19 @@ def persist_assistant_message_no_commit(
     turn_id: Optional[str] = None,
     content_is_reconciled: bool = False,
     source_event_id: Optional[str] = None,
+    execution_event_id: Optional[str] = None,
 ) -> Optional[TaskChatMessage]:
     """Stage an assistant transcript row for an atomic caller-owned commit."""
+
+    # The outbound writer holds the task lock and already recorded this fact.
+    if execution_event_id is not None:
+        existing = (
+            db.query(TaskChatMessage)
+            .filter(TaskChatMessage.execution_event_id == execution_event_id)
+            .first()
+        )
+        if existing is not None:
+            return existing
 
     reconciled_content = (
         content
@@ -740,8 +751,12 @@ def persist_assistant_message_no_commit(
         turn_id=turn_id,
         attachments=None,
         source_event_id=source_event_id,
+        execution_event_id=execution_event_id,
     )
-    message = stage_chat_message_no_commit(db, message)
+    if execution_event_id is not None:
+        db.add(message)
+    else:
+        message = stage_chat_message_no_commit(db, message)
     touch_task_last_activity(db, task_id)
     return message
 

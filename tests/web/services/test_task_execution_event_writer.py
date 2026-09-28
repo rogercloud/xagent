@@ -602,11 +602,12 @@ async def test_outbound_question_preserves_source_identity_in_atomic_projection(
         }
     )
     with factory() as db:
+        assert len(facts(db, task_id)) == 1
         row = db.query(TaskChatMessage).one()
         assert row.source_event_id == "question-event"
-        event = next(e for e in facts(db, task_id) if e.kind == "assistant_message")
+        event = next(e for e in facts(db, task_id) if e.kind == "agent_message")
         assert row.execution_event_id == event.event_id
-        assert event.payload["source_event_id"] == "question-event"
+        assert event.payload["protocol_event_id"] == "question-event"
         assert db.query(TraceEvent).one().event_id == "question-event"
 
 
@@ -644,15 +645,11 @@ def test_repeated_resting_settlements_keep_distinct_facts_in_same_run(
         assert db.get(Task, task_id).runner_id is None
 
 
-@pytest.mark.parametrize("committing", [False, True])
-def test_racing_message_claim_has_only_one_delivery_owner(
-    canonical, engine, committing
-):
+def test_racing_message_claim_has_only_one_delivery_owner(canonical, engine):
     from concurrent.futures import ThreadPoolExecutor
     from threading import Event, current_thread
 
     from xagent.web.services.chat_history_service import (
-        claim_user_message_delivery,
         claim_user_message_delivery_no_commit,
     )
 
@@ -683,11 +680,9 @@ def test_racing_message_claim_has_only_one_delivery_owner(
 
             def second_claim():
                 with factory() as db:
-                    claim = (
-                        claim_user_message_delivery
-                        if committing
-                        else claim_user_message_delivery_no_commit
-                    )(db, task_id, user_id, "one input", turn_id="same-turn")
+                    claim = claim_user_message_delivery_no_commit(
+                        db, task_id, user_id, "one input", turn_id="same-turn"
+                    )
                     result = claim.claimed, claim.payload_matches
                     db.commit()
                     return result
@@ -838,3 +833,87 @@ def test_trace_fact_and_command_acceptance_do_not_deadlock(canonical, engine):
     finally:
         sa.event.remove(engine, "after_cursor_execute", after_execute)
         sa.event.remove(engine, "before_cursor_execute", before_execute)
+
+
+def test_withdrawn_input_reuses_acceptance_when_handed_to_new_run(canonical):
+    from xagent.web.services.chat_history_service import (
+        claim_user_message_delivery_no_commit,
+        withdraw_pending_user_message_delivery_sync,
+    )
+
+    factory, tid = canonical
+    with factory() as db:
+        task = db.get(Task, tid)
+        task.run_id = "ended-run"
+        claim = claim_user_message_delivery_no_commit(
+            db, tid, task.user_id, "new input", turn_id="turn"
+        )
+        assert claim.claimed
+        db.commit()
+        event_id = claim.message.execution_event_id
+        user_id = task.user_id
+    assert withdraw_pending_user_message_delivery_sync(tid, "turn")
+    with factory() as db:
+        db.get(Task, tid).run_id = "new-run"
+        row = persist_user_message_no_commit(
+            db, tid, user_id, "new input", turn_id="turn", delivery_status="pending"
+        )
+        db.commit()
+        assert row.execution_event_id == event_id
+        assert len(facts(db, tid)) == 1
+        assert facts(db, tid)[0].run_id == "ended-run"
+        assert db.query(TaskChatMessage).count() == 1
+
+
+def test_orphan_delivery_fact_and_projection_are_atomic(canonical, monkeypatch):
+    from xagent.web.services import task_execution_event_writer as writer
+    from xagent.web.services.task_lease_recovery import (
+        reconcile_orphaned_pending_deliveries_no_commit,
+    )
+    from xagent.web.services.task_lease_service import utc_now
+
+    factory, tid = canonical
+    with factory() as db:
+        task = db.get(Task, tid)
+        task.status = TaskStatus.COMPLETED
+        persist_user_message_no_commit(
+            db,
+            tid,
+            task.user_id,
+            "pending input",
+            turn_id="turn",
+            delivery_status="pending",
+        )
+        db.commit()
+        original = writer.stage_delivery_fact_no_commit
+
+        def fail_after_fact(*args, **kwargs):
+            original(*args, **kwargs)
+            raise OSError("failed transaction")
+
+        with monkeypatch.context() as failure:
+            failure.setattr(writer, "stage_delivery_fact_no_commit", fail_after_fact)
+            with pytest.raises(OSError):
+                reconcile_orphaned_pending_deliveries_no_commit(
+                    db, now=utc_now(), task_id=tid
+                )
+            db.rollback()
+        assert db.query(TaskChatMessage).one().delivery_status == "pending"
+        assert len(facts(db, tid)) == 1
+        assert (
+            reconcile_orphaned_pending_deliveries_no_commit(
+                db, now=utc_now(), task_id=tid
+            )
+            == 1
+        )
+        db.commit()
+        db.expire_all()
+        assert db.query(TaskChatMessage).one().delivery_status == "dispatched"
+        assert facts(db, tid)[-1].payload == {"status": "dispatched"}
+        assert (
+            reconcile_orphaned_pending_deliveries_no_commit(
+                db, now=utc_now(), task_id=tid
+            )
+            == 0
+        )
+        assert len(facts(db, tid)) == 2

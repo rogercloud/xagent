@@ -17,7 +17,10 @@ from sqlalchemy.orm import Session
 from ..models.chat_message import TaskChatMessage
 from ..models.task import Task, TaskStatus
 from ..models.task_execution_event import TaskExecutionEvent
-from .task_execution_event_store import append_task_execution_event_no_commit
+from .task_execution_event_store import (
+    append_task_execution_event_no_commit,
+    lock_task_execution_events_no_commit,
+)
 
 
 def uses_execution_events(db: Session, task_id: int) -> bool:
@@ -76,6 +79,7 @@ def stage_chat_message_no_commit(
     if not uses_execution_events(db, int(message.task_id)):
         db.add(message)
         return message
+    lock_task_execution_events_no_commit(db, int(message.task_id))
     task = cast(Any, db.get(Task, message.task_id))
     turn_id = cast(str | None, message.turn_id)
     if message.role == "user" and not turn_id:
@@ -101,13 +105,26 @@ def stage_chat_message_no_commit(
         "delivery_status": message.delivery_status,
         "source_event_id": message.source_event_id,
     }
+    # A fresh input can be withdrawn before injection and handed to a new run.
+    # Acceptance is still the same occurrence; retain its original provenance.
+    run_id = cast(str | None, task.run_id)
+    if message.role == "user":
+        original = db.scalar(
+            select(TaskExecutionEvent).where(
+                TaskExecutionEvent.task_id == message.task_id,
+                TaskExecutionEvent.scope_id == "root",
+                TaskExecutionEvent.idempotency_key == f"message:{identity}",
+            )
+        )
+        if original is not None:
+            run_id = cast(str | None, original.run_id)
     event = append_fact_no_commit(
         db,
         task_id=int(message.task_id),
         kind="input_accepted" if message.role == "user" else "assistant_message",
         key=f"message:{identity}",
         payload=payload,
-        run_id=cast(str | None, task.run_id),
+        run_id=run_id,
         turn_id=turn_id,
     )
     # Reuse the committed envelope, including an empty attachments list and the

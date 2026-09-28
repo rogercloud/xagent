@@ -3817,7 +3817,13 @@ class ReActPattern(AgentPattern):
             "tool_call_id": tool_call["id"],
             "tool_name": tool_call["name"],
         }
-        for key in ("step_id", "dag_step_id", "turn_id"):
+        for key in (
+            "step_id",
+            "dag_step_id",
+            "turn_id",
+            "assistant_message_id",
+            "tool_attempt_id",
+        ):
             if tool_call.get(key):
                 source[key] = tool_call[key]
         return source
