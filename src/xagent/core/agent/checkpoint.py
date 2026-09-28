@@ -3,7 +3,7 @@ from __future__ import annotations
 import inspect
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, cast
 
 from .trace import TraceAction, TraceCategory, TraceEventType, Tracer, TraceScope
 
@@ -185,6 +185,14 @@ class TraceCheckpointStore:
     @property
     def records_execution_events(self) -> bool:
         return getattr(self.tracer, "records_execution_events", False) is True
+
+    async def load_committed_tool_outcome(
+        self, tool_call: dict[str, Any]
+    ) -> dict[str, Any] | None:
+        return cast(
+            dict[str, Any] | None,
+            await self.tracer.load_committed_tool_outcome(tool_call),
+        )
 
     async def checkpoint(self, **payload: Any) -> str | None:
         return await self.save(payload)

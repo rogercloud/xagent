@@ -508,6 +508,36 @@ def resolve_checkpoint_recovery(
     resolution instead of failing the candidate outright.
     """
 
+    from .task_execution_event_writer import uses_execution_events
+
+    if uses_execution_events(db, candidate.task_id):
+        from ...core.agent.checkpoint import (
+            CheckpointAccessRefusedError,
+            CheckpointCorruptError,
+            CheckpointUnavailableError,
+        )
+        from .task_execution_event_recovery import read_event_checkpoint
+
+        if candidate.run_id is None:
+            return CheckpointRecoveryVerdict.NOT_RECOVERABLE
+        try:
+            data = read_event_checkpoint(
+                db,
+                task_id=candidate.task_id,
+                scope_id="root",
+                execution_id=str(candidate.task_id),
+                run_id=candidate.run_id,
+            )
+        except (CheckpointCorruptError, CheckpointAccessRefusedError):
+            return CheckpointRecoveryVerdict.NOT_RECOVERABLE
+        except CheckpointUnavailableError:
+            return CheckpointRecoveryVerdict.INDETERMINATE
+        return (
+            CheckpointRecoveryVerdict.RECOVERABLE
+            if data is not None
+            else CheckpointRecoveryVerdict.NOT_RECOVERABLE
+        )
+
     if candidate.last_checkpoint_trace_event_id is not None:
         row = db.get(TraceEvent, candidate.last_checkpoint_trace_event_id)
         if row is not None:

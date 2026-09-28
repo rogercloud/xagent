@@ -190,6 +190,47 @@ def load_task_reconstruction_snapshot_sync(
     task_id: int,
 ) -> TaskReconstructionSnapshot:
     """Load and decode reconstruction rows before the worker Session closes."""
+    from .task_execution_event_writer import uses_execution_events
+
+    if uses_execution_events(session, task_id):
+        from sqlalchemy import select
+
+        from ..models.task_execution_event import TaskExecutionEvent
+        from .task_execution_event_recovery import event_checkpoint_data
+
+        # AgentService.reconstruct_from_history currently only restores the task
+        # id. Keep its history-presence gate event-backed; actual execution state
+        # is selected under the runner's partition and lease by the reader.
+        event = session.scalar(
+            select(TaskExecutionEvent)
+            .where(
+                TaskExecutionEvent.task_id == task_id,
+                TaskExecutionEvent.scope_id == "root",
+                TaskExecutionEvent.kind == "recovery_state",
+            )
+            .order_by(TaskExecutionEvent.sequence.desc())
+            .limit(1)
+        )
+        if event is None:
+            return TaskReconstructionSnapshot()
+        data = event_checkpoint_data(event)
+        state = data["snapshot"].get("pattern_state") or {}
+        return TaskReconstructionSnapshot(
+            tracer_events=(
+                {
+                    "id": event.payload["protocol_event_id"],
+                    "event_type": "system_update_general",
+                    "task_id": str(task_id),
+                    "step_id": event.payload.get("step_id"),
+                    "timestamp": event.occurred_at.timestamp(),
+                    "data": deepcopy(data),
+                    "parent_id": event.payload.get("parent_event_id"),
+                },
+            ),
+            plan_state=deepcopy(state.get("plan")),
+            has_history=True,
+        )
+
     from .trace_message_storage import decode_trace_events_data
 
     trace_rows = (
