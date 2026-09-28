@@ -3229,6 +3229,22 @@ def _apply_pause_requested_isolated(
         return False
 
 
+def _task_rests_paused_on_run_isolated(task_id: int, run_id: str | None) -> bool:
+    """Whether the task row is PAUSED on exactly ``run_id``."""
+
+    if run_id is None:
+        return False
+    SessionLocal = get_session_local()
+    with SessionLocal() as db:
+        current = db.query(Task.run_id, Task.status).filter(Task.id == task_id).first()
+    return (
+        current is not None
+        and current[1] == TaskStatus.PAUSED
+        and current[0] is not None
+        and str(current[0]) == run_id
+    )
+
+
 def _pause_retry_found_its_run_paused(
     status: TaskStatus, run_id: str | None, message_data: dict
 ) -> bool:
@@ -3396,6 +3412,20 @@ async def pause_task(reply: CommandReply, task_id: int, message_data: dict) -> N
                     owner_leases=owner_leases,
                 )
             )
+            if not pause_applied and await run_db_io_cancellation_safe(
+                lambda: _task_rests_paused_on_run_isolated(task_id, expected_run_id)
+            ):
+                # The interrupt above reached the live run, and the run settled
+                # PAUSED before the fenced write ran, so the write found no
+                # RUNNING row. The pause took effect; that settlement already
+                # published the durable PAUSED ``task_info``.
+                logger.info(
+                    "Task %s run %s paused before its pause request was "
+                    "recorded; pause command settles as applied",
+                    task_id,
+                    expected_run_id,
+                )
+                return
             if not pause_applied:
                 message_data["_durable_command_error"] = (
                     "Task finished before the pause request was applied"
