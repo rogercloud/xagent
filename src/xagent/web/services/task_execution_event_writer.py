@@ -213,6 +213,12 @@ def compact_transcript_event_watermark(
 
     This positions only the transcript prefix, not all runtime/tool facts
     before that sequence. Keep the legacy metadata unchanged for old readers.
+
+    Every root V2 transcript row must reference its execution event. Bypassing
+    the fact-backed writers breaks this invariant: an unresolved watermark
+    propagates as ExecutionEventPersistenceError and fails the current run at
+    compaction, not just this write. Stage 3.3-C must carry event-native coverage
+    through model setup and compaction to remove this transitional lookup.
     """
     summary = data.get(COMPACT_SUMMARY_METADATA_KEY)
     watermark = data.get(COMPACT_WATERMARK_METADATA_KEY)
