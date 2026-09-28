@@ -301,6 +301,9 @@ def recover_task_lease_candidate_no_commit(
         )
     db.expire_all()
     task = db.query(Task).filter(Task.id == candidate.task_id).one()
+    from .task_execution_event_writer import stage_result_fact_no_commit
+
+    stage_result_fact_no_commit(db, task, {"error": task_error})
     sync_workforce_run_status(db, task, next_status)
     sync_trigger_run_status(
         db,

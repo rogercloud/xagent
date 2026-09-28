@@ -1055,6 +1055,8 @@ class DatabaseTraceHandler(BaseTraceHandler):
             else:
                 with observe_duration("xagent.trace.database.serialization.duration"):
                     data = self._serialize_data_for_json(event.data or {})
+            if prepared is None and event_type_str in _REDACTED_TOOL_EVENT_TYPES:
+                data = redact_runtime_sensitive_payload(data)
             if self.authoritative:
                 from .task_execution_event_store import (
                     lock_task_execution_events_no_commit,
@@ -1177,8 +1179,6 @@ class DatabaseTraceHandler(BaseTraceHandler):
                             return
                         raise RuntimeError(f"Task {self.task_id} no longer exists")
                     raise RuntimeError("Trace event producer lost its task lease")
-            if prepared is None and event_type_str in _REDACTED_TOOL_EVENT_TYPES:
-                data = redact_runtime_sensitive_payload(data)
             if self._is_duplicate_user_message_turn(db, event_type_str, data):
                 logger.debug(
                     "Skipping duplicate user_message turn_id=%s for task %s",

@@ -39,6 +39,9 @@ task_id = task_id_fixture
 
 @pytest.fixture
 def canonical(engine, task_id, monkeypatch):
+    # Use this fixture's session factory, not a prior test's global async engine.
+    # The runtime compatibility test below supplies both backends explicitly.
+    monkeypatch.setenv("XAGENT_ASYNC_TRACE_DB_ENABLED", "false")
     factory = sessionmaker(engine)
     with factory() as db:
         task = db.get(Task, task_id)
@@ -917,3 +920,91 @@ def test_orphan_delivery_fact_and_projection_are_atomic(canonical, monkeypatch):
             == 0
         )
         assert len(facts(db, tid)) == 2
+
+
+@pytest.mark.parametrize("with_checkpoint", [False, True])
+def test_expired_lease_outcome_fact_and_task_are_atomic(
+    canonical, monkeypatch, with_checkpoint
+):
+    from datetime import timedelta
+
+    from xagent.core.agent.checkpoint import CHECKPOINT_TYPE
+    from xagent.web.services import task_execution_event_writer as writer
+    from xagent.web.services.task_lease_recovery import (
+        TASK_LEASE_EXPIRED_ERROR,
+        recover_task_lease_candidate_no_commit,
+    )
+    from xagent.web.services.task_lease_service import (
+        TASK_RUN_ID_TRACE_FIELD,
+        get_expired_task_lease_candidates,
+        utc_now,
+    )
+
+    factory, tid = canonical
+    with factory() as db:
+        task = db.get(Task, tid)
+        task.status = TaskStatus.RUNNING
+        task.control_state = "running"
+        task.run_id = "expired-run"
+        task.runner_id = "dead-runner"
+        task.lease_expires_at = utc_now() - timedelta(seconds=5)
+        if with_checkpoint:
+            db.add(
+                TraceEvent(
+                    task_id=tid,
+                    event_id="expired-checkpoint",
+                    event_type="system_update_general",
+                    timestamp=utc_now(),
+                    data={
+                        "checkpoint_type": CHECKPOINT_TYPE,
+                        "snapshot": {"type": "checkpoint"},
+                        TASK_RUN_ID_TRACE_FIELD: "expired-run",
+                    },
+                )
+            )
+            task.last_checkpoint_event_id = "expired-checkpoint"
+        db.commit()
+        candidate = get_expired_task_lease_candidates(db, cutoff=utc_now(), limit=1)[0]
+        original = writer.stage_result_fact_no_commit
+
+        def fail_after_fact(*args, **kwargs):
+            original(*args, **kwargs)
+            raise OSError("failed recovery transaction")
+
+        with monkeypatch.context() as failure:
+            failure.setattr(writer, "stage_result_fact_no_commit", fail_after_fact)
+            with pytest.raises(OSError, match="failed recovery transaction"):
+                recover_task_lease_candidate_no_commit(
+                    db, candidate, recovered_at=utc_now()
+                )
+            db.rollback()
+        assert db.get(Task, tid).status == TaskStatus.RUNNING
+        assert db.get(Task, tid).runner_id == "dead-runner"
+        assert db.get(Task, tid).state_version == candidate.state_version
+        assert facts(db, tid) == []
+
+        expected = TaskStatus.PAUSED if with_checkpoint else TaskStatus.FAILED
+        assert (
+            recover_task_lease_candidate_no_commit(
+                db, candidate, recovered_at=utc_now()
+            )
+            == expected
+        )
+        db.commit()
+        assert db.get(Task, tid).status == expected
+        assert db.get(Task, tid).runner_id is None
+        assert len(facts(db, tid)) == 1
+        outcome = facts(db, tid)[0]
+        assert outcome.kind == "execution_settled"
+        assert outcome.run_id == "expired-run"
+        assert outcome.payload == {
+            "status": expected.value,
+            "result": {"error": None if with_checkpoint else TASK_LEASE_EXPIRED_ERROR},
+        }
+        assert (
+            recover_task_lease_candidate_no_commit(
+                db, candidate, recovered_at=utc_now()
+            )
+            is None
+        )
+        assert len(facts(db, tid)) == 1
