@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from unittest.mock import AsyncMock
 
 import pytest
@@ -314,12 +315,12 @@ async def test_outbound_stream_is_committed_before_websocket_and_failure_is_stri
 
     async def broadcast(event, task_id):
         with factory() as db:
-            assert facts(db, task_id)[-1].payload["data"]["delta"] == "hello"
+            assert facts(db, task_id)[-1].payload["data"]["content"] == "hello"
         broadcasts.append(event)
 
     monkeypatch.setattr(websocket, "publish_task_event", broadcast)
     handler = websocket.make_agent_outbound_handler(task_id, authoritative=True)
-    payload = {"type": "final_answer_delta", "delta": "hello", "stream_id": "stream1"}
+    payload = {"type": "final_answer_end", "content": "hello", "stream_id": "stream1"}
     await handler(payload)
     assert len(broadcasts) == 1
 
@@ -1008,3 +1009,76 @@ def test_expired_lease_outcome_fact_and_task_are_atomic(
             is None
         )
         assert len(facts(db, tid)) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "action,field", [(TraceAction.START, "messages"), (TraceAction.END, "response")]
+)
+async def test_llm_projection_is_capped_while_fact_stays_complete(
+    canonical, monkeypatch, action, field
+):
+    factory, task_id = canonical
+    monkeypatch.setenv("XAGENT_MAX_TRACE_PAYLOAD_BYTES", "50000")
+    content = "x" * 200_000
+    value = [{"role": "user", "content": content}] if field == "messages" else content
+    runtime = PatternRuntime(tracer=create_task_tracer(task_id))
+    await runtime._emit_trace_event(
+        TraceEventType(TraceScope.ACTION, action, TraceCategory.LLM),
+        task_id=str(task_id),
+        step_id="llm-step",
+        data={field: value, "model": "test-model"},
+    )
+    with factory() as db:
+        fact = facts(db, task_id)[0]
+        projection = db.query(TraceEvent).filter_by(task_id=task_id).one()
+        assert fact.payload["data"][field] == value
+        assert len(json.dumps(projection.data).encode()) <= 50000
+        assert projection.data["model"] == "test-model"
+
+
+@pytest.mark.asyncio
+async def test_stream_deltas_publish_without_durable_writes(
+    canonical, monkeypatch, engine
+):
+    from xagent.web.services import task_execution as websocket
+    from xagent.web.services.task_lease_service import bind_task_lease_context
+
+    factory, task_id = canonical
+    monkeypatch.setattr(websocket, "get_db", lambda: iter([factory()]))
+    publish = AsyncMock()
+    monkeypatch.setattr(websocket, "publish_task_event", publish)
+    handler = websocket.make_agent_outbound_handler(task_id, authoritative=True)
+    with factory() as db:
+        lease = acquire_task_lease(db, task_id, new_run=True)
+    statements = []
+
+    def record(_conn, _cursor, statement, _parameters, _context, _executemany):
+        statements.append(statement)
+
+    sa.event.listen(engine, "before_cursor_execute", record)
+    try:
+        with bind_task_lease_context(lease):
+            for chunk in ("hello", " ", "world"):
+                await handler(
+                    {"type": "final_answer_delta", "delta": chunk, "stream_id": "s"}
+                )
+    finally:
+        sa.event.remove(engine, "before_cursor_execute", record)
+    assert [call.args[0]["delta"] for call in publish.await_args_list] == [
+        "hello",
+        " ",
+        "world",
+    ]
+    assert statements and all(
+        statement.lstrip().upper().startswith("SELECT") for statement in statements
+    )
+    with factory() as db:
+        assert facts(db, task_id) == []
+    with bind_task_lease_context(lease):
+        await handler(
+            {"type": "final_answer_end", "content": "hello world", "stream_id": "s"}
+        )
+    with factory() as db:
+        assert [row.kind for row in facts(db, task_id)] == ["final_answer_end"]
+        assert facts(db, task_id)[0].payload["data"]["content"] == "hello world"

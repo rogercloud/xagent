@@ -3167,7 +3167,7 @@ def _apply_pause_requested_isolated(
     *,
     expected_run_id: str | None,
     owner_leases: Sequence[TaskLease],
-) -> bool:
+) -> bool | Literal["settled"]:
     """Persist PAUSE_REQUESTED for the exact RUNNING run in a short Session.
 
     ``owner_leases`` are the acquisitions this process holds for the run
@@ -3222,6 +3222,9 @@ def _apply_pause_requested_isolated(
                     f"task {task_id} run changed from {expected_run_id} "
                     f"to {current_run_id}"
                 )
+            if expected_run_id is not None and current[1] == TaskStatus.PAUSED:
+                # The accepted interrupt can settle before this control write.
+                return "settled"
             if expected_run_id is not None and current[1] == TaskStatus.RUNNING:
                 logger.warning(
                     "task %s run %s is owned by another lease acquisition; "
@@ -3402,6 +3405,10 @@ async def pause_task(reply: CommandReply, task_id: int, message_data: dict) -> N
                     owner_leases=owner_leases,
                 )
             )
+            if pause_applied == "settled":
+                # Settlement already published PAUSED. No pending request or
+                # marker remains for a later execution to inherit.
+                return
             if not pause_applied:
                 message_data["_durable_command_error"] = (
                     "Task finished before the pause request was applied"

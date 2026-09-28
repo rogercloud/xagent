@@ -22,8 +22,14 @@ from ...core.agent.checkpoint import (
     CheckpointUnavailableError,
     checkpoint_execution_id,
 )
-from ...core.agent.trace import BaseTraceHandler
+from ...core.agent.trace import (
+    BaseTraceHandler,
+    TraceCategory,
+)
 from ...core.agent.trace import TraceEvent as CoreTraceEvent
+from ...core.agent.trace import (
+    normalize_llm_trace_payload,
+)
 from ...core.runtime_performance import (
     increment_counter as increment_performance_counter,
 )
@@ -1139,6 +1145,9 @@ class DatabaseTraceHandler(BaseTraceHandler):
                     occurred_at=timestamp,
                 )
                 data = cast(dict[str, Any], fact.payload["data"])
+                if event.event_type.category == TraceCategory.LLM:
+                    # Keep complete facts, but preserve the legacy projection cap.
+                    data = normalize_llm_trace_payload(data)
                 if is_state:
                     from .task_execution_event_writer import (
                         stage_applied_inputs_no_commit,

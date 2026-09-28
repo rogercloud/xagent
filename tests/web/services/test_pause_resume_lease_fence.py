@@ -267,7 +267,7 @@ def test_pause_fence_without_a_local_holder_defers(db_session) -> None:
     assert _row(db_session, int(task.id)).state_version == 3
 
 
-def test_pause_fence_still_reports_a_settled_run_as_finished(db_session) -> None:
+def test_pause_fence_recognizes_a_run_that_already_settled_paused(db_session) -> None:
     task = _leased_task(db_session)
     task.lease_attempt_id = "own-attempt"
     task.status = TaskStatus.PAUSED
@@ -282,7 +282,7 @@ def test_pause_fence_still_reports_a_settled_run_as_finished(db_session) -> None
         ),
     )
 
-    assert applied is False
+    assert applied == "settled"
 
 
 @pytest.mark.parametrize(
@@ -1012,3 +1012,37 @@ def test_late_resumed_result_keeps_a_settled_row(
     assert stored.runner_id is None
     assert stored.lease_attempt_id is None
     assert stored.lease_expires_at is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("settled_status", [TaskStatus.PAUSED, TaskStatus.COMPLETED])
+async def test_pause_interrupt_settles_before_control_write(
+    live_task_lease, db_session, monkeypatch, settled_status
+) -> None:
+    task = _leased_task(db_session)
+    lease = live_task_lease(db_session, task)
+    pause_execution = _patch_pause_runtime(monkeypatch, task)
+
+    async def interrupt_and_settle():
+        with get_session_local()() as db:
+            assert leases.release_task_lease_no_commit(db, lease, status=settled_status)
+            db.commit()
+        return True
+
+    pause_execution.side_effect = interrupt_and_settle
+    publish = AsyncMock()
+    monkeypatch.setattr(commands, "publish_task_event", publish)
+    reply = AsyncMock()
+    message = _pause_message(task)
+    await commands.pause_task(reply, int(task.id), message)
+
+    assert not execution._is_task_pause_accepted(int(task.id))
+    publish.assert_not_awaited()
+    if settled_status == TaskStatus.PAUSED:
+        assert "_durable_command_error" not in message
+        reply.assert_not_awaited()
+    else:
+        assert message["_durable_command_error"] == (
+            "Task finished before the pause request was applied"
+        )
+        reply.assert_awaited_once()

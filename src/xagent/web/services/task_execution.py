@@ -630,6 +630,27 @@ def _persist_agent_outbound_event(
     db_gen = get_db()
     db = next(db_gen)
     try:
+        from .task_lease_service import current_task_lease
+
+        lease = current_task_lease()
+        if authoritative and event.get("type") == "final_answer_delta":
+            # Chunks are ephemeral; complete answers and stream boundaries are
+            # durable. Check ownership without serializing every chunk against
+            # fact writers. Publication already occurs outside the transaction.
+            if lease is not None and (
+                lease.task_id != task_id
+                or db.query(DatabaseTask.id)
+                .filter(
+                    DatabaseTask.id == task_id,
+                    DatabaseTask.runner_id == lease.runner_id,
+                    DatabaseTask.run_id == lease.run_id,
+                    task_lease_attempt_predicate(lease),
+                )
+                .first()
+                is None
+            ):
+                raise TaskLeaseLostError("Outbound event producer lost its task lease")
+            return
         event_data = event.get("data")
         if authoritative and event_data is None:
             event_data = dict(event)
@@ -658,9 +679,6 @@ def _persist_agent_outbound_event(
             parent_event_id=None,
             data=data,
         )
-        from .task_lease_service import current_task_lease
-
-        lease = current_task_lease()
         if lease is not None and (
             lease.task_id != task_id or not lock_task_lease_no_commit(db, lease)
         ):
