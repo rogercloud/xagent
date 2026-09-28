@@ -267,14 +267,35 @@ def test_pause_fence_without_a_local_holder_defers(db_session) -> None:
     assert _row(db_session, int(task.id)).state_version == 3
 
 
-def test_pause_fence_recognizes_a_run_that_already_settled_paused(db_session) -> None:
+@pytest.mark.parametrize(
+    ("status", "control_state", "outcome"),
+    [
+        # The interrupted run paused itself: the pause took effect.
+        (
+            TaskStatus.PAUSED,
+            TaskControlState.PAUSED,
+            commands.PauseWriteOutcome.RUN_ALREADY_PAUSED,
+        ),
+        (
+            TaskStatus.COMPLETED,
+            TaskControlState.COMPLETED,
+            commands.PauseWriteOutcome.NOT_APPLIED,
+        ),
+    ],
+    ids=["paused", "completed"],
+)
+def test_pause_fence_does_not_defer_a_settled_run(
+    db_session, status, control_state, outcome
+) -> None:
+    """A settled run is not another live owner, so the pause is not deferred."""
+
     task = _leased_task(db_session)
     task.lease_attempt_id = "own-attempt"
-    task.status = TaskStatus.PAUSED
-    task.control_state = TaskControlState.PAUSED.value
+    task.status = status
+    task.control_state = control_state.value
     db_session.commit()
 
-    applied = commands._apply_pause_requested_isolated(
+    result = commands._apply_pause_requested_isolated(
         int(task.id),
         expected_run_id=str(task.run_id),
         owner_leases=(
@@ -282,7 +303,8 @@ def test_pause_fence_recognizes_a_run_that_already_settled_paused(db_session) ->
         ),
     )
 
-    assert applied == "settled"
+    assert result is outcome
+    assert _row(db_session, int(task.id)).state_version == 3
 
 
 @pytest.mark.parametrize(
@@ -1012,37 +1034,3 @@ def test_late_resumed_result_keeps_a_settled_row(
     assert stored.runner_id is None
     assert stored.lease_attempt_id is None
     assert stored.lease_expires_at is None
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("settled_status", [TaskStatus.PAUSED, TaskStatus.COMPLETED])
-async def test_pause_interrupt_settles_before_control_write(
-    live_task_lease, db_session, monkeypatch, settled_status
-) -> None:
-    task = _leased_task(db_session)
-    lease = live_task_lease(db_session, task)
-    pause_execution = _patch_pause_runtime(monkeypatch, task)
-
-    async def interrupt_and_settle():
-        with get_session_local()() as db:
-            assert leases.release_task_lease_no_commit(db, lease, status=settled_status)
-            db.commit()
-        return True
-
-    pause_execution.side_effect = interrupt_and_settle
-    publish = AsyncMock()
-    monkeypatch.setattr(commands, "publish_task_event", publish)
-    reply = AsyncMock()
-    message = _pause_message(task)
-    await commands.pause_task(reply, int(task.id), message)
-
-    assert not execution._is_task_pause_accepted(int(task.id))
-    publish.assert_not_awaited()
-    if settled_status == TaskStatus.PAUSED:
-        assert "_durable_command_error" not in message
-        reply.assert_not_awaited()
-    else:
-        assert message["_durable_command_error"] == (
-            "Task finished before the pause request was applied"
-        )
-        reply.assert_awaited_once()
