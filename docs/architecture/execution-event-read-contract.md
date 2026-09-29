@@ -382,6 +382,8 @@ without an outcome is explicitly unknown, including its external effect; this
 model observation does not relax B's refusal to resume an unknown effect.
 Question outbounds supply their transcript content. Failed/cancelled settlements
 supply one outcome instead of a safe failure placeholder plus another summary.
+Normal waiting, paused and interrupted settlements do not add a failure outcome,
+including after a successful continuation.
 Selected-skill loading continues through the existing business loader.
 
 The existing newest-first budget of 16 historical image references is shared by
@@ -404,3 +406,16 @@ earlier tool facts. Summaries with no coordinate cannot replace a known prefix;
 the reader replays facts without regenerating the summary. Malformed required
 facts or invalid coverage fail explicitly, without a legacy-content fallback.
 Display/Trace conversion and whole-task isolation remain D and E work.
+
+### Follow-up: bound model-context payload loading
+
+The current reader pages queries and batches anchor lookups, but retains every
+matching event payload before applying summary coverage and the tool window.
+Thus payload bytes read and setup memory still grow with lifetime history even
+when compaction covers old facts. This is a non-blocking follow-up to stage C.
+Select the applicable summary and retained batch identities first, then load
+only required payloads at the same fixed committed horizon. Selection must keep
+inputs applied after the summary boundary even when accepted before it, tool
+batches with outcomes after the boundary, and complete boundary batches. Verify
+bounded payload loading against large histories as well as equivalent model
+messages for these cross-boundary cases.

@@ -124,6 +124,82 @@ def test_applied_inputs_and_cutoff_are_occurrences_not_text(canonical):
         assert load_task_event_context(db, task_id).messages == native.messages
 
 
+@pytest.mark.parametrize(
+    ("task_status", "result_status"),
+    [
+        ("waiting_for_user", "waiting_for_user"),
+        ("paused", "interrupted"),
+        ("paused", None),
+    ],
+)
+def test_normal_pause_then_success_does_not_add_failure(
+    canonical, task_status, result_status
+):
+    factory, task_id = canonical
+    with factory() as db:
+        accept(db, task_id, "question", text="Find the weather")
+        apply(db, task_id, "question")
+        fact(
+            db,
+            task_id,
+            "agent_message",
+            "clarification",
+            {"message": "Which city?", "expect_response": True},
+        )
+        result = {"success": False}
+        if result_status is not None:
+            result["status"] = result_status
+        fact(
+            db,
+            task_id,
+            "execution_settled",
+            "pause",
+            {"status": task_status, "result": result},
+        )
+        db.commit()
+        expected = [
+            {"role": "user", "content": "Find the weather"},
+            {"role": "assistant", "content": "Which city?"},
+        ]
+        assert load_task_event_context(db, task_id).messages == expected
+        accept(db, task_id, "answer", text="Taipei")
+        apply(db, task_id, "answer")
+        fact(
+            db,
+            task_id,
+            "execution_settled",
+            "complete",
+            {"status": "completed", "result": {"success": True, "status": "completed"}},
+        )
+        db.commit()
+        assert load_task_event_context(db, task_id).messages == expected + [
+            {"role": "user", "content": "Taipei"}
+        ]
+
+
+@pytest.mark.parametrize(
+    ("status", "summary"),
+    [
+        ("failed", "- Previous execution failed."),
+        ("cancelled", "- Previous execution was cancelled."),
+    ],
+)
+def test_terminal_settlement_still_adds_outcome(canonical, status, summary):
+    factory, task_id = canonical
+    with factory() as db:
+        fact(
+            db,
+            task_id,
+            "execution_settled",
+            "terminal",
+            {"status": status, "result": {"success": False, "status": status}},
+        )
+        db.commit()
+        assert load_task_event_context(db, task_id).messages == [
+            {"role": "system", "content": summary}
+        ]
+
+
 def test_batch_pairing_failure_skill_and_root_isolation(canonical):
     factory, task_id = canonical
     with factory() as db:

@@ -349,6 +349,8 @@ def load_task_event_context(
             if not isinstance(result, dict):
                 raise ValueError("Invalid execution settlement")
             status = result.get("status", data.get("status"))
+            if status in {"waiting_for_user", "interrupted", "paused"}:
+                continue
             if status == "cancelled":
                 failure = cast(str | None, "- Previous execution was cancelled.")
             else:
