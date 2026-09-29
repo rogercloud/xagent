@@ -5608,7 +5608,6 @@ class ReActPattern(AgentPattern):
                     error=committed["error"],
                 )
                 return result
-        if not is_control:
             # The duplicate-write scan runs before this call writes any ledger
             # record: provider-supplied tool_call ids are not guaranteed
             # unique (see _run_concurrent_batch), so recording "running" first

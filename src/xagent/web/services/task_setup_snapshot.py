@@ -202,6 +202,9 @@ def load_task_reconstruction_snapshot_sync(
         # AgentService.reconstruct_from_history currently only restores the task
         # id. Keep its history-presence gate event-backed; actual execution state
         # is selected under the runner's partition and lease by the reader.
+        # If reconstruction starts consuming history/plan again, first apply
+        # run/execution/horizon selection and adapt this pattern state to the
+        # legacy plan shape; these arguments are currently ignored by it.
         event = session.scalar(
             select(TaskExecutionEvent)
             .where(

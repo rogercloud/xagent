@@ -315,12 +315,20 @@ A completed/failed settlement after the state prevents root
 resume, including cancellations recorded as failed settlements.
 
 Before a saved state reaches the scheduler, every pending ordinary tool attempt
-is checked, including active DAG steps. A committed result is reused through
+is checked, including active DAG steps and Auto's selected ReAct/DAG child. A committed result is reused through
 the existing ReAct result application path; no second tool invocation or tool
 start/result fact is emitted. A start without a confirmed result, including an
-interrupted attempt, raises `CheckpointUnavailableError`. It is an unknown
-external effect, not an automatic retry. A database read failure also reports
-unavailable; an unsupported recovery payload reports corrupt. Neither falls
+interrupted attempt, raises `UnknownToolEffectError`. Lease-expiry recovery
+settles that run as FAILED through its existing fenced transaction; it does not
+leave an expired RUNNING lease for endless retries. This includes pausing or
+stopping V2 while a tool is in flight: cancellation does not prove that an
+external side effect was rolled back, so that pending attempt cannot be resumed
+automatically. The context reader may show a failure observation to the model;
+that observation is not confirmation of the external outcome. V1 replay behavior
+is unchanged. Manual reconciliation of unknown effects is outside this stage.
+A database read failure reports unavailable (retryable); an unsupported recovery
+payload reports corrupt. Unavailable lease reads report an operational degradation
+for the sweep. None falls
 back to legacy content. Control-message retries retain their existing occurrence
 identity and outbound reconciliation path.
 

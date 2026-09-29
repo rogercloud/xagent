@@ -20,6 +20,7 @@ from xagent.core.agent.checkpoint import (
     CheckpointUnavailableError,
     ExecutionEventPersistenceError,
     TraceCheckpointStore,
+    UnknownToolEffectError,
 )
 from xagent.core.agent.trace import Tracer
 from xagent.web.models.task import Task
@@ -101,12 +102,44 @@ async def test_settled_execution_cannot_resume_older_checkpoint(canonical):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("scope", [None, "child"])
+@pytest.mark.parametrize("mode", ["react", "auto_react", "auto_dag"])
 async def test_resume_reuses_tool_result_committed_before_next_checkpoint(
-    canonical, scope, monkeypatch, tmp_path
+    canonical, scope, monkeypatch, tmp_path, mode
 ):
+    from tests.core.agent.test_auto import FakeLLM as AutoLLM
+    from tests.core.agent.test_auto import (
+        decision_tool_response,
+        plan_tool_response,
+    )
     from tests.core.agent.test_react import FakeLLM, FakeTool
     from tests.core.agent.test_runner import FakeWorkspaceManager
-    from xagent.core.agent import Agent, AgentRunner
+    from xagent.core.agent import (
+        Agent,
+        AgentRunner,
+        AutoPattern,
+        DAGPattern,
+        LLMPlanGenerator,
+    )
+
+    def make_pattern():
+        return (
+            ReActPattern(max_iterations=3)
+            if mode == "react"
+            else AutoPattern(dag_pattern=DAGPattern(LLMPlanGenerator()))
+        )
+
+    def make_llm(responses, *, resume=False):
+        if mode == "react":
+            return FakeLLM(responses=responses)
+        if not resume:
+            action = "react" if mode == "auto_react" else "plan_execute"
+            prefix = [decision_tool_response(action, "Calculate")]
+            if mode == "auto_dag":
+                prefix.append(
+                    plan_tool_response([{"id": "calc", "task": "Calculate 2+2"}])
+                )
+            responses = prefix + responses
+        return AutoLLM(responses)
 
     factory, tid = canonical
     tracer = tracer_for(tid, scope)
@@ -115,7 +148,7 @@ async def test_resume_reuses_tool_result_committed_before_next_checkpoint(
     original_checkpoint = runtime.checkpoint
 
     async def crash_after_tool(label, **kwargs):
-        if label in {"after_tool", "after_tool_batch"}:
+        if label.endswith(("after_tool", "after_tool_batch")):
             raise ExecutionEventPersistenceError("simulated crash after result commit")
         return await original_checkpoint(label, **kwargs)
 
@@ -124,11 +157,11 @@ async def test_resume_reuses_tool_result_committed_before_next_checkpoint(
     context.add_user_message("2+2")
     tool = FakeTool()
     with pytest.raises(ExecutionEventPersistenceError):
-        await ReActPattern(max_iterations=3).run(
+        await make_pattern().run(
             context=context,
             tools=[tool],
             runtime=runtime,
-            llm=FakeLLM(
+            llm=make_llm(
                 responses=[
                     {
                         "content": "calculate",
@@ -152,9 +185,9 @@ async def test_resume_reuses_tool_result_committed_before_next_checkpoint(
     runner = AgentRunner(
         agent=Agent(
             name="recovered",
-            patterns=[ReActPattern(max_iterations=3)],
+            patterns=[make_pattern()],
             tools=[tool],
-            llm=FakeLLM(responses=[{"content": "4", "done": True}]),
+            llm=make_llm(responses=[{"content": "4", "done": True}], resume=True),
         ),
         tracer=store,
         workspace_manager=FakeWorkspaceManager(tmp_path),
@@ -188,7 +221,7 @@ async def test_unknown_tool_effect_is_not_reexecuted(canonical):
     }
     await runtime.on_tool_start(tool_call=call)
     tool = FakeTool()
-    with pytest.raises(CheckpointUnavailableError, match="automatic replay is unsafe"):
+    with pytest.raises(UnknownToolEffectError, match="automatic replay is unsafe"):
         await ReActPattern()._execute_tool_safely(
             call, [tool], runtime, context=ExecutionContext()
         )
@@ -196,7 +229,10 @@ async def test_unknown_tool_effect_is_not_reexecuted(canonical):
 
 
 @pytest.mark.asyncio
-async def test_reader_preflights_all_pending_effects_before_scheduling(canonical):
+@pytest.mark.parametrize("pattern", ["ReActPattern", "AutoReact", "AutoDAG"])
+async def test_reader_preflights_all_pending_effects_before_scheduling(
+    canonical, pattern
+):
     _, tid = canonical
     tracer = tracer_for(tid)
     store = TraceCheckpointStore(tracer)
@@ -210,15 +246,24 @@ async def test_reader_preflights_all_pending_effects_before_scheduling(canonical
         }
         for i in range(2)
     ]
+    state = {"pending_tool_calls": calls}
+    if pattern == "AutoReact":
+        state = {"decision": {"action": "react"}, "react_state": state}
+    elif pattern == "AutoDAG":
+        state = {
+            "decision": {"action": "plan_execute"},
+            "dag_state": {"active_step_pattern_states": {"step": state}},
+        }
     await store.save(
         {
             "execution_id": "execution",
             "context": {"messages": []},
-            "pattern_state": {"pending_tool_calls": calls},
+            "pattern": "AutoPattern" if pattern.startswith("Auto") else pattern,
+            "pattern_state": state,
         }
     )
     await PatternRuntime(tracer=store).on_tool_start(tool_call=calls[1])
-    with pytest.raises(CheckpointUnavailableError, match="automatic replay is unsafe"):
+    with pytest.raises(UnknownToolEffectError, match="automatic replay is unsafe"):
         await store.load_latest_checkpoint("execution")
 
 
@@ -421,7 +466,7 @@ async def test_tool_outcome_recovery_preserves_failure_and_waiting(canonical, ou
     pattern = ReActPattern()
     if outcome == "cancelled":
         await runtime.on_tool_cancelled(tool_call=call)
-        with pytest.raises(CheckpointUnavailableError):
+        with pytest.raises(UnknownToolEffectError):
             await pattern._execute_tool_safely(
                 call, [tool], runtime, context=ExecutionContext()
             )
@@ -701,3 +746,184 @@ async def test_missing_task_protocol_anchor_never_looks_up_literal_none(
         assert task.last_checkpoint_trace_event_id is not None
         task.last_checkpoint_event_id = None
         assert resolve_interaction_anchor(db, task) is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cancelled", [False, True])
+async def test_unknown_effect_settles_expired_task(canonical, cancelled):
+    from datetime import timedelta
+
+    from xagent.web.models.task import TaskStatus
+    from xagent.web.services.task_lease_recovery import (
+        recover_task_lease_candidate_no_commit,
+    )
+    from xagent.web.services.task_lease_service import (
+        acquire_task_lease,
+        bind_task_lease_context,
+        get_expired_task_lease_candidates,
+        utc_now,
+    )
+
+    factory, tid = canonical
+    with factory() as db:
+        lease = acquire_task_lease(db, tid, new_run=True)
+    call = {
+        "id": "call",
+        "name": "calculator",
+        "args": {},
+        "assistant_message_id": "batch",
+        "tool_attempt_id": "attempt",
+    }
+    with bind_task_lease_context(lease):
+        store = TraceCheckpointStore(tracer_for(tid))
+        runtime = PatternRuntime(tracer=store)
+        await store.save(
+            {
+                "execution_id": str(tid),
+                "context": {"messages": []},
+                "pattern_state": {"pending_tool_calls": [call]},
+            }
+        )
+        await runtime.on_tool_start(tool_call=call)
+        if cancelled:
+            await runtime.on_tool_cancelled(tool_call=call)
+    with factory() as db:
+        task = db.get(Task, tid)
+        task.lease_expires_at = utc_now() - timedelta(seconds=5)
+        db.commit()
+        candidate = get_expired_task_lease_candidates(db, cutoff=utc_now(), limit=1)[0]
+        assert (
+            recover_task_lease_candidate_no_commit(
+                db, candidate, recovered_at=utc_now()
+            )
+            == TaskStatus.FAILED
+        )
+        db.commit()
+        task = db.get(Task, tid)
+        assert task.status == TaskStatus.FAILED
+        assert task.runner_id is None
+        assert task.lease_expires_at is None
+        settled = [
+            event for event in facts(db, tid) if event.kind == "execution_settled"
+        ]
+        assert len(settled) == 1
+        assert settled[0].payload["status"] == "failed"
+        assert not get_expired_task_lease_candidates(db, cutoff=utc_now(), limit=1)
+        assert (
+            recover_task_lease_candidate_no_commit(
+                db, candidate, recovered_at=utc_now()
+            )
+            is None
+        )
+        db.commit()
+        assert (
+            len(
+                [event for event in facts(db, tid) if event.kind == "execution_settled"]
+            )
+            == 1
+        )
+
+
+@pytest.mark.asyncio
+async def test_corrupt_sibling_execution_is_isolated(canonical):
+    factory, tid = canonical
+    store = TraceCheckpointStore(tracer_for(tid, "child"))
+    target = {"execution_id": "target", "context": {"messages": []}}
+    await store.save(target)
+    await store.save({"execution_id": "other", "context": {"messages": []}})
+    with factory() as db:
+        event = (
+            db.query(TaskExecutionEvent)
+            .filter_by(kind="recovery_state")
+            .order_by(TaskExecutionEvent.sequence.desc())
+            .first()
+        )
+        event.payload_version = 99
+        db.commit()
+    assert await store.load_latest_checkpoint("target") == target
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["typed", "storage_version", "facts"])
+async def test_unavailable_lease_read_is_visible_until_next_clean_sweep(
+    canonical, monkeypatch, failure
+):
+    from datetime import timedelta
+
+    from xagent.web.models.task import TaskStatus
+    from xagent.web.services import task_execution_event_recovery as reader
+    from xagent.web.services.ops_signals import (
+        CHECKPOINT_RECOVERY_UNAVAILABLE,
+        active_degradations,
+        clear_degradation,
+    )
+    from xagent.web.services.task_lease_recovery import (
+        recover_expired_task_leases_until_cutoff,
+    )
+    from xagent.web.services.task_lease_service import utc_now
+
+    factory, tid = canonical
+    monkeypatch.setattr(
+        "xagent.web.models.database.get_engine", lambda: factory.kw["bind"]
+    )
+    with factory() as db:
+        task = db.get(Task, tid)
+        task.status = TaskStatus.RUNNING
+        task.run_id = "expired-run"
+        task.runner_id = "dead-runner"
+        task.lease_expires_at = utc_now() - timedelta(seconds=5)
+        db.commit()
+
+    def unavailable(*args, **kwargs):
+        raise CheckpointUnavailableError("temporarily unavailable")
+
+    def database_failure(conn, cursor, statement, parameters, context, executemany):
+        target = (
+            "SELECT tasks.conversation_storage_version"
+            if failure == "storage_version"
+            else "FROM task_execution_events"
+        )
+        if target in statement:
+            raise sa.exc.OperationalError(
+                statement, parameters, RuntimeError("offline")
+            )
+
+    clear_degradation(CHECKPOINT_RECOVERY_UNAVAILABLE)
+    try:
+        with monkeypatch.context() as patch:
+            if failure == "typed":
+                patch.setattr(reader, "read_event_checkpoint", unavailable)
+            else:
+                sa.event.listen(
+                    factory.kw["bind"], "before_cursor_execute", database_failure
+                )
+            assert (
+                await recover_expired_task_leases_until_cutoff(
+                    cutoff=utc_now(), batch_size=10
+                )
+                == 0
+            )
+        if failure != "typed":
+            sa.event.remove(
+                factory.kw["bind"], "before_cursor_execute", database_failure
+            )
+        assert CHECKPOINT_RECOVERY_UNAVAILABLE in active_degradations()
+        assert "SELECT" not in active_degradations()[CHECKPOINT_RECOVERY_UNAVAILABLE]
+        with factory() as db:
+            assert db.get(Task, tid).status == TaskStatus.RUNNING
+            assert db.get(Task, tid).runner_id == "dead-runner"
+        assert (
+            await recover_expired_task_leases_until_cutoff(
+                cutoff=utc_now(), batch_size=10
+            )
+            == 1
+        )
+        assert CHECKPOINT_RECOVERY_UNAVAILABLE not in active_degradations()
+    finally:
+        if sa.event.contains(
+            factory.kw["bind"], "before_cursor_execute", database_failure
+        ):
+            sa.event.remove(
+                factory.kw["bind"], "before_cursor_execute", database_failure
+            )
+        clear_degradation(CHECKPOINT_RECOVERY_UNAVAILABLE)

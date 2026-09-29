@@ -89,6 +89,14 @@ class CheckpointUnavailableError(CheckpointReadError):
     """
 
 
+class UnknownToolEffectError(CheckpointReadError):
+    """A persisted attempt has no confirmed external outcome; do not replay it.
+
+    Unlike a transient read failure, retrying this checkpoint cannot establish
+    whether the tool performed its side effect before interruption.
+    """
+
+
 class CheckpointCorruptError(CheckpointReadError):
     """Raised when matching checkpoint rows exist but none are usable.
 

@@ -14,6 +14,7 @@ from ...core.agent.checkpoint import (
     CheckpointAccessRefusedError,
     CheckpointCorruptError,
     CheckpointUnavailableError,
+    UnknownToolEffectError,
     checkpoint_execution_id,
 )
 from ...core.agent.result import CONTROL_TOOL_NAMES
@@ -100,9 +101,14 @@ def read_event_checkpoint(
         if not page:
             return None
         for event in page:
+            raw_data = (
+                event.payload.get("data") if isinstance(event.payload, dict) else None
+            )
+            if isinstance(raw_data, dict):
+                identity = checkpoint_execution_id(raw_data)
+                if identity and identity != execution_id:
+                    continue
             data = event_checkpoint_data(event)
-            if checkpoint_execution_id(data) != execution_id:
-                continue
             if scope_id == "root":
                 settlement = db.scalar(
                     select(TaskExecutionEvent)
@@ -134,6 +140,20 @@ def read_event_checkpoint(
                         )
             snapshot = data["snapshot"]
             state = snapshot.get("pattern_state") or {}
+            if snapshot.get("pattern") == "AutoPattern":
+                if not isinstance(state, dict):
+                    raise CheckpointCorruptError("Unreadable Auto recovery state")
+                decision = state.get("decision") or {}
+                if not isinstance(decision, dict):
+                    raise CheckpointCorruptError("Unreadable Auto decision")
+                action = decision.get("action")
+                state = (
+                    state.get("react_state")
+                    if action == "react"
+                    else state.get("dag_state")
+                    if action == "plan_execute"
+                    else None
+                ) or {}
             if not isinstance(state, dict) or not isinstance(
                 state.get("active_step_pattern_states", {}), dict
             ):
@@ -176,7 +196,6 @@ def read_committed_tool_outcome(
     through_sequence: int | None = None,
 ) -> dict[str, Any] | None:
     """Return an occurrence's committed outcome, or refuse an unknown effect."""
-    check_recovery_owner(db, task_id)
     query = (
         select(TaskExecutionEvent)
         .where(
@@ -193,7 +212,6 @@ def read_committed_tool_outcome(
         query = query.where(TaskExecutionEvent.sequence <= through_sequence)
     rows = list(db.scalars(query))
     if not rows:
-        check_recovery_owner(db, task_id)
         return None
     outcome = None
     for event in rows:
@@ -210,7 +228,7 @@ def read_committed_tool_outcome(
             )
         if event.kind in {"tool_execution_end", "tool_execution_failed"}:
             if data.get("interrupted") is True:
-                raise CheckpointUnavailableError(
+                raise UnknownToolEffectError(
                     "Interrupted tool attempt has no confirmed result"
                 )
             if "result" not in data:
@@ -224,10 +242,9 @@ def read_committed_tool_outcome(
                 else None,
             }
     if outcome is None:
-        raise CheckpointUnavailableError(
+        raise UnknownToolEffectError(
             "Tool attempt started without a committed result; automatic replay is unsafe"
         )
-    check_recovery_owner(db, task_id)
     return outcome
 
 

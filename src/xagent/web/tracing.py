@@ -133,7 +133,10 @@ class ExecutionEventTraceAdapter(DatabaseTraceHandler):
         import asyncio
 
         from .models.database import get_session_local
-        from .services.task_execution_event_recovery import read_committed_tool_outcome
+        from .services.task_execution_event_recovery import (
+            check_recovery_owner,
+            read_committed_tool_outcome,
+        )
 
         def load() -> dict[str, Any] | None:
             from sqlalchemy.exc import SQLAlchemyError
@@ -142,12 +145,15 @@ class ExecutionEventTraceAdapter(DatabaseTraceHandler):
 
             try:
                 with get_session_local()() as db:
-                    return read_committed_tool_outcome(
+                    check_recovery_owner(db, self.task_id)
+                    result = read_committed_tool_outcome(
                         db,
                         task_id=self.task_id,
                         scope_id=self.build_id or "root",
                         tool_call=tool_call,
                     )
+                    check_recovery_owner(db, self.task_id)
+                    return result
             except SQLAlchemyError as exc:
                 raise CheckpointUnavailableError(
                     "Committed tool outcome read could not complete"
