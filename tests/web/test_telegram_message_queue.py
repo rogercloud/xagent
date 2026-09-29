@@ -660,6 +660,7 @@ async def test_stop_during_the_loading_message_removes_it_and_replies(
             runtime_user=None,
             conversation_history=(),
             conversation_watermark=None,
+            conversation_event_watermark=None,
             execution_recovery=TaskExecutionRecoverySnapshot(),
             # The turn binds ``task.source`` into the agent context (MCP
             # approval gate identity), so the stand-in row carries the
@@ -1469,6 +1470,7 @@ async def test_empty_output_edits_the_loading_message_with_a_placeholder(
             runtime_user=None,
             conversation_history=(),
             conversation_watermark=None,
+            conversation_event_watermark=None,
             execution_recovery=TaskExecutionRecoverySnapshot(),
             # The turn binds ``task.source`` into the agent context (MCP
             # approval gate identity), so the stand-in row carries the
@@ -1623,6 +1625,7 @@ async def test_successful_telegram_turn_hands_finalize_the_execution_result(
             runtime_user=None,
             conversation_history=(),
             conversation_watermark=None,
+            conversation_event_watermark=None,
             execution_recovery=TaskExecutionRecoverySnapshot(),
             # The turn binds ``task.source`` into the agent context (MCP
             # approval gate identity), so the stand-in row carries the
@@ -1762,6 +1765,7 @@ async def test_channel_failure_suppresses_stale_error_after_exact_settlement_rej
             runtime_user=None,
             conversation_history=(),
             conversation_watermark=None,
+            conversation_event_watermark=None,
             execution_recovery=TaskExecutionRecoverySnapshot(),
             # The turn binds ``task.source`` into the agent context (MCP
             # approval gate identity), so the stand-in row carries the

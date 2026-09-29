@@ -213,6 +213,7 @@ async def test_channel_failure_suppresses_stale_error_after_exact_settlement_rej
             runtime_user=None,
             conversation_history=(),
             conversation_watermark=None,
+            conversation_event_watermark=None,
             execution_recovery=TaskExecutionRecoverySnapshot(),
             # The turn binds ``task.source`` into the agent context (MCP
             # approval gate identity), so the stand-in row carries the
@@ -402,6 +403,7 @@ async def test_successful_channel_turn_persists_user_before_exact_assistant_sett
             runtime_user=None,
             conversation_history=(),
             conversation_watermark=None,
+            conversation_event_watermark=None,
             execution_recovery=TaskExecutionRecoverySnapshot(),
             # The turn binds ``task.source`` into the agent context (MCP
             # approval gate identity), so the stand-in row carries the

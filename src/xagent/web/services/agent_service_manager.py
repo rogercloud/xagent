@@ -1654,7 +1654,9 @@ class AgentServiceManager:
             return
 
         agent.set_conversation_history(
-            conversation_history, watermark=transcript_window.watermark
+            conversation_history,
+            watermark=transcript_window.watermark,
+            event_watermark=transcript_window.event_watermark,
         )
         logger.info(
             f"Loaded {len(conversation_history)} persisted chat messages for task {task_id}"
@@ -3002,6 +3004,7 @@ class AgentServiceManager:
                     agent_service.set_conversation_history(
                         [dict(message) for message in snapshot.conversation_history],
                         watermark=snapshot.conversation_watermark,
+                        event_watermark=snapshot.conversation_event_watermark,
                     )
                     recovery_state = await materialize_task_execution_recovery_state(
                         snapshot.execution_recovery
@@ -4113,6 +4116,7 @@ class AgentServiceManager:
             agent_service.set_conversation_history(
                 [dict(message) for message in snapshot.conversation_history],
                 watermark=snapshot.conversation_watermark,
+                event_watermark=snapshot.conversation_event_watermark,
             )
             recovery_state = await materialize_task_execution_recovery_state(
                 snapshot.execution_recovery

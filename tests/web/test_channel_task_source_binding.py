@@ -49,6 +49,7 @@ def _snapshot(source: str | None) -> Any:
         runtime_user=None,
         conversation_history=(),
         conversation_watermark=None,
+        conversation_event_watermark=None,
         execution_recovery=TaskExecutionRecoverySnapshot(),
         task=SimpleNamespace(source=source),
     )
@@ -369,6 +370,7 @@ async def test_shared_channel_turn_binds_the_snapshot_source(
         runtime_user=None,
         conversation_history=(),
         conversation_watermark=None,
+        conversation_event_watermark=None,
         execution_recovery=TaskExecutionRecoverySnapshot(),
         task=SimpleNamespace(source="internal", user_id=5),
     )

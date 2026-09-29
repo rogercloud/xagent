@@ -70,6 +70,7 @@ class _TaskFields:
     run_id: str | None = None
     state_version: int = 0
     control_state: str | None = None
+    conversation_storage_version: int = 1
 
 
 @dataclass(frozen=True)
@@ -154,6 +155,7 @@ class TaskSetupSnapshot:
     # Resolved by ``resolve_task_runtime_config_core`` using this same Session.
     # Kept as the service-layer frozen dataclass; no ORM row is retained.
     workforce_runtime: WorkforceTaskRuntime | None = None
+    conversation_event_watermark: dict[str, Any] | None = None
 
 
 # NOTE: All LLM resolution + agent-builder merge + execution-mode →
@@ -314,6 +316,7 @@ def load_task_setup_snapshot_sync(
     task_owner_user_id: Optional[int],
     *,
     before_message_id: Optional[int] = None,
+    before_turn_id: str | None = None,
     actor_user_id: Optional[int] = None,
     actor_is_admin: bool = False,
 ) -> Optional[TaskSetupSnapshot]:
@@ -368,6 +371,7 @@ def load_task_setup_snapshot_sync(
 
         task_fields = _TaskFields(
             id=int(task_row.id),
+            conversation_storage_version=int(task_row.conversation_storage_version),
             user_id=int(task_row.user_id),
             status=task_row.status,
             source=str(task_row.source) if task_row.source is not None else None,
@@ -414,16 +418,33 @@ def load_task_setup_snapshot_sync(
 
         from .chat_history_service import load_task_transcript_window
 
-        transcript_window = load_task_transcript_window(
-            session,
-            task_id,
-            before_message_id=before_message_id,
-        )
-        conversation_history = tuple(transcript_window.messages)
-        execution_recovery = load_task_execution_recovery_snapshot_sync(
-            session,
-            task_id,
-        )
+        event_watermark = None
+        if task_fields.conversation_storage_version == 2:
+            from .task_event_context_service import load_task_event_context
+
+            event_context = load_task_event_context(
+                session,
+                task_id,
+                before_message_id=before_message_id,
+                before_turn_id=before_turn_id,
+            )
+            conversation_history = tuple(event_context.messages)
+            conversation_watermark = None
+            event_watermark = event_context.watermark
+            execution_recovery = TaskExecutionRecoverySnapshot(
+                selected_skill_name=event_context.selected_skill_name,
+            )
+        else:
+            transcript_window = load_task_transcript_window(
+                session,
+                task_id,
+                before_message_id=before_message_id,
+            )
+            conversation_history = tuple(transcript_window.messages)
+            conversation_watermark = transcript_window.watermark
+            execution_recovery = load_task_execution_recovery_snapshot_sync(
+                session, task_id
+            )
         reconstruction = load_task_reconstruction_snapshot_sync(session, task_id)
 
         # ``core.agent_fields`` is already an ``AgentRuntimeFields``
@@ -441,7 +462,8 @@ def load_task_setup_snapshot_sync(
             agent_config=core.agent_config,
             excluded_agent_id=excluded_agent_id,
             conversation_history=conversation_history,
-            conversation_watermark=transcript_window.watermark,
+            conversation_watermark=conversation_watermark,
+            conversation_event_watermark=event_watermark,
             execution_recovery=execution_recovery,
             reconstruction=reconstruction,
             workforce_runtime=deepcopy(core.workforce),

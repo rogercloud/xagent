@@ -39,6 +39,15 @@ def load_task_execution_recovery_snapshot_sync(
     max_tool_events: int = 8,
 ) -> TaskExecutionRecoverySnapshot:
     """Read the database-backed recovery inputs into detached primitives."""
+    from .task_execution_event_writer import uses_execution_events
+
+    if uses_execution_events(db, task_id):
+        from .task_event_context_service import load_task_event_context
+
+        context = load_task_event_context(db, task_id)
+        return TaskExecutionRecoverySnapshot(
+            selected_skill_name=context.selected_skill_name
+        )
     return TaskExecutionRecoverySnapshot(
         messages=tuple(
             load_task_execution_context_messages(
