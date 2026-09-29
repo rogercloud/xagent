@@ -531,3 +531,152 @@ async def test_event_context_reaches_actual_model_with_batch_and_current_input_o
         service.execution_metadata[MODEL_CONTEXT_WATERMARK_METADATA_KEY]
         == loaded.watermark
     )
+
+
+def test_reference_queries_are_batched_and_include_internal_summary_anchors(canonical):
+    factory, task_id = canonical
+    with factory() as db:
+        for index in range(105):
+            accept(db, task_id, str(index))
+            apply(db, task_id, str(index))
+            anchor = fact(
+                db,
+                task_id,
+                "llm_call_end",
+                f"internal-{index}",
+                {"data": {"response": "not model history"}},
+            )
+            fact(
+                db,
+                task_id,
+                "action_end_compact",
+                f"compact-{index}",
+                {
+                    "data": {
+                        "summary": f"summary {index}",
+                        MODEL_CONTEXT_WATERMARK_METADATA_KEY: {
+                            "scope_id": "root",
+                            "event_id": anchor.event_id,
+                            "sequence": anchor.sequence,
+                        },
+                    }
+                },
+            )
+        db.commit()
+        statements = []
+
+        def record(_conn, _cursor, statement, parameters, _context, _many):
+            if statement.lstrip().upper().startswith("SELECT"):
+                statements.append((statement, parameters))
+
+        sa.event.listen(db.bind, "before_cursor_execute", record)
+        try:
+            loaded = load_task_event_context(db, task_id)
+        finally:
+            sa.event.remove(db.bind, "before_cursor_execute", record)
+    assert loaded.messages == [{"role": "system", "content": "summary 104"}]
+    # 105 input applications and 105 summaries must not cause 210 round trips.
+    assert len(statements) <= 10
+    lookups = [
+        (sql, parameters) for sql, parameters in statements if "event_id IN" in sql
+    ]
+    assert len(lookups) == 3
+    assert all(len(parameters) <= 103 for _, parameters in lookups)
+    assert all("task_execution_events.payload," not in sql for sql, _ in lookups)
+
+
+@pytest.mark.parametrize("invalid", [None, "", [], 7])
+def test_coordinate_identity_is_rejected_before_writer_sql(canonical, invalid):
+    from xagent.web.services.task_execution_event_writer import (
+        compact_transcript_event_watermark,
+    )
+
+    factory, task_id = canonical
+    coordinate = {"scope_id": "root", "sequence": 1}
+    if invalid is not None:
+        coordinate["event_id"] = invalid
+    data = {
+        "summary": "invalid identity",
+        MODEL_CONTEXT_WATERMARK_METADATA_KEY: coordinate,
+    }
+    with factory() as db:
+        with patch.object(
+            db, "scalar", side_effect=AssertionError("invalid identity reached SQL")
+        ):
+            with pytest.raises(
+                ValueError, match="Invalid native model context watermark"
+            ):
+                compact_transcript_event_watermark(db, task_id, "invalid", data)
+        fact(db, task_id, "action_end_compact", "invalid", {"data": data})
+        db.commit()
+        with pytest.raises(ValueError, match="Invalid model context coverage identity"):
+            load_task_event_context(db, task_id)
+
+
+@pytest.mark.parametrize("invalid", ["scope", "kind", "version", "future"])
+def test_batched_application_anchors_keep_existing_rejection_rules(canonical, invalid):
+    factory, task_id = canonical
+    with factory() as db:
+        accept(db, task_id, "turn")
+        apply(db, task_id, "turn")
+        state = db.scalar(
+            sa.select(TaskExecutionEvent).where(
+                TaskExecutionEvent.kind == "recovery_state"
+            )
+        )
+        if invalid == "scope":
+            state.scope_id = "child"
+        elif invalid == "kind":
+            state.kind = "llm_call_end"
+        elif invalid == "version":
+            state.payload_version = 2
+        else:
+            later = fact(db, task_id, "recovery_state", "later-state", {})
+            applied = db.scalar(
+                sa.select(TaskExecutionEvent).where(
+                    TaskExecutionEvent.kind == "input_applied"
+                )
+            )
+            applied.payload = {"recovery_event_id": later.event_id}
+        db.commit()
+        with pytest.raises(
+            ValueError, match="Applied input has no prior root recovery state"
+        ):
+            load_task_event_context(db, task_id)
+
+
+def test_empty_task_keeps_zero_horizon(canonical):
+    factory, task_id = canonical
+    with factory() as db:
+        assert db.get(Task, task_id).conversation_event_sequence == 0
+        loaded = load_task_event_context(db, task_id)
+        assert loaded.messages == []
+        assert loaded.watermark is None
+
+
+def test_boolean_sequence_is_not_a_native_coordinate(canonical):
+    from xagent.web.services.task_execution_event_writer import (
+        compact_transcript_event_watermark,
+    )
+
+    factory, task_id = canonical
+    data = {
+        "summary": "invalid sequence",
+        MODEL_CONTEXT_WATERMARK_METADATA_KEY: {
+            "scope_id": "root",
+            "sequence": True,
+            "event_id": "anchor",
+        },
+    }
+    with factory() as db:
+        with patch.object(
+            db, "scalar", side_effect=AssertionError("boolean sequence reached SQL")
+        ):
+            with pytest.raises(
+                ValueError, match="Invalid native model context watermark"
+            ):
+                compact_transcript_event_watermark(db, task_id, "invalid", data)
+        fact(db, task_id, "action_end_compact", "invalid", {"data": data})
+        db.commit()
+        with pytest.raises(ValueError, match="Invalid model context coverage sequence"):
+            load_task_event_context(db, task_id)

@@ -228,6 +228,8 @@ def compact_transcript_event_watermark(
             or native.get("scope_id") != "root"
             or type(native.get("sequence")) is not int
             or native["sequence"] <= 0
+            or not isinstance(native.get("event_id"), str)
+            or not native["event_id"]
         ):
             raise ValueError("Invalid native model context watermark")
         anchor = db.scalar(

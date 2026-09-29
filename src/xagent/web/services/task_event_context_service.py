@@ -55,22 +55,61 @@ def _data(event: TaskExecutionEvent) -> dict[str, Any]:
     return data
 
 
-def _coordinate(value: Any, db: Session, task_id: int) -> int:
+def _coordinate(value: Any) -> tuple[int, str]:
     if not isinstance(value, dict) or value.get("scope_id") != "root":
         raise ValueError("Invalid model context coverage scope")
     sequence = value.get("sequence")
     if type(sequence) is not int or sequence <= 0:
         raise ValueError("Invalid model context coverage sequence")
-    anchor = db.scalar(
-        select(TaskExecutionEvent.event_id).where(
-            TaskExecutionEvent.task_id == task_id,
-            TaskExecutionEvent.scope_id == "root",
-            TaskExecutionEvent.sequence == sequence,
-        )
-    )
-    if anchor is None or value.get("event_id") != anchor:
+    event_id = value.get("event_id")
+    if not isinstance(event_id, str) or not event_id:
         raise ValueError("Invalid model context coverage identity")
-    return sequence
+    return sequence, event_id
+
+
+def _load_context_anchors(
+    db: Session, task_id: int, horizon: int, events: list[TaskExecutionEvent]
+) -> dict[str, tuple[int, str, int]]:
+    """Fetch referenced identities in bounded batches, without snapshot bodies."""
+    references: set[str] = set()
+    for event in events:
+        if event.kind == "input_applied":
+            event_id = _data(event).get("recovery_event_id")
+            if not isinstance(event_id, str) or not event_id:
+                raise ValueError("Applied input has no prior root recovery state")
+            references.add(event_id)
+        elif event.kind == "action_end_compact":
+            data = _data(event)
+            content = data.get("summary")
+            if not isinstance(content, str) or not content.strip():
+                continue
+            coordinate = data.get(MODEL_CONTEXT_WATERMARK_METADATA_KEY)
+            if coordinate is None:
+                coordinate = event.payload.get("transcript_watermark")
+            if coordinate is not None:
+                references.add(_coordinate(coordinate)[1])
+
+    identities = sorted(references)
+    anchors: dict[str, tuple[int, str, int]] = {}
+    for offset in range(0, len(identities), MAX_EXECUTION_EVENT_PAGE_SIZE):
+        rows = db.execute(
+            select(
+                TaskExecutionEvent.event_id,
+                TaskExecutionEvent.sequence,
+                TaskExecutionEvent.kind,
+                TaskExecutionEvent.payload_version,
+            ).where(
+                TaskExecutionEvent.task_id == task_id,
+                TaskExecutionEvent.scope_id == "root",
+                TaskExecutionEvent.sequence <= horizon,
+                TaskExecutionEvent.event_id.in_(
+                    identities[offset : offset + MAX_EXECUTION_EVENT_PAGE_SIZE]
+                ),
+            )
+        )
+        for event_id, sequence, kind, version in rows:
+            anchors[event_id] = (sequence, kind, version)
+    return anchors
 
 
 def load_task_event_context(
@@ -148,6 +187,7 @@ def load_task_event_context(
     ):
         events.extend(page)
         cursor = int(page[-1].sequence)
+    anchors = _load_context_anchors(db, task_id, horizon, events)
     accepted: dict[str, TaskExecutionEvent] = {}
     applied: dict[str, int] = {}
     skill_name = None
@@ -165,17 +205,13 @@ def load_task_event_context(
             accepted[str(event.turn_id)] = event
         elif event.kind == "input_applied":
             data = _data(event)
-            state = db.scalar(
-                select(TaskExecutionEvent.sequence).where(
-                    TaskExecutionEvent.task_id == task_id,
-                    TaskExecutionEvent.scope_id == "root",
-                    TaskExecutionEvent.event_id == data.get("recovery_event_id"),
-                    TaskExecutionEvent.kind == "recovery_state",
-                    TaskExecutionEvent.payload_version == 1,
-                    TaskExecutionEvent.sequence < event.sequence,
-                )
-            )
-            if state is None:
+            state = anchors.get(cast(str, data.get("recovery_event_id")))
+            if (
+                state is None
+                or state[1] != "recovery_state"
+                or state[2] != 1
+                or state[0] >= event.sequence
+            ):
                 raise ValueError("Applied input has no prior root recovery state")
             # Existing/non-transcript starts legitimately have no acceptance.
             # Application alone must not invent a transcript message for them.
@@ -197,7 +233,10 @@ def load_task_event_context(
             legacy = event.payload.get("transcript_watermark")
             if native is None and legacy is None:
                 continue  # Older summaries make no usable coverage claim.
-            floor = _coordinate(native if native is not None else legacy, db, task_id)
+            floor, anchor_id = _coordinate(native if native is not None else legacy)
+            anchor = anchors.get(anchor_id)
+            if anchor is None or anchor[0] != floor:
+                raise ValueError("Invalid model context coverage identity")
             if floor >= event.sequence:
                 raise ValueError("Summary covers a future event")
             # Native coverage includes model history; A's coordinate only

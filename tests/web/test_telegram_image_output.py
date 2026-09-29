@@ -293,7 +293,9 @@ async def test_restore_telegram_task_context_loads_transcript_and_recovery_state
             self.execution_context_messages = None
             self.recovered_skill_context = None
 
-        def set_conversation_history(self, messages, *, watermark=None):
+        def set_conversation_history(
+            self, messages, *, watermark=None, event_watermark=None
+        ):
             self.conversation_history = messages
 
         def set_execution_context_messages(self, messages):
