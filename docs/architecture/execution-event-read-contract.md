@@ -308,19 +308,24 @@ For V2 tasks, `ExecutionEventTraceAdapter` reads `recovery_state` instead of
 legacy Trace checkpoint content. It selects the latest state in the existing
 root run/execution partition or delegated build/execution scope, bounded by the
 committed task sequence. The root reader retains the existing partition-widening
-policy and its recheck; both root and child readers verify a bound lease again
+policy and its recheck, including terminal unknown-tool-effect verdicts; both root
+and child readers verify a bound lease again
 before returning, including current terminal task status: coordinator cancellation
 can retain the lease identity and can commit after the captured horizon.
 A completed/failed settlement after the state prevents root
 resume, including cancellations recorded as failed settlements.
 
 Before a saved state reaches the scheduler, every pending ordinary tool attempt
-is checked, including active DAG steps and Auto's selected ReAct/DAG child. A committed result is reused through
+is checked, including active DAG steps and Auto's selected ReAct/DAG child. Auto
+state with a non-empty child but no recognized decision is rejected as corrupt;
+empty pre-decision and final-answer states remain readable. A committed result is reused through
 the existing ReAct result application path; no second tool invocation or tool
 start/result fact is emitted. A start without a confirmed result, including an
 interrupted attempt, raises `UnknownToolEffectError`. Lease-expiry recovery
 settles that run as FAILED through its existing fenced transaction; it does not
-leave an expired RUNNING lease for endless retries. This includes pausing or
+leave an expired RUNNING lease for endless retries. The task error and settled
+fact distinguish an unknown tool effect from a generic lease-expiry failure.
+This includes pausing or
 stopping V2 while a tool is in flight: cancellation does not prove that an
 external side effect was rolled back, so that pending attempt cannot be resumed
 automatically. The context reader may show a failure observation to the model;

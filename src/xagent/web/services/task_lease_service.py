@@ -340,7 +340,9 @@ class CheckpointRecoveryVerdict(str, Enum):
     ``RECOVERABLE`` and ``NOT_RECOVERABLE`` both mean the checkpoint's row
     identity was authoritatively resolved (found-and-valid, or found-invalid,
     or provably absent); the caller acts on the candidate immediately,
-    recovering to PAUSED or FAILED respectively. ``INDETERMINATE`` means row
+    recovering to PAUSED or FAILED respectively. ``UNKNOWN_TOOL_EFFECT`` also
+    fails the task, preserving why replay is unsafe for the persisted error.
+    ``INDETERMINATE`` means row
     identity or content could not be established this round (an ambiguous
     legacy match or unavailable event read) -- the caller must leave the
     candidate's lease and status untouched so the next sweep can retry, never fold this into FAILED.
@@ -348,6 +350,7 @@ class CheckpointRecoveryVerdict(str, Enum):
 
     RECOVERABLE = "recoverable"
     NOT_RECOVERABLE = "not_recoverable"
+    UNKNOWN_TOOL_EFFECT = "unknown_tool_effect"
     INDETERMINATE = "indeterminate"
 
 
@@ -531,11 +534,9 @@ def resolve_checkpoint_recovery(
                     execution_id=str(candidate.task_id),
                     run_id=candidate.run_id,
                 )
-            except (
-                CheckpointCorruptError,
-                CheckpointAccessRefusedError,
-                UnknownToolEffectError,
-            ):
+            except UnknownToolEffectError:
+                return CheckpointRecoveryVerdict.UNKNOWN_TOOL_EFFECT
+            except (CheckpointCorruptError, CheckpointAccessRefusedError):
                 return CheckpointRecoveryVerdict.NOT_RECOVERABLE
             return (
                 CheckpointRecoveryVerdict.RECOVERABLE

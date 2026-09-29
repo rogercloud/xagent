@@ -42,6 +42,10 @@ logger = logging.getLogger(__name__)
 TASK_LEASE_EXPIRED_ERROR = (
     "Task execution lease expired before the runner completed the task."
 )
+TASK_UNKNOWN_TOOL_EFFECT_ERROR = (
+    "Task execution lease expired with an unknown tool effect; "
+    "automatic replay is unsafe."
+)
 TASK_LEASE_PAUSED_TRIGGER_ERROR = (
     "Task paused after execution lease expiry; manual resume is required."
 )
@@ -279,7 +283,13 @@ def recover_task_lease_candidate_no_commit(
         if verdict is CheckpointRecoveryVerdict.RECOVERABLE
         else TaskStatus.FAILED
     )
-    task_error = None if next_status == TaskStatus.PAUSED else TASK_LEASE_EXPIRED_ERROR
+    task_error = (
+        None
+        if next_status == TaskStatus.PAUSED
+        else TASK_UNKNOWN_TOOL_EFFECT_ERROR
+        if verdict is CheckpointRecoveryVerdict.UNKNOWN_TOOL_EFFECT
+        else TASK_LEASE_EXPIRED_ERROR
+    )
     recovered = recover_expired_task_lease_no_commit(
         db,
         candidate,

@@ -808,6 +808,11 @@ async def test_unknown_effect_settles_expired_task(canonical, cancelled):
         ]
         assert len(settled) == 1
         assert settled[0].payload["status"] == "failed"
+        assert task.error_message == (
+            "Task execution lease expired with an unknown tool effect; "
+            "automatic replay is unsafe."
+        )
+        assert settled[0].payload["result"]["error"] == task.error_message
         assert not get_expired_task_lease_candidates(db, cutoff=utc_now(), limit=1)
         assert (
             recover_task_lease_candidate_no_commit(
@@ -927,3 +932,154 @@ async def test_unavailable_lease_read_is_visible_until_next_clean_sweep(
                 factory.kw["bind"], "before_cursor_execute", database_failure
             )
         clear_degradation(CHECKPOINT_RECOVERY_UNAVAILABLE)
+
+
+@pytest.mark.asyncio
+async def test_unknown_effect_rechecks_widened_partition(canonical, monkeypatch):
+    from copy import deepcopy
+
+    from xagent.web.services.task_lease_service import (
+        acquire_task_lease,
+        bind_task_lease_context,
+    )
+
+    factory, tid = canonical
+    store = TraceCheckpointStore(tracer_for(tid))
+    call = {
+        "id": "call",
+        "name": "calculator",
+        "args": {},
+        "assistant_message_id": "batch",
+        "tool_attempt_id": "attempt",
+    }
+    await store.save(
+        {
+            "execution_id": str(tid),
+            "context": {"messages": []},
+            "pattern_state": {"pending_tool_calls": [call]},
+        }
+    )
+    await PatternRuntime(tracer=store).on_tool_start(tool_call=call)
+    with factory() as db:
+        old = db.query(TaskExecutionEvent).filter_by(kind="recovery_state").one()
+        assert old.run_id is None
+        payload = deepcopy(old.payload)
+        lease = acquire_task_lease(db, tid, new_run=True)
+    adapter = ExecutionEventTraceAdapter(tid)
+    probe = adapter._task_has_run_tagged_checkpoint
+    observations = []
+
+    def commit_tagged_checkpoint_after_probe(db):
+        answer = probe(db)
+        observations.append(answer)
+        if len(observations) == 1:
+            assert answer is False
+            payload["protocol_event_id"] = "fresh-tagged"
+            payload["data"]["snapshot"]["pattern_state"] = {}
+            with factory() as writer:
+                append_fact_no_commit(
+                    writer,
+                    task_id=tid,
+                    scope_id="root",
+                    run_id=lease.run_id,
+                    kind="recovery_state",
+                    key="runtime:fresh-tagged",
+                    payload=payload,
+                )
+                writer.commit()
+        return answer
+
+    monkeypatch.setattr(
+        adapter,
+        "_task_has_run_tagged_checkpoint",
+        commit_tagged_checkpoint_after_probe,
+    )
+    with bind_task_lease_context(lease):
+        with pytest.raises(CheckpointUnavailableError, match="stale snapshot"):
+            await adapter.load_latest_checkpoint(str(tid))
+        assert observations == [False, True]
+        assert (await adapter.load_latest_checkpoint(str(tid)))["pattern_state"] == {}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("decision", [None, {}, {"action": "unknown"}])
+@pytest.mark.parametrize("child_slot", ["react_state", "dag_state"])
+async def test_auto_child_state_requires_recognized_decision(
+    canonical, decision, child_slot
+):
+    _, tid = canonical
+    store = TraceCheckpointStore(tracer_for(tid))
+    call = {
+        "id": "call",
+        "name": "calculator",
+        "args": {},
+        "assistant_message_id": "batch",
+        "tool_attempt_id": "attempt",
+    }
+    child = {"pending_tool_calls": [call]}
+    if child_slot == "dag_state":
+        child = {"active_step_pattern_states": {"step": child}}
+    await store.save(
+        {
+            "execution_id": str(tid),
+            "context": {"messages": []},
+            "pattern": "AutoPattern",
+            "pattern_state": {"decision": decision, child_slot: child},
+        }
+    )
+    await PatternRuntime(tracer=store).on_tool_start(tool_call=call)
+    with pytest.raises(CheckpointCorruptError, match="Auto child state"):
+        await store.load_latest_checkpoint(str(tid))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("decision", [None, {"action": "final_answer"}])
+async def test_auto_without_child_state_remains_readable(canonical, decision):
+    _, tid = canonical
+    store = TraceCheckpointStore(tracer_for(tid))
+    snapshot = {
+        "execution_id": str(tid),
+        "context": {"messages": []},
+        "pattern": "AutoPattern",
+        "pattern_state": {
+            "decision": decision,
+            "react_state": None,
+            "dag_state": None,
+        },
+    }
+    await store.save(snapshot)
+    assert await store.load_latest_checkpoint(str(tid)) == snapshot
+
+
+@pytest.mark.asyncio
+async def test_no_checkpoint_keeps_generic_expiry_reason(canonical):
+    from datetime import timedelta
+
+    from xagent.web.models.task import TaskStatus
+    from xagent.web.services.task_lease_recovery import (
+        TASK_LEASE_EXPIRED_ERROR,
+        recover_task_lease_candidate_no_commit,
+    )
+    from xagent.web.services.task_lease_service import (
+        acquire_task_lease,
+        get_expired_task_lease_candidates,
+        utc_now,
+    )
+
+    factory, tid = canonical
+    with factory() as db:
+        acquire_task_lease(db, tid, new_run=True)
+        db.get(Task, tid).lease_expires_at = utc_now() - timedelta(seconds=5)
+        db.commit()
+        candidate = get_expired_task_lease_candidates(db, cutoff=utc_now(), limit=1)[0]
+        assert (
+            recover_task_lease_candidate_no_commit(
+                db, candidate, recovered_at=utc_now()
+            )
+            == TaskStatus.FAILED
+        )
+        db.commit()
+        task = db.get(Task, tid)
+        settled = db.query(TaskExecutionEvent).filter_by(kind="execution_settled").one()
+        assert task.error_message == TASK_LEASE_EXPIRED_ERROR
+        assert settled.payload["result"]["error"] == TASK_LEASE_EXPIRED_ERROR

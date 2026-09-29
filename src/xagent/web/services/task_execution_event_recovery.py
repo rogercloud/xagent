@@ -147,6 +147,12 @@ def read_event_checkpoint(
                 if not isinstance(decision, dict):
                     raise CheckpointCorruptError("Unreadable Auto decision")
                 action = decision.get("action")
+                if action not in ("react", "plan_execute", "final_answer") and (
+                    state.get("react_state") or state.get("dag_state")
+                ):
+                    raise CheckpointCorruptError(
+                        "Auto child state has no recognized decision"
+                    )
                 state = (
                     state.get("react_state")
                     if action == "react"
