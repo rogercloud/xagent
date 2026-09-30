@@ -177,7 +177,10 @@ async def test_channel_failure_suppresses_stale_error_after_exact_settlement_rej
 
     agent_service = SimpleNamespace(
         tracer=FakeTracer(),
-        set_conversation_history=lambda _messages, *, watermark=None: None,
+        set_conversation_history=lambda _messages,
+        *,
+        watermark=None,
+        event_watermark=None: None,
         set_execution_context_messages=lambda _messages: None,
         set_recovered_skill_context=lambda _context: None,
     )
@@ -355,7 +358,10 @@ async def test_successful_channel_turn_persists_user_before_exact_assistant_sett
 
     agent_service = SimpleNamespace(
         tracer=FakeTracer(),
-        set_conversation_history=lambda _messages, *, watermark=None: None,
+        set_conversation_history=lambda _messages,
+        *,
+        watermark=None,
+        event_watermark=None: None,
         set_execution_context_messages=lambda _messages: None,
         set_recovered_skill_context=lambda _context: None,
     )

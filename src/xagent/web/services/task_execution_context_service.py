@@ -42,11 +42,10 @@ def load_task_execution_recovery_snapshot_sync(
     from .task_execution_event_writer import uses_execution_events
 
     if uses_execution_events(db, task_id):
-        from .task_event_context_service import load_task_event_context
+        from .task_event_context_service import load_task_event_skill_name
 
-        context = load_task_event_context(db, task_id)
         return TaskExecutionRecoverySnapshot(
-            selected_skill_name=context.selected_skill_name
+            selected_skill_name=load_task_event_skill_name(db, task_id)
         )
     return TaskExecutionRecoverySnapshot(
         messages=tuple(

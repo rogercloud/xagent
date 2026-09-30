@@ -756,3 +756,205 @@ def test_boolean_sequence_is_not_a_native_coordinate(canonical):
         db.commit()
         with pytest.raises(ValueError, match="Invalid model context coverage sequence"):
             load_task_event_context(db, task_id)
+
+
+def test_skill_only_recovery_reads_latest_root_selection_without_model_payloads(
+    canonical,
+):
+    from xagent.web.services.task_execution_context_service import (
+        load_task_execution_recovery_snapshot_sync,
+    )
+
+    factory, task_id = canonical
+    with factory() as db:
+        assert (
+            load_task_execution_recovery_snapshot_sync(db, task_id).selected_skill_name
+            is None
+        )
+        fact(
+            db,
+            task_id,
+            "skill_select_end",
+            "first-skill",
+            {"data": {"selected": True, "skill_name": " csv "}},
+        )
+        child = fact(
+            db,
+            task_id,
+            "skill_select_end",
+            "child-skill",
+            {"data": {"selected": True, "skill_name": "child"}},
+            scope_id="child",
+        )
+        horizon = child.sequence
+        for index in range(105):
+            # Skill recovery does not load or interpret unrelated model facts.
+            fact(
+                db,
+                task_id,
+                "tool_execution_end",
+                f"unrelated:{index}",
+                {"large_result": "unrelated"},
+            )
+        future = fact(
+            db,
+            task_id,
+            "skill_select_end",
+            "future-skill",
+            {"data": {"selected": True, "skill_name": "future"}},
+        )
+        db.get(Task, task_id).conversation_event_sequence = horizon
+        db.commit()
+        statements = []
+
+        def record(_conn, _cursor, statement, parameters, _context, _executemany):
+            if statement.lstrip().upper().startswith("SELECT"):
+                statements.append((statement, parameters))
+
+        sa.event.listen(db.get_bind(), "before_cursor_execute", record)
+        try:
+            with patch(
+                "xagent.web.services.task_event_context_service.load_task_event_context",
+                side_effect=AssertionError("full history must not be reconstructed"),
+            ):
+                recovered = load_task_execution_recovery_snapshot_sync(db, task_id)
+        finally:
+            sa.event.remove(db.get_bind(), "before_cursor_execute", record)
+        assert recovered.selected_skill_name == "csv"
+        assert recovered.messages == ()
+        assert len(statements) == 2  # storage version + one bounded skill selection
+        parameters = statements[-1][1]
+        assert "skill_select_end" in (
+            parameters.values() if isinstance(parameters, dict) else parameters
+        )
+        assert "LIMIT" in statements[-1][0]
+        db.get(Task, task_id).conversation_event_sequence = future.sequence
+        fact(
+            db,
+            task_id,
+            "skill_select_end",
+            "deselected",
+            {"data": {"selected": False, "skill_name": "csv"}},
+        )
+        db.commit()
+        assert (
+            load_task_execution_recovery_snapshot_sync(db, task_id).selected_skill_name
+            is None
+        )
+
+
+def test_skill_only_recovery_rejects_invalid_selected_event(canonical):
+    from xagent.web.services.task_execution_context_service import (
+        load_task_execution_recovery_snapshot_sync,
+    )
+
+    factory, task_id = canonical
+    with factory() as db:
+        event = fact(db, task_id, "skill_select_end", "bad-skill", {"data": []})
+        event_id = event.event_id
+        db.commit()
+        with pytest.raises(ValueError) as error:
+            load_task_execution_recovery_snapshot_sync(db, task_id)
+        assert f"task_id={task_id}" in str(error.value)
+        assert event_id in str(error.value)
+
+
+@pytest.mark.parametrize(
+    ("kind", "payload", "identity"),
+    [
+        ("input_accepted", {"role": "assistant", "content": "private content"}, {}),
+        (
+            "action_end_compact",
+            {
+                "data": {
+                    "summary": "private content",
+                    MODEL_CONTEXT_WATERMARK_METADATA_KEY: {
+                        "scope_id": "child",
+                        "event_id": "invalid",
+                        "sequence": 1,
+                    },
+                }
+            },
+            {},
+        ),
+        ("execution_settled", {"result": []}, {}),
+        (
+            "tool_execution_end",
+            {"data": {"tool_name": "search", "result": "private content"}},
+            {"tool_attempt_id": "orphan", "assistant_message_id": "batch"},
+        ),
+        (
+            "tool_execution_start",
+            {"data": {"tool_name": "search"}},
+            {"tool_attempt_id": "start", "assistant_message_id": "batch"},
+        ),
+    ],
+)
+def test_model_history_errors_identify_task_and_offending_event(
+    canonical, kind, payload, identity
+):
+    factory, task_id = canonical
+    with factory() as db:
+        event = fact(db, task_id, kind, "malformed", payload, **identity)
+        event_id = event.event_id
+        db.commit()
+        with pytest.raises(ValueError) as error:
+            load_task_event_context(db, task_id)
+        assert f"task_id={task_id}" in str(error.value)
+        assert f"event_id={event_id}" in str(error.value)
+        assert "private content" not in str(error.value)
+
+
+@pytest.mark.parametrize(
+    "cutoff", [{"before_turn_id": "missing-turn"}, {"before_message_id": 123456}]
+)
+def test_missing_cutoff_errors_identify_task_and_requested_cutoff(canonical, cutoff):
+    factory, task_id = canonical
+    with factory() as db:
+        with pytest.raises(ValueError) as error:
+            load_task_event_context(db, task_id, **cutoff)
+        assert f"task_id={task_id}" in str(error.value)
+        assert str(next(iter(cutoff.values()))) in str(error.value)
+
+
+@pytest.mark.parametrize("metadata", [[], ["private content"]])
+def test_invalid_question_metadata_names_the_event(canonical, metadata):
+    factory, task_id = canonical
+    with factory() as db:
+        event = fact(
+            db,
+            task_id,
+            "agent_message",
+            "question",
+            {
+                "data": {
+                    "expect_response": True,
+                    "message": "private content",
+                    "metadata": metadata,
+                }
+            },
+        )
+        event_id = event.event_id
+        db.commit()
+        with pytest.raises(ValueError, match="Invalid question metadata") as error:
+            load_task_event_context(db, task_id)
+        assert f"task_id={task_id}" in str(error.value)
+        assert f"event_id={event_id}" in str(error.value)
+        assert "private content" not in str(error.value)
+
+
+@pytest.mark.parametrize("fields", [{}, {"metadata": None}, {"metadata": {}}])
+def test_question_metadata_may_be_absent_null_or_an_object(canonical, fields):
+    factory, task_id = canonical
+    with factory() as db:
+        fact(
+            db,
+            task_id,
+            "agent_message",
+            "question",
+            {"data": {"expect_response": True, "message": "Which city?", **fields}},
+        )
+        db.commit()
+        assert load_task_event_context(db, task_id).messages == [
+            {"role": "assistant", "content": "Which city?"}
+        ]

@@ -48,22 +48,32 @@ class TaskEventContext:
 
 def _data(event: TaskExecutionEvent) -> dict[str, Any]:
     if event.payload_version != 1 or not isinstance(event.payload, dict):
-        raise ValueError(f"Unsupported model context event {event.event_id}")
+        raise ValueError(
+            f"Unsupported model context event {event.event_id} (task_id={event.task_id})"
+        )
     data = event.payload.get("data", event.payload)
     if not isinstance(data, dict):
-        raise ValueError(f"Invalid model context event {event.event_id}")
+        raise ValueError(
+            f"Invalid model context event {event.event_id} (task_id={event.task_id})"
+        )
     return data
 
 
-def _coordinate(value: Any) -> tuple[int, str]:
+def _coordinate(value: Any, event: TaskExecutionEvent) -> tuple[int, str]:
     if not isinstance(value, dict) or value.get("scope_id") != "root":
-        raise ValueError("Invalid model context coverage scope")
+        raise ValueError(
+            f"Invalid model context coverage scope (task_id={event.task_id}, event_id={event.event_id})"
+        )
     sequence = value.get("sequence")
     if type(sequence) is not int or sequence <= 0:
-        raise ValueError("Invalid model context coverage sequence")
+        raise ValueError(
+            f"Invalid model context coverage sequence (task_id={event.task_id}, event_id={event.event_id})"
+        )
     event_id = value.get("event_id")
     if not isinstance(event_id, str) or not event_id:
-        raise ValueError("Invalid model context coverage identity")
+        raise ValueError(
+            f"Invalid model context coverage identity (task_id={event.task_id}, event_id={event.event_id})"
+        )
     return sequence, event_id
 
 
@@ -76,7 +86,9 @@ def _load_context_anchors(
         if event.kind == "input_applied":
             event_id = _data(event).get("recovery_event_id")
             if not isinstance(event_id, str) or not event_id:
-                raise ValueError("Applied input has no prior root recovery state")
+                raise ValueError(
+                    f"Applied input has no prior root recovery state (task_id={event.task_id}, event_id={event.event_id})"
+                )
             references.add(event_id)
         elif event.kind == "action_end_compact":
             data = _data(event)
@@ -87,7 +99,7 @@ def _load_context_anchors(
             if coordinate is None:
                 coordinate = event.payload.get("transcript_watermark")
             if coordinate is not None:
-                references.add(_coordinate(coordinate)[1])
+                references.add(_coordinate(coordinate, event)[1])
 
     identities = sorted(references)
     anchors: dict[str, tuple[int, str, int]] = {}
@@ -112,6 +124,32 @@ def _load_context_anchors(
     return anchors
 
 
+def _selected_skill_name(event: TaskExecutionEvent) -> str | None:
+    data = _data(event)
+    return str(data.get("skill_name") or "").strip() if data.get("selected") else None
+
+
+def load_task_event_skill_name(db: Session, task_id: int) -> str | None:
+    """Read only the latest root skill selection at the committed horizon."""
+    horizon = (
+        select(Task.conversation_event_sequence)
+        .where(Task.id == task_id)
+        .scalar_subquery()
+    )
+    event = db.scalar(
+        select(TaskExecutionEvent)
+        .where(
+            TaskExecutionEvent.task_id == task_id,
+            TaskExecutionEvent.scope_id == "root",
+            TaskExecutionEvent.kind == "skill_select_end",
+            TaskExecutionEvent.sequence <= horizon,
+        )
+        .order_by(TaskExecutionEvent.sequence.desc())
+        .limit(1)
+    )
+    return _selected_skill_name(event) if event is not None else None
+
+
 def load_task_event_context(
     db: Session,
     task_id: int,
@@ -134,7 +172,9 @@ def load_task_event_context(
             )
         )
         if boundary is None:
-            raise ValueError("Current turn has no accepted event")
+            raise ValueError(
+                f"Current turn has no accepted event (task_id={task_id}, turn_id={before_turn_id})"
+            )
         horizon = min(horizon, boundary - 1)
     elif before_message_id is not None:
         # Queued commands retain the old integer meaning. This is an identity
@@ -153,7 +193,9 @@ def load_task_event_context(
             )
         )
         if boundary is None:
-            raise ValueError("Historical cutoff has no root execution event")
+            raise ValueError(
+                f"Historical cutoff has no root execution event (task_id={task_id}, message_id={before_message_id})"
+            )
         horizon = min(horizon, boundary - 1)
 
     events: list[TaskExecutionEvent] = []
@@ -201,7 +243,9 @@ def load_task_event_context(
                 or data.get("role") != "user"
                 or not isinstance(data.get("content"), str)
             ):
-                raise ValueError("Invalid accepted input")
+                raise ValueError(
+                    f"Invalid accepted input (task_id={event.task_id}, event_id={event.event_id})"
+                )
             accepted[str(event.turn_id)] = event
         elif event.kind == "input_applied":
             data = _data(event)
@@ -212,18 +256,15 @@ def load_task_event_context(
                 or state[2] != 1
                 or state[0] >= event.sequence
             ):
-                raise ValueError("Applied input has no prior root recovery state")
+                raise ValueError(
+                    f"Applied input has no prior root recovery state (task_id={event.task_id}, event_id={event.event_id})"
+                )
             # Existing/non-transcript starts legitimately have no acceptance.
             # Application alone must not invent a transcript message for them.
             if event.turn_id in accepted:
                 applied[str(event.turn_id)] = int(event.sequence)
         elif event.kind == "skill_select_end":
-            data = _data(event)
-            skill_name = (
-                str(data.get("skill_name") or "").strip()
-                if data.get("selected")
-                else None
-            )
+            skill_name = _selected_skill_name(event)
         elif event.kind == "action_end_compact":
             data = _data(event)
             content = data.get("summary")
@@ -233,12 +274,18 @@ def load_task_event_context(
             legacy = event.payload.get("transcript_watermark")
             if native is None and legacy is None:
                 continue  # Older summaries make no usable coverage claim.
-            floor, anchor_id = _coordinate(native if native is not None else legacy)
+            floor, anchor_id = _coordinate(
+                native if native is not None else legacy, event
+            )
             anchor = anchors.get(anchor_id)
             if anchor is None or anchor[0] != floor:
-                raise ValueError("Invalid model context coverage identity")
+                raise ValueError(
+                    f"Invalid model context coverage identity (task_id={event.task_id}, event_id={event.event_id})"
+                )
             if floor >= event.sequence:
-                raise ValueError("Summary covers a future event")
+                raise ValueError(
+                    f"Summary covers a future event (task_id={event.task_id}, event_id={event.event_id})"
+                )
             # Native coverage includes model history; A's coordinate only
             # covers transcript facts, so earlier tool facts remain eligible.
             summary = {
@@ -292,7 +339,9 @@ def load_task_event_context(
             ):
                 continue
             if not isinstance(data.get("content"), str):
-                raise ValueError("Invalid assistant message")
+                raise ValueError(
+                    f"Invalid assistant message (task_id={event.task_id}, event_id={event.event_id})"
+                )
             message_type = str(data.get("message_type") or "")
             refs = (
                 build_image_context_references(data.get("attachments"))
@@ -316,10 +365,14 @@ def load_task_event_context(
         elif event.kind == "agent_message" and event.sequence > transcript_floor:
             data = _data(event)
             if data.get("expect_response"):
-                metadata = data.get("metadata") or {}
+                metadata = data.get("metadata")
+                if metadata is not None and not isinstance(metadata, dict):
+                    raise ValueError(
+                        f"Invalid question metadata (task_id={event.task_id}, event_id={event.event_id})"
+                    )
                 content = build_assistant_transcript_content(
                     content=data.get("message"),
-                    interactions=metadata.get("interactions"),
+                    interactions=(metadata or {}).get("interactions"),
                 )
                 if content:
                     entries.append(
@@ -337,7 +390,9 @@ def load_task_event_context(
             if data.get("tool_name") in CONTROL_TOOL_NAMES:
                 continue
             if not event.tool_attempt_id or not event.assistant_message_id:
-                raise ValueError("Tool event has no attempt/batch identity")
+                raise ValueError(
+                    f"Tool event has no attempt/batch identity (task_id={event.task_id}, event_id={event.event_id})"
+                )
             if event.kind == "tool_execution_start":
                 starts[str(event.tool_attempt_id)] = event
                 batches.setdefault(str(event.assistant_message_id), []).append(event)
@@ -347,7 +402,9 @@ def load_task_event_context(
             data = _data(event)
             result = data.get("result")
             if not isinstance(result, dict):
-                raise ValueError("Invalid execution settlement")
+                raise ValueError(
+                    f"Invalid execution settlement (task_id={event.task_id}, event_id={event.event_id})"
+                )
             status = result.get("status", data.get("status"))
             if status in {"waiting_for_user", "interrupted", "paused"}:
                 continue
@@ -384,7 +441,9 @@ def load_task_event_context(
                     or end.assistant_message_id != start.assistant_message_id
                     or end.run_id != start.run_id
                 ):
-                    raise ValueError("Tool outcome does not match its start")
+                    raise ValueError(
+                        f"Tool outcome does not match its start (task_id={task_id}, event_id={end.event_id}, start_event_id={start.event_id})"
+                    )
                 last_position = max(last_position, int(end.sequence))
                 result = _resolve_tool_result(str(end.kind), _data(end))
             else:
@@ -405,7 +464,9 @@ def load_task_event_context(
                 or not call_id
                 or not isinstance(params, dict)
             ):
-                raise ValueError("Invalid persisted tool call")
+                raise ValueError(
+                    f"Invalid persisted tool call (task_id={task_id}, event_id={start.event_id})"
+                )
             calls.append(
                 {
                     "id": call_id,
@@ -443,8 +504,11 @@ def load_task_event_context(
                     ],
                 )
             )
-    if outcomes.keys() - starts.keys():
-        raise ValueError("Tool result has no matching start")
+    for attempt_id, end in outcomes.items():
+        if attempt_id not in starts:
+            raise ValueError(
+                f"Tool result has no matching start (task_id={task_id}, event_id={end.event_id})"
+            )
 
     messages = [
         message
