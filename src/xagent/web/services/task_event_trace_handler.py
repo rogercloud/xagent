@@ -369,8 +369,9 @@ def _convert_timestamp_to_utc_timestamp(timestamp: Any) -> float:
 class TaskEventTraceHandler(TraceHandler):
     """Trace handler that publishes events through the host event delivery adapter."""
 
-    def __init__(self, task_id: int):
+    def __init__(self, task_id: int, *, authoritative: bool = False):
         self.task_id = task_id
+        self.authoritative = authoritative
         self._task_description: Optional[str] = None
         self._task_description_loaded = False
 
@@ -418,6 +419,16 @@ class TaskEventTraceHandler(TraceHandler):
                 f"TaskEventTraceHandler handling event: {event.event_type.value} for task {self.task_id}"
             )
 
+            if self.authoritative:
+                stream_event = await run_in_thread_with_telemetry(
+                    "websocket_execution_event_display",
+                    self._load_event_display,
+                    str(event.id),
+                )
+                if stream_event is not None:
+                    await publish_task_event(stream_event, self.task_id)
+                return
+
             # Load task description if not already loaded
             await self._load_task_description()
 
@@ -458,6 +469,13 @@ class TaskEventTraceHandler(TraceHandler):
             logger.warning(
                 f"Failed to send trace event to WebSocket for task {self.task_id}: {e}"
             )
+
+    def _load_event_display(self, protocol_event_id: str) -> dict[str, Any] | None:
+        from ..models.database import get_session_local
+        from .task_event_display import load_live_display_event
+
+        with get_session_local()() as db:
+            return load_live_display_event(db, self.task_id, protocol_event_id)
 
     async def _load_task_description(self) -> None:
         """Load task description from database."""

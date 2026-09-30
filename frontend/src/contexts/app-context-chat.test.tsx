@@ -197,6 +197,7 @@ function StateProbe() {
           }))
         )}
       </div>
+      <div data-testid="message-statuses">{JSON.stringify(state.messages.map(message => message.status))}</div>
       <div data-testid="trace-events">
         {JSON.stringify(
           allTraceEvents.map((event) => {
@@ -591,6 +592,112 @@ describe("AppProvider websocket message routing", () => {
   afterEach(() => {
     cleanup()
     localStorage.clear()
+  })
+
+  it("keeps equal V2 assistant occurrences and reconciles their replay by identity", () => {
+    render(<AppProvider token="token"><SeedRunningTask /><StateProbe /></AppProvider>)
+    const send = (id: string) => act(() => {
+      webSocketOptions.current?.onMessage?.({
+        type: "trace_event", event_type: "agent_message", event_id: `wire-${id}`,
+        task_id: 1, timestamp: "2026-05-27T05:00:00Z",
+        data: { message: "same answer", message_id: id, display: "chat", expect_response: false },
+      } as never)
+    })
+    send("execution_message_first")
+    send("execution_message_second")
+    send("execution_message_first")
+    const messages = JSON.parse(screen.getByTestId("messages").textContent || "[]")
+    expect(messages.map((message: { id: string }) => message.id)).toEqual([
+      "execution_message_first", "execution_message_second",
+    ])
+  })
+
+  it("uses the V2 settled message to update its stream while completion traces stay in the timeline", () => {
+    render(<AppProvider token="token"><SeedRunningTask /><StateProbe /></AppProvider>)
+    const send = (message: Record<string, unknown>) => act(() => {
+      webSocketOptions.current?.onMessage?.({
+        task_id: 1, timestamp: "2026-05-27T05:00:00Z", ...message,
+      } as never)
+    })
+    send({ type: "final_answer_start", message_id: "final_answer_v2" })
+    send({ type: "final_answer_end", message_id: "final_answer_v2", content: "streamed answer" })
+    send({ type: "trace_event", event_type: "task_completion", event_id: "completion", data: {
+      display: "timeline", success: true, result: { content: "completion answer", stream_message_id: "final_answer_v2" },
+    } })
+    send({ type: "trace_event", event_type: "ai_message", event_id: "ai", data: {
+      display: "timeline", content: "AI trace answer", stream_message_id: "final_answer_v2",
+    } })
+    send({ type: "trace_event", event_type: "agent_message", event_id: "execution_message_result", data: {
+      display: "chat", message: "settled answer", message_id: "final_answer_v2", expect_response: false,
+    } })
+    const messages = JSON.parse(screen.getByTestId("messages").textContent || "[]")
+    expect(messages).toHaveLength(1)
+    expect(messages[0]).toMatchObject({ id: "final_answer_v2", content: "settled answer" })
+  })
+
+  it("keeps the newest V2 stream content across overlapping live and historical frames", () => {
+    render(<AppProvider token="token"><SeedRunningTask /><StateProbe /></AppProvider>)
+    const send = (message: Record<string, unknown>) => act(() => {
+      webSocketOptions.current?.onMessage?.({
+        task_id: 1, timestamp: "2026-05-27T05:00:00Z", ...message,
+      } as never)
+    })
+    send({ type: "stream_resync_required" })
+    send({ type: "final_answer_end", message_id: "final_answer_order", content: "complete", execution_sequence: 12 })
+    send({ type: "final_answer_start", message_id: "final_answer_order", execution_sequence: 10 })
+    send({ type: "final_answer_delta", message_id: "final_answer_order", delta: "late token" })
+    let messages = JSON.parse(screen.getByTestId("messages").textContent || "[]")
+    expect(messages[0]).toMatchObject({ content: "complete" })
+    expect(JSON.parse(screen.getByTestId("message-statuses").textContent || "[]")).toEqual(["completed"])
+    send({ type: "trace_event", event_type: "agent_message", execution_sequence: 14,
+      event_id: "execution_message_owner", data: {
+        message_id: "final_answer_order", message: "settled with file link", expect_response: false,
+      },
+    })
+    send({ type: "final_answer_end", message_id: "final_answer_order", content: "complete", execution_sequence: 12 })
+    send({ type: "final_answer_start", message_id: "final_answer_attempt2", execution_sequence: 16 })
+    send({ type: "final_answer_end", message_id: "final_answer_attempt2", content: "second attempt", execution_sequence: 17 })
+    messages = JSON.parse(screen.getByTestId("messages").textContent || "[]")
+    expect(messages).toHaveLength(2)
+    expect(messages[0]).toMatchObject({ content: "settled with file link" })
+    expect(messages[1]).toMatchObject({ content: "second attempt" })
+  })
+
+  it("refreshes preserved stream ownership on reconnect without reviving an interrupted attempt", () => {
+    render(<AppProvider token="token"><SeedRunningTask /><StateProbe /></AppProvider>)
+    const send = (status: string) => act(() => {
+      webSocketOptions.current?.onMessage?.({
+        type: "final_answer_start", message_id: "final_answer_owner", execution_sequence: 10,
+        task_id: 1, timestamp: "2026-05-27T05:00:00Z", status,
+      } as never)
+    })
+    send("running")
+    act(() => { webSocketOptions.current?.onConnect?.() })
+    send("interrupted")
+    send("running")
+    expect(JSON.parse(screen.getByTestId("message-statuses").textContent || "[]")).toEqual(["interrupted"])
+  })
+
+  it("continues the current V2 attempt after an older history terminal arrives", () => {
+    render(<AppProvider token="token"><SeedRunningTask /><StateProbe /></AppProvider>)
+    const send = (message: Record<string, unknown>) => act(() => {
+      webSocketOptions.current?.onMessage?.({
+        task_id: 1, timestamp: "2026-05-27T05:00:00Z", ...message,
+      } as never)
+    })
+    send({ type: "final_answer_start", message_id: "final_answer_current", execution_sequence: 16, stream_run_id: "run" })
+    send({ type: "final_answer_end", message_id: "final_answer_old", execution_sequence: 12, content: "old answer" })
+    send({ type: "final_answer_delta", message_id: "final_answer_current", stream_run_id: "run", delta: "current prefix" })
+    const messages = JSON.parse(screen.getByTestId("messages").textContent || "[]")
+    expect(messages.find((message: { id: string }) => message.id === "final_answer_current").content).toBe("current prefix")
+    expect(messages.find((message: { id: string }) => message.id === "final_answer_old").content).toBe("old answer")
+    send({ type: "final_answer_end", message_id: "final_answer_current", execution_sequence: 17, content: "current full" })
+    send({ type: "final_answer_delta", message_id: "final_answer_missing_start", stream_run_id: "run", delta: "missing prefix suffix" })
+    expect(screen.getByTestId("messages").textContent).not.toContain("missing prefix suffix")
+    expect(screen.getByTestId("stream-recovery").textContent).toBe("1")
+    send({ type: "final_answer_end", message_id: "final_answer_missing_start", execution_sequence: 20, content: "recovered full answer" })
+    expect(screen.getByTestId("messages").textContent).toContain("recovered full answer")
+    expect(screen.getByTestId("stream-recovery").textContent).toBe("")
   })
 
   it.each([

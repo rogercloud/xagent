@@ -384,7 +384,44 @@ def _serialize_agent_execution_traces(
     *,
     task_id: int,
     worker_task_id: str,
+    event_horizon: int | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    if event_horizon is not None:
+        from ..services.task_event_display import (
+            convert_display_event,
+            event_data,
+            load_display_facts,
+        )
+
+        facts = load_display_facts(
+            db, task_id, scope_id=worker_task_id, through_sequence=event_horizon
+        )
+        converted = [
+            convert_display_event(row, replay=True)
+            for row in facts
+            if event_data(row).get("source") == DELEGATED_AGENT_TRACE_SOURCE
+        ]
+        canonical_events = [
+            {
+                key: event[key]
+                for key in (
+                    "event_id",
+                    "event_type",
+                    "step_id",
+                    "timestamp",
+                    "data",
+                    "parent_event_id",
+                )
+            }
+            for event in converted
+            if event is not None and event["type"] == "trace_event"
+        ]
+        if not canonical_events:
+            raise HTTPException(status_code=404, detail="Agent execution not found")
+        canonical_metadata: dict[str, Any] = {"worker_task_id": worker_task_id}
+        for event in canonical_events:
+            _merge_agent_execution_metadata(canonical_metadata, event["data"])
+        return canonical_events, canonical_metadata
     events = (
         db.query(TraceEvent)
         .filter(
@@ -736,10 +773,16 @@ async def get_workforce_agent_execution(
     if run is None:
         raise HTTPException(status_code=404, detail="Workforce run not found")
 
+    event_horizon = None
+    if run.task.conversation_storage_version == 2:
+        from ..services.task_event_display import display_horizon
+
+        event_horizon = display_horizon(db, task_id)
     trace_events, metadata = _serialize_agent_execution_traces(
         db,
         task_id=task_id,
         worker_task_id=worker_task_id,
+        event_horizon=event_horizon,
     )
 
     status = _derive_agent_execution_status(trace_events) or "running"
@@ -749,18 +792,44 @@ async def get_workforce_agent_execution(
         and run.task.status in {TaskStatus.COMPLETED, TaskStatus.FAILED}
     ):
         status = "interrupted"
-    summary_events = (
-        db.query(TraceEvent)
-        .filter(
-            TraceEvent.task_id == task_id,
-            TraceEvent.build_id.is_(None),
-            TraceEvent.data["worker_task_id"].as_string() == worker_task_id,
+    if event_horizon is not None:
+        from ..models.task_execution_event import TaskExecutionEvent
+        from ..services.task_event_display import convert_display_event
+
+        facts = (
+            db.query(TaskExecutionEvent)
+            .filter(
+                TaskExecutionEvent.task_id == task_id,
+                TaskExecutionEvent.scope_id == "root",
+                TaskExecutionEvent.sequence <= event_horizon,
+                TaskExecutionEvent.kind == "task_update_general",
+                TaskExecutionEvent.payload["data"]["worker_task_id"].as_string()
+                == worker_task_id,
+            )
+            .order_by(TaskExecutionEvent.sequence)
+            .all()
         )
-        .order_by(TraceEvent.id)
-        .all()
-    )
-    for event in summary_events:
-        data: dict[str, Any] = event.data if isinstance(event.data, dict) else {}
+        summary_data = [
+            {**event["data"], "event_type": event["event_type"]}
+            for fact in facts
+            if (event := convert_display_event(fact)) is not None
+        ]
+    else:
+        summary_events = (
+            db.query(TraceEvent)
+            .filter(
+                TraceEvent.task_id == task_id,
+                TraceEvent.build_id.is_(None),
+                TraceEvent.data["worker_task_id"].as_string() == worker_task_id,
+            )
+            .order_by(TraceEvent.id)
+            .all()
+        )
+        summary_data = [
+            event.data if isinstance(event.data, dict) else {}
+            for event in summary_events
+        ]
+    for data in summary_data:
         summary_type = data.get("event_type")
         _merge_agent_execution_metadata(metadata, data)
         if summary_type == "workforce_delegation_end":
