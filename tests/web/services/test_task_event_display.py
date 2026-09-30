@@ -814,3 +814,61 @@ async def test_orchestrator_setup_failure_publishes_canonical_error_and_code(
     assert terminal["type"] == "task_error"
     assert terminal["code"] == "auto_model_unavailable"
     assert terminal["message_id"] == historical["data"]["message_id"]
+
+
+@pytest.mark.parametrize("kind", ["input_accepted", "assistant_message"])
+@pytest.mark.parametrize("field", ["content", "message_type"])
+@pytest.mark.parametrize("value", [0, False, [], {}])
+def test_message_validation_rejects_falsey_non_strings(canonical, kind, field, value):
+    from xagent.web.services.task_event_display import load_live_display_event
+
+    factory, task_id = canonical
+    with factory() as db:
+        payload = {
+            "content": "hello",
+            "message_type": "user"
+            if kind == "input_accepted"
+            else "assistant_response",
+            "protocol_event_id": "invalid-message",
+        }
+        payload[field] = value
+        row = fact(
+            db, task_id, kind, "invalid-message", payload, flat=True, turn_id="turn"
+        )
+        db.commit()
+        error = f"task_id={task_id}, event_id={row.event_id}.*invalid message content or type"
+        with pytest.raises(ValueError, match=error):
+            load_event_display_snapshot(db, task_id)
+        with pytest.raises(ValueError, match=error):
+            load_live_display_event(db, task_id, "invalid-message")
+
+
+@pytest.mark.parametrize("kind", ["input_accepted", "assistant_message"])
+@pytest.mark.parametrize(
+    "payload",
+    [{}, {"content": None, "message_type": None}, {"content": "", "message_type": ""}],
+)
+def test_message_empty_defaults_remain_supported(canonical, kind, payload):
+    from xagent.web.services.client_error_messages import CLIENT_SAFE_TASK_FAILURE
+    from xagent.web.services.task_event_display import load_live_display_event
+
+    factory, task_id = canonical
+    with factory() as db:
+        fact(
+            db,
+            task_id,
+            kind,
+            "empty-message",
+            {**payload, "protocol_event_id": "empty-message"},
+            flat=True,
+            turn_id="turn",
+        )
+        db.commit()
+        snapshot = load_event_display_snapshot(db, task_id)
+        expected = "" if kind == "input_accepted" else CLIENT_SAFE_TASK_FAILURE
+        assert snapshot.messages[0]["content"] == expected
+        assert snapshot.messages[0]["message_type"] == ""
+        assert (
+            load_live_display_event(db, task_id, "empty-message")["data"]["content"]
+            == expected
+        )

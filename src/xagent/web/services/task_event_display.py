@@ -168,10 +168,14 @@ def _message(event: TaskExecutionEvent) -> dict[str, Any] | None:
         return None
     if event.kind in {"input_accepted", "assistant_message"}:
         role = "user" if event.kind == "input_accepted" else "assistant"
-        content = data.get("content") or ""
-        message_type = data.get("message_type") or ""
-        if not isinstance(content, str) or not isinstance(message_type, str):
+        content = data.get("content")
+        message_type = data.get("message_type")
+        if (content is not None and not isinstance(content, str)) or (
+            message_type is not None and not isinstance(message_type, str)
+        ):
             raise _invalid(event, "invalid message content or type")
+        content = content or ""
+        message_type = message_type or ""
         safe = role == "user" or assistant_history_has_safe_ancillary_payload(
             message_type
         )
