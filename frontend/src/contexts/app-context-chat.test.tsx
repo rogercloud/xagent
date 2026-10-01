@@ -197,6 +197,7 @@ function StateProbe() {
           }))
         )}
       </div>
+      <div data-testid="staged-trace-events">{JSON.stringify(state.traceEvents.map(event => event.event_id))}</div>
       <div data-testid="message-statuses">{JSON.stringify(state.messages.map(message => message.status))}</div>
       <div data-testid="trace-events">
         {JSON.stringify(
@@ -210,6 +211,7 @@ function StateProbe() {
         )}
       </div>
       <div data-testid="last-task-update">{state.lastTaskUpdate}</div>
+      <div data-testid="conversation-storage-version">{state.currentTask?.conversationStorageVersion}</div>
       <div data-testid="task-status">{state.currentTask?.status || ""}</div>
       <div data-testid="task-outcome">{state.currentTask?.completionOutcome || ""}</div>
       <div data-testid="waiting-request-id">{state.currentTask?.waitingRequestId || ""}</div>
@@ -594,6 +596,20 @@ describe("AppProvider websocket message routing", () => {
     localStorage.clear()
   })
 
+  it("retains the conversation storage version from task history for child navigation", () => {
+    render(<AppProvider token="token"><SeedRunningTask /><StateProbe /></AppProvider>)
+    act(() => { webSocketOptions.current?.onMessage?.(taskInfoMessage(1, { conversation_storage_version: 2 })) })
+    expect(screen.getByTestId("conversation-storage-version")).toHaveTextContent("2")
+  })
+
+  it.each(["paused", "waiting_for_user"])("keeps V2 child navigation metadata after partial %s task info", (status) => {
+    render(<AppProvider token="token"><SeedRunningTask /><StateProbe /></AppProvider>)
+    act(() => { webSocketOptions.current?.onMessage?.(taskInfoMessage(1, { conversation_storage_version: 2 })) })
+    act(() => { webSocketOptions.current?.onMessage?.(taskInfoMessage(1, { status })) })
+    expect(screen.getByTestId("task-status")).toHaveTextContent(status)
+    expect(screen.getByTestId("conversation-storage-version")).toHaveTextContent("2")
+  })
+
   it("keeps equal V2 assistant occurrences and reconciles their replay by identity", () => {
     render(<AppProvider token="token"><SeedRunningTask /><StateProbe /></AppProvider>)
     const send = (id: string) => act(() => {
@@ -633,6 +649,46 @@ describe("AppProvider websocket message routing", () => {
     const messages = JSON.parse(screen.getByTestId("messages").textContent || "[]")
     expect(messages).toHaveLength(1)
     expect(messages[0]).toMatchObject({ id: "final_answer_v2", content: "settled answer" })
+    expect(JSON.parse(screen.getByTestId("trace-events").textContent || "[]")).toEqual(expect.arrayContaining([
+      expect.objectContaining({ event_type: "task_completion" }),
+      expect.objectContaining({ event_type: "ai_message" }),
+    ]))
+  })
+
+  it.each([
+    { sequence: 13, streamed: true }, { sequence: 14, streamed: true },
+    { sequence: 13, streamed: false }, { sequence: 14, streamed: false },
+  ])("ignores settled replay $sequence (streamed=$streamed) without consuming the next turn traces", ({ sequence, streamed }) => {
+    function PendingTrace() {
+      const { dispatch } = useApp()
+      return <button onClick={() => {
+        dispatch({ type: "ADD_MESSAGE", payload: { id: "next-user", role: "user", content: "next turn", timestamp: "2026-05-27T05:00:01Z" } })
+        dispatch({ type: "SET_TRACE_EVENTS", payload: [{ event_id: "pending-tool", event_type: "tool_execution_start", timestamp: "2026-05-27T05:00:00Z", data: { tool_name: "search" } }] })
+      }}>Stage trace</button>
+    }
+    render(<AppProvider token="token"><SeedRunningTask /><StateProbe /><PendingTrace /></AppProvider>)
+    const send = (message: Record<string, unknown>) => act(() => {
+      webSocketOptions.current?.onMessage?.({ task_id: 1, timestamp: "2026-05-27T05:00:00Z", ...message } as never)
+    })
+    const messageId = streamed ? "final_answer_order" : "execution_message_order"
+    if (streamed) {
+      send({ type: "final_answer_start", message_id: messageId, execution_sequence: 10 })
+      send({ type: "final_answer_end", message_id: messageId, content: "stream", execution_sequence: 12 })
+    }
+    const settled = (execution_sequence: number, message: string) => send({
+      type: "trace_event", event_type: "agent_message", event_id: `answer-${execution_sequence}`,
+      execution_sequence, data: { message_id: messageId, message, display: "chat", expect_response: false },
+    })
+    settled(14, "newest answer")
+    fireEvent.click(screen.getByText("Stage trace"))
+    const staged = screen.getByTestId("staged-trace-events").textContent
+    expect(staged).toContain("pending-tool")
+    settled(sequence, "stale answer")
+    expect(screen.getByTestId("staged-trace-events").textContent).toBe(staged)
+    const messages = JSON.parse(screen.getByTestId("messages").textContent || "[]")
+    expect(messages).toHaveLength(2)
+    expect(messages[0]).toMatchObject({ content: "newest answer" })
+    expect(messages[1]).toMatchObject({ id: "next-user", content: "next turn" })
   })
 
   it("keeps the newest V2 stream content across overlapping live and historical frames", () => {

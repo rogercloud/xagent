@@ -690,6 +690,7 @@ export interface Task {
   title: string
   status: TaskStatus
   completionOutcome?: TaskCompletionOutcome
+  conversationStorageVersion?: number
   description: string
   createdAt: string | number
   updatedAt: string | number
@@ -899,6 +900,9 @@ const taskFromTaskInfoData = (
   description: taskData.description as string,
   status: normalizeTaskStatus(taskData.status) || "pending",
   completionOutcome: normalizeCompletionOutcome(taskData.completion_outcome),
+  ...(taskData.conversation_storage_version !== undefined
+    ? { conversationStorageVersion: taskData.conversation_storage_version as number }
+    : {}),
   createdAt: taskData.created_at as string | number,
   updatedAt: taskData.updated_at as string | number,
   modelId: taskData.model_id as string | undefined,
@@ -1435,14 +1439,15 @@ function projectAppState(state: AppState, action: AppAction): AppState {
           )
           return { ...state, messages: updatedMessages, traceEvents: newTraceEvents }
         }
-        if (newMessage.streamMessageId) {
-          const streamingIndex = state.messages.findIndex(
+        if (newMessage.streamMessageId || newMessage.executionSequence !== undefined) {
+          const targetId = newMessage.streamMessageId ?? newMessage.id
+          const deliveredIndex = state.messages.findIndex(
             message =>
-              message.id === newMessage.streamMessageId &&
-              isStreamingFinalAnswerMessage(message)
+              message.role === "assistant" && message.id === targetId &&
+              (!newMessage.streamMessageId || isStreamingFinalAnswerMessage(message))
           )
-          if (streamingIndex >= 0) {
-            return replaceMessageAt(streamingIndex)
+          if (deliveredIndex >= 0) {
+            return replaceMessageAt(deliveredIndex)
           }
         }
       }
@@ -6939,6 +6944,7 @@ export function AppProvider({
             agentId: taskData.agent_id,
             agentName: taskData.agent_name,
             agentLogoUrl: taskData.agent_logo_url,
+            conversationStorageVersion: taskData.conversation_storage_version,
             waitingQuestion: taskData.waiting_question,
             waitingInteractions: normalizeInteractions(taskData.waiting_interactions),
             runId: taskData.run_id,

@@ -435,8 +435,10 @@ def test_v2_rest_steps_and_child_details_read_events_without_legacy_content(
     canonical, monkeypatch
 ):
     from xagent.web.api.v1 import tasks
-    from xagent.web.api.workforces import _serialize_agent_execution_traces
     from xagent.web.models.agent import Agent
+    from xagent.web.services.task_agent_execution import (
+        _serialize_agent_execution_traces,
+    )
 
     factory, task_id = canonical
     with factory() as db:

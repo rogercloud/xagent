@@ -2050,6 +2050,7 @@ def _history_task_info(db: Any, task: Any, task_id: int) -> dict[str, Any]:
             "status": task.status.value,
             "model_id": model_id,
             "completion_outcome": task.completion_outcome,
+            "conversation_storage_version": task.conversation_storage_version,
             "small_fast_model_id": small_fast_model_id,
             "visual_model_id": visual_model_id,
             "compact_model_id": compact_model_id,
@@ -2170,6 +2171,15 @@ def _load_event_historical_stream_snapshot(
             },
         )
     )
+    # The cache lookup released the original read transaction. Reassert one
+    # current control tuple, including its matching pending question, rather
+    # than combining a refreshed status with the earlier state version.
+    db.refresh(task)
+    current_state = task_control_snapshot(task).as_dict()
+    state_changed = current_state != state
+    if state_changed:
+        info = _history_task_info(db, task, task_id)
+        events[0] = info
     if task.status in {TaskStatus.PAUSED, TaskStatus.WAITING_FOR_USER}:
         kind, default = _waiting_or_paused_event_fields(task.status)
         question = info["data"]["waiting_question"]
@@ -2179,7 +2189,7 @@ def _load_event_historical_stream_snapshot(
             "task_id": task_id,
             "message": question or default,
             "timestamp": datetime.now(timezone.utc).timestamp(),
-            **state,
+            **current_state,
         }
         if question:
             status_event["question"] = question
@@ -2188,10 +2198,10 @@ def _load_event_historical_stream_snapshot(
             status_event["interactions"] = interactions
         events.append(status_event)
     detached = [
-        _with_task_control_state_snapshot(e, task_id=task_id, state=state)
+        _with_task_control_state_snapshot(e, task_id=task_id, state=current_state)
         for e in events
     ]
-    if release_db_connection_if_clean(db):
+    if release_db_connection_if_clean(db) and not state_changed:
         cache_set(
             cache_key,
             {"event_version": version, "events": detached},

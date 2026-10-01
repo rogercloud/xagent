@@ -6,7 +6,19 @@ from datetime import timezone
 from typing import Any, Sequence
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from sqlalchemy import and_, case, func, or_, select, union_all
+from sqlalchemy import (
+    JSON,
+    String,
+    and_,
+    case,
+    cast,
+    func,
+    literal,
+    or_,
+    select,
+    union_all,
+)
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session, aliased, selectinload
 from sqlalchemy.sql import ColumnElement, visitors
@@ -791,22 +803,43 @@ def _source_summary_from_query(
     )
 
 
-def _event_log_message_predicate() -> Any:
+def _event_log_message_predicate(db: Session) -> Any:
     data = TaskExecutionEvent.payload["data"]
+    expects_response: ColumnElement[bool]
+    # Match the transcript reader's Python identity/truthiness checks without
+    # casting arbitrary persisted JSON strings to PostgreSQL booleans.
+    if db.get_bind().dialect.name == "postgresql":
+        audit_only = cast(data["__audit_only__"], JSONB) == literal(True, type_=JSONB)
+        hidden = cast(data["visible"], JSONB) == literal(False, type_=JSONB)
+        expects_response = cast(data["expect_response"], JSONB).not_in(
+            [JSON.NULL, False, 0, "", [], {}]
+        )
+    else:
+        audit_only = (
+            func.json_type(TaskExecutionEvent.payload, "$.data.__audit_only__")
+            == "true"
+        )
+        hidden = func.json_type(TaskExecutionEvent.payload, "$.data.visible") == "false"
+        response_type = func.json_type(
+            TaskExecutionEvent.payload, "$.data.expect_response"
+        )
+        expects_response = case(
+            (
+                response_type.in_(["integer", "real"]),
+                data["expect_response"].as_float() != 0,
+            ),
+            else_=cast(data["expect_response"], String).not_in(
+                ["null", "0", '""', "[]", "{}"]
+            ),
+        )
     return and_(
-        or_(
-            data["__audit_only__"].as_boolean().is_(None),
-            data["__audit_only__"].as_boolean().is_(False),
-        ),
+        audit_only.is_not(True),
         or_(
             TaskExecutionEvent.kind.in_(["input_accepted", "assistant_message"]),
             and_(
                 TaskExecutionEvent.kind == "agent_message",
-                data["expect_response"].as_boolean().is_(True),
-                or_(
-                    data["visible"].as_boolean().is_(None),
-                    data["visible"].as_boolean().is_(True),
-                ),
+                expects_response,
+                hidden.is_not(True),
                 data["message"].as_string().isnot(None),
                 data["message"].as_string() != "",
             ),
@@ -814,14 +847,14 @@ def _event_log_message_predicate() -> Any:
     )
 
 
-def _latest_message_activity_subquery(db: Session) -> Any:
+def _latest_message_activity_subquery(db: Session, task_ids: Any) -> Any:
     legacy = (
         select(
             TaskChatMessage.task_id.label("task_id"),
             TaskChatMessage.created_at.label("created_at"),
         )
         .join(Task, Task.id == TaskChatMessage.task_id)
-        .where(Task.conversation_storage_version == 1)
+        .where(Task.conversation_storage_version == 1, Task.id.in_(task_ids))
     )
     canonical = (
         select(
@@ -832,7 +865,8 @@ def _latest_message_activity_subquery(db: Session) -> Any:
         .where(
             Task.conversation_storage_version == 2,
             TaskExecutionEvent.scope_id == "root",
-            _event_log_message_predicate(),
+            Task.id.in_(task_ids),
+            _event_log_message_predicate(db),
         )
     )
     messages = union_all(legacy, canonical).subquery()
@@ -889,7 +923,9 @@ async def list_conversation_logs(
 
     total = int(source_counts[normalized_source])
     start = (page - 1) * per_page
-    latest_message_activity = _latest_message_activity_subquery(db)
+    latest_message_activity = _latest_message_activity_subquery(
+        db, filtered_query.with_entities(Task.id).statement.correlate(None)
+    )
     last_activity_at = func.coalesce(
         latest_message_activity.c.last_message_at,
         Task.updated_at,

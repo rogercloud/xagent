@@ -2133,7 +2133,10 @@ class AgentTool(AbstractBaseTool):
         if (
             self._parent_tracer is None
             or self._parent_task_id is None
-            or not self._runtime_metadata
+            or (
+                not self._runtime_metadata
+                and getattr(self._parent_tracer, "event_writer", None) is None
+            )
         ):
             return
 

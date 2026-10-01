@@ -16,6 +16,7 @@ from ...core.runtime_performance import (
     observe_duration,
     run_in_thread_with_telemetry,
 )
+from .client_error_messages import CLIENT_SAFE_TASK_FAILURE
 from .public_trace_events import is_audit_only_trace_data, normalize_public_trace_event
 from .task_events import publish_task_event, task_has_audience
 from .task_execution import create_stream_event
@@ -420,10 +421,39 @@ class TaskEventTraceHandler(TraceHandler):
             )
 
             if self.authoritative:
-                stream_event = await run_in_thread_with_telemetry(
-                    "websocket_execution_event_display",
-                    self._load_event_display,
-                    str(event.id),
+                try:
+                    stream_event = await run_in_thread_with_telemetry(
+                        "websocket_execution_event_display",
+                        self._load_event_display,
+                        str(event.id),
+                    )
+                except ValueError:
+                    increment_counter(
+                        "xagent.websocket.trace.events",
+                        attributes={"outcome": "integrity_gap"},
+                    )
+                    logger.warning(
+                        "Live display integrity gap task_id=%s event_id=%s",
+                        self.task_id,
+                        event.id,
+                        exc_info=True,
+                    )
+                    await publish_task_event(
+                        {
+                            "type": "error",
+                            "task_id": self.task_id,
+                            "message": CLIENT_SAFE_TASK_FAILURE,
+                        },
+                        self.task_id,
+                    )
+                    return
+                increment_counter(
+                    "xagent.websocket.trace.events",
+                    attributes={
+                        "outcome": "broadcast"
+                        if stream_event is not None
+                        else "dropped"
+                    },
                 )
                 if stream_event is not None:
                     await publish_task_event(stream_event, self.task_id)

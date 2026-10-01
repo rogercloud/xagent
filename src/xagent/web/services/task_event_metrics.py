@@ -9,7 +9,7 @@ from ..models.task import Task, TraceEvent
 from ..models.task_execution_event import TaskExecutionEvent
 
 
-def monitoring_trace_source() -> Any:
+def monitoring_trace_source(*, user_id: int | None = None) -> Any:
     """Retain the existing metrics SQL while excluding V2 compatibility rows.
 
     The negative ID is only an ORM identity-map key in this read-only union;
@@ -45,6 +45,9 @@ def monitoring_trace_source() -> Any:
             TaskExecutionEvent.kind != "recovery_state",
         )
     )
+    if user_id is not None:
+        legacy = legacy.where(Task.user_id == user_id)
+        events = events.where(Task.user_id == user_id)
     return aliased(
         TraceEvent, union_all(legacy, events).subquery(), adapt_on_names=True
     )

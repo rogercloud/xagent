@@ -107,9 +107,7 @@ export interface ChatMessageProps {
 function GeneratingIndicator({ latestTitle, taskStatus }: { latestTitle?: string, taskStatus?: string }) {
   const { t } = useI18n();
 
-  const displayTitle = taskStatus === "interrupted"
-    ? t("agent.layout.status.interrupted")
-    : taskStatus === 'paused'
+  const displayTitle = taskStatus === 'paused'
     ? t("common.taskPaused")
     : taskStatus === 'waiting_for_user'
       ? t("common.waitingForUser")
@@ -118,7 +116,7 @@ function GeneratingIndicator({ latestTitle, taskStatus }: { latestTitle?: string
   return (
     <div className="py-3 text-sm leading-relaxed text-muted-foreground flex items-center">
       <span>{displayTitle}</span>
-      {!["paused", "waiting_for_user", "completed", "interrupted"].includes(taskStatus || "") && (
+      {!["paused", "waiting_for_user", "completed"].includes(taskStatus || "") && (
         <span className="ml-1 inline-flex items-end gap-1">
           <span className="dot" />
           <span className="dot" />

@@ -266,7 +266,9 @@ async def get_monitoring_stats(
     server's or the viewer's local day.
     """
     try:
-        TraceEvent = monitoring_trace_source()
+        TraceEvent = monitoring_trace_source(
+            user_id=None if is_admin_user(current_user) else int(current_user.id)
+        )
 
         # Build TraceEvent query filter based on user permissions
         trace_event_filter = []
@@ -497,7 +499,9 @@ async def get_popular_tools(
 ) -> List[Dict[str, Any]]:
     """Get popular tools statistics"""
     try:
-        TraceEvent = monitoring_trace_source()
+        TraceEvent = monitoring_trace_source(
+            user_id=None if is_admin_user(current_user) else int(current_user.id)
+        )
 
         # Build filter conditions based on user permissions
         trace_event_filter = []
@@ -561,7 +565,9 @@ async def get_model_stats(
 ) -> List[Dict[str, Any]]:
     """Get model usage statistics"""
     try:
-        TraceEvent = monitoring_trace_source()
+        TraceEvent = monitoring_trace_source(
+            user_id=None if is_admin_user(current_user) else int(current_user.id)
+        )
 
         # Build filter conditions based on user permissions
         trace_event_filter = []
@@ -650,7 +656,9 @@ async def get_dashboard_stats(
     try:
         from ..models.task import Task, TaskStatus, task_status_predicate
 
-        TraceEvent = monitoring_trace_source()
+        TraceEvent = monitoring_trace_source(
+            user_id=None if is_admin_user(current_user) else int(current_user.id)
+        )
 
         # Build filter conditions based on user permissions
         task_filter = []

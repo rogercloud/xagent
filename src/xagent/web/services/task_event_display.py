@@ -87,20 +87,27 @@ def load_display_facts(
     scope_id: str = "root",
     through_sequence: int,
     after_sequence: int = 0,
+    source: str | None = None,
+    kinds: tuple[str, ...] | None = None,
 ) -> list[TaskExecutionEvent]:
     events: list[TaskExecutionEvent] = []
     after = after_sequence
+    query = select(TaskExecutionEvent).where(
+        TaskExecutionEvent.task_id == task_id,
+        TaskExecutionEvent.scope_id == scope_id,
+        TaskExecutionEvent.sequence <= through_sequence,
+        TaskExecutionEvent.kind.not_in(_INTERNAL_KINDS),
+    )
+    if source is not None:
+        query = query.where(
+            TaskExecutionEvent.payload["data"]["source"].as_string() == source
+        )
+    if kinds is not None:
+        query = query.where(TaskExecutionEvent.kind.in_(kinds))
     while True:
         page = list(
             db.scalars(
-                select(TaskExecutionEvent)
-                .where(
-                    TaskExecutionEvent.task_id == task_id,
-                    TaskExecutionEvent.scope_id == scope_id,
-                    TaskExecutionEvent.sequence > after,
-                    TaskExecutionEvent.sequence <= through_sequence,
-                    TaskExecutionEvent.kind.not_in(_INTERNAL_KINDS),
-                )
+                query.where(TaskExecutionEvent.sequence > after)
                 .order_by(TaskExecutionEvent.sequence)
                 .limit(MAX_EXECUTION_EVENT_PAGE_SIZE)
             )
@@ -139,6 +146,8 @@ def _stream_aliases(events: list[TaskExecutionEvent]) -> dict[str, str]:
                 if isinstance(event_data(row).get("result"), dict)
                 and event_data(row)["result"].get("stream_message_id")
             ]
+            if not linked and any(row.kind == "final_answer_end" for row in interval):
+                raise _invalid(settlement, "missing completed stream provenance")
             if linked:
                 if not settlement.run_id or len(completions) != 1 or len(messages) != 1:
                     raise _invalid(settlement, "ambiguous stream settlement provenance")
@@ -495,6 +504,12 @@ def settlement_display_events(
         task_id,
         after_sequence=int(previous),
         through_sequence=int(settlement.sequence),
+        kinds=(
+            "assistant_message",
+            "task_completion",
+            "final_answer_end",
+            "execution_settled",
+        ),
     )
     aliases = _stream_aliases(facts)
     frames = []

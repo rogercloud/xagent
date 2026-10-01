@@ -446,11 +446,19 @@ its run is owned, or an explicit interrupted state after ownership ends. Complet
 and companion AI traces remain timeline entries. The settlement message supplies
 the final bubble, under its explicit stream alias when present. Shared-stream
 reconciliation uses those same settled message facts instead of V2 `Task.output`.
+It re-sends durable content to repair dropped frames, while isolating an invalid
+task's display from other connected tasks. A completed interval with a stream end
+requires its matching completion link; missing provenance never creates a second
+answer identity.
 
 Root views exclude child scopes. The worker inspector reads only its requested
 scope after the existing task authorization checks, selects delegated occurrences
 before public redaction, and retains safe failure events even when redaction
-removes their source metadata. Business tables still own authorization, control,
+removes their source metadata. Ordinary V2 tasks expose this inspector through
+`/api/chat/task/{task_id}/agent-executions/{worker_task_id}`, authorized for the
+owner or an admin; workforce runs retain their existing access checks. The open
+inspector refreshes an active child and stops on terminal status or close.
+Business tables still own authorization, control,
 interaction CAS, file records and file-byte materialization. Existing error,
 checkpoint, audit-only and sensitive-tool normalization remains in the display
 pipeline; recovery snapshots and raw LLM bodies are not chat content.
@@ -458,6 +466,8 @@ pipeline; recovery snapshots and raw LLM bodies are not chat content.
 V2 log IDs are message sequences, counts/activity use the same message inclusion
 policy, and compaction notices are ordered at their event position. Monitoring
 selects V1 traces or V2 root facts once per task, excluding V2 compatibility rows.
+User-scoped monitoring filters each source before the union; conversation activity
+aggregates only the candidate tasks selected by the list's existing filters.
 Task-level token counters remain existing business metadata. Queries page facts at
 a captured horizon; total history payload loading is not claimed to be bounded
 independently of lifetime history. Whole-task legacy-read isolation is stage E;
