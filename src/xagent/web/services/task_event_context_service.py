@@ -167,7 +167,9 @@ _MODEL_KINDS = frozenset(
 _TOOL_KINDS = frozenset(
     {"tool_execution_start", "tool_execution_end", "tool_execution_failed"}
 )
-_OUTCOME_KINDS = _TOOL_KINDS - {"tool_execution_start"}
+_START_KINDS = frozenset({"tool_execution_start"})
+_ACCEPTED_KINDS = frozenset({"input_accepted"})
+_OUTCOME_KINDS = _TOOL_KINDS - _START_KINDS
 
 
 def _root_events(
@@ -296,13 +298,18 @@ def _covered_facts_still_used(
     Inputs accepted before the floor but applied after it, and every start and
     outcome of a tool batch with any start or outcome after it. Selection reads
     identity columns only; the projection still validates what it uses.
+
+    This mirrors the pre-floor facts ``_project`` consumes for a native floor.
+    Changing which of them the projection uses requires updating this function;
+    ``test_task_event_context_equivalence.py`` guards that against a live read
+    of the full history.
     """
     turns = {e.turn_id for e in suffix if e.kind == "input_applied"}
     prior = _root_events_matching(
         db,
         task_id,
         through=floor,
-        kinds=frozenset({"input_accepted"}),
+        kinds=_ACCEPTED_KINDS,
         column=TaskExecutionEvent.turn_id,
         values=turns,
     )
@@ -313,12 +320,11 @@ def _covered_facts_still_used(
         for e in suffix
         if e.kind in _OUTCOME_KINDS and e.tool_attempt_id not in started
     }
-    starts = frozenset({"tool_execution_start"})
     early = _root_events_matching(
         db,
         task_id,
         through=floor,
-        kinds=starts,
+        kinds=_START_KINDS,
         column=TaskExecutionEvent.tool_attempt_id,
         values=unmatched,
     )
@@ -328,7 +334,7 @@ def _covered_facts_still_used(
         db,
         task_id,
         through=floor,
-        kinds=starts,
+        kinds=_START_KINDS,
         column=TaskExecutionEvent.assistant_message_id,
         values={e.assistant_message_id for e in (*suffix_starts, *early)},
     )
@@ -444,7 +450,11 @@ def load_task_event_context(
 def _project(
     db: Session, task_id: int, horizon: int, events: list[TaskExecutionEvent]
 ) -> TaskEventContext:
-    """Project root model history from ``events``, ascending by sequence."""
+    """Project root model history from ``events``, ascending by sequence.
+
+    Changing which pre-floor facts this uses requires updating
+    ``_covered_facts_still_used``, guarded by the live-oracle equivalence test.
+    """
     anchors = _load_context_anchors(db, task_id, horizon, events)
     accepted: dict[str, TaskExecutionEvent] = {}
     applied: dict[str, int] = {}
