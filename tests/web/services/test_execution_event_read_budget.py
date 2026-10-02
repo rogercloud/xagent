@@ -76,7 +76,7 @@ pytestmark = [
 
 RESULTS = os.getenv("XAGENT_READ_BUDGET_RESULTS")
 PASSES = int(os.getenv("XAGENT_READ_BUDGET_PASSES", "5"))
-RSS = os.getenv("XAGENT_READ_BUDGET_RSS", "1") != "0"
+RSS = os.getenv("XAGENT_READ_BUDGET_RSS", "1") != "0" and sys.platform != "win32"
 
 
 def _publish(record_property, result: dict[str, Any]) -> None:
@@ -84,7 +84,7 @@ def _publish(record_property, result: dict[str, Any]) -> None:
     record_property("read_budget", line)
     print("READ_BUDGET " + line)
     if RESULTS:
-        with open(RESULTS, "a") as handle:
+        with open(RESULTS, "a", encoding="utf-8") as handle:
             handle.write(line + "\n")
 
 

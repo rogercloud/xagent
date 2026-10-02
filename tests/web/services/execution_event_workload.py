@@ -78,7 +78,7 @@ DROP_KEEP_MESSAGES = 20
 
 @cache
 def templates() -> dict[str, dict[str, Any]]:
-    exported = json.loads(TEMPLATES_PATH.read_text())
+    exported = json.loads(TEMPLATES_PATH.read_text(encoding="utf-8"))
     picked: dict[str, dict[str, Any]] = {}
     for workflow in exported["template_workflows"]:
         for key, payload in exported["templates"][workflow].items():
@@ -88,7 +88,7 @@ def templates() -> dict[str, dict[str, Any]]:
 
 @cache
 def exported_sequences() -> dict[str, list[dict[str, Any]]]:
-    return json.loads(TEMPLATES_PATH.read_text())["sequences"]
+    return json.loads(TEMPLATES_PATH.read_text(encoding="utf-8"))["sequences"]
 
 
 def template(key: str) -> dict[str, Any]:

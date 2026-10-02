@@ -139,8 +139,11 @@ def test_export_execution_event_templates(shared_app, workflow):
         ]
     assert raw
     if RAW_OUTPUT:
-        Path(RAW_OUTPUT, f"{workflow}.json").write_text(
-            json.dumps(raw, ensure_ascii=False, indent=1, default=str)
+        raw_dir = Path(RAW_OUTPUT)
+        raw_dir.mkdir(parents=True, exist_ok=True)
+        raw_dir.joinpath(f"{workflow}.json").write_text(
+            json.dumps(raw, ensure_ascii=False, indent=1, default=str),
+            encoding="utf-8",
         )
     # Identity columns become ordinals: sequences keep which rows share a
     # run, turn, batch or attempt, not the generated values themselves.
@@ -179,12 +182,13 @@ def test_export_execution_event_templates(shared_app, workflow):
             templates.setdefault(key, _sanitize(event["payload"], root))
 
     output = Path(cast(str, OUTPUT))
-    exported = json.loads(output.read_text()) if output.exists() else {}
+    exported = json.loads(output.read_text(encoding="utf-8")) if output.exists() else {}
     exported["source"] = "tests/e2e/test_execution_event_template_export.py"
     exported["template_workflows"] = list(TEMPLATE_WORKFLOWS)
     exported.setdefault("sequences", {})[workflow] = sequence
     if templates:
         exported.setdefault("templates", {})[workflow] = templates
     output.write_text(
-        json.dumps(exported, ensure_ascii=False, indent=1, sort_keys=True) + "\n"
+        json.dumps(exported, ensure_ascii=False, indent=1, sort_keys=True) + "\n",
+        encoding="utf-8",
     )
