@@ -524,6 +524,11 @@ def _break_retained_run(db, task_id):
     done(db, task_id, "pre", "pre", run_id="other-run")
 
 
+def _break_retained_batch(db, task_id):
+    # The batch is found from the start, not from the outcome's own batch id.
+    done(db, task_id, "other-batch", "pre", run_id="run")
+
+
 @pytest.mark.parametrize(
     "corrupt",
     [
@@ -533,6 +538,7 @@ def _break_retained_run(db, task_id):
         _break_suffix_applied,
         _break_suffix_orphan,
         _break_retained_run,
+        _break_retained_batch,
     ],
 )
 def test_errors_after_the_floor_match_the_oracle(canonical, corrupt):
@@ -545,3 +551,62 @@ def test_errors_after_the_floor_match_the_oracle(canonical, corrupt):
         corrupt(db, task_id)
         purge_legacy(db, task_id)
     assert sweep(factory, task_id)[0] == "error"
+
+
+def _covered_invalid_acceptance(db, task_id):
+    fact(
+        db,
+        task_id,
+        "input_accepted",
+        "bad-accepted",
+        {"role": "assistant", "content": "x"},
+        turn_id="bad",
+    )
+
+
+def _covered_orphan_outcome(db, task_id):
+    done(db, task_id, "orphan", "orphan")
+
+
+def _covered_invalid_summary(db, task_id):
+    anchor = say(db, task_id, "first")
+    bad = summarize(db, task_id, "bad", anchor)
+    recover(db, bad, coordinate(anchor, scope_id="child"))
+
+
+@pytest.mark.parametrize(
+    ("corrupt", "legacy", "validated"),
+    [
+        (_covered_invalid_acceptance, False, False),
+        (_covered_orphan_outcome, False, False),
+        (_covered_invalid_summary, False, False),
+        (_covered_invalid_acceptance, True, False),
+        # Legacy coverage still reads, and so validates, earlier tool facts.
+        (_covered_orphan_outcome, True, True),
+    ],
+)
+def test_covered_facts_that_are_not_projected_are_not_revalidated(
+    canonical, corrupt, legacy, validated
+):
+    """B1: a usable summary's floor ends validation of facts it does not use.
+
+    The floor is a coordinate a previous successful read returned. Only facts
+    the suffix still projects are read and validated again.
+    """
+    factory, task_id = canonical
+    with factory() as db:
+        corrupt(db, task_id)
+        say(db, task_id, "covered")
+        summarize(db, task_id, "s", last_root(db, task_id), legacy=legacy)
+        say(db, task_id, "tail")
+        db.commit()
+    expected = _read(factory, reference_load_task_event_context, task_id)
+    actual = _read(factory, task_event_context_service.load_task_event_context, task_id)
+    assert expected[0] == "error"
+    if validated:
+        assert actual == expected
+    else:
+        assert messages(actual) == [
+            {"role": "system", "content": "summary s"},
+            {"role": "assistant", "content": "tail"},
+        ]
