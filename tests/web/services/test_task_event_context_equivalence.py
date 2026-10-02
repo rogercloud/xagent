@@ -1,0 +1,547 @@
+"""The model-context reader must project exactly what the full-history oracle does.
+
+Every scenario is swept over each committed horizon H, and at each H over every
+accepted root turn and legacy message cutoff. Each read uses its own Session.
+"""
+
+import pytest
+import sqlalchemy as sa
+
+from tests.shared.execution_event_read_guard import forbid_legacy_content
+from tests.web.services.task_event_context_reference import (
+    reference_load_task_event_context,
+)
+from tests.web.services.test_task_event_context_service import (
+    accept,
+    apply,
+    fact,
+    purge_legacy,
+)
+from tests.web.services.test_task_execution_event_writer import (
+    canonical as canonical_fixture,
+)
+from tests.web.services.test_task_execution_event_writer import engine as engine_fixture
+from tests.web.services.test_task_execution_event_writer import (
+    task_id as task_id_fixture,
+)
+from xagent.core.agent.context.execution import MODEL_CONTEXT_WATERMARK_METADATA_KEY
+from xagent.web.models.chat_message import TaskChatMessage
+from xagent.web.models.task import Task
+from xagent.web.models.task_execution_event import TaskExecutionEvent
+from xagent.web.services import task_event_context_service
+
+canonical = canonical_fixture
+engine = engine_fixture
+task_id = task_id_fixture
+
+
+def _read(factory, loader, task_id, **cutoff):
+    with factory() as db:
+        try:
+            return ("ok", loader(db, task_id, **cutoff))
+        except ValueError as error:
+            return ("error", str(error))
+
+
+def compare(factory, task_id, **cutoff):
+    expected = _read(factory, reference_load_task_event_context, task_id, **cutoff)
+    actual = _read(
+        factory, task_event_context_service.load_task_event_context, task_id, **cutoff
+    )
+    assert actual == expected, cutoff
+    return expected
+
+
+def set_horizon(factory, task_id, horizon):
+    with factory() as db:
+        db.execute(
+            sa.update(Task)
+            .where(Task.id == task_id)
+            .values(conversation_event_sequence=horizon)
+        )
+        db.commit()
+
+
+def sweep(factory, task_id):
+    """Compare at every horizon and cutoff; return the outcome at the top."""
+    with factory() as db:
+        top = db.get(Task, task_id).conversation_event_sequence
+        turns = sorted(
+            db.scalars(
+                sa.select(TaskExecutionEvent.turn_id).where(
+                    TaskExecutionEvent.task_id == task_id,
+                    TaskExecutionEvent.scope_id == "root",
+                    TaskExecutionEvent.kind == "input_accepted",
+                    TaskExecutionEvent.turn_id.is_not(None),
+                )
+            )
+        )
+        message_ids = sorted(
+            db.scalars(
+                sa.select(TaskChatMessage.id).where(
+                    TaskChatMessage.task_id == task_id,
+                    TaskChatMessage.execution_event_id.is_not(None),
+                )
+            )
+        )
+    try:
+        with forbid_legacy_content(factory.kw["bind"]):
+            for horizon in range(top + 1):
+                set_horizon(factory, task_id, horizon)
+                latest = compare(factory, task_id)
+                for turn in turns:
+                    compare(factory, task_id, before_turn_id=turn)
+                for message_id in message_ids:
+                    compare(factory, task_id, before_message_id=message_id)
+    finally:
+        set_horizon(factory, task_id, top)
+    return latest
+
+
+def last_root(db, task_id):
+    db.flush()
+    return db.scalar(
+        sa.select(TaskExecutionEvent)
+        .where(
+            TaskExecutionEvent.task_id == task_id,
+            TaskExecutionEvent.scope_id == "root",
+        )
+        .order_by(TaskExecutionEvent.sequence.desc())
+        .limit(1)
+    )
+
+
+def coordinate(event, **override):
+    return {
+        "scope_id": "root",
+        "sequence": int(event.sequence),
+        "event_id": event.event_id,
+        **override,
+    }
+
+
+def summarize(db, task_id, key, anchor, *, text=None, legacy=False, **extra):
+    """Append a summary covering everything through ``anchor``."""
+    data = {"summary": f"summary {key}" if text is None else text, **extra}
+    payload = {"data": data}
+    if anchor is not None and legacy:
+        payload["transcript_watermark"] = coordinate(anchor)
+    elif anchor is not None:
+        data[MODEL_CONTEXT_WATERMARK_METADATA_KEY] = coordinate(anchor)
+    return fact(db, task_id, "action_end_compact", key, payload)
+
+
+def recover(db, event, coverage):
+    """Rewrite a stored summary's coverage claim, as corruption would."""
+    data = {**event.payload["data"], MODEL_CONTEXT_WATERMARK_METADATA_KEY: coverage}
+    event.payload = {**event.payload, "data": data}
+    db.flush()
+
+
+def say(db, task_id, key, text=None):
+    return fact(
+        db,
+        task_id,
+        "assistant_message",
+        key,
+        {"content": text or key, "message_type": "assistant_response"},
+    )
+
+
+def settle(db, task_id, key, status):
+    return fact(
+        db,
+        task_id,
+        "execution_settled",
+        key,
+        {"status": status, "result": {"success": False, "status": status}},
+    )
+
+
+def call(db, task_id, batch, attempt, kind="tool_execution_start", **kwargs):
+    scope_id = kwargs.pop("scope_id", "root")
+    data = {
+        "tool_name": kwargs.pop("tool_name", "search"),
+        "tool_call_id": attempt,
+        "tool_params": {"q": attempt},
+    }
+    if kind != "tool_execution_start":
+        data["result"] = kwargs.pop("result", {"value": attempt})
+    return fact(
+        db,
+        task_id,
+        kind,
+        f"{attempt}:{kind}",
+        {"data": data},
+        tool_attempt_id=attempt,
+        assistant_message_id=batch,
+        scope_id=scope_id,
+        **kwargs,
+    )
+
+
+def done(db, task_id, batch, attempt, **kwargs):
+    return call(db, task_id, batch, attempt, "tool_execution_end", **kwargs)
+
+
+def failed(db, task_id, batch, attempt, **kwargs):
+    return call(db, task_id, batch, attempt, "tool_execution_failed", **kwargs)
+
+
+def messages(outcome):
+    assert outcome[0] == "ok", outcome
+    return outcome[1].messages
+
+
+def tool_batches(result):
+    return [[c["id"] for c in m["tool_calls"]] for m in result if "tool_calls" in m]
+
+
+def test_native_summary_with_late_application_and_pending_input(canonical):
+    factory, task_id = canonical
+    with factory() as db:
+        accept(db, task_id, "old", "covered")
+        apply(db, task_id, "old")
+        accept(db, task_id, "late", "accepted before summary")
+        accept(db, task_id, "pending", "never applied")
+        say(db, task_id, "covered-answer")
+        summarize(db, task_id, "s", last_root(db, task_id))
+        apply(db, task_id, "late")
+        say(db, task_id, "tail")
+        accept(db, task_id, "current", "current")
+        apply(db, task_id, "current")
+        purge_legacy(db, task_id)
+    assert messages(sweep(factory, task_id)) == [
+        {"role": "system", "content": "summary s"},
+        {"role": "user", "content": "accepted before summary"},
+        {"role": "assistant", "content": "tail"},
+        {"role": "user", "content": "current"},
+    ]
+
+
+def test_tool_batches_across_the_summary_floor(canonical):
+    factory, task_id = canonical
+    with factory() as db:
+        # Entirely covered, and covered without any outcome.
+        call(db, task_id, "early", "e1")
+        done(db, task_id, "early", "e1")
+        call(db, task_id, "dangling", "d1")
+        # One batch crosses the floor: a finishes before it, b fails after
+        # it, and c is entirely after it.
+        call(db, task_id, "cross", "a")
+        call(db, task_id, "cross", "b")
+        done(db, task_id, "cross", "a")
+        # A start before the floor whose only outcome lands after it.
+        call(db, task_id, "single", "s1")
+        summarize(db, task_id, "s", last_root(db, task_id))
+        failed(db, task_id, "cross", "b", result={"success": False, "error": "x"})
+        call(db, task_id, "cross", "c")
+        done(db, task_id, "cross", "c")
+        done(db, task_id, "single", "s1")
+        db.commit()
+    result = messages(sweep(factory, task_id))
+    assert result[0]["content"] == "summary s"
+    assert tool_batches(result) == [["a", "b", "c"], ["s1"]]
+
+
+def test_tool_window_out_of_order_completion_and_more_than_nine_calls(canonical):
+    factory, task_id = canonical
+    with factory() as db:
+        call(db, task_id, "first", "f1")
+        call(db, task_id, "first", "f2")
+        summarize(db, task_id, "s", last_root(db, task_id))
+        done(db, task_id, "first", "f2")
+        done(db, task_id, "first", "f1")
+        for batch in range(4):
+            for index in range(3):
+                call(db, task_id, f"b{batch}", f"{batch}-{index}")
+            for index in reversed(range(3)):
+                done(db, task_id, f"b{batch}", f"{batch}-{index}")
+        db.commit()
+    result = messages(sweep(factory, task_id))
+    assert [len(batch) for batch in tool_batches(result)] == [3, 3, 3]
+
+
+def test_multiple_summaries_pick_the_last_usable_coverage(canonical):
+    factory, task_id = canonical
+    with factory() as db:
+        accept(db, task_id, "t1", "first")
+        apply(db, task_id, "t1")
+        say(db, task_id, "one")
+        anchor = last_root(db, task_id)
+        summarize(db, task_id, "s1", anchor)
+        say(db, task_id, "two")
+        summarize(db, task_id, "s2", anchor, text="same coverage again")
+        say(db, task_id, "three")
+        summarize(db, task_id, "s3", last_root(db, task_id), text="  ")
+        summarize(db, task_id, "s4", None, text="no coverage claim")
+        say(db, task_id, "four")
+        purge_legacy(db, task_id)
+    assert messages(sweep(factory, task_id)) == [
+        {"role": "system", "content": "same coverage again"},
+        {"role": "assistant", "content": "two"},
+        {"role": "assistant", "content": "three"},
+        {"role": "assistant", "content": "four"},
+    ]
+
+
+def test_legacy_summary_keeps_earlier_tool_and_settlement_facts(canonical):
+    factory, task_id = canonical
+    with factory() as db:
+        accept(db, task_id, "old", "covered")
+        apply(db, task_id, "old")
+        call(db, task_id, "batch", "a")
+        done(db, task_id, "batch", "a")
+        settle(db, task_id, "failed", "failed")
+        settle(db, task_id, "cancelled", "cancelled")
+        accept(db, task_id, "late", "accepted before summary")
+        say(db, task_id, "covered-answer")
+        summarize(db, task_id, "s", last_root(db, task_id), legacy=True)
+        apply(db, task_id, "late")
+        accept(db, task_id, "after", "after summary")
+        apply(db, task_id, "after")
+        say(db, task_id, "tail")
+        purge_legacy(db, task_id)
+    result = messages(sweep(factory, task_id))
+    assert result[0] == {"role": "system", "content": "summary s"}
+    assert [m["content"] for m in result if m["role"] == "user"] == ["after summary"]
+    assert len([m for m in result if m["role"] == "tool"]) == 1
+    assert [m["content"] for m in result[1:] if m["role"] == "system"] == [
+        "- Previous execution failed.",
+        "- Previous execution was cancelled.",
+    ]
+
+
+@pytest.mark.parametrize("legacy", [False, True])
+def test_settlement_statuses_on_both_sides_of_the_floor(canonical, legacy):
+    factory, task_id = canonical
+    statuses = ["failed", "cancelled", "paused", "waiting_for_user", "interrupted"]
+    with factory() as db:
+        for status in statuses:
+            settle(db, task_id, f"before-{status}", status)
+        say(db, task_id, "covered")
+        summarize(db, task_id, "s", last_root(db, task_id), legacy=legacy)
+        for status in statuses:
+            settle(db, task_id, f"after-{status}", status)
+        db.commit()
+    result = messages(sweep(factory, task_id))
+    assert len([m for m in result if m["role"] == "system"]) == (5 if legacy else 3)
+
+
+def test_child_scopes_reuse_root_identities(canonical):
+    factory, task_id = canonical
+    with factory() as db:
+        accept(db, task_id, "turn", "root input")
+        call(db, task_id, "batch", "a")
+        call(db, task_id, "batch", "a", scope_id="child")
+        fact(
+            db,
+            task_id,
+            "skill_select_end",
+            "child-skill",
+            {"data": {"selected": True, "skill_name": "child"}},
+            scope_id="child",
+        )
+        anchor = last_root(db, task_id)
+        summarize(db, task_id, "s", anchor)
+        fact(
+            db,
+            task_id,
+            "action_end_compact",
+            "child-summary",
+            {
+                "data": {
+                    "summary": "child summary",
+                    MODEL_CONTEXT_WATERMARK_METADATA_KEY: coordinate(anchor),
+                }
+            },
+            scope_id="child",
+        )
+        done(db, task_id, "batch", "a", scope_id="child")
+        fact(
+            db,
+            task_id,
+            "input_applied",
+            "child-applied",
+            {"recovery_event_id": "child"},
+            turn_id="turn",
+            scope_id="child",
+        )
+        apply(db, task_id, "turn")
+        done(db, task_id, "batch", "a")
+        purge_legacy(db, task_id)
+    outcome = sweep(factory, task_id)
+    result = messages(outcome)
+    assert result[0]["content"] == "summary s"
+    assert [m["content"] for m in result if m["role"] == "user"] == ["root input"]
+    assert len([m for m in result if m["role"] == "tool"]) == 1
+    assert outcome[1].selected_skill_name is None
+
+
+def test_skill_selected_only_before_the_floor_then_deselected(canonical):
+    factory, task_id = canonical
+    with factory() as db:
+        fact(
+            db,
+            task_id,
+            "skill_select_end",
+            "first",
+            {"data": {"selected": True, "skill_name": "csv"}},
+        )
+        say(db, task_id, "covered")
+        summarize(db, task_id, "s", last_root(db, task_id))
+        say(db, task_id, "kept")
+        before_deselect = int(last_root(db, task_id).sequence)
+        fact(
+            db,
+            task_id,
+            "skill_select_end",
+            "deselect",
+            {"data": {"selected": False, "skill_name": "csv"}},
+        )
+        db.commit()
+    assert sweep(factory, task_id)[1].selected_skill_name is None
+    set_horizon(factory, task_id, before_deselect)
+    assert compare(factory, task_id)[1].selected_skill_name == "csv"
+
+
+def test_control_tool_batch_across_the_floor(canonical):
+    factory, task_id = canonical
+    with factory() as db:
+        call(db, task_id, "batch", "answer", tool_name="final_answer")
+        call(db, task_id, "batch", "work")
+        summarize(db, task_id, "s", last_root(db, task_id))
+        done(db, task_id, "batch", "answer", tool_name="final_answer")
+        done(db, task_id, "batch", "work")
+        db.commit()
+    assert tool_batches(messages(sweep(factory, task_id))) == [["work"]]
+
+
+def test_message_cutoffs_match_turn_cutoffs(canonical):
+    factory, task_id = canonical
+    with factory() as db:
+        accept(db, task_id, "t1", "first")
+        apply(db, task_id, "t1")
+        accept(db, task_id, "t2", "second")
+        summarize(db, task_id, "s", last_root(db, task_id))
+        apply(db, task_id, "t2")
+        accept(db, task_id, "t3", "third")
+        apply(db, task_id, "t3")
+        accept(db, task_id, "t4", "fourth")
+        db.commit()
+        rows = db.execute(
+            sa.select(TaskChatMessage.id, TaskChatMessage.turn_id).where(
+                TaskChatMessage.task_id == task_id
+            )
+        ).all()
+    # Legacy rows are kept: the sweep also covers every message cutoff.
+    sweep(factory, task_id)
+    for message_id, turn in rows:
+        assert compare(factory, task_id, before_message_id=message_id) == compare(
+            factory, task_id, before_turn_id=turn
+        )
+
+
+def test_summary_refs_and_image_budget(canonical):
+    from xagent.core.agent.attachments import build_image_context_references
+    from xagent.core.context_ref import CONTEXT_REFS_KEY
+
+    def image(i):
+        return {"file_id": f"image-{i}", "name": f"{i}.png", "type": "image/png"}
+
+    factory, task_id = canonical
+    with factory() as db:
+        for i in range(3):
+            accept(db, task_id, f"old-{i}", "", attachments=[image(100 + i)])
+            apply(db, task_id, f"old-{i}")
+        accept(db, task_id, "late", "", attachments=[image(-3)])
+        refs = [
+            r.durable_dict()
+            for r in build_image_context_references([image(-1), image(-2)])
+        ]
+        summarize(db, task_id, "s", last_root(db, task_id), summary_context_refs=refs)
+        apply(db, task_id, "late")
+        for i in range(15):
+            accept(db, task_id, str(i), "", attachments=[image(i)])
+            apply(db, task_id, str(i))
+        purge_legacy(db, task_id)
+    result = messages(sweep(factory, task_id))
+    references = [r for m in result for r in m.get(CONTEXT_REFS_KEY, [])]
+    # The late input applied after the floor and the 15 newer ones fill the
+    # budget; the summary's own references are the oldest and are dropped.
+    assert CONTEXT_REFS_KEY not in result[0]
+    assert [r["file_ref"]["file_id"] for r in references] == [
+        "image--3",
+        *(f"image-{i}" for i in range(15)),
+    ]
+
+
+def _break_summary_identity(db, task_id):
+    say(db, task_id, "covered")
+    anchor = last_root(db, task_id)
+    bad = summarize(db, task_id, "bad", anchor)
+    recover(db, bad, coordinate(anchor, event_id="ghost"))
+    say(db, task_id, "tail")
+
+
+def _break_summary_future(db, task_id):
+    say(db, task_id, "covered")
+    bad = summarize(db, task_id, "bad", last_root(db, task_id))
+    future = say(db, task_id, "future")
+    db.flush()
+    recover(db, bad, coordinate(future))
+    say(db, task_id, "tail")
+
+
+def _break_suffix_accepted(db, task_id):
+    fact(
+        db,
+        task_id,
+        "input_accepted",
+        "bad-accepted",
+        {"role": "assistant", "content": "x"},
+        turn_id="bad",
+    )
+
+
+def _break_suffix_applied(db, task_id):
+    fact(
+        db,
+        task_id,
+        "input_applied",
+        "bad-applied",
+        {"recovery_event_id": "ghost"},
+        turn_id="t1",
+    )
+
+
+def _break_suffix_orphan(db, task_id):
+    done(db, task_id, "orphan", "orphan")
+
+
+def _break_retained_run(db, task_id):
+    # Its start precedes the valid floor; the outcome keeps the batch.
+    done(db, task_id, "pre", "pre", run_id="other-run")
+
+
+@pytest.mark.parametrize(
+    "corrupt",
+    [
+        _break_summary_identity,
+        _break_summary_future,
+        _break_suffix_accepted,
+        _break_suffix_applied,
+        _break_suffix_orphan,
+        _break_retained_run,
+    ],
+)
+def test_errors_after_the_floor_match_the_oracle(canonical, corrupt):
+    factory, task_id = canonical
+    with factory() as db:
+        accept(db, task_id, "t1", "first")
+        apply(db, task_id, "t1")
+        call(db, task_id, "pre", "pre", run_id="run")
+        summarize(db, task_id, "valid", last_root(db, task_id))
+        corrupt(db, task_id)
+        purge_legacy(db, task_id)
+    assert sweep(factory, task_id)[0] == "error"
