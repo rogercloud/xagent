@@ -226,6 +226,170 @@ def _summary_coverage(
     return summary, floor, floor if native is not None else 0
 
 
+def _root_events_matching(
+    db: Session,
+    task_id: int,
+    *,
+    through: int,
+    kinds: frozenset[str],
+    column: Any,
+    values: set[Any],
+) -> list[TaskExecutionEvent]:
+    """Fetch covered facts by an identity column, in bounded IN batches."""
+    identities = sorted(value for value in values if value)
+    events: list[TaskExecutionEvent] = []
+    for offset in range(0, len(identities), MAX_EXECUTION_EVENT_PAGE_SIZE):
+        events.extend(
+            db.scalars(
+                select(TaskExecutionEvent)
+                .where(
+                    TaskExecutionEvent.task_id == task_id,
+                    TaskExecutionEvent.scope_id == "root",
+                    TaskExecutionEvent.sequence <= through,
+                    TaskExecutionEvent.kind.in_(kinds),
+                    column.in_(
+                        identities[offset : offset + MAX_EXECUTION_EVENT_PAGE_SIZE]
+                    ),
+                )
+                .order_by(TaskExecutionEvent.sequence)
+            )
+        )
+    return events
+
+
+def _latest_summary_floor(
+    db: Session, task_id: int, horizon: int
+) -> tuple[int, bool] | None:
+    """Find the summary the projection will keep, newest first.
+
+    Returns its floor and whether the coverage is native (model history), or
+    None when no summary at the horizon makes a usable coverage claim.
+    """
+    query = select(TaskExecutionEvent).where(
+        TaskExecutionEvent.task_id == task_id,
+        TaskExecutionEvent.scope_id == "root",
+        TaskExecutionEvent.kind == "action_end_compact",
+    )
+    # The newest summary is usually usable: do not page in older bodies first.
+    cursor, limit = horizon + 1, 1
+    while page := list(
+        db.scalars(
+            query.where(TaskExecutionEvent.sequence < cursor)
+            .order_by(TaskExecutionEvent.sequence.desc())
+            .limit(limit)
+        )
+    ):
+        for event in page:
+            anchors = _load_context_anchors(db, task_id, horizon, [event])
+            coverage = _summary_coverage(event, anchors)
+            if coverage is not None:
+                return coverage[1], coverage[2] != 0
+        cursor, limit = int(page[-1].sequence), MAX_EXECUTION_EVENT_PAGE_SIZE
+    return None
+
+
+def _covered_facts_still_used(
+    db: Session, task_id: int, floor: int, suffix: list[TaskExecutionEvent]
+) -> list[TaskExecutionEvent]:
+    """Covered facts a native summary's suffix still projects.
+
+    Inputs accepted before the floor but applied after it, and every start and
+    outcome of a tool batch with any start or outcome after it. Selection reads
+    identity columns only; the projection still validates what it uses.
+    """
+    turns = {e.turn_id for e in suffix if e.kind == "input_applied"}
+    prior = _root_events_matching(
+        db,
+        task_id,
+        through=floor,
+        kinds=frozenset({"input_accepted"}),
+        column=TaskExecutionEvent.turn_id,
+        values=turns,
+    )
+    suffix_starts = [e for e in suffix if e.kind == "tool_execution_start"]
+    started = {e.tool_attempt_id for e in suffix_starts}
+    unmatched = {
+        e.tool_attempt_id
+        for e in suffix
+        if e.kind in _OUTCOME_KINDS and e.tool_attempt_id not in started
+    }
+    starts = frozenset({"tool_execution_start"})
+    early = _root_events_matching(
+        db,
+        task_id,
+        through=floor,
+        kinds=starts,
+        column=TaskExecutionEvent.tool_attempt_id,
+        values=unmatched,
+    )
+    # Batch membership comes from starts: an outcome's own batch id may not
+    # match its start, which the projection must still reject.
+    early += _root_events_matching(
+        db,
+        task_id,
+        through=floor,
+        kinds=starts,
+        column=TaskExecutionEvent.assistant_message_id,
+        values={e.assistant_message_id for e in (*suffix_starts, *early)},
+    )
+    prior += early
+    prior += _root_events_matching(
+        db,
+        task_id,
+        through=floor,
+        kinds=_OUTCOME_KINDS,
+        column=TaskExecutionEvent.tool_attempt_id,
+        values={e.tool_attempt_id for e in (*suffix_starts, *early)},
+    )
+    return prior
+
+
+def _load_model_events(
+    db: Session, task_id: int, horizon: int
+) -> list[TaskExecutionEvent]:
+    """Root events the projection needs, ascending by sequence.
+
+    Without a usable summary this is the whole history. Otherwise it is the
+    suffix after the summary's floor plus the covered facts that suffix still
+    projects; covered facts that are not projected are neither read nor
+    revalidated.
+    """
+    found = _latest_summary_floor(db, task_id, horizon)
+    if found is None:
+        return _root_events(db, task_id, after=0, through=horizon, kinds=_MODEL_KINDS)
+    floor, native = found
+    suffix = _root_events(db, task_id, after=floor, through=horizon, kinds=_MODEL_KINDS)
+    if native:
+        prior = _covered_facts_still_used(db, task_id, floor, suffix)
+    else:
+        # A legacy coordinate covers transcript facts only: every earlier tool
+        # and settlement fact remains eligible, so this read is unbounded.
+        prior = _root_events(
+            db,
+            task_id,
+            after=0,
+            through=floor,
+            kinds=_TOOL_KINDS | {"execution_settled"},
+        )
+    if not any(event.kind == "skill_select_end" for event in suffix):
+        skill = db.scalar(
+            select(TaskExecutionEvent)
+            .where(
+                TaskExecutionEvent.task_id == task_id,
+                TaskExecutionEvent.scope_id == "root",
+                TaskExecutionEvent.kind == "skill_select_end",
+                TaskExecutionEvent.sequence <= floor,
+            )
+            .order_by(TaskExecutionEvent.sequence.desc())
+            .limit(1)
+        )
+        if skill is not None:
+            prior.append(skill)
+    # Starts found by attempt and by batch overlap.
+    by_sequence = {int(event.sequence): event for event in (*prior, *suffix)}
+    return [by_sequence[sequence] for sequence in sorted(by_sequence)]
+
+
 def load_task_event_context(
     db: Session,
     task_id: int,
@@ -274,8 +438,7 @@ def load_task_event_context(
             )
         horizon = min(horizon, boundary - 1)
 
-    events = _root_events(db, task_id, after=0, through=horizon, kinds=_MODEL_KINDS)
-    return _project(db, task_id, horizon, events)
+    return _project(db, task_id, horizon, _load_model_events(db, task_id, horizon))
 
 
 def _project(
