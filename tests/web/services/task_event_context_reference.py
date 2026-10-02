@@ -1,4 +1,4 @@
-"""Frozen pre-T2 ``load_task_event_context``, the equivalence-test oracle.
+"""Frozen pre-bounded-read ``load_task_event_context``, the equivalence-test oracle.
 
 Verbatim copy of the full-history reader at main ``f912c171f``, renamed only.
 Do not edit: it defines the projection the bounded reader must reproduce. It
