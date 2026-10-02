@@ -426,12 +426,13 @@ it receives change:
   of a tool batch with a start or outcome after F. Batch membership comes from
   the start's `assistant_message_id`, found by `tool_attempt_id` when only the
   outcome is after F. The reader also takes the latest root skill selection at
-  or before F. Rows read and payload bytes depend on the suffix, not on how
+  or before F. Rows fetched and payload bytes depend on the suffix, not on how
   much history the summary covers.
 - **Legacy coverage** (`transcript_watermark` only): the same suffix, plus
-  every earlier root tool and `execution_settled` fact. That coordinate covers
-  transcript facts only, so this part stays unbounded. Current V2 setup does
-  not write legacy-only coverage; it exists only in stage-A V2 data.
+  every earlier root tool and `execution_settled` fact, and the latest
+  pre-floor skill selection. That coordinate covers transcript facts only, so
+  this part stays unbounded. Current V2 setup does not write legacy-only
+  coverage; it exists only in stage-A V2 data.
 - **No usable summary**: full history, as before, after one summary lookup.
   This includes a long first run, whose compactions have no coordinate yet.
   Summaries without a usable coordinate are read once more by that lookup.
@@ -439,18 +440,32 @@ it receives change:
 Behavior change: covered facts that are not projected are no longer read, so
 they are no longer validated again. That covers payload version, acceptance
 shape, application anchors, older summary coordinates, tool identity, and
-orphaned outcomes. A native floor is the watermark of an earlier successful
-read of the same append-only history. Facts that are still projected keep
-every check. When several facts are corrupt, the first error reported may
-differ.
+orphaned outcomes. Every fact the projection uses is validated in this read;
+covered facts that are not projected cannot affect the output, so they are not
+re-validated. Facts that are still projected keep every check. When several
+facts are corrupt, the first error reported may differ.
 
 `tests/web/services/task_event_context_reference.py` freezes the
 full-history reader as an oracle. `test_task_event_context_equivalence.py`
 compares both readers at every horizon and cutoff, and
 `test_task_event_context_read_budget.py` checks that queries, rows and bytes
-stay constant as covered history grows. The oracle is removed in stage 3.7. A
-suffix can still grow without bound while no new native summary is written.
-Bounding that suffix is separate follow-up work.
+stay constant as covered history grows. The frozen oracle is removed in stage
+3.7; the live comparison against a full-history projection of the same reader
+stays.
+
+Follow-up limits:
+
+- The suffix can still grow without bound. Compactions inside one run reuse
+  the floor fixed at that run's setup, so they do not shorten it, and the
+  suffix read includes tool start and outcome payloads outside the
+  projection's 8-call window. Bounding that suffix is separate work.
+- Only client-fetched rows and bytes are bounded. Rows the database examines
+  still grow with the covered prefix: the summary lookup, the skill lookup and
+  the `turn_id`, `tool_attempt_id` and `assistant_message_id` `IN` lookups
+  filter on non-indexed columns within the `(task_id, scope_id, sequence)`
+  index range. A `(task_id, scope_id, kind, sequence)` index, or per-column
+  indexes, is a conditional follow-up if measured database time exceeds its
+  budget.
 
 
 ## Stage 3.3-D: event-backed display and Trace
