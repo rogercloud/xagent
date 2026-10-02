@@ -282,6 +282,9 @@ def _latest_summary_floor(
         )
     ):
         for event in page:
+            # Unusable summaries reference no anchor and issue no lookup; the
+            # first one with a coordinate returns or raises, so this queries at
+            # most once. Batching the page would resolve unused older coordinates.
             anchors = _load_context_anchors(db, task_id, horizon, [event])
             coverage = _summary_coverage(event, anchors)
             if coverage is not None:
