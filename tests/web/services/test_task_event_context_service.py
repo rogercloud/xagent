@@ -687,7 +687,7 @@ def test_reference_queries_are_batched_and_include_internal_summary_anchors(cano
     lookups = [
         (sql, parameters) for sql, parameters in statements if "event_id IN" in sql
     ]
-    assert len(lookups) <= 2
+    assert len(lookups) == 2
     assert all(len(parameters) <= 103 for _, parameters in lookups)
     assert all("task_execution_events.payload," not in sql for sql, _ in lookups)
 

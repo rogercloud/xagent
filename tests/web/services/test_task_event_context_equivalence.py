@@ -52,6 +52,36 @@ def compare(factory, task_id, **cutoff):
     return expected
 
 
+def _live_projection(db, task_id):
+    horizon = db.get(Task, task_id).conversation_event_sequence
+    return task_event_context_service._project(
+        db,
+        task_id,
+        horizon,
+        task_event_context_service._root_events(
+            db,
+            task_id,
+            after=0,
+            through=horizon,
+            kinds=task_event_context_service._MODEL_KINDS,
+        ),
+    )
+
+
+def compare_live(factory, task_id):
+    """The floor-based reader must equal the projection of the whole history.
+
+    Unlike the frozen oracle, this stays after the oracle is removed. It guards
+    ``_covered_facts_still_used`` against drifting from ``_project``. Only the
+    plain horizon is compared: before_turn_id / before_message_id cutoffs just
+    lower the horizon, and reproducing that here would duplicate production
+    logic; the frozen oracle already covers them.
+    """
+    expected = _read(factory, _live_projection, task_id)
+    actual = _read(factory, task_event_context_service.load_task_event_context, task_id)
+    assert actual == expected
+
+
 def set_horizon(factory, task_id, horizon):
     with factory() as db:
         db.execute(
@@ -62,8 +92,13 @@ def set_horizon(factory, task_id, horizon):
         db.commit()
 
 
-def sweep(factory, task_id):
-    """Compare at every horizon and cutoff; return the outcome at the top."""
+def sweep(factory, task_id, *, live=True):
+    """Compare at every horizon and cutoff; return the outcome at the top.
+
+    ``live`` adds the permanent full-history comparison; scenarios with
+    deliberately invalid data opt out, since the reader no longer validates
+    facts it does not use.
+    """
     with factory() as db:
         top = db.get(Task, task_id).conversation_event_sequence
         turns = sorted(
@@ -89,6 +124,8 @@ def sweep(factory, task_id):
             for horizon in range(top + 1):
                 set_horizon(factory, task_id, horizon)
                 latest = compare(factory, task_id)
+                if live:
+                    compare_live(factory, task_id)
                 for turn in turns:
                     compare(factory, task_id, before_turn_id=turn)
                 for message_id in message_ids:
@@ -550,7 +587,7 @@ def test_errors_after_the_floor_match_the_oracle(canonical, corrupt):
         summarize(db, task_id, "valid", last_root(db, task_id))
         corrupt(db, task_id)
         purge_legacy(db, task_id)
-    assert sweep(factory, task_id)[0] == "error"
+    assert sweep(factory, task_id, live=False)[0] == "error"
 
 
 def _covered_invalid_acceptance(db, task_id):
@@ -610,3 +647,134 @@ def test_covered_facts_that_are_not_projected_are_not_revalidated(
             {"role": "system", "content": "summary s"},
             {"role": "assistant", "content": "tail"},
         ]
+
+
+def test_child_summary_with_a_later_root_anchor_does_not_set_the_floor(canonical):
+    factory, task_id = canonical
+    with factory() as db:
+        say(db, task_id, "covered")
+        summarize(db, task_id, "root", last_root(db, task_id))
+        say(db, task_id, "kept-1")
+        say(db, task_id, "kept-2")
+        later = last_root(db, task_id)
+        fact(
+            db,
+            task_id,
+            "action_end_compact",
+            "child-summary",
+            {
+                "data": {
+                    "summary": "child summary",
+                    MODEL_CONTEXT_WATERMARK_METADATA_KEY: coordinate(later),
+                }
+            },
+            scope_id="child",
+        )
+        say(db, task_id, "tail")
+        purge_legacy(db, task_id)
+    assert [m["content"] for m in messages(sweep(factory, task_id))] == [
+        "summary root",
+        "kept-1",
+        "kept-2",
+        "tail",
+    ]
+
+
+def test_summary_lookup_pages_past_many_unusable_summaries(canonical, monkeypatch):
+    factory, task_id = canonical
+    with factory() as db:
+        say(db, task_id, "covered")
+        summarize(db, task_id, "usable", last_root(db, task_id))
+        say(db, task_id, "kept")
+        anchor = last_root(db, task_id)
+        # More than the limit-1 first page and one full page of newer ones.
+        for i in range(110):
+            if i % 2:
+                summarize(db, task_id, f"empty-{i}", anchor, text="  ")
+            else:
+                summarize(db, task_id, f"bare-{i}", None)
+        say(db, task_id, "tail")
+        purge_legacy(db, task_id)
+    assert [m["content"] for m in messages(sweep(factory, task_id))] == [
+        "summary usable",
+        "kept",
+        "tail",
+    ]
+    # A lookup that gave up would fall back to full history with the same
+    # output, so also require that the suffix read starts at the floor.
+    reads = []
+    original = task_event_context_service._root_events
+
+    def spy(db, task_id, *, after, **kwargs):
+        reads.append(after)
+        return original(db, task_id, after=after, **kwargs)
+
+    monkeypatch.setattr(task_event_context_service, "_root_events", spy)
+    _read(factory, task_event_context_service.load_task_event_context, task_id)
+    assert reads and reads[0] > 0
+
+
+def test_summary_floors_need_not_increase_with_sequence(canonical):
+    factory, task_id = canonical
+    with factory() as db:
+        say(db, task_id, "a")
+        first = last_root(db, task_id)
+        summarize(db, task_id, "s1", first)
+        say(db, task_id, "b")
+        say(db, task_id, "c")
+        summarize(db, task_id, "s2", last_root(db, task_id))
+        say(db, task_id, "d")
+        # The latest usable summary may cover less than an earlier one.
+        summarize(db, task_id, "s3", first)
+        say(db, task_id, "e")
+        purge_legacy(db, task_id)
+    assert [m["content"] for m in messages(sweep(factory, task_id))] == [
+        "summary s3",
+        "b",
+        "c",
+        "d",
+        "e",
+    ]
+
+
+@pytest.mark.parametrize("newest_legacy", [True, False])
+def test_native_and_legacy_summaries_alternate(canonical, newest_legacy):
+    factory, task_id = canonical
+    with factory() as db:
+        accept(db, task_id, "old", "covered")
+        apply(db, task_id, "old")
+        call(db, task_id, "early", "e1")
+        done(db, task_id, "early", "e1")
+        settle(db, task_id, "failed", "failed")
+        summarize(
+            db, task_id, "first", last_root(db, task_id), legacy=not newest_legacy
+        )
+        say(db, task_id, "middle")
+        call(db, task_id, "mid", "m1")
+        done(db, task_id, "mid", "m1")
+        summarize(db, task_id, "second", last_root(db, task_id), legacy=newest_legacy)
+        say(db, task_id, "tail")
+        purge_legacy(db, task_id)
+    result = messages(sweep(factory, task_id))
+    assert result[0]["content"] == "summary second"
+    # A legacy newest summary keeps every earlier tool and settlement fact.
+    assert len([m for m in result if m["role"] == "tool"]) == (
+        2 if newest_legacy else 0
+    )
+
+
+def test_skill_selected_exactly_at_the_floor(canonical):
+    factory, task_id = canonical
+    with factory() as db:
+        say(db, task_id, "covered")
+        fact(
+            db,
+            task_id,
+            "skill_select_end",
+            "at-floor",
+            {"data": {"selected": True, "skill_name": "csv"}},
+        )
+        summarize(db, task_id, "s", last_root(db, task_id))
+        say(db, task_id, "tail")
+        purge_legacy(db, task_id)
+    assert sweep(factory, task_id)[1].selected_skill_name == "csv"

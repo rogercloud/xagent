@@ -98,7 +98,7 @@ def _measure(factory, task_id):
 
 
 def _seed(factory, owner_task_id, size):
-    """A V2 task with ``size`` covered 8 KiB messages and a small suffix."""
+    """A V2 task with ``size`` covered 8 KiB messages, 150 older summaries and a small suffix."""
     now = datetime.now(timezone.utc)
     with factory() as db:
         task = Task(
@@ -132,6 +132,10 @@ def _seed(factory, owner_task_id, size):
         )
         task.conversation_event_sequence = size
         db.commit()
+        # Many earlier usable summaries with large bodies: reading more than
+        # the newest one would grow rows and bytes.
+        for i in range(150):
+            summarize(db, task_id, f"old-{i}", last_root(db, task_id), text="y" * 8192)
         accept(db, task_id, "late", "accepted before summary")
         call(db, task_id, "cross", "a")
         call(db, task_id, "cross", "b")
@@ -155,7 +159,9 @@ def _assert_bounded(factory, owner_task_id, sizes):
         "user",
         "assistant",
     ]
+    assert small["rows"] > 0 and small["bytes"] > 0
     for loaded, metrics in rest:
+        assert metrics["rows"] > 0 and metrics["bytes"] > 0
         assert loaded.messages == first.messages
         assert metrics["queries"] == small["queries"]
         assert metrics["rows"] == small["rows"]
