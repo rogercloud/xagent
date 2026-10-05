@@ -240,3 +240,35 @@ def test_settlement_agent_result_is_not_fetched(canonical, mode):
     assert metrics["rows"] > 0
     # Each of the three settlements embeds ``size`` bytes of agent context.
     assert metrics["bytes"] < size // 4
+
+
+def test_anchor_lookup_filters_by_event_id_only(canonical):
+    """event_id is unique; a task/scope filter lets the planner scan the task."""
+    factory, task_id = canonical
+    with factory() as db:
+        say(db, task_id, "covered")
+        summarize(db, task_id, "s", last_root(db, task_id))
+        say(db, task_id, "tail")
+        purge_legacy(db, task_id)
+    statements = []
+
+    def capture(_conn, _cursor, statement, _params, _context, _many):
+        statements.append(" ".join(statement.split()))
+
+    engine = factory.kw["bind"]
+    sa.event.listen(engine, "before_cursor_execute", capture)
+    try:
+        with factory() as db:
+            assert load_task_event_context(db, task_id).messages
+    finally:
+        sa.event.remove(engine, "before_cursor_execute", capture)
+    anchor_lookups = [
+        s
+        for s in statements
+        if "task_execution_events.event_id IN" in s
+        and "task_execution_events.scope_id," in s
+    ]
+    assert anchor_lookups
+    for lookup in anchor_lookups:
+        where = lookup.split(" WHERE ", 1)[1]
+        assert not any(c in where for c in ("task_id", "scope_id", "sequence"))

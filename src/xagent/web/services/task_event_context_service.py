@@ -104,23 +104,26 @@ def _load_context_anchors(
     identities = sorted(references)
     anchors: dict[str, tuple[int, str, int]] = {}
     for offset in range(0, len(identities), MAX_EXECUTION_EVENT_PAGE_SIZE):
+        # event_id is globally unique: look it up on that index alone and
+        # apply the task, scope and horizon predicates here, so the planner
+        # cannot scan the task's rows through the (task, scope, sequence) index.
         rows = db.execute(
             select(
                 TaskExecutionEvent.event_id,
+                TaskExecutionEvent.task_id,
+                TaskExecutionEvent.scope_id,
                 TaskExecutionEvent.sequence,
                 TaskExecutionEvent.kind,
                 TaskExecutionEvent.payload_version,
             ).where(
-                TaskExecutionEvent.task_id == task_id,
-                TaskExecutionEvent.scope_id == "root",
-                TaskExecutionEvent.sequence <= horizon,
                 TaskExecutionEvent.event_id.in_(
                     identities[offset : offset + MAX_EXECUTION_EVENT_PAGE_SIZE]
                 ),
             )
         )
-        for event_id, sequence, kind, version in rows:
-            anchors[event_id] = (sequence, kind, version)
+        for event_id, owner, scope_id, sequence, kind, version in rows:
+            if owner == task_id and scope_id == "root" and sequence <= horizon:
+                anchors[event_id] = (sequence, kind, version)
     return anchors
 
 
