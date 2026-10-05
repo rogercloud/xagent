@@ -1779,9 +1779,11 @@ def settle_task_lease_isolated(
     ``classify_unknown_tool_effect`` is for a run that raised: if its V2
     facts show a started tool attempt with no committed outcome, the failure
     is recorded as an unknown tool effect -- the classification lease
-    recovery applies -- instead of ``error_message``. The tool is never
-    re-run. When that read cannot complete, this raises and the lease is
-    retained, so TTL recovery classifies the run instead.
+    recovery applies -- instead of ``error_message``. The tool is not
+    automatically replayed. The read runs only after the fenced failure
+    matched the RUNNING row, inside that transaction. When it cannot
+    complete, this raises and the lease is retained, so TTL recovery
+    classifies the run instead.
 
     On checkout or commit failure the transaction is rolled back and the lease
     is intentionally retained for TTL recovery; this function never creates an
@@ -1796,10 +1798,6 @@ def settle_task_lease_isolated(
     with SessionLocal() as settle_db:
         try:
             if error_message is not None:
-                if classify_unknown_tool_effect and run_has_unknown_tool_effect(
-                    settle_db, lease
-                ):
-                    error_message = TASK_UNKNOWN_TOOL_EFFECT_SETTLEMENT_ERROR
                 failed = fail_and_release_task_lease_no_commit(
                     settle_db,
                     lease,
@@ -1807,6 +1805,11 @@ def settle_task_lease_isolated(
                 )
                 if failed:
                     task = settle_db.query(Task).filter(Task.id == lease.task_id).one()
+                    if classify_unknown_tool_effect and run_has_unknown_tool_effect(
+                        settle_db, lease
+                    ):
+                        error_message = TASK_UNKNOWN_TOOL_EFFECT_SETTLEMENT_ERROR
+                        setattr(task, "error_message", error_message)
                     sync_workforce_run_status(settle_db, task, TaskStatus.FAILED)
                     sync_trigger_run_status(settle_db, task, TaskStatus.FAILED)
                     if task.user_id is not None:

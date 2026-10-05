@@ -58,7 +58,8 @@ def finalize_managed_task_lease_result(
     A FAILED settlement without an ``execution_result`` is a run that raised
     (or was abandoned). When its V2 facts show a started tool attempt with no
     committed outcome, it is recorded as an unknown tool effect, the
-    classification lease recovery applies; the tool is never re-run.
+    classification lease recovery applies; the tool is not automatically
+    replayed.
     """
 
     if status == TaskStatus.RUNNING:
@@ -140,6 +141,9 @@ def finalize_managed_task_lease_result(
                 "output",
                 history_content if status == TaskStatus.COMPLETED else None,
             )
+        # A lost acknowledgement is not reconciled here: the lease is released
+        # in this transaction, so only the result fact's witness can prove the
+        # commit. That belongs with the same-identity retry work.
         db.commit()
     except Exception:
         db.rollback()

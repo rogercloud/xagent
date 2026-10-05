@@ -538,19 +538,37 @@ def run_has_unknown_tool_effect(db: Session, lease: TaskLease) -> bool:
     Uses the classification lease recovery applies to an expired run: the
     run's latest checkpoint names a started tool attempt with no committed
     outcome. Legacy (V1) tasks are never classified. A read that cannot be
-    completed raises, so the caller rolls back and leaves the exact lease to
-    TTL recovery, which repeats this classification.
+    completed raises -- after the same degradation signal recovery's read
+    registers -- so the caller rolls back and leaves the exact lease to TTL
+    recovery, which repeats this classification.
     """
 
+    from ...core.agent.checkpoint import CheckpointUnavailableError
     from .task_execution_event_writer import uses_execution_events
 
-    return (
-        uses_execution_events(db, lease.task_id)
-        and _resolve_event_checkpoint_recovery(
+    try:
+        if not uses_execution_events(db, lease.task_id):
+            return False
+        verdict = _resolve_event_checkpoint_recovery(
             db, task_id=lease.task_id, run_id=lease.run_id
         )
-        is CheckpointRecoveryVerdict.UNKNOWN_TOOL_EFFECT
+    except (CheckpointUnavailableError, SQLAlchemyError) as exc:
+        # Same signal as recovery's read; do not publish SQL/parameters.
+        detail = f"task_id={lease.task_id}: {type(exc).__name__}"
+        logger.warning(
+            "Settlement unknown-effect classification unavailable: %s", detail
+        )
+        register_degradation(CHECKPOINT_RECOVERY_UNAVAILABLE, detail)
+        raise
+    if verdict is not CheckpointRecoveryVerdict.UNKNOWN_TOOL_EFFECT:
+        return False
+    logger.warning(
+        "Task %s run %s settles as an unknown tool effect (verdict %s)",
+        lease.task_id,
+        lease.run_id,
+        verdict.value,
     )
+    return True
 
 
 def resolve_checkpoint_recovery(
