@@ -57,6 +57,16 @@ engine = engine_fixture
 task_id = task_id_fixture
 
 
+@pytest.fixture(autouse=True)
+def _clear_bg_manager():
+    """``_schedule_bg`` registers its handle globally; do not leak it."""
+    from xagent.web.services.task_execution import background_task_manager
+
+    background_task_manager.running_tasks.clear()
+    yield
+    background_task_manager.running_tasks.clear()
+
+
 def _tool_turn_llm() -> FakeLLM:
     return FakeLLM(
         responses=[
