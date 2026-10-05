@@ -1705,6 +1705,68 @@ class _TaskExecutionFinalization:
     late_result: bool = False
 
 
+def _commit_finalization_or_reconcile(
+    finalize_db: Session,
+    *,
+    task_id: int,
+    task_lease: TaskLease | None,
+    expected: TaskControlSnapshot | None,
+) -> None:
+    """Commit one result transition, or prove an unacknowledged COMMIT applied.
+
+    A driver can raise after the server committed. Without this read-back the
+    run would be reported as a setup/run failure that the fenced settlement
+    cannot apply (the row is no longer RUNNING), so neither the result nor a
+    failure would ever be announced. The exact owned row carrying this
+    transition's status and state version proves the commit; anything else
+    re-raises the commit error unchanged.
+    """
+    try:
+        finalize_db.commit()
+        return
+    except Exception as commit_error:
+        try:
+            finalize_db.rollback()
+        except Exception:
+            logger.warning(
+                "Task %s finalization rollback failed after a commit error",
+                task_id,
+                exc_info=True,
+            )
+        if task_lease is None or task_lease.run_id is None or expected is None:
+            raise
+        try:
+            with get_session_local()() as read_db:
+                committed = (
+                    read_db.query(Task.id)
+                    .filter(
+                        Task.id == task_id,
+                        Task.runner_id == task_lease.runner_id,
+                        task_lease_attempt_predicate(task_lease),
+                        Task.run_id == task_lease.run_id,
+                        Task.status == expected.status,
+                        Task.state_version == expected.state_version,
+                    )
+                    .first()
+                    is not None
+                )
+        except Exception:
+            logger.warning(
+                "Task %s finalization commit read-back failed",
+                task_id,
+                exc_info=True,
+            )
+            committed = False
+        if not committed:
+            raise commit_error
+        logger.warning(
+            "Task %s result commit was not acknowledged but is committed; "
+            "continuing with the committed %s result",
+            task_id,
+            expected.status.value,
+        )
+
+
 def _finalize_task_execution_result_isolated(
     *,
     task_id: int,
@@ -1877,7 +1939,12 @@ def _finalize_task_execution_result_isolated(
                     task_updated.status,
                 )
                 stage_result_fact_no_commit(finalize_db, task_updated, result)
-                finalize_db.commit()
+                _commit_finalization_or_reconcile(
+                    finalize_db,
+                    task_id=task_id,
+                    task_lease=task_lease,
+                    expected=final_control_snapshot,
+                )
                 metadata_committed = True
                 terminal_state_committed = True
                 waiting_for_control = True
@@ -1999,13 +2066,23 @@ def _finalize_task_execution_result_isolated(
                     content_is_reconciled=True,
                 )
                 stage_result_fact_no_commit(finalize_db, task_updated, result)
-                finalize_db.commit()
+                _commit_finalization_or_reconcile(
+                    finalize_db,
+                    task_id=task_id,
+                    task_lease=task_lease,
+                    expected=final_control_snapshot,
+                )
                 metadata_committed = True
                 terminal_state_committed = True
 
             if pause_commit_pending and not metadata_committed:
                 stage_result_fact_no_commit(finalize_db, task_updated, result)
-                finalize_db.commit()
+                _commit_finalization_or_reconcile(
+                    finalize_db,
+                    task_id=task_id,
+                    task_lease=task_lease,
+                    expected=final_control_snapshot,
+                )
                 metadata_committed = True
             broadcast_meta = {
                 "id": int(task_updated.id),

@@ -8,6 +8,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from sqlalchemy.exc import OperationalError
+from sqlalchemy.orm import Session
 
 from tests.core.agent.test_react import FakeLLM, FakeTool
 from tests.web.services.test_execution_event_recovery import tracer_for
@@ -302,3 +303,168 @@ def test_legacy_task_settlement_is_not_classified(canonical):
         task = db.get(Task, tid)
         assert task.status == TaskStatus.FAILED
         assert task.error_message == "setup/run error: RuntimeError: boom"
+
+
+async def _run_turn_with_broken_finalize_commit(
+    canonical, monkeypatch, outcome: dict[str, Any], *, applied: bool
+) -> tuple[Any, list[dict[str, Any]]]:
+    """Run one real turn whose result COMMIT raises once.
+
+    ``applied`` decides whether the server applied that COMMIT before the
+    driver raised (a lost acknowledgement) or rolled it back.
+    """
+
+    from xagent.web.models import database
+    from xagent.web.services import task_execution
+
+    factory, tid = canonical
+    monkeypatch.setattr(database, "_SessionLocal", factory)
+    with factory() as db:
+        lease = acquire_task_lease(db, tid, new_run=True)
+
+    armed: list[bool] = []
+    broken: list[str] = []
+    original_commit = Session.commit
+
+    def broken_commit(self):
+        if not (armed and armed[0]):
+            return original_commit(self)
+        armed[0] = False
+        broken.append("finalize")
+        if applied:
+            original_commit(self)
+        raise OperationalError("COMMIT", {}, Exception("connection lost"))
+
+    original_finalize = task_execution._finalize_task_execution_result_isolated
+
+    def finalize(**kwargs):
+        armed[:] = [True]
+        try:
+            return original_finalize(**kwargs)
+        finally:
+            armed.clear()
+
+    monkeypatch.setattr(Session, "commit", broken_commit)
+    monkeypatch.setattr(
+        task_execution, "_finalize_task_execution_result_isolated", finalize
+    )
+    manager = MagicMock()
+    manager.get_agent_for_task = AsyncMock(return_value=MagicMock())
+    manager.execute_task = AsyncMock(return_value=dict(outcome))
+    published: list[dict[str, Any]] = []
+
+    async def publish(event, _task_id):
+        published.append(event)
+
+    with (
+        patch.object(orchestrator, "run_task_lease_heartbeat", new=AsyncMock()),
+        patch.object(
+            orchestrator, "resolve_execution_scope", return_value=None, create=True
+        ),
+        patch.object(orchestrator, "_get_agent_manager", return_value=manager),
+        patch("xagent.web.services.task_events.publish_task_event", new=publish),
+        patch.object(task_execution, "publish_task_event", new=publish),
+    ):
+        await _schedule_bg(
+            task_id=tid,
+            task_owner_user_id=1,
+            task_source="sdk",
+            task_lease=lease,
+            payload=TaskTurnPayload("2+2"),
+            force_fresh=False,
+            context=None,
+        )
+
+    assert broken == ["finalize"]
+    manager.execute_task.assert_awaited_once()
+    return lease, published
+
+
+def _terminal_events(published: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [
+        event
+        for event in published
+        if event.get("type") in {"task_completed", "task_error"}
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "outcome",
+    [
+        {"success": True, "output": "4"},
+        {"success": False, "output": "", "error": "model refused"},
+    ],
+    ids=["completed", "failed"],
+)
+async def test_finalize_lost_ack_publishes_committed_terminal_once(
+    canonical, monkeypatch, outcome
+):
+    """COMMIT reached the server but the driver raised: announce what committed."""
+
+    factory, tid = canonical
+    lease, published = await _run_turn_with_broken_finalize_commit(
+        canonical, monkeypatch, outcome, applied=True
+    )
+
+    expected = TaskStatus.COMPLETED if outcome["success"] else TaskStatus.FAILED
+    with factory() as db:
+        task = db.get(Task, tid)
+        assert task.status == expected
+        assert task.runner_id is None
+        settled = [row for row in facts(db, tid) if row.kind == "execution_settled"]
+        assert len(settled) == 1
+        state_version = int(task.state_version)
+    terminal = _terminal_events(published)
+    assert len(terminal) == 1
+    assert terminal[0]["type"] == "task_completed"
+    assert terminal[0]["task"]["status"] == expected.value
+    assert terminal[0]["run_id"] == lease.run_id
+    assert terminal[0]["state_version"] == state_version
+    if outcome["success"]:
+        # The V2 display path ran: the committed assistant frame precedes it.
+        assert terminal[0]["message_id"] == published[-2]["data"]["message_id"]
+
+
+@pytest.mark.asyncio
+async def test_finalize_rolled_back_commit_is_never_reported_as_success(
+    canonical, monkeypatch
+):
+    factory, tid = canonical
+    lease, published = await _run_turn_with_broken_finalize_commit(
+        canonical, monkeypatch, {"success": True, "output": "4"}, applied=False
+    )
+
+    with factory() as db:
+        task = db.get(Task, tid)
+        assert task.status == TaskStatus.FAILED
+        assert task.runner_id is None
+        assert task.error_message.startswith("setup/run error: OperationalError")
+        settled = [row for row in facts(db, tid) if row.kind == "execution_settled"]
+        assert [row.payload["status"] for row in settled] == ["failed"]
+    terminal = _terminal_events(published)
+    assert [event["type"] for event in terminal] == ["task_error"]
+    assert terminal[0]["run_id"] == lease.run_id
+
+
+@pytest.mark.asyncio
+async def test_finalize_lost_ack_publishes_committed_wait_once(canonical, monkeypatch):
+    factory, tid = canonical
+    lease, published = await _run_turn_with_broken_finalize_commit(
+        canonical,
+        monkeypatch,
+        {"success": True, "status": "waiting_for_user", "output": "Which file?"},
+        applied=True,
+    )
+
+    with factory() as db:
+        task = db.get(Task, tid)
+        assert task.status == TaskStatus.WAITING_FOR_USER
+        assert task.runner_id is None
+        state_version = int(task.state_version)
+    assert _terminal_events(published) == []
+    info = [event for event in published if event.get("event_type") == "task_info"]
+    assert len(info) == 1
+    assert info[0]["data"]["status"] == TaskStatus.WAITING_FOR_USER.value
+    assert info[0]["data"]["state_version"] == state_version
+    assert info[0]["data"]["run_id"] == lease.run_id
