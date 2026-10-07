@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from datetime import UTC, datetime
@@ -38,7 +39,8 @@ def _add_upload(sessions, tmp_path, file_id: str) -> None:
                 file_id=file_id,
                 filename=path.name,
                 storage_path=str(path),
-                storage_key=f"durable/{file_id}",
+                storage_key=f"users/1/uploads/{file_id}/{file_id}.txt",
+                checksum=hashlib.sha256(file_id.encode()).hexdigest(),
                 storage_status="available",
                 created_at=datetime.now(UTC),
             )
@@ -50,7 +52,11 @@ def _claim(file_id: str) -> RegisteredUploadCompensationClaim:
         user_id=1,
         file_id=file_id,
         expected_task_id=None,
-        expected_storage_key=f"durable/{file_id}",
+        expected_storage_key=(
+            "users/1/uploads/source/source.txt"
+            if file_id == "source"
+            else f"users/1/uploads/{file_id}/{file_id}.txt"
+        ),
     )
 
 
@@ -183,6 +189,7 @@ def test_cancelled_settlement_does_not_freeze_admission_or_shutdown():
 
     script = """
 import asyncio
+import hashlib
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session
 from xagent.web.services import kb_reference_protection as protection
