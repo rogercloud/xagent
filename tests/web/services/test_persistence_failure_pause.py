@@ -73,6 +73,7 @@ from xagent.web.models.trigger import (
 )
 from xagent.web.models.user import User
 from xagent.web.models.workforce import Workforce, WorkforceRun
+from xagent.web.services import task_auto_recovery
 from xagent.web.services import task_execution_event_recovery as event_recovery
 from xagent.web.services import task_orchestrator as orchestrator
 from xagent.web.services.chat_history_service import (
@@ -100,6 +101,8 @@ from xagent.web.services.task_lease_recovery import (
 )
 from xagent.web.services.task_lease_service import (
     TASK_UNKNOWN_TOOL_EFFECT_SETTLEMENT_ERROR,
+    CheckpointRecoveryResolution,
+    CheckpointRecoveryVerdict,
     TaskLease,
     acquire_task_lease,
     bind_task_lease_context,
@@ -108,8 +111,10 @@ from xagent.web.services.task_lease_service import (
 )
 from xagent.web.services.task_orchestrator import (
     TASK_INTERRUPTION_PAUSED_MESSAGE,
+    TASK_USER_PAUSED_MESSAGE,
     TaskTurnPayload,
     _schedule_bg,
+    publish_interruption_pause,
     settle_task_lease_isolated,
 )
 
@@ -204,6 +209,17 @@ def _settled_facts(factory, tid: int) -> list[dict[str, Any]]:
         ]
 
 
+def _assert_no_failure_in_model_context(factory, tid: int) -> None:
+    """The paused run must not read as a failed execution to the next turn."""
+    from xagent.web.services.task_event_context_service import (
+        load_task_event_context,
+    )
+
+    with factory() as db:
+        context = load_task_event_context(db, tid)
+    assert "failed" not in str(context).lower()
+
+
 def _assert_paused(factory, tid: int, lease: TaskLease, *, reason: str) -> Any:
     task, row, events = _state(factory, tid)
     assert task.status == TaskStatus.PAUSED
@@ -223,16 +239,19 @@ def _assert_paused(factory, tid: int, lease: TaskLease, *, reason: str) -> Any:
     return row
 
 
-def _settle(lease: TaskLease, **kwargs: Any) -> tuple[bool, dict[str, Any]]:
-    outcome: dict[str, Any] = {}
+def _settle(lease: TaskLease, **kwargs: Any) -> tuple[bool, list[InterruptionReason]]:
+    paused_for: list[InterruptionReason] = []
     settled = settle_task_lease_isolated(
         lease,
         error_message=RUN_ERROR,
         classify_unknown_tool_effect=True,
-        settled_outcome=outcome,
+        paused_for=paused_for,
         **kwargs,
     )
-    return settled, outcome
+    return settled, paused_for
+
+
+PAUSED_FACT = {"status": "paused", "result": {"error": None}}
 
 
 def _persistence_interruption() -> InterruptionReason:
@@ -392,9 +411,9 @@ def test_run_without_checkpoint_fails_as_before(canonical):
     factory, tid = canonical
     lease = _start_run(factory, tid)
 
-    settled, outcome = _settle(lease, interruption=_persistence_interruption())
+    settled, paused_for = _settle(lease, interruption=_persistence_interruption())
 
-    assert settled and outcome == {"status": TaskStatus.FAILED}
+    assert settled and paused_for == []
     task, row, _events = _state(factory, tid)
     assert task.status == TaskStatus.FAILED
     assert task.error_message == RUN_ERROR
@@ -409,13 +428,9 @@ def test_pause_requested_run_pauses_for_the_user(canonical):
         db.get(Task, tid).control_state = "pause_requested"
         db.commit()
 
-    settled, outcome = _settle(lease, interruption=_persistence_interruption())
+    settled, paused_for = _settle(lease, interruption=_persistence_interruption())
 
-    assert settled
-    assert outcome == {
-        "status": TaskStatus.PAUSED,
-        "interruption_reason": InterruptionReason.USER_PAUSE,
-    }
+    assert settled and paused_for == [InterruptionReason.USER_PAUSE]
     _assert_paused(factory, tid, lease, reason="user_pause")
 
 
@@ -530,7 +545,7 @@ def test_result_persistence_failure_pauses(canonical):
 
     finalized = _finalize(factory, tid, lease, PERSISTENCE_RESULT)
 
-    assert finalized.interruption_paused
+    assert finalized.interruption_pause_reason is InterruptionReason.PERSISTENCE_FAILURE
     assert finalized.waiting_for_control and finalized.terminal_state_committed
     assert finalized.final_task_status == "paused"
     assert finalized.final_control_snapshot.control_state.value == "paused"
@@ -538,6 +553,9 @@ def test_result_persistence_failure_pauses(canonical):
     assert settle_task_lease_isolated(lease)
     row = _assert_paused(factory, tid, lease, reason="persistence_failure")
     assert row.last_error == PERSISTENCE_RESULT["error"]
+    # Settled like lease recovery, not as the run's unsuccessful result.
+    assert _settled_facts(factory, tid) == [PAUSED_FACT]
+    _assert_no_failure_in_model_context(factory, tid)
     assert _assistant_lines(factory, tid) == []
 
 
@@ -562,7 +580,7 @@ def test_other_results_fail_as_before(canonical, result):
 
     finalized = _finalize(factory, tid, lease, result)
 
-    assert not finalized.interruption_paused
+    assert finalized.interruption_pause_reason is None
     assert finalized.final_task_status == "failed"
     task, row, events = _state(factory, tid)
     assert task.status == TaskStatus.FAILED
@@ -610,9 +628,14 @@ def test_resumed_result_persistence_failure_pauses(canonical):
     )
 
     assert finalized["final_status"] == "paused"
-    assert finalized["lease_released"] and finalized["interruption_paused"]
+    assert finalized["lease_released"]
+    assert (
+        finalized["interruption_pause_reason"] is InterruptionReason.PERSISTENCE_FAILURE
+    )
     _assert_paused(factory, tid, lease, reason="persistence_failure")
     assert _assistant_lines(factory, tid) == []
+    assert _settled_facts(factory, tid) == [PAUSED_FACT]
+    _assert_no_failure_in_model_context(factory, tid)
 
 
 class _FakeTracker:
@@ -630,7 +653,7 @@ class _FakeTracker:
 
 
 async def _resume_raising(
-    error: BaseException, settle: Any
+    error: BaseException, settle: Any, *, explicit_cancel: bool = False
 ) -> tuple[AsyncMock, list[str]]:
     """Drive the resume entry point into its exception branch.
 
@@ -657,6 +680,11 @@ async def _resume_raising(
         patch(
             "xagent.web.services.task_orchestrator.publish_interruption_pause",
             publish_pause,
+        ),
+        patch(
+            "xagent.web.services.task_execution.background_task_manager"
+            ".cancel_was_requested",
+            return_value=explicit_cancel,
         ),
     ]
     for item in patches:
@@ -685,7 +713,7 @@ async def _resume_raising(
 async def test_resume_exception_passes_the_interruption_and_announces_the_pause():
     def settle(lease, **kwargs):
         assert kwargs["interruption"] is InterruptionReason.PERSISTENCE_FAILURE
-        kwargs["settled_outcome"].update(status=TaskStatus.PAUSED)
+        kwargs["paused_for"].append(InterruptionReason.PERSISTENCE_FAILURE)
         kwargs["terminal_event_state"].update(status="paused", run_id=lease.run_id)
         return True
 
@@ -695,7 +723,11 @@ async def test_resume_exception_passes_the_interruption_and_announces_the_pause(
     )
 
     settle_mock.assert_called_once()
-    publish_pause.assert_awaited_once_with(42, {"status": "paused", "run_id": "run-a"})
+    publish_pause.assert_awaited_once_with(
+        42,
+        {"status": "paused", "run_id": "run-a"},
+        InterruptionReason.PERSISTENCE_FAILURE,
+    )
     assert "task_error" not in frames
 
 
@@ -802,7 +834,9 @@ def _projected_task(factory, *, source: str = "trigger") -> dict[str, Any]:
         }
 
 
-def _prepare_run(factory, ids: dict[str, Any], **fields: Any) -> TaskLease:
+def _prepare_run(
+    factory, ids: dict[str, Any], *, checkpoint: bool = True, **fields: Any
+) -> TaskLease:
     """Start a run with prior output, a pending user turn and a checkpoint."""
     lease = _start_run(factory, ids["task"], **fields)
     with factory() as db:
@@ -817,7 +851,8 @@ def _prepare_run(factory, ids: dict[str, Any], **fields: Any) -> TaskLease:
             delivery_status=DELIVERY_PENDING,
         )
         db.commit()
-    _checkpoint(factory, ids["task"], lease.run_id)
+    if checkpoint:
+        _checkpoint(factory, ids["task"], lease.run_id)
     with factory() as db:
         ids["version"] = int(db.get(Task, ids["task"]).state_version)
     return lease
@@ -966,14 +1001,18 @@ async def test_pause_projects_like_lease_recovery(canonical):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("source", "detail"),
-    [("trigger", None), ("sdk", "ineligible:source_sdk")],
+    ("source", "state", "detail", "event"),
+    [
+        ("trigger", "disabled", None, "interrupted"),
+        # Ineligibility wins over the switch.
+        ("sdk", "ineligible", "ineligible:source_sdk", "ineligible"),
+    ],
 )
 async def test_switch_off_settles_exactly_as_before(
-    canonical, monkeypatch, source, detail
+    canonical, monkeypatch, source, state, detail, event
 ):
     """Switch off: the same FAILED settlement as without any interruption,
-    plus a ``disabled`` row that keeps the ineligibility detail."""
+    plus a ``disabled`` row (``ineligible`` for an ineligible task)."""
 
     monkeypatch.setenv(PAUSE_SWITCH, "false")
     factory, _tid = canonical
@@ -998,12 +1037,10 @@ async def test_switch_off_settles_exactly_as_before(
     _task, row, events = _state(factory, gated["task"])
     assert (row.reason, row.state, row.state_detail) == (
         "persistence_failure",
-        "disabled",
+        state,
         detail,
     )
-    assert [(e.event, e.detail["task_status"]) for e in events] == [
-        ("interrupted", "failed")
-    ]
+    assert [(e.event, e.detail["task_status"]) for e in events] == [(event, "failed")]
     assert _state(factory, baseline["task"])[1] is None
 
 
@@ -1117,7 +1154,8 @@ def test_quota_stop_wins_over_its_interruption_reason(canonical, monkeypatch, sw
     left = _finalize_and_release(factory, gated, gated_lease, quota)
     right = _finalize_and_release(factory, baseline, baseline_lease, plain_quota)
 
-    assert not left.interruption_paused and not right.interruption_paused
+    assert left.interruption_pause_reason is None
+    assert right.interruption_pause_reason is None
     gated_projection = _drop_reason(_projection(factory, gated, gated_lease))
     assert gated_projection == _projection(factory, baseline, baseline_lease)
     assert gated_projection["status"] == TaskStatus.FAILED
@@ -1160,7 +1198,8 @@ def test_result_recording_failure_does_not_change_the_pause(
             factory, unrecorded, unrecorded_lease, dict(PERSISTENCE_RESULT)
         )
 
-    assert left.interruption_paused and right.interruption_paused
+    assert left.interruption_pause_reason is not None
+    assert right.interruption_pause_reason is not None
     left_projection = _projection(factory, recorded, recorded_lease)
     assert left_projection == _projection(factory, unrecorded, unrecorded_lease)
     assert left_projection["status"] == TaskStatus.PAUSED
@@ -1191,8 +1230,274 @@ def test_resumed_quota_result_settles_exactly_as_before(canonical):
             prepared_outputs=NO_OUTPUTS,
         )
         assert finalized["final_status"] == "failed"
-        assert not finalized["interruption_paused"]
+        assert finalized["interruption_pause_reason"] is None
 
     gated_projection = _drop_reason(_projection(factory, gated, gated_lease))
     assert gated_projection == _projection(factory, baseline, baseline_lease)
     assert _state(factory, gated["task"])[1] is None
+
+
+# --------------------------------------------- result paths, real database
+
+
+def _finalize_resumed(ids: dict[str, Any], lease: TaskLease, result: dict[str, Any]):
+    return _finalize_resumed_task(
+        ids["task"],
+        status=str(result.get("status") or "failed"),
+        success=False,
+        output=result["output"],
+        task_owner_user_id=ids["user"],
+        result=dict(result),
+        task_lease=lease,
+        prepared_outputs=NO_OUTPUTS,
+    )
+
+
+def _settle_result(path: str, factory, ids, lease, result) -> None:
+    """Settle ``result`` through S1 (and the scheduler's release) or S3."""
+    if path == "result":
+        _finalize_and_release(factory, ids, lease, dict(result))
+    else:
+        assert _finalize_resumed(ids, lease, result)["lease_released"]
+
+
+RESULT_PATHS = pytest.mark.parametrize("path", ["result", "resumed_result"])
+
+
+@RESULT_PATHS
+def test_result_pause_projects_like_lease_recovery(canonical, path):
+    factory, _tid = canonical
+    paused, recovered = _projected_task(factory), _projected_task(factory)
+    paused_lease = _prepare_run(factory, paused)
+    recovered_lease = _prepare_run(factory, recovered)
+
+    _settle_result(path, factory, paused, paused_lease, PERSISTENCE_RESULT)
+    assert _expire_and_recover(factory, recovered) == TaskStatus.PAUSED
+
+    left = _projection(factory, paused, paused_lease)
+    right = _projection(factory, recovered, recovered_lease)
+    assert left.pop("trigger_run")[1] == TASK_INTERRUPTION_PAUSED_TRIGGER_ERROR
+    assert right.pop("trigger_run")[1] == TASK_LEASE_PAUSED_TRIGGER_ERROR
+    # Only lease recovery reconciles orphaned delivery rows.
+    left.pop("delivery")
+    right.pop("delivery")
+    assert left == right
+    assert left["settled"] == [PAUSED_FACT]
+    _task, row, _events = _state(factory, paused["task"])
+    assert (row.reason, row.state) == ("persistence_failure", "manual")
+
+
+@RESULT_PATHS
+@pytest.mark.parametrize(
+    "case",
+    ["unknown_tool_effect", "not_recoverable", "pause_requested", "resume_requested"],
+)
+def test_result_paths_decide_every_verdict(canonical, monkeypatch, path, case):
+    factory, _tid = canonical
+    ids = _projected_task(factory)
+    lease = _prepare_run(factory, ids, checkpoint=case != "not_recoverable")
+    if case == "unknown_tool_effect":
+        monkeypatch.setattr(
+            task_auto_recovery,
+            "resolve_checkpoint_recovery_with_data",
+            lambda _db, _candidate: CheckpointRecoveryResolution(
+                CheckpointRecoveryVerdict.UNKNOWN_TOOL_EFFECT
+            ),
+        )
+    if case in {"pause_requested", "resume_requested"}:
+        with factory() as db:
+            db.get(Task, ids["task"]).control_state = case
+            db.commit()
+
+    _settle_result(path, factory, ids, lease, PERSISTENCE_RESULT)
+
+    task, row, _events = _state(factory, ids["task"])
+    settled = _projection(factory, ids, lease)["settled"]
+    if case in {"unknown_tool_effect", "not_recoverable"}:
+        assert task.status == TaskStatus.FAILED
+        assert task.error_message == (
+            TASK_UNKNOWN_TOOL_EFFECT_SETTLEMENT_ERROR
+            if case == "unknown_tool_effect"
+            else PERSISTENCE_RESULT["error"]
+        )
+        assert (row.reason, row.state) == (case, "manual")
+        assert [fact["status"] for fact in settled] == ["failed"]
+    else:
+        assert (task.status, task.control_state) == (TaskStatus.PAUSED, "paused")
+        assert task.runner_id is None
+        assert (row.reason, row.state) == (
+            "user_pause" if case == "pause_requested" else "persistence_failure",
+            "manual",
+        )
+        assert settled == [PAUSED_FACT]
+
+
+@RESULT_PATHS
+@pytest.mark.parametrize("case", ["switch_off", "ineligible"])
+def test_result_paths_settle_exactly_as_before(canonical, monkeypatch, path, case):
+    if case == "switch_off":
+        monkeypatch.setenv(PAUSE_SWITCH, "false")
+    source = "sdk" if case == "ineligible" else "trigger"
+    factory, _tid = canonical
+    plain = {k: v for k, v in PERSISTENCE_RESULT.items() if k != "interruption_reason"}
+    gated = _projected_task(factory, source=source)
+    baseline = _projected_task(factory, source=source)
+    gated_lease = _prepare_run(factory, gated)
+    baseline_lease = _prepare_run(factory, baseline)
+
+    _settle_result(path, factory, gated, gated_lease, PERSISTENCE_RESULT)
+    _settle_result(path, factory, baseline, baseline_lease, plain)
+
+    gated_projection = _drop_reason(_projection(factory, gated, gated_lease))
+    assert gated_projection == _projection(factory, baseline, baseline_lease)
+    assert gated_projection["status"] == TaskStatus.FAILED
+    _task, row, _events = _state(factory, gated["task"])
+    assert (row.reason, row.state) == (
+        "persistence_failure",
+        "disabled" if case == "switch_off" else "ineligible",
+    )
+    assert _state(factory, baseline["task"])[1] is None
+
+
+def test_resume_settlement_pauses_on_a_real_database(canonical):
+    """The resume exception path's settlement against the real database."""
+    from xagent.web.services.task_execution import _settle_resumed_task_lease
+
+    factory, _tid = canonical
+    ids = _projected_task(factory)
+    lease = _prepare_run(factory, ids)
+    paused_for: list[InterruptionReason] = []
+
+    assert _settle_resumed_task_lease(
+        lease,
+        error_message=RUN_ERROR,
+        interruption=_persistence_interruption(),
+        paused_for=paused_for,
+    )
+
+    assert paused_for == [InterruptionReason.PERSISTENCE_FAILURE]
+    projection = _projection(factory, ids, lease)
+    assert (projection["status"], projection["runner_id"]) == (TaskStatus.PAUSED, None)
+    assert projection["settled"] == [PAUSED_FACT]
+    assert projection["trigger_run"][1] == TASK_INTERRUPTION_PAUSED_TRIGGER_ERROR
+
+
+# ----------------------------------------- undecidable interruptions defer to TTL
+
+
+def _break_decision(m: pytest.MonkeyPatch, failure: str) -> None:
+    if failure == "eligibility":
+
+        def boom(*_args: Any, **_kwargs: Any) -> Any:
+            raise RuntimeError("eligibility read failed")
+
+        m.setattr(task_auto_recovery, "auto_recovery_eligibility", boom)
+        return
+
+    def unreadable(*_args: Any, **_kwargs: Any) -> Any:
+        raise OperationalError("SELECT", {}, Exception("connection reset"))
+
+    m.setattr(event_recovery, "read_event_checkpoint", unreadable)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path", ["exception", "result", "resumed_result"])
+@pytest.mark.parametrize("failure", ["eligibility", "checkpoint_read"])
+async def test_undecidable_interruption_keeps_the_lease_for_ttl(
+    canonical, monkeypatch, path, failure
+):
+    """Any error deciding the interruption defers it on every settling path:
+    the run stays RUNNING under its lease, and TTL recovery pauses it."""
+
+    factory, _tid = canonical
+    ids = _projected_task(factory)
+    lease = _prepare_run(factory, ids)
+
+    with monkeypatch.context() as m:
+        _break_decision(m, failure)
+        if path == "exception":
+            frames = await _schedule_failing_turn(
+                factory, ids, lease, _persistence_error()
+            )
+            assert frames == []
+        else:
+            with pytest.raises(InterruptionSettlementDeferred) as deferred:
+                if path == "result":
+                    _finalize(factory, ids["task"], lease, dict(PERSISTENCE_RESULT))
+                else:
+                    _finalize_resumed(ids, lease, PERSISTENCE_RESULT)
+            assert deferred.value.__cause__ is not None
+
+    task, row, _events = _state(factory, ids["task"])
+    assert task.status == TaskStatus.RUNNING
+    assert (task.runner_id, task.run_id) == (lease.runner_id, lease.run_id)
+    assert row is None
+    assert _projection(factory, ids, lease)["settled"] == []
+
+    assert _expire_and_recover(factory, ids) == TaskStatus.PAUSED
+    _task, row, _events = _state(factory, ids["task"])
+    assert (row.reason, row.state) == ("lease_expired", "manual")
+
+
+# ----------------------------------------------------- broadcasts and metrics
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("reason", "message"),
+    [
+        (InterruptionReason.USER_PAUSE, TASK_USER_PAUSED_MESSAGE),
+        (InterruptionReason.PERSISTENCE_FAILURE, TASK_INTERRUPTION_PAUSED_MESSAGE),
+    ],
+)
+async def test_pause_broadcast_says_who_paused(reason, message):
+    with patch(
+        "xagent.web.services.task_events.publish_task_event", new=AsyncMock()
+    ) as published:
+        await publish_interruption_pause(7, {"status": "paused"}, reason)
+
+    event = published.await_args.args[0]
+    assert (event["type"], event["message"], event["status"]) == (
+        "task_paused",
+        message,
+        "paused",
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("switch", "failed"), [("true", False), ("false", True)])
+async def test_trigger_metrics_do_not_count_a_pause_as_a_failure(
+    canonical, monkeypatch, switch, failed
+):
+    from xagent.core.utils import setup_metrics
+
+    monkeypatch.setenv(PAUSE_SWITCH, switch)
+    finished: list[bool] = []
+    monkeypatch.setattr(setup_metrics.trigger_execution, "start", lambda: 0.0)
+    monkeypatch.setattr(
+        setup_metrics.trigger_execution,
+        "finish",
+        lambda _started, *, cancelled, failed: finished.append(failed),
+    )
+    factory, _tid = canonical
+    ids = _projected_task(factory)
+    lease = _prepare_run(factory, ids)
+
+    await _schedule_failing_turn(factory, ids, lease, _persistence_error())
+    await asyncio.sleep(0)
+
+    assert finished == [failed]
+
+
+@pytest.mark.asyncio
+async def test_explicit_cancel_is_not_settled_as_an_interruption():
+    settle_mock = MagicMock(return_value=True)
+    publish_pause, _frames = await _resume_raising(
+        ExecutionEventPersistenceError("event write failed"),
+        settle_mock,
+        explicit_cancel=True,
+    )
+
+    settle_mock.assert_called_once()
+    assert settle_mock.call_args.kwargs["interruption"] is None
+    publish_pause.assert_not_awaited()

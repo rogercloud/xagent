@@ -980,7 +980,7 @@ async def test_resume_db_lifecycle_runs_in_short_session_workers() -> None:
         injection_outcome_unknown: bool = False,
         terminal_event_state: dict[str, Any] | None = None,
         interruption: Any = None,
-        settled_outcome: dict[str, Any] | None = None,
+        paused_for: list[Any] | None = None,
     ) -> None:
         assert acquired_lease is lease
         assert error_message is None
