@@ -28,7 +28,12 @@ from ...config import (
 from ...core.agent.checkpoint import checkpoint_progress_marker
 from ...core.agent.interruption import InterruptionReason
 from ..models.task import Task, TaskStatus
-from ..models.task_auto_recovery import TaskAutoRecovery, TaskRecoveryEvent
+from ..models.task_auto_recovery import (
+    TaskAutoRecovery,
+    TaskAutoRecoveryState,
+    TaskRecoveryEvent,
+    TaskRecoveryEventType,
+)
 from ..models.trigger import TriggerType
 from ..models.workforce import WorkforceRun
 from .task_execution_controller import TaskControlState
@@ -40,13 +45,6 @@ from .task_lease_service import (
 from .workforce_runtime import extract_workforce_run_id
 
 logger = logging.getLogger(__name__)
-
-RECOVERY_STATE_MANUAL = "manual"
-RECOVERY_STATE_INELIGIBLE = "ineligible"
-RECOVERY_STATE_DISABLED = "disabled"
-
-RECOVERY_EVENT_INTERRUPTED = "interrupted"
-RECOVERY_EVENT_INELIGIBLE = "ineligible"
 
 # Callers that own their own protocol for a stopped run: SDK and A2A clients,
 # external cancellation, and anonymous visitors of a widget or shared link.
@@ -148,11 +146,11 @@ def record_interruption_no_commit(
 
     eligibility = auto_recovery_eligibility(db, task)
     if not get_task_infra_failure_pause_enabled():
-        state, state_detail = RECOVERY_STATE_DISABLED, None
+        state, state_detail = TaskAutoRecoveryState.DISABLED, None
     elif not eligibility.eligible:
-        state, state_detail = RECOVERY_STATE_INELIGIBLE, eligibility.detail
+        state, state_detail = TaskAutoRecoveryState.INELIGIBLE, eligibility.detail
     else:
-        state, state_detail = RECOVERY_STATE_MANUAL, None
+        state, state_detail = TaskAutoRecoveryState.MANUAL, None
 
     row = db.get(TaskAutoRecovery, task.id)
     same_run = row is not None and row.run_id == run_id
@@ -170,7 +168,7 @@ def record_interruption_no_commit(
         row.last_command_id = None
     row.run_id = run_id
     row.reason = reason.value
-    row.state = state
+    row.state = state.value
     row.state_detail = state_detail
     row.paused_state_version = int(task.state_version or 0)
     row.interrupted_at = interrupted_at
@@ -178,7 +176,7 @@ def record_interruption_no_commit(
     row.next_attempt_at = None
     row.last_error = None
 
-    detail: dict[str, Any] = {"task_status": task_status.value, "state": state}
+    detail: dict[str, Any] = {"task_status": task_status.value, "state": state.value}
     if state_detail is not None:
         detail["state_detail"] = state_detail
     if eligibility.kind is not None:
@@ -188,10 +186,10 @@ def record_interruption_no_commit(
             task_id=task.id,
             run_id=run_id,
             event=(
-                RECOVERY_EVENT_INELIGIBLE
-                if state == RECOVERY_STATE_INELIGIBLE
-                else RECOVERY_EVENT_INTERRUPTED
-            ),
+                TaskRecoveryEventType.INELIGIBLE
+                if state is TaskAutoRecoveryState.INELIGIBLE
+                else TaskRecoveryEventType.INTERRUPTED
+            ).value,
             reason=reason.value,
             detail=detail,
         )
@@ -203,7 +201,7 @@ def record_interruption_no_commit(
         task.id,
         run_id,
         reason.value,
-        state,
+        state.value,
     )
     return row
 
