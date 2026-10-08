@@ -212,6 +212,9 @@ class TaskLeaseRecoveryCandidate:
     last_checkpoint_event_id: str | None
     last_checkpoint_trace_event_id: int | None
     attempt_id: str | None = None
+    # Fenced through ``state_version``: every control-state write bumps it,
+    # so the recovery CAS never applies over a control state it did not see.
+    control_state: str | None = None
 
     @property
     def cursor(self) -> tuple[datetime, int]:
@@ -359,6 +362,23 @@ class CheckpointRecoveryVerdict(str, Enum):
     INDETERMINATE = "indeterminate"
 
 
+@dataclass(frozen=True)
+class CheckpointRecoveryResolution:
+    """A recovery verdict together with the checkpoint it was reached on.
+
+    ``checkpoint`` is the stored payload of the checkpoint that made the
+    verdict ``RECOVERABLE`` -- its ``snapshot`` carries the context and
+    pattern state -- and ``None`` for every other verdict. ``encoded`` marks
+    a legacy ``trace_events`` payload, whose snapshot may still hold storage
+    refs (``decode_trace_event_data`` resolves them); a version-two
+    ``recovery_state`` payload is always inline.
+    """
+
+    verdict: CheckpointRecoveryVerdict
+    checkpoint: dict[str, Any] | None = None
+    encoded: bool = False
+
+
 def _checkpoint_row_matches_candidate(
     row: TraceEvent, candidate: TaskLeaseRecoveryCandidate
 ) -> bool:
@@ -442,7 +462,7 @@ def _candidate_row_failures(
 def _resolve_legacy_checkpoint_recovery(
     db: Session,
     candidate: TaskLeaseRecoveryCandidate,
-) -> CheckpointRecoveryVerdict:
+) -> CheckpointRecoveryResolution:
     """Resolve the candidate's legacy ``event_id`` string against the row it
     names, within the same partition (task, root scope, checkpoint type)
     today's query has always used.
@@ -456,7 +476,7 @@ def _resolve_legacy_checkpoint_recovery(
     """
 
     if candidate.last_checkpoint_event_id is None:
-        return CheckpointRecoveryVerdict.NOT_RECOVERABLE
+        return CheckpointRecoveryResolution(CheckpointRecoveryVerdict.NOT_RECOVERABLE)
     query = db.query(TraceEvent).filter(
         TraceEvent.task_id == candidate.task_id,
         TraceEvent.build_id.is_(None),
@@ -482,13 +502,21 @@ def _resolve_legacy_checkpoint_recovery(
             f"task {candidate.task_id}: legacy checkpoint event_id "
             f"{candidate.last_checkpoint_event_id} matches more than one row",
         )
-        return CheckpointRecoveryVerdict.INDETERMINATE
+        return CheckpointRecoveryResolution(CheckpointRecoveryVerdict.INDETERMINATE)
     if row is None:
-        return CheckpointRecoveryVerdict.NOT_RECOVERABLE
-    return (
-        CheckpointRecoveryVerdict.RECOVERABLE
-        if _checkpoint_row_matches_candidate(row, candidate)
-        else CheckpointRecoveryVerdict.NOT_RECOVERABLE
+        return CheckpointRecoveryResolution(CheckpointRecoveryVerdict.NOT_RECOVERABLE)
+    if not _checkpoint_row_matches_candidate(row, candidate):
+        return CheckpointRecoveryResolution(CheckpointRecoveryVerdict.NOT_RECOVERABLE)
+    return _recoverable_trace_row(row)
+
+
+def _recoverable_trace_row(row: TraceEvent) -> CheckpointRecoveryResolution:
+    return CheckpointRecoveryResolution(
+        CheckpointRecoveryVerdict.RECOVERABLE,
+        checkpoint=(
+            cast(dict[str, Any], row.data) if isinstance(row.data, dict) else None
+        ),
+        encoded=True,
     )
 
 
@@ -504,6 +532,19 @@ def _resolve_event_checkpoint_recovery(
     caller decides whether an undetermined read is retried or deferred.
     """
 
+    return _resolve_event_checkpoint_recovery_with_data(
+        db, task_id=task_id, run_id=run_id
+    ).verdict
+
+
+def _resolve_event_checkpoint_recovery_with_data(
+    db: Session,
+    *,
+    task_id: int,
+    run_id: str | None,
+) -> CheckpointRecoveryResolution:
+    """``_resolve_event_checkpoint_recovery`` keeping the checkpoint it read."""
+
     from ...core.agent.checkpoint import (
         CheckpointAccessRefusedError,
         CheckpointCorruptError,
@@ -512,7 +553,7 @@ def _resolve_event_checkpoint_recovery(
     from .task_execution_event_recovery import read_event_checkpoint
 
     if run_id is None:
-        return CheckpointRecoveryVerdict.NOT_RECOVERABLE
+        return CheckpointRecoveryResolution(CheckpointRecoveryVerdict.NOT_RECOVERABLE)
     try:
         data = read_event_checkpoint(
             db,
@@ -522,13 +563,15 @@ def _resolve_event_checkpoint_recovery(
             run_id=run_id,
         )
     except UnknownToolEffectError:
-        return CheckpointRecoveryVerdict.UNKNOWN_TOOL_EFFECT
+        return CheckpointRecoveryResolution(
+            CheckpointRecoveryVerdict.UNKNOWN_TOOL_EFFECT
+        )
     except (CheckpointCorruptError, CheckpointAccessRefusedError):
-        return CheckpointRecoveryVerdict.NOT_RECOVERABLE
-    return (
-        CheckpointRecoveryVerdict.RECOVERABLE
-        if data is not None
-        else CheckpointRecoveryVerdict.NOT_RECOVERABLE
+        return CheckpointRecoveryResolution(CheckpointRecoveryVerdict.NOT_RECOVERABLE)
+    if data is None:
+        return CheckpointRecoveryResolution(CheckpointRecoveryVerdict.NOT_RECOVERABLE)
+    return CheckpointRecoveryResolution(
+        CheckpointRecoveryVerdict.RECOVERABLE, checkpoint=data
     )
 
 
@@ -578,6 +621,20 @@ def resolve_checkpoint_recovery(
     """Resolve whether the candidate's checkpoint pointer identifies a
     recoverable checkpoint for its current run.
 
+    The verdict of ``resolve_checkpoint_recovery_with_data``; see there.
+    """
+
+    return resolve_checkpoint_recovery_with_data(db, candidate).verdict
+
+
+def resolve_checkpoint_recovery_with_data(
+    db: Session,
+    candidate: TaskLeaseRecoveryCandidate,
+) -> CheckpointRecoveryResolution:
+    """Resolve whether the candidate's checkpoint pointer identifies a
+    recoverable checkpoint for its current run, and return that checkpoint
+    with a ``RECOVERABLE`` verdict (callers fingerprint its progress).
+
     Recovery fails closed for events written before run provenance was
     introduced: an exact pointer alone cannot prove that the checkpoint
     belongs to the expired run. New-run claims clear both pointer columns
@@ -601,7 +658,7 @@ def resolve_checkpoint_recovery(
 
     try:
         if uses_execution_events(db, candidate.task_id):
-            return _resolve_event_checkpoint_recovery(
+            return _resolve_event_checkpoint_recovery_with_data(
                 db, task_id=candidate.task_id, run_id=candidate.run_id
             )
     except (CheckpointUnavailableError, SQLAlchemyError) as exc:
@@ -612,7 +669,7 @@ def resolve_checkpoint_recovery(
         if isinstance(exc, SQLAlchemyError):
             # Keep existing rollback and pool-timeout handling in the sweeper.
             raise
-        return CheckpointRecoveryVerdict.INDETERMINATE
+        return CheckpointRecoveryResolution(CheckpointRecoveryVerdict.INDETERMINATE)
 
     if candidate.last_checkpoint_trace_event_id is not None:
         row = db.get(TraceEvent, candidate.last_checkpoint_trace_event_id)
@@ -620,12 +677,16 @@ def resolve_checkpoint_recovery(
             from .trace_event_staging import is_missing_run_partition_only
 
             if candidate.run_id is None:
-                return CheckpointRecoveryVerdict.NOT_RECOVERABLE
+                return CheckpointRecoveryResolution(
+                    CheckpointRecoveryVerdict.NOT_RECOVERABLE
+                )
             row_data, failed = _candidate_row_failures(row, candidate)
             if not failed:
-                return CheckpointRecoveryVerdict.RECOVERABLE
+                return _recoverable_trace_row(row)
             if not is_missing_run_partition_only(failed, row_data):
-                return CheckpointRecoveryVerdict.NOT_RECOVERABLE
+                return CheckpointRecoveryResolution(
+                    CheckpointRecoveryVerdict.NOT_RECOVERABLE
+                )
             # A pre-existing row, not a mismatched one: the 20260804 backfill
             # can point this column at a trace_events row written before the
             # run-partition field existed. Treating it as "this pointer did
@@ -751,6 +812,7 @@ def _expired_task_lease_candidates_query(
             Task.state_version,
             Task.last_checkpoint_event_id,
             Task.last_checkpoint_trace_event_id,
+            Task.control_state,
         )
         .filter(
             task_status_predicate.eq(TaskStatus.RUNNING),
@@ -795,6 +857,9 @@ def _task_lease_recovery_candidate_from_row(
             int(row.last_checkpoint_trace_event_id)
             if row.last_checkpoint_trace_event_id is not None
             else None
+        ),
+        control_state=(
+            str(row.control_state) if row.control_state is not None else None
         ),
     )
 
