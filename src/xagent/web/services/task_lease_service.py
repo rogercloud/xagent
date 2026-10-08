@@ -402,7 +402,7 @@ def _checkpoint_row_matches_candidate(
     around that predicate rather than inside it: a candidate with no
     ``run_id`` fails closed before the predicate is consulted, and the
     missing-run-partition reclassification is handled by the caller
-    (``resolve_checkpoint_recovery``) rather than here, because only the
+    (``resolve_checkpoint_recovery_with_data``) rather than here, because only the
     exact-pointer path has a second candidate set to defer to.
 
     The vocabularies still differ deliberately -- this path calls the
@@ -435,7 +435,8 @@ def _candidate_row_failures(
 
     ``candidate.run_id is None`` never reaches here. That case is this
     module's own terminal outcome -- an exact pointer alone cannot prove a
-    checkpoint belongs to the expired run (see ``resolve_checkpoint_recovery``)
+    checkpoint belongs to the expired run (see
+    ``resolve_checkpoint_recovery_with_data``)
     -- and the shared predicate deliberately does not encode it: a ``None``
     ``run_id`` is a legitimate partition there, matched by a row whose own
     run field is also absent. Both callers fail closed on it first, which is
@@ -614,19 +615,6 @@ def run_has_unknown_tool_effect(db: Session, lease: TaskLease) -> bool:
         verdict.value,
     )
     return True
-
-
-def resolve_checkpoint_recovery(
-    db: Session,
-    candidate: TaskLeaseRecoveryCandidate,
-) -> CheckpointRecoveryVerdict:
-    """Resolve whether the candidate's checkpoint pointer identifies a
-    recoverable checkpoint for its current run.
-
-    The verdict of ``resolve_checkpoint_recovery_with_data``; see there.
-    """
-
-    return resolve_checkpoint_recovery_with_data(db, candidate).verdict
 
 
 def resolve_checkpoint_recovery_with_data(

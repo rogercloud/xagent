@@ -358,13 +358,19 @@ def test_infra_failure_pause_switch_does_not_gate_lease_expiry(factory, monkeypa
 
 
 @pytest.mark.parametrize(
-    ("source", "expected_detail"),
-    [(None, None), ("sdk", "ineligible:source_sdk")],
+    ("source", "switch", "expected"),
+    [
+        (None, "false", ("disabled", None, "interrupted")),
+        (None, "true", ("manual", None, "interrupted")),
+        # Ineligibility is permanent, so it wins over the temporary switch.
+        ("sdk", "false", ("ineligible", "ineligible:source_sdk", "ineligible")),
+        ("sdk", "true", ("ineligible", "ineligible:source_sdk", "ineligible")),
+    ],
 )
-def test_gated_settlement_records_disabled_and_keeps_why(
-    factory, monkeypatch, source, expected_detail
+def test_gated_settlement_state_precedence(
+    factory, monkeypatch, source, switch, expected
 ):
-    monkeypatch.setenv("XAGENT_TASK_INFRA_FAILURE_PAUSE_ENABLED", "false")
+    monkeypatch.setenv("XAGENT_TASK_INFRA_FAILURE_PAUSE_ENABLED", switch)
     with factory() as db:
         fields = {"source": source} if source else {}
         task = _task(db, _user(db), checkpoint=None, **fields)
@@ -378,12 +384,11 @@ def test_gated_settlement_records_disabled_and_keeps_why(
             gated_by_infra_pause_switch=True,
         )
         assert row is not None
-        assert (row.state, row.state_detail) == ("disabled", expected_detail)
         event = db.scalars(
             sa.select(TaskRecoveryEvent).where(TaskRecoveryEvent.task_id == task.id)
         ).one()
-        assert event.event == "interrupted"
-        assert event.detail.get("state_detail") == expected_detail
+        assert (row.state, row.state_detail, event.event) == expected
+        assert event.detail.get("state_detail") == expected[1]
 
 
 def _channel(db: Session, user: User) -> int:

@@ -144,7 +144,11 @@ def record_interruption_no_commit(
     ``gated_by_infra_pause_switch`` says whether the caller's PAUSED outcome
     depends on ``XAGENT_TASK_INFRA_FAILURE_PAUSE_ENABLED``. Settlement paths
     that pause instead of failing are; lease-expiry recovery is not (it paused
-    before this switch existed), so it never records ``disabled``.
+    before this switch existed), so it never records ``disabled``. An
+    ineligible task records ``ineligible`` whatever the switch says.
+
+    ``paused_state_version`` is the task's ``state_version`` after the
+    settling write, PAUSED or FAILED; only a PAUSED row's fence is ever read.
 
     Episodes: a recorded interruption of the same run at the same progress
     marker continues the current no-progress episode (its start and
@@ -159,11 +163,12 @@ def record_interruption_no_commit(
         return None
 
     eligibility = auto_recovery_eligibility(db, task)
-    if gated_by_infra_pause_switch and not get_task_infra_failure_pause_enabled():
-        # Keep why the task would be ineligible anyway.
-        state, state_detail = TaskAutoRecoveryState.DISABLED, eligibility.detail
-    elif not eligibility.eligible:
+    # Ineligibility is permanent and the switch is not, so it wins: a
+    # ``disabled`` row always means "turning the switch on would help".
+    if not eligibility.eligible:
         state, state_detail = TaskAutoRecoveryState.INELIGIBLE, eligibility.detail
+    elif gated_by_infra_pause_switch and not get_task_infra_failure_pause_enabled():
+        state, state_detail = TaskAutoRecoveryState.DISABLED, None
     else:
         state, state_detail = TaskAutoRecoveryState.MANUAL, None
 
@@ -315,9 +320,17 @@ def record_lease_expiry_interruption_no_commit(
     and the commit would fail anyway; that error propagates and the whole
     recovery retries next tick.
 
-    Relies on the fenced status write having already run in this
-    transaction: on SQLite that UPDATE is what opens it, so the SAVEPOINT is
-    nested rather than autocommitted.
+    Preconditions, both met by the lease-recovery transaction today:
+
+    - The fenced status write has already run in this transaction: on
+      SQLite that UPDATE is what opens it, so the SAVEPOINT is nested rather
+      than autocommitted.
+    - Nothing staged earlier in the transaction is still pending in the
+      session. ``flush`` has no scope, so pending objects would be emitted
+      inside the SAVEPOINT and discarded with it on failure. Sessions are
+      built with ``autoflush=False`` and every earlier staging step (the
+      orphaned-delivery reconciliation) flushes itself; a new step added
+      before this call must do the same.
     """
 
     reason = lease_expiry_interruption_reason(candidate, resolution.verdict)
