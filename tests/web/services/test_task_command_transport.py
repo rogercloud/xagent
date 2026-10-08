@@ -1711,7 +1711,8 @@ def test_dispatcher_failure_backoff_grows_exponentially_to_cap(monkeypatch) -> N
 
     delays = [
         task_command_transport_module._dispatcher_failure_backoff_seconds(failures)
-        for failures in (1, 2, 3, 4, 5, 6, 7, 8, 1000)
+        # 2000 is past 1025, where an unclamped float(1 << exponent) overflows.
+        for failures in (1, 2, 3, 4, 5, 6, 7, 8, 2000)
     ]
 
     assert delays == [0.5, 1.0, 2.0, 4.0, 8.0, 16.0, 30.0, 30.0, 30.0]

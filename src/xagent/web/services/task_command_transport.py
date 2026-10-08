@@ -102,6 +102,9 @@ DISPATCHER_CONCURRENCY = 4
 # A failing claim (typically an unreachable database) backs off exponentially
 # from DISPATCHER_IDLE_SECONDS up to this ceiling instead of retrying every
 # idle tick, and repeats of the failure are logged at most once per interval.
+# Both are per worker: with DISPATCHER_CONCURRENCY workers an outage logs up
+# to that many lines per interval, and each line's consecutive_failures counts
+# only that worker's failed claims.
 DISPATCHER_FAILURE_BACKOFF_MAX_SECONDS = 30.0
 DISPATCHER_FAILURE_LOG_INTERVAL_SECONDS = 60.0
 
@@ -453,7 +456,10 @@ def stage_task_command(
        notify_task_command_dispatcher(). Skipping it does not lose the
        command -- the dispatcher's idle poll still recovers it -- but
        delivery silently degrades to up to DISPATCHER_IDLE_SECONDS of added
-       latency instead of an immediate wakeup.
+       latency instead of an immediate wakeup. While a worker is backing off
+       after failed claims, its poll interval grows to at most
+       DISPATCHER_FAILURE_BACKOFF_MAX_SECONDS, which then bounds that latency;
+       a notify only reaches workers in the process that sent it.
     b. On IntegrityError from the command-insert flush in step 5, the caller
        must roll back the whole transaction before issuing any further
        statement on this session -- classify_task_command_conflict below
