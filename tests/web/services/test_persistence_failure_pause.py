@@ -217,7 +217,8 @@ def _assert_no_failure_in_model_context(factory, tid: int) -> None:
 
     with factory() as db:
         context = load_task_event_context(db, tid)
-    assert "failed" not in str(context).lower()
+    # summarize_execution_failure_event's line for a failed settlement.
+    assert "previous execution failed" not in str(context).lower()
 
 
 def _assert_paused(factory, tid: int, lease: TaskLease, *, reason: str) -> Any:

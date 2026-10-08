@@ -2606,6 +2606,8 @@ def _schedule_bg(
                         "recovery: %s",
                         task_id,
                         setup_or_run_err,
+                        # The chained cause is the actual read failure.
+                        exc_info=setup_or_run_err,
                     )
                 else:
                     is_public_safe_mcp_error = isinstance(

@@ -4091,6 +4091,8 @@ async def execute_resume_background(
                 "unresolvable; retaining lease for TTL recovery: %s",
                 task_id,
                 e,
+                # The chained cause is the actual read failure.
+                exc_info=e,
             )
             return
         elif delivery_outcome_unknown:
