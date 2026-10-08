@@ -667,11 +667,15 @@ class AgentRunner:
                         return normalized
 
                     reason = interruption_reason_value(classify_run_result(normalized))
+                    # On the result itself, not only the entry: a single failed
+                    # pattern returns ``normalized`` directly below and the
+                    # aggregate that copies entry reasons is skipped. Only the
+                    # validated value survives; an unknown or non-string reason
+                    # the pattern set itself is dropped.
                     if reason is not None:
-                        # On the result itself, not only the entry: a single
-                        # failed pattern returns ``normalized`` directly below
-                        # and the aggregate that copies entry reasons is skipped.
                         normalized[INTERRUPTION_REASON_KEY] = reason
+                    else:
+                        normalized.pop(INTERRUPTION_REASON_KEY, None)
                     pattern_errors.append(
                         {
                             "pattern": pattern.__class__.__name__,

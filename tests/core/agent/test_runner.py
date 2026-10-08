@@ -28,6 +28,7 @@ from xagent.core.agent.context.execution import (
     TOOL_EVIDENCE_REMOVED_METADATA_KEY,
     tool_evidence_state,
 )
+from xagent.core.agent.interruption import InterruptionReason
 from xagent.core.agent.language import (
     OUTPUT_LANGUAGE_METADATA_KEY,
     OUTPUT_LANGUAGE_SOURCE_METADATA_KEY,
@@ -1025,10 +1026,18 @@ async def test_runner_single_unsuccessful_pattern_result_carries_reason(
 async def test_runner_single_pattern_keeps_its_own_interruption_reason(
     tmp_path: Path,
 ) -> None:
+    # The enum member, not its value: only the classifier's own-reason branch
+    # turns it into a plain string. ``InterruptionReason`` subclasses ``str``,
+    # so equality alone would pass either way; the type is what is pinned.
     agent = Agent(
         name="writer",
         patterns=[
-            FakePattern({"success": False, "interruption_reason": "llm_unavailable"})
+            FakePattern(
+                {
+                    "success": False,
+                    "interruption_reason": InterruptionReason.LLM_UNAVAILABLE,
+                }
+            )
         ],
     )
     runner = AgentRunner(agent=agent, workspace_manager=FakeWorkspaceManager(tmp_path))
@@ -1036,6 +1045,27 @@ async def test_runner_single_pattern_keeps_its_own_interruption_reason(
     result = await runner.run(task="Impossible", execution_id="exec-reason-own")
 
     assert result["interruption_reason"] == "llm_unavailable"
+    assert type(result["interruption_reason"]) is str
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("own_reason", ["not_a_real_reason", 42, None])
+async def test_runner_single_pattern_drops_invalid_own_reason(
+    tmp_path: Path, own_reason: object
+) -> None:
+    agent = Agent(
+        name="writer",
+        patterns=[
+            FakePattern(
+                {"success": False, "error": "x", "interruption_reason": own_reason}
+            )
+        ],
+    )
+    runner = AgentRunner(agent=agent, workspace_manager=FakeWorkspaceManager(tmp_path))
+
+    result = await runner.run(task="Impossible", execution_id="exec-reason-bad")
+
+    assert "interruption_reason" not in result
 
 
 @pytest.mark.asyncio

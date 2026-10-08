@@ -10,15 +10,26 @@ from its checkpoint, and this module is where core names it.
 Unusable model output counts as an interruption because resuming does not
 replay the failed provider request: the run continues from its last
 checkpoint and samples again, which can succeed where an identical retry
-would not. Callers bound how often that happens.
+would not. The settling layer must bound how often that happens (below).
 
 Classification is advisory metadata. Nothing in core acts on it; callers that
-settle a run decide what an interruption reason means for the task. The
-runner annotates only failures a pattern contains (an exception it catches,
-or an unsuccessful result). Failures it deliberately lets escape, notably
-``CheckpointPersistenceError``, are classified by whatever settles the run,
-by calling :func:`classify_run_failure` on the escaping exception; that is the
-producer of ``PERSISTENCE_FAILURE`` for checkpoint writes.
+settle a run decide what an interruption reason means for the task.
+
+Where the reason travels: the runner annotates only failures a pattern
+contains (an exception it catches, or an unsuccessful result) under
+``interruption_reason``, and ``AgentExecutionAdapter`` forwards that key as a
+top-level field of its result, which is what ``AgentService`` callers receive.
+
+Obligations of the layer that settles a run (none of them is enforced here):
+
+- Failures the runner deliberately lets escape, notably
+  ``CheckpointPersistenceError``, are classified there, by calling
+  :func:`classify_run_failure` on the escaping exception; that is the
+  producer of ``PERSISTENCE_FAILURE`` for checkpoint writes.
+- Resumes must be capped there. ``MODEL_OUTPUT_INVALID`` in particular can
+  recur on every run of a deterministically bad prompt, so without a cap
+  (a limit on resumes that make no progress, and an absolute limit per run)
+  treating it as resumable would loop forever.
 """
 
 from __future__ import annotations
