@@ -12,6 +12,7 @@ from ..task_runtime import (
 )
 from .agent import Agent
 from .attachments import build_image_context_references
+from .budget import BudgetPolicyProvider
 from .interruption import (
     INTERRUPTION_REASON_KEY,
     classify_run_result,
@@ -67,6 +68,7 @@ class AgentExecutionConfig:
     user_interaction_enabled: bool = True
     preferred_input_modalities: tuple[str, ...] = ()
     execution_metadata: dict[str, Any] = field(default_factory=dict)
+    budget_policy_provider: BudgetPolicyProvider | None = None
 
 
 class AgentExecutionAdapter:
@@ -193,6 +195,7 @@ class AgentExecutionAdapter:
             # AgentService may have rebuilt the tool objects after a connection
             # or policy change. A paused runner still holds the previous list.
             handle.runner.agent.tools = self.config.tools
+            handle.runner.budget_policy_provider = self.config.budget_policy_provider
             execution_type = str(
                 handle.metadata.get("execution_type") or self._execution_type()
             )
@@ -306,6 +309,7 @@ class AgentExecutionAdapter:
         )
         return (
             AgentRunner(
+                budget_policy_provider=self.config.budget_policy_provider,
                 agent=agent,
                 tracer=self.config.tracer,
                 callbacks=[TraceEventCallback()],
@@ -467,7 +471,7 @@ class AgentExecutionAdapter:
             normalized["completion_outcome"] = completion_outcome
             normalized["metadata"]["completion_outcome"] = completion_outcome
         termination_reason = result.get("termination_reason")
-        if termination_reason in ("max_iterations", "step_failed"):
+        if termination_reason in ("max_iterations", "step_failed", "token_budget"):
             normalized["termination_reason"] = termination_reason
             normalized["metadata"]["termination_reason"] = termination_reason
         # The supported contract for whatever settles the run; only a value
