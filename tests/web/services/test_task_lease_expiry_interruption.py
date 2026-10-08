@@ -1,9 +1,10 @@
 """Lease-expiry recovery records why it stopped a run, and changes nothing else.
 
 Runs on SQLite and, when ``XAGENT_TEST_POSTGRES_URL`` is set, on PostgreSQL
-through the shared ``engine`` fixture. Every case drives the real recovery
-batch, so SQLite exercises the compare-and-swap path and PostgreSQL the
-row-lock path.
+through the shared ``engine`` fixture (CI runs the PostgreSQL cells in the
+task-lease step of test-migrations.yml). Recovery cases drive the real
+recovery batch, so SQLite exercises the compare-and-swap path and PostgreSQL
+the row-lock path; only the switch-gating case calls the recorder directly.
 """
 
 from __future__ import annotations
@@ -18,10 +19,12 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from tests.web.services.task_database_shared import engine as engine_fixture
 from xagent.core.agent.checkpoint import CHECKPOINT_SCHEMA_VERSION, CHECKPOINT_TYPE
+from xagent.core.agent.interruption import InterruptionReason
 from xagent.web.models.agent import Agent
 from xagent.web.models.database import Base
 from xagent.web.models.task import Task, TaskStatus, TraceEvent
 from xagent.web.models.task_auto_recovery import TaskAutoRecovery, TaskRecoveryEvent
+from xagent.web.models.task_execution_event import TaskExecutionEvent
 from xagent.web.models.trigger import (
     AgentTrigger,
     TriggerRun,
@@ -32,7 +35,7 @@ from xagent.web.models.user import User
 from xagent.web.models.user_channel import UserChannel
 from xagent.web.models.workforce import Workforce, WorkforceRun
 from xagent.web.services import task_auto_recovery, task_lease_recovery
-from xagent.web.services.task_auto_recovery import auto_recovery_eligibility
+from xagent.web.services.task_auto_recovery import record_interruption_no_commit
 from xagent.web.services.task_execution_event_writer import append_fact_no_commit
 from xagent.web.services.task_lease_recovery import (
     TASK_LEASE_EXPIRED_ERROR,
@@ -334,7 +337,9 @@ def test_lost_recovery_race_writes_nothing(factory, monkeypatch):
     assert row is None and events == []
 
 
-def test_disabled_infra_failure_pause_records_metadata_only(factory, monkeypatch):
+def test_infra_failure_pause_switch_does_not_gate_lease_expiry(factory, monkeypatch):
+    # Lease expiry paused runs before this switch existed, so its rows stay
+    # manual: a later executor may still schedule them (plan §5.10).
     monkeypatch.setenv("XAGENT_TASK_INFRA_FAILURE_PAUSE_ENABLED", "false")
     with factory() as db:
         task_id = int(_task(db, _user(db)).id)
@@ -346,10 +351,39 @@ def test_disabled_infra_failure_pause_records_metadata_only(factory, monkeypatch
     assert task.error_message is None
     assert (row.reason, row.state, row.state_detail) == (
         "lease_expired",
-        "disabled",
+        "manual",
         None,
     )
     assert [e.event for e in events] == ["interrupted"]
+
+
+@pytest.mark.parametrize(
+    ("source", "expected_detail"),
+    [(None, None), ("sdk", "ineligible:source_sdk")],
+)
+def test_gated_settlement_records_disabled_and_keeps_why(
+    factory, monkeypatch, source, expected_detail
+):
+    monkeypatch.setenv("XAGENT_TASK_INFRA_FAILURE_PAUSE_ENABLED", "false")
+    with factory() as db:
+        fields = {"source": source} if source else {}
+        task = _task(db, _user(db), checkpoint=None, **fields)
+        row = record_interruption_no_commit(
+            db,
+            task=task,
+            reason=InterruptionReason.PERSISTENCE_FAILURE,
+            task_status=TaskStatus.FAILED,
+            interrupted_at=utc_now(),
+            progress_marker=None,
+            gated_by_infra_pause_switch=True,
+        )
+        assert row is not None
+        assert (row.state, row.state_detail) == ("disabled", expected_detail)
+        event = db.scalars(
+            sa.select(TaskRecoveryEvent).where(TaskRecoveryEvent.task_id == task.id)
+        ).one()
+        assert event.event == "interrupted"
+        assert event.detail.get("state_detail") == expected_detail
 
 
 def _channel(db: Session, user: User) -> int:
@@ -396,6 +430,7 @@ def _workforce_run(db: Session, user: User, *, is_preview: bool) -> int:
         ("widget", "ineligible:source_widget"),
         ("shared_link", "ineligible:source_shared_link"),
         ("workforce_preview", "ineligible:preview"),
+        ("workforce_missing", "ineligible:workforce_run_missing"),
         ("internal_invisible", "ineligible:preview"),
         ("channel_combined", "ineligible:channel_inline"),
     ],
@@ -416,6 +451,8 @@ def test_ineligible_tasks_recover_unchanged_and_record_why(
             fields["agent_config"] = {
                 "workforce_run_id": _workforce_run(db, user, is_preview=True)
             }
+        elif case == "workforce_missing":
+            fields["agent_config"] = {"workforce_run_id": 987654321}
         elif case == "internal_invisible":
             fields["is_visible"] = False
         else:
@@ -442,72 +479,48 @@ def test_ineligible_tasks_recover_unchanged_and_record_why(
     [
         ("normal", "normal"),
         ("trigger", "trigger_webhook"),
+        ("trigger_no_type", "trigger"),
+        ("trigger_unknown_type", "trigger"),
+        ("trigger_unhashable_type", "trigger"),
+        ("trigger_with_workforce", "workforce"),
         ("workforce", "workforce"),
         ("channel_shared", "channel"),
+        ("channel_shared_invisible", "channel"),
     ],
 )
-def test_eligible_task_kinds(factory, monkeypatch, case, kind):
+def test_eligible_tasks_record_their_kind(factory, monkeypatch, case, kind):
     monkeypatch.setenv("XAGENT_SHARED_TASK_EXECUTION_ENABLED", "true")
     with factory() as db:
         user = _user(db)
         fields: dict[str, Any] = {}
-        if case == "trigger":
+        if case.startswith("trigger"):
             fields["source"] = "trigger"
-            fields["agent_config"] = {"trigger_type": TriggerType.WEBHOOK.value}
+            fields["agent_config"] = {
+                "trigger": {"trigger_type": TriggerType.WEBHOOK.value},
+                "trigger_no_type": {},
+                "trigger_unknown_type": {"trigger_type": "carrier_pigeon"},
+                "trigger_unhashable_type": {"trigger_type": ["webhook"]},
+                "trigger_with_workforce": {
+                    "trigger_type": TriggerType.SCHEDULED.value,
+                    "workforce_run_id": _workforce_run(db, user, is_preview=False),
+                },
+            }[case]
         elif case == "workforce":
             fields["agent_config"] = {
                 "workforce_run_id": _workforce_run(db, user, is_preview=False)
             }
-        elif case == "channel_shared":
+        elif case.startswith("channel_shared"):
             fields["channel_id"] = _channel(db, user)
-        task = _task(db, user, checkpoint=None, **fields)
-        eligibility = auto_recovery_eligibility(db, task)
-
-    assert eligibility.eligible is True
-    assert eligibility.kind == kind
-    assert eligibility.detail is None
-
-
-def test_projections_match_plain_lease_recovery(factory):
-    with factory() as db:
-        user = _user(db)
-        run_id = _workforce_run(db, user, is_preview=False)
-        task = _task(db, user, source="trigger")
-        task.agent_config = {"workforce_run_id": run_id}
-        workforce_run = db.get(WorkforceRun, run_id)
-        workforce_run.task_id = task.id
-        trigger = AgentTrigger(
-            user_id=user.id,
-            workforce_id=workforce_run.workforce_id,
-            type=TriggerType.SCHEDULED.value,
-            name="Interruption trigger",
-            config={},
-        )
-        db.add(trigger)
-        db.flush()
-        trigger_run = TriggerRun(
-            trigger_id=trigger.id,
-            task_id=task.id,
-            status=TriggerRunStatus.RUNNING.value,
-            idempotency_key=f"interruption-{task.id}",
-        )
-        db.add(trigger_run)
-        db.commit()
-        task_id, trigger_run_id = int(task.id), int(trigger_run.id)
+            if case == "channel_shared_invisible":
+                # The channel rule precedes the hidden-preview rule.
+                fields["is_visible"] = False
+        task_id = int(_task(db, user, **fields).id)
 
     assert _recover() == 1
 
-    task, row, _events = _state(factory, task_id)
-    with factory() as db:
-        workforce_run = db.get(WorkforceRun, run_id)
-        trigger_run = db.get(TriggerRun, trigger_run_id)
-        assert workforce_run.status == "paused"
-        assert workforce_run.completed_at is None
-        assert trigger_run.status == TriggerRunStatus.FAILED.value
-        assert trigger_run.error_message == TASK_LEASE_PAUSED_TRIGGER_ERROR
-        assert trigger_run.finished_at is not None
-    assert task.status == TaskStatus.PAUSED
-    assert (row.state, row.reason) == ("manual", "lease_expired")
+    _task_row, row, events = _state(factory, task_id)
+    assert (row.state, row.state_detail) == ("manual", None)
+    assert [(e.event, e.detail.get("kind")) for e in events] == [("interrupted", kind)]
 
 
 def _rerun(factory: sessionmaker, task_id: int, *, run_id: str | None = None):
@@ -582,25 +595,162 @@ def test_repeated_interruptions_track_episodes_and_runs(factory):
     assert [e.run_id for e in events] == [first.run_id] * 3 + ["run-next"]
 
 
-@pytest.mark.parametrize("failure", ["python", "database"])
-def test_metadata_failure_still_recovers_the_task(factory, monkeypatch, failure):
+def test_missing_marker_continues_the_episode(factory, monkeypatch):
     with factory() as db:
-        user = _user(db)
-        task_id = int(_task(db, user).id)
-    original = task_auto_recovery.record_interruption_no_commit
+        task_id = int(_task(db, _user(db), messages=2).id)
+    assert _recover() == 1
+    _task_row, first, _events = _state(factory, task_id)
+    assert first.progress_marker is not None
+    with factory() as db:
+        db.get(TaskAutoRecovery, task_id).no_progress_resumes = 2
+        db.commit()
 
-    def fail(db, **kwargs):
-        # Leave real writes behind first: the SAVEPOINT must discard them.
-        original(db, **kwargs)
-        if failure == "database":
-            db.execute(sa.text("SELECT * FROM no_such_table"))
-        raise RuntimeError("metadata failed")
-
-    monkeypatch.setattr(task_auto_recovery, "record_interruption_no_commit", fail)
-
+    # An undecodable checkpoint is unknown, not progress.
+    monkeypatch.setattr(
+        task_auto_recovery, "resolution_progress_marker", lambda *_a, **_k: None
+    )
+    _rerun(factory, task_id)
     assert _recover() == 1
 
-    task, row, events = _state(factory, task_id)
-    assert task.status == TaskStatus.PAUSED
-    assert task.state_version == 4
-    assert row is None and events == []
+    _task_row, row, _events = _state(factory, task_id)
+    assert row.progress_marker == first.progress_marker
+    assert _aware(row.episode_started_at) == _aware(first.episode_started_at)
+    assert row.no_progress_resumes == 2
+
+
+def _projected_task(factory: sessionmaker, *, verdict: str) -> tuple[int, int, int]:
+    """A v2 trigger + workforce task whose run's lease has expired."""
+    with factory() as db:
+        user = _user(db)
+        run_id = _workforce_run(db, user, is_preview=False)
+        task = _task(
+            db,
+            user,
+            checkpoint="events" if verdict == "recoverable" else None,
+            source="trigger",
+            conversation_storage_version=2,
+        )
+        task.agent_config = {"workforce_run_id": run_id}
+        workforce_run = db.get(WorkforceRun, run_id)
+        workforce_run.task_id = task.id
+        trigger = AgentTrigger(
+            user_id=user.id,
+            workforce_id=workforce_run.workforce_id,
+            type=TriggerType.SCHEDULED.value,
+            name="Interruption trigger",
+            config={},
+        )
+        db.add(trigger)
+        db.flush()
+        trigger_run = TriggerRun(
+            trigger_id=trigger.id,
+            task_id=task.id,
+            status=TriggerRunStatus.RUNNING.value,
+            idempotency_key=f"interruption-{task.id}",
+        )
+        db.add(trigger_run)
+        db.commit()
+        return int(task.id), run_id, int(trigger_run.id)
+
+
+def _projections(factory: sessionmaker, ids: tuple[int, int, int]) -> tuple:
+    task_id, run_id, trigger_run_id = ids
+    with factory() as db:
+        task = db.get(Task, task_id)
+        workforce_run = db.get(WorkforceRun, run_id)
+        trigger_run = db.get(TriggerRun, trigger_run_id)
+        facts = [
+            (event.payload["status"], event.payload["result"])
+            for event in db.scalars(
+                sa.select(TaskExecutionEvent).where(
+                    TaskExecutionEvent.task_id == task_id,
+                    TaskExecutionEvent.kind == "execution_settled",
+                )
+            )
+        ]
+        return (
+            task.status,
+            task.control_state,
+            task.error_message,
+            task.output,
+            task.state_version,
+            task.runner_id,
+            task.lease_expires_at,
+            workforce_run.status,
+            workforce_run.completed_at is None,
+            trigger_run.status,
+            trigger_run.error_message,
+            trigger_run.finished_at is not None,
+            facts,
+        )
+
+
+def _fail_recording(m: pytest.MonkeyPatch, failure: str) -> None:
+    if failure in {"python", "database"}:
+        original = task_auto_recovery.record_interruption_no_commit
+
+        def fail(db, **kwargs):
+            # Leave real writes behind first: the SAVEPOINT must discard them.
+            original(db, **kwargs)
+            if failure == "database":
+                db.execute(sa.text("SELECT * FROM no_such_table"))
+            raise RuntimeError("metadata failed")
+
+        m.setattr(task_auto_recovery, "record_interruption_no_commit", fail)
+        return
+
+    def boom(*_args: Any, **_kwargs: Any) -> Any:
+        raise RuntimeError(f"{failure} failed")
+
+    target = {
+        "marker": "resolution_progress_marker",
+        "eligibility": "auto_recovery_eligibility",
+    }[failure]
+    m.setattr(task_auto_recovery, target, boom)
+
+
+@pytest.mark.parametrize("verdict", ["recoverable", "not_recoverable"])
+@pytest.mark.parametrize(
+    "mode", ["recorded", "python", "database", "marker", "eligibility"]
+)
+def test_recording_never_changes_the_recovered_task(
+    factory, monkeypatch, verdict, mode
+):
+    """Projections equal those of recovery with no metadata at all."""
+    with monkeypatch.context() as m:
+        m.setattr(
+            task_auto_recovery,
+            "record_lease_expiry_interruption_no_commit",
+            lambda *_args, **_kwargs: None,
+        )
+        plain = _projected_task(factory, verdict=verdict)
+        assert _recover() == 1
+    with monkeypatch.context() as m:
+        if mode != "recorded":
+            _fail_recording(m, mode)
+        observed = _projected_task(factory, verdict=verdict)
+        assert _recover() == 1
+
+    # Pin the baseline itself too, so both sides cannot drift together.
+    baseline = _projections(factory, plain)
+    if verdict == "recoverable":
+        assert baseline[0] == TaskStatus.PAUSED
+        assert baseline[2] is None
+        assert baseline[7] == "paused"
+        assert baseline[10] == TASK_LEASE_PAUSED_TRIGGER_ERROR
+    else:
+        assert baseline[0] == TaskStatus.FAILED
+        assert baseline[2] == TASK_LEASE_EXPIRED_ERROR
+        assert baseline[10] == TASK_LEASE_EXPIRED_ERROR
+    assert baseline[9] == TriggerRunStatus.FAILED.value
+    assert baseline[12], "a v2 task stages its execution_settled fact"
+    assert _projections(factory, observed) == baseline
+    _task_row, row, events = _state(factory, observed[0])
+    if mode == "recorded":
+        assert row is not None
+        assert row.reason == (
+            "lease_expired" if verdict == "recoverable" else "not_recoverable"
+        )
+        assert len(events) == 1
+    else:
+        assert row is None and events == []

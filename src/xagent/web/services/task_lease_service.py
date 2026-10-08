@@ -212,8 +212,10 @@ class TaskLeaseRecoveryCandidate:
     last_checkpoint_event_id: str | None
     last_checkpoint_trace_event_id: int | None
     attempt_id: str | None = None
-    # Fenced through ``state_version``: every control-state write bumps it,
-    # so the recovery CAS never applies over a control state it did not see.
+    # Fenced through ``state_version``: writes that change the control state
+    # bump it (lease acquisition only when the status/control pair actually
+    # changes), so the recovery CAS never applies over a control state it
+    # did not see.
     control_state: str | None = None
 
     @property

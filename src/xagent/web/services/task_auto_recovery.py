@@ -7,9 +7,11 @@ changes a task's status, control state, error message or lifecycle
 projections, which stay the settling writer's own decision.
 
 Phase 1 has no executor, so a recorded interruption is never ``scheduled``.
-Its state says only who may resume the run: ``manual`` (the user, from the
-PAUSED task), ``ineligible`` (a task kind automatic recovery will never
-touch) or ``disabled`` (``XAGENT_TASK_INFRA_FAILURE_PAUSE_ENABLED`` is off).
+Its state says only that nothing automatic will act on the run: ``manual``
+(only the user can act -- resume a PAUSED task; a FAILED one is terminal and
+the row just records why), ``ineligible`` (a task kind automatic recovery will
+never touch) or ``disabled`` (the settling path is gated by
+``XAGENT_TASK_INFRA_FAILURE_PAUSE_ENABLED`` and that switch is off).
 """
 
 from __future__ import annotations
@@ -49,6 +51,7 @@ logger = logging.getLogger(__name__)
 # Callers that own their own protocol for a stopped run: SDK and A2A clients,
 # external cancellation, and anonymous visitors of a widget or shared link.
 _INELIGIBLE_SOURCES = frozenset({"sdk", "a2a", "external", "widget", "shared_link"})
+_TRIGGER_TYPES = frozenset(member.value for member in TriggerType)
 
 
 @dataclass(frozen=True)
@@ -102,10 +105,13 @@ def auto_recovery_eligibility(db: Session, task: Task) -> AutoRecoveryEligibilit
         trigger_type = (
             agent_config.get("trigger_type") if isinstance(agent_config, dict) else None
         )
-        known = {member.value for member in TriggerType}
         return AutoRecoveryEligibility(
             eligible=True,
-            kind=f"trigger_{trigger_type}" if trigger_type in known else "trigger",
+            kind=(
+                f"trigger_{trigger_type}"
+                if isinstance(trigger_type, str) and trigger_type in _TRIGGER_TYPES
+                else "trigger"
+            ),
         )
 
     if task.channel_id is not None:
@@ -127,6 +133,7 @@ def record_interruption_no_commit(
     task_status: TaskStatus,
     interrupted_at: datetime,
     progress_marker: str | None,
+    gated_by_infra_pause_switch: bool,
 ) -> TaskAutoRecovery | None:
     """Upsert ``task``'s recovery row for one interruption and log the event.
 
@@ -134,10 +141,17 @@ def record_interruption_no_commit(
     transaction: its ``run_id`` and ``state_version`` become the row's run
     and fence. A run without an id is not recorded -- it cannot be fenced.
 
+    ``gated_by_infra_pause_switch`` says whether the caller's PAUSED outcome
+    depends on ``XAGENT_TASK_INFRA_FAILURE_PAUSE_ENABLED``. Settlement paths
+    that pause instead of failing are; lease-expiry recovery is not (it paused
+    before this switch existed), so it never records ``disabled``.
+
     Episodes: a recorded interruption of the same run at the same progress
     marker continues the current no-progress episode (its start and
     ``no_progress_resumes`` are kept). Any progress starts a new episode, and
-    a different run also restarts ``total_resumes``.
+    a different run also restarts ``total_resumes``. A missing marker (an
+    undecodable or absent checkpoint) is unknown, not progress: it continues
+    the episode and keeps the last known marker.
     """
 
     run_id = task.run_id
@@ -145,8 +159,9 @@ def record_interruption_no_commit(
         return None
 
     eligibility = auto_recovery_eligibility(db, task)
-    if not get_task_infra_failure_pause_enabled():
-        state, state_detail = TaskAutoRecoveryState.DISABLED, None
+    if gated_by_infra_pause_switch and not get_task_infra_failure_pause_enabled():
+        # Keep why the task would be ineligible anyway.
+        state, state_detail = TaskAutoRecoveryState.DISABLED, eligibility.detail
     elif not eligibility.eligible:
         state, state_detail = TaskAutoRecoveryState.INELIGIBLE, eligibility.detail
     else:
@@ -154,8 +169,12 @@ def record_interruption_no_commit(
 
     row = db.get(TaskAutoRecovery, task.id)
     same_run = row is not None and row.run_id == run_id
+    if same_run and row is not None and progress_marker is None:
+        progress_marker = row.progress_marker
     same_episode = (
-        same_run and row is not None and row.progress_marker == progress_marker
+        same_run
+        and row is not None
+        and (row.progress_marker is None or row.progress_marker == progress_marker)
     )
     if row is None:
         row = TaskAutoRecovery(task_id=task.id)
@@ -235,8 +254,10 @@ def resolution_progress_marker(
     """Progress fingerprint of a recoverable verdict's checkpoint, if any.
 
     A legacy payload is decoded first, because its message list and tool
-    ledger may be stored as refs. A payload whose refs cannot be decoded
-    still records the interruption, just without a marker.
+    ledger may be stored as refs; only counts are needed, so blob hashes are
+    not verified. Refs that fail to decode (``CheckpointMessageDecodeError``)
+    still record the interruption, just without a marker; any other lookup
+    error propagates to the caller's SAVEPOINT and skips the row.
     """
 
     from .trace_message_storage import (
@@ -252,7 +273,13 @@ def resolution_progress_marker(
     data: Any = resolution.checkpoint
     if resolution.encoded:
         try:
-            data = decode_trace_event_data(db, task_id=task_id, data=data, strict=True)
+            data = decode_trace_event_data(
+                db,
+                task_id=task_id,
+                data=data,
+                strict=True,
+                verify_blob_hashes=False,
+            )
         except CheckpointMessageDecodeError:
             logger.warning(
                 "Task %s checkpoint refs are undecodable; recording its "
@@ -272,10 +299,11 @@ def record_lease_expiry_interruption_no_commit(
     resolution: CheckpointRecoveryResolution,
     task_status: TaskStatus,
     recovered_at: datetime,
-) -> bool:
+) -> None:
     """Record a lease recovery's interruption inside its open transaction.
 
-    Runs in a SAVEPOINT and never raises past it for an ordinary failure:
+    Runs in a SAVEPOINT and does not raise past it for a failure inside the
+    recording itself:
     the fenced status write and its projections must commit exactly as they
     would without this metadata. Rolling the whole recovery back instead
     would retry it next tick, but a failure that repeats deterministically
@@ -283,28 +311,28 @@ def record_lease_expiry_interruption_no_commit(
     would then leave the task RUNNING with an expired lease forever. A
     skipped row only means the task takes no part in automatic recovery,
     which is the safe direction. If the SAVEPOINT itself cannot be rolled
-    back, the connection is gone and the commit would fail anyway; that
-    error propagates and the whole recovery retries next tick.
+    back, or opening or releasing it fails, the transaction itself is broken
+    and the commit would fail anyway; that error propagates and the whole
+    recovery retries next tick.
 
-    Returns whether the interruption was recorded.
+    Relies on the fenced status write having already run in this
+    transaction: on SQLite that UPDATE is what opens it, so the SAVEPOINT is
+    nested rather than autocommitted.
     """
 
     reason = lease_expiry_interruption_reason(candidate, resolution.verdict)
     if reason is None:
-        return False
+        return
     savepoint = db.begin_nested()
     try:
-        marker = resolution_progress_marker(db, int(task.id), resolution)
-        recorded = (
-            record_interruption_no_commit(
-                db,
-                task=task,
-                reason=reason,
-                task_status=task_status,
-                interrupted_at=recovered_at,
-                progress_marker=marker,
-            )
-            is not None
+        record_interruption_no_commit(
+            db,
+            task=task,
+            reason=reason,
+            task_status=task_status,
+            interrupted_at=recovered_at,
+            progress_marker=resolution_progress_marker(db, int(task.id), resolution),
+            gated_by_infra_pause_switch=False,
         )
     except Exception:
         savepoint.rollback()
@@ -313,6 +341,5 @@ def record_lease_expiry_interruption_no_commit(
             "recovering it without auto-recovery metadata",
             task.id,
         )
-        return False
+        return
     savepoint.commit()
-    return recorded
