@@ -2,13 +2,23 @@
 
 A run that ends in an exception or an unsuccessful result is either finished
 for good (the task itself cannot succeed: a context window it does not fit,
-bad credentials, a tool the model keeps misusing past every repair) or merely
-interrupted by something outside the task (the database went away, the LLM
-provider kept refusing, the process died). Only the second kind is worth
-resuming from its checkpoint, and this module is where core names it.
+bad credentials, a bad request) or merely interrupted (the database went away,
+the LLM provider kept refusing, the process died, or the model's output was
+unusable even after in-run repair). Only the second kind is worth resuming
+from its checkpoint, and this module is where core names it.
+
+Unusable model output counts as an interruption because resuming does not
+replay the failed provider request: the run continues from its last
+checkpoint and samples again, which can succeed where an identical retry
+would not. Callers bound how often that happens.
 
 Classification is advisory metadata. Nothing in core acts on it; callers that
-settle a run decide what an interruption reason means for the task.
+settle a run decide what an interruption reason means for the task. The
+runner annotates only failures a pattern contains (an exception it catches,
+or an unsuccessful result). Failures it deliberately lets escape, notably
+``CheckpointPersistenceError``, are classified by whatever settles the run,
+by calling :func:`classify_run_failure` on the escaping exception; that is the
+producer of ``PERSISTENCE_FAILURE`` for checkpoint writes.
 """
 
 from __future__ import annotations
@@ -71,10 +81,14 @@ _MODEL_OUTPUT_INVALID_ERRORS = (
 def _cause_chain(error: BaseException) -> Iterator[BaseException]:
     """Yield ``error`` and its explicit ``__cause__`` chain, cycle-safe.
 
-    ``__context__`` is deliberately not followed, for the reason
+    This walk deliberately does not follow ``__context__``, for the reason
     ``xagent.core.retry.policy._causes`` gives: it is set implicitly for any
     exception raised while another was being handled, so it can link an
     unrelated cleanup failure and misclassify the run.
+
+    Composed rules can still look further: ``retry_on`` (rule 5) starts with
+    ``is_context_length_error``, which follows ``__context__`` too. That can
+    only turn ``LLM_UNAVAILABLE`` into a terminal ``None``, never the reverse.
     """
     seen: set[int] = set()
     current: BaseException | None = error
@@ -120,7 +134,11 @@ def classify_run_failure(exc: BaseException) -> InterruptionReason | None:
        task and terminal, whatever wraps it.
     2. Checkpoint/execution-event persistence failures.
     3. SQLAlchemy connectivity failures.
-    4. Unusable model output. Checked before rule 5 because these classes
+    4. Unusable model output, including the ``LLMToolProtocolError`` codes
+       ``retry_on`` refuses (``malformed_tool_arguments``,
+       ``unavailable_tool_call``): that veto is about replaying the identical
+       provider request, whereas a resumed run re-generates from its
+       checkpoint. Checked before rule 5 because these classes
        subclass ``LLMRetryableError``, which ``retry_on`` accepts, and a
        wrapper's ``retry_on`` looks one ``__cause__`` deep.
     5. Transient provider failures (``retry_on``) and capacity refusals.
@@ -152,6 +170,11 @@ def classify_run_result(result: Any) -> InterruptionReason | None:
     """
     if not isinstance(result, Mapping):
         return None
+    # Deliberately the whole status, not only the repair-exhausted empty
+    # answer: it also covers provider protocol errors, mixed control calls and
+    # a non-final_answer tool on a forced turn (see ``_child_never_answered``
+    # in tools/adapters/vibe/agent_tool.py). All of them are model output a
+    # fresh sample can fix, and callers cap how often they resume for it.
     if result.get("status") == "invalid_tool_protocol":
         return InterruptionReason.MODEL_OUTPUT_INVALID
     reason = result.get(INTERRUPTION_REASON_KEY)

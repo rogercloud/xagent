@@ -1005,6 +1005,55 @@ async def test_runner_classifies_unsuccessful_pattern_results(tmp_path: Path) ->
 
 
 @pytest.mark.asyncio
+async def test_runner_single_unsuccessful_pattern_result_carries_reason(
+    tmp_path: Path,
+) -> None:
+    """Production runs one pattern; its returned result must carry the reason."""
+    agent = Agent(
+        name="writer",
+        patterns=[FakePattern({"success": False, "status": "invalid_tool_protocol"})],
+    )
+    runner = AgentRunner(agent=agent, workspace_manager=FakeWorkspaceManager(tmp_path))
+
+    result = await runner.run(task="Impossible", execution_id="exec-reason-single")
+
+    assert result["status"] == "invalid_tool_protocol"
+    assert result["interruption_reason"] == "model_output_invalid"
+
+
+@pytest.mark.asyncio
+async def test_runner_single_pattern_keeps_its_own_interruption_reason(
+    tmp_path: Path,
+) -> None:
+    agent = Agent(
+        name="writer",
+        patterns=[
+            FakePattern({"success": False, "interruption_reason": "llm_unavailable"})
+        ],
+    )
+    runner = AgentRunner(agent=agent, workspace_manager=FakeWorkspaceManager(tmp_path))
+
+    result = await runner.run(task="Impossible", execution_id="exec-reason-own")
+
+    assert result["interruption_reason"] == "llm_unavailable"
+
+
+@pytest.mark.asyncio
+async def test_runner_single_terminal_pattern_result_has_no_reason(
+    tmp_path: Path,
+) -> None:
+    agent = Agent(
+        name="writer",
+        patterns=[FakePattern({"success": False, "error": "bad request"})],
+    )
+    runner = AgentRunner(agent=agent, workspace_manager=FakeWorkspaceManager(tmp_path))
+
+    result = await runner.run(task="Impossible", execution_id="exec-reason-none")
+
+    assert "interruption_reason" not in result
+
+
+@pytest.mark.asyncio
 async def test_runner_success_after_failed_pattern_has_no_interruption_reason(
     tmp_path: Path,
 ) -> None:

@@ -666,6 +666,12 @@ class AgentRunner:
                         await self._finish_run(context, normalized, runtime=runtime)
                         return normalized
 
+                    reason = interruption_reason_value(classify_run_result(normalized))
+                    if reason is not None:
+                        # On the result itself, not only the entry: a single
+                        # failed pattern returns ``normalized`` directly below
+                        # and the aggregate that copies entry reasons is skipped.
+                        normalized[INTERRUPTION_REASON_KEY] = reason
                     pattern_errors.append(
                         {
                             "pattern": pattern.__class__.__name__,
@@ -673,9 +679,7 @@ class AgentRunner:
                                 "error", "Pattern failed without a detailed error."
                             ),
                             "result": normalized,
-                            INTERRUPTION_REASON_KEY: interruption_reason_value(
-                                classify_run_result(normalized)
-                            ),
+                            INTERRUPTION_REASON_KEY: reason,
                         }
                     )
             finally:
