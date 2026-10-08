@@ -3831,7 +3831,14 @@ class TestTaskAutoRecoveryConfig:
             monkeypatch.setenv(env_var, truthy)
             assert read() is True
 
-        for invalid in ("", "maybe", "2"):
+        for blank in ("", "   "):
+            monkeypatch.setenv(env_var, blank)
+            caplog.clear()
+            with caplog.at_level(logging.WARNING, logger="xagent.config"):
+                assert read() is True
+            assert env_var not in caplog.text
+
+        for invalid in ("maybe", "2"):
             monkeypatch.setenv(env_var, invalid)
             caplog.clear()
             with caplog.at_level(logging.WARNING, logger="xagent.config"):

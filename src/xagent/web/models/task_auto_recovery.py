@@ -6,10 +6,22 @@ from ``tasks`` so that no existing writer of ``tasks`` has to maintain
 scheduling columns: the row is fenced by ``paused_state_version`` instead. A
 task without a row simply does not take part in automatic recovery.
 
+The counters and ``episode_started_at`` are scoped to ``run_id``: a writer
+that reuses the row for a new run must reset ``no_progress_resumes``,
+``total_resumes`` and ``episode_started_at`` together (and clear
+``last_command_id``), so a non-zero counter always belongs to the run named
+on the row.
+
 ``task_recovery_events`` is its append-only history, used for timelines,
 audit and test assertions. Both tables cascade with their task.
+
+``reason`` holds an ``xagent.core.agent.interruption.InterruptionReason``
+value; ``state`` and ``event`` hold :class:`TaskAutoRecoveryState` and
+:class:`TaskRecoveryEventType` values. The columns stay plain strings so
+adding a value needs no schema change.
 """
 
+import enum
 from datetime import datetime
 from typing import Any
 
@@ -18,6 +30,39 @@ from sqlalchemy.orm import Mapped, mapped_column
 from sqlalchemy.sql import func
 
 from .database import Base
+
+# Upper bound on ``TaskAutoRecovery.last_error``; writers truncate to it.
+TASK_AUTO_RECOVERY_LAST_ERROR_MAX_CHARS = 2048
+
+
+class TaskAutoRecoveryState(str, enum.Enum):
+    """Where automatic recovery of the row's run stands."""
+
+    MANUAL = "manual"
+    SCHEDULED = "scheduled"
+    DISPATCHED = "dispatched"
+    EXHAUSTED = "exhausted"
+    EXPIRED = "expired"
+    SUPERSEDED = "superseded"
+    INELIGIBLE = "ineligible"
+    DISABLED = "disabled"
+    STALE = "stale"
+    DISPATCH_FAILED = "dispatch_failed"
+
+
+class TaskRecoveryEventType(str, enum.Enum):
+    """Kinds of entries in ``task_recovery_events``."""
+
+    INTERRUPTED = "interrupted"
+    SCHEDULED = "scheduled"
+    AUTO_RESUMED = "auto_resumed"
+    EXHAUSTED = "exhausted"
+    EXPIRED = "expired"
+    SUPERSEDED = "superseded"
+    INELIGIBLE = "ineligible"
+    SKIPPED_USER_INTENT = "skipped_user_intent"
+    DISPATCH_FAILED = "dispatch_failed"
+    STALE = "stale"
 
 
 class TaskAutoRecovery(Base):  # type: ignore
@@ -34,8 +79,7 @@ class TaskAutoRecovery(Base):  # type: ignore
     run_id: Mapped[str] = mapped_column(String(64), nullable=False)
     # Most recent interruption reason (an InterruptionReason value).
     reason: Mapped[str] = mapped_column(String(32), nullable=False)
-    # manual / scheduled / dispatched / exhausted / expired / superseded /
-    # ineligible / disabled / stale / dispatch_failed
+    # A TaskAutoRecoveryState value.
     state: Mapped[str] = mapped_column(String(24), nullable=False)
     # e.g. ``ineligible:source_sdk``.
     state_detail: Mapped[str | None] = mapped_column(String(64), nullable=True)
@@ -65,7 +109,8 @@ class TaskAutoRecovery(Base):  # type: ignore
     )
     # ``command_id`` of the most recently dispatched RESUME command.
     last_command_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
-    # Operator-only diagnostic, truncated by the writer; never sent to clients.
+    # Operator-only diagnostic, at most TASK_AUTO_RECOVERY_LAST_ERROR_MAX_CHARS
+    # (writers truncate); never sent to clients.
     last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
@@ -89,8 +134,7 @@ class TaskRecoveryEvent(Base):  # type: ignore
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
-    # interrupted / scheduled / auto_resumed / exhausted / expired /
-    # superseded / ineligible / skipped_user_intent / dispatch_failed / stale
+    # A TaskRecoveryEventType value.
     event: Mapped[str] = mapped_column(String(32), nullable=False)
     reason: Mapped[str | None] = mapped_column(String(32), nullable=True)
     attempt: Mapped[int | None] = mapped_column(Integer, nullable=True)

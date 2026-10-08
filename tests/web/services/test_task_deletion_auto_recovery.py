@@ -51,10 +51,15 @@ def _counts(db: Session, task_id: int) -> tuple[int, int]:
     )
 
 
-def test_purge_task_rows_removes_recovery_rows(engine):
+@pytest.mark.parametrize("fk_enforced", [True, False])
+def test_purge_task_rows_removes_recovery_rows(engine, fk_enforced):
     Base.metadata.create_all(engine)
     with Session(engine) as db:
-        _user_id, first, second = _seed(db, username="purge-owner")
+        if engine.dialect.name == "sqlite" and not fk_enforced:
+            # Without the pragma, ON DELETE CASCADE cannot do the work, so
+            # this case proves the explicit deletes do.
+            db.execute(sa.text("PRAGMA foreign_keys=OFF"))
+        _user_id, first, second = _seed(db, username=f"purge-owner-{fk_enforced}")
         assert purge_task_rows(db, task_id=first, detached_reason="task_deleted")
         db.commit()
         assert _counts(db, first) == (0, 0)

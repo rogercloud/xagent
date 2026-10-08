@@ -491,10 +491,18 @@ def get_task_lease_recovery_batch_size() -> int:
 
 
 def _get_strict_bool_env(env_var: str, default: bool) -> bool:
-    """Parse a boolean env var, warning and falling back on unrecognised values."""
+    """Parse a boolean env var, warning and falling back on unrecognised values.
+
+    Unlike :func:`_get_bool_env`, an unrecognised value keeps the default
+    instead of reading as ``False``, so a typo cannot silently turn off a
+    default-on switch. Blank counts as unset, as in
+    :func:`_get_retention_bool_env`: a compose file interpolating an unset
+    shell variable passes an empty string, which states nothing and must not
+    warn on every read.
+    """
 
     value = os.getenv(env_var)
-    if value is None:
+    if value is None or not value.strip():
         return default
     normalized = value.strip().lower()
     if normalized in {"1", "true", "yes", "on"}:

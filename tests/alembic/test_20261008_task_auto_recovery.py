@@ -48,6 +48,14 @@ def test_migration_matches_the_models_and_is_idempotent(engine):
                     table.name,
                     column.name,
                 )
+                # Compiled form compares class and length: String(24) vs
+                # String(32) must not pass.
+                assert reflected[column.name]["type"].compile(
+                    dialect=connection.dialect
+                ) == column.type.compile(dialect=connection.dialect), (
+                    table.name,
+                    column.name,
+                )
             assert [
                 (fk["referred_table"], fk["constrained_columns"], fk["options"])
                 for fk in inspector.get_foreign_keys(table.name)

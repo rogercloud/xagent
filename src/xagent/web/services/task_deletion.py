@@ -81,8 +81,10 @@ def purge_task_rows(
         ).delete(synchronize_session=False)
 
     # Explicit rather than relying on ON DELETE CASCADE: SQLite only enforces
-    # foreign keys when the pragma is on. Unlike the interaction table these
-    # are always created together with ``tasks``, so no presence gate.
+    # foreign keys when the pragma is on. No presence gate, unlike the
+    # interaction table: an Alembic upgrade can stop short of these tables,
+    # but ``Base.metadata.create_all`` runs right after ``try_upgrade_db`` on
+    # every startup, so they exist before the process serves anything.
     db.query(TaskRecoveryEvent).filter(TaskRecoveryEvent.task_id == task_id).delete(
         synchronize_session=False
     )
