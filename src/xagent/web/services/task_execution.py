@@ -2135,7 +2135,7 @@ def _finalize_task_execution_result_isolated(
                     else None
                 )
                 if interruption is not None and interruption.pause:
-                    # A recoverable run interrupted by infrastructure rests
+                    # A recoverable run interrupted by a system cause rests
                     # PAUSED for its user to resume, as lease recovery
                     # leaves it; the scheduler's settlement releases it.
                     final_control_snapshot = apply_task_control_transition(
@@ -4206,8 +4206,8 @@ async def execute_resume_background(
                 exc_info=True,
             )
             settlement_error = error_message
-            # A checkpoint/event write or the database itself failed: a
-            # recoverable run is paused, not failed.
+            # An interruption (in practice a checkpoint/event write or the
+            # database itself failed): a recoverable run is paused, not failed.
             settlement_interruption = settlement_interruption_for_failure(e)
             broadcast_error_message = client_safe_error_message(
                 e,
