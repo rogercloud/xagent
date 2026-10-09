@@ -117,9 +117,12 @@ async def test_error_after_prepare_settles_preclaimed_task_instead_of_orphaning_
     assert finalized == [TaskStatus.FAILED]
     assert managed.closed is True
     assert sent_messages == [
-        CLIENT_SAFE_AUTO_MODEL_UNAVAILABLE
-        if auto_unavailable
-        else "Sorry, an error occurred while processing your request."
+        (
+            CLIENT_SAFE_AUTO_MODEL_UNAVAILABLE
+            if auto_unavailable
+            else "Sorry, an error occurred while processing your request."
+        )
+        + " (Task ID: 45)"
     ]
 
 

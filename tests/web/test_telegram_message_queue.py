@@ -1495,7 +1495,7 @@ async def test_empty_output_edits_the_loading_message_with_a_placeholder(
     # The execution produced no visible text and no attachments.
     monkeypatch.setattr(
         "xagent.web.channels.telegram.bot.project_execution_result_for_channel",
-        lambda _result: SimpleNamespace(
+        lambda _result, **_kwargs: SimpleNamespace(
             visible_text="",
             task_status=TaskStatus.COMPLETED,
             transcript_content="",

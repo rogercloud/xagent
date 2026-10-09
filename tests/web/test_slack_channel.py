@@ -1353,7 +1353,9 @@ async def test_slack_turn_reuses_channel_runtime_and_reports_auto_failure(
     assert bot.active_tasks == {"T1:D1:U1:direct": 45}
     if auto_unavailable:
         assert finalized == [(TaskStatus.FAILED, "")]
-        assert final_messages == [{"text": CLIENT_SAFE_AUTO_MODEL_UNAVAILABLE}]
+        assert final_messages == [
+            {"text": f"{CLIENT_SAFE_AUTO_MODEL_UNAVAILABLE} (Task ID: 45)"}
+        ]
         assert managed.closed is True
         return
     assert persisted[0]["content"] == "hello"
