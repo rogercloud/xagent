@@ -112,6 +112,8 @@ on:
       - 'tests/web/services/test_task_lease_expiry_interruption.py'
       - 'tests/web/services/test_persistence_failure_pause.py'
       - 'tests/web/services/test_provider_failure_pause.py'
+      - 'src/xagent/web/services/managed_task_lease.py'
+      - 'src/xagent/web/services/execution_result_projection.py'
       - 'tests/web/services/test_task_execution_event_store.py'
       - 'tests/web/services/task_database_shared.py'
       - 'src/xagent/web/services/chat_history_service.py'
@@ -319,6 +321,8 @@ jobs:
             tests/web/services/test_task_lease_expiry_interruption.py
             tests/web/services/test_persistence_failure_pause.py
             tests/web/services/test_provider_failure_pause.py
+            src/xagent/web/services/managed_task_lease.py
+            src/xagent/web/services/execution_result_projection.py
             tests/web/services/test_task_execution_event_store.py
             tests/web/services/task_database_shared.py
             src/xagent/web/services/chat_history_service.py

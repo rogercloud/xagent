@@ -5,23 +5,36 @@ unusable output, rests PAUSED instead of FAILED.
 ``persistence_failure``; ``model_output_invalid`` also needs
 ``XAGENT_TASK_AUTO_RESUME_ENABLED``. Both reach settlement as an unsuccessful
 result, so the result paths carry them: a new run's
-(``_finalize_task_execution_result_isolated``) and a resumed run's
-(``_finalize_resumed_task``). Runs on SQLite and, when
+(``_finalize_task_execution_result_isolated``), a resumed run's
+(``_finalize_resumed_task``) and the shared channel leaf's
+(``finalize_managed_task_lease_result``). Runs on SQLite and, when
 ``XAGENT_TEST_POSTGRES_URL`` is set, on PostgreSQL through the shared
 ``canonical`` fixture.
 """
 
 from __future__ import annotations
 
+import asyncio
+from types import SimpleNamespace
 from typing import Any
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 
 from tests.core.agent.test_auto import decision_tool_response, plan_tool_response
 from tests.core.agent.test_react import FakeLLM, FakeTool
 from tests.core.agent.test_runner import FakeWorkspaceManager
+from tests.web.services.channel_delivery_shared import (
+    database_url as database_url_fixture,
+)
+from tests.web.services.channel_delivery_shared import selected as selected_fixture
+from tests.web.services.coordinator_command_shared import claim_task_command
+from tests.web.services.test_execution_event_persistence_settlement import (
+    _run_scheduled_turn,
+)
 from tests.web.services.test_execution_event_recovery import tracer_for
 from tests.web.services.test_persistence_failure_pause import (
+    PERSISTENCE_RESULT,
     _assert_no_failure_in_model_context,
     _assert_paused,
     _assistant_lines,
@@ -50,10 +63,14 @@ from tests.web.services.test_task_execution_event_writer import (
 )
 from tests.web.services.test_task_execution_event_writer import engine as engine_fixture
 from tests.web.services.test_task_execution_event_writer import (
+    facts,
+)
+from tests.web.services.test_task_execution_event_writer import (
     task_id as task_id_fixture,
 )
 from tests.web.services.test_task_lease_expiry_interruption import (
     _fail_recording,
+    _snapshot,
 )
 from xagent.core.agent import (
     Agent,
@@ -62,8 +79,11 @@ from xagent.core.agent import (
     ReActPattern,
 )
 from xagent.core.agent.checkpoint import (
+    CHECKPOINT_SCHEMA_VERSION,
+    CHECKPOINT_TYPE,
     TraceCheckpointStore,
 )
+from xagent.core.agent.execution_adapter import INTERRUPTED_USER_MESSAGE
 from xagent.core.agent.interruption import InterruptionReason
 from xagent.core.agent.pattern.auto.auto import DECISION_TOOL_NAME
 from xagent.core.agent.service import AgentService
@@ -71,8 +91,34 @@ from xagent.core.model.chat.error import retry_on
 from xagent.core.model.chat.exceptions import LLMEmptyContentError, LLMTimeoutError
 from xagent.core.retry import RetryWrapper
 from xagent.core.retry.strategy import FixedDelay
+from xagent.web.models.chat_message import TaskChatMessage
+from xagent.web.models.database import get_session_local
 from xagent.web.models.task import Task, TaskStatus
-from xagent.web.services import task_auto_recovery, task_execution
+from xagent.web.models.task_auto_recovery import TaskAutoRecovery
+from xagent.web.models.task_command import TaskExecutionCommand
+
+# Imported here, not lazily: a module first imported while ``canonical``
+# patches ``database.get_session_local`` would keep that patched factory.
+from xagent.web.services import (
+    agent_service_manager,
+)
+from xagent.web.services import shared_channel_execution as shared
+from xagent.web.services import (
+    task_auto_recovery,
+    task_command_execution,
+    task_coordinator_runtime,
+    task_event_bridge,
+    task_execution,
+    task_orchestrator,
+)
+from xagent.web.services.client_error_messages import CLIENT_SAFE_TASK_FAILURE
+from xagent.web.services.execution_result_projection import (
+    INTERRUPTED_CHANNEL_RESULT,
+    project_execution_result_for_channel,
+)
+from xagent.web.services.managed_task_lease import (
+    finalize_managed_task_lease_result,
+)
 from xagent.web.services.task_auto_recovery import (
     TASK_INTERRUPTION_PAUSED_TRIGGER_ERROR,
     InterruptionSettlementDeferred,
@@ -81,6 +127,10 @@ from xagent.web.services.task_auto_recovery import (
     settlement_pause_enabled,
 )
 from xagent.web.services.task_execution import _acquire_resume_task_lease
+from xagent.web.services.task_execution_context_service import (
+    TaskExecutionRecoverySnapshot,
+)
+from xagent.web.services.task_execution_event_writer import append_fact_no_commit
 from xagent.web.services.task_lease_recovery import TASK_LEASE_PAUSED_TRIGGER_ERROR
 from xagent.web.services.task_lease_service import (
     TASK_UNKNOWN_TOOL_EFFECT_SETTLEMENT_ERROR,
@@ -90,6 +140,7 @@ from xagent.web.services.task_lease_service import (
     bind_task_lease_context,
 )
 from xagent.web.services.task_orchestrator import (
+    TaskTurnPayload,
     settle_task_lease_isolated,
 )
 
@@ -97,6 +148,8 @@ canonical = canonical_fixture
 engine = engine_fixture
 task_id = task_id_fixture
 _late_bound_sessions = _late_bound_sessions_fixture
+database_url = database_url_fixture
+selected = selected_fixture
 
 PAUSE_SWITCH = "XAGENT_TASK_INFRA_FAILURE_PAUSE_ENABLED"
 AUTO_SWITCH = "XAGENT_TASK_AUTO_RESUME_ENABLED"
@@ -455,7 +508,11 @@ MODEL_RESULT = {
     ),
     "interruption_reason": "model_output_invalid",
 }
-RESULTS = {"llm_unavailable": LLM_RESULT, "model_output_invalid": MODEL_RESULT}
+RESULTS = {
+    "llm_unavailable": LLM_RESULT,
+    "model_output_invalid": MODEL_RESULT,
+    "persistence_failure": PERSISTENCE_RESULT,
+}
 
 
 def test_settlement_acts_on_provider_and_model_output_failures():
@@ -514,19 +571,45 @@ def test_settlement_switches_per_reason(monkeypatch, infra, auto, enabled):
     } == enabled | ({"user_pause"} if infra == "true" else set())
 
 
-# --------------------------------------------- result paths: S1 and S3
+# ------------------------------- result paths: S1, S3 and the shared channel S4
 
+# PR4a covers ``persistence_failure`` on S1 and S3; S4 gains all three here.
 _PATH_REASONS = [
-    (path, reason) for path in ("result", "resumed_result") for reason in RESULTS
+    (path, reason)
+    for path in ("result", "resumed_result", "channel")
+    for reason in RESULTS
+    if path == "channel" or reason != "persistence_failure"
 ]
 CASES = pytest.mark.parametrize(("path", "reason"), _PATH_REASONS)
+
+
+def _settle_channel(
+    factory, ids, lease, result, *, settle_interruption: bool = True
+) -> None:
+    """Settle ``result`` as the shared channel leaf does (without a command)."""
+    projection = project_execution_result_for_channel(dict(result))
+    with factory() as db:
+        assert finalize_managed_task_lease_result(
+            db,
+            lease,
+            status=projection.task_status,
+            assistant_content=projection.transcript_content,
+            turn_id=ids["turn_id"],
+            interactions=projection.interactions,
+            message_type=projection.message_type,
+            error_message=projection.diagnostic_error,
+            execution_result=dict(result),
+            settle_interruption=settle_interruption,
+        )
 
 
 def _settle_result(path: str, factory, ids, lease, result) -> None:
     if path == "result":
         _finalize_and_release(factory, ids, lease, dict(result))
-    else:
+    elif path == "resumed_result":
         assert _finalize_resumed(ids, lease, result)["lease_released"]
+    else:
+        _settle_channel(factory, ids, lease, result)
 
 
 def _without_result_interruption(m: pytest.MonkeyPatch) -> None:
@@ -752,8 +835,10 @@ def test_undecidable_interruption_keeps_the_lease_for_ttl(
         with pytest.raises(InterruptionSettlementDeferred) as deferred:
             if path == "result":
                 _finalize(factory, ids["task"], lease, dict(RESULTS[reason]))
-            else:
+            elif path == "resumed_result":
                 _finalize_resumed(ids, lease, RESULTS[reason])
+            else:
+                _settle_channel(factory, ids, lease, RESULTS[reason])
         assert deferred.value.__cause__ is not None
 
     task, row, _events = _state(factory, ids["task"])
@@ -765,6 +850,27 @@ def test_undecidable_interruption_keeps_the_lease_for_ttl(
     assert _expire_and_recover(factory, ids) == TaskStatus.PAUSED
     _task, row, _events = _state(factory, ids["task"])
     assert (row.reason, row.state) == ("lease_expired", "manual")
+
+
+def test_combined_channel_settlement_is_unchanged(canonical):
+    """The combined bots finalize without deciding interruptions: their
+    tasks are never eligible, so they fail as before, with no row."""
+
+    factory, _tid = canonical
+    gated, baseline = _projected_task(factory), _projected_task(factory)
+    gated_lease = _prepare_run(factory, gated)
+    baseline_lease = _prepare_run(factory, baseline)
+    plain = {k: v for k, v in LLM_RESULT.items() if k != "interruption_reason"}
+
+    _settle_channel(factory, gated, gated_lease, LLM_RESULT, settle_interruption=False)
+    _settle_channel(factory, baseline, baseline_lease, plain, settle_interruption=False)
+
+    gated_projection = _without_settled_reason(
+        _projection(factory, gated, gated_lease), "llm_unavailable"
+    )
+    assert gated_projection == _projection(factory, baseline, baseline_lease)
+    assert gated_projection["status"] == TaskStatus.FAILED
+    assert _state(factory, gated["task"])[1] is None
 
 
 # ------------------------------------------- S2: the rare raised provider error
@@ -821,3 +927,185 @@ async def test_raised_model_output_failure_without_auto_resume_fails_as_before(
     assert gated_frames == baseline_frames == ["task_error"]
     _task, row, _events = _state(factory, gated["task"])
     assert (row.reason, row.state) == ("model_output_invalid", "disabled")
+
+
+# ------------------------------------- S4: a shared channel turn, end to end
+
+
+async def _run_shared_channel_turn(
+    selected, monkeypatch, execution_result: dict[str, Any]
+) -> TaskExecutionCommand:
+    """Run one accepted channel turn through the worker's command executor.
+
+    The fake agent writes a recoverable checkpoint for its run, then returns
+    ``execution_result``.
+    """
+
+    monkeypatch.setenv("XAGENT_TASK_EXECUTION_ROLE", "worker")
+    monkeypatch.setattr(task_coordinator_runtime, "get_runner_id", lambda: "worker-1")
+    # A registry an earlier test left on this loop is bound to its database.
+    monkeypatch.setattr(task_coordinator_runtime, "_registry", None)
+    assert task_coordinator_runtime.get_session_local is get_session_local
+    with get_session_local()() as db:
+        db.get(Task, selected.selection.task_id).conversation_storage_version = 2
+        db.commit()
+    command_id = shared._accept_channel_turn(
+        selected, TaskTurnPayload("hello"), "ingress"
+    )
+    with get_session_local()() as db:
+        command = await claim_task_command(
+            db, runner_id="worker-1", command_db_id=command_id
+        )
+    service = SimpleNamespace(
+        tracer=SimpleNamespace(add_handler=Mock(), remove_handler=Mock()),
+        workspace=None,
+        set_conversation_history=Mock(),
+        set_execution_context_messages=Mock(),
+        set_recovered_skill_context=Mock(),
+    )
+
+    async def execute(**kwargs: Any) -> dict[str, Any]:
+        run_id = kwargs["task_lease"].run_id
+        with get_session_local()() as db:
+            append_fact_no_commit(
+                db,
+                task_id=selected.selection.task_id,
+                kind="recovery_state",
+                key=f"runtime:{run_id}",
+                payload={
+                    "data": {
+                        "checkpoint_type": CHECKPOINT_TYPE,
+                        "snapshot_schema_version": CHECKPOINT_SCHEMA_VERSION,
+                        "execution_id": str(selected.selection.task_id),
+                        "snapshot": _snapshot(messages=2, iteration=1),
+                    }
+                },
+                run_id=run_id,
+            )
+            db.commit()
+        return dict(execution_result)
+
+    manager = SimpleNamespace(
+        get_agent_for_task=AsyncMock(return_value=service),
+        execute_task=AsyncMock(side_effect=execute),
+    )
+    monkeypatch.setattr(agent_service_manager, "get_agent_manager", lambda: manager)
+    bridge = Mock()
+    monkeypatch.setattr(task_event_bridge, "_bridge", bridge)
+    monkeypatch.setattr(shared, "get_task_event_bridge", lambda: bridge)
+    snapshot = SimpleNamespace(
+        runtime_user=object(),
+        task=SimpleNamespace(user_id=selected.selection.user_id, source="internal"),
+        conversation_history=(),
+        conversation_watermark=None,
+        conversation_event_watermark=None,
+        execution_recovery=TaskExecutionRecoverySnapshot(),
+    )
+    monkeypatch.setattr(
+        task_orchestrator, "load_task_setup_snapshot_sync", lambda *a, **kw: snapshot
+    )
+    monkeypatch.setattr(task_orchestrator, "resolve_execution_scope", lambda *a: None)
+    monkeypatch.setattr(
+        task_execution,
+        "background_task_manager",
+        task_execution.BackgroundTaskManager(),
+    )
+    try:
+        await task_command_execution.execute_durable_task_command(command)
+        async with asyncio.timeout(10):
+            while shared._read_channel_result(command.id, selected.run_id) is None:
+                await asyncio.sleep(0.01)
+    finally:
+        await task_coordinator_runtime.close_task_coordinators()
+        await task_execution.background_task_manager.shutdown()
+    return command
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("reason", sorted(RESULTS))
+async def test_shared_channel_turn_pauses_and_its_channel_reads_interrupted(
+    selected, monkeypatch, reason
+):
+    """The shared channel leaf pauses an eligible interrupted run. Its
+    channel gets the same "interrupted" reply a lease-expiry pause produces
+    (until a later change holds the reply across an automatic resume)."""
+
+    command = await _run_shared_channel_turn(selected, monkeypatch, RESULTS[reason])
+
+    tid = selected.selection.task_id
+    channel_result = shared._read_channel_result(command.id, selected.run_id)
+    assert channel_result == INTERRUPTED_CHANNEL_RESULT
+    assert (
+        project_execution_result_for_channel(channel_result).visible_text
+        == INTERRUPTED_USER_MESSAGE
+    )
+    with get_session_local()() as db:
+        task = db.get(Task, tid)
+        assert (task.status, task.control_state) == (TaskStatus.PAUSED, "paused")
+        assert (task.run_id, task.runner_id) == (selected.run_id, None)
+        assert task.lease_attempt_id is None
+        assert task.error_message is None
+        row = db.get(TaskAutoRecovery, tid)
+        assert (row.reason, row.state, row.run_id) == (
+            reason,
+            "manual",
+            selected.run_id,
+        )
+        assert row.paused_state_version == task.state_version
+        assert row.progress_marker is not None
+        assert (
+            db.query(TaskChatMessage).filter_by(task_id=tid, role="assistant").all()
+            == []
+        )
+        assert [
+            fact.payload for fact in facts(db, tid) if fact.kind == "execution_settled"
+        ] == [PAUSED_FACT]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("reason", sorted(RESULTS))
+async def test_shared_channel_turn_with_the_switch_off_fails_as_before(
+    selected, monkeypatch, reason
+):
+    monkeypatch.setenv(PAUSE_SWITCH, "false")
+
+    command = await _run_shared_channel_turn(selected, monkeypatch, RESULTS[reason])
+
+    tid = selected.selection.task_id
+    channel_result = shared._read_channel_result(command.id, selected.run_id)
+    assert (channel_result["success"], channel_result["output"]) == (
+        False,
+        CLIENT_SAFE_TASK_FAILURE,
+    )
+    with get_session_local()() as db:
+        task = db.get(Task, tid)
+        assert task.status == TaskStatus.FAILED
+        assert task.error_message == RESULTS[reason]["error"]
+        row = db.get(TaskAutoRecovery, tid)
+        assert (row.reason, row.state) == (reason, "disabled")
+        assert [
+            message.content
+            for message in db.query(TaskChatMessage).filter_by(
+                task_id=tid, role="assistant"
+            )
+        ] == [CLIENT_SAFE_TASK_FAILURE]
+
+
+@pytest.mark.asyncio
+async def test_shared_channel_deferred_settlement_retains_the_lease(canonical):
+    """An undecidable channel settlement raises out of the leaf; the
+    scheduler keeps the lease for TTL recovery, as on the other paths."""
+
+    factory, tid = canonical
+    lease = _start_run(factory, tid)
+
+    async def execute(**_kwargs: Any) -> None:
+        raise InterruptionSettlementDeferred("checkpoint not resolvable")
+
+    published = await _run_scheduled_turn(tid, lease, execute, channel=True)
+
+    assert published == []
+    task, row, _events = _state(factory, tid)
+    assert task.status == TaskStatus.RUNNING
+    assert task.runner_id == lease.runner_id
+    assert row is None
