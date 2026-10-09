@@ -147,6 +147,43 @@ def test_context_length_failures_are_terminal(error: BaseException) -> None:
     assert classify_run_failure(error) is None
 
 
+def _insufficient_quota_error() -> Exception:
+    response = httpx.Response(429, request=REQUEST)
+    return openai.RateLimitError(
+        "You exceeded your current quota, please check your plan and billing",
+        response=response,
+        body={"code": "insufficient_quota", "type": "insufficient_quota"},
+    )
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        _insufficient_quota_error(),
+        # How openai.py re-raises an SDK rate-limit error.
+        _chained(
+            RuntimeError("OpenAI rate limit exceeded: quota"),
+            _insufficient_quota_error(),
+        ),
+        _chained(RuntimeError("chat failed"), _status_error(402, "pay up")),
+        _chained(RuntimeError("chat failed"), _status_error(401, "bad key")),
+    ],
+    ids=["quota", "quota_wrapped", "payment_required", "credential_wrapped"],
+)
+def test_quota_and_credential_refusals_are_terminal(error: BaseException) -> None:
+    assert classify_run_failure(error) is None
+
+
+def test_plain_rate_limit_stays_resumable() -> None:
+    assert classify_run_failure(_rate_limit_error()) is (
+        InterruptionReason.LLM_UNAVAILABLE
+    )
+    wrapped = _chained(
+        RuntimeError("OpenAI rate limit exceeded: slow down"), _rate_limit_error()
+    )
+    assert classify_run_failure(wrapped) is InterruptionReason.LLM_UNAVAILABLE
+
+
 def test_classifier_walks_explicit_cause_chain() -> None:
     db_down = sa_exc.OperationalError("SELECT 1", {}, Exception("server closed"))
     wrapped = _chained(

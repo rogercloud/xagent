@@ -145,6 +145,26 @@ def _is_llm_unavailable(error: BaseException) -> bool:
     return is_capacity_error(error)
 
 
+def _is_provider_refusal(error: BaseException) -> bool:
+    """Whether the provider refused the account rather than the moment.
+
+    An exhausted quota or balance and a rejected credential often arrive as
+    a 429 or a wrapped ``RuntimeError`` that ``retry_on`` accepts, but asking
+    again later will not help. The provider-call boundary already names
+    them; this reuses its classification instead of a second set of markers.
+    Imported lazily so this module does not load every provider adapter.
+    Its chain walk also follows ``__context__``, which can only make a
+    failure terminal here, never resumable.
+    """
+    from ..model.chat.basic.call_boundary import (
+        CREDENTIAL_REJECTED,
+        PROVIDER_QUOTA,
+        classify_provider_failure,
+    )
+
+    return classify_provider_failure(error) in {PROVIDER_QUOTA, CREDENTIAL_REJECTED}
+
+
 def classify_run_failure(exc: BaseException) -> InterruptionReason | None:
     """Classify an exception that ended a run, or ``None`` if it is terminal.
 
@@ -162,7 +182,9 @@ def classify_run_failure(exc: BaseException) -> InterruptionReason | None:
        checkpoint. Checked before rule 5 because these classes
        subclass ``LLMRetryableError``, which ``retry_on`` accepts, and a
        wrapper's ``retry_on`` looks one ``__cause__`` deep.
-    5. Transient provider failures (``retry_on``) and capacity refusals.
+    5. Transient provider failures (``retry_on``) and capacity refusals,
+       unless the provider-call boundary classifies the failure as an
+       exhausted quota or a rejected credential, which are terminal.
 
     Anything else (configuration, authentication, bad requests, tool errors,
     iteration limits) is terminal and returns ``None``.
@@ -177,6 +199,8 @@ def classify_run_failure(exc: BaseException) -> InterruptionReason | None:
     if any(isinstance(error, _MODEL_OUTPUT_INVALID_ERRORS) for error in chain):
         return InterruptionReason.MODEL_OUTPUT_INVALID
     if any(_is_llm_unavailable(error) for error in chain):
+        if _is_provider_refusal(exc):
+            return None
         return InterruptionReason.LLM_UNAVAILABLE
     return None
 
