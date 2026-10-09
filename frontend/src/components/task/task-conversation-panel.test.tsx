@@ -996,6 +996,36 @@ describe("TaskConversationPanel", () => {
     expect(renderedMessages[0]).toHaveAttribute("data-failure-task-id", "")
   })
 
+  it("labels a failed embedded turn once when trace group and result row both fail", () => {
+    appState.messages = [
+      { id: "msg-user", role: "user", content: "Run analysis", timestamp: "1000" },
+      {
+        id: "msg-failed",
+        role: "assistant",
+        content: "Task execution failed.",
+        timestamp: "1700",
+        status: "failed",
+        isResult: true,
+      },
+    ] as any
+    appState.traceEvents = [
+      { event_id: "start", event_type: "task_start", timestamp: 1500, data: {} },
+      { event_id: "fail", event_type: "task_failed", timestamp: 1600, data: { error: "boom" } },
+    ] as any
+    appState.currentTask = { id: "42", title: "Task", status: "failed" } as any
+
+    render(<TaskConversationPanel mode="page" showProcessView={false} />)
+
+    const labels = screen
+      .getAllByTestId("chat-message")
+      .map((message) => message.getAttribute("data-failure-task-id"))
+    expect(labels.filter((label) => label === "42")).toHaveLength(1)
+    const failedRow = screen
+      .getAllByTestId("chat-message")
+      .find((message) => message.textContent?.includes("Task execution failed."))
+    expect(failedRow).toHaveAttribute("data-failure-task-id", "42")
+  })
+
   it("passes the task id to the virtual failure placeholder of the current task", () => {
     appState.messages = [
       { id: "msg-user", role: "user", content: "Run analysis", timestamp: "1000" },
