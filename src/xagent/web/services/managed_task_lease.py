@@ -21,8 +21,8 @@ from .db_runtime import (
     run_db_io_cancellation_safe,
 )
 from .execution_result_projection import (
-    INTERRUPTED_CHANNEL_RESULT,
     completion_outcome_for_status,
+    interrupted_channel_result,
 )
 from .task_lease_service import (
     TASK_UNKNOWN_TOOL_EFFECT_SETTLEMENT_ERROR,
@@ -70,9 +70,11 @@ def finalize_managed_task_lease_result(
     an interruption is decided as the other result paths decide it: a
     recoverable run rests PAUSED with no failure transcript, error or result,
     and its channel result says it was interrupted (as lease recovery's does).
-    An undecidable run raises ``InterruptionSettlementDeferred`` after rolling
-    back, keeping the lease for TTL recovery. Every decided interruption is
-    recorded in ``task_auto_recovery``.
+    It needs ``XAGENT_TASK_INFRA_FAILURE_PAUSE_ENABLED`` (off by default), as
+    on the other paths. A database connectivity failure while deciding raises
+    ``InterruptionSettlementDeferred`` after rolling back, keeping the lease
+    for TTL recovery; any other decision fault settles as before. Every
+    decided interruption is recorded in ``task_auto_recovery``.
     """
 
     if status == TaskStatus.RUNNING:
@@ -84,6 +86,7 @@ def finalize_managed_task_lease_result(
         InterruptionOutcome,
         apply_interruption_outcome_no_commit,
         decide_owned_run_interruption,
+        interruption_pause_result,
         settlement_interruption_for_result,
     )
     from .task_execution_event_writer import stage_result_fact_no_commit
@@ -168,7 +171,7 @@ def finalize_managed_task_lease_result(
             # Like lease recovery's: the unsuccessful result would read as a
             # failed execution when the transcript is projected for the next
             # model call.
-            {"error": None}
+            interruption_pause_result()
             if paused
             else dict(execution_result or {"error": error_message}),
         )
@@ -187,7 +190,7 @@ def finalize_managed_task_lease_result(
                 db.rollback()
                 return False
             if paused:
-                channel_result = dict(INTERRUPTED_CHANNEL_RESULT)
+                channel_result = interrupted_channel_result()
             setattr(
                 command, "result", {**command.result, "channel_result": channel_result}
             )

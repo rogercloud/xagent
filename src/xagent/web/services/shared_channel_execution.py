@@ -48,7 +48,7 @@ from .db_runtime import (
     cancel_and_drain_async_task,
     run_db_io_cancellation_safe,
 )
-from .execution_result_projection import INTERRUPTED_CHANNEL_RESULT
+from .execution_result_projection import interrupted_channel_result
 from .task_command_transport import (
     ClaimedTaskCommand,
     TaskCommandKind,
@@ -526,7 +526,7 @@ def _read_channel_result(command_id: int, run_id: str) -> dict[str, Any] | None:
         # Crash recovery or a control command can settle without reaching the
         # execution leaf. Its persisted state still terminates this exact wait.
         if task.status == TaskStatus.PAUSED:
-            return dict(INTERRUPTED_CHANNEL_RESULT)
+            return interrupted_channel_result()
         return {
             "success": task.status == TaskStatus.COMPLETED,
             "status": task.status.value,

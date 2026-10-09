@@ -40,6 +40,7 @@ from tests.web.services.test_persistence_failure_pause import (
     _assistant_lines,
     _break_decision,
     _checkpoint,
+    _connection_reset,
     _expire_and_recover,
     _finalize,
     _finalize_and_release,
@@ -113,7 +114,7 @@ from xagent.web.services import (
 )
 from xagent.web.services.client_error_messages import CLIENT_SAFE_TASK_FAILURE
 from xagent.web.services.execution_result_projection import (
-    INTERRUPTED_CHANNEL_RESULT,
+    interrupted_channel_result,
     project_execution_result_for_channel,
 )
 from xagent.web.services.managed_task_lease import (
@@ -158,7 +159,9 @@ PAUSED_FACT = {"status": "paused", "result": {"error": None}}
 
 @pytest.fixture(autouse=True)
 def _switch_defaults(monkeypatch):
-    monkeypatch.delenv(PAUSE_SWITCH, raising=False)
+    # The infra switch is off by default until automatic resume ships; these
+    # tests exercise it on (``infra_default`` cases pin the default).
+    monkeypatch.setenv(PAUSE_SWITCH, "true")
     monkeypatch.delenv(AUTO_SWITCH, raising=False)
 
 
@@ -661,6 +664,8 @@ def _switch_case(m: pytest.MonkeyPatch, case: str) -> str:
     """Apply ``case``; return the task source it settles."""
     if case == "infra_off":
         m.setenv(PAUSE_SWITCH, "false")
+    elif case == "infra_default":
+        m.delenv(PAUSE_SWITCH)
     elif case == "auto_resume_off":
         m.setenv(AUTO_SWITCH, "false")
     return "sdk" if case == "ineligible" else "trigger"
@@ -671,7 +676,7 @@ def _switch_case(m: pytest.MonkeyPatch, case: str) -> str:
     [
         (path, reason, case)
         for path, reason in _PATH_REASONS
-        for case in ("infra_off", "auto_resume_off", "ineligible")
+        for case in ("infra_default", "infra_off", "auto_resume_off", "ineligible")
         # Automatic resume gates model_output_invalid only.
         if case != "auto_resume_off" or reason == "model_output_invalid"
     ],
@@ -823,15 +828,16 @@ def test_recording_failure_does_not_change_the_pause(
 def test_undecidable_interruption_keeps_the_lease_for_ttl(
     canonical, monkeypatch, path, reason, failure
 ):
-    """Any error deciding the interruption defers it: nothing settles, the run
-    stays RUNNING under its lease, and TTL recovery pauses it later."""
+    """A connectivity failure deciding the interruption defers it: nothing
+    settles, the run stays RUNNING under its lease, and TTL recovery pauses
+    it once the database answers again."""
 
     factory, _tid = canonical
     ids = _projected_task(factory)
     lease = _prepare_run(factory, ids)
 
     with monkeypatch.context() as m:
-        _break_decision(m, failure)
+        _break_decision(m, failure, _connection_reset())
         with pytest.raises(InterruptionSettlementDeferred) as deferred:
             if path == "result":
                 _finalize(factory, ids["task"], lease, dict(RESULTS[reason]))
@@ -850,6 +856,33 @@ def test_undecidable_interruption_keeps_the_lease_for_ttl(
     assert _expire_and_recover(factory, ids) == TaskStatus.PAUSED
     _task, row, _events = _state(factory, ids["task"])
     assert (row.reason, row.state) == ("lease_expired", "manual")
+
+
+@CASES
+@pytest.mark.parametrize("failure", ["eligibility", "checkpoint_read"])
+def test_reproducible_decision_fault_settles_as_before(
+    canonical, monkeypatch, path, reason, failure
+):
+    """A fault that would recur on every attempt does not defer (TTL recovery
+    would hit it too and leave the run RUNNING forever): the run settles
+    exactly as without an interruption and releases its lease."""
+
+    factory, _tid = canonical
+    gated, baseline = _projected_task(factory), _projected_task(factory)
+    gated_lease = _prepare_run(factory, gated)
+    baseline_lease = _prepare_run(factory, baseline)
+
+    with monkeypatch.context() as m:
+        _break_decision(m, failure, TypeError("resolver bug"))
+        _settle_result(path, factory, gated, gated_lease, RESULTS[reason])
+    with monkeypatch.context() as m:
+        _without_result_interruption(m)
+        _settle_result(path, factory, baseline, baseline_lease, RESULTS[reason])
+
+    gated_projection = _projection(factory, gated, gated_lease)
+    assert gated_projection == _projection(factory, baseline, baseline_lease)
+    assert gated_projection["status"] == TaskStatus.FAILED
+    assert gated_projection["runner_id"] is None
 
 
 def test_combined_channel_settlement_is_unchanged(canonical):
@@ -1034,7 +1067,7 @@ async def test_shared_channel_turn_pauses_and_its_channel_reads_interrupted(
 
     tid = selected.selection.task_id
     channel_result = shared._read_channel_result(command.id, selected.run_id)
-    assert channel_result == INTERRUPTED_CHANNEL_RESULT
+    assert channel_result == interrupted_channel_result()
     assert (
         project_execution_result_for_channel(channel_result).visible_text
         == INTERRUPTED_USER_MESSAGE

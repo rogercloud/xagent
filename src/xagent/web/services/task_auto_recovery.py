@@ -447,7 +447,9 @@ SETTLEMENT_INTERRUPTION_REASONS = frozenset(
 def settlement_pause_enabled(reason: InterruptionReason) -> bool:
     """Whether the settlement switches let ``reason`` pause an eligible run.
 
-    Every settlement reason needs ``XAGENT_TASK_INFRA_FAILURE_PAUSE_ENABLED``.
+    Every settlement reason needs ``XAGENT_TASK_INFRA_FAILURE_PAUSE_ENABLED``
+    (off by default until automatic resume ships, so by default every reason
+    settles as before).
     ``model_output_invalid`` also needs ``XAGENT_TASK_AUTO_RESUME_ENABLED``:
     it is not an infrastructure failure, and a run paused for it is worth
     stopping only when something will resample it; without automatic resume
