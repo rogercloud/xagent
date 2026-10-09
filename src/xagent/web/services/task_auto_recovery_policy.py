@@ -8,14 +8,16 @@ first ``next_attempt_at``) and again at dispatch time, because the clock, the
 counters and the env limits may have moved while the row waited. Config is
 read at call time so an env change applies without a restart.
 
-All datetimes are timezone-aware UTC; a naive one is a programming error.
+Datetimes are normalized to aware UTC on entry: a naive value is taken as UTC
+(SQLite returns naive columns even for ``DateTime(timezone=True)``) and an
+aware one is converted.
 """
 
 from __future__ import annotations
 
 import random
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from enum import Enum
 
 from sqlalchemy.orm import Session
@@ -33,10 +35,17 @@ from ...config import (
 )
 from ...core.agent.interruption import InterruptionReason
 from ..models.task import Task
-from ..models.trigger import TriggerRun, TriggerType
+from ..models.task_auto_recovery import TaskAutoRecoveryState
+from ..models.trigger import (
+    TEST_TRIGGER_RUN_KEY_PREFIX,
+    TriggerRun,
+    TriggerRunStatus,
+    TriggerType,
+)
 
-# Backoff ceiling for the short-backoff reasons (lease expiry, persistence).
-_SHORT_MAX_BACKOFF_SECONDS = 60.0
+# Floor of the backoff ceiling for the short-backoff reasons (lease expiry,
+# persistence); a larger configured initial backoff raises the ceiling.
+_SHORT_MAX_BACKOFF_SECONDS = 60
 _SHORT_JITTER_CAP_SECONDS = 30.0
 _LLM_JITTER_CAP_SECONDS = 30.0
 _MODEL_OUTPUT_JITTER_CAP_SECONDS = 5.0
@@ -58,21 +67,30 @@ class AutoResumePolicy:
     jitter_cap_seconds: float
 
 
-def auto_resume_policy(reason: InterruptionReason) -> AutoResumePolicy | None:
-    """The policy for ``reason``; ``None`` means it is never auto-resumed."""
+def auto_resume_policy(reason: InterruptionReason | str) -> AutoResumePolicy | None:
+    """The policy for ``reason``; ``None`` means it is never auto-resumed.
 
+    Accepts the plain string a ``task_auto_recovery.reason`` column holds; an
+    unknown string has no policy.
+    """
+
+    try:
+        reason = InterruptionReason(reason)
+    except ValueError:
+        return None
     if reason in (
         InterruptionReason.LEASE_EXPIRED,
         InterruptionReason.PERSISTENCE_FAILURE,
     ):
+        initial = get_task_auto_resume_short_initial_backoff_seconds()
         return AutoResumePolicy(
-            initial_backoff_seconds=get_task_auto_resume_short_initial_backoff_seconds(),
-            max_backoff_seconds=_SHORT_MAX_BACKOFF_SECONDS,
+            initial_backoff_seconds=initial,
+            max_backoff_seconds=max(_SHORT_MAX_BACKOFF_SECONDS, initial),
             max_no_progress=get_task_auto_resume_short_max_no_progress(),
             max_elapsed_seconds=None,
             jitter_cap_seconds=_SHORT_JITTER_CAP_SECONDS,
         )
-    if reason is InterruptionReason.LLM_UNAVAILABLE:
+    if reason == InterruptionReason.LLM_UNAVAILABLE:
         return AutoResumePolicy(
             initial_backoff_seconds=get_task_auto_resume_llm_initial_backoff_seconds(),
             max_backoff_seconds=get_task_auto_resume_llm_max_backoff_seconds(),
@@ -80,7 +98,7 @@ def auto_resume_policy(reason: InterruptionReason) -> AutoResumePolicy | None:
             max_elapsed_seconds=get_task_auto_resume_llm_max_elapsed_seconds(),
             jitter_cap_seconds=_LLM_JITTER_CAP_SECONDS,
         )
-    if reason is InterruptionReason.MODEL_OUTPUT_INVALID:
+    if reason == InterruptionReason.MODEL_OUTPUT_INVALID:
         # Retried immediately (a fresh sample usually fixes it), so a short
         # run-level limit stands in for backoff.
         return AutoResumePolicy(
@@ -128,27 +146,114 @@ def staleness_window_seconds(kind: str | None) -> int:
 
 
 class AutoResumeOutcome(str, Enum):
-    SCHEDULE = "schedule"
+    """What the policy decided; values match :class:`TaskAutoRecoveryState`."""
+
+    SCHEDULED = "scheduled"
     EXHAUSTED = "exhausted"
     EXPIRED = "expired"
+    # Never auto-resumed; the row rests in ``manual``.
     NEVER = "never"
+
+
+def auto_resume_recovery_state(outcome: AutoResumeOutcome) -> TaskAutoRecoveryState:
+    """The ``task_auto_recovery.state`` a policy outcome is recorded as."""
+
+    if outcome is AutoResumeOutcome.NEVER:
+        return TaskAutoRecoveryState.MANUAL
+    return TaskAutoRecoveryState(outcome.value)
 
 
 @dataclass(frozen=True)
 class AutoResumeVerdict:
+    """Outcome of :func:`plan_auto_resume`, plus the time when it is SCHEDULED."""
+
     outcome: AutoResumeOutcome
-    # Set only for SCHEDULE.
+    # Set only for SCHEDULED.
     next_attempt_at: datetime | None = None
 
 
-def _require_aware(name: str, value: datetime) -> None:
-    if value.tzinfo is None or value.utcoffset() is None:
-        raise ValueError(f"{name} must be timezone-aware")
+def _utc(value: datetime) -> datetime:
+    """Aware UTC; a naive value is read as UTC."""
+
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
+
+def auto_resume_limit(
+    *,
+    reason: InterruptionReason | str,
+    kind: str | None,
+    interrupted_at: datetime,
+    episode_started_at: datetime,
+    no_progress_resumes: int,
+    total_resumes: int,
+    now: datetime,
+) -> AutoResumeOutcome | None:
+    """The limit that stops an auto-resume, or ``None`` if it may proceed.
+
+    Checks apply in order:
+
+    1. no policy for ``reason`` -> NEVER;
+    2. interrupted longer ago than the staleness window -> EXPIRED;
+    3. total resume cap reached -> EXHAUSTED;
+    4. no-progress limit reached -> EXHAUSTED;
+    5. episode elapsed limit reached -> EXHAUSTED.
+
+    This is the whole dispatch-time check; it computes no schedule. It trusts
+    the caller's counters: ``no_progress_resumes`` counts dispatched resumes in
+    the current no-progress episode, ``total_resumes`` counts this run's
+    dispatches and ``episode_started_at`` is that episode's start. ``kind``
+    must come from ``auto_recovery_eligibility`` evaluated at call time.
+    """
+
+    policy = auto_resume_policy(reason)
+    if policy is None:
+        return AutoResumeOutcome.NEVER
+    now = _utc(now)
+    if now - _utc(interrupted_at) > timedelta(seconds=staleness_window_seconds(kind)):
+        return AutoResumeOutcome.EXPIRED
+    if total_resumes >= get_task_auto_resume_max_total_per_run():
+        return AutoResumeOutcome.EXHAUSTED
+    if (
+        policy.max_no_progress is not None
+        and no_progress_resumes >= policy.max_no_progress
+    ):
+        return AutoResumeOutcome.EXHAUSTED
+    if policy.max_elapsed_seconds is not None and now - _utc(
+        episode_started_at
+    ) >= timedelta(seconds=policy.max_elapsed_seconds):
+        return AutoResumeOutcome.EXHAUSTED
+    return None
+
+
+def next_auto_resume_at(
+    policy_or_reason: AutoResumePolicy | InterruptionReason | str,
+    no_progress_resumes: int,
+    now: datetime,
+    rng: random.Random,
+) -> datetime:
+    """``now + backoff + jitter`` for the next attempt.
+
+    The result may land past the staleness window or the elapsed limit; it is
+    still scheduled and the dispatch-time :func:`auto_resume_limit` settles it.
+    """
+
+    policy = (
+        policy_or_reason
+        if isinstance(policy_or_reason, AutoResumePolicy)
+        else auto_resume_policy(policy_or_reason)
+    )
+    if policy is None:
+        raise ValueError(f"reason {policy_or_reason!r} is never auto-resumed")
+    backoff = backoff_seconds(policy, no_progress_resumes)
+    delay = backoff + jitter_seconds(policy, backoff, rng)
+    return _utc(now) + timedelta(seconds=delay)
 
 
 def plan_auto_resume(
     *,
-    reason: InterruptionReason,
+    reason: InterruptionReason | str,
     kind: str | None,
     interrupted_at: datetime,
     episode_started_at: datetime,
@@ -157,45 +262,42 @@ def plan_auto_resume(
     now: datetime,
     rng: random.Random,
 ) -> AutoResumeVerdict:
-    """Decide whether and when to auto-resume; checks apply in order.
+    """Record-time decision: :func:`auto_resume_limit`, else a schedule.
 
-    1. no policy for ``reason`` -> NEVER;
-    2. interrupted longer ago than the staleness window -> EXPIRED;
-    3. total resume cap reached -> EXHAUSTED;
-    4. no-progress limit reached -> EXHAUSTED;
-    5. episode elapsed limit reached -> EXHAUSTED;
-    6. otherwise SCHEDULE at ``now + backoff + jitter``.
-
-    A scheduled attempt that would land past the staleness window or the
-    elapsed limit is still scheduled: the dispatch-time call re-checks with
-    the then-current clock and settles it as EXPIRED / EXHAUSTED.
+    Record time calls this (it needs the next attempt time); dispatch time
+    calls only :func:`auto_resume_limit`, so it does not draw an unused
+    jitter.
     """
 
-    _require_aware("interrupted_at", interrupted_at)
-    _require_aware("episode_started_at", episode_started_at)
-    _require_aware("now", now)
-
-    policy = auto_resume_policy(reason)
-    if policy is None:
-        return AutoResumeVerdict(AutoResumeOutcome.NEVER)
-    if now - interrupted_at > timedelta(seconds=staleness_window_seconds(kind)):
-        return AutoResumeVerdict(AutoResumeOutcome.EXPIRED)
-    if total_resumes >= get_task_auto_resume_max_total_per_run():
-        return AutoResumeVerdict(AutoResumeOutcome.EXHAUSTED)
-    if (
-        policy.max_no_progress is not None
-        and no_progress_resumes >= policy.max_no_progress
-    ):
-        return AutoResumeVerdict(AutoResumeOutcome.EXHAUSTED)
-    if policy.max_elapsed_seconds is not None and now - episode_started_at >= timedelta(
-        seconds=policy.max_elapsed_seconds
-    ):
-        return AutoResumeVerdict(AutoResumeOutcome.EXHAUSTED)
-
-    backoff = backoff_seconds(policy, no_progress_resumes)
-    delay = backoff + jitter_seconds(policy, backoff, rng)
+    limit = auto_resume_limit(
+        reason=reason,
+        kind=kind,
+        interrupted_at=interrupted_at,
+        episode_started_at=episode_started_at,
+        no_progress_resumes=no_progress_resumes,
+        total_resumes=total_resumes,
+        now=now,
+    )
+    if limit is not None:
+        return AutoResumeVerdict(limit)
     return AutoResumeVerdict(
-        AutoResumeOutcome.SCHEDULE, next_attempt_at=now + timedelta(seconds=delay)
+        AutoResumeOutcome.SCHEDULED,
+        next_attempt_at=next_auto_resume_at(reason, no_progress_resumes, now, rng),
+    )
+
+
+# A later run supersedes only if it actually ran: a failed one produced
+# nothing newer to prefer over the paused tick.
+_SUPERSEDING_RUN_STATUSES = (
+    TriggerRunStatus.RUNNING.value,
+    TriggerRunStatus.COMPLETED.value,
+)
+
+
+def _is_test_run(run: TriggerRun, agent_config: dict[object, object]) -> bool:
+    key = str(run.idempotency_key or "")
+    return key.startswith(TEST_TRIGGER_RUN_KEY_PREFIX) or (
+        agent_config.get("trigger_test") is True
     )
 
 
@@ -205,6 +307,7 @@ def scheduled_trigger_superseded(db: Session, task: Task) -> bool:
     A scheduled run is the latest tick of a recurring job; resuming an old
     tick once the next one is running would duplicate its work. Webhook and
     gmail runs each carry a distinct event, so they are never superseded.
+    Manual test fires and failed runs neither supersede nor are superseded.
     ``TriggerRun.task_id`` is the link; a missing run row is not superseded.
     """
 
@@ -222,7 +325,7 @@ def scheduled_trigger_superseded(db: Session, task: Task) -> bool:
         .order_by(TriggerRun.id.desc())
         .first()
     )
-    if run is None:
+    if run is None or _is_test_run(run, agent_config):
         return False
     later = (
         db.query(TriggerRun.id)
@@ -230,6 +333,8 @@ def scheduled_trigger_superseded(db: Session, task: Task) -> bool:
             TriggerRun.trigger_id == run.trigger_id,
             TriggerRun.id > run.id,
             TriggerRun.started_at.isnot(None),
+            TriggerRun.status.in_(_SUPERSEDING_RUN_STATUSES),
+            ~TriggerRun.idempotency_key.startswith(TEST_TRIGGER_RUN_KEY_PREFIX),
         )
         .first()
     )
