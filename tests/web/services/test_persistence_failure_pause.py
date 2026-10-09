@@ -129,8 +129,9 @@ NO_OUTPUTS = _PreparedTaskFileOutputs((), (), ())
 
 
 @pytest.fixture(autouse=True)
-def _pause_switch_default(monkeypatch):
-    monkeypatch.delenv(PAUSE_SWITCH, raising=False)
+def _pause_switch_on(monkeypatch):
+    # Off by default until automatic resume ships; these tests exercise it on.
+    monkeypatch.setenv(PAUSE_SWITCH, "true")
 
 
 @pytest.fixture(autouse=True)
