@@ -2645,9 +2645,12 @@ def _schedule_bg(
                         # E.g. a tool ran but its result commit failed: the
                         # settlement must say the effect is unknown.
                         classify_unknown_tool_effect = True
-                        # An interruption (in practice a checkpoint/event
-                        # write or the database itself failed): a
-                        # recoverable run is paused, not failed.
+                        # A recoverable run that was interrupted (mostly
+                        # a checkpoint/event write or the database failing;
+                        # LLM failures arrive as results) is paused, not
+                        # failed. Known and narrow: a non-LLM transport
+                        # error escaping setup code (say an HTTP timeout)
+                        # can also match the LLM classifier here.
                         settlement_interruption = settlement_interruption_for_failure(
                             setup_or_run_err
                         )

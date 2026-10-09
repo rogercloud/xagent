@@ -58,6 +58,7 @@ ChannelSender = Callable[[ChannelDelivery, dict[str, Any]], Awaitable[None]]
 def _claim(
     command_id: int, *, progress: bool = False
 ) -> tuple[ChannelDelivery, dict[str, Any] | None] | None:
+    from .execution_result_projection import interrupted_channel_result
     from .shared_channel_execution import _read_channel_result
 
     now = datetime.now(timezone.utc)
@@ -135,7 +136,7 @@ def _claim(
     try:
         result = _read_channel_result(command_id, run_id)
     except TaskLeaseLostError:
-        result = {"success": True, "status": "interrupted"}
+        result = interrupted_channel_result()
     return delivery, result
 
 

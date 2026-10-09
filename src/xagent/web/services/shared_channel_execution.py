@@ -279,7 +279,7 @@ class SharedChannelTurn:
         self.register_trace_handler(trace_handler)
         bridge = get_task_event_bridge()
         if self.stop_requested:
-            return {"success": True, "status": "interrupted"}
+            return interrupted_channel_result()
         acceptance = asyncio.create_task(
             asyncio.to_thread(_accept_channel_turn, self, payload, bridge.host_id)
         )
@@ -318,7 +318,7 @@ class SharedChannelTurn:
                 retry_delay = min(retry_delay * 2, 5.0)
                 continue
             except TaskLeaseLostError:
-                return {"success": True, "status": "interrupted"}
+                return interrupted_channel_result()
             unavailable_since = None
             retry_delay = 0.25
             if result is not None:

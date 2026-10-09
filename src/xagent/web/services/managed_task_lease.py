@@ -107,6 +107,10 @@ def finalize_managed_task_lease_result(
             and interruption.outcome is InterruptionOutcome.FAIL_UNKNOWN_TOOL_EFFECT
         ):
             error_message = TASK_UNKNOWN_TOOL_EFFECT_SETTLEMENT_ERROR
+        # For a pause this generic release is equivalent to
+        # ``pause_and_release_task_lease_no_commit``: it does not itself
+        # require RUNNING, but decide_owned_run_interruption has just locked
+        # the exact run and seen it RUNNING in this transaction.
         if not release_task_lease_no_commit(db, lease, status=status):
             db.rollback()
             return False
@@ -209,6 +213,15 @@ def finalize_managed_task_lease_result(
         db.rollback()
         raise
 
+    if paused and interruption is not None:
+        logger.warning(
+            "task_id=%s run_id=%s component=settlement paused interrupted "
+            "channel run (reason=%s): %s",
+            lease.task_id,
+            lease.run_id,
+            interruption.reason.value,
+            run_error,
+        )
     invalidate_task_cache_best_effort(lease.task_id)
     return True
 
