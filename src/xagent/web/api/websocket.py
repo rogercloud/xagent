@@ -71,6 +71,7 @@ from ..models.user import User
 from ..services import task_command_execution as command_execution_service
 from ..services import task_start as task_start_service
 from ..services.assistant_history_safety import (
+    TASK_FAILURE_MESSAGE_TYPE,
     assistant_history_has_safe_ancillary_payload,
     client_safe_assistant_history_content,
 )
@@ -2574,6 +2575,12 @@ def _load_historical_stream_snapshot_sync(
                     }
                     if isinstance(interactions, list):
                         data["metadata"] = {"interactions": interactions}
+                    # Only the failure provenance is exposed: the client marks
+                    # the replayed bubble failed (and shows the task id). Other
+                    # types stay hidden, e.g. ``question`` would re-arm the
+                    # expects-response path that ``expect_response`` disables.
+                    if chat_message.message_type == TASK_FAILURE_MESSAGE_TYPE:
+                        data["message_type"] = TASK_FAILURE_MESSAGE_TYPE
                     event_type = "agent_message"
                 else:
                     continue

@@ -80,6 +80,7 @@ const en = {
     errors: {
       unknown: "Unknown error",
       taskFailed: "Something went wrong. Please try again.",
+      taskIdReference: "Task ID: {id}",
     },
   },
   voiceInput: {

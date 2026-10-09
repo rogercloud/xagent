@@ -806,6 +806,12 @@ export function TaskConversationPanel({
                         } : undefined}
                         onOpenExecutionPlan={showDagPreview ? openDagPreview : undefined}
                         onAgentExecutionClick={onAgentExecutionClick}
+                        failureTaskId={
+                          item.role === "assistant" &&
+                          (item.status === "failed" || item.processStatus === "failed")
+                            ? state.taskId
+                            : undefined
+                        }
                       />
                     )
                   })}
@@ -824,6 +830,12 @@ export function TaskConversationPanel({
                       interactionsActive={state.currentTask?.status === "waiting_for_user"}
                       onOpenExecutionPlan={showDagPreview ? openDagPreview : undefined}
                       onAgentExecutionClick={onAgentExecutionClick}
+                      failureTaskId={
+                        state.currentTask?.id === String(state.taskId) &&
+                        state.currentTask.status === "failed"
+                          ? state.taskId
+                          : undefined
+                      }
                     />
                   )}
                 </>

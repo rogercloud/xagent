@@ -80,6 +80,7 @@ const zh = {
     errors: {
       unknown: "未知错误",
       taskFailed: "出了点问题，请重试。",
+      taskIdReference: "任务 ID：{id}",
     },
   },
   voiceInput: {
