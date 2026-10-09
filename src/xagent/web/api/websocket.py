@@ -2023,6 +2023,20 @@ class _HistoricalStreamSnapshot:
     events: tuple[dict[str, Any], ...]
 
 
+def _add_interruption_reason(
+    status_event: dict[str, Any], task_info: dict[str, Any]
+) -> None:
+    """Say why a reasserted pause stopped the run, as its live broadcast did.
+
+    Replayed activity before the reassert reads as running to a client, which
+    drops the pause's reason; the reassert restores it. The reason comes from
+    the ``task_info`` view built for this same replay.
+    """
+    auto_recovery = task_info["data"].get("auto_recovery")
+    if status_event["type"] == "task_paused" and auto_recovery:
+        status_event["interruption_reason"] = auto_recovery["reason"]
+
+
 def _history_task_info(db: Any, task: Any, task_id: int) -> dict[str, Any]:
     from ..models.agent import Agent
 
@@ -2205,6 +2219,7 @@ def _load_event_historical_stream_snapshot(
         interactions = info["data"]["waiting_interactions"]
         if isinstance(interactions, list):
             status_event["interactions"] = interactions
+        _add_interruption_reason(status_event, info)
         events.append(status_event)
     detached = [
         _with_task_control_state_snapshot(e, task_id=task_id, state=current_state)
@@ -2715,6 +2730,7 @@ def _load_historical_stream_snapshot_sync(
                     status_event["question"] = question_message
                 if isinstance(question_interactions, list):
                     status_event["interactions"] = question_interactions
+                _add_interruption_reason(status_event, task_event)
                 cached_stream_events.append(status_event)
 
             detached_events = [

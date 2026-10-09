@@ -690,28 +690,20 @@ const normalizeTaskRuntimeExtensions = (value: unknown): TaskRuntimeExtensions =
 }
 
 // Why a PAUSED task's run stopped: the server's ``auto_recovery`` view
-// (task detail, status and history task_info) or a ``task_paused`` event's
-// ``interruption_reason``. ``reason`` is an InterruptionReason value
-// (``user_pause`` when the user paused it). Kept only while the task is paused.
+// (history task_info) or a ``task_paused`` event's ``interruption_reason``.
+// ``reason`` is an InterruptionReason value (``user_pause`` when the user
+// paused it). Kept only while the task is paused.
 export interface TaskAutoRecovery {
   reason: string
-  state?: string
-  interruptedAt?: string
 }
 
-const normalizeAutoRecovery = (value: unknown): TaskAutoRecovery | undefined => {
-  if (!isJsonRecord(value) || typeof value.reason !== "string" || !value.reason) {
-    return undefined
-  }
-  return {
-    reason: value.reason,
-    ...(typeof value.state === "string" ? { state: value.state } : {}),
-    ...(typeof value.interrupted_at === "string" ? { interruptedAt: value.interrupted_at } : {}),
-  }
-}
+const normalizeAutoRecovery = (value: unknown): TaskAutoRecovery | undefined =>
+  isJsonRecord(value) && typeof value.reason === "string" && value.reason
+    ? { reason: value.reason }
+    : undefined
 
 // A task's interruption only describes it while it rests paused.
-const withAutoRecovery = (task: Task | null): Task | null =>
+const clearStaleAutoRecovery = (task: Task | null): Task | null =>
   task && task.status !== "paused" && task.autoRecovery !== undefined
     ? { ...task, autoRecovery: undefined }
     : task
@@ -1435,7 +1427,7 @@ function projectAppState(state: AppState, action: AppAction): AppState {
       return {
         ...state,
         taskId: action.payload.taskId,
-        currentTask: withAutoRecovery(withDagTerminatedAt(action.payload.task)),
+        currentTask: clearStaleAutoRecovery(withDagTerminatedAt(action.payload.task)),
         taskRuntimeExtensions: {},
       }
 
@@ -1684,7 +1676,7 @@ function projectAppState(state: AppState, action: AppAction): AppState {
       // never passes through UPDATE_TASK_STATUS either - withDagTerminatedAt
       // backfills the former and clears the latter so a prior run's
       // dagTerminatedAt can't linger into this one.
-      const currentTask = withAutoRecovery(withDagTerminatedAt(mergedTask && {
+      const currentTask = clearStaleAutoRecovery(withDagTerminatedAt(mergedTask && {
         ...mergedTask,
         completionOutcome: mergedTask.status === "completed" ? mergedTask.completionOutcome : undefined,
       }))
@@ -1792,8 +1784,9 @@ function projectAppState(state: AppState, action: AppAction): AppState {
           runId: action.payload.runId ?? state.currentTask.runId,
           stateVersion: action.payload.stateVersion ?? state.currentTask.stateVersion,
           controlState: action.payload.controlState ?? state.currentTask.controlState,
-          // A pause event without a reason (a replayed or user pause) keeps
-          // the one already known; leaving paused clears it.
+          // A pause event without a reason (history's reasserted pause, a
+          // live-lease restore, an unknown-input pause) keeps the one already
+          // known; leaving paused clears it.
           autoRecovery: nextStatus === "paused"
             ? action.payload.autoRecovery ?? state.currentTask.autoRecovery
             : undefined,

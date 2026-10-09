@@ -79,10 +79,10 @@ def finalize_managed_task_lease_result(
     for TTL recovery; any other decision fault settles as before. Every
     decided interruption is recorded in ``task_auto_recovery``.
 
-    After a committed pause, ``paused_for`` (when supplied) receives its
-    recorded reason and ``terminal_event_state`` the committed control
-    identity, as ``settle_task_lease_isolated`` fills them, so the caller can
-    announce the pause.
+    Both out-parameters are filled only after this call commits a pause, and
+    left untouched for every other outcome: ``paused_for`` (when supplied)
+    receives the pause's recorded reason and ``terminal_event_state`` (when
+    supplied) its committed control identity, so the caller can announce it.
     """
 
     if status == TaskStatus.RUNNING:

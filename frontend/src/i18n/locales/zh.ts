@@ -6,7 +6,7 @@ const zh = {
   },
   sharedStream: { interrupted: "实时更新已中断，当前显示的回答可能不完整；已保存的完整结果可用后会自动同步。" },
   taskInterruption: {
-    paused: "因系统中断已暂停，可点击“继续”恢复执行。",
+    paused: "任务因系统中断已暂停，可点击“继续”恢复执行。",
     leaseExpired: "运行任务的服务器已停止，任务因系统中断已暂停，可点击“继续”恢复执行。",
     persistenceFailure: "数据库暂时不可用，任务因系统中断已暂停，可点击“继续”恢复执行。",
     llmUnavailable: "模型服务暂时不可用，任务因系统中断已暂停，可点击“继续”恢复执行。",

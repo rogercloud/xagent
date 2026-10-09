@@ -733,7 +733,10 @@ export function TaskConversationPanel({
     timelineItems.length === 0 &&
     state.isHistoryLoading
   // A user's own pause needs no explanation; a system interruption does.
-  const interruptionReason = state.currentTask?.status === "paused"
+  // Only for the viewed task: right after a switch currentTask can still be
+  // the previous one.
+  const interruptionReason = state.currentTask?.id === String(state.taskId)
+    && state.currentTask.status === "paused"
     && state.currentTask.autoRecovery?.reason
     && state.currentTask.autoRecovery.reason !== "user_pause"
     ? state.currentTask.autoRecovery.reason

@@ -2941,7 +2941,6 @@ describe("AppProvider websocket message routing", () => {
         control_state: "paused",
         auto_recovery: {
           reason: "lease_expired",
-          state: "manual",
           interrupted_at: "2026-05-27T04:59:00+00:00",
         },
       }))
@@ -2949,11 +2948,7 @@ describe("AppProvider websocket message routing", () => {
     await waitFor(() => {
       expect(screen.getByTestId("task-status").textContent).toBe("paused")
     })
-    expect(autoRecovery()).toEqual({
-      reason: "lease_expired",
-      state: "manual",
-      interruptedAt: "2026-05-27T04:59:00+00:00",
-    })
+    expect(autoRecovery()).toEqual({ reason: "lease_expired" })
 
     // A live task_info frame does not carry the view: keep the known one.
     act(() => {
@@ -2964,7 +2959,7 @@ describe("AppProvider websocket message routing", () => {
         control_state: "paused",
       }))
     })
-    expect(autoRecovery()).toEqual(expect.objectContaining({ reason: "lease_expired" }))
+    expect(autoRecovery()).toEqual({ reason: "lease_expired" })
 
     // A new run's task_info (``task_started`` itself carries no status
     // update) moves the task off paused.
@@ -2980,6 +2975,63 @@ describe("AppProvider websocket message routing", () => {
       expect(screen.getByTestId("task-status").textContent).toBe("running")
     })
     expect(autoRecovery()).toBeNull()
+  })
+
+  it("restores a reloaded pause's reason from history's reasserted task_paused", async () => {
+    render(
+      <AppProvider token="token">
+        <SeedRunningTask />
+        <StateProbe />
+      </AppProvider>
+    )
+
+    const onMessage = webSocketOptions.current?.onMessage
+    const autoRecovery = () => JSON.parse(screen.getByTestId("task-auto-recovery").textContent || "null")
+    const pausedState = { run_id: "run-1", state_version: 4, control_state: "paused" }
+
+    act(() => {
+      onMessage?.(taskInfoMessage(1, {
+        status: "paused",
+        ...pausedState,
+        auto_recovery: { reason: "llm_unavailable", interrupted_at: "2026-05-27T04:59:00+00:00" },
+      }))
+    })
+    await waitFor(() => {
+      expect(autoRecovery()).toEqual({ reason: "llm_unavailable" })
+    })
+
+    // Replayed activity infers running, which drops the reason...
+    act(() => {
+      onMessage?.({
+        type: "trace_event",
+        timestamp: "2026-05-27T05:00:01Z",
+        data: {
+          event_id: "replayed-dag-start",
+          event_type: "dag_execute_start",
+          data: { iteration: 1 },
+        },
+      })
+    })
+    await waitFor(() => {
+      expect(screen.getByTestId("task-status").textContent).toBe("running")
+    })
+    expect(autoRecovery()).toBeNull()
+
+    // ...and the pause history reasserts last restores it.
+    act(() => {
+      onMessage?.({
+        type: "task_paused",
+        timestamp: "2026-05-27T05:00:02Z",
+        task_id: 1,
+        status: "paused",
+        ...pausedState,
+        interruption_reason: "llm_unavailable",
+      })
+    })
+    await waitFor(() => {
+      expect(screen.getByTestId("task-status").textContent).toBe("paused")
+    })
+    expect(autoRecovery()).toEqual({ reason: "llm_unavailable" })
   })
 
   it("lets a task_info that reports no interruption clear a stale one", async () => {
@@ -3000,7 +3052,7 @@ describe("AppProvider websocket message routing", () => {
     })
 
     act(() => {
-      onMessage?.(pausedInfo({ reason: "persistence_failure", state: "manual" }))
+      onMessage?.(pausedInfo({ reason: "persistence_failure" }))
     })
     await waitFor(() => {
       expect(screen.getByTestId("task-auto-recovery").textContent).toContain("persistence_failure")
