@@ -212,8 +212,11 @@ def record_interruption_no_commit(
         state, state_detail = TaskAutoRecoveryState.INELIGIBLE, eligibility.detail
     elif (
         gated_by_settlement_switches
+        # The invariant, local to this line: ``disabled`` means turning the
+        # infra switch on would pause it -- false for a deferred reason, which
+        # no switch pauses yet.
         and reason not in SETTLEMENT_PAUSE_DEFERRED_REASONS
-        and not settlement_pause_enabled(reason)
+        and not get_task_infra_failure_pause_enabled()
     ):
         state, state_detail = TaskAutoRecoveryState.DISABLED, None
     else:

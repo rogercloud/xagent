@@ -105,6 +105,7 @@ on:
       - 'src/xagent/web/models/task_interaction.py'
       - 'src/xagent/web/services/task_interaction_schema.py'
       - 'src/xagent/core/agent/checkpoint.py'
+      - 'src/xagent/core/agent/interruption.py'
       - 'src/xagent/web/services/task_lease_service.py'
       - 'tests/web/services/test_task_lease_heartbeat_batch.py'
       - 'tests/web/services/test_task_settlement_locking.py'
@@ -314,6 +315,7 @@ jobs:
             src/xagent/web/models/task_interaction.py
             src/xagent/web/services/task_interaction_schema.py
             src/xagent/core/agent/checkpoint.py
+            src/xagent/core/agent/interruption.py
             src/xagent/web/services/task_lease_service.py
             tests/web/services/test_task_lease_heartbeat_batch.py
             tests/web/services/test_task_settlement_locking.py

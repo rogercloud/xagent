@@ -24,6 +24,7 @@ from .channel_runtime import (
     _load_channel_owner_sync,
 )
 from .db_runtime import run_db_io_cancellation_safe
+from .execution_result_projection import interrupted_channel_result
 from .task_lease_service import TaskLeaseLostError
 
 logger = logging.getLogger(__name__)
@@ -58,7 +59,6 @@ ChannelSender = Callable[[ChannelDelivery, dict[str, Any]], Awaitable[None]]
 def _claim(
     command_id: int, *, progress: bool = False
 ) -> tuple[ChannelDelivery, dict[str, Any] | None] | None:
-    from .execution_result_projection import interrupted_channel_result
     from .shared_channel_execution import _read_channel_result
 
     now = datetime.now(timezone.utc)
