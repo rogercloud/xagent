@@ -1386,19 +1386,18 @@ def test_resume_settlement_pauses_on_a_real_database(canonical):
 # ----------------------------------------- undecidable interruptions defer to TTL
 
 
-def _break_decision(m: pytest.MonkeyPatch, failure: str) -> None:
+def _break_decision(m: pytest.MonkeyPatch, failure: str, error: Exception) -> None:
+    def boom(*_args: Any, **_kwargs: Any) -> Any:
+        raise error
+
     if failure == "eligibility":
-
-        def boom(*_args: Any, **_kwargs: Any) -> Any:
-            raise RuntimeError("eligibility read failed")
-
         m.setattr(task_auto_recovery, "auto_recovery_eligibility", boom)
-        return
+    else:
+        m.setattr(event_recovery, "read_event_checkpoint", boom)
 
-    def unreadable(*_args: Any, **_kwargs: Any) -> Any:
-        raise OperationalError("SELECT", {}, Exception("connection reset"))
 
-    m.setattr(event_recovery, "read_event_checkpoint", unreadable)
+def _connection_reset() -> OperationalError:
+    return OperationalError("SELECT", {}, Exception("connection reset"))
 
 
 @pytest.mark.asyncio
@@ -1407,15 +1406,16 @@ def _break_decision(m: pytest.MonkeyPatch, failure: str) -> None:
 async def test_undecidable_interruption_keeps_the_lease_for_ttl(
     canonical, monkeypatch, path, failure
 ):
-    """Any error deciding the interruption defers it on every settling path:
-    the run stays RUNNING under its lease, and TTL recovery pauses it."""
+    """A connectivity failure deciding the interruption defers it on every
+    settling path: the run stays RUNNING under its lease, and TTL recovery
+    pauses it once the database answers again."""
 
     factory, _tid = canonical
     ids = _projected_task(factory)
     lease = _prepare_run(factory, ids)
 
     with monkeypatch.context() as m:
-        _break_decision(m, failure)
+        _break_decision(m, failure, _connection_reset())
         if path == "exception":
             frames = await _schedule_failing_turn(
                 factory, ids, lease, _persistence_error()
@@ -1438,6 +1438,41 @@ async def test_undecidable_interruption_keeps_the_lease_for_ttl(
     assert _expire_and_recover(factory, ids) == TaskStatus.PAUSED
     _task, row, _events = _state(factory, ids["task"])
     assert (row.reason, row.state) == ("lease_expired", "manual")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path", ["exception", "result", "resumed_result"])
+@pytest.mark.parametrize("failure", ["eligibility", "checkpoint_read"])
+async def test_reproducible_decision_fault_settles_as_before(
+    canonical, monkeypatch, path, failure
+):
+    """A fault that would recur on every attempt must not defer: TTL recovery
+    reads the checkpoint the same way, so the run would stay RUNNING forever.
+    It settles FAILED, as before this change, and releases the lease."""
+
+    factory, _tid = canonical
+    ids = _projected_task(factory)
+    lease = _prepare_run(factory, ids)
+
+    with monkeypatch.context() as m:
+        _break_decision(m, failure, TypeError("resolver bug"))
+        if path == "exception":
+            await _schedule_failing_turn(factory, ids, lease, _persistence_error())
+        elif path == "result":
+            _finalize_and_release(factory, ids, lease, dict(PERSISTENCE_RESULT))
+        else:
+            _finalize_resumed(ids, lease, PERSISTENCE_RESULT)
+
+    task, _row, _events = _state(factory, ids["task"])
+    if path == "exception" and failure == "checkpoint_read":
+        # The legacy settlement itself classifies the run's tool effect from
+        # the same checkpoint (run_has_unknown_tool_effect) and has always
+        # kept the lease when that read raises; unchanged here.
+        assert task.status == TaskStatus.RUNNING
+        assert (task.runner_id, task.run_id) == (lease.runner_id, lease.run_id)
+        return
+    assert task.status == TaskStatus.FAILED
+    assert task.runner_id is None and task.lease_expires_at is None
 
 
 # ----------------------------------------------------- broadcasts and metrics

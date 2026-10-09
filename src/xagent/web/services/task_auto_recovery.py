@@ -40,6 +40,7 @@ from ...core.agent.interruption import (
     InterruptionReason,
     classify_run_failure,
     classify_run_result,
+    is_database_unavailable,
 )
 from ..models.task import Task, TaskStatus
 from ..models.task_auto_recovery import (
@@ -64,6 +65,17 @@ from .task_lease_service import (
 from .workforce_runtime import extract_workforce_run_id
 
 logger = logging.getLogger(__name__)
+
+
+def interruption_pause_result() -> dict[str, Any]:
+    """The ``execution_settled`` result of a run paused by an interruption.
+
+    The same shape lease recovery stages, so the next turn's context does not
+    read the pause as a failed execution. A fresh dict per call: the fact
+    writer stores it by reference in the row payload.
+    """
+    return {"error": None}
+
 
 # Callers that own their own protocol for a stopped run: SDK and A2A clients,
 # external cancellation, and anonymous visitors of a widget or shared link.
@@ -527,9 +539,14 @@ def decide_interruption(
        ``UNKNOWN_TOOL_EFFECT`` and ``NOT_RECOVERABLE`` fail, ``RECOVERABLE``
        pauses -- as a user pause when the run was PAUSE_REQUESTED (the user
        already decided), else for ``reason``.
-    3. ``INDETERMINATE``, or any error reading eligibility or the
-       checkpoint, raises :class:`InterruptionSettlementDeferred` so every
-       settling path keeps the lease for TTL recovery alike.
+    3. ``INDETERMINATE``, or a database connectivity failure while reading
+       eligibility or the checkpoint, raises
+       :class:`InterruptionSettlementDeferred` so every settling path keeps
+       the lease for TTL recovery alike.
+    4. Any other error reading them is ``LEGACY``: it would reproduce on
+       every attempt, and TTL recovery reads the checkpoint the same way, so
+       deferring would leave the run RUNNING forever. Settling as before
+       (FAILED) keeps it terminal and visible.
     """
 
     if not get_task_infra_failure_pause_enabled():
@@ -540,6 +557,14 @@ def decide_interruption(
         candidate = _settlement_candidate(task)
         resolution = resolve_checkpoint_recovery_with_data(db, candidate)
     except Exception as exc:
+        if not is_database_unavailable(exc):
+            logger.exception(
+                "task_id=%s component=auto-recovery deciding interrupted run "
+                "%s failed; settling it as before",
+                task.id,
+                task.run_id,
+            )
+            return legacy_interruption_decision(reason)
         raise InterruptionSettlementDeferred(
             f"task {task.id}: interrupted run {task.run_id} is not decidable "
             f"now ({type(exc).__name__})"

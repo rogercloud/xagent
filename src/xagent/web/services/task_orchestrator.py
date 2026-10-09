@@ -107,6 +107,7 @@ from .task_auto_recovery import (
     InterruptionSettlementDeferred,
     apply_interruption_outcome_no_commit,
     decide_interruption,
+    interruption_pause_result,
     legacy_interruption_decision,
     settlement_interruption_for_failure,
 )
@@ -1857,7 +1858,7 @@ def _pause_interrupted_run_no_commit(
     db.expire_all()
     task = db.query(Task).filter(Task.id == lease.task_id).one()
     apply_interruption_outcome_no_commit(db, task=task, decision=decision, error=error)
-    stage_result_fact_no_commit(db, task, {"error": None})
+    stage_result_fact_no_commit(db, task, interruption_pause_result())
     logger.warning(
         "task_id=%s run_id=%s component=settlement paused interrupted run "
         "(reason=%s): %s",

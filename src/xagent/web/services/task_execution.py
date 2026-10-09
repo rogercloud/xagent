@@ -92,6 +92,7 @@ from .task_auto_recovery import (
     InterruptionSettlementDeferred,
     apply_interruption_outcome_no_commit,
     decide_interruption,
+    interruption_pause_result,
     settlement_interruption_for_failure,
     settlement_interruption_for_result,
 )
@@ -1877,12 +1878,6 @@ def _apply_result_interruption(
     )
 
 
-# The settled fact of a run an interruption paused. Like lease recovery's,
-# it carries no error: the run's unsuccessful result would read as a failed
-# execution when the transcript is projected for the next model call.
-_INTERRUPTION_PAUSE_RESULT: dict[str, Any] = {"error": None}
-
-
 def _finalize_task_execution_result_isolated(
     *,
     task_id: int,
@@ -2226,7 +2221,7 @@ def _finalize_task_execution_result_isolated(
                 fact_witness = stage_result_fact_no_commit(
                     finalize_db,
                     task_updated,
-                    _INTERRUPTION_PAUSE_RESULT
+                    interruption_pause_result()
                     if interruption_pause_reason is not None
                     else result,
                 )
@@ -3061,7 +3056,7 @@ def _finalize_resumed_task(
         stage_result_fact_no_commit(
             db,
             task,
-            _INTERRUPTION_PAUSE_RESULT
+            interruption_pause_result()
             if finalized["interruption_pause_reason"] is not None
             else result,
         )
