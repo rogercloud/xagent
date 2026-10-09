@@ -2,9 +2,9 @@
 unusable output, rests PAUSED instead of FAILED.
 
 ``llm_unavailable`` follows ``XAGENT_TASK_INFRA_FAILURE_PAUSE_ENABLED`` like
-``persistence_failure``; ``model_output_invalid`` also needs
-``XAGENT_TASK_AUTO_RESUME_ENABLED``. Both reach settlement as an unsuccessful
-result, so the result paths carry them: a new run's
+``persistence_failure``; ``model_output_invalid`` is recorded but never paused
+for until the automatic-resume executor ships. Both reach settlement as an
+unsuccessful result, so the result paths carry them: a new run's
 (``_finalize_task_execution_result_isolated``), a resumed run's
 (``_finalize_resumed_task``) and the shared channel leaf's
 (``finalize_managed_task_lease_result``). Runs on SQLite and, when
@@ -19,6 +19,8 @@ from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, Mock
 
+import httpx
+import openai
 import pytest
 
 from tests.core.agent.test_auto import decision_tool_response, plan_tool_response
@@ -53,6 +55,7 @@ from tests.web.services.test_persistence_failure_pause import (
     _prepare_run,
     _projected_task,
     _projection,
+    _resume_raising,
     _schedule_failing_turn,
     _settled_facts,
     _start_run,
@@ -127,7 +130,10 @@ from xagent.web.services.task_auto_recovery import (
     settlement_interruption_for_result,
     settlement_pause_enabled,
 )
-from xagent.web.services.task_execution import _acquire_resume_task_lease
+from xagent.web.services.task_execution import (
+    _acquire_resume_task_lease,
+    _settle_resumed_task_lease,
+)
 from xagent.web.services.task_execution_context_service import (
     TaskExecutionRecoverySnapshot,
 )
@@ -153,7 +159,6 @@ database_url = database_url_fixture
 selected = selected_fixture
 
 PAUSE_SWITCH = "XAGENT_TASK_INFRA_FAILURE_PAUSE_ENABLED"
-AUTO_SWITCH = "XAGENT_TASK_AUTO_RESUME_ENABLED"
 PAUSED_FACT = {"status": "paused", "result": {"error": None}}
 
 
@@ -162,7 +167,6 @@ def _switch_defaults(monkeypatch):
     # The infra switch is off by default until automatic resume ships; these
     # tests exercise it on (``infra_default`` cases pin the default).
     monkeypatch.setenv(PAUSE_SWITCH, "true")
-    monkeypatch.delenv(AUTO_SWITCH, raising=False)
 
 
 # ------------------------------------------------- real runs, then resumed
@@ -293,14 +297,23 @@ def _settle_new_run(factory, tid: int, lease: TaskLease, result: dict[str, Any])
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("wrapped", ["react", "auto"])
+@pytest.mark.parametrize("gate", ["today", "executor"])
 async def test_invalid_tool_protocol_resume_samples_the_model_again(
-    canonical, tmp_path, wrapped
+    canonical, monkeypatch, tmp_path, wrapped, gate
 ):
-    """The run gives up on the tool protocol after a tool call; resuming the
-    paused run continues from its checkpoint with a NEW model call -- it does
-    not replay the cached failure (Auto caches the child's result in its
+    """The run gives up on the tool protocol after a tool call.
+
+    ``today``: settlement never pauses for it yet; the run fails as before
+    and the row records why. ``executor``: with the deferral lifted, as the
+    automatic-resume executor will lift it, the run pauses, and resuming it
+    continues from its checkpoint with a NEW model call -- it does not replay
+    the cached failure (Auto caches the child's result in its
     ``auto_after_child`` checkpoint) and does not re-run the tool."""
 
+    if gate == "executor":
+        monkeypatch.setattr(
+            task_auto_recovery, "SETTLEMENT_PAUSE_DEFERRED_REASONS", frozenset()
+        )
     factory, tid = canonical
     lease = _start_run(factory, tid)
     tool = FakeTool()
@@ -338,6 +351,16 @@ async def test_invalid_tool_protocol_resume_samples_the_model_again(
 
     finalized = _settle_new_run(factory, tid, lease, result)
 
+    if gate == "today":
+        assert finalized.interruption_pause_reason is None
+        task, row, events = _state(factory, tid)
+        assert task.status == TaskStatus.FAILED
+        assert task.error_message == result["error"]
+        assert (row.reason, row.state) == ("model_output_invalid", "manual")
+        assert [(e.event, e.detail["task_status"]) for e in events] == [
+            ("interrupted", "failed")
+        ]
+        return
     assert finalized.interruption_pause_reason is (
         InterruptionReason.MODEL_OUTPUT_INVALID
     )
@@ -552,17 +575,21 @@ def test_settlement_acts_on_provider_and_model_output_failures():
 
 
 @pytest.mark.parametrize(
-    ("infra", "auto", "enabled"),
+    ("infra", "enabled"),
     [
-        ("true", "true", {"persistence_failure", "llm_unavailable", "model"}),
-        ("true", "false", {"persistence_failure", "llm_unavailable"}),
-        ("false", "true", set()),
-        ("false", "false", set()),
+        ("true", {"persistence_failure", "llm_unavailable", "user_pause"}),
+        ("false", set()),
+        (None, set()),
     ],
+    ids=["on", "off", "default"],
 )
-def test_settlement_switches_per_reason(monkeypatch, infra, auto, enabled):
-    monkeypatch.setenv(PAUSE_SWITCH, infra)
-    monkeypatch.setenv(AUTO_SWITCH, auto)
+def test_settlement_switches_per_reason(monkeypatch, infra, enabled):
+    """model_output_invalid never pauses until the executor ships, and the
+    switch defaults off."""
+    if infra is None:
+        monkeypatch.delenv(PAUSE_SWITCH)
+    else:
+        monkeypatch.setenv(PAUSE_SWITCH, infra)
     names = {
         "persistence_failure": InterruptionReason.PERSISTENCE_FAILURE,
         "llm_unavailable": InterruptionReason.LLM_UNAVAILABLE,
@@ -571,26 +598,59 @@ def test_settlement_switches_per_reason(monkeypatch, infra, auto, enabled):
     }
     assert {
         name for name, reason in names.items() if settlement_pause_enabled(reason)
-    } == enabled | ({"user_pause"} if infra == "true" else set())
+    } == enabled
 
 
 # ------------------------------- result paths: S1, S3 and the shared channel S4
 
 # PR4a covers ``persistence_failure`` on S1 and S3; S4 gains all three here.
+_PATHS = ("result", "resumed_result", "channel")
 _PATH_REASONS = [
     (path, reason)
-    for path in ("result", "resumed_result", "channel")
+    for path in _PATHS
     for reason in RESULTS
     if path == "channel" or reason != "persistence_failure"
 ]
+# The reasons settlement pauses for today.
+_PAUSE_PATH_REASONS = [
+    case for case in _PATH_REASONS if case[1] != "model_output_invalid"
+]
 CASES = pytest.mark.parametrize(("path", "reason"), _PATH_REASONS)
+PAUSE_CASES = pytest.mark.parametrize(("path", "reason"), _PAUSE_PATH_REASONS)
+
+
+def _completed_channel_command(factory, ids, lease) -> tuple[int, dict[str, Any]]:
+    """A completed channel START command of ``lease``'s run, as the worker
+    leaves it before the leaf finalizes; returns the leaf's ``completion``."""
+    with factory() as db:
+        command = TaskExecutionCommand(
+            task_id=ids["task"],
+            command_id=f"channel-{ids['turn_id']}",
+            kind="start",
+            payload={},
+            target_run_id=lease.run_id,
+            status="completed",
+            result={"run_id": lease.run_id, "lease_attempt_id": lease.attempt_id},
+        )
+        db.add(command)
+        db.commit()
+        ids["command"] = int(command.id)
+    return ids["command"], {"success": False, "status": "failed"}
 
 
 def _settle_channel(
     factory, ids, lease, result, *, settle_interruption: bool = True
 ) -> None:
-    """Settle ``result`` as the shared channel leaf does (without a command)."""
+    """Settle ``result`` as the shared channel leaf does, completing a real
+    channel command (its ``channel_result`` and the task output included)."""
     projection = project_execution_result_for_channel(dict(result))
+    command_id, _placeholder = _completed_channel_command(factory, ids, lease)
+    durable_result = {
+        "success": projection.task_status != TaskStatus.FAILED,
+        "status": str(result.get("status") or projection.task_status.value),
+        "output": projection.transcript_content,
+        "completion_outcome": projection.completion_outcome,
+    }
     with factory() as db:
         assert finalize_managed_task_lease_result(
             db,
@@ -602,8 +662,19 @@ def _settle_channel(
             message_type=projection.message_type,
             error_message=projection.diagnostic_error,
             execution_result=dict(result),
+            completion=(command_id, durable_result),
             settle_interruption=settle_interruption,
         )
+
+
+def _full_projection(factory, ids, lease) -> dict[str, Any]:
+    """PR4a's projection plus the channel command's ``channel_result``."""
+    projection = _projection(factory, ids, lease)
+    if "command" in ids:
+        with factory() as db:
+            result = db.get(TaskExecutionCommand, ids["command"]).result
+        projection["channel_result"] = result.get("channel_result")
+    return projection
 
 
 def _settle_result(path: str, factory, ids, lease, result) -> None:
@@ -628,7 +699,7 @@ def _without_settled_reason(projection: dict[str, Any], reason: str):
     return projection
 
 
-@CASES
+@PAUSE_CASES
 def test_pause_projects_like_lease_recovery(canonical, path, reason):
     factory, _tid = canonical
     paused, recovered = _projected_task(factory), _projected_task(factory)
@@ -638,8 +709,11 @@ def test_pause_projects_like_lease_recovery(canonical, path, reason):
     _settle_result(path, factory, paused, paused_lease, RESULTS[reason])
     assert _expire_and_recover(factory, recovered) == TaskStatus.PAUSED
 
-    left = _projection(factory, paused, paused_lease)
-    right = _projection(factory, recovered, recovered_lease)
+    left = _full_projection(factory, paused, paused_lease)
+    right = _full_projection(factory, recovered, recovered_lease)
+    if path == "channel":
+        # Lease recovery leaves no channel result; a reader derives this one.
+        assert left.pop("channel_result") == interrupted_channel_result()
     assert left.pop("trigger_run")[1] == TASK_INTERRUPTION_PAUSED_TRIGGER_ERROR
     assert right.pop("trigger_run")[1] == TASK_LEASE_PAUSED_TRIGGER_ERROR
     # Only lease recovery reconciles orphaned delivery rows.
@@ -664,10 +738,9 @@ def _switch_case(m: pytest.MonkeyPatch, case: str) -> str:
     """Apply ``case``; return the task source it settles."""
     if case == "infra_off":
         m.setenv(PAUSE_SWITCH, "false")
-    elif case == "infra_default":
-        m.delenv(PAUSE_SWITCH)
-    elif case == "auto_resume_off":
-        m.setenv(AUTO_SWITCH, "false")
+    elif case in {"infra_default", "pause_requested"}:
+        if case == "infra_default":
+            m.delenv(PAUSE_SWITCH)
     return "sdk" if case == "ineligible" else "trigger"
 
 
@@ -675,18 +748,16 @@ def _switch_case(m: pytest.MonkeyPatch, case: str) -> str:
     ("path", "reason", "case"),
     [
         (path, reason, case)
-        for path, reason in _PATH_REASONS
-        for case in ("infra_default", "infra_off", "auto_resume_off", "ineligible")
-        # Automatic resume gates model_output_invalid only.
-        if case != "auto_resume_off" or reason == "model_output_invalid"
+        for path, reason in _PAUSE_PATH_REASONS
+        for case in ("infra_default", "infra_off", "ineligible")
     ],
 )
 def test_unpaused_runs_settle_exactly_as_before(
     canonical, monkeypatch, path, reason, case
 ):
-    """A switch the reason depends on is off, or the task is ineligible: the
-    same FAILED settlement as without an interruption, plus a ``disabled``
-    (or ``ineligible``) row. Auto-resume gates ``model_output_invalid`` only."""
+    """The switch is off (or unset: it defaults off), or the task is
+    ineligible: the same FAILED settlement as without an interruption, plus a
+    ``disabled`` (or ``ineligible``) row."""
 
     source = _switch_case(monkeypatch, case)
     factory, _tid = canonical
@@ -700,8 +771,8 @@ def test_unpaused_runs_settle_exactly_as_before(
         _without_result_interruption(m)
         _settle_result(path, factory, baseline, baseline_lease, RESULTS[reason])
 
-    gated_projection = _projection(factory, gated, gated_lease)
-    assert gated_projection == _projection(factory, baseline, baseline_lease)
+    gated_projection = _full_projection(factory, gated, gated_lease)
+    assert gated_projection == _full_projection(factory, baseline, baseline_lease)
     assert gated_projection["status"] == TaskStatus.FAILED
     _task, row, events = _state(factory, gated["task"])
     expected = "ineligible" if case == "ineligible" else "disabled"
@@ -710,29 +781,45 @@ def test_unpaused_runs_settle_exactly_as_before(
     assert _state(factory, baseline["task"])[1] is None
 
 
+@pytest.mark.parametrize("path", _PATHS)
 @pytest.mark.parametrize(
-    ("path", "reason"),
-    [case for case in _PATH_REASONS if case[1] != "model_output_invalid"],
+    "case", ["infra_on", "infra_off", "infra_default", "pause_requested", "ineligible"]
 )
-def test_auto_resume_switch_gates_only_model_output(
-    canonical, monkeypatch, path, reason
-):
-    """With automatic resume off, the infrastructure reasons still pause:
-    the task can be resumed by hand."""
+def test_model_output_invalid_never_pauses_yet(canonical, monkeypatch, path, case):
+    """Until the automatic-resume executor ships, unusable model output
+    settles exactly as without an interruption whatever the switch, the
+    checkpoint or the control state say; the row records it as ``manual``
+    (no switch would help), or ``ineligible``."""
 
-    monkeypatch.setenv(AUTO_SWITCH, "false")
+    if case == "infra_off":
+        monkeypatch.setenv(PAUSE_SWITCH, "false")
+    source = _switch_case(monkeypatch, case)
     factory, _tid = canonical
-    ids = _projected_task(factory)
-    lease = _prepare_run(factory, ids)
+    gated = _projected_task(factory, source=source)
+    baseline = _projected_task(factory, source=source)
+    gated_lease = _prepare_run(factory, gated)
+    baseline_lease = _prepare_run(factory, baseline)
+    if case == "pause_requested":
+        with factory() as db:
+            for ids in (gated, baseline):
+                db.get(Task, ids["task"]).control_state = "pause_requested"
+            db.commit()
 
-    _settle_result(path, factory, ids, lease, RESULTS[reason])
+    _settle_result(path, factory, gated, gated_lease, MODEL_RESULT)
+    with monkeypatch.context() as m:
+        _without_result_interruption(m)
+        _settle_result(path, factory, baseline, baseline_lease, MODEL_RESULT)
 
-    task, row, _events = _state(factory, ids["task"])
-    assert (task.status, task.control_state) == (TaskStatus.PAUSED, "paused")
-    assert (row.reason, row.state) == (reason, "manual")
+    gated_projection = _full_projection(factory, gated, gated_lease)
+    assert gated_projection == _full_projection(factory, baseline, baseline_lease)
+    assert gated_projection["status"] == TaskStatus.FAILED
+    _task, row, events = _state(factory, gated["task"])
+    expected = "ineligible" if case == "ineligible" else "manual"
+    assert (row.reason, row.state) == ("model_output_invalid", expected)
+    assert [e.detail["task_status"] for e in events] == ["failed"]
 
 
-@CASES
+@PAUSE_CASES
 @pytest.mark.parametrize(
     "case",
     ["unknown_tool_effect", "not_recoverable", "pause_requested", "resume_requested"],
@@ -757,7 +844,7 @@ def test_paths_decide_every_verdict(canonical, monkeypatch, path, reason, case):
     _settle_result(path, factory, ids, lease, RESULTS[reason])
 
     task, row, _events = _state(factory, ids["task"])
-    projection = _projection(factory, ids, lease)
+    projection = _full_projection(factory, ids, lease)
     if case in {"unknown_tool_effect", "not_recoverable"}:
         assert task.status == TaskStatus.FAILED
         assert task.error_message == (
@@ -794,14 +881,14 @@ def test_quota_stop_wins_over_the_reason(canonical, monkeypatch, path, reason, s
     _settle_result(path, factory, baseline, baseline_lease, plain_quota)
 
     gated_projection = _without_settled_reason(
-        _projection(factory, gated, gated_lease), reason
+        _full_projection(factory, gated, gated_lease), reason
     )
-    assert gated_projection == _projection(factory, baseline, baseline_lease)
+    assert gated_projection == _full_projection(factory, baseline, baseline_lease)
     assert gated_projection["status"] == TaskStatus.FAILED
     assert _state(factory, gated["task"])[1] is None
 
 
-@CASES
+@PAUSE_CASES
 @pytest.mark.parametrize("failure", ["python", "database", "marker"])
 def test_recording_failure_does_not_change_the_pause(
     canonical, monkeypatch, path, reason, failure
@@ -816,14 +903,14 @@ def test_recording_failure_does_not_change_the_pause(
         _fail_recording(m, failure)
         _settle_result(path, factory, unrecorded, unrecorded_lease, RESULTS[reason])
 
-    left = _projection(factory, recorded, recorded_lease)
-    assert left == _projection(factory, unrecorded, unrecorded_lease)
+    left = _full_projection(factory, recorded, recorded_lease)
+    assert left == _full_projection(factory, unrecorded, unrecorded_lease)
     assert left["status"] == TaskStatus.PAUSED
     assert left["trigger_run"][1] == TASK_INTERRUPTION_PAUSED_TRIGGER_ERROR
     assert _state(factory, unrecorded["task"])[1:] == (None, [])
 
 
-@CASES
+@PAUSE_CASES
 @pytest.mark.parametrize("failure", ["eligibility", "checkpoint_read"])
 def test_undecidable_interruption_keeps_the_lease_for_ttl(
     canonical, monkeypatch, path, reason, failure
@@ -851,14 +938,14 @@ def test_undecidable_interruption_keeps_the_lease_for_ttl(
     assert task.status == TaskStatus.RUNNING
     assert (task.runner_id, task.run_id) == (lease.runner_id, lease.run_id)
     assert row is None
-    assert _projection(factory, ids, lease)["settled"] == []
+    assert _full_projection(factory, ids, lease)["settled"] == []
 
     assert _expire_and_recover(factory, ids) == TaskStatus.PAUSED
     _task, row, _events = _state(factory, ids["task"])
     assert (row.reason, row.state) == ("lease_expired", "manual")
 
 
-@CASES
+@PAUSE_CASES
 @pytest.mark.parametrize("failure", ["eligibility", "checkpoint_read"])
 def test_reproducible_decision_fault_settles_as_before(
     canonical, monkeypatch, path, reason, failure
@@ -879,8 +966,8 @@ def test_reproducible_decision_fault_settles_as_before(
         _without_result_interruption(m)
         _settle_result(path, factory, baseline, baseline_lease, RESULTS[reason])
 
-    gated_projection = _projection(factory, gated, gated_lease)
-    assert gated_projection == _projection(factory, baseline, baseline_lease)
+    gated_projection = _full_projection(factory, gated, gated_lease)
+    assert gated_projection == _full_projection(factory, baseline, baseline_lease)
     assert gated_projection["status"] == TaskStatus.FAILED
     assert gated_projection["runner_id"] is None
 
@@ -899,9 +986,9 @@ def test_combined_channel_settlement_is_unchanged(canonical):
     _settle_channel(factory, baseline, baseline_lease, plain, settle_interruption=False)
 
     gated_projection = _without_settled_reason(
-        _projection(factory, gated, gated_lease), "llm_unavailable"
+        _full_projection(factory, gated, gated_lease), "llm_unavailable"
     )
-    assert gated_projection == _projection(factory, baseline, baseline_lease)
+    assert gated_projection == _full_projection(factory, baseline, baseline_lease)
     assert gated_projection["status"] == TaskStatus.FAILED
     assert _state(factory, gated["task"])[1] is None
 
@@ -912,10 +999,7 @@ def test_combined_channel_settlement_is_unchanged(canonical):
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("error", "reason"),
-    [
-        (LLMTimeoutError("provider timed out"), "llm_unavailable"),
-        (LLMEmptyContentError("empty response"), "model_output_invalid"),
-    ],
+    [(LLMTimeoutError("provider timed out"), "llm_unavailable")],
 )
 async def test_raised_provider_failure_pauses_on_the_exception_path(
     canonical, error, reason
@@ -936,10 +1020,7 @@ async def test_raised_provider_failure_pauses_on_the_exception_path(
 
 
 @pytest.mark.asyncio
-async def test_raised_model_output_failure_without_auto_resume_fails_as_before(
-    canonical, monkeypatch
-):
-    monkeypatch.setenv(AUTO_SWITCH, "false")
+async def test_raised_model_output_failure_fails_as_before(canonical, monkeypatch):
     factory, _tid = canonical
     gated, baseline = _projected_task(factory), _projected_task(factory)
     gated_lease = _prepare_run(factory, gated)
@@ -954,15 +1035,18 @@ async def test_raised_model_output_failure_without_auto_resume_fails_as_before(
             factory, baseline, baseline_lease, LLMEmptyContentError("empty response")
         )
 
-    gated_projection = _projection(factory, gated, gated_lease)
-    assert gated_projection == _projection(factory, baseline, baseline_lease)
+    gated_projection = _full_projection(factory, gated, gated_lease)
+    assert gated_projection == _full_projection(factory, baseline, baseline_lease)
     assert gated_projection["status"] == TaskStatus.FAILED
     assert gated_frames == baseline_frames == ["task_error"]
     _task, row, _events = _state(factory, gated["task"])
-    assert (row.reason, row.state) == ("model_output_invalid", "disabled")
+    assert (row.reason, row.state) == ("model_output_invalid", "manual")
 
 
 # ------------------------------------- S4: a shared channel turn, end to end
+
+
+PREVIOUS_OUTPUT = "previous channel answer"
 
 
 async def _run_shared_channel_turn(
@@ -970,8 +1054,8 @@ async def _run_shared_channel_turn(
 ) -> TaskExecutionCommand:
     """Run one accepted channel turn through the worker's command executor.
 
-    The fake agent writes a recoverable checkpoint for its run, then returns
-    ``execution_result``.
+    The fake agent writes a recoverable checkpoint for its run and gives the
+    task a previous output, then returns ``execution_result``.
     """
 
     monkeypatch.setenv("XAGENT_TASK_EXECUTION_ROLE", "worker")
@@ -1015,6 +1099,9 @@ async def _run_shared_channel_turn(
                 },
                 run_id=run_id,
             )
+            # The output the task carries from its previous turn when this
+            # run settles (starting the run does not keep the stored one).
+            db.get(Task, selected.selection.task_id).output = PREVIOUS_OUTPUT
             db.commit()
         return dict(execution_result)
 
@@ -1055,7 +1142,7 @@ async def _run_shared_channel_turn(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("reason", sorted(RESULTS))
+@pytest.mark.parametrize("reason", ["llm_unavailable", "persistence_failure"])
 async def test_shared_channel_turn_pauses_and_its_channel_reads_interrupted(
     selected, monkeypatch, reason
 ):
@@ -1078,6 +1165,12 @@ async def test_shared_channel_turn_pauses_and_its_channel_reads_interrupted(
         assert (task.run_id, task.runner_id) == (selected.run_id, None)
         assert task.lease_attempt_id is None
         assert task.error_message is None
+        # A pause keeps the previous output, as lease recovery does.
+        assert task.output == PREVIOUS_OUTPUT
+        assert (
+            db.get(TaskExecutionCommand, command.id).result["channel_result"]
+            == interrupted_channel_result()
+        )
         row = db.get(TaskAutoRecovery, tid)
         assert (row.reason, row.state, row.run_id) == (
             reason,
@@ -1095,27 +1188,59 @@ async def test_shared_channel_turn_pauses_and_its_channel_reads_interrupted(
         ] == [PAUSED_FACT]
 
 
+def _leaf_failed_channel_result(result: dict[str, Any]) -> dict[str, Any]:
+    """The channel result the leaf has always stored for a FAILED result."""
+    projection = project_execution_result_for_channel(dict(result))
+    return {
+        "success": False,
+        "status": str(result.get("status") or projection.task_status.value),
+        "output": projection.transcript_content,
+        "completion_outcome": projection.completion_outcome,
+        "chat_response": {
+            "message": projection.transcript_content,
+            "interactions": projection.interactions,
+        },
+    }
+
+
 @pytest.mark.asyncio
-@pytest.mark.parametrize("reason", sorted(RESULTS))
-async def test_shared_channel_turn_with_the_switch_off_fails_as_before(
-    selected, monkeypatch, reason
+@pytest.mark.parametrize(
+    ("reason", "switch"),
+    [(reason, "false") for reason in sorted(RESULTS)]
+    + [("model_output_invalid", "true")],
+)
+async def test_shared_channel_turn_that_does_not_pause_fails_as_before(
+    selected, monkeypatch, reason, switch
 ):
-    monkeypatch.setenv(PAUSE_SWITCH, "false")
+    """Switch off, or a reason settlement does not pause for yet: the channel
+    command, its result and the task output are what the leaf has always
+    written for a FAILED result."""
+
+    monkeypatch.setenv(PAUSE_SWITCH, switch)
 
     command = await _run_shared_channel_turn(selected, monkeypatch, RESULTS[reason])
 
     tid = selected.selection.task_id
     channel_result = shared._read_channel_result(command.id, selected.run_id)
-    assert (channel_result["success"], channel_result["output"]) == (
-        False,
-        CLIENT_SAFE_TASK_FAILURE,
-    )
+    assert channel_result == _leaf_failed_channel_result(RESULTS[reason])
+    assert channel_result["output"] == CLIENT_SAFE_TASK_FAILURE
     with get_session_local()() as db:
+        stored = db.get(TaskExecutionCommand, command.id).result
+        assert stored == {
+            "run_id": selected.run_id,
+            "lease_attempt_id": stored["lease_attempt_id"],
+            "channel_result": channel_result,
+        }
         task = db.get(Task, tid)
         assert task.status == TaskStatus.FAILED
         assert task.error_message == RESULTS[reason]["error"]
+        # A FAILED channel result clears the output, as it always has.
+        assert task.output is None
         row = db.get(TaskAutoRecovery, tid)
-        assert (row.reason, row.state) == (reason, "disabled")
+        assert (row.reason, row.state) == (
+            reason,
+            "manual" if reason == "model_output_invalid" else "disabled",
+        )
         assert [
             message.content
             for message in db.query(TaskChatMessage).filter_by(
@@ -1141,4 +1266,98 @@ async def test_shared_channel_deferred_settlement_retains_the_lease(canonical):
     task, row, _events = _state(factory, tid)
     assert task.status == TaskStatus.RUNNING
     assert task.runner_id == lease.runner_id
+    assert row is None
+
+
+# --------------------------------------- S3: the resume exception path, LLM
+
+
+@pytest.mark.asyncio
+async def test_resume_exception_passes_an_llm_reason_and_announces_the_pause():
+    """A provider failure that escapes a resumed run reaches the resume
+    exception path's settlement as ``llm_unavailable``."""
+
+    def settle(lease, **kwargs):
+        assert kwargs["interruption"] is InterruptionReason.LLM_UNAVAILABLE
+        kwargs["paused_for"].append(InterruptionReason.LLM_UNAVAILABLE)
+        kwargs["terminal_event_state"].update(status="paused", run_id=lease.run_id)
+        return True
+
+    settle_mock = Mock(side_effect=settle)
+    publish_pause, frames = await _resume_raising(
+        LLMTimeoutError("provider timed out"), settle_mock
+    )
+
+    settle_mock.assert_called_once()
+    publish_pause.assert_awaited_once_with(
+        42,
+        {"status": "paused", "run_id": "run-a"},
+        InterruptionReason.LLM_UNAVAILABLE,
+    )
+    assert "task_error" not in frames
+
+
+def test_resume_exception_settlement_pauses_for_llm_on_a_real_database(canonical):
+    factory, _tid = canonical
+    ids = _projected_task(factory)
+    lease = _prepare_run(factory, ids)
+    paused_for: list[InterruptionReason] = []
+
+    assert _settle_resumed_task_lease(
+        lease,
+        error_message="setup/run error: LLMTimeoutError: provider timed out",
+        interruption=InterruptionReason.LLM_UNAVAILABLE,
+        paused_for=paused_for,
+    )
+
+    assert paused_for == [InterruptionReason.LLM_UNAVAILABLE]
+    projection = _full_projection(factory, ids, lease)
+    assert (projection["status"], projection["runner_id"]) == (TaskStatus.PAUSED, None)
+    assert projection["settled"] == [PAUSED_FACT]
+    _task, row, _events = _state(factory, ids["task"])
+    assert (row.reason, row.state) == ("llm_unavailable", "manual")
+
+
+# ------------------------------------ provider refusals are not interruptions
+
+
+def _insufficient_quota() -> RuntimeError:
+    """How openai.py re-raises an exhausted-quota rate limit."""
+    request = httpx.Request("POST", "https://api.openai.com/v1/chat/completions")
+    sdk_error = openai.RateLimitError(
+        "You exceeded your current quota, please check your plan and billing",
+        response=httpx.Response(429, request=request),
+        body={"code": "insufficient_quota", "type": "insufficient_quota"},
+    )
+    error = RuntimeError(f"OpenAI rate limit exceeded: {sdk_error.message}")
+    error.__cause__ = sdk_error
+    return error
+
+
+@pytest.mark.asyncio
+async def test_exhausted_quota_settles_failed_with_the_switch_on(canonical, tmp_path):
+    """A provider that refuses the account (quota, credential) is terminal:
+    a real ReAct run carries no interruption reason and settles FAILED."""
+
+    factory, tid = canonical
+    lease = _start_run(factory, tid)
+    _checkpoint(factory, tid, lease.run_id)
+    tool = FakeTool()
+
+    class _OutOfQuota:
+        async def chat(self, **_kwargs: Any) -> Any:
+            raise _insufficient_quota()
+
+    with bind_task_lease_context(lease):
+        result = await _runner(tid, _react(), _OutOfQuota(), tool, tmp_path).run(
+            task="2+2", execution_id=str(tid)
+        )
+    assert result["success"] is False
+    assert "interruption_reason" not in result
+
+    finalized = _settle_new_run(factory, tid, lease, result)
+
+    assert finalized.interruption_pause_reason is None
+    task, row, _events = _state(factory, tid)
+    assert task.status == TaskStatus.FAILED
     assert row is None
