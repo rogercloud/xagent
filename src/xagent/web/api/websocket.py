@@ -124,6 +124,7 @@ from ..services.public_trace_events import (
     normalize_public_trace_event,
     public_task_trace_filter,
 )
+from ..services.task_auto_recovery import current_auto_recovery_view
 from ..services.task_command_execution import _read_task_error_payload_offloop
 from ..services.task_command_transport import (
     COMMAND_FAILED,
@@ -2071,6 +2072,8 @@ def _history_task_info(db: Any, task: Any, task_id: int) -> dict[str, Any]:
             "is_dag": is_dag,
             "waiting_question": waiting_question,
             "waiting_interactions": waiting_interactions,
+            # The interruption that left the task as it stands, if any.
+            "auto_recovery": current_auto_recovery_view(db, task),
             "created_at": safe_timestamp_to_unix(task.created_at)
             if task.created_at
             else None,

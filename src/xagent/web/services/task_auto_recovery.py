@@ -53,6 +53,7 @@ from ..models.task_auto_recovery import (
 )
 from ..models.trigger import TriggerType
 from ..models.workforce import WorkforceRun
+from ..utils.db_timezone import format_datetime_for_api
 from .task_execution_controller import TaskControlState
 from .task_lease_service import (
     TASK_UNKNOWN_TOOL_EFFECT_SETTLEMENT_ERROR,
@@ -282,6 +283,30 @@ def record_interruption_no_commit(
         state.value,
     )
     return row
+
+
+def current_auto_recovery_view(db: Session, task: Task) -> dict[str, Any] | None:
+    """The client view of ``task``'s recovery row, or ``None``.
+
+    The row is not cleared when its run is resumed; it goes stale as the
+    task's ``run_id`` or ``state_version`` moves on. Only a row that still
+    describes the task as it stands -- same run, fenced at the current
+    ``state_version`` -- is shown. Deliberately minimal: the operator-only
+    ``last_error``, ``state_detail``, counters and command ids stay private.
+    """
+
+    row = db.get(TaskAutoRecovery, task.id)
+    if (
+        row is None
+        or row.run_id != task.run_id
+        or row.paused_state_version != int(task.state_version or 0)
+    ):
+        return None
+    return {
+        "reason": row.reason,
+        "state": row.state,
+        "interrupted_at": format_datetime_for_api(row.interrupted_at),
+    }
 
 
 def lease_expiry_interruption_reason(
