@@ -2936,6 +2936,7 @@ def _finalize_resumed_task(
     """Persist one fenced resumed result in a single worker transaction."""
     from ..models.agent import Agent
     from .chat_history_service import persist_assistant_message_no_commit
+    from .task_orchestrator import sync_trigger_run_status
 
     finalized: dict[str, Any] = {
         "task_title": None,
@@ -3114,6 +3115,11 @@ def _finalize_resumed_task(
                 finalized["interruption_pause_reason"] = interruption.reason
         else:
             sync_workforce_run_status(db, task, final_task_status)
+        if final_task_status in {TaskStatus.COMPLETED, TaskStatus.FAILED}:
+            # As ``finish_turn`` does for a new run: a trigger run left
+            # RUNNING by a user pause or a wait for the user ends with the
+            # resumed run. A pause leaves it as is, or projects it above.
+            sync_trigger_run_status(db, task, final_task_status)
         lease_released = release_task_lease_no_commit(
             db,
             task_lease,
