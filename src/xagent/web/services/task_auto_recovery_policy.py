@@ -307,7 +307,10 @@ def scheduled_trigger_superseded(db: Session, task: Task) -> bool:
     A scheduled run is the latest tick of a recurring job; resuming an old
     tick once the next one is running would duplicate its work. Webhook and
     gmail runs each carry a distinct event, so they are never superseded.
-    Manual test fires and failed runs neither supersede nor are superseded.
+    A later run supersedes once it has started and has not failed, even if
+    its own task is now paused by its user or waiting for an answer: only the
+    latest tick matters. Manual test fires and failed runs neither supersede
+    nor are superseded.
     ``TriggerRun.task_id`` is the link; a missing run row is not superseded.
     """
 

@@ -490,12 +490,19 @@ class _World:
         self.db.flush()
         return trigger
 
-    def task(self, *, source="trigger", trigger_type="scheduled", test=False) -> Task:
+    def task(
+        self,
+        *,
+        source="trigger",
+        trigger_type="scheduled",
+        test=False,
+        status=TaskStatus.PAUSED,
+    ) -> Task:
         task = Task(
             user_id=self.user.id,
             title="t",
             description="t",
-            status=TaskStatus.PAUSED,
+            status=status,
             execution_mode="auto",
             source=source,
             agent_config=(
@@ -626,6 +633,22 @@ def test_later_completed_run_supersedes(world) -> None:
     task = world.task()
     world.run(trigger, task)
     world.run(trigger, world.task(), status=TriggerRunStatus.COMPLETED.value)
+    assert scheduled_trigger_superseded(world.db, task) is True
+
+
+@pytest.mark.parametrize(
+    "later_task_status", [TaskStatus.PAUSED, TaskStatus.WAITING_FOR_USER]
+)
+def test_later_run_waiting_on_a_person_still_supersedes(
+    world, later_task_status
+) -> None:
+    """Only the latest tick matters: a later tick its user paused, or that
+    waits for an answer, keeps its run ``running``, and resuming the earlier
+    tick would still duplicate it."""
+    trigger = world.trigger()
+    task = world.task()
+    world.run(trigger, task)
+    world.run(trigger, world.task(status=later_task_status))
     assert scheduled_trigger_superseded(world.db, task) is True
 
 
