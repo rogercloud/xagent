@@ -56,6 +56,7 @@ from ..models.task_auto_recovery import (
 from ..models.trigger import TriggerType
 from ..models.workforce import WorkforceRun
 from ..utils.db_timezone import format_datetime_for_api
+from .task_command_transport import AUTO_RESUME_COMMAND_PREFIX
 from .task_execution_controller import TaskControlState
 from .task_lease_service import (
     TASK_UNKNOWN_TOOL_EFFECT_SETTLEMENT_ERROR,
@@ -302,16 +303,14 @@ def record_interruption_no_commit(
     return row
 
 
-# Prefix of every command id the auto-resume sweeper stages. Clients may not
-# use it (the WebSocket ingress and respond() refuse it), so a RESUME with it
-# is the sweeper's own.
-AUTO_RESUME_COMMAND_PREFIX = "auto-resume:"
-
-
 def is_auto_resume_command_id(command_id: object) -> bool:
-    """Whether ``command_id`` is in the namespace reserved for the sweeper."""
+    """Whether ``command_id`` is in the namespace reserved for the sweeper.
 
-    return isinstance(command_id, str) and command_id.strip().startswith(
+    ``stage_task_command`` refuses the prefix to every caller but the
+    sweeper, so a staged command with it is the sweeper's own.
+    """
+
+    return isinstance(command_id, str) and command_id.startswith(
         AUTO_RESUME_COMMAND_PREFIX
     )
 

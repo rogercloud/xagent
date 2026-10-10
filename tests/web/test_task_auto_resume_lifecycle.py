@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import sys
+from types import ModuleType
 
 import pytest
 from fastapi import FastAPI
@@ -83,24 +85,75 @@ def test_web_role_does_not_run_the_sweeper(monkeypatch: pytest.MonkeyPatch) -> N
 
 
 @pytest.mark.asyncio
-async def test_application_shutdown_stops_the_sweeper(
+async def test_application_shutdown_stops_the_sweeper_before_lease_recovery(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     order: list[str] = []
 
-    async def stop_sweeper(app_instance) -> None:
-        assert app_instance is app_module.app
-        order.append("auto_resume")
+    async def record(name: str) -> None:
+        order.append(name)
 
-    async def stop_recovery(app_instance) -> None:
-        order.append("lease_recovery")
+    class _FakeChannel:
+        enabled = False
 
-    monkeypatch.setattr(app_module, "stop_task_auto_resume_task", stop_sweeper)
-    monkeypatch.setattr(app_module, "stop_task_lease_recovery_task", stop_recovery)
-    # Reuse the full shutdown scaffold of the lease-recovery lifecycle test.
-    from tests.web import test_task_lease_recovery_lifecycle as lease_lifecycle
+        async def stop(self) -> None:
+            return None
 
-    await lease_lifecycle.test_application_shutdown_stops_task_lease_recovery(
-        monkeypatch
+    class _FakeSandboxManager:
+        async def cleanup(self) -> None:
+            return None
+
+    for module_name, attribute in (
+        ("xagent.web.channels.telegram.bot", "get_telegram_channel"),
+        ("xagent.web.channels.feishu.bot", "get_feishu_channel"),
+        ("xagent.web.channels.slack.bot", "get_slack_channel"),
+    ):
+        fake = ModuleType(module_name)
+        setattr(fake, attribute, lambda: _FakeChannel())
+        monkeypatch.setitem(sys.modules, module_name, fake)
+    monkeypatch.setattr(app_module, "flush_langfuse", lambda: None)
+    for name in (
+        "stop_runtime_performance_monitor",
+        "stop_orphan_upload_gc_task",
+        "stop_retention_purge_task",
+        "stop_task_cleanup_retry_task",
+        "stop_uploaded_file_recovery_task",
+    ):
+        monkeypatch.setattr(app_module, name, lambda _app: record("other"))
+    monkeypatch.setattr(
+        app_module, "stop_task_auto_resume_task", lambda _app: record("auto_resume")
     )
-    assert "auto_resume" in order
+    monkeypatch.setattr(
+        app_module,
+        "stop_task_lease_recovery_task",
+        lambda _app: record("lease_recovery"),
+    )
+    monkeypatch.setattr(
+        "xagent.web.services.task_execution.background_task_manager.shutdown",
+        lambda: record("other"),
+    )
+    monkeypatch.setattr(
+        "xagent.web.services.task_lease_service.wait_for_heartbeat_manager_idle",
+        lambda: record("other"),
+    )
+    for name in (
+        "_task_command_dispatcher_task",
+        "_sandbox_idle_sweep_task",
+        "_file_storage_startup_sync_task",
+        "_trigger_dispatcher_task",
+        "_migration_task",
+    ):
+        monkeypatch.setattr(app_module, name, None)
+    monkeypatch.setattr(
+        "xagent.web.sandbox_manager.get_sandbox_manager",
+        lambda: _FakeSandboxManager(),
+    )
+    app_module.app.state.metadata_rebuild_task = None
+    for attribute in ("telegram_task", "slack_task"):
+        if hasattr(app_module.app.state, attribute):
+            monkeypatch.delattr(app_module.app.state, attribute)
+
+    await app_module.shutdown_event()
+
+    stops = [name for name in order if name != "other"]
+    assert stops == ["auto_resume", "lease_recovery"]

@@ -100,13 +100,17 @@ async def test_runtime_readiness_and_shutdown_order(monkeypatch, bridge_fails):
         order.append("heartbeat_idle")
 
     async def recovery(**kwargs):
-        await asyncio.Event().wait()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            order.append("recovery_stop")
 
-    def auto_resume(**kwargs):
-        # Recorded when the worker creates the loop; run_worker returning at
-        # all proves it cancelled and drained it (the loop never ends alone).
+    async def auto_resume(**kwargs):
         order.append("auto_resume")
-        return asyncio.Event().wait()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            order.append("auto_resume_stop")
 
     monkeypatch.setattr(worker, "stop_task_command_dispatcher", stop_dispatch)
     monkeypatch.setattr(worker, "stop_task_event_bridge", stop_bridge)
@@ -122,6 +126,8 @@ async def test_runtime_readiness_and_shutdown_order(monkeypatch, bridge_fails):
     async def supervise(executor, stop_event):
         assert executor is worker.execute_durable_task_command
         assert stop_event is stop
+        # Let the background loops start, as the real supervisor's waits do.
+        await asyncio.sleep(0)
         order.append("supervise")
 
     monkeypatch.setattr(worker, "supervise_task_command_dispatcher", supervise)
@@ -148,9 +154,15 @@ async def test_runtime_readiness_and_shutdown_order(monkeypatch, bridge_fails):
             < order.index("supervise")
             < order.index("stop_claims")
         )
-        # The sweeper starts beside lease recovery, before claims are served.
+        # The sweeper runs beside lease recovery and is cancelled before it,
+        # after the claims stop.
         assert order.index("accept") < order.index("auto_resume")
-        assert order.index("auto_resume") < order.index("dispatch")
+        assert (
+            order.index("stop_claims")
+            < order.index("auto_resume_stop")
+            < order.index("recovery_stop")
+            < order.index("coordinator_drain")
+        )
         # Persistent memory is admitted before this worker will accept a task.
         # The worker process never runs the FastAPI startup, so this is its
         # only admission; without it the worker serves no persistent memory,

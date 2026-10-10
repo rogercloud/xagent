@@ -628,3 +628,253 @@ async def test_dispatched_command_for_a_moved_task_completes_as_auto_skipped(
     broadcasts.assert_not_awaited()
     handler.background.assert_not_called()
     assert _row(factory, task_id).state == "stale"
+
+
+# --------------------------------------------------------------------------
+# The recovery row decides too
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("row_case", ["other_command", "scheduled", "stale", "missing"])
+@pytest.mark.parametrize("retry", [False, True])
+def test_a_claim_the_row_no_longer_names_is_skipped_and_the_row_left_alone(
+    factory, row_case, retry
+):
+    with factory() as db:
+        task_id, _ = _seed(
+            db,
+            state="scheduled"
+            if row_case == "scheduled"
+            else "stale"
+            if row_case == "stale"
+            else "dispatched",
+            last_command_id=(
+                auto_resume_command_id(PV, 2, RUN)
+                if row_case == "other_command"
+                else CID
+            ),
+            **(
+                {"control_state": "resume_requested", "state_version": PV + 1}
+                if retry
+                else {}
+            ),
+        )
+        if row_case == "missing":
+            db.delete(db.get(TaskAutoRecovery, task_id))
+        db.commit()
+    before = _row(factory, task_id)
+
+    decision = _check(
+        task_id,
+        **(
+            {
+                "control_state": "resume_requested",
+                "state_version": PV + 1,
+                "attempt_count": 2,
+            }
+            if retry
+            else {}
+        ),
+    )
+
+    assert (decision.proceed, decision.why, decision.notices) == (
+        False,
+        "not_current",
+        (),
+    )
+    after = _row(factory, task_id)
+    if before is None:
+        assert after is None
+    else:
+        assert (after.state, after.last_command_id, after.next_attempt_at) == (
+            before.state,
+            before.last_command_id,
+            before.next_attempt_at,
+        )
+    assert _events(factory, task_id) == []
+
+
+# --------------------------------------------------------------------------
+# A resume this command started and then rolled back
+# --------------------------------------------------------------------------
+
+
+def test_retry_after_its_own_rolled_back_resume_is_scheduled_again(
+    factory, monkeypatch
+):
+    monkeypatch.setattr(
+        task_auto_resume, "_AUTO_RESUME_RNG", __import__("random").Random(3)
+    )
+    with factory() as db:
+        task_id, trigger_run_id = _seed(db, trigger=True, state_version=PV + 2)
+        db.commit()
+    now = utc_now()
+
+    decision = _check(task_id, state_version=PV + 2, attempt_count=2)
+
+    assert (decision.proceed, decision.why) == (False, "rolled_back")
+    row = _row(factory, task_id)
+    assert row.state == "scheduled"
+    assert row.paused_state_version == PV + 2
+    assert row.next_attempt_at is not None
+    assert row.next_attempt_at.replace(tzinfo=None) >= now.replace(tzinfo=None)
+    assert _events(factory, task_id) == ["scheduled"]
+    (notice,) = decision.notices
+    assert notice.auto_resume["status"] == "scheduled"
+    assert notice.state_version == PV + 2
+    with factory() as db:
+        assert db.get(TriggerRun, trigger_run_id).status == "running"
+
+
+def test_rolled_back_retry_at_its_limit_stops_with_a_notice(factory):
+    with factory() as db:
+        task_id, trigger_run_id = _seed(db, trigger=True, state_version=PV + 2)
+        db.get(TaskAutoRecovery, task_id).no_progress_resumes = 3
+        db.commit()
+
+    decision = _check(task_id, state_version=PV + 2, attempt_count=2)
+
+    assert decision.why == "rolled_back"
+    assert _row(factory, task_id).state == "exhausted"
+    assert [n.auto_resume["stop_reason"] for n in decision.notices] == ["limit_reached"]
+    with factory() as db:
+        assert db.get(TriggerRun, trigger_run_id).status == "failed"
+
+
+@pytest.mark.parametrize("case", ["first_attempt", "user_command", "three_versions"])
+def test_a_rollback_lookalike_stays_stale(factory, case):
+    with factory() as db:
+        task_id, _ = _seed(
+            db, state_version=PV + (3 if case == "three_versions" else 2)
+        )
+        task = db.get(Task, task_id)
+        for command_id, kind in [(CID, "resume")] + (
+            [("message-1", "message")] if case == "user_command" else []
+        ):
+            db.add(
+                TaskExecutionCommand(
+                    task_id=task_id,
+                    actor_user_id=task.user_id,
+                    command_id=command_id,
+                    kind=kind,
+                    payload={},
+                    status="pending",
+                )
+            )
+        db.commit()
+
+    decision = _check(
+        task_id,
+        state_version=PV + (3 if case == "three_versions" else 2),
+        attempt_count=1 if case == "first_attempt" else 2,
+    )
+
+    assert decision.why == "stale"
+    assert _row(factory, task_id).state == "stale"
+
+
+@pytest.mark.asyncio
+async def test_resume_task_reschedules_after_its_own_rollback(factory, handler):
+    with factory() as db:
+        task_id, _ = _seed(db)
+        db.commit()
+    handler.manager.register_reserved_resume.side_effect = RuntimeError("boom")
+
+    with pytest.raises(RuntimeError, match="boom"):
+        await _resume(factory, task_id)
+
+    task = _task(factory, task_id)
+    assert (task.control_state, task.state_version) == ("paused", PV + 2)
+    handler.manager.register_reserved_resume.side_effect = None
+    retry, reply = await _resume(factory, task_id, attempt_count=2)
+
+    assert retry.outcome is ResumeCommandOutcome.AUTO_SKIPPED
+    assert retry.reason_code == "rolled_back"
+    reply.assert_not_awaited()
+    row = _row(factory, task_id)
+    assert (row.state, row.paused_state_version) == ("scheduled", PV + 2)
+
+
+# --------------------------------------------------------------------------
+# resume_task contract
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_resume_task_with_the_switch_off_publishes_and_never_replies(
+    factory, handler, monkeypatch
+):
+    monkeypatch.setenv("XAGENT_TASK_AUTO_RESUME_ENABLED", "false")
+    published: list[Any] = []
+
+    async def publish(notices):
+        published.extend(notices)
+
+    monkeypatch.setattr(task_auto_resume, "publish_recovery_notices", publish)
+    with factory() as db:
+        task_id, _ = _seed(db)
+        db.commit()
+
+    result, reply = await _resume(factory, task_id)
+
+    assert result.outcome is ResumeCommandOutcome.AUTO_SKIPPED
+    assert result.reason_code == "auto_resume_disabled"
+    reply.assert_not_awaited()
+    assert [n.auto_resume["stop_reason"] for n in published] == ["disabled"]
+    assert _row(factory, task_id).state == "manual"
+    assert _task(factory, task_id).state_version == PV
+
+
+@pytest.mark.asyncio
+async def test_resume_task_skips_an_unanswered_question_without_an_error(
+    factory, handler, monkeypatch
+):
+    from xagent.web.services.task_interaction_close import ActiveInteractionFound
+
+    with factory() as db:
+        task_id, _ = _seed(db)
+        db.commit()
+    handler.interaction.return_value = ActiveInteractionFound(interaction_id=9)
+
+    result, reply = await _resume(factory, task_id)
+
+    assert result.outcome is ResumeCommandOutcome.AUTO_SKIPPED
+    assert result.reason_code == "interaction_pending"
+    reply.assert_not_awaited()
+    handler.manager.try_reserve_resume.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_foreign_lease_defers_at_the_fence_and_the_retry_proceeds(
+    factory, handler, monkeypatch
+):
+    with factory() as db:
+        task_id, _ = _seed(db)
+        db.commit()
+    foreign = MagicMock(side_effect=[True, False])
+    monkeypatch.setattr(commands, "task_has_live_foreign_runner", foreign)
+
+    first, _reply = await _resume(factory, task_id)
+    assert first.outcome is ResumeCommandOutcome.DEFERRED
+    assert _row(factory, task_id).state == "dispatched"
+
+    retry, _reply = await _resume(factory, task_id, attempt_count=2)
+    assert retry.outcome is ResumeCommandOutcome.SCHEDULED
+    assert _task(factory, task_id).control_state == "resume_requested"
+
+
+def test_a_database_error_while_closing_a_skipped_claim_propagates(
+    factory, monkeypatch
+):
+    with factory() as db:
+        task_id, _ = _seed(db, state_version=PV + 1)
+        db.commit()
+
+    def broken(*_args, **_kwargs):
+        raise sa.exc.OperationalError("UPDATE", {}, Exception("database is down"))
+
+    monkeypatch.setattr(task_auto_resume, "_give_up_no_commit", broken)
+
+    with pytest.raises(sa.exc.OperationalError):
+        _check(task_id, state_version=PV + 1)
+    assert _row(factory, task_id).state == "dispatched"

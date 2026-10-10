@@ -454,7 +454,7 @@ def test_each_fence_column_makes_the_row_stale(factory, notified, field, task_fi
     assert event.detail["mismatch"] == field
     assert event.detail["at"] == "dispatch"
     # A person's own action produced it; nothing is announced.
-    assert report.notices == ()
+    assert report.notices == []
     assert notified == []
 
 
@@ -696,9 +696,10 @@ def test_give_ups_still_advance_when_no_dispatch_budget_is_left(
     assert (report.budget, report.dispatched) == (0, 0)
     assert _row(factory, expired).state == "expired"
     assert _row(factory, stale).state == "stale"
-    # The first candidate that needs a dispatch stops the scan unwritten.
+    # A row that needs a dispatch is left unwritten and the scan goes on, so
+    # it cannot hold back the give-ups behind it.
     assert _row(factory, waiting).state == "scheduled"
-    assert _row(factory, after).state == "scheduled"
+    assert _row(factory, after).state == "expired"
     assert _commands(factory, waiting) == []
     assert notified == []
 
@@ -840,33 +841,62 @@ def test_give_up_cas_rechecks_the_fence(factory, notified, monkeypatch):
     assert _row(factory, task_id).state == "scheduled"
 
 
-def test_an_existing_command_with_the_same_id_is_not_staged_twice(
-    factory, notified, caplog
+@pytest.mark.parametrize("existing", ["pending", "completed", "foreign"])
+def test_an_existing_command_with_the_same_id_commits_only_if_it_will_run(
+    factory, notified, caplog, existing
 ):
     now = utc_now()
     with factory() as db:
         task_id = _seed(db, now)
         task = db.get(Task, task_id)
-        db.add(
-            TaskExecutionCommand(
-                task_id=task_id,
-                actor_user_id=task.user_id,
-                command_id=auto_resume_command_id(PV, 1, RUN),
-                kind="resume",
-                payload={"type": "resume_task"},
-                status="pending",
+        if existing == "foreign":
+            db.add(
+                TaskExecutionCommand(
+                    task_id=task_id,
+                    actor_user_id=task.user_id,
+                    command_id=auto_resume_command_id(PV, 1, RUN),
+                    kind="resume",
+                    payload={"type": "resume_task"},
+                    status="pending",
+                )
             )
-        )
         db.commit()
+    if existing != "foreign":
+        # An earlier dispatch of this exact (fence, attempt) whose CAS a
+        # second sweeper then saw undone: the row reads scheduled again.
+        assert run_auto_resume_tick(now=now).dispatched == 1
+        with factory() as db:
+            row = db.get(TaskAutoRecovery, task_id)
+            row.state, row.total_resumes, row.no_progress_resumes = "scheduled", 0, 0
+            row.next_attempt_at = now - timedelta(seconds=1)
+            command = db.scalars(
+                sa.select(TaskExecutionCommand).where(
+                    TaskExecutionCommand.task_id == task_id
+                )
+            ).one()
+            command.status = existing
+            db.commit()
+        notified.clear()
+    events_before = len(_events(factory, task_id))
 
     with caplog.at_level(logging.WARNING, logger=task_auto_resume.__name__):
         report = run_auto_resume_tick(now=now)
 
-    assert (report.dispatched, report.staged_commands) == (1, 0)
-    assert _row(factory, task_id).state == "dispatched"
-    assert len(_commands(factory, task_id)) == 1
     assert "already existed" in caplog.text
+    assert len(_commands(factory, task_id)) == 1
+    assert report.staged_commands == 0
     assert notified == []
+    row = _row(factory, task_id)
+    if existing == "pending":
+        # That command is this dispatch and will still run.
+        assert report.dispatched == 1
+        assert row.state == "dispatched"
+        assert len(_events(factory, task_id)) == events_before + 1
+    else:
+        # A finished command or someone else's payload: nothing commits.
+        assert (report.dispatched, report.raced) == (0, 1)
+        assert (row.state, row.total_resumes) == ("scheduled", 0)
+        assert len(_events(factory, task_id)) == events_before
 
 
 def test_full_admission_queue_postpones_and_stops_the_tick(
@@ -1006,6 +1036,13 @@ def test_postgresql_sweeper_skips_a_task_a_settlement_holds_without_deadlock(
             cursor.execute("SET lock_timeout = '1500ms'")
         connection.autocommit = False
 
+    try:
+        _sweeper_skips_a_held_task(factory, engine)
+    finally:
+        sa.event.remove(engine, "connect", short_lock_timeout)
+
+
+def _sweeper_skips_a_held_task(factory: sessionmaker, engine) -> None:
     engine.dispose()
     now = utc_now()
     with factory() as db:
@@ -1049,7 +1086,6 @@ def test_postgresql_sweeper_skips_a_task_a_settlement_holds_without_deadlock(
     # Released, the next tick dispatches it.
     assert run_auto_resume_tick(now=now).dispatched == 1
     assert _row(factory, task_id).state == "dispatched"
-    sa.event.remove(engine, "connect", short_lock_timeout)
 
 
 # --------------------------------------------------------------------------
@@ -1140,7 +1176,7 @@ def test_housekeeping_reschedules_a_completed_resume_that_did_not_happen(
     assert _aware(row.next_attempt_at) <= now + timedelta(seconds=30)
     (event,) = _events(factory, task_id)
     assert (event.event, event.attempt) == ("scheduled", 2)
-    assert event.detail == {"after": "already_in_progress"}
+    assert event.detail == {"at": "housekeeping", "after": "already_in_progress"}
     (notice,) = report.notices
     assert notice.auto_resume["status"] == "scheduled"
     assert notice.auto_resume["next_attempt_at"] is not None
@@ -1209,7 +1245,7 @@ def test_housekeeping_confirms_once_the_fence_moved(factory, notified, command_s
     row = _row(factory, task_id)
     assert (row.state, row.next_attempt_at) == ("dispatched", None)
     assert _events(factory, task_id) == []
-    assert report.notices == ()
+    assert report.notices == []
 
 
 @pytest.mark.parametrize("command_status", ["pending", "processing"])
@@ -1250,17 +1286,17 @@ def test_housekeeping_ignores_dispatches_not_yet_due(factory, notified):
 
 def test_switch_off_drains_scheduled_rows_to_manual(factory, notified, monkeypatch):
     monkeypatch.setenv("XAGENT_TASK_AUTO_RESUME_ENABLED", "false")
+    monkeypatch.setattr(task_auto_resume, "_last_inflight", 7)
     now = utc_now()
     with factory() as db:
         task_id, trigger_run_id = _trigger_task(db, now, due_in=3_600)
         moved = _seed(db, now, state_version=PV + 1)
-        # Dispatched rows are left to the claim-time guard.
-        dispatched = _dispatched(db, now, command_status="failed")
         db.commit()
 
     report = run_auto_resume_tick(now=now)
 
     assert report.inflight is None
+    assert task_auto_resume._last_inflight == 0
     row = _row(factory, task_id)
     assert (row.state, row.state_detail) == ("manual", "auto_resume_disabled")
     assert row.next_attempt_at is None
@@ -1271,10 +1307,59 @@ def test_switch_off_drains_scheduled_rows_to_manual(factory, notified, monkeypat
     assert run.status == TriggerRunStatus.FAILED.value
     assert run.error_message == TASK_AUTO_RESUME_DISABLED_TRIGGER_ERROR
     assert _row(factory, moved).state == "stale"
-    assert _row(factory, dispatched).state == "dispatched"
     assert _commands(factory, task_id) == []
     assert [n.auto_resume["stop_reason"] for n in report.notices] == ["disabled"]
     assert notified == []
+
+
+@pytest.mark.parametrize("command_status", ["completed", "failed", None])
+def test_switch_off_closes_a_dispatch_whose_command_ended(
+    factory, notified, monkeypatch, command_status
+):
+    monkeypatch.setenv("XAGENT_TASK_AUTO_RESUME_ENABLED", "false")
+    now = utc_now()
+    with factory() as db:
+        task_id = _dispatched(db, now, command_status=command_status)
+        user = db.get(User, db.get(Task, task_id).user_id)
+        trigger_run_id, _later = _trigger(db, user, task_id)
+        db.commit()
+
+    report = run_auto_resume_tick(now=now)
+
+    row = _row(factory, task_id)
+    assert (row.state, row.state_detail) == ("manual", "auto_resume_disabled")
+    assert [e.event for e in _events(factory, task_id)] == ["skipped_disabled"]
+    run = _trigger_run(factory, trigger_run_id)
+    assert (run.status, run.error_message) == (
+        TriggerRunStatus.FAILED.value,
+        TASK_AUTO_RESUME_DISABLED_TRIGGER_ERROR,
+    )
+    assert [n.auto_resume["stop_reason"] for n in report.notices] == ["disabled"]
+
+
+def test_switch_off_leaves_a_queued_dispatch_to_the_claim_guard(
+    factory, notified, monkeypatch
+):
+    monkeypatch.setenv("XAGENT_TASK_AUTO_RESUME_ENABLED", "false")
+    now = utc_now()
+    with factory() as db:
+        queued = _dispatched(db, now, command_status="pending")
+        moved = _dispatched(db, now, command_status="completed", state_version=PV + 2)
+        db.commit()
+
+    report = run_auto_resume_tick(now=now)
+
+    assert (report.rearmed, report.confirmed) == (1, 1)
+    row = _row(factory, queued)
+    assert row.state == "dispatched"
+    assert _aware(row.next_attempt_at) == now + timedelta(
+        seconds=DISPATCH_CHECK_GRACE_SECONDS
+    )
+    assert (_row(factory, moved).state, _row(factory, moved).next_attempt_at) == (
+        "dispatched",
+        None,
+    )
+    assert _events(factory, queued) == []
 
 
 # --------------------------------------------------------------------------
@@ -1432,3 +1517,309 @@ def test_user_commands_queue_behind_a_pending_auto_resume(factory, notified):
         claimed.append(second.command_id)
 
     assert claimed == [auto_resume_command_id(PV, 1, RUN), "message-1"]
+
+
+def test_transport_refuses_the_reserved_prefix_to_every_caller_but_the_sweeper(
+    factory,
+):
+    from xagent.web.services.task_command_transport import (
+        TaskCommandKind,
+        enqueue_task_command,
+        stage_task_command,
+    )
+
+    now = utc_now()
+    with factory() as db:
+        task_id = _seed(db, now)
+        user_id = int(db.get(Task, task_id).user_id)
+        db.commit()
+    for kind in (TaskCommandKind.RESUME, TaskCommandKind.MESSAGE):
+        with factory() as db:
+            with pytest.raises(ValueError, match="reserved"):
+                stage_task_command(
+                    db,
+                    task_id=task_id,
+                    actor_user_id=user_id,
+                    command_id=" auto-resume:5:1:run",
+                    kind=kind,
+                    payload={},
+                )
+            with pytest.raises(ValueError, match="reserved"):
+                enqueue_task_command(
+                    db,
+                    task_id=task_id,
+                    actor_user_id=user_id,
+                    command_id="auto-resume:5:1:run",
+                    kind=kind,
+                    payload={},
+                )
+    assert _commands(factory, task_id) == []
+    with factory() as db:
+        staged = stage_task_command(
+            db,
+            task_id=task_id,
+            actor_user_id=user_id,
+            command_id="auto-resume:5:1:run",
+            kind=TaskCommandKind.RESUME,
+            payload={},
+            reserved=True,
+        )
+        db.commit()
+    assert staged.created
+
+
+# --------------------------------------------------------------------------
+# Tick robustness
+# --------------------------------------------------------------------------
+
+
+def test_nothing_due_costs_one_exists_and_no_counts(factory, notified, monkeypatch):
+    now = utc_now()
+    with factory() as db:
+        _seed(db, now, due_in=60)
+        _seed(db, now, state="dispatched", due_in=60, run_id="run-b")
+        _seed(db, now, state="manual", due_in=None, run_id="run-c")
+        db.commit()
+
+    def unexpected(*_args, **_kwargs):
+        raise AssertionError("the inert tick must stop at the EXISTS")
+
+    monkeypatch.setattr(task_auto_resume, "count_inflight", unexpected)
+    monkeypatch.setattr(task_auto_resume, "_for_each_candidate", unexpected)
+
+    report = run_auto_resume_tick(now=now)
+
+    assert (report.dispatched, report.inflight) == (0, None)
+
+
+@pytest.mark.parametrize("enabled", ["true", "false"])
+def test_due_dispatched_rows_alone_make_the_tick_run(
+    factory, notified, monkeypatch, enabled
+):
+    monkeypatch.setenv("XAGENT_TASK_AUTO_RESUME_ENABLED", enabled)
+    now = utc_now()
+    with factory() as db:
+        task_id = _dispatched(db, now, command_status="pending")
+        db.commit()
+
+    assert run_auto_resume_tick(now=now).rearmed == 1
+    assert _aware(_row(factory, task_id).next_attempt_at) > now
+
+
+def test_dispatch_cas_requires_the_row_to_still_be_scheduled(
+    factory, notified, monkeypatch
+):
+    # Another sweeper closed the row (here: drained it with the switch off)
+    # without touching the task or the counters.
+    now = utc_now()
+    with factory() as db:
+        task_id = _seed(db, now)
+        db.commit()
+
+    def drained(db: Session) -> None:
+        db.get(TaskAutoRecovery, task_id).state = "manual"
+
+    result = _process_with_stale_view(factory, monkeypatch, task_id, now, drained)
+
+    assert result.outcome is task_auto_resume._Outcome.RACED
+    assert _commands(factory, task_id) == []
+    assert _row(factory, task_id).state == "manual"
+
+
+def test_dispatch_cas_pins_the_attempt_it_read(factory, notified, monkeypatch):
+    now = utc_now()
+    with factory() as db:
+        task_id = _seed(db, now)
+        db.commit()
+
+    def dispatched_meanwhile(db: Session) -> None:
+        db.get(TaskAutoRecovery, task_id).total_resumes = 1
+
+    result = _process_with_stale_view(
+        factory, monkeypatch, task_id, now, dispatched_meanwhile
+    )
+
+    assert result.outcome is task_auto_resume._Outcome.RACED
+    assert _commands(factory, task_id) == []
+    assert _row(factory, task_id).total_resumes == 1
+
+
+def test_naive_now_is_read_as_utc(factory, notified):
+    now = utc_now()
+    with factory() as db:
+        due = _seed(db, now, due_in=-1)
+        later = _seed(db, now, due_in=30, run_id="run-later")
+        db.commit()
+
+    report = run_auto_resume_tick(now=now.replace(tzinfo=None))
+
+    assert report.dispatched == 1
+    assert _row(factory, due).state == "dispatched"
+    assert _row(factory, later).state == "scheduled"
+    assert _aware(_row(factory, due).next_attempt_at) == now + timedelta(
+        seconds=DISPATCH_CHECK_GRACE_SECONDS
+    )
+
+
+def test_pool_timeout_aborts_the_tick_and_is_not_a_candidate_failure(
+    factory, notified, monkeypatch
+):
+    from sqlalchemy.exc import TimeoutError as PoolTimeout
+
+    now = utc_now()
+    with factory() as db:
+        first = _seed(db, now, due_in=-10)
+        second = _seed(db, now, due_in=-5)
+        db.commit()
+    failures: list[str] = []
+    real_counter = task_auto_resume.increment_counter
+    monkeypatch.setattr(
+        task_auto_resume,
+        "increment_counter",
+        lambda name, **kw: (failures.append(name), real_counter(name, **kw)),
+    )
+
+    def exhausted(db, task):
+        raise PoolTimeout("QueuePool limit reached")
+
+    monkeypatch.setattr(task_auto_resume, "auto_recovery_eligibility", exhausted)
+
+    with pytest.raises(PoolTimeout):
+        run_auto_resume_tick(now=now)
+
+    assert "xagent.task.auto_resume.candidate_failed" not in failures
+    assert _row(factory, first).state == "scheduled"
+    assert _row(factory, second).state == "scheduled"
+
+
+def test_integrity_error_while_staging_is_a_race_and_writes_nothing(
+    factory, notified, monkeypatch
+):
+    now = utc_now()
+    with factory() as db:
+        task_id = _seed(db, now)
+        db.commit()
+
+    def conflict(*_args, **_kwargs):
+        raise sa.exc.IntegrityError("INSERT", {}, Exception("duplicate"))
+
+    monkeypatch.setattr(task_auto_resume, "stage_task_command", conflict)
+
+    report = run_auto_resume_tick(now=now)
+
+    assert (report.dispatched, report.raced, report.failed) == (0, 1, 0)
+    row = _row(factory, task_id)
+    assert (row.state, row.total_resumes) == ("scheduled", 0)
+    assert _events(factory, task_id) == []
+    assert notified == []
+
+
+def test_notify_fires_even_when_the_tick_fails_after_a_dispatch(
+    factory, notified, monkeypatch
+):
+    from sqlalchemy.exc import TimeoutError as PoolTimeout
+
+    now = utc_now()
+    with factory() as db:
+        first = _seed(db, now, due_in=-10)
+        _seed(db, now, due_in=-5, run_id="run-second")
+        db.commit()
+    real = task_auto_resume._process_due_candidate_no_commit
+    calls = 0
+
+    def second_times_out(db, task_id, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise PoolTimeout("QueuePool limit reached")
+        return real(db, task_id, **kwargs)
+
+    monkeypatch.setattr(
+        task_auto_resume, "_process_due_candidate_no_commit", second_times_out
+    )
+
+    with pytest.raises(PoolTimeout):
+        run_auto_resume_tick(now=now)
+
+    assert _row(factory, first).state == "dispatched"
+    assert notified == [1]
+
+
+def test_scan_and_housekeeping_limits_bound_each_tick(factory, notified, monkeypatch):
+    monkeypatch.setenv("XAGENT_TASK_AUTO_RESUME_MAX_PER_TICK", "1")
+    now = utc_now()
+    with factory() as db:
+        # Housekeeping takes at most MAX_PER_TICK rows.
+        queued = [
+            _dispatched(db, now, command_status="pending", due_in=-10 + i)
+            for i in range(2)
+        ]
+        # The scan takes at most 4 x MAX_PER_TICK rows, give-ups included.
+        expired = [
+            _seed(
+                db,
+                now,
+                due_in=-20 + i,
+                interrupted_ago=86_400 + 60,
+                run_id=f"run-{i}",
+            )
+            for i in range(5)
+        ]
+        db.commit()
+
+    report = run_auto_resume_tick(now=now)
+
+    assert report.rearmed == 1
+    assert [_aware(_row(factory, t).next_attempt_at) > now for t in queued] == [
+        True,
+        False,
+    ]
+    assert report.gave_up == 4
+    assert [_row(factory, t).state for t in expired] == ["expired"] * 4 + ["scheduled"]
+
+
+def test_failure_while_postponing_after_a_full_queue_fails_the_tick(
+    factory, notified, monkeypatch
+):
+    def full(_db, _command):
+        raise AdmissionQueueFull("Execution queue is full")
+
+    def broken(*_args, **_kwargs):
+        raise RuntimeError("postpone failed")
+
+    monkeypatch.setattr(
+        "xagent.web.services.task_execution_admission.stage_task_admission", full
+    )
+    monkeypatch.setattr(task_auto_resume, "_postpone_after_admission_full", broken)
+    now = utc_now()
+    with factory() as db:
+        task_id = _seed(db, now)
+        db.commit()
+
+    with pytest.raises(RuntimeError, match="postpone failed"):
+        run_auto_resume_tick(now=now)
+
+    # Nothing committed: the row is still due and the next tick retries it.
+    row = _row(factory, task_id)
+    assert (row.state, row.total_resumes) == ("scheduled", 0)
+    assert _aware(row.next_attempt_at) == now - timedelta(seconds=1)
+    assert notified == []
+
+
+def test_dispatch_delay_is_observed(factory, notified, monkeypatch):
+    observed: list[tuple[str, float, str]] = []
+    monkeypatch.setattr(
+        task_auto_resume,
+        "observe_value",
+        lambda name, value, *, unit, attributes=None: observed.append(
+            (name, value, unit)
+        ),
+    )
+    now = utc_now()
+    with factory() as db:
+        _seed(db, now, due_in=-12)
+        db.commit()
+
+    run_auto_resume_tick(now=now)
+
+    assert observed == [("xagent.task.auto_resume.dispatch_delay_seconds", 12.0, "s")]

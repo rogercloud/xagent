@@ -3609,6 +3609,21 @@ async def resume_task(
                 or receipt_interaction_id != active_interaction_id
                 or not receipt_responder_identity
             ):
+                if auto_resume is not None:
+                    # The sweeper cannot answer the question; the run waits
+                    # for its user. Not an error to anyone: housekeeping
+                    # sees the unchanged fence and schedules or stops it.
+                    logger.info(
+                        "auto resume skipped task_id=%s run_id=%s "
+                        "why=interaction_pending component=auto-resume",
+                        task_id,
+                        task_fields.run_id,
+                    )
+                    return ResumeCommandResult(
+                        ResumeCommandOutcome.AUTO_SKIPPED,
+                        "Automatic resume skipped (interaction_pending)",
+                        reason_code="interaction_pending",
+                    )
                 from . import ops_signals
 
                 ops_signals.register_degradation(

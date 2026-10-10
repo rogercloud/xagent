@@ -1738,7 +1738,7 @@ async def _enqueue_websocket_task_command(
             "Reserved field 'auto_resume' is not accepted from clients",
             error_code=ClientErrorCode.INVALID_MESSAGE,
         )
-    if is_auto_resume_command_id(resolved_command_id):
+    if is_auto_resume_command_id(resolved_command_id.strip()):
         raise ClientVisibleValidationError(
             "Command ids starting with 'auto-resume:' are reserved",
             error_code=ClientErrorCode.INVALID_MESSAGE,
