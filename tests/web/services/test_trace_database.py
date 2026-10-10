@@ -13,11 +13,14 @@ from sqlalchemy.pool import QueuePool
 from xagent.web.services import trace_database, trace_handlers
 from xagent.web.services.trace_database import TraceDatabaseRuntime
 
-# Blocked workers wait on ``release`` without a timeout: a worker that gives up
-# returns its permit and lets queued work in, which on a stalled CI runner looks
-# exactly like an admission bug. Tests always release in ``finally`` and
-# pytest-timeout guards real hangs. This bound only covers loop-side waits,
-# where expiry fails the test instead of changing what it measures.
+# A blocked worker that gives up returns its permit and lets queued work in,
+# which on a stalled CI runner looks exactly like an admission bug. Tests set
+# ``release`` in ``finally``, so workers wait far beyond any realistic stall;
+# the bound (below pytest-timeout) only stops a missed release from keeping the
+# default executor, and with it the pytest process, alive after a failure.
+WORKER_RELEASE_BOUND = 240
+# Loop-side waits, where expiry fails the test instead of changing what it
+# measures.
 HANG_TIMEOUT = 30
 
 
@@ -46,7 +49,7 @@ async def test_admission_precedes_thread_submission_and_keeps_context(monkeypatc
             peak = max(peak, active)
         started.append(context.get())
         try:
-            release.wait()
+            release.wait(WORKER_RELEASE_BOUND)
         finally:
             with active_lock:
                 active -= 1
@@ -82,7 +85,7 @@ async def test_handler_cancellation_drains_before_releasing_admission(
 
     def write(event):
         started.append(event.id)
-        release.wait()
+        release.wait(WORKER_RELEASE_BOUND)
 
     monkeypatch.setattr(handler, "_sync_save_to_database", write)
     events = [
@@ -117,13 +120,14 @@ async def test_close_drains_accepted_writes_and_rejects_new_work():
 
     def write():
         started.set()
-        release.wait()
+        release.wait(WORKER_RELEASE_BOUND)
 
     work = asyncio.create_task(runtime.run(write, lambda db: None))
-    await wait_until(started.is_set)
-    close = asyncio.create_task(runtime.close())
-    await wait_until(lambda: runtime._closing)
+    close = None
     try:
+        await wait_until(started.is_set)
+        close = asyncio.create_task(runtime.close())
+        await wait_until(lambda: runtime._closing)
         with pytest.raises(RuntimeError, match="closing"):
             await runtime.run(lambda: None, lambda db: None)
         close.cancel()
@@ -132,8 +136,9 @@ async def test_close_drains_accepted_writes_and_rejects_new_work():
     finally:
         release.set()
         await work
-        with pytest.raises(asyncio.CancelledError):
-            await close
+        if close is not None:
+            with pytest.raises(asyncio.CancelledError):
+                await close
         await runtime.close()
 
 
@@ -174,7 +179,7 @@ async def test_preparation_is_bounded_drained_and_precedes_connection(
     def prepare(trace):
         prepared.append(context.get())
         started.set()
-        release.wait()
+        release.wait(WORKER_RELEASE_BOUND)
         return lambda db: None
 
     monkeypatch.setattr(handler, "_prepare_async_trace_transaction", prepare)
