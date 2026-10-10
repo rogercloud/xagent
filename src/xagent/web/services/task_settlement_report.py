@@ -15,8 +15,8 @@ class SettlementReport:
     Two uses. A caller-supplied report is passed to a settle/finalize function
     (``settle_task_lease_isolated``, ``_settle_resumed_task_lease``,
     ``finalize_managed_task_lease_result``) and filled only after that call's
-    commit succeeds, by assignment, so a reused report holds nothing from an
-    earlier attempt. The function's bool return is the commit signal: an empty
+    commit succeeds. Callers create one report per settlement call: a fill
+    writes only the fields its outcome sets. The function's bool return is the commit signal: an empty
     report does not by itself mean "not committed". A report is also returned
     by ``_finalize_resumed_task`` and ``_TaskExecutionFinalization``, which
     carry non-pause outcomes too.

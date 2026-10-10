@@ -233,8 +233,9 @@ def _is_known_non_error_event_type(
 def _is_settlement_report_control_state(
     expr: ast.expr, parents: dict[ast.AST, ast.AST]
 ) -> bool:
-    """``<name>.control_state`` where every binding of ``name`` is a fresh
-    ``SettlementReport(...)``; a parameter or any other binding is not trusted."""
+    """``<name>.control_state`` where every binding of ``name`` is a fresh,
+    empty ``SettlementReport()``; a report built with arguments, a parameter
+    or any other binding is not trusted."""
     if not (
         isinstance(expr, ast.Attribute)
         and expr.attr == "control_state"
@@ -248,6 +249,8 @@ def _is_settlement_report_control_state(
         isinstance(binding, ast.Call)
         and isinstance(binding.func, ast.Name)
         and binding.func.id == "SettlementReport"
+        and not binding.args
+        and not binding.keywords
         for binding in bindings
     )
 

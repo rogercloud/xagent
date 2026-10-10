@@ -1209,6 +1209,10 @@ def test_guard_trusts_control_state_of_a_fresh_settlement_report() -> None:
         pytest.param("pass", id="parameter"),
         pytest.param("report = load_report()", id="rebound-to-other-call"),
         pytest.param(
+            "report = SettlementReport(control_state={'message': str(exc)})",
+            id="built-with-arguments",
+        ),
+        pytest.param(
             "report = SettlementReport() if websocket else other",
             id="rebound-conditionally",
         ),
