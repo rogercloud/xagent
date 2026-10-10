@@ -230,6 +230,10 @@ def _is_known_non_error_event_type(
     )
 
 
+# Variables bound to a ``SettlementReport`` at the event producers.
+_SETTLEMENT_REPORT_NAMES = frozenset({"report", "settlement_report"})
+
+
 def _dict_variants(
     expr: ast.expr,
     reference: ast.AST,
@@ -298,6 +302,15 @@ def _dict_variants(
                 resolving | {expr.id},
             )
         ]
+    if (
+        isinstance(expr, ast.Attribute)
+        and expr.attr == "control_state"
+        and isinstance(expr.value, ast.Name)
+        and expr.value.id in _SETTLEMENT_REPORT_NAMES
+    ):
+        # ``SettlementReport.control_state`` holds only committed control
+        # identity (run_id, state_version, control_state, status).
+        return [({}, set())]
     if not isinstance(expr, ast.Dict):
         return [({}, SENSITIVE_PAYLOAD_FIELDS.copy())]
 
