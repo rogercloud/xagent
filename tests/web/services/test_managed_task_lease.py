@@ -5,7 +5,6 @@ import asyncio
 import inspect
 import logging
 import threading
-from functools import partial
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -35,7 +34,6 @@ from xagent.web.services.task_lease_service import (
     TaskLeaseHeartbeatOutcome,
     acquire_task_lease,
 )
-from xagent.web.services.task_settlement_report import SettlementReport
 
 
 @pytest.fixture()
@@ -129,37 +127,6 @@ def test_finalize_managed_result_rejects_replacement_owner(db_session) -> None:
         .count()
         == 0
     )
-
-
-def test_finalize_managed_result_leaves_the_report_empty_without_a_pause(
-    db_session,
-) -> None:
-    task = _create_task(db_session)
-    lease = acquire_task_lease(db_session, int(task.id), new_run=True)
-    assert lease is not None
-    report = SettlementReport()
-    finalize = partial(
-        finalize_managed_task_lease_result,
-        db_session,
-        lease,
-        status=TaskStatus.COMPLETED,
-        assistant_content="done",
-        settle_interruption=True,
-        report=report,
-    )
-
-    # The commit fails: nothing is reported and the error propagates.
-    with patch.object(db_session, "commit", side_effect=RuntimeError("boom")):
-        with pytest.raises(RuntimeError, match="boom"):
-            finalize()
-    assert report == SettlementReport()
-
-    # The fence misses (replacement owner): nothing is reported either.
-    task.runner_id = "replacement-runner"
-    task.run_id = "replacement-run"
-    db_session.commit()
-    assert finalize() is False
-    assert report == SettlementReport()
 
 
 @pytest.mark.asyncio

@@ -1913,7 +1913,7 @@ def settle_task_lease_isolated(
                     if paused_state is not None:
                         settle_db.commit()
                         if report is not None:
-                            report.control_state.update(paused_state)
+                            report.control_state = dict(paused_state)
                             report.paused_for = decision.reason
                         invalidate_task_cache_best_effort(lease.task_id)
                         return True
@@ -1987,7 +1987,7 @@ def settle_task_lease_isolated(
                     )
                     settle_db.commit()
                     if report is not None:
-                        report.control_state.update(event_state)
+                        report.control_state = dict(event_state)
                     invalidate_task_cache_best_effort(lease.task_id)
                     return True
 

@@ -412,11 +412,15 @@ def test_run_without_checkpoint_fails_as_before(canonical):
     assert settled and not report.paused
     task, row, _events = _state(factory, tid)
     assert task.status == TaskStatus.FAILED
+    # The fail branch reports the committed FAILED control identity.
+    assert report.control_state["status"] == "failed"
+    assert report.control_state["run_id"] == lease.run_id
+    assert report.control_state["state_version"] == task.state_version
     assert task.error_message == RUN_ERROR
     assert (row.reason, row.state) == ("not_recoverable", "manual")
 
 
-def test_report_stays_empty_when_the_fenced_pause_misses(canonical):
+def test_report_stays_empty_when_the_lease_no_longer_owns_the_run(canonical):
     factory, tid = canonical
     lease = _start_run(factory, tid)
     _checkpoint(factory, tid, lease.run_id)
@@ -429,6 +433,25 @@ def test_report_stays_empty_when_the_fenced_pause_misses(canonical):
     settled, report = _settle(lease, interruption=_persistence_interruption())
 
     assert not settled
+    assert report == SettlementReport()
+
+
+def test_report_stays_empty_when_the_fenced_pause_write_misses(canonical, monkeypatch):
+    factory, tid = canonical
+    lease = _start_run(factory, tid)
+    _checkpoint(factory, tid, lease.run_id)
+    with factory() as db:
+        db.get(Task, tid).control_state = "pause_requested"
+        db.commit()
+    # The decision is to pause, but the fenced PAUSED write matches no row.
+    monkeypatch.setattr(
+        orchestrator,
+        "pause_and_release_task_lease_no_commit",
+        lambda _db, _lease: False,
+    )
+
+    _settled, report = _settle(lease, interruption=_persistence_interruption())
+
     assert report == SettlementReport()
 
 

@@ -15,9 +15,10 @@ unsuccessful result, so the result paths carry them: a new run's
 from __future__ import annotations
 
 import asyncio
+import contextlib
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import AsyncMock, Mock
+from unittest.mock import AsyncMock, Mock, patch
 
 import httpx
 import openai
@@ -362,7 +363,7 @@ async def test_invalid_tool_protocol_resume_samples_the_model_again(
             ("interrupted", "failed")
         ]
         return
-    assert finalized.report.paused_for is (InterruptionReason.MODEL_OUTPUT_INVALID)
+    assert finalized.report.paused_for is InterruptionReason.MODEL_OUTPUT_INVALID
     _assert_paused(factory, tid, lease, reason="model_output_invalid")
     assert _settled_facts(factory, tid) == [PAUSED_FACT]
     assert _assistant_lines(factory, tid) == []
@@ -638,7 +639,14 @@ def _completed_channel_command(factory, ids, lease) -> tuple[int, dict[str, Any]
 
 
 def _settle_channel(
-    factory, ids, lease, result, *, settle_interruption: bool = True
+    factory,
+    ids,
+    lease,
+    result,
+    *,
+    settle_interruption: bool = True,
+    report: SettlementReport | None = None,
+    finalize_context: Any = None,
 ) -> None:
     """Settle ``result`` as the shared channel leaf does, completing a real
     channel command (its ``channel_result`` and the task output included)."""
@@ -650,7 +658,7 @@ def _settle_channel(
         "output": projection.transcript_content,
         "completion_outcome": projection.completion_outcome,
     }
-    with factory() as db:
+    with factory() as db, finalize_context or contextlib.nullcontext():
         assert finalize_managed_task_lease_result(
             db,
             lease,
@@ -663,6 +671,7 @@ def _settle_channel(
             execution_result=dict(result),
             completion=(command_id, durable_result),
             settle_interruption=settle_interruption,
+            report=report,
         )
 
 
@@ -696,6 +705,41 @@ def _without_settled_reason(projection: dict[str, Any], reason: str):
     for fact in projection["settled"]:
         assert fact["result"].pop("interruption_reason") == reason
     return projection
+
+
+def test_channel_pause_fills_the_report_after_the_commit(canonical):
+    factory, _tid = canonical
+    ids = _projected_task(factory)
+    lease = _prepare_run(factory, ids)
+    report = SettlementReport()
+
+    _settle_channel(factory, ids, lease, LLM_RESULT, report=report)
+
+    assert report.paused_for is InterruptionReason.LLM_UNAVAILABLE
+    assert report.control_state["status"] == "paused"
+    assert report.control_state["run_id"] == lease.run_id
+
+
+def test_channel_pause_leaves_the_report_empty_when_the_commit_fails(canonical):
+    factory, _tid = canonical
+    ids = _projected_task(factory)
+    lease = _prepare_run(factory, ids)
+    report = SettlementReport()
+
+    def failing_commit(self):
+        raise RuntimeError("commit failed")
+
+    with pytest.raises(RuntimeError, match="commit failed"):
+        _settle_channel(
+            factory,
+            ids,
+            lease,
+            LLM_RESULT,
+            report=report,
+            finalize_context=patch("sqlalchemy.orm.Session.commit", failing_commit),
+        )
+
+    assert report == SettlementReport()
 
 
 @PAUSE_CASES

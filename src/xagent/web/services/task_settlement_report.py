@@ -10,15 +10,21 @@ from ...core.agent.interruption import InterruptionReason
 
 @dataclass
 class SettlementReport:
-    """What a settlement committed, filled only after its commit succeeds.
+    """What a settlement committed, for the caller that announces it.
 
-    Callers create an empty report, pass it in, and read it after the call.
-    It stays empty when the settlement did not commit (fence missed, commit
-    failed, nothing to settle).
+    Two uses. A caller-supplied report is passed to a settle/finalize function
+    (``settle_task_lease_isolated``, ``_settle_resumed_task_lease``,
+    ``finalize_managed_task_lease_result``) and filled only after that call's
+    commit succeeds, by assignment, so a reused report holds nothing from an
+    earlier attempt. The function's bool return is the commit signal: an empty
+    report does not by itself mean "not committed". A report is also returned
+    by ``_finalize_resumed_task`` and ``_TaskExecutionFinalization``, which
+    carry non-pause outcomes too.
 
-    ``control_state`` is the committed V2 control identity, so the caller can
-    publish without re-reading the latest state. ``paused_for`` is the
-    recorded reason of a committed interruption pause.
+    ``control_state`` is the committed V2 control identity, filled where a
+    caller publishes it; it may be empty after a commit (a non-V2 row, or the
+    managed path for a non-pause outcome). ``paused_for`` is the recorded
+    reason of a committed interruption pause, and is set only then.
     """
 
     control_state: dict[str, Any] = field(default_factory=dict)

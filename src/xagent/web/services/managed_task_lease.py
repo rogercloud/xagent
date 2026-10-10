@@ -224,7 +224,7 @@ def finalize_managed_task_lease_result(
 
     if paused_state is not None and interruption is not None:
         if report is not None:
-            report.control_state.update(paused_state)
+            report.control_state = dict(paused_state)
             report.paused_for = interruption.reason
         logger.warning(
             "task_id=%s run_id=%s component=settlement paused interrupted "

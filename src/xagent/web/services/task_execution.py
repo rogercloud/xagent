@@ -3311,7 +3311,6 @@ async def execute_resume_background(
     # Set when a cancellation or lease loss lands after the deferred turn was
     # durably accepted; the handlers below record the acceptance.
     delivery_accepted_unrecorded = False
-    report = SettlementReport()
 
     async def notify_deferred_delivery(
         accepted: bool,
