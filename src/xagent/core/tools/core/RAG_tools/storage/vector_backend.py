@@ -88,11 +88,11 @@ def require_implemented_vector_backend(backend: VectorBackend) -> None:
     Raises:
         ConfigurationError: If the backend is known but not implemented yet.
     """
-    if backend is VectorBackend.LANCEDB:
+    if backend in (VectorBackend.LANCEDB, VectorBackend.MILVUS):
         return
     raise ConfigurationError(
         f"KB engine {backend.value!r} is not implemented yet. "
-        f"Set {VECTOR_BACKEND_ENV}=lancedb (default)."
+        f"Set {VECTOR_BACKEND_ENV} to lancedb (default) or milvus."
     )
 
 
@@ -123,7 +123,7 @@ def _detect_engine(
 
     conn = None
     try:
-        # Uncached, so a Celery parent does not fork with an open connection.
+        # Not the cached connection: the finally below closes this one.
         conn = lancedb.connect(db_dir)
         names = list_table_names(conn)
     except Exception as exc:  # noqa: BLE001 - unlistable KB data is unreachable

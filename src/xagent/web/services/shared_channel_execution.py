@@ -16,6 +16,7 @@ from sqlalchemy.exc import TimeoutError as DatabaseTimeoutError
 from sqlalchemy.orm import Session
 
 from ...config import get_task_reply_wait_timeout_seconds
+from ...core.agent.interruption import InterruptionReason
 from ...core.agent.trace import (
     TraceAction,
     TraceCategory,
@@ -48,6 +49,7 @@ from .db_runtime import (
     cancel_and_drain_async_task,
     run_db_io_cancellation_safe,
 )
+from .execution_result_projection import interrupted_channel_result
 from .task_command_transport import (
     ClaimedTaskCommand,
     TaskCommandKind,
@@ -278,7 +280,7 @@ class SharedChannelTurn:
         self.register_trace_handler(trace_handler)
         bridge = get_task_event_bridge()
         if self.stop_requested:
-            return {"success": True, "status": "interrupted"}
+            return interrupted_channel_result()
         acceptance = asyncio.create_task(
             asyncio.to_thread(_accept_channel_turn, self, payload, bridge.host_id)
         )
@@ -317,7 +319,7 @@ class SharedChannelTurn:
                 retry_delay = min(retry_delay * 2, 5.0)
                 continue
             except TaskLeaseLostError:
-                return {"success": True, "status": "interrupted"}
+                return interrupted_channel_result()
             unavailable_since = None
             retry_delay = 0.25
             if result is not None:
@@ -525,7 +527,7 @@ def _read_channel_result(command_id: int, run_id: str) -> dict[str, Any] | None:
         # Crash recovery or a control command can settle without reaching the
         # execution leaf. Its persisted state still terminates this exact wait.
         if task.status == TaskStatus.PAUSED:
-            return {"success": True, "status": "interrupted"}
+            return interrupted_channel_result()
         return {
             "success": task.status == TaskStatus.COMPLETED,
             "status": task.status.value,
@@ -751,6 +753,9 @@ async def execute_channel_background(
             },
         }
 
+        paused_for: list[InterruptionReason] = []
+        paused_state: dict[str, Any] = {}
+
         def finalize() -> bool:
             with get_session_local()() as db:
                 return finalize_managed_task_lease_result(
@@ -764,10 +769,24 @@ async def execute_channel_background(
                     error_message=projection.diagnostic_error,
                     execution_result=result,
                     completion=(command.id, durable_result),
+                    # An interrupted run may rest PAUSED instead; its channel
+                    # then reads "interrupted", as after lease recovery.
+                    settle_interruption=True,
+                    paused_for=paused_for,
+                    terminal_event_state=paused_state,
                 )
 
         if not await run_db_io_cancellation_safe(finalize):
             raise TaskLeaseLostError("Channel result no longer owns its execution")
+        if paused_for:
+            # The channel has its "interrupted" reply; a web viewer of the
+            # task learns of the committed pause here. Best effort, as on
+            # the other settlement paths: a failed broadcast is only logged.
+            from .task_orchestrator import publish_interruption_pause
+
+            await publish_interruption_pause(
+                command.task_id, paused_state, paused_for[0]
+            )
     finally:
         service.tracer.remove_handler(forwarder)
         try:
