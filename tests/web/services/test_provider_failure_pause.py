@@ -1135,6 +1135,12 @@ async def _run_shared_channel_turn(
         async with asyncio.timeout(10):
             while shared._read_channel_result(command.id, selected.run_id) is None:
                 await asyncio.sleep(0.01)
+            # The channel result commits with the settlement, before the run
+            # broadcasts it; let the run finish rather than have shutdown
+            # cancel it mid-broadcast.
+            await asyncio.gather(
+                *task_execution.background_task_manager.running_tasks.values()
+            )
     finally:
         await task_coordinator_runtime.close_task_coordinators()
         await task_execution.background_task_manager.shutdown()
