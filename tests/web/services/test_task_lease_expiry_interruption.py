@@ -743,6 +743,9 @@ def test_progress_after_dispatch_starts_an_episode_but_keeps_the_total(factory):
         # Only the sweeper's RESUME counts as automatic; a forged id on any
         # other kind is a person's command.
         ("auto-resume:3:9:run", "message"),
+        # The reserved prefix is case-sensitive, as the transport checks it;
+        # SQLite's LIKE would match this one.
+        ("AUTO-RESUME:3:9:run", "resume"),
     ],
 )
 def test_user_command_after_dispatch_restarts_every_counter(factory, command_id, kind):

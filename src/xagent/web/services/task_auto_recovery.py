@@ -326,7 +326,7 @@ def _user_command_since_dispatch(
 
     if last_command_id is None:
         return False
-    from sqlalchemy import and_, select
+    from sqlalchemy import and_, func, select
 
     from ..models.task_command import TaskExecutionCommand
 
@@ -345,7 +345,16 @@ def _user_command_since_dispatch(
             TaskExecutionCommand.id > dispatched_id,
             ~and_(
                 TaskExecutionCommand.kind == "resume",
-                TaskExecutionCommand.command_id.startswith(AUTO_RESUME_COMMAND_PREFIX),
+                # Exact, case-sensitive prefix, as ``_normalize_command_id``
+                # checks it: ``startswith`` compiles to LIKE, which ignores
+                # ASCII case on SQLite, so a person's ``AUTO-RESUME:...``
+                # RESUME would pass for the sweeper's.
+                func.substr(
+                    TaskExecutionCommand.command_id,
+                    1,
+                    len(AUTO_RESUME_COMMAND_PREFIX),
+                )
+                == AUTO_RESUME_COMMAND_PREFIX,
             ),
         )
         .limit(1)
