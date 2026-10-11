@@ -652,6 +652,63 @@ async def test_dispatched_command_for_a_moved_task_completes_as_auto_skipped(
     assert _row(factory, task_id).state == "stale"
 
 
+@pytest.mark.asyncio
+async def test_dispatched_command_for_a_rotated_run_completes_as_auto_skipped(
+    factory, handler, monkeypatch
+):
+    """The dispatcher's run-identity check would reject a RESUME whose run
+    rotated as ``stale_run``; the sweeper's own goes to its claim guard, which
+    closes the recovery row instead of leaving it ``dispatched``."""
+    monkeypatch.setattr(
+        task_auto_resume, "notify_task_command_dispatcher", lambda: None
+    )
+    task_id = _scheduled(factory)
+    assert run_auto_resume_tick(now=utc_now()).dispatched == 1
+    # A new message started a new run, which has since paused again.
+    with factory() as db:
+        db.get(Task, task_id).run_id = f"rotated-{uuid.uuid4().hex}"
+        db.commit()
+    broadcasts = AsyncMock()
+    monkeypatch.setattr(commands, "_broadcast_terminal_command_error", broadcasts)
+
+    command = await _dispatch_auto_command(factory, task_id)
+
+    assert command.status == "completed"
+    assert command.result["resume_outcome"] == "auto_skipped"
+    assert command.error is None
+    broadcasts.assert_not_awaited()
+    handler.background.assert_not_called()
+    assert _row(factory, task_id).state == "stale"
+
+
+@pytest.mark.asyncio
+async def test_an_ordinary_resume_for_a_rotated_run_is_still_rejected(factory, handler):
+    task_id = _scheduled(factory)
+    with factory() as db:
+        task = db.get(Task, task_id)
+        db.add(
+            TaskExecutionCommand(
+                task_id=task_id,
+                command_id="resume-by-hand",
+                kind="resume",
+                payload={"type": "resume_task"},
+                status="pending",
+                actor_user_id=task.user_id,
+                target_run_id="an-older-run",
+            )
+        )
+        db.commit()
+
+    command = await _dispatch_auto_command(factory, task_id)
+
+    assert command.status == "failed"
+    assert command.error == (
+        "Task run changed before resume command resume-by-hand was applied"
+    )
+    handler.background.assert_not_called()
+    assert _row(factory, task_id).state == "scheduled"
+
+
 # --------------------------------------------------------------------------
 # The recovery row decides too
 # --------------------------------------------------------------------------

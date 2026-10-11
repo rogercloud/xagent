@@ -142,6 +142,7 @@ from .task_command_terminal_events import (
     terminal_event_draft_for_error,
 )
 from .task_command_transport import (
+    AUTO_RESUME_COMMAND_PREFIX,
     COMMAND_ID_PATTERN,
     COMMAND_PROCESSING,
     MAX_COMMAND_FAILURES,
@@ -4384,7 +4385,17 @@ async def _execute_durable_task_command(
             lambda: _load_command_actor(command.actor_user_id)
         )
         message_data.update({"user": user, "user_id": int(user.id)})
-    if command.kind != TaskCommandKind.MESSAGE and command.target_run_id is not None:
+    # The sweeper's own RESUME checks the run itself, in its claim guard, and
+    # closes its recovery row as ``stale`` when the run has rotated; rejecting
+    # it here would fail the command and leave that row ``dispatched``.
+    auto_resume = command.kind == TaskCommandKind.RESUME and (
+        command.command_id.startswith(AUTO_RESUME_COMMAND_PREFIX)
+    )
+    if (
+        command.kind != TaskCommandKind.MESSAGE
+        and command.target_run_id is not None
+        and not auto_resume
+    ):
         current_run_id = await run_db_io_cancellation_safe(
             lambda: _load_command_task_run_id(command.task_id)
         )
