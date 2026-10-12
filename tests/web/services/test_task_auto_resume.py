@@ -541,6 +541,11 @@ def test_each_fence_column_makes_the_row_stale(factory, notified, field, task_fi
         (TaskStatus.WAITING_FOR_USER, TriggerRunStatus.RUNNING.value),
         (TaskStatus.COMPLETED, TriggerRunStatus.COMPLETED.value),
         (TaskStatus.FAILED, TriggerRunStatus.FAILED.value),
+        # A user's resume that failed to start rolled the task back to
+        # paused on the same run, two versions on. The row goes stale and
+        # the run stays RUNNING until a later run settles it, as after any
+        # user pause (#2177); deleting the task fails it.
+        (TaskStatus.PAUSED, TriggerRunStatus.RUNNING.value),
     ],
 )
 def test_stale_never_fails_a_trigger_run_it_only_mirrors_an_ended_task(
@@ -549,7 +554,10 @@ def test_stale_never_fails_a_trigger_run_it_only_mirrors_an_ended_task(
     now = utc_now()
     with factory() as db:
         task_id, trigger_run_id = _trigger_task(db, now)
-        db.get(Task, task_id).status = status
+        task = db.get(Task, task_id)
+        task.status = status
+        if status is TaskStatus.PAUSED:
+            task.state_version = int(task.state_version) + 2
         db.commit()
 
     assert run_auto_resume_tick(now=now).stale == 1

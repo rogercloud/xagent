@@ -84,13 +84,13 @@ def test_user_purge_removes_recovery_rows(engine, fk_enforced):
     [
         ("scheduled", "failed"),
         ("dispatched", "failed"),
-        # Nothing automatic owns the outcome: deletion leaves it as before.
-        ("manual", "running"),
+        # A user pause or a wait for the user leaves the run RUNNING as well
+        # (#2177); deleting the task is the last chance to settle it.
+        ("manual", "failed"),
+        (None, "failed"),
     ],
 )
-def test_deleting_a_task_awaiting_auto_resume_fails_its_trigger_run(
-    engine, state, expected
-):
+def test_deleting_a_task_fails_its_unsettled_trigger_run(engine, state, expected):
     from xagent.web.models.agent import Agent
     from xagent.web.models.trigger import (
         AgentTrigger,
@@ -99,14 +99,19 @@ def test_deleting_a_task_awaiting_auto_resume_fails_its_trigger_run(
         TriggerType,
     )
     from xagent.web.services.task_deletion import (
-        TASK_DELETED_DURING_AUTO_RESUME_TRIGGER_ERROR,
+        TASK_DELETED_TRIGGER_ERROR,
     )
 
     Base.metadata.create_all(engine)
     with Session(engine) as db:
-        _user_id, first, _second = _seed(db, username=f"trigger-owner-{state}")
+        _user_id, first, _second = _seed(
+            db, username=f"trigger-owner-{state or 'none'}"
+        )
         task = db.get(Task, first)
-        db.get(TaskAutoRecovery, first).state = state
+        if state is None:
+            db.delete(db.get(TaskAutoRecovery, first))
+        else:
+            db.get(TaskAutoRecovery, first).state = state
         agent = Agent(user_id=task.user_id, name="tick agent")
         db.add(agent)
         db.flush()
@@ -136,5 +141,5 @@ def test_deleting_a_task_awaiting_auto_resume_fails_its_trigger_run(
         run = db.get(TriggerRun, run_id)
         assert run.status == expected
         if expected == "failed":
-            assert run.error_message == TASK_DELETED_DURING_AUTO_RESUME_TRIGGER_ERROR
+            assert run.error_message == TASK_DELETED_TRIGGER_ERROR
             assert run.finished_at is not None

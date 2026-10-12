@@ -1341,6 +1341,95 @@ def test_batches_report_only_committed_pauses(factory, engine, monkeypatch, path
     assert [item.task_id for item in _recorded(batch)] == [paused_id]
 
 
+def _time_out_second_recovery(monkeypatch: pytest.MonkeyPatch, path: str) -> None:
+    """Let the first candidate's recovery commit, then fail the next one with
+    a pool timeout, which ends the batch instead of skipping the candidate."""
+
+    from sqlalchemy.exc import TimeoutError as PoolTimeout
+
+    name = (
+        "stage_task_lease_recovery_no_commit"
+        if path == "postgresql"
+        else "_commit_task_lease_recovery"
+    )
+    real = getattr(task_lease_recovery, name)
+    calls = {"n": 0}
+
+    def flaky(*args: Any, **kwargs: Any) -> Any:
+        calls["n"] += 1
+        if calls["n"] == 2:
+            raise PoolTimeout("QueuePool limit reached")
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(task_lease_recovery, name, flaky)
+
+
+def _batch_path(monkeypatch: pytest.MonkeyPatch, engine: Any, path: str) -> None:
+    if path == "postgresql":
+        _force_postgresql_batch(monkeypatch, engine)
+    elif engine.dialect.name == "postgresql":
+        monkeypatch.setattr(
+            task_lease_recovery, "_use_postgresql_recovery_partitioning", lambda: False
+        )
+
+
+@pytest.mark.parametrize("path", ["cas", "postgresql"])
+def test_a_batch_ended_by_a_pool_timeout_keeps_its_committed_pauses(
+    factory, engine, monkeypatch, path
+):
+    from sqlalchemy.exc import TimeoutError as PoolTimeout
+
+    _batch_path(monkeypatch, engine, path)
+    with factory() as db:
+        user = _user(db)
+        for _ in range(2):
+            _task(db, user)
+    _time_out_second_recovery(monkeypatch, path)
+
+    with pytest.raises(PoolTimeout) as raised:
+        recover_expired_task_leases_batch_isolated(
+            cutoff=utc_now(), batch_size=10, after=None
+        )
+
+    (pause,) = task_lease_recovery.committed_lease_recovery_pauses(raised.value)
+    assert _state(factory, pause.task_id)[0].status == TaskStatus.PAUSED
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path", ["cas", "postgresql"])
+async def test_drain_announces_what_a_failed_batch_committed(
+    factory, engine, monkeypatch, path
+):
+    from sqlalchemy.exc import TimeoutError as PoolTimeout
+
+    _batch_path(monkeypatch, engine, path)
+    with factory() as db:
+        user = _user(db)
+        for _ in range(2):
+            _task(db, user)
+    _time_out_second_recovery(monkeypatch, path)
+    published: list[dict[str, Any]] = []
+
+    async def publish(event: dict[str, Any], task_id: int) -> None:
+        published.append(event)
+
+    async def run_inline(operation: Any) -> Any:
+        return operation()
+
+    monkeypatch.setattr("xagent.web.services.task_events.publish_task_event", publish)
+    monkeypatch.setattr(task_lease_recovery, "run_db_io_cancellation_safe", run_inline)
+
+    with pytest.raises(PoolTimeout):
+        await task_lease_recovery.recover_expired_task_leases_until_cutoff(
+            cutoff=utc_now(), batch_size=10
+        )
+
+    assert [event["type"] for event in published] == [
+        "task_paused",
+        "task_recovery_update",
+    ]
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("auto_resume", ["true", "false"])
 async def test_drain_announces_each_committed_pause_then_its_resume(

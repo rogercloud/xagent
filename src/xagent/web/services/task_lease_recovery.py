@@ -458,6 +458,28 @@ def _record_recovered_task_lease(
     )
 
 
+_COMMITTED_PAUSES_ATTR = "_xagent_committed_lease_recovery_pauses"
+
+
+def _carry_committed_pauses(
+    exc: BaseException, paused: list[LeaseRecoveryPause]
+) -> None:
+    """Keep the pauses this batch committed on the error that ended it, so
+    the drain still announces them (as the auto-resume tick does)."""
+
+    if paused:
+        exc.__dict__[_COMMITTED_PAUSES_ATTR] = tuple(paused)
+
+
+def committed_lease_recovery_pauses(
+    exc: BaseException,
+) -> tuple[LeaseRecoveryPause, ...]:
+    """What a batch that raised ``exc`` had committed before it failed."""
+
+    pauses = getattr(exc, _COMMITTED_PAUSES_ATTR, ())
+    return pauses if isinstance(pauses, tuple) else ()
+
+
 def _recover_expired_task_leases_batch_with_cas(
     *,
     cutoff: datetime,
@@ -479,20 +501,26 @@ def _recover_expired_task_leases_batch_with_cas(
 
     recovered = 0
     paused: list[LeaseRecoveryPause] = []
-    for candidate in candidates:
-        try:
-            committed = _commit_task_lease_recovery(candidate, recovered_at=utc_now())
-            if committed is not None:
-                recovered += 1
-                if committed.pause is not None:
-                    paused.append(committed.pause)
-        except Exception as exc:
-            if is_database_pool_timeout(exc):
-                raise
-            logger.exception(
-                "Task lease recovery failed for task %s; retrying next tick",
-                candidate.task_id,
-            )
+    try:
+        for candidate in candidates:
+            try:
+                committed = _commit_task_lease_recovery(
+                    candidate, recovered_at=utc_now()
+                )
+                if committed is not None:
+                    recovered += 1
+                    if committed.pause is not None:
+                        paused.append(committed.pause)
+            except Exception as exc:
+                if is_database_pool_timeout(exc):
+                    raise
+                logger.exception(
+                    "Task lease recovery failed for task %s; retrying next tick",
+                    candidate.task_id,
+                )
+    except Exception as exc:
+        _carry_committed_pauses(exc, paused)
+        raise
 
     return TaskLeaseRecoveryBatch(
         scanned=len(candidates),
@@ -525,51 +553,55 @@ def _recover_expired_task_leases_batch_with_postgresql_locks(
     recovered_count = 0
     paused: list[LeaseRecoveryPause] = []
     cursor = after
-    while scanned < batch_size:
-        candidate: TaskLeaseRecoveryCandidate | None = None
-        recovered: TaskLeaseRecovery | None = None
-        with SessionLocal() as db:
-            try:
-                candidate = get_next_expired_task_lease_candidate_for_update(
-                    db,
-                    cutoff=cutoff,
-                    after=cursor,
-                )
-            except Exception:
-                db.rollback()
-                raise
-
-            if candidate is None:
-                db.rollback()
-                break
-
-            try:
-                recovered = stage_task_lease_recovery_no_commit(
-                    db,
-                    candidate,
-                    recovered_at=utc_now(),
-                )
-                if recovered is None:
+    try:
+        while scanned < batch_size:
+            candidate: TaskLeaseRecoveryCandidate | None = None
+            recovered: TaskLeaseRecovery | None = None
+            with SessionLocal() as db:
+                try:
+                    candidate = get_next_expired_task_lease_candidate_for_update(
+                        db,
+                        cutoff=cutoff,
+                        after=cursor,
+                    )
+                except Exception:
                     db.rollback()
-                else:
-                    db.commit()
-            except Exception as exc:
-                db.rollback()
-                if is_database_pool_timeout(exc):
                     raise
-                recovered = None
-                logger.exception(
-                    "Task lease recovery failed for task %s; retrying next tick",
-                    candidate.task_id,
-                )
 
-        scanned += 1
-        cursor = candidate.cursor
-        if recovered is not None:
-            recovered_count += 1
-            _record_recovered_task_lease(candidate, recovered.status)
-            if recovered.pause is not None:
-                paused.append(recovered.pause)
+                if candidate is None:
+                    db.rollback()
+                    break
+
+                try:
+                    recovered = stage_task_lease_recovery_no_commit(
+                        db,
+                        candidate,
+                        recovered_at=utc_now(),
+                    )
+                    if recovered is None:
+                        db.rollback()
+                    else:
+                        db.commit()
+                except Exception as exc:
+                    db.rollback()
+                    if is_database_pool_timeout(exc):
+                        raise
+                    recovered = None
+                    logger.exception(
+                        "Task lease recovery failed for task %s; retrying next tick",
+                        candidate.task_id,
+                    )
+
+            scanned += 1
+            cursor = candidate.cursor
+            if recovered is not None:
+                recovered_count += 1
+                _record_recovered_task_lease(candidate, recovered.status)
+                if recovered.pause is not None:
+                    paused.append(recovered.pause)
+    except Exception as exc:
+        _carry_committed_pauses(exc, paused)
+        raise
 
     return TaskLeaseRecoveryBatch(
         scanned=scanned,
@@ -622,24 +654,33 @@ async def recover_expired_task_leases_until_cutoff(
     clear_degradation(CHECKPOINT_RECOVERY_UNAVAILABLE)
     from .task_auto_resume import publish_recovery_notices, recorded_notice
 
-    recovered = 0
-    cursor: TaskLeaseRecoveryCursor | None = None
-    while True:
-        batch = await run_db_io_cancellation_safe(
-            lambda: recover_expired_task_leases_batch_isolated(
-                cutoff=cutoff,
-                batch_size=batch_size,
-                after=cursor,
-            )
-        )
-        recovered += batch.recovered
+    async def announce(pauses: tuple[LeaseRecoveryPause, ...]) -> None:
         # Committed pauses are announced as settlement announces its own:
         # ``task_paused``, then any automatic-resume notice. Best effort.
-        for pause in batch.paused:
+        for pause in pauses:
             await publish_settlement_pause(pause.task_id, pause.report)
             notice = recorded_notice(pause.recorded)
             if notice is not None:
                 await publish_recovery_notices((notice,))
+
+    recovered = 0
+    cursor: TaskLeaseRecoveryCursor | None = None
+    while True:
+        try:
+            batch = await run_db_io_cancellation_safe(
+                lambda: recover_expired_task_leases_batch_isolated(
+                    cutoff=cutoff,
+                    batch_size=batch_size,
+                    after=cursor,
+                )
+            )
+        except Exception as exc:
+            # A later candidate failed the batch (a pool timeout, the scan);
+            # what it committed before that is still announced.
+            await announce(committed_lease_recovery_pauses(exc))
+            raise
+        recovered += batch.recovered
+        await announce(batch.paused)
         if batch.scanned < batch_size:
             return recovered
         cursor = batch.next_cursor

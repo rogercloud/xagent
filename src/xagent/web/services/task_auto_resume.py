@@ -497,11 +497,14 @@ def _give_up_no_commit(
 
     The CAS re-checks the fence except for ``stale``, which exists because
     the fence no longer holds; ``fenced`` overrides that for a caller that
-    has already established why the fence moved. TriggerRun: a give-up fails a PENDING/RUNNING
-    run with the state's message; ``stale`` only mirrors a task that already
-    ended, since otherwise a person resumed or changed it and that run's own
-    settlement reports the real outcome. ``stop`` overrides the state's
-    ``(event, TriggerRun error)``.
+    has already established why the fence moved. TriggerRun: a give-up fails
+    a PENDING/RUNNING run with the state's message; ``stale`` only mirrors a
+    task that already ended, since otherwise a person resumed or changed it
+    and that run's own settlement reports the real outcome. That includes a
+    task left paused on the same run, as after a user's resume that failed
+    to start: like any user pause, its run stays RUNNING until a later run
+    settles it (#2177), and deleting the task fails it. ``stop`` overrides
+    the state's ``(event, TriggerRun error)``.
     """
 
     from .task_orchestrator import sync_trigger_run_status
