@@ -1439,6 +1439,13 @@ def test_housekeeping_fails_a_resume_whose_last_attempt_rolled_back(factory, not
     run = _trigger_run(factory, trigger_run_id)
     assert run.status == TriggerRunStatus.FAILED.value
     assert run.error_message == TASK_AUTO_RESUME_DISPATCH_FAILED_TRIGGER_ERROR
+    # The notice names the pause the client shows (the rolled-back version),
+    # not the row's old fence, or a viewer at that version drops it.
+    (notice,) = report.notices
+    assert (notice.state_version, notice.auto_resume["status"]) == (
+        PV + 2,
+        "stopped",
+    )
 
 
 @pytest.mark.parametrize("command_status", ["pending", "processing"])
@@ -1582,6 +1589,11 @@ def test_switch_off_closes_a_resume_whose_last_attempt_rolled_back(
         TriggerRunStatus.FAILED.value
     )
     assert report.gave_up == 1
+    (notice,) = report.notices
+    assert (notice.state_version, notice.auto_resume["stop_reason"]) == (
+        PV + 2,
+        "disabled",
+    )
 
 
 def test_switch_off_leaves_a_queued_dispatch_to_the_claim_guard(

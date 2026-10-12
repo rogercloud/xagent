@@ -264,7 +264,10 @@ def _notice(
     state_detail: str | None,
     attempt: int | None,
     next_attempt_at: datetime | None = None,
+    state_version: int | None = None,
 ) -> RecoveryNotice | None:
+    """``state_version`` names the pause the client shows when it is not the
+    row's fence (a give-up past a rolled-back resume); the row's otherwise."""
     view = public_auto_resume_view(
         state.value,
         state_detail=state_detail,
@@ -277,7 +280,9 @@ def _notice(
     return RecoveryNotice(
         task_id=int(row.task_id),
         run_id=str(row.run_id),
-        state_version=int(row.paused_state_version),
+        state_version=(
+            int(row.paused_state_version) if state_version is None else state_version
+        ),
         auto_resume=view,
     )
 
@@ -528,7 +533,16 @@ def _give_up_no_commit(
     )
     return _CandidateResult(
         _Outcome.GAVE_UP,
-        _notice(row, new_state, state_detail=state_detail, attempt=attempts),
+        _notice(
+            row,
+            new_state,
+            state_detail=state_detail,
+            attempt=attempts,
+            # Past a rolled-back resume the task rests paused on the same
+            # run at a later version; the client shows that pause, so name
+            # it, or a viewer holding that version drops the notice as old.
+            state_version=None if fenced is not False else int(task.state_version or 0),
+        ),
     )
 
 
