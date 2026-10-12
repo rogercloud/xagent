@@ -670,15 +670,20 @@ def _housekeep_candidate_no_commit(
 ) -> _CandidateResult:
     """Check one ``dispatched`` row whose check time has come.
 
-    - command failed while the task is still ``paused`` on the same run:
-      the resume itself failed, even if the version moved. A person acting
-      first makes the claim guard complete the command as ``auto_skipped``,
-      so a failed one is the resume failing -- including its last attempt
-      after rolling ``resume_requested`` back to ``paused`` two versions on;
+    While the task still rests ``paused`` on the same run, nothing has
+    resumed it, whatever the version: a rolled-back resume moves the version
+    by two. So at that state a queued or failed command is never taken for
+    a confirmation:
+
+    - command queued (including a retry waiting out its backoff after a
+      rollback, which the claim guard normally re-arms): check again after
+      the grace period (with the switch off, the claim-time guard drops it);
+    - command failed: the resume itself failed. A person acting first makes
+      the claim guard complete the command as ``auto_skipped``, so a failed
+      one is the resume failing -- rare after a rollback, since the claim
+      guard re-arms the first retry, so only when every attempt failed;
     - fence otherwise moved: the resume took effect or a person acted;
       confirm by clearing ``next_attempt_at`` (no event);
-    - command still queued: check again after the grace period (with the
-      switch off, the claim-time guard drops it);
     - switch off, command ended (or missing), the resume not having taken
       effect: the row rests in ``manual(auto_resume_disabled)``, as a
       drained row does;
@@ -708,21 +713,21 @@ def _housekeep_candidate_no_commit(
     )
     at_fence = _fence_mismatch(task, row) is None
     fence_moved = not at_fence
-    failed_while_paused = (
-        command is not None
-        and command.status == COMMAND_FAILED
-        and task.status == TaskStatus.PAUSED
+    paused_on_run = (
+        task.status == TaskStatus.PAUSED
         and task.control_state == TaskControlState.PAUSED.value
         and task.run_id == row.run_id
     )
-    if fence_moved and failed_while_paused:
+    queued = command is not None and command.status not in COMMAND_TERMINAL
+    failed = command is not None and command.status == COMMAND_FAILED
+    if fence_moved and paused_on_run and (queued or failed):
         fence_moved = False
-    if fence_moved or (command is not None and command.status not in COMMAND_TERMINAL):
+    if fence_moved or queued:
         # Confirmed, or still queued: only the next check time changes.
         updated = _rowcount(
             db.execute(
                 update(TaskAutoRecovery)
-                .where(*_row_cas(row, _DISPATCHED, fenced=not fence_moved))
+                .where(*_row_cas(row, _DISPATCHED, fenced=at_fence))
                 .values(
                     next_attempt_at=(
                         None
@@ -1580,7 +1585,11 @@ def _rolled_back_by_this_claim(
 def _refence_rolled_back_claim_no_commit(
     db: Session, task: Task, row: TaskAutoRecovery
 ) -> _CandidateResult:
-    """Move the row to the task's current fence, then schedule it again."""
+    """Move the row to the task's current fence, then schedule it again.
+
+    With the switch off it stops instead, as a drained row does, so turning
+    the switch back on never resumes it retroactively.
+    """
 
     updated = _rowcount(
         db.execute(
@@ -1593,6 +1602,17 @@ def _refence_rolled_back_claim_no_commit(
     if updated != 1:
         return _RACED
     db.refresh(row)
+    if not get_task_auto_resume_enabled():
+        return _give_up_no_commit(
+            db,
+            task,
+            row,
+            TaskAutoRecoveryState.MANUAL,
+            from_state=_DISPATCHED,
+            at="claim",
+            state_detail=AUTO_RESUME_DISABLED_DETAIL,
+            stop=_DISABLED_STOP,
+        )
     return _reschedule_dispatched_no_commit(
         db, task, row, now=utc_now(), at="claim", after="resume_rolled_back"
     )

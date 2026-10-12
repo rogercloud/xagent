@@ -861,6 +861,26 @@ def test_retry_after_its_own_rolled_back_resume_is_scheduled_again(
         assert db.get(TriggerRun, trigger_run_id).status == "running"
 
 
+def test_rolled_back_retry_with_the_switch_off_stops(factory, monkeypatch):
+    """The re-arm does not schedule while the switch is off, so turning it
+    back on never resumes the row retroactively."""
+    monkeypatch.setenv("XAGENT_TASK_AUTO_RESUME_ENABLED", "false")
+    with factory() as db:
+        task_id, trigger_run_id = _seed(db, trigger=True, state_version=PV + 2)
+        db.commit()
+
+    decision = _check(task_id, state_version=PV + 2, attempt_count=2)
+
+    assert (decision.proceed, decision.why) == (False, "rolled_back")
+    row = _row(factory, task_id)
+    assert (row.state, row.state_detail) == ("manual", "auto_resume_disabled")
+    assert row.paused_state_version == PV + 2
+    assert row.next_attempt_at is None
+    assert _events(factory, task_id) == ["skipped_disabled"]
+    with factory() as db:
+        assert db.get(TriggerRun, trigger_run_id).status == "failed"
+
+
 def test_rolled_back_retry_at_its_limit_stops(factory):
     with factory() as db:
         task_id, trigger_run_id = _seed(db, trigger=True, state_version=PV + 2)

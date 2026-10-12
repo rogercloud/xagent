@@ -1438,6 +1438,30 @@ def test_switch_off_closes_a_dispatch_whose_command_ended(
     assert report.gave_up == 1
 
 
+@pytest.mark.parametrize("command_status", ["pending", "processing"])
+def test_housekeeping_rearms_a_retry_queued_after_a_rollback(
+    factory, notified, monkeypatch, command_status
+):
+    """A rolled-back resume moved the version by two while its retry waits
+    out its backoff: nothing resumed the task, so it is re-checked, not
+    confirmed."""
+    now = utc_now()
+    with factory() as db:
+        task_id = _dispatched(db, now, command_status=command_status)
+        db.get(Task, task_id).state_version = PV + 2
+        db.commit()
+    counters = _capture_counters(monkeypatch)
+
+    report = run_auto_resume_tick(now=now)
+
+    assert (report.confirmed, report.rearmed) == (0, 1)
+    assert "xagent.task.auto_resume.confirmed" not in counters
+    row = _row(factory, task_id)
+    assert row.state == "dispatched"
+    assert row.next_attempt_at is not None
+    assert _events(factory, task_id) == []
+
+
 def test_switch_off_closes_a_resume_whose_last_attempt_rolled_back(
     factory, notified, monkeypatch
 ):
