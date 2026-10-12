@@ -565,6 +565,17 @@ def test_max_per_tick_bounds_dispatches(factory, notified, monkeypatch):
     assert notified == [1]
 
 
+def _capture_counters(monkeypatch) -> list[str]:
+    names: list[str] = []
+    real_counter = task_auto_resume.increment_counter
+    monkeypatch.setattr(
+        task_auto_resume,
+        "increment_counter",
+        lambda name, **kw: (names.append(name), real_counter(name, **kw)),
+    )
+    return names
+
+
 def _inflight_running(db: Session, now: datetime) -> None:
     """A: an auto-resumed run still RUNNING (row confirmed, check cleared)."""
     _seed(
@@ -616,6 +627,58 @@ def test_max_inflight_counts_running_and_queued_resumes(
     assert report.budget == 3 - expected
     assert report.dispatched == 3 - expected
     assert sum(_row(factory, i).state == "dispatched" for i in ids) == 3 - expected
+
+
+@pytest.mark.parametrize(
+    ("later_command", "counted"),
+    [
+        (None, True),
+        # The sweeper's own later dispatch is still automatic.
+        ("auto-resume:5:2:run-a", True),
+        # A person resumed it by hand since: not an automatic resume any more.
+        ("resume-by-hand", False),
+        ("message-1", False),
+        # The reserved prefix is case-sensitive, as the transport checks it.
+        ("AUTO-RESUME:5:2:run-a", False),
+    ],
+)
+def test_inflight_running_excludes_runs_a_person_resumed(
+    factory, later_command, counted
+):
+    now = utc_now()
+    dispatch_id = auto_resume_command_id(PV, 1, "run-a")
+    with factory() as db:
+        task_id = _seed(
+            db,
+            now,
+            state="dispatched",
+            due_in=None,
+            status=TaskStatus.RUNNING,
+            control_state="running",
+            run_id="run-a",
+            state_version=PV + 4,
+            paused_state_version=PV,
+            last_command_id=dispatch_id,
+        )
+        user_id = db.get(Task, task_id).user_id
+        for command_id in (dispatch_id, later_command):
+            if command_id is None:
+                continue
+            db.add(
+                TaskExecutionCommand(
+                    task_id=task_id,
+                    actor_user_id=user_id,
+                    command_id=command_id,
+                    kind="message" if command_id.startswith("message") else "resume",
+                    payload={},
+                    status="completed",
+                )
+            )
+            db.flush()
+        db.commit()
+
+    with factory() as db:
+        assert task_auto_resume.count_inflight(db) == (1 if counted else 0)
 
 
 def test_give_ups_still_advance_when_no_dispatch_budget_is_left(
@@ -1256,7 +1319,9 @@ def test_housekeeping_rearm_rechecks_the_fence(factory, notified, monkeypatch):
 
 
 @pytest.mark.parametrize("command_status", ["completed", "failed", "pending", None])
-def test_housekeeping_confirms_once_the_fence_moved(factory, notified, command_status):
+def test_housekeeping_confirms_once_the_fence_moved(
+    factory, notified, monkeypatch, command_status
+):
     now = utc_now()
     with factory() as db:
         task_id = _dispatched(db, now, command_status=command_status)
@@ -1266,26 +1331,57 @@ def test_housekeeping_confirms_once_the_fence_moved(factory, notified, command_s
         task.state_version = PV + 2
         db.commit()
 
+    counters = _capture_counters(monkeypatch)
+
     report = run_auto_resume_tick(now=now)
 
     assert report.confirmed == 1
+    assert "xagent.task.auto_resume.confirmed" in counters
     row = _row(factory, task_id)
     assert (row.state, row.next_attempt_at) == ("dispatched", None)
     assert _events(factory, task_id) == []
 
 
+def test_housekeeping_fails_a_resume_whose_last_attempt_rolled_back(factory, notified):
+    """The resume wrote ``resume_requested``, failed to start and rolled the
+    task back to ``paused`` two versions on, on its command's last attempt:
+    the fence moved, but nothing resumed the task, so it is a failed
+    dispatch rather than a confirmed one."""
+    now = utc_now()
+    with factory() as db:
+        task_id = _dispatched(db, now, command_status="failed")
+        user = db.get(User, db.get(Task, task_id).user_id)
+        trigger_run_id, _later = _trigger(db, user, task_id)
+        db.get(Task, task_id).state_version = PV + 2
+        db.commit()
+
+    report = run_auto_resume_tick(now=now)
+
+    assert (report.confirmed, report.gave_up) == (0, 1)
+    row = _row(factory, task_id)
+    assert (row.state, row.next_attempt_at) == ("dispatch_failed", None)
+    (event,) = _events(factory, task_id)
+    assert event.event == "dispatch_failed"
+    run = _trigger_run(factory, trigger_run_id)
+    assert run.status == TriggerRunStatus.FAILED.value
+    assert run.error_message == TASK_AUTO_RESUME_DISPATCH_FAILED_TRIGGER_ERROR
+
+
 @pytest.mark.parametrize("command_status", ["pending", "processing"])
 def test_housekeeping_rechecks_a_queued_command_later(
-    factory, notified, command_status
+    factory, notified, monkeypatch, command_status
 ):
     now = utc_now()
     with factory() as db:
         task_id = _dispatched(db, now, command_status=command_status)
         db.commit()
 
+    counters = _capture_counters(monkeypatch)
+
     report = run_auto_resume_tick(now=now)
 
     assert report.rearmed == 1
+    assert "xagent.task.auto_resume.rearmed" in counters
     row = _row(factory, task_id)
     assert row.state == "dispatched"
     assert _aware(row.next_attempt_at) == now + timedelta(

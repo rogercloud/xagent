@@ -53,9 +53,9 @@ from datetime import datetime, timedelta, timezone
 from enum import Enum
 from typing import Any, Callable
 
-from sqlalchemy import and_, func, or_, select, update
+from sqlalchemy import and_, exists, func, or_, select, update
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, aliased
 
 from ...config import (
     get_task_auto_resume_enabled,
@@ -320,11 +320,13 @@ def _give_up_no_commit(
     state_detail: str | None = None,
     event_detail: dict[str, Any] | None = None,
     stop: tuple[TaskRecoveryEventType, str | None] | None = None,
+    fenced: bool | None = None,
 ) -> _CandidateResult:
     """Stop automatic recovery of ``row`` in ``new_state``; no commit.
 
     The CAS re-checks the fence except for ``stale``, which exists because
-    the fence no longer holds. TriggerRun: a give-up fails a PENDING/RUNNING
+    the fence no longer holds; ``fenced`` overrides that for a caller that
+    has already established why the fence moved. TriggerRun: a give-up fails a PENDING/RUNNING
     run with the state's message; ``stale`` only mirrors a task that already
     ended, since otherwise a person resumed or changed it and that run's own
     settlement reports the real outcome. ``stop`` overrides the state's
@@ -338,7 +340,11 @@ def _give_up_no_commit(
     updated = _rowcount(
         db.execute(
             update(TaskAutoRecovery)
-            .where(*_row_cas(row, from_state, fenced=not stale))
+            .where(
+                *_row_cas(
+                    row, from_state, fenced=not stale if fenced is None else fenced
+                )
+            )
             .values(
                 state=new_state.value, state_detail=state_detail, next_attempt_at=None
             )
@@ -665,9 +671,14 @@ def _housekeep_candidate_no_commit(
 ) -> _CandidateResult:
     """Check one ``dispatched`` row whose check time has come.
 
-    - fence moved: the resume took effect or a person acted; confirm by
-      clearing ``next_attempt_at`` (no event);
-    - command failed or missing at an unchanged fence: ``dispatch_failed``;
+    - command failed while the task is still ``paused`` on the same run:
+      ``dispatch_failed``, even if the version moved. A person acting first
+      makes the claim guard complete the command as ``auto_skipped``, so a
+      failed one is the resume itself failing -- including its last attempt
+      after rolling ``resume_requested`` back to ``paused`` two versions on;
+    - fence otherwise moved: the resume took effect or a person acted;
+      confirm by clearing ``next_attempt_at`` (no event);
+    - command missing at an unchanged fence: ``dispatch_failed``;
     - command completed at an unchanged fence (e.g. ``already_in_progress``):
       the resume did not happen; schedule it again unless a limit stops it
       (the counters stand: the dispatch happened, and the limits are what
@@ -694,7 +705,17 @@ def _housekeep_candidate_no_commit(
         if row.last_command_id is not None
         else None
     )
-    fence_moved = _fence_mismatch(task, row) is not None
+    at_fence = _fence_mismatch(task, row) is None
+    fence_moved = not at_fence
+    failed_while_paused = (
+        command is not None
+        and command.status == COMMAND_FAILED
+        and task.status == TaskStatus.PAUSED
+        and task.control_state == TaskControlState.PAUSED.value
+        and task.run_id == row.run_id
+    )
+    if fence_moved and failed_while_paused:
+        fence_moved = False
     if fence_moved or (command is not None and command.status not in COMMAND_TERMINAL):
         # Confirmed, or still queued: only the next check time changes.
         updated = _rowcount(
@@ -723,7 +744,10 @@ def _housekeep_candidate_no_commit(
                 _DISPATCHED.value,
                 row.total_resumes,
             )
+            increment_counter("xagent.task.auto_resume.confirmed")
             return _CandidateResult(_Outcome.CONFIRMED)
+        # A growing count means dispatched commands sit in the queue.
+        increment_counter("xagent.task.auto_resume.rearmed")
         return _CandidateResult(_Outcome.REARMED)
     command_result: dict[str, Any] = (
         command.result
@@ -743,6 +767,9 @@ def _housekeep_candidate_no_commit(
                 "command": "missing" if command is None else "failed",
                 "rejection_reason": (rejection if isinstance(rejection, str) else None),
             },
+            # A failed resume that rolled back moved the version; the row's
+            # own CAS still pins this dispatch.
+            fenced=at_fence,
         )
 
     assert command.status == COMMAND_COMPLETED
@@ -1039,7 +1066,10 @@ def count_inflight(db: Session) -> int:
     """Automatic resumes in flight across every process.
 
     A: auto-resumed runs still RUNNING (driven from the task status index);
-    bounded by the running tasks, and a row leaves it when its run stops.
+    bounded by the running tasks, and a row leaves it when its run stops. A
+    confirmed row stays ``dispatched``, so a run some person paused and
+    resumed by hand since -- a command other than the sweeper's after the
+    dispatch -- is not counted: it is not an automatic resume any more.
     B: dispatches whose command is still queued (pending claim, waiting for
     admission or deferred) at an unchanged fence. A row whose command has
     ended stops counting even before housekeeping closes it, so B cannot
@@ -1047,6 +1077,24 @@ def count_inflight(db: Session) -> int:
     has moved past the fence version.
     """
 
+    dispatch = aliased(TaskExecutionCommand)
+    later = aliased(TaskExecutionCommand)
+    person_acted = exists().where(
+        later.task_id == Task.id,
+        later.id
+        > select(dispatch.id)
+        .where(
+            dispatch.task_id == Task.id,
+            dispatch.command_id == TaskAutoRecovery.last_command_id,
+        )
+        .scalar_subquery(),
+        # Exact, case-sensitive prefix, as the transport reserves it.
+        ~and_(
+            later.kind == "resume",
+            func.substr(later.command_id, 1, len(AUTO_RESUME_COMMAND_PREFIX))
+            == AUTO_RESUME_COMMAND_PREFIX,
+        ),
+    )
     running = db.execute(
         select(func.count())
         .select_from(Task)
@@ -1060,6 +1108,7 @@ def count_inflight(db: Session) -> int:
         .where(
             task_status_predicate.eq(TaskStatus.RUNNING),
             TaskAutoRecovery.state == _DISPATCHED.value,
+            ~person_acted,
         )
     ).scalar_one()
     queued = db.execute(
