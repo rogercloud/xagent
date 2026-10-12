@@ -3,10 +3,9 @@
 The sweeper turns due ``scheduled`` rows of ``task_auto_recovery`` into
 durable RESUME commands; ``resume_task`` re-checks each such command when it
 is claimed (:func:`check_auto_resume_claim_sync`), because the task may have
-moved on while the command waited. Recording an interruption does not
-schedule yet, so in production every tick is a single ``EXISTS`` over the
-due index that finds nothing; every path here is reachable by inserting
-``scheduled`` rows directly.
+moved on while the command waited. Rows become ``scheduled`` when an
+interruption is recorded (``task_auto_recovery.record_interruption_no_commit``);
+with nothing due a tick is a single ``EXISTS`` over the due index.
 
 Every process that runs lease recovery runs a sweeper; correctness rests on
 the compare-and-swaps below, not on a singleton.
@@ -82,6 +81,9 @@ from .ops_signals import (
     register_degradation,
 )
 from .task_auto_recovery import (
+    AUTO_RESUME_DISABLED_DETAIL,
+    CHANNEL_HOLD_PENDING_DETAIL,
+    PLANNED_RECOVERY_EVENTS,
     TASK_INTERRUPTION_PAUSED_TRIGGER_ERROR,
     auto_recovery_eligibility,
     auto_resume_schedulable,
@@ -107,6 +109,7 @@ from .task_command_transport import (
 from .task_execution_admission import AdmissionQueueFull
 from .task_execution_controller import TaskControlState
 from .task_lease_service import utc_now
+from .task_settlement_report import RecordedInterruption
 
 logger = logging.getLogger(__name__)
 
@@ -143,11 +146,6 @@ TASK_AUTO_RESUME_DISABLED_TRIGGER_ERROR = (
     "Task paused after a system interruption; automatic resume is disabled. "
     "Manual resume is required."
 )
-
-# ``state_detail`` of a row stopped because XAGENT_TASK_AUTO_RESUME_ENABLED is
-# off, and the ``why`` of a claim skipped for it.
-AUTO_RESUME_DISABLED_DETAIL = "auto_resume_disabled"
-CHANNEL_HOLD_PENDING_DETAIL = "channel_hold_pending"
 
 # Module-level so tests can seed it; drawn only by housekeeping reschedules.
 _AUTO_RESUME_RNG = random.Random()
@@ -280,6 +278,54 @@ def _notice(
         state_version=int(row.paused_state_version),
         auto_resume=view,
     )
+
+
+# Recorded states announced at record time. A recorded ``manual``,
+# ``ineligible`` or ``disabled`` changes nothing for the client: the pause it
+# already shows is all there is.
+_RECORDED_ANNOUNCED = frozenset(state.value for state in PLANNED_RECOVERY_EVENTS)
+
+
+def recorded_notice(recorded: RecordedInterruption | None) -> RecoveryNotice | None:
+    """The notice for what recording an interruption committed, if any."""
+
+    if recorded is None or recorded.state not in _RECORDED_ANNOUNCED:
+        return None
+    view = public_auto_resume_view(
+        recorded.state,
+        state_detail=recorded.state_detail,
+        reason=recorded.reason,
+        attempt=recorded.attempt,
+        next_attempt_at=recorded.next_attempt_at,
+    )
+    if view is None:
+        return None
+    return RecoveryNotice(
+        task_id=recorded.task_id,
+        run_id=recorded.run_id,
+        state_version=recorded.paused_state_version,
+        auto_resume=view,
+    )
+
+
+def trigger_error_for_recorded(
+    recorded: RecordedInterruption | None, *, default: str
+) -> str | None:
+    """The TriggerRun error for a recorded PAUSED interruption, or ``None``.
+
+    ``None`` keeps the run RUNNING: a scheduled resume settles it later. A
+    stop names why automatic resume will not run; anything else (``manual``,
+    ``ineligible``, or nothing recorded) is the caller's ``default``.
+    """
+
+    if recorded is None:
+        return default
+    if recorded.state == _SCHEDULED.value:
+        return None
+    stop = _STOPS.get(TaskAutoRecoveryState(recorded.state))
+    if recorded.state in _RECORDED_ANNOUNCED and stop is not None:
+        return stop[1]
+    return default
 
 
 async def publish_recovery_notices(notices: Iterable[RecoveryNotice]) -> None:
