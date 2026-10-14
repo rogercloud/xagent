@@ -376,8 +376,11 @@ def test_later_scheduled_tick_supersedes_the_killed_one(shared_app):
     _wait_for(lambda: (app.root / "model-entered").exists(), app, "model call")
 
     _kill(app, app.processes[1])
-    app.start("worker")
+    # Before the worker restarts: the web host's dispatcher claims the next
+    # tick on its own, so it counts as started well before the killed run's
+    # lease expires, however long the replacement worker takes to boot.
     _due_now(trigger_id)
+    app.start("worker")
     _wait_for(
         lambda: [
             run
@@ -394,6 +397,7 @@ def test_later_scheduled_tick_supersedes_the_killed_one(shared_app):
         "the superseded resume",
     )
     assert _task(first["task_id"])["status"] == "paused"
+    assert "superseded" in _recovery(first["task_id"])[1]
     (killed,) = [run for run in _trigger_runs(trigger_id) if run["id"] == first["id"]]
     assert (killed["status"], killed["error"]) == (
         "failed",
