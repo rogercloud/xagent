@@ -1897,9 +1897,10 @@ def _auto_resume_holds(snap: Any, *, run_id: str, now: datetime) -> bool:
     A dispatched command still queued or running holds whatever the version
     (a retry after a rolled-back resume moves it by two). No deadline bounds
     that branch: the command's own liveness does (an expired claim is
-    reclaimed and run, a command that fails ends the hold, and housekeeping
-    closes the row after a failed one); housekeeping only re-arms a command
-    that is still queued. Every other hold ends at the channel window from the latest
+    reclaimed and run; a command that fails leaves this branch, and the row
+    then holds only until housekeeping closes it as ``dispatch_failed`` or
+    the window ends); housekeeping only re-arms a command that is still
+    queued. Every other hold ends at the channel window from the latest
     interruption, plus a clock grace: past it the sweeper can no longer
     dispatch the row.
     """
