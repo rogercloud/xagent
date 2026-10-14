@@ -17,7 +17,6 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-from datetime import datetime, timezone
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, Mock, patch
@@ -104,6 +103,7 @@ from xagent.web.models.database import get_session_local
 from xagent.web.models.task import Task, TaskStatus
 from xagent.web.models.task_auto_recovery import TaskAutoRecovery
 from xagent.web.models.task_command import TaskExecutionCommand
+from xagent.web.models.trigger import TriggerRunStatus
 
 # Imported here, not lazily: a module first imported while ``canonical``
 # patches ``database.get_session_local`` would keep that patched factory.
@@ -133,6 +133,10 @@ from xagent.web.services.task_auto_recovery import (
     settlement_interruption_for_failure,
     settlement_interruption_for_result,
     settlement_pause_enabled,
+)
+from xagent.web.services.task_auto_resume import (
+    TASK_AUTO_RESUME_EXHAUSTED_TRIGGER_ERROR,
+    auto_resume_command_id,
 )
 from xagent.web.services.task_execution import (
     _acquire_resume_task_lease,
@@ -636,7 +640,8 @@ _PATH_REASONS = [
     for reason in RESULTS
     if path == "channel" or reason != "persistence_failure"
 ]
-# The reasons settlement pauses for today.
+# The reasons settlement pauses for whether or not automatic resume is on;
+# model_output_invalid has its own cases.
 _PAUSE_PATH_REASONS = [
     case for case in _PATH_REASONS if case[1] != "model_output_invalid"
 ]
@@ -832,7 +837,8 @@ def _switch_case(m: pytest.MonkeyPatch, case: str) -> str:
 def test_unpaused_runs_settle_exactly_as_before(
     canonical, monkeypatch, path, reason, case
 ):
-    """The switch is off (or unset: it defaults off), or the task is
+    """The switch is off (or unset, following automatic resume, which this
+    suite turns off), or the task is
     ineligible: the same FAILED settlement as without an interruption, plus a
     ``disabled`` (or ``ineligible``) row."""
 
@@ -920,11 +926,19 @@ def test_model_output_invalid_pauses_for_an_automatic_resume(
 
     _settle_result(path, factory, ids, lease, MODEL_RESULT)
 
-    task, row, events = _state(factory, ids["task"])
     if infra == "off":
-        assert task.status == TaskStatus.FAILED
+        baseline = _projected_task(factory)
+        baseline_lease = _prepare_run(factory, baseline)
+        with monkeypatch.context() as m:
+            _without_result_interruption(m)
+            _settle_result(path, factory, baseline, baseline_lease, MODEL_RESULT)
+        projection = _full_projection(factory, ids, lease)
+        assert projection == _full_projection(factory, baseline, baseline_lease)
+        assert projection["status"] == TaskStatus.FAILED
+        _task, row, _events = _state(factory, ids["task"])
         assert (row.reason, row.state) == ("model_output_invalid", "disabled")
         return
+    task, row, events = _state(factory, ids["task"])
     assert (task.status, task.control_state) == (TaskStatus.PAUSED, "paused")
     assert task.error_message is None
     assert (row.reason, row.state) == ("model_output_invalid", "scheduled")
@@ -938,41 +952,55 @@ def test_model_output_invalid_pauses_for_an_automatic_resume(
     assert projection["trigger_run"][0] == "running"
 
 
-@pytest.mark.parametrize("path", ["result", "resumed_result"])
-def test_model_output_invalid_out_of_resumes_stays_paused(canonical, monkeypatch, path):
+def test_model_output_invalid_out_of_resumes_stays_paused(canonical, monkeypatch):
     """An automatically resumed run that keeps producing unusable output
-    stops at the policy's limit: ``exhausted``, and the task stays PAUSED for
-    its user, like any reason that runs out of resumes."""
+    without progress stops at the policy's limit: ``exhausted``, and the task
+    stays PAUSED for its user, like any reason that runs out of resumes."""
 
     monkeypatch.setenv(AUTO_RESUME_SWITCH, "true")
     monkeypatch.delenv(PAUSE_SWITCH)
     factory, _tid = canonical
     ids = _projected_task(factory)
     lease = _prepare_run(factory, ids)
+    _settle_result("resumed_result", factory, ids, lease, MODEL_RESULT)
+    # The sweeper dispatched the last resume the policy allows: two without
+    # progress, through its own RESUME command, which nobody followed.
     with factory() as db:
+        row = db.get(TaskAutoRecovery, ids["task"])
+        assert row.state == "scheduled" and row.progress_marker is not None
+        command_id = auto_resume_command_id(
+            int(row.paused_state_version), 2, lease.run_id
+        )
         db.add(
-            TaskAutoRecovery(
+            TaskExecutionCommand(
                 task_id=ids["task"],
-                run_id=lease.run_id,
-                reason="model_output_invalid",
-                state="dispatched",
-                paused_state_version=0,
-                interrupted_at=datetime.now(timezone.utc),
-                episode_started_at=datetime.now(timezone.utc),
-                no_progress_resumes=2,
-                total_resumes=2,
-                last_command_id=f"auto-resume:0:2:{lease.run_id}",
+                command_id=command_id,
+                kind="resume",
+                payload={},
+                target_run_id=lease.run_id,
+                status="completed",
             )
         )
+        row.state = "dispatched"
+        row.no_progress_resumes = 2
+        row.total_resumes = 2
+        row.last_command_id = command_id
         db.commit()
+    resume_lease = _acquire_resume_task_lease(ids["task"], ids["user"], lease.run_id)
+    assert resume_lease is not None and resume_lease.run_id == lease.run_id
 
-    _settle_result(path, factory, ids, lease, MODEL_RESULT)
+    _settle_result("resumed_result", factory, ids, resume_lease, MODEL_RESULT)
 
     task, row, events = _state(factory, ids["task"])
     assert (task.status, task.control_state) == (TaskStatus.PAUSED, "paused")
+    assert task.error_message is None
     assert (row.reason, row.state) == ("model_output_invalid", "exhausted")
     assert row.next_attempt_at is None
-    assert [e.event for e in events] == ["interrupted", "exhausted"]
+    assert [e.event for e in events][-2:] == ["interrupted", "exhausted"]
+    assert _projection(factory, ids, resume_lease)["trigger_run"][:2] == (
+        TriggerRunStatus.FAILED.value,
+        TASK_AUTO_RESUME_EXHAUSTED_TRIGGER_ERROR,
+    )
 
 
 @PAUSE_CASES
@@ -1176,7 +1204,31 @@ async def test_raised_provider_failure_pauses_on_the_exception_path(
 
 
 @pytest.mark.asyncio
+async def test_raised_model_output_failure_pauses_for_an_automatic_resume(
+    canonical, monkeypatch
+):
+    """With automatic resume on, the exception path decides unusable model
+    output as the result paths do: paused, with a resume scheduled."""
+
+    monkeypatch.setenv(AUTO_RESUME_SWITCH, "true")
+    factory, _tid = canonical
+    ids = _projected_task(factory)
+    lease = _prepare_run(factory, ids)
+
+    frames = await _schedule_failing_turn(
+        factory, ids, lease, LLMEmptyContentError("empty response")
+    )
+
+    assert frames == ["task_paused", "task_recovery_update"]
+    task, row, _events = _state(factory, ids["task"])
+    assert (task.status, task.control_state) == (TaskStatus.PAUSED, "paused")
+    assert (row.reason, row.state) == ("model_output_invalid", "scheduled")
+
+
+@pytest.mark.asyncio
 async def test_raised_model_output_failure_fails_as_before(canonical, monkeypatch):
+    """Automatic resume off (this suite's default): nothing would resample
+    the model, so the run fails exactly as before."""
     factory, _tid = canonical
     gated, baseline = _projected_task(factory), _projected_task(factory)
     gated_lease = _prepare_run(factory, gated)

@@ -730,8 +730,9 @@ def record_lease_expiry_interruption_no_commit(
 # failures into an ordinary failed result without a reason, so it never
 # pauses for either (it still pauses for a persistence failure).
 #
-# Every one of them is recorded; ``SETTLEMENT_PAUSE_DEFERRED_REASONS`` says
-# which of them settlement does not pause for yet.
+# Every one of them is recorded; ``_pausable_with_infra_switch`` says which
+# of them the infra switch decides (``model_output_invalid`` also needs an
+# automatic resume to resample it).
 SETTLEMENT_INTERRUPTION_REASONS = frozenset(
     {
         InterruptionReason.PERSISTENCE_FAILURE,
@@ -763,10 +764,9 @@ def _pausable_with_infra_switch(
     if reason in SETTLEMENT_PAUSE_DEFERRED_REASONS:
         return False
     if reason is InterruptionReason.MODEL_OUTPUT_INVALID:
-        if not get_task_auto_resume_enabled():
-            return False
-        if kind is not None and not auto_resume_schedulable(kind):
-            return False
+        return get_task_auto_resume_enabled() and (
+            kind is None or auto_resume_schedulable(kind)
+        )
     return True
 
 
@@ -893,7 +893,8 @@ def decide_interruption(
     order:
 
     1. Settlement does not pause for ``reason`` (:func:`settlement_pause_enabled`:
-       the switch is off, or the reason is deferred), an ineligible task, or
+       the switch is off, the reason is deferred, or it is
+       ``model_output_invalid`` with automatic resume off), an ineligible task, or
        ``model_output_invalid`` on a task kind automatic resume does not
        schedule (nothing would resample it): ``LEGACY``.
     2. The run's checkpoint, resolved as lease recovery resolves it:

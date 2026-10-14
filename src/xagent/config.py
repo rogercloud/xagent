@@ -517,7 +517,8 @@ def _get_strict_bool_env(env_var: str, default: bool) -> bool:
 def get_task_infra_failure_pause_enabled() -> bool:
     """Whether eligible tasks pause (instead of failing) on infrastructure failures.
 
-    Unset, it follows :func:`get_task_auto_resume_enabled`: a paused run that
+    Unset (or blank or invalid), it follows
+    :func:`get_task_auto_resume_enabled`: a paused run that
     nothing resumes is worse than a terminal failure for unattended (e.g.
     scheduled) tasks, so pausing is the default only while automatic resume
     is on. Set it explicitly to pause for a manual resume with automatic
