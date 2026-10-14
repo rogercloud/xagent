@@ -82,19 +82,22 @@ def _clean_signals():
     ops_signals.clear_degradation(ops_signals.TASK_AUTO_RESUME_UNAVAILABLE)
 
 
-def _stale_database_accessors() -> list[str]:
+# Captured at import, before any fixture patches ``database``.
+_REAL_DATABASE_ACCESSORS = {
+    "get_session_local": database.get_session_local,
+    "get_engine": database.get_engine,
+}
+
+
+def _stale_database_accessors() -> set[str]:
     """Loaded modules whose imported database accessors are not the real ones."""
-    accessors = {
-        "get_session_local": database.get_session_local,
-        "get_engine": database.get_engine,
-    }
-    return sorted(
+    return {
         f"{name}.{attr}"
         for name, module in list(sys.modules.items())
         if name.startswith("xagent.") and module is not None
-        for attr, real in accessors.items()
+        for attr, real in _REAL_DATABASE_ACCESSORS.items()
         if getattr(module, attr, real) is not real
-    )
+    }
 
 
 @pytest.fixture
@@ -109,8 +112,11 @@ def factory(engine, monkeypatch) -> Iterator[sessionmaker]:
     monkeypatch.setattr(database, "_engine", engine)
     for name in _ENV:
         monkeypatch.delenv(name, raising=False)
+    # Only flag what this test leaked; other files may still leak the old way.
+    stale_before = _stale_database_accessors()
     yield result
-    assert _stale_database_accessors() == []
+    leaked = sorted(_stale_database_accessors() - stale_before)
+    assert not leaked, f"modules bound a patched database accessor: {leaked}"
 
 
 @pytest.fixture
