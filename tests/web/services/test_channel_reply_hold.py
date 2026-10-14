@@ -1052,12 +1052,19 @@ def test_a_start_with_nothing_to_stamp_is_left_alone(canonical, case):
         )
 
 
-def test_a_failed_stamp_never_undoes_the_settlement(canonical, monkeypatch):
+@pytest.mark.parametrize("failure", ["raises", "update_fails"])
+def test_a_failed_stamp_never_undoes_the_settlement(canonical, monkeypatch, failure):
+    """``raises``: the stamp itself fails. ``update_fails``: the stamp only
+    assigns the START's result, and the UPDATE fails when it is flushed."""
     factory, _tid = canonical
     ids, lease = _channel_task_run(factory)
     original = shared.stamp_channel_result_no_commit
 
     def stamp_then_fail(db, **kwargs):
+        if failure == "update_fails":
+            # Not JSON-serializable: only the flush of the UPDATE fails.
+            kwargs["channel_result"] = {**kwargs["channel_result"], "x": object()}
+            return original(db, **kwargs)
         assert original(db, **kwargs)
         db.flush()
         raise RuntimeError("stamp failed")

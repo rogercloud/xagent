@@ -3233,7 +3233,9 @@ def _finalize_resumed_task(
             )
 
             # Best effort: a failed stamp never undoes the settlement; the
-            # channel then falls back to the task row.
+            # channel then falls back to the task row. The stamp only assigns
+            # the START's result, so it is flushed (and the savepoint
+            # released) inside the ``try``: a failing UPDATE is caught too.
             stamp = db.begin_nested()
             try:
                 stamp_channel_result_no_commit(
@@ -3248,6 +3250,8 @@ def _finalize_resumed_task(
                         transcript=output if success and output.strip() else None,
                     ),
                 )
+                db.flush()
+                stamp.commit()
             except Exception:
                 stamp.rollback()
                 logger.exception(
@@ -3255,8 +3259,6 @@ def _finalize_resumed_task(
                     "its channel reads the task row instead",
                     task_id,
                 )
-            else:
-                stamp.commit()
         # A lost acknowledgement here is not reconciled yet: the lease is
         # released in this transaction, so only the result fact's witness
         # (returned above) can prove the commit. That belongs with the
