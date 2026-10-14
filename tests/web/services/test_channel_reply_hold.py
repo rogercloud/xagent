@@ -1444,6 +1444,115 @@ def test_a_turn_sent_while_the_resume_hands_off_or_runs_is_busy(channel, state):
     assert shared._read_channel_result(channel.command_id, channel.run_id) is None
 
 
+def _hand_off(ch, *, row: dict[str, Any] | None, manual_resume: str | None) -> None:
+    """The task rests PAUSED, ``resume_requested``, on its run: optionally a
+    recovery row (``_recovery_row`` kwargs) and a person's RESUME command
+    with status ``manual_resume``."""
+    with get_session_local()() as db:
+        if row is not None:
+            _recovery_row(db, ch.task_id, ch.run_id, ch.version, **row)
+        if manual_resume is not None:
+            db.add(
+                TaskExecutionCommand(
+                    task_id=ch.task_id,
+                    actor_user_id=db.get(Task, ch.task_id).user_id,
+                    command_id=f"manual-resume-{uuid.uuid4().hex[:8]}",
+                    kind="resume",
+                    payload={"type": "resume_task"},
+                    target_run_id=ch.run_id,
+                    status=manual_resume,
+                )
+            )
+        db.get(Task, ch.task_id).control_state = "resume_requested"
+        db.commit()
+
+
+@pytest.mark.parametrize(
+    ("row", "manual_resume", "busy"),
+    [
+        pytest.param(None, "pending", True, id="manual_resume_queued"),
+        pytest.param(
+            {"state": "manual", "interrupted_ago": 30},
+            "processing",
+            True,
+            id="manual_resume_running_on_a_manual_row",
+        ),
+        # Its command ended, but an automatic resume within the window still
+        # holds the reply: its run may yet take the lease.
+        pytest.param(
+            {
+                "state": "dispatched",
+                "interrupted_ago": 30,
+                "command_status": "completed",
+            },
+            None,
+            True,
+            id="automatic_within_the_window",
+        ),
+        # Stranded: nothing can still start the resumed run.
+        pytest.param(None, "completed", False, id="stranded_manual"),
+        pytest.param(
+            {
+                "state": "dispatched",
+                "interrupted_ago": "past",
+                "command_status": "completed",
+            },
+            None,
+            False,
+            id="stranded_automatic_past_the_window",
+        ),
+    ],
+)
+def test_a_turn_is_busy_only_while_the_hand_off_can_complete(
+    channel, row, manual_resume, busy
+):
+    if row is not None and row["interrupted_ago"] == "past":
+        row = {**row, "interrupted_ago": _limit() + 5}
+    _hand_off(channel, row=row, manual_resume=manual_resume)
+    with get_session_local()() as db:
+        before = {
+            c.id
+            for c in db.scalars(
+                sa.select(TaskExecutionCommand).where(
+                    TaskExecutionCommand.task_id == channel.task_id
+                )
+            )
+        }
+
+    def accept() -> int:
+        return shared._accept_channel_turn(
+            _second_turn(channel), TaskTurnPayload("again"), "ingress"
+        )
+
+    if busy:
+        with pytest.raises(TaskTurnError) as refused:
+            accept()
+        assert refused.value.reason == "busy"
+    else:
+        accepted = accept()
+    with get_session_local()() as db:
+        assert int(db.get(Task, channel.task_id).state_version) == channel.version
+        added = [
+            c
+            for c in db.scalars(
+                sa.select(TaskExecutionCommand).where(
+                    TaskExecutionCommand.task_id == channel.task_id
+                )
+            )
+            if c.id not in before
+        ]
+        if busy:
+            assert added == []
+        else:
+            (start,) = added
+            assert (start.id, start.kind, start.status) == (
+                accepted,
+                "start",
+                "pending",
+            )
+            assert start.payload["state_version"] == channel.version
+
+
 @pytest.mark.asyncio
 async def test_an_unanswered_question_ends_the_hold_within_the_limit(
     channel, handler, monkeypatch

@@ -1843,7 +1843,9 @@ CHANNEL_HOLD_CLOCK_GRACE_SECONDS = 60
 
 
 def _hold_snapshot(db: Session, task_id: int) -> Any:
-    """The task, its recovery row and the row's dispatched command, read once.
+    """The task, its recovery row and the row's dispatched command, read once,
+    with whether any RESUME of the task (automatic or not) is still queued or
+    running.
 
     One statement on purpose: under PostgreSQL's READ COMMITTED two reads
     could straddle a resume that was interrupted and recorded again, pairing
@@ -1860,6 +1862,16 @@ def _hold_snapshot(db: Session, task_id: int) -> Any:
         .correlate(TaskAutoRecovery)
         .scalar_subquery()
     )
+    resume_in_flight = (
+        select(TaskExecutionCommand.id)
+        .where(
+            TaskExecutionCommand.task_id == Task.id,
+            TaskExecutionCommand.kind == TaskCommandKind.RESUME.value,
+            TaskExecutionCommand.status.in_((COMMAND_PENDING, COMMAND_PROCESSING)),
+        )
+        .correlate(Task)
+        .exists()
+    )
     return db.execute(
         select(
             Task.status,
@@ -1871,6 +1883,7 @@ def _hold_snapshot(db: Session, task_id: int) -> Any:
             TaskAutoRecovery.paused_state_version,
             TaskAutoRecovery.interrupted_at,
             command_status.label("dispatch_status"),
+            resume_in_flight.label("resume_in_flight"),
         )
         .select_from(Task)
         .outerjoin(TaskAutoRecovery, TaskAutoRecovery.task_id == Task.id)
@@ -1940,6 +1953,29 @@ def channel_reply_waits_for_auto_resume(
     if snap.status != TaskStatus.PAUSED or snap.run_id != run_id:
         return True
     return _auto_resume_holds(snap, run_id=run_id, now=now)
+
+
+def resume_hand_off_can_complete(db: Session, task: Task, *, now: datetime) -> bool:
+    """Whether the resume ``task`` is handing off (PAUSED, ``resume_requested``)
+    can still start its run, so a new channel turn should wait (busy).
+
+    True while a RESUME command of the task (automatic or a person's) is still
+    queued or running, or while an automatic resume of its run still holds
+    the channel reply (``_auto_resume_holds``: within the channel window and
+    its grace). Otherwise the hand-off is stranded -- its command ended but
+    the resumed run never took the lease -- and refusing every turn would
+    strand the channel with it. One read, no locks; the caller holds the task
+    row lock.
+    """
+
+    snap = _hold_snapshot(db, int(task.id))
+    if snap is None:
+        return False
+    if snap.resume_in_flight:
+        return True
+    return snap.run_id is not None and _auto_resume_holds(
+        snap, run_id=str(snap.run_id), now=now
+    )
 
 
 def supersede_pending_auto_resume_no_commit(

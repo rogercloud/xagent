@@ -458,7 +458,9 @@ def auto_resume_schedulable(kind: str | None) -> bool:
 
     Every eligible kind is: a channel task's reply waits for the resumed run
     (``channel_reply_waits_for_auto_resume``). Kept as the one place a kind
-    could be held back again.
+    could be held back again. It is read when an interruption is recorded
+    (and by :func:`_pausable_with_infra_switch`), not at dispatch: rows
+    already ``scheduled`` when it is narrowed still dispatch.
     """
 
     return kind is not None
@@ -752,7 +754,8 @@ def _pausable_with_infra_switch(
     infrastructure failure: a run paused for it is worth stopping only when
     an automatic resume will resample it, so it also needs automatic resume
     on and, when ``kind`` is known, a task kind it schedules
-    (:func:`auto_resume_schedulable`). Otherwise it fails as before.
+    (:func:`auto_resume_schedulable`; every eligible kind today, so that case
+    is unreachable and kept as the seam). Otherwise it fails as before.
     """
 
     if reason in SETTLEMENT_PAUSE_DEFERRED_REASONS:
@@ -890,8 +893,8 @@ def decide_interruption(
        the switch is off, the reason is deferred, or it is
        ``model_output_invalid`` with automatic resume off), an ineligible task, or
        ``model_output_invalid`` on a task kind automatic resume does not
-       schedule (:func:`auto_resume_schedulable`; nothing would resample it):
-       ``LEGACY``.
+       schedule (:func:`auto_resume_schedulable`; nothing would resample it;
+       unreachable today, every eligible kind is scheduled): ``LEGACY``.
     2. The run's checkpoint, resolved as lease recovery resolves it:
        ``UNKNOWN_TOOL_EFFECT`` and ``NOT_RECOVERABLE`` fail, ``RECOVERABLE``
        pauses -- as a user pause when the run was PAUSE_REQUESTED (the user

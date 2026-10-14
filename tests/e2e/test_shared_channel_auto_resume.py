@@ -7,8 +7,8 @@ killed with SIGKILL while the run waits on the model; lease recovery on the
 web host pauses it and the sweeper resumes it, unless a newer channel
 message replaced the resume or the reply stopped waiting first.
 
-Backoff and polling are shortened so a resume is due about a second after the
-lease (10s) expires.
+Backoff and polling are shortened so a resume is due a few seconds after the
+lease (10s) expires: long enough for the reader to see the paused run.
 """
 
 from __future__ import annotations
@@ -44,7 +44,7 @@ PROCESSING = "still being processed"
 @pytest.fixture(autouse=True)
 def _fast_auto_resume(monkeypatch):
     # Read by the hosts the shared_app fixture spawns after this.
-    monkeypatch.setenv("XAGENT_TASK_AUTO_RESUME_SHORT_INITIAL_BACKOFF_SECONDS", "1")
+    monkeypatch.setenv("XAGENT_TASK_AUTO_RESUME_SHORT_INITIAL_BACKOFF_SECONDS", "4")
     monkeypatch.setenv("XAGENT_TASK_AUTO_RESUME_POLL_SECONDS", "1")
     monkeypatch.delenv("XAGENT_TASK_AUTO_RESUME_ENABLED", raising=False)
     monkeypatch.delenv("XAGENT_TASK_AUTO_RESUME_CHANNEL_WINDOW_SECONDS", raising=False)
@@ -126,19 +126,24 @@ def _starts(task_id: int) -> list[dict[str, Any]]:
     from xagent.web.models.task_command import TaskExecutionCommand
 
     with get_session_local()() as db:
-        return [
-            {
-                "id": int(command.id),
-                "run_id": command.target_run_id,
-                "status": command.status,
-                "channel_result": (command.result or {}).get("channel_result"),
-                "delivery": db.get(TaskChannelDelivery, command.id).status,
-                "delivered_at": db.get(TaskChannelDelivery, command.id).delivered_at,
-            }
-            for command in db.query(TaskExecutionCommand)
+        starts = []
+        for command in (
+            db.query(TaskExecutionCommand)
             .filter_by(task_id=task_id, kind="start")
             .order_by(TaskExecutionCommand.id)
-        ]
+        ):
+            delivery = db.get(TaskChannelDelivery, command.id)
+            starts.append(
+                {
+                    "id": int(command.id),
+                    "run_id": command.target_run_id,
+                    "status": command.status,
+                    "channel_result": (command.result or {}).get("channel_result"),
+                    "delivery": delivery.status,
+                    "delivered_at": delivery.delivered_at,
+                }
+            )
+        return starts
 
 
 async def _deliver_round(ingress) -> None:
@@ -160,14 +165,20 @@ async def _deliver_round(ingress) -> None:
     )
 
 
-async def _deliver_until_done(ingress, task_id: int, app, timeout: float) -> None:
+async def _deliver_until_done(ingress, task_id: int, app, timeout: float) -> int:
     """Poll replies every half second, as the reader would, until every
-    reply of ``task_id`` is out."""
+    reply of ``task_id`` is out. Returns how many rounds ran while the task
+    rested PAUSED and left its first reply pending (held)."""
+    held = 0
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
+        paused = task_state(task_id)["status"] == "paused"
         await _deliver_round(ingress)
-        if all(start["delivery"] != "pending" for start in _starts(task_id)):
-            return
+        starts = _starts(task_id)
+        if paused and starts[0]["delivery"] == "pending":
+            held += 1
+        if all(start["delivery"] != "pending" for start in starts):
+            return held
         await asyncio.sleep(0.5)
     pytest.fail(f"Replies still pending: {_starts(task_id)}\n{app.diagnostics()}")
 
@@ -210,8 +221,10 @@ async def test_killed_channel_run_resumes_and_answers_its_channel(shared_app, in
         _deliver_until_done(ingress, task_id, app, timeout=SETTLE_TIMEOUT + 30)
     )
     settled = await asyncio.to_thread(app.wait_task, task_id, timeout=SETTLE_TIMEOUT)
-    await delivering
+    held = await delivering
 
+    # The reader saw the paused run and kept waiting.
+    assert held > 0
     assert settled["run_id"] == run_id
     assert ANSWER in (settled["output"] or "")
     row, events = recovery_state(task_id)
@@ -244,6 +257,9 @@ async def test_killed_channel_run_resumes_and_answers_its_channel(shared_app, in
 
 @pytest.mark.asyncio
 async def test_channel_message_while_scheduled_replaces_the_resume(shared_app, ingress):
+    from xagent.web.models.database import get_session_local
+    from xagent.web.models.task_auto_recovery import TaskAutoRecovery
+
     app = shared_app
     # A wide window between recording and dispatch.
     await asyncio.to_thread(
@@ -263,6 +279,8 @@ async def test_channel_message_while_scheduled_replaces_the_resume(shared_app, i
     await _deliver_round(ingress)
     assert _starts(task_id)[0]["delivery"] == "pending"
     calls_before = len(model_calls(app))
+    with get_session_local()() as db:
+        due = db.get(TaskAutoRecovery, task_id).next_attempt_at
 
     await _send(ingress, "Channel followup", "m2")
 
@@ -283,8 +301,12 @@ async def test_channel_message_while_scheduled_replaces_the_resume(shared_app, i
     assert _count(ingress.sent, ANSWER) == 1
     # Only M2's run called the model after the kill; never the sweeper's.
     assert len(model_calls(app)) > calls_before
-    # Past the dispatch time: the sweeper stood down.
-    await asyncio.sleep(25)
+    # Past the dispatch time and two sweeper polls: it stood down.
+    if due is None:
+        await asyncio.sleep(35)
+    else:
+        remaining = _utc(due) + timedelta(seconds=2) - datetime.now(timezone.utc)
+        await asyncio.sleep(max(remaining.total_seconds(), 0))
     assert auto_resume_commands(task_id) == []
     assert recovery_state(task_id)[0]["state"] == "stale"
 
@@ -330,9 +352,9 @@ async def test_channel_reply_past_the_window_is_interrupted(
     with get_session_local()() as db:
         interrupted_at = db.get(TaskAutoRecovery, task_id).interrupted_at
     (start,) = _starts(task_id)
-    # Not before the window (and the shortened grace) ran out.
+    # Not before the window and the shortened grace (1s) ran out.
     assert _utc(start["delivered_at"]) - _utc(interrupted_at) >= timedelta(
-        seconds=int(window)
+        seconds=int(window) + 1
     )
     # Still scheduled: the sweeper never ran it, the reply gave up on it.
     assert recovery_state(task_id)[0]["state"] == "scheduled"
