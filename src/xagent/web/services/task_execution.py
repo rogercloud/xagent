@@ -3232,17 +3232,31 @@ def _finalize_resumed_task(
                 stamp_channel_result_no_commit,
             )
 
-            stamp_channel_result_no_commit(
-                db,
-                task_id=task_id,
-                run_id=task_lease.run_id,
-                channel_result=channel_durable_result(
-                    result,
-                    project_execution_result_for_channel(result),
-                    # The text this transaction stored, file links rewritten.
-                    transcript=output if success and output.strip() else None,
-                ),
-            )
+            # Best effort: a failed stamp never undoes the settlement; the
+            # channel then falls back to the task row.
+            stamp = db.begin_nested()
+            try:
+                stamp_channel_result_no_commit(
+                    db,
+                    task_id=task_id,
+                    run_id=task_lease.run_id,
+                    channel_result=channel_durable_result(
+                        result,
+                        project_execution_result_for_channel(result),
+                        # The text this transaction stored, file links
+                        # rewritten.
+                        transcript=output if success and output.strip() else None,
+                    ),
+                )
+            except Exception:
+                stamp.rollback()
+                logger.exception(
+                    "Storing the channel result of resumed task %s failed; "
+                    "its channel reads the task row instead",
+                    task_id,
+                )
+            else:
+                stamp.commit()
         # A lost acknowledgement here is not reconciled yet: the lease is
         # released in this transaction, so only the result fact's witness
         # (returned above) can prove the commit. That belongs with the

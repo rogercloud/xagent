@@ -417,7 +417,9 @@ def accept_channel_turn_no_commit(
     from .task_auto_resume import supersede_pending_auto_resume_no_commit
 
     # A turn accepted while the run waits for an automatic resume replaces
-    # it; the START is staged at the version that moved.
+    # it; the START is staged at the version that moved. No notice is
+    # published: web clients learn the new version when this START's run
+    # broadcasts.
     supersede_pending_auto_resume_no_commit(db, task, now=utc_now())
     db.refresh(task)
     files = (
@@ -848,7 +850,8 @@ async def execute_channel_background(
         if not await run_db_io_cancellation_safe(finalize):
             raise TaskLeaseLostError("Channel result no longer owns its execution")
         if report.paused:
-            # The channel has its "interrupted" reply; a web viewer of the
+            # The channel has its "interrupted" reply, or waits for the
+            # automatic resume the pause scheduled; a web viewer of the
             # task learns of the committed pause here. Best effort, as on
             # the other settlement paths: a failed broadcast is only logged.
             from .task_orchestrator import publish_settlement_pause

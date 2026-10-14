@@ -1895,8 +1895,11 @@ def _auto_resume_holds(snap: Any, *, run_id: str, now: datetime) -> bool:
     due or starting?
 
     A dispatched command still queued or running holds whatever the version
-    (a retry after a rolled-back resume moves it by two); housekeeping bounds
-    it. Every other hold ends at the channel window from the latest
+    (a retry after a rolled-back resume moves it by two). No deadline bounds
+    that branch: the command's own liveness does (an expired claim is
+    reclaimed and run, a command that fails ends the hold, and housekeeping
+    closes the row after a failed one); housekeeping only re-arms a command
+    that is still queued. Every other hold ends at the channel window from the latest
     interruption, plus a clock grace: past it the sweeper can no longer
     dispatch the row.
     """
@@ -1935,11 +1938,12 @@ def channel_reply_waits_for_auto_resume(
 ) -> bool:
     """Whether a channel reply for ``run_id`` waits for an automatic resume.
 
-    False only when one consistent read shows the task PAUSED on ``run_id``
-    with no automatic resume pending or starting; the reply is then
-    "interrupted". A task that moved since the caller read it is True: the
-    caller reads again and its other branches decide. A deleted task is
-    False; the caller then reads it as missing.
+    The caller (``_read_channel_result``) replies "interrupted" on False and
+    reads again later on True. False when one consistent read shows the task
+    PAUSED on ``run_id`` with no automatic resume pending or starting, and
+    when the task is gone (deleted since the caller read it), so that reply
+    is "interrupted" too. A task that moved otherwise since the caller read
+    it is True: the next read's other branches decide.
     """
 
     snap = _hold_snapshot(db, task_id)
@@ -1962,8 +1966,9 @@ def supersede_pending_auto_resume_no_commit(
     recovery row. Acts only while the resume has not begun its hand-off
     (``control_state='paused'``). It moves ``state_version`` so that the
     RESUME_REQUESTED transition of an already-claimed automatic RESUME, fenced
-    on the version it admitted from, can no longer succeed; the claim guard
-    then skips the retry (``not_current``). Marking the row ``stale`` alone
+    on the version it admitted from, can no longer succeed; it defers, and
+    the claim guard skips the retry (``stale``: its snapshot is past the
+    fence, and the row no longer names the command). Marking the row ``stale`` alone
     would let that transition resume the old run and reject the new START.
     """
 

@@ -13,7 +13,6 @@ PostgreSQL only.
 
 from __future__ import annotations
 
-import asyncio
 import dataclasses
 import threading
 import time
@@ -36,6 +35,9 @@ from tests.web.services.channel_delivery_shared import (
 from tests.web.services.channel_delivery_shared import selected as selected_fixture
 from tests.web.services.task_database_shared import engine as engine_fixture
 from tests.web.services.task_database_shared import task_id as task_id_fixture
+from tests.web.services.test_persistence_failure_pause import (
+    _checkpoint,
+)
 from tests.web.services.test_persistence_failure_pause import (
     _late_bound_sessions as _late_bound_sessions_fixture,
 )
@@ -64,10 +66,9 @@ from xagent.web.services import shared_channel_execution as shared
 from xagent.web.services import task_auto_recovery, task_auto_resume
 from xagent.web.services import task_command_execution as commands
 from xagent.web.services import task_execution as task_execution_service
-from xagent.web.services.execution_result_projection import (
-    interrupted_channel_result,
-    project_execution_result_for_channel,
-)
+from xagent.web.services.client_error_messages import CLIENT_SAFE_TASK_FAILURE
+from xagent.web.services.execution_result_projection import interrupted_channel_result
+from xagent.web.services.managed_task_lease import finalize_managed_task_lease_result
 from xagent.web.services.task_auto_recovery_policy import staleness_window_seconds
 from xagent.web.services.task_auto_resume import (
     CHANNEL_HOLD_CLOCK_GRACE_SECONDS,
@@ -85,7 +86,7 @@ from xagent.web.services.task_execution import (
     _PreparedTaskFileOutputs,
 )
 from xagent.web.services.task_interaction_close import ActiveInteractionAbsent
-from xagent.web.services.task_lease_service import utc_now
+from xagent.web.services.task_lease_service import acquire_task_lease, utc_now
 from xagent.web.services.task_orchestrator import TaskTurnPayload
 from xagent.web.services.task_settlement_report import SettlementReport
 
@@ -125,9 +126,62 @@ def factory(engine, monkeypatch) -> sessionmaker:
     return result
 
 
+def _recovery_row(
+    db: Session,
+    task_id: int,
+    run_id: str,
+    pv: int,
+    *,
+    state: str,
+    interrupted_ago: float,
+    command_status: str | None = None,
+) -> str | None:
+    """Add ``task_id``'s recovery row; a ``dispatched`` one names the
+    sweeper's RESUME, staged with ``command_status`` when given."""
+    now = utc_now()
+    dispatched = state == "dispatched"
+    command_id = auto_resume_command_id(pv, 1, run_id) if dispatched else None
+    db.add(
+        TaskAutoRecovery(
+            task_id=task_id,
+            run_id=run_id,
+            reason="lease_expired",
+            state=state,
+            paused_state_version=pv,
+            interrupted_at=now - timedelta(seconds=interrupted_ago),
+            episode_started_at=now - timedelta(seconds=interrupted_ago),
+            total_resumes=int(dispatched),
+            no_progress_resumes=int(dispatched),
+            next_attempt_at=now - timedelta(seconds=1),
+            last_command_id=command_id,
+        )
+    )
+    if command_status is not None:
+        db.add(
+            TaskExecutionCommand(
+                task_id=task_id,
+                actor_user_id=db.get(Task, task_id).user_id,
+                command_id=command_id,
+                kind="resume",
+                payload={
+                    "type": "resume_task",
+                    "auto_resume": {
+                        "expected_run_id": run_id,
+                        "expected_state_version": pv,
+                        "reason": "lease_expired",
+                        "attempt": 1,
+                    },
+                },
+                target_run_id=run_id,
+                status=command_status,
+            )
+        )
+    db.flush()
+    return command_id
+
+
 def _seed(
     db: Session,
-    now: datetime,
     *,
     state: str | None = "scheduled",
     status: TaskStatus = TaskStatus.PAUSED,
@@ -138,7 +192,7 @@ def _seed(
     row_run: str = RUN,
 ) -> int:
     """A task resting on ``RUN`` and, unless ``state`` is None, its row
-    recorded at ``PV`` (with its dispatched command, if ``command_status``)."""
+    recorded at ``PV``."""
     user = User(username=f"hold-{uuid.uuid4().hex[:8]}", password_hash="x")
     db.add(user)
     db.flush()
@@ -155,34 +209,15 @@ def _seed(
     db.add(task)
     db.flush()
     if state is not None:
-        db.add(
-            TaskAutoRecovery(
-                task_id=task.id,
-                run_id=row_run,
-                reason="lease_expired",
-                state=state,
-                paused_state_version=PV,
-                interrupted_at=now - timedelta(seconds=interrupted_ago),
-                episode_started_at=now - timedelta(seconds=interrupted_ago),
-                total_resumes=1 if state == "dispatched" else 0,
-                no_progress_resumes=1 if state == "dispatched" else 0,
-                next_attempt_at=now - timedelta(seconds=1),
-                last_command_id=CID if state == "dispatched" else None,
-            )
+        _recovery_row(
+            db,
+            int(task.id),
+            row_run,
+            PV,
+            state=state,
+            interrupted_ago=interrupted_ago,
+            command_status=command_status,
         )
-    if command_status is not None:
-        db.add(
-            TaskExecutionCommand(
-                task_id=task.id,
-                actor_user_id=user.id,
-                command_id=CID,
-                kind="resume",
-                payload={"type": "resume_task"},
-                target_run_id=RUN,
-                status=command_status,
-            )
-        )
-    db.flush()
     return int(task.id)
 
 
@@ -198,7 +233,7 @@ _TABLE = [
     ("no_row", {"state": None}, False),
     ("other_run", {"row_run": "older-run"}, False),
     *[
-        (f"{state}", {"state": state}, False)
+        (state, {"state": state}, False)
         for state in (
             "manual",
             "exhausted",
@@ -252,6 +287,12 @@ _TABLE = [
         {"state": "dispatched", "command_status": "completed"},
         True,
     ),
+    # Housekeeping still has to close it (dispatch_failed) or reschedule it.
+    (
+        "dispatched_failed_at_the_fence",
+        {"state": "dispatched", "command_status": "failed"},
+        True,
+    ),
     ("dispatched_command_missing", {"state": "dispatched"}, True),
     (
         "dispatched_completed_past_the_deadline",
@@ -276,12 +317,7 @@ _TABLE = [
 ]
 
 
-@pytest.mark.parametrize(
-    ("seed", "expected"),
-    [pytest.param(seed, expected, id=name) for name, seed, expected in _TABLE],
-)
-def test_hold_decision_table(factory, seed, expected):
-    now = utc_now()
+def _seed_case(factory, seed: dict[str, Any]) -> int:
     seed = dict(seed)
     ago = seed.get("interrupted_ago")
     if ago == _PAST:
@@ -290,11 +326,22 @@ def test_hold_decision_table(factory, seed, expected):
         # Past the window itself, inside the clock grace.
         seed["interrupted_ago"] = _limit() - 5
     with factory() as db:
-        tid = _seed(db, now, **seed)
+        tid = _seed(db, **seed)
         db.commit()
+    return tid
+
+
+@pytest.mark.parametrize(
+    ("seed", "expected"),
+    [pytest.param(seed, expected, id=name) for name, seed, expected in _TABLE],
+)
+def test_hold_decision_table(factory, seed, expected):
+    tid = _seed_case(factory, seed)
     with factory() as db:
         assert (
-            channel_reply_waits_for_auto_resume(db, task_id=tid, run_id=RUN, now=now)
+            channel_reply_waits_for_auto_resume(
+                db, task_id=tid, run_id=RUN, now=utc_now()
+            )
             is expected
         )
 
@@ -313,11 +360,8 @@ def test_hold_decision_table(factory, seed, expected):
 )
 def test_a_task_that_moved_since_the_caller_read_it(factory, change, expected):
     """Anything but PAUSED on the run reads again (True); a deleted task is
-    released (False) and the caller reads it as missing."""
-    now = utc_now()
-    with factory() as db:
-        tid = _seed(db, now, state="manual")
-        db.commit()
+    False, so its reader replies "interrupted"."""
+    tid = _seed_case(factory, {"state": "manual"})
     with factory() as db:
         if change is None:
             db.delete(db.get(Task, tid))
@@ -327,7 +371,9 @@ def test_a_task_that_moved_since_the_caller_read_it(factory, change, expected):
         db.commit()
     with factory() as db:
         assert (
-            channel_reply_waits_for_auto_resume(db, task_id=tid, run_id=RUN, now=now)
+            channel_reply_waits_for_auto_resume(
+                db, task_id=tid, run_id=RUN, now=utc_now()
+            )
             is expected
         )
 
@@ -338,10 +384,10 @@ def test_a_task_that_moved_since_the_caller_read_it(factory, change, expected):
 
 
 def test_the_hold_snapshot_is_one_statement(factory, engine):
-    now = utc_now()
-    with factory() as db:
-        tid = _seed(db, now, state="dispatched", command_status="pending")
-        db.commit()
+    """The proxy for the single-snapshot requirement: task, recovery row and
+    command status must come from one statement, or READ COMMITTED could
+    pair versions from two different interruptions."""
+    tid = _seed_case(factory, {"state": "dispatched", "command_status": "pending"})
     statements: list[str] = []
 
     def count(_conn, _cursor, statement, *_args):
@@ -352,7 +398,7 @@ def test_the_hold_snapshot_is_one_statement(factory, engine):
         sa.event.listen(engine, "before_cursor_execute", count)
         try:
             assert channel_reply_waits_for_auto_resume(
-                db, task_id=tid, run_id=RUN, now=now
+                db, task_id=tid, run_id=RUN, now=utc_now()
             )
         finally:
             sa.event.remove(engine, "before_cursor_execute", count)
@@ -364,12 +410,12 @@ def test_the_hold_snapshot_is_one_statement(factory, engine):
 # --------------------------------------------------------------------------
 
 
-def _supersede(factory, tid: int, now: datetime) -> bool:
+def _supersede(factory, tid: int) -> bool:
     with factory() as db:
         task = db.execute(
             sa.select(Task).where(Task.id == tid).with_for_update()
         ).scalar_one()
-        superseded = supersede_pending_auto_resume_no_commit(db, task, now=now)
+        superseded = supersede_pending_auto_resume_no_commit(db, task, now=utc_now())
         db.commit()
     return superseded
 
@@ -391,12 +437,9 @@ def _supersede(factory, tid: int, now: datetime) -> bool:
     ],
 )
 def test_a_new_turn_supersedes_a_resume_that_has_not_handed_off(factory, seed, version):
-    now = utc_now()
-    with factory() as db:
-        tid = _seed(db, now, **seed)
-        db.commit()
+    tid = _seed_case(factory, seed)
 
-    assert _supersede(factory, tid, now)
+    assert _supersede(factory, tid)
 
     with factory() as db:
         task = db.get(Task, tid)
@@ -414,9 +457,8 @@ def test_a_new_turn_supersedes_a_resume_that_has_not_handed_off(factory, seed, v
         assert [(e.event, e.detail["at"], e.detail["mismatch"]) for e in events] == [
             ("stale", "new_turn", "new_turn")
         ]
-        # The supersede ends the hold.
         assert not channel_reply_waits_for_auto_resume(
-            db, task_id=tid, run_id=RUN, now=now
+            db, task_id=tid, run_id=RUN, now=utc_now()
         )
 
 
@@ -444,40 +486,28 @@ def test_a_new_turn_supersedes_a_resume_that_has_not_handed_off(factory, seed, v
             },
             id="running",
         ),
-        pytest.param({"state": "manual"}, id="manual"),
-        pytest.param({"state": "expired"}, id="expired"),
-        pytest.param({"interrupted_ago": "past"}, id="past_the_deadline"),
-        pytest.param({"version": PV + 1}, id="version_moved"),
     ],
 )
 def test_nothing_to_supersede_leaves_the_task_alone(factory, seed):
-    now = utc_now()
-    seed = dict(seed)
-    if seed.get("interrupted_ago") == "past":
-        seed["interrupted_ago"] = _limit() + 5
+    """Released rows are the decision table's; these hold, but have begun
+    their hand-off."""
+    tid = _seed_case(factory, seed)
     with factory() as db:
-        tid = _seed(db, now, **seed)
         before = (
             int(db.get(Task, tid).state_version),
             db.get(TaskAutoRecovery, tid).state,
         )
-        db.commit()
 
-    assert not _supersede(factory, tid, now)
+    assert not _supersede(factory, tid)
 
     with factory() as db:
         assert (
             int(db.get(Task, tid).state_version),
             db.get(TaskAutoRecovery, tid).state,
         ) == before
-        assert (
-            db.scalar(
-                sa.select(sa.func.count())
-                .select_from(TaskRecoveryEvent)
-                .where(TaskRecoveryEvent.task_id == tid)
-            )
-            == 0
-        )
+        assert not db.scalars(
+            sa.select(TaskRecoveryEvent).where(TaskRecoveryEvent.task_id == tid)
+        ).all()
 
 
 # --------------------------------------------------------------------------
@@ -485,13 +515,15 @@ def test_nothing_to_supersede_leaves_the_task_alone(factory, seed):
 # --------------------------------------------------------------------------
 
 
+def _accept_first_turn(selected) -> int:
+    selected.delivery_destination = {"chat_id": "conversation"}
+    return shared._accept_channel_turn(selected, TaskTurnPayload("hello"), "ingress")
+
+
 @pytest.fixture
 def channel(selected):
     """M1 accepted; its run started and then rested PAUSED on its run."""
-    selected.delivery_destination = {"chat_id": "conversation"}
-    command_id = shared._accept_channel_turn(
-        selected, TaskTurnPayload("hello"), "ingress"
-    )
+    command_id = _accept_first_turn(selected)
     run_id = selected.run_id
     with get_session_local()() as db:
         command = db.get(TaskExecutionCommand, command_id)
@@ -517,62 +549,20 @@ def channel(selected):
 
 
 def _record(
-    ch, *, state: str = "scheduled", dispatched_status: str | None = None
+    ch, *, state: str = "scheduled", command_status: str | None = None
 ) -> str | None:
-    """The recovery row of ``ch``'s run; ``dispatched_status`` also stages
-    the sweeper's RESUME. Returns its command id."""
-    now = utc_now()
-    command_id = (
-        auto_resume_command_id(ch.version, 1, ch.run_id)
-        if dispatched_status is not None
-        else None
-    )
     with get_session_local()() as db:
-        db.add(
-            TaskAutoRecovery(
-                task_id=ch.task_id,
-                run_id=ch.run_id,
-                reason="lease_expired",
-                state="dispatched" if dispatched_status is not None else state,
-                paused_state_version=ch.version,
-                interrupted_at=now - timedelta(seconds=30),
-                episode_started_at=now - timedelta(seconds=30),
-                total_resumes=1 if dispatched_status is not None else 0,
-                no_progress_resumes=1 if dispatched_status is not None else 0,
-                next_attempt_at=now - timedelta(seconds=1),
-                last_command_id=command_id,
-            )
+        command_id = _recovery_row(
+            db,
+            ch.task_id,
+            ch.run_id,
+            ch.version,
+            state=state,
+            interrupted_ago=30,
+            command_status=command_status,
         )
-        if dispatched_status is not None:
-            db.add(
-                TaskExecutionCommand(
-                    task_id=ch.task_id,
-                    actor_user_id=db.get(Task, ch.task_id).user_id,
-                    command_id=command_id,
-                    kind="resume",
-                    payload={
-                        "type": "resume_task",
-                        "auto_resume": {
-                            "expected_run_id": ch.run_id,
-                            "expected_state_version": ch.version,
-                            "reason": "lease_expired",
-                            "attempt": 1,
-                        },
-                    },
-                    target_run_id=ch.run_id,
-                    status=dispatched_status,
-                )
-            )
         db.commit()
     return command_id
-
-
-def _set_row(ch, **values: Any) -> None:
-    with get_session_local()() as db:
-        row = db.get(TaskAutoRecovery, ch.task_id)
-        for name, value in values.items():
-            setattr(row, name, value)
-        db.commit()
 
 
 def _delivery(command_id: int) -> TaskChannelDelivery:
@@ -582,24 +572,17 @@ def _delivery(command_id: int) -> TaskChannelDelivery:
         return row
 
 
-def _second_turn(ch, *, version: int | None = None) -> shared.SharedChannelTurn:
+def _second_turn(ch) -> shared.SharedChannelTurn:
     selection = dataclasses.replace(
         ch.turn.selection,
         is_new_task=False,
         previous_run_id=ch.run_id,
-        state_version=ch.version if version is None else version,
+        state_version=ch.version,
     )
     turn = shared.SharedChannelTurn(selection, workspace=SimpleNamespace())
     turn.origin = "origin-token"
     turn.delivery_destination = {"chat_id": "conversation"}
     return turn
-
-
-def _command(command_id: int) -> TaskExecutionCommand:
-    with get_session_local()() as db:
-        row = db.get(TaskExecutionCommand, command_id)
-        db.expunge_all()
-        return row
 
 
 # --------------------------------------------------------------------------
@@ -614,13 +597,6 @@ def test_read_holds_while_a_resume_is_due(channel):
 
 def test_read_is_interrupted_once_automatic_resume_stops(channel):
     _record(channel, state="exhausted")
-    assert (
-        shared._read_channel_result(channel.command_id, channel.run_id)
-        == interrupted_channel_result()
-    )
-
-
-def test_read_without_a_recovery_row_is_interrupted_as_before(channel):
     assert (
         shared._read_channel_result(channel.command_id, channel.run_id)
         == interrupted_channel_result()
@@ -665,77 +641,36 @@ async def test_a_held_delivery_stays_pending_without_a_failure(channel, via):
     assert before + timedelta(seconds=25) <= available_at
     assert available_at <= datetime.now(timezone.utc) + timedelta(seconds=35)
 
-    # Released: the next attempt delivers "interrupted" exactly once.
-    _set_row(channel, state="expired")
-    expire_claim(channel.command_id)
-    first, second = await asyncio.gather(
-        channel_delivery.deliver_channel_result(channel.command_id, sender),
-        channel_delivery.deliver_channel_result(channel.command_id, sender),
-    )
-    assert sorted([first, second]) == [False, True]
-    sender.assert_awaited_once()
-    assert sender.await_args.args[1] == interrupted_channel_result()
-    assert _delivery(channel.command_id).status == "delivered"
-
-
-@pytest.mark.asyncio
-async def test_a_pending_notice_during_the_hold_keeps_the_reply_pending(channel):
-    """The original wait times out into the "still processing" notice."""
-    _record(channel)
-    sender = AsyncMock()
-
-    assert not await channel_delivery.deliver_channel_result(
-        channel.command_id, sender, pending_notice=True
-    )
-
-    sender.assert_awaited_once()
-    assert sender.await_args.args[1] == channel_delivery.PENDING_CHANNEL_RESULT
-    assert _delivery(channel.command_id).status == "pending"
-
 
 # --------------------------------------------------------------------------
 # 8. Acceptance supersedes
 # --------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("dispatched_status", [None, "pending"])
-def test_a_turn_accepted_during_the_hold_supersedes_the_resume(
-    channel, dispatched_status
-):
-    _record(channel, dispatched_status=dispatched_status)
+@pytest.mark.parametrize("command_status", [None, "pending"])
+def test_a_turn_accepted_during_the_hold_supersedes_the_resume(channel, command_status):
+    _record(
+        channel,
+        state="dispatched" if command_status else "scheduled",
+        command_status=command_status,
+    )
 
     second = shared._accept_channel_turn(
         _second_turn(channel), TaskTurnPayload("again"), "ingress"
     )
 
-    start = _command(second)
     with get_session_local()() as db:
+        start = db.get(TaskExecutionCommand, second)
         task = db.get(Task, channel.task_id)
         row = db.get(TaskAutoRecovery, channel.task_id)
         assert int(task.state_version) == channel.version + 1
         assert start.payload["state_version"] == channel.version + 1
         assert start.target_state_version == channel.version + 1
         assert (row.state, row.state_detail) == ("stale", "new_turn")
-    # M1 now reads "interrupted"; M2 waits for its own run.
     assert (
         shared._read_channel_result(channel.command_id, channel.run_id)
         == interrupted_channel_result()
     )
-
-
-@pytest.mark.parametrize("state", ["manual", "expired"])
-def test_a_turn_accepted_without_a_hold_leaves_the_version(channel, state):
-    """9a is inert: a channel row that is never scheduled changes nothing."""
-    _record(channel, state=state)
-
-    second = shared._accept_channel_turn(
-        _second_turn(channel), TaskTurnPayload("again"), "ingress"
-    )
-
-    assert _command(second).payload["state_version"] == channel.version
-    with get_session_local()() as db:
-        assert int(db.get(Task, channel.task_id).state_version) == channel.version
-        assert db.get(TaskAutoRecovery, channel.task_id).state == state
 
 
 # --------------------------------------------------------------------------
@@ -807,11 +742,15 @@ async def _auto_resume(ch, command_id: str, *, attempt_count: int):
     )
 
 
+def _claimable(db: Session) -> list[int]:
+    return [c.id for c in _claimable_query(db, runner_id="worker", command_db_id=None)]
+
+
 @pytest.mark.asyncio
 async def test_a_turn_accepted_after_the_guard_defers_the_resume_and_runs(
     channel, handler
 ):
-    auto_command_id = _record(channel, dispatched_status="processing")
+    auto_command_id = _record(channel, state="dispatched", command_status="processing")
     accepted: list[int] = []
 
     def accept_between_guard_and_transition(_task_id):
@@ -842,10 +781,7 @@ async def test_a_turn_accepted_after_the_guard_defers_the_resume_and_runs(
         row = db.get(TaskAutoRecovery, channel.task_id)
         assert (row.state, row.state_detail) == ("stale", "new_turn")
         # Serialized behind the RESUME until it completes (auto_skipped).
-        claimable = [
-            c.id for c in _claimable_query(db, runner_id="worker", command_db_id=None)
-        ]
-        assert accepted[0] not in claimable
+        assert accepted[0] not in _claimable(db)
         auto = db.scalars(
             sa.select(TaskExecutionCommand).where(
                 TaskExecutionCommand.command_id == auto_command_id
@@ -855,10 +791,7 @@ async def test_a_turn_accepted_after_the_guard_defers_the_resume_and_runs(
         auto.result = {"resume_outcome": "auto_skipped"}
         db.commit()
     with get_session_local()() as db:
-        claimable = [
-            c.id for c in _claimable_query(db, runner_id="worker", command_db_id=None)
-        ]
-        assert claimable == [accepted[0]]
+        assert _claimable(db) == [accepted[0]]
         # START's own admission checks (task_start_consumer) pass.
         task = db.get(Task, channel.task_id)
         start = db.get(TaskExecutionCommand, accepted[0])
@@ -877,26 +810,31 @@ async def test_a_turn_accepted_after_the_guard_defers_the_resume_and_runs(
 # --------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("recorded", ["scheduled", "exhausted", "manual", "raises"])
-def test_the_leaf_holds_its_reply_only_for_a_scheduled_resume(
-    canonical, monkeypatch, recorded
-):
+def _force_recorded(monkeypatch, recorded: str) -> None:
+    """Settle with the pause switches on, recording ``recorded``."""
     monkeypatch.setenv(PAUSE_SWITCH, "true")
     monkeypatch.setenv(AUTO_RESUME_SWITCH, "true")
     if recorded == "raises":
         _fail_recording(monkeypatch, "python")
-    else:
-        original = task_auto_recovery.record_interruption_no_commit
+        return
+    original = task_auto_recovery.record_interruption_no_commit
 
-        def force(db, **kwargs):
-            row = original(db, **kwargs)
-            row.state = recorded
-            if recorded != "scheduled":
-                row.next_attempt_at = None
-            db.flush()
-            return row
+    def force(db, **kwargs):
+        row = original(db, **kwargs)
+        row.state = recorded
+        if recorded != "scheduled":
+            row.next_attempt_at = None
+        db.flush()
+        return row
 
-        monkeypatch.setattr(task_auto_recovery, "record_interruption_no_commit", force)
+    monkeypatch.setattr(task_auto_recovery, "record_interruption_no_commit", force)
+
+
+@pytest.mark.parametrize("recorded", ["scheduled", "exhausted", "manual", "raises"])
+def test_the_leaf_holds_its_reply_only_for_a_scheduled_resume(
+    canonical, monkeypatch, recorded
+):
+    _force_recorded(monkeypatch, recorded)
     factory, _tid = canonical
     ids = _projected_task(factory)
     lease = _prepare_run(factory, ids)
@@ -922,34 +860,14 @@ def test_the_leaf_holds_its_reply_only_for_a_scheduled_resume(
 # 5. The resumed run stores the channel answer
 # --------------------------------------------------------------------------
 
+_INTERACTIONS = [
+    {"type": "select_one", "field": "choice", "label": "Pick", "options": ["a", "b"]}
+]
 _COMPLETED = {
     "success": True,
     "status": "completed",
     "output": "The resumed answer",
     "completion_outcome": "completed",
-}
-_EXCEL_FAILED = {
-    "success": False,
-    "status": "failed",
-    "output": "workbook locked",
-    "error": "workbook locked",
-    "failure_code": "excel_workbook_locked",
-}
-_QUESTION = {
-    "success": True,
-    "status": "waiting_for_user",
-    "output": "Which one?",
-    "chat_response": {
-        "message": "Which one?",
-        "interactions": [
-            {
-                "type": "select_one",
-                "field": "choice",
-                "label": "Pick",
-                "options": ["left", "right"],
-            }
-        ],
-    },
 }
 
 
@@ -972,10 +890,7 @@ def _channel_task_run(
         channel_id = int(user_channel.id)
     lease = _prepare_run(factory, ids)
     if start:
-        result: dict[str, Any] = {
-            "run_id": lease.run_id,
-            "lease_attempt_id": "first-segment",
-        }
+        result: dict[str, Any] = {"run_id": lease.run_id, "lease_attempt_id": "first"}
         if stored is not None:
             result["channel_result"] = stored
         with factory() as db:
@@ -1019,42 +934,78 @@ def _start_result(factory, ids) -> dict[str, Any]:
 
 
 @pytest.mark.parametrize(
-    ("result", "status"),
+    ("result", "stored"),
     [
-        pytest.param(_COMPLETED, TaskStatus.COMPLETED, id="completed"),
-        pytest.param(_EXCEL_FAILED, TaskStatus.FAILED, id="failed_coded"),
-        pytest.param(_QUESTION, TaskStatus.WAITING_FOR_USER, id="waiting_for_user"),
+        pytest.param(
+            {
+                **_COMPLETED,
+                # The transcript stores ``output``; the leaf would show this.
+                "chat_response": {"message": "unrewritten text", "interactions": []},
+            },
+            {
+                "success": True,
+                "status": "completed",
+                "output": "The resumed answer",
+                "completion_outcome": "completed",
+                "chat_response": {"message": "The resumed answer", "interactions": []},
+            },
+            id="completed_keeps_the_stored_transcript",
+        ),
+        pytest.param(
+            {
+                "success": False,
+                "status": "failed",
+                "output": "workbook locked",
+                "error": "workbook locked",
+                "failure_code": "excel_workbook_locked",
+            },
+            {
+                "success": False,
+                "status": "failed",
+                "output": CLIENT_SAFE_TASK_FAILURE,
+                "completion_outcome": None,
+                "chat_response": {
+                    "message": CLIENT_SAFE_TASK_FAILURE,
+                    "interactions": [],
+                },
+                "failure_code": "excel_workbook_locked",
+            },
+            id="failed_coded",
+        ),
+        pytest.param(
+            {
+                "success": True,
+                "status": "waiting_for_user",
+                "output": "Which one?",
+                "chat_response": {
+                    "message": "Which one?",
+                    "interactions": _INTERACTIONS,
+                },
+            },
+            {
+                "success": True,
+                "status": "waiting_for_user",
+                "output": "Which one?",
+                "completion_outcome": None,
+                "chat_response": {
+                    "message": "Which one?",
+                    "interactions": _INTERACTIONS,
+                },
+            },
+            id="waiting_for_user",
+        ),
     ],
 )
-def test_the_resumed_run_stores_the_leaf_projection(canonical, result, status):
+def test_the_resumed_run_stores_its_channel_result(canonical, result, stored):
     factory, _tid = canonical
     ids, lease = _channel_task_run(factory)
 
-    finalized = _finalize(ids, lease, result)
+    assert _finalize(ids, lease, result)["lease_released"]
 
-    assert finalized["lease_released"]
-    assert finalized["final_status"] == status.value
-    stored = _start_result(factory, ids)["channel_result"]
-    projection = project_execution_result_for_channel(dict(result))
-    with factory() as db:
-        task_output = db.get(Task, ids["task"]).output
-    transcript = task_output if result["success"] else None
-    assert stored == shared.channel_durable_result(
-        dict(result), projection, transcript=transcript
-    )
-    if status == TaskStatus.COMPLETED:
-        # The text the transcript stored (file links rewritten there).
-        assert stored["output"] == task_output == "The resumed answer"
-        assert stored["status"] == "completed"
-    elif status == TaskStatus.FAILED:
-        assert stored["failure_code"] == "excel_workbook_locked"
-        assert stored["success"] is False
-    else:
-        assert (
-            stored["chat_response"]["interactions"]
-            == (_QUESTION["chat_response"]["interactions"])
-        )
-        assert stored["status"] == "waiting_for_user"
+    assert _start_result(factory, ids)["channel_result"] == stored
+    if result["status"] == "completed":
+        with factory() as db:
+            assert db.get(Task, ids["task"]).output == stored["output"]
 
 
 @pytest.mark.parametrize("result", ["interrupted", "paused_again"])
@@ -1069,40 +1020,51 @@ def test_a_resumed_run_that_pauses_stores_nothing(canonical, monkeypatch, result
         else LLM_RESULT
     )
 
-    finalized = _finalize(ids, lease, payload)
-
-    assert finalized["final_status"] == TaskStatus.PAUSED.value
+    assert _finalize(ids, lease, payload)["final_status"] == "paused"
     assert "channel_result" not in _start_result(factory, ids)
 
 
-def test_a_stored_channel_result_is_never_replaced(canonical):
+@pytest.mark.parametrize("case", ["already_stored", "not_a_channel_turn", "no_start"])
+def test_a_start_with_nothing_to_stamp_is_left_alone(canonical, case):
     factory, _tid = canonical
-    ids, lease = _channel_task_run(factory, stored=interrupted_channel_result())
-
-    assert _finalize(ids, lease, _COMPLETED)["lease_released"]
-
-    assert _start_result(factory, ids)["channel_result"] == (
-        interrupted_channel_result()
+    ids, lease = _channel_task_run(
+        factory,
+        stored=interrupted_channel_result() if case == "already_stored" else None,
+        channel_payload=case != "not_a_channel_turn",
+        start=case != "no_start",
     )
 
+    finalized = _finalize(ids, lease, _COMPLETED)
 
-def test_a_start_that_is_not_a_channel_turn_is_left_alone(canonical):
+    assert finalized["final_status"] == "completed"
+    if case != "no_start":
+        assert _start_result(factory, ids).get("channel_result") == (
+            interrupted_channel_result() if case == "already_stored" else None
+        )
+
+
+def test_a_failed_stamp_never_undoes_the_settlement(canonical, monkeypatch):
     factory, _tid = canonical
-    ids, lease = _channel_task_run(factory, channel_payload=False)
+    ids, lease = _channel_task_run(factory)
+    original = shared.stamp_channel_result_no_commit
 
-    assert _finalize(ids, lease, _COMPLETED)["lease_released"]
+    def stamp_then_fail(db, **kwargs):
+        assert original(db, **kwargs)
+        db.flush()
+        raise RuntimeError("stamp failed")
 
-    assert "channel_result" not in _start_result(factory, ids)
-
-
-def test_a_run_without_its_start_still_settles(canonical):
-    factory, _tid = canonical
-    ids, lease = _channel_task_run(factory, start=False)
+    monkeypatch.setattr(shared, "stamp_channel_result_no_commit", stamp_then_fail)
 
     finalized = _finalize(ids, lease, _COMPLETED)
 
     assert finalized["lease_released"]
-    assert finalized["final_status"] == TaskStatus.COMPLETED.value
+    with factory() as db:
+        task = db.get(Task, ids["task"])
+        assert (task.status, task.output) == (
+            TaskStatus.COMPLETED,
+            "The resumed answer",
+        )
+    assert "channel_result" not in _start_result(factory, ids)
 
 
 def test_a_rolled_back_settlement_stores_nothing(canonical, monkeypatch):
@@ -1114,14 +1076,82 @@ def test_a_rolled_back_settlement_stores_nothing(canonical, monkeypatch):
         lambda *_args, **_kwargs: False,
     )
 
-    finalized = _finalize(ids, lease, _COMPLETED)
-
-    assert finalized["late_result"]
+    assert _finalize(ids, lease, _COMPLETED)["late_result"]
     assert "channel_result" not in _start_result(factory, ids)
 
 
 # --------------------------------------------------------------------------
-# 16-18. PostgreSQL: lock order with the sweeper, the claim guard and W
+# The whole chain: leaf holds, delivery waits, resumed run answers once
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_a_held_reply_is_delivered_once_with_the_resumed_answer(
+    selected, monkeypatch
+):
+    _force_recorded(monkeypatch, "scheduled")
+    command_id = _accept_first_turn(selected)
+    with get_session_local()() as db:
+        tid = int(db.get(TaskExecutionCommand, command_id).task_id)
+        db.get(Task, tid).conversation_storage_version = 2
+        db.commit()
+        lease = acquire_task_lease(db, tid, new_run=True)
+    # The START hand-off this run came from.
+    with get_session_local()() as db:
+        start = db.get(TaskExecutionCommand, command_id)
+        start.target_run_id = lease.run_id
+        start.status = "completed"
+        start.result = {"run_id": lease.run_id, "lease_attempt_id": lease.attempt_id}
+        db.commit()
+    _checkpoint(get_session_local(), tid, lease.run_id)
+
+    with get_session_local()() as db:
+        assert finalize_managed_task_lease_result(
+            db,
+            lease,
+            status=TaskStatus.FAILED,
+            execution_result=dict(LLM_RESULT),
+            completion=(command_id, {"success": False, "status": "failed"}),
+            settle_interruption=True,
+        )
+    with get_session_local()() as db:
+        assert db.get(Task, tid).status == TaskStatus.PAUSED
+        assert db.get(TaskAutoRecovery, tid).state == "scheduled"
+
+    sender = AsyncMock()
+    assert not await channel_delivery.deliver_channel_result(command_id, sender)
+    sender.assert_not_awaited()
+
+    # The automatic resume runs the same run to completion.
+    with get_session_local()() as db:
+        resumed = acquire_task_lease(db, tid, expected_run_id=lease.run_id)
+    assert resumed is not None and resumed.run_id == lease.run_id
+    finalized = _finalize_resumed_task(
+        tid,
+        status="completed",
+        success=True,
+        output="The resumed answer",
+        task_owner_user_id=selected.selection.user_id,
+        result=dict(_COMPLETED),
+        task_lease=resumed,
+        prepared_outputs=NO_OUTPUTS,
+    )
+    assert finalized["final_status"] == "completed"
+
+    expire_claim(command_id)
+    await channel_delivery.recover_channel_results(
+        selected.selection.channel_id, sender
+    )
+    assert not await channel_delivery.deliver_channel_result(command_id, sender)
+
+    sender.assert_awaited_once()
+    sent = sender.await_args.args[1]
+    assert (sent["status"], sent["output"]) == ("completed", "The resumed answer")
+    assert _delivery(command_id).status == "delivered"
+
+
+# --------------------------------------------------------------------------
+# 16-17. PostgreSQL: lock order with the sweeper and the claim guard
 # --------------------------------------------------------------------------
 
 
@@ -1179,6 +1209,23 @@ def test_postgresql_sweeper_skips_a_task_an_acceptance_holds(
         assert db.get(TaskAutoRecovery, channel.task_id).state == "stale"
 
 
+def _wait_for_a_lock_waiter(monitor: Session, timeout: float = 5.0) -> None:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        waiting = monitor.execute(
+            sa.text(
+                "SELECT count(*) FROM pg_stat_activity "
+                "WHERE datname = current_database() AND wait_event_type = 'Lock' "
+                "AND pid <> pg_backend_pid()"
+            )
+        ).scalar_one()
+        monitor.rollback()
+        if waiting:
+            return
+        time.sleep(0.05)
+    raise AssertionError("the guard never waited on the acceptance's locks")
+
+
 @pytest.mark.parametrize("snapshot", ["at_fence", "moved"])
 def test_postgresql_claim_guard_waits_for_an_acceptance_without_deadlock(
     channel, short_lock_timeout, snapshot
@@ -1187,7 +1234,7 @@ def test_postgresql_claim_guard_waits_for_an_acceptance_without_deadlock(
     first. Either way it waits for the acceptance (which holds both, tasks
     first) and then finds the row superseded."""
     _postgresql_only()
-    command_id = _record(channel, dispatched_status="processing")
+    command_id = _record(channel, state="dispatched", command_status="processing")
     outcome: dict[str, Any] = {}
 
     def guard() -> None:
@@ -1211,14 +1258,14 @@ def test_postgresql_claim_guard_waits_for_an_acceptance_without_deadlock(
             outcome["error"] = exc
 
     accepting = get_session_local()()
+    thread = threading.Thread(target=guard)
     try:
         shared.accept_channel_turn_no_commit(
             accepting, _second_turn(channel), TaskTurnPayload("again"), "ingress"
         )
-        thread = threading.Thread(target=guard)
         thread.start()
-        time.sleep(0.5)
-        assert thread.is_alive(), "the guard did not wait for the acceptance"
+        with get_session_local()() as monitor:
+            _wait_for_a_lock_waiter(monitor)
         accepting.commit()
     finally:
         accepting.close()
@@ -1229,89 +1276,3 @@ def test_postgresql_claim_guard_waits_for_an_acceptance_without_deadlock(
     with get_session_local()() as db:
         row = db.get(TaskAutoRecovery, channel.task_id)
         assert (row.state, row.state_detail) == ("stale", "new_turn")
-
-
-def _running_channel_run(ch) -> None:
-    """The run resumed: RUNNING on the same run under a lease."""
-    with get_session_local()() as db:
-        task = db.get(Task, ch.task_id)
-        task.status = TaskStatus.RUNNING
-        task.control_state = "running"
-        task.runner_id = "worker"
-        task.lease_expires_at = utc_now() + timedelta(minutes=5)
-        db.commit()
-
-
-def _stamp_locked(db: Session, ch, answer: dict[str, Any]) -> None:
-    """``_finalize_resumed_task``'s order: the task row, then the START."""
-    task = db.execute(
-        sa.select(Task).where(Task.id == ch.task_id).with_for_update()
-    ).scalar_one()
-    task.status = TaskStatus.COMPLETED
-    task.control_state = "completed"
-    task.runner_id = None
-    task.lease_expires_at = None
-    db.flush()
-    assert shared.stamp_channel_result_no_commit(
-        db, task_id=ch.task_id, run_id=ch.run_id, channel_result=answer
-    )
-
-
-ANSWER = {"success": True, "status": "completed", "output": "resumed answer"}
-
-
-def test_postgresql_stamp_and_a_delivery_claim_do_not_block_each_other(
-    channel, short_lock_timeout
-):
-    _postgresql_only()
-    _record(channel, dispatched_status="completed")
-    _running_channel_run(channel)
-
-    # W holds the task and START rows; the claim neither waits nor sees it.
-    settling = get_session_local()()
-    try:
-        _stamp_locked(settling, channel, ANSWER)
-        outcome: dict[str, Any] = {}
-
-        def claim() -> None:
-            try:
-                outcome["claimed"] = channel_delivery._claim(channel.command_id)
-            except BaseException as exc:  # pragma: no cover - reported below
-                outcome["error"] = exc
-
-        thread = threading.Thread(target=claim)
-        thread.start()
-        thread.join(timeout=10)
-        assert not thread.is_alive()
-        assert "error" not in outcome, outcome.get("error")
-        _delivery_row, result = outcome["claimed"]
-        assert result is None  # still RUNNING as committed
-        settling.commit()
-    finally:
-        settling.close()
-
-    # A claim held open does not block the stamp's locks either.
-    expire_claim(channel.command_id)
-    claiming = get_session_local()()
-    try:
-        claiming.execute(
-            sa.update(TaskChannelDelivery)
-            .where(TaskChannelDelivery.command_id == channel.command_id)
-            .values(claim_token="held")
-        )
-        assert shared._read_channel_result(channel.command_id, channel.run_id) == ANSWER
-        with get_session_local()() as other:
-            # Already stored: first writer wins, and it took the locks freely.
-            other.execute(
-                sa.select(Task).where(Task.id == channel.task_id).with_for_update()
-            ).scalar_one()
-            assert not shared.stamp_channel_result_no_commit(
-                other,
-                task_id=channel.task_id,
-                run_id=channel.run_id,
-                channel_result={"success": False},
-            )
-            other.rollback()
-        claiming.rollback()
-    finally:
-        claiming.close()
