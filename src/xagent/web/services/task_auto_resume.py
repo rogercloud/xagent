@@ -82,11 +82,9 @@ from .ops_signals import (
 )
 from .task_auto_recovery import (
     AUTO_RESUME_DISABLED_DETAIL,
-    CHANNEL_HOLD_PENDING_DETAIL,
     PLANNED_RECOVERY_EVENTS,
     TASK_INTERRUPTION_PAUSED_TRIGGER_ERROR,
     auto_recovery_eligibility,
-    auto_resume_schedulable,
     is_auto_resume_command_id,
 )
 from .task_auto_recovery_policy import (
@@ -206,8 +204,8 @@ def public_auto_resume_view(
     it, and that action announced itself. ``manual`` reached from an
     announced state (the sweeper or the guard closing a scheduled or
     dispatched row) is ``stopped``: ``disabled`` for a switched-off executor,
-    else ``ineligible`` (a channel task or a reason with no policy -- either
-    way automatic resume will not act on the task). Callers decide whether a
+    else ``ineligible`` (a reason with no policy: automatic resume will not
+    act on the task). Callers decide whether a
     transition is announced at all; a recorded ``manual`` is not.
     """
 
@@ -415,9 +413,9 @@ def _row_cas(
 
 
 # Each terminal state's event and TriggerRun error. A dispatch-time
-# ``manual`` (a reason with no policy, a channel task) is the task being out
-# of automatic recovery's reach, recorded as an ``ineligible`` event whose
-# detail names the state; a disabled switch passes its own event and error.
+# ``manual`` (a reason with no policy) is the task being out of automatic
+# recovery's reach, recorded as an ``ineligible`` event whose detail names
+# the state; a disabled switch passes its own event and error.
 # ``stale`` never fails a TriggerRun.
 _STOPS: dict[TaskAutoRecoveryState, tuple[TaskRecoveryEventType, str | None]] = {
     TaskAutoRecoveryState.EXHAUSTED: (
@@ -685,16 +683,6 @@ def _process_due_candidate_no_commit(
             from_state=_SCHEDULED,
             at="dispatch",
             state_detail=eligibility.detail,
-        )
-    if not auto_resume_schedulable(eligibility.kind):
-        return _give_up_no_commit(
-            db,
-            task,
-            row,
-            TaskAutoRecoveryState.MANUAL,
-            from_state=_SCHEDULED,
-            at="dispatch",
-            state_detail=CHANNEL_HOLD_PENDING_DETAIL,
         )
     if scheduled_trigger_superseded(db, task):
         return _give_up_no_commit(

@@ -60,6 +60,7 @@ from .task_command_transport import (
     stage_task_command,
 )
 from .task_event_bridge import get_task_event_bridge
+from .task_execution_controller import TaskControlState
 from .task_lease_service import TaskLease, TaskLeaseLostError, utc_now
 from .task_orchestrator import (
     TaskTurnError,
@@ -400,6 +401,13 @@ def accept_channel_turn_no_commit(
     if (
         task.state_version != selection.state_version
         or task.run_id != selection.previous_run_id
+        # A resume handing off (automatic or a person's) is about to run the
+        # paused turn again: busy, as while it runs. Its START would only be
+        # refused as ``start_state_changed``.
+        or (
+            task.status == TaskStatus.PAUSED
+            and task.control_state == TaskControlState.RESUME_REQUESTED.value
+        )
         or not reserve_task_start_no_commit(
             db,
             task_id=int(task.id),
