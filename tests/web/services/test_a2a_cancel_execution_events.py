@@ -1,6 +1,7 @@
 """A2A cancellation records its outcome with the state it settles."""
 
 import asyncio
+import functools
 from types import SimpleNamespace
 
 import pytest
@@ -136,8 +137,16 @@ async def test_cancel_fact_failure_rolls_back_state_and_retry_succeeds(
 
 
 @pytest.mark.asyncio
-async def test_live_cancel_keeps_execution_finalizers_result(a2a_task):
+async def test_live_cancel_keeps_execution_finalizers_result(a2a_task, monkeypatch):
     ctx = a2a_task
+    # This covers a finalizer that drains inside ``cancel_task``. Its default
+    # drain timeout is short enough for a loaded CI worker to miss, which
+    # turns this into the mid-finalize interleaving tested below.
+    monkeypatch.setattr(
+        ctx.manager,
+        "cancel_task",
+        functools.partial(ctx.manager.cancel_task, timeout_seconds=30),
+    )
     with ctx.factory() as db:
         lease = acquire_task_lease(db, ctx.target["task_id"], new_run=True)
         task = db.get(Task, lease.task_id)
@@ -168,6 +177,71 @@ async def test_live_cancel_keeps_execution_finalizers_result(a2a_task):
         assert snapshot.agent_config["a2a_state"] == "TASK_STATE_CANCELED"
         await a2a_task_cancel.cancel_a2a_task(**target)
         with ctx.factory() as db:
+            rows = outcomes(db, lease.task_id)
+            assert len(rows) == 1
+            assert rows[0].payload == {
+                "status": "failed",
+                "result": {"error": "resume execution cancelled"},
+            }
+    finally:
+        running.cancel()
+        await asyncio.gather(running, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_live_cancel_accepts_finalizer_settling_during_finalize(
+    a2a_task, monkeypatch
+):
+    ctx = a2a_task
+    with ctx.factory() as db:
+        lease = acquire_task_lease(db, ctx.target["task_id"], new_run=True)
+        task = db.get(Task, lease.task_id)
+        target = {
+            **ctx.target,
+            "expected_run_id": task.run_id,
+            "expected_state_version": task.state_version,
+        }
+    started = asyncio.Event()
+    cancelled = []
+
+    async def execute():
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            cancelled.append(True)
+            raise
+
+    # The cancelled execution outlived ``cancel_task``'s drain timeout: its
+    # finalizer commits after the cancel command read the running row and
+    # before its conditional UPDATE.
+    completed_target = a2a_task_cancel._is_completed_a2a_cancel_target
+    settled = []
+
+    def settle_after_read(*args, **kwargs):
+        # The load before ``cancel_task`` reads through here too.
+        if cancelled and not settled:
+            settled.append(
+                settle_task_lease_isolated(
+                    lease, error_message="resume execution cancelled"
+                )
+            )
+        return completed_target(*args, **kwargs)
+
+    monkeypatch.setattr(
+        a2a_task_cancel, "_is_completed_a2a_cancel_target", settle_after_read
+    )
+    running = asyncio.create_task(execute())
+    ctx.manager.register_task(lease.task_id, running)
+    try:
+        await started.wait()
+        snapshot = await a2a_task_cancel.cancel_a2a_task(**target)
+        assert settled == [True]
+        assert snapshot.agent_config["a2a_state"] == "TASK_STATE_CANCELED"
+        with ctx.factory() as db:
+            task = db.get(Task, lease.task_id)
+            assert task.status == TaskStatus.FAILED
+            assert task.state_version == target["expected_state_version"] + 1
             rows = outcomes(db, lease.task_id)
             assert len(rows) == 1
             assert rows[0].payload == {
