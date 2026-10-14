@@ -151,7 +151,10 @@ from xagent.web.services.task_orchestrator import (
     TaskTurnPayload,
     settle_task_lease_isolated,
 )
-from xagent.web.services.task_settlement_report import SettlementReport
+from xagent.web.services.task_settlement_report import (
+    RecordedInterruption,
+    SettlementReport,
+)
 
 canonical = canonical_fixture
 engine = engine_fixture
@@ -730,6 +733,11 @@ def test_channel_pause_fills_the_report_after_the_commit(canonical):
     assert report.paused_for is InterruptionReason.LLM_UNAVAILABLE
     assert report.control_state["status"] == "paused"
     assert report.control_state["run_id"] == lease.run_id
+    # Channel tasks are not scheduled yet, so nothing announces this; pin
+    # the snapshot for when the channel hold lands.
+    with factory() as db:
+        row = db.get(TaskAutoRecovery, ids["task"])
+        assert report.recovery == RecordedInterruption.from_row(row)
 
 
 def test_channel_pause_leaves_the_report_empty_when_the_commit_fails(canonical):

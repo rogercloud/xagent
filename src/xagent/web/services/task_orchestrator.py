@@ -1820,11 +1820,12 @@ def _pause_interrupted_run_no_commit(
     """Pause and release an interrupted run with its projections, uncommitted.
 
     Returns the paused control snapshot and what was recorded for automatic
-    recovery, or ``None`` when the fenced write missed. This path keeps its own writer rather than the ORM transition
-    the result paths use: like ``fail_and_release_task_lease_no_commit`` it
-    settles and releases in one fenced UPDATE (RUNNING, exact run and
-    attempt), which is what this function's FAILED branch has always
-    written, and it emits no control-state fact for that write.
+    recovery, or ``None`` when the fenced write missed. This path keeps its
+    own writer rather than the ORM transition the result paths use: like
+    ``fail_and_release_task_lease_no_commit`` it settles and releases in one
+    fenced UPDATE (RUNNING, exact run and attempt), which is what this
+    function's FAILED branch has always written, and it emits no
+    control-state fact for that write.
     """
     from .task_execution_controller import task_control_snapshot
     from .task_execution_event_writer import stage_result_fact_no_commit
