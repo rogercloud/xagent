@@ -589,7 +589,7 @@ async def test_paused_replay_event_embeds_known_control_state(monkeypatch) -> No
     async def send_personal_message(event: dict, websocket: object) -> None:
         sent_events.append(event)
 
-    monkeypatch.setattr("xagent.web.models.database.get_db", get_test_db)
+    monkeypatch.setattr("xagent.web.models.database._SessionLocal", SessionLocal)
     monkeypatch.setattr("xagent.web.api.websocket.cache_get", lambda *args: None)
     monkeypatch.setattr(
         "xagent.web.api.websocket.cache_set", lambda *args, **kwargs: None
@@ -730,7 +730,7 @@ async def test_historical_replay_detaches_before_slow_network_send(
         send_entered.set()
         await release_send.wait()
 
-    monkeypatch.setattr(database_module, "get_db", get_test_db)
+    monkeypatch.setattr(database_module, "_SessionLocal", SessionLocal)
     monkeypatch.setattr(websocket_api, "get_session_local", lambda: SessionLocal)
     monkeypatch.setattr(websocket_api, "cache_get", slow_cache_get)
     monkeypatch.setattr(websocket_api, "cache_set", record_cache_set)
@@ -862,7 +862,7 @@ def test_historical_replay_does_not_backfill_legacy_file_outputs(
         put_observations.append(engine.pool.checkedout())
         return original_put_file(self, source, key, content_type)
 
-    monkeypatch.setattr(database_module, "get_db", get_test_db)
+    monkeypatch.setattr(database_module, "_SessionLocal", SessionLocal)
     monkeypatch.setattr(websocket_api, "cache_get", lambda *_args: None)
     monkeypatch.setattr(
         websocket_api,
@@ -3792,7 +3792,7 @@ def test_websocket_trace_handler_dedupes_prior_user_message_turn_id(
         finally:
             session.close()
 
-    monkeypatch.setattr("xagent.web.models.database.get_db", get_test_db)
+    monkeypatch.setattr("xagent.web.models.database._SessionLocal", SessionLocal)
 
     handler = TaskEventTraceHandler(task_id)
     assert not handler._has_prior_user_message_turn(
@@ -3990,7 +3990,7 @@ async def test_broadcast_payload_is_unchanged_for_an_attached_audience(
         finally:
             session.close()
 
-    monkeypatch.setattr("xagent.web.models.database.get_db", get_test_db)
+    monkeypatch.setattr("xagent.web.models.database._SessionLocal", SessionLocal)
 
     local_manager = ConnectionManager()
     local_manager.register_connection(object(), task_id)
@@ -4646,7 +4646,7 @@ async def test_late_attach_replays_events_skipped_while_unattached(
         finally:
             session.close()
 
-    monkeypatch.setattr("xagent.web.models.database.get_db", get_test_db)
+    monkeypatch.setattr("xagent.web.models.database._SessionLocal", SessionLocal)
 
     local_manager = ConnectionManager()
     monkeypatch.setattr(
@@ -4815,7 +4815,7 @@ async def test_skipped_frames_are_recoverable_through_the_real_persistence_path(
         finally:
             session.close()
 
-    monkeypatch.setattr("xagent.web.models.database.get_db", get_test_db)
+    monkeypatch.setattr("xagent.web.models.database._SessionLocal", SessionLocal)
     monkeypatch.setattr("xagent.web.services.trace_handlers.get_db", get_test_db)
 
     empty_manager = ConnectionManager()
@@ -5095,7 +5095,7 @@ async def test_historical_replay_skips_audit_only_trace_events(monkeypatch) -> N
     async def send_personal_message(event: dict, websocket: object) -> None:
         sent_events.append(event)
 
-    monkeypatch.setattr("xagent.web.models.database.get_db", get_test_db)
+    monkeypatch.setattr("xagent.web.models.database._SessionLocal", SessionLocal)
     monkeypatch.setattr("xagent.web.api.websocket.cache_get", lambda *args: None)
     monkeypatch.setattr(
         "xagent.web.api.websocket.cache_set", lambda *args, **kwargs: None
@@ -5182,7 +5182,7 @@ async def test_historical_replay_promotes_workforce_delegation_summary(
     async def send_personal_message(event: dict, websocket: object) -> None:
         sent_events.append(event)
 
-    monkeypatch.setattr("xagent.web.models.database.get_db", get_test_db)
+    monkeypatch.setattr("xagent.web.models.database._SessionLocal", SessionLocal)
     monkeypatch.setattr("xagent.web.api.websocket.cache_get", lambda *args: None)
     monkeypatch.setattr(
         "xagent.web.api.websocket.cache_set", lambda *args, **kwargs: None
@@ -5263,7 +5263,7 @@ async def test_historical_replay_includes_child_trace_for_non_workforce_task(
     async def send_personal_message(event: dict, websocket: object) -> None:
         sent_events.append(event)
 
-    monkeypatch.setattr("xagent.web.models.database.get_db", get_test_db)
+    monkeypatch.setattr("xagent.web.models.database._SessionLocal", SessionLocal)
     monkeypatch.setattr("xagent.web.api.websocket.cache_get", lambda *args: None)
     monkeypatch.setattr(
         "xagent.web.api.websocket.cache_set", lambda *args, **kwargs: None
@@ -5334,7 +5334,7 @@ async def test_historical_replay_skips_checkpoint_rows_before_streaming(
     async def send_personal_message(event: dict, websocket: object) -> None:
         sent_events.append(event)
 
-    monkeypatch.setattr("xagent.web.models.database.get_db", get_test_db)
+    monkeypatch.setattr("xagent.web.models.database._SessionLocal", SessionLocal)
     monkeypatch.setattr("xagent.web.api.websocket.cache_get", lambda *args: None)
     monkeypatch.setattr(
         "xagent.web.api.websocket.cache_set", lambda *args, **kwargs: None
@@ -5393,7 +5393,7 @@ async def test_historical_replay_marks_assistant_chat_history_for_chat_display(
     async def send_personal_message(event: dict, websocket: object) -> None:
         sent_events.append(event)
 
-    monkeypatch.setattr("xagent.web.models.database.get_db", get_test_db)
+    monkeypatch.setattr("xagent.web.models.database._SessionLocal", SessionLocal)
     monkeypatch.setattr("xagent.web.api.websocket.cache_get", lambda *args: None)
     monkeypatch.setattr(
         "xagent.web.api.websocket.cache_set", lambda *args, **kwargs: None
@@ -5484,7 +5484,7 @@ async def test_historical_replay_orders_equal_timestamps_by_id(
     async def send_personal_message(event: dict, websocket: object) -> None:
         sent_events.append(event)
 
-    monkeypatch.setattr("xagent.web.models.database.get_db", get_test_db)
+    monkeypatch.setattr("xagent.web.models.database._SessionLocal", SessionLocal)
     monkeypatch.setattr("xagent.web.api.websocket.cache_get", lambda *args: None)
     monkeypatch.setattr(
         "xagent.web.api.websocket.cache_set", lambda *args, **kwargs: None
@@ -5582,7 +5582,7 @@ async def test_historical_replay_uses_turn_id_before_legacy_content_dedupe(
     async def send_personal_message(event: dict, websocket: object) -> None:
         sent_events.append(event)
 
-    monkeypatch.setattr("xagent.web.models.database.get_db", get_test_db)
+    monkeypatch.setattr("xagent.web.models.database._SessionLocal", SessionLocal)
     monkeypatch.setattr("xagent.web.api.websocket.cache_get", lambda *args: None)
     monkeypatch.setattr(
         "xagent.web.api.websocket.cache_set", lambda *args, **kwargs: None
@@ -5675,7 +5675,7 @@ async def test_historical_replay_dedupes_file_only_turns_by_turn_id(
     async def send_personal_message(event: dict, websocket: object) -> None:
         sent_events.append(event)
 
-    monkeypatch.setattr("xagent.web.models.database.get_db", get_test_db)
+    monkeypatch.setattr("xagent.web.models.database._SessionLocal", SessionLocal)
     monkeypatch.setattr("xagent.web.api.websocket.cache_get", lambda *args: None)
     monkeypatch.setattr(
         "xagent.web.api.websocket.cache_set", lambda *args, **kwargs: None
