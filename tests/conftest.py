@@ -76,7 +76,9 @@ def local_execution_unless_selected(monkeypatch):
 
 
 _DATABASE_MODULE = "xagent.web.models.database"
-_DATABASE_ACCESSORS = ("get_session_local", "get_engine")
+_DATABASE_ACCESSORS = ("get_session_local", "get_optional_session_local", "get_engine")
+# ``get_db`` reads ``_SessionLocal`` too but is not checked yet: tests still
+# patch it directly, so adding it here waits on converting those tests.
 # A leaked binding stays leaked for the rest of the process; report it once,
 # against the test that leaked it, instead of failing every later test too.
 _reported_stale_database_accessors: set[str] = set()
@@ -94,7 +96,7 @@ def _stale_database_accessors() -> list[str]:
     """Loaded ``xagent`` modules holding a patched database accessor.
 
     A module first imported while a test patches
-    ``xagent.web.models.database.get_session_local`` (or ``get_engine``) binds
+    ``xagent.web.models.database.get_session_local`` (or another accessor) binds
     the replacement by name through ``from ..models.database import ...`` and
     keeps it after monkeypatch restores the database module, so every later
     test in the process silently uses the wrong database. Tests should patch
@@ -125,7 +127,7 @@ def pytest_runtest_teardown(item, nextitem):
         raise AssertionError(
             f"{item.nodeid} leaked patched database accessors into: "
             f"{', '.join(stale)}. Patch xagent.web.models.database._SessionLocal "
-            "/ _engine instead of get_session_local / get_engine."
+            "/ _engine instead of the accessors that read them."
         )
     return result
 
