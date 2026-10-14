@@ -518,12 +518,15 @@ def get_task_infra_failure_pause_enabled() -> bool:
     """Whether eligible tasks pause (instead of failing) on infrastructure failures.
 
     Unset (or blank or invalid), it follows
-    :func:`get_task_auto_resume_enabled`: a paused run that
-    nothing resumes is worse than a terminal failure for unattended (e.g.
-    scheduled) tasks, so pausing is the default only while automatic resume
-    is on. Set it explicitly to pause for a manual resume with automatic
-    resume off, or to fail as before with it on. Lease-expiry recovery pauses
-    regardless, as it always has.
+    :func:`get_task_auto_resume_enabled`: a paused run that nothing resumes
+    is worse than a terminal failure for unattended (e.g. scheduled) tasks,
+    so pausing is the default only while automatic resume is on. Channel
+    tasks are the exception automatic resume does not schedule yet: they
+    pause, their channel gets the "interrupted" reply, and the next channel
+    message starts a new turn from the pause, as after a lease expiry. Set it
+    explicitly to pause for a manual resume with automatic resume off, or to
+    fail as before with it on. Lease-expiry recovery pauses regardless, as it
+    always has.
 
     Priority:
         1. XAGENT_TASK_INFRA_FAILURE_PAUSE_ENABLED environment variable
