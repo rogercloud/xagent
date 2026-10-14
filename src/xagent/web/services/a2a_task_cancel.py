@@ -298,7 +298,9 @@ async def cancel_a2a_task(
             raise
         # ``cancel_task`` only waits a bounded time for the cancelled
         # execution to drain. Its finalizer can still be settling the run and
-        # commit between this command's read and its conditional UPDATE. Read
-        # once more: that settled local cancel now matches exactly, while any
-        # other change to the target is still rejected.
+        # commit between this command's read and its conditional UPDATE. Every
+        # stale result is re-checked once rather than only that UPDATE miss:
+        # each one is raised before any write or after a rollback, and the
+        # second attempt applies the same exact checks. A settled local cancel
+        # now matches; any other change to the target is still rejected.
         return await run_db_io_cancellation_safe(finalize)
