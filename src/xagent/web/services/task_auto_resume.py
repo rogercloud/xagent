@@ -233,6 +233,69 @@ def public_auto_resume_view(
     }
 
 
+# Row states whose announcement the state alone determines. ``manual`` and
+# ``ineligible`` also arise at record time, where nothing is announced, and
+# ``stale``/``disabled`` never are.
+_READ_VIEW_STATES = frozenset(
+    {
+        _SCHEDULED.value,
+        _DISPATCHED.value,
+        TaskAutoRecoveryState.EXHAUSTED.value,
+        TaskAutoRecoveryState.EXPIRED.value,
+        TaskAutoRecoveryState.SUPERSEDED.value,
+        TaskAutoRecoveryState.DISPATCH_FAILED.value,
+    }
+)
+
+
+def current_auto_resume_view(
+    task: Task, row: TaskAutoRecovery
+) -> dict[str, Any] | None:
+    """The ``auto_resume`` a task read reports for ``row``, or ``None``.
+
+    The ``task_recovery_update`` notice for the row's current state, computed
+    from the row alone (no query): only at the sweeper's fence
+    (:func:`_fence_mismatch`), and only for states whose notice the state
+    itself determines. ``attempt`` is derived as at record time
+    (:meth:`RecordedInterruption.from_row`).
+
+    Every ``manual`` and ``ineligible`` reads as ``None``. Recording one
+    announces nothing, and the same state reached later -- ``manual``
+    (``auto_resume_disabled``) by the switch-off drain or the claim guard,
+    ``ineligible`` at dispatch -- was announced ``stopped``, but the row
+    cannot tell the two apart. Nor is a give-up past a rolled-back resume
+    shown: its notice names a later version than the row's fence.
+
+    Ordering, for clients merging reads with live notices: a later
+    ``(run_id, state_version)`` wins, as between live notices. Within one
+    fence ``state_version`` does not move, so order by ``k(status,
+    attempt)``: ``(attempt, 0)`` for ``resuming``, ``(attempt - 1, 1)`` for
+    ``scheduled`` and ``(attempt, 2)`` for ``stopped``. It strictly
+    increases along a fence's transitions (``scheduled`` -> ``resuming`` ->
+    ``scheduled`` -> ... -> ``stopped``); equal keys (a postponed
+    ``scheduled``) keep the later arrival, and ``stopped`` is the fence's
+    last word. A ``None`` read at the fence a client holds is terminal too
+    -- a state never announced, or one of the stops above -- so the client
+    drops the notice it holds.
+
+    Never cached on its own: the sweeper's transitions do not write
+    ``tasks``, so every read computes it afresh or keys its cache on it.
+    """
+
+    if _fence_mismatch(task, row) is not None:
+        return None
+    state = str(row.state)
+    if state not in _READ_VIEW_STATES:
+        return None
+    return public_auto_resume_view(
+        state,
+        state_detail=row.state_detail,
+        reason=str(row.reason),
+        attempt=RecordedInterruption.from_row(row).attempt,
+        next_attempt_at=row.next_attempt_at,
+    )
+
+
 @dataclass(frozen=True)
 class RecoveryNotice:
     """A committed transition to announce as ``task_recovery_update``."""
