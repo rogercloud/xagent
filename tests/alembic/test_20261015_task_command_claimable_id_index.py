@@ -15,14 +15,21 @@ import pytest
 from alembic import command
 from alembic.migration import MigrationContext
 from alembic.operations import Operations
-from sqlalchemy import create_engine, inspect, text
+from sqlalchemy import create_engine, event, inspect, text
+from sqlalchemy.orm import Session, sessionmaker
 
 from tests.shared.postgres_disposable import (
     disposable_database_factory,
     load_migration_module,
 )
+from xagent.config import SHARED_TASK_EXECUTION_ENABLED
 from xagent.db.config import create_alembic_config
+from xagent.web.models import database as database_module
+from xagent.web.models.database import Base
+from xagent.web.models.task import Task, TaskStatus
 from xagent.web.models.task_command import TaskExecutionCommand
+from xagent.web.models.user import User
+from xagent.web.services import task_command_transport as transport
 
 REVISION = "20261015_task_cmd_claimable_id"
 DOWN_REVISION = "20261014_task_cmd_claimable_kind"
@@ -252,35 +259,85 @@ def test_postgresql_upgrade_builds_a_valid_index_with_the_expected_predicate(
 
 
 @pytest.mark.postgresql
-def test_postgresql_oldest_claimable_lookup_uses_the_partial_index(
-    postgresql_engine_factory,
+@pytest.mark.parametrize("shared", [True, False], ids=["shared", "legacy"])
+def test_postgresql_fallback_claim_lookup_uses_the_partial_index(
+    postgresql_engine_factory, monkeypatch, shared
 ) -> None:
-    """With many settled rows and a near-empty queue, the oldest-claimable
-    lookup must be served by the partial index, not a primary-key walk."""
+    """EXPLAIN the fallback statement the real ``_find_command_candidate`` issues.
 
-    migration = load_migration_module(MIGRATION_PATH, "claimable_id_index_plan")
-    engine = postgresql_engine_factory("plan")
+    A partial index only applies when the planner can prove the query's WHERE
+    implies the index predicate, and the claim predicate's status filter is
+    built separately from ``_CLAIMABLE_STATUS_CLAUSE``: an ``IN`` list with
+    shared execution enabled, and per-status ``OR`` arms without it. Planning
+    the real statement for both settings pins that implication, so a status
+    added on the claim side cannot silently send the idle poll back to a
+    primary-key walk.
+    """
 
+    engine = postgresql_engine_factory(f"plan_{'shared' if shared else 'legacy'}")
+    Base.metadata.create_all(engine)
+    factory = sessionmaker(engine, expire_on_commit=False)
+    monkeypatch.setenv(SHARED_TASK_EXECUTION_ENABLED, "true" if shared else "false")
+    monkeypatch.setattr(database_module, "_SessionLocal", factory)
+    monkeypatch.setattr(transport, "get_runner_id", lambda: "me")
+
+    with Session(engine) as session:
+        user = User(username="plan-user", password_hash="hash", is_admin=False)
+        session.add(user)
+        session.flush()
+        for task_id in range(1, 401):
+            session.add(
+                Task(
+                    id=task_id,
+                    user_id=user.id,
+                    title=f"task {task_id}",
+                    status=TaskStatus.RUNNING,
+                    runner_id=None,
+                    lease_expires_at=None,
+                )
+            )
+        session.commit()
+
+    # Settled history with a near-empty queue and no claimable reply, so the
+    # reply-first lookup finds nothing and the fallback statement is issued.
+    # The open commands are pauses because the legacy claim excludes starts.
     with engine.connect() as connection:
-        _create_pg_table(connection)
         connection.execute(
             text(
-                f"INSERT INTO {TABLE} (task_id, kind, status) "
-                "SELECT (g % 20) + 1, 'start', "
-                "CASE WHEN g > 19995 THEN 'pending' ELSE 'completed' END "
-                "FROM generate_series(1, 20000) AS g"
+                f"INSERT INTO {TABLE} (task_id, command_id, kind, payload, status, "
+                "created_at, updated_at) "
+                "SELECT (g % 400) + 1, 'c' || g, "
+                "CASE WHEN g > 19995 THEN 'pause' ELSE 'start' END, "
+                "'{}', "
+                "CASE WHEN g > 19995 THEN 'pending' ELSE 'completed' END, "
+                "NOW(), NOW() FROM generate_series(1, 20000) AS g"
             )
         )
-        connection.commit()
-        _run(migration, connection, "upgrade")
         connection.execute(text(f"ANALYZE {TABLE}"))
         connection.commit()
 
+    captured: list[tuple[str, object]] = []
+
+    def record(_conn, _cursor, statement, parameters, *_args) -> None:
+        if statement.lstrip().upper().startswith("SELECT"):
+            captured.append((statement, parameters))
+
+    event.listen(engine, "before_cursor_execute", record)
+    try:
+        found = transport._find_command_candidate(None)
+    finally:
+        event.remove(engine, "before_cursor_execute", record)
+
+    assert found is not None
+    assert found[2] is transport.TaskCommandKind.PAUSE
+    # Reply-first lookup, then the fallback this index serves.
+    assert len(captured) == 2, [statement for statement, _ in captured]
+    statement, parameters = captured[-1]
+    with engine.connect() as connection:
         plan = "\n".join(
             row[0]
             for row in connection.exec_driver_sql(
-                f"EXPLAIN SELECT id FROM {TABLE} "
-                "WHERE status IN ('pending', 'processing') ORDER BY id LIMIT 1"
+                "EXPLAIN " + statement, parameters
             ).all()
         )
     assert INDEX in plan, plan
