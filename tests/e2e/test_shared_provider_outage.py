@@ -47,6 +47,10 @@ ATTEMPTS = 3
 LLM_QUIET_SECONDS = 5
 # Unusable output is resumed after up to 5s of jitter, then a 1s poll.
 MODEL_OUTPUT_QUIET_SECONDS = 7
+# E5a: model calls in each unusable-output run (the answer and its one repair
+# retry), and the runs before exhaustion (the first run plus two resumes).
+CALLS_PER_RUN = 2
+RUNS = 3
 ANSWER = "Shared E2E answer"
 TWO_RESUMES = [
     "interrupted",
@@ -275,8 +279,7 @@ def test_unusable_model_output_resumes_twice_then_stops(
         2,
     )
     assert events == TWO_RESUMES + ["interrupted", "exhausted"]
-    # Each run asks twice: the answer and its one repair retry.
-    assert len(model_faults(app, "invalid_output")) == 2 * 3
+    assert len(model_faults(app, "invalid_output")) == CALLS_PER_RUN * RUNS
     assert answered_model_calls(app) == []
     assert len(auto_resume_commands(task_id)) == 2
     assert task_detail(app, task_id)["auto_recovery"]["auto_resume"] == _stopped(
@@ -305,7 +308,7 @@ def test_unusable_model_output_resumes_twice_then_stops(
 
     time.sleep(MODEL_OUTPUT_QUIET_SECONDS)
     assert len(auto_resume_commands(task_id)) == 2
-    assert len(model_faults(app)) == 2 * 3
+    assert len(model_faults(app)) == CALLS_PER_RUN * RUNS
 
 
 # --------------------------------------------------------------------------
