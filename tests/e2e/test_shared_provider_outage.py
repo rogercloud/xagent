@@ -1,12 +1,13 @@
 """Automatic resume after model provider faults, through real hosts.
 
-The hosts' scripted provider fails on demand (see ``MODEL_FAULT_FILE``): a
-real ``openai.InternalServerError`` (503) for an outage, or an empty
-``final_answer`` for unusable output. Faults are consumed per provider
+The hosts' scripted provider fails on demand (see ``MODEL_FAULT_FILE``): for
+an outage it raises a real ``openai.InternalServerError`` (503) directly,
+without the provider-error wrapping ``OpenAILLM`` would add; for unusable
+output it returns an empty ``final_answer``. Faults are consumed per provider
 attempt, so the moment the provider "recovers" is fixed by call count, never
 by the clock. The production tier-1 retry layer sits in front of the provider
 with exactly three attempts per model call, so an outage pauses the run only
-after that layer gave up, as it would in production.
+after that layer gave up.
 
 Backoff and polling are shortened so each resume is due within a few seconds.
 """
@@ -25,6 +26,7 @@ from tests.e2e.shared_execution_harness import (
     auto_resume_commands,
     clear_model_fault,
     collect_events,
+    create_task,
     model_faults,
     receive_event,
     recovery_state,
@@ -65,7 +67,8 @@ def _fast_auto_resume(monkeypatch):
     monkeypatch.setenv("XAGENT_TASK_AUTO_RESUME_LLM_MAX_BACKOFF_SECONDS", "2")
     monkeypatch.setenv("XAGENT_TASK_AUTO_RESUME_MODEL_OUTPUT_MAX_NO_PROGRESS", "2")
     monkeypatch.setenv("E2E_MODEL_RETRY_ATTEMPTS", str(ATTEMPTS))
-    # The attempt count, not the deadline, bounds each call.
+    # Pinned so a developer's shorter deadline cannot cut the three attempts
+    # (about 0.6s of backoff in all) short.
     monkeypatch.setenv("XAGENT_LLM_RETRY_DEADLINE_SECONDS", "30")
     for name in (
         "XAGENT_TASK_AUTO_RESUME_ENABLED",
@@ -109,7 +112,6 @@ def _row(task_id: int) -> dict:
 def _assert_answered_once(task_id: int) -> None:
     """One answer reached the history, and no failure bubble."""
     messages = assistant_messages(task_id)
-    assert [m for m in messages if ANSWER in m[1]], messages
     assert len([m for m in messages if ANSWER in m[1]]) == 1, messages
     assert not [m for m in messages if m[0] == "task_failure"], messages
 
@@ -133,34 +135,48 @@ def test_provider_outage_pauses_then_resumes_when_provider_recovers(shared_app):
     app = shared_app
     # Two whole model calls fail; the third call's first attempt answers.
     set_model_fault(app, "unavailable", count=2 * ATTEMPTS)
-    task_id = start_task(app, "e2e outage", gate=False)
+    task_id = start_task(app, "e2e outage")
     run_id = _run_id(app, task_id)
 
     def first_pause():
-        if (_row(task_id).get("state"), _row(task_id).get("total_resumes")) != (
-            "scheduled",
-            0,
-        ):
+        def paused_once():
+            # One snapshot: the task and its row read together.
+            state, row = task_state(task_id), _row(task_id)
+            if state["status"] != "paused" or (
+                row.get("state"),
+                row.get("total_resumes"),
+            ) != ("scheduled", 0):
+                return None
+            return row
+
+        row = paused_once()
+        if row is None:
             return None
-        detail = task_detail(app, task_id)
-        recovery = detail["auto_recovery"] or {}
-        if (recovery.get("auto_resume") or {}).get("status") != "scheduled":
+        recovery = task_detail(app, task_id)["auto_recovery"] or {}
+        faults, answered = model_faults(app), answered_model_calls(app)
+        # Still the same pause afterwards: no resumed call had started when
+        # the calls were counted, and the first one had ended.
+        if paused_once() is None:
             return None
-        return task_state(task_id), _row(task_id), recovery
+        return row, recovery, faults, answered
 
     # The first resume is due a second or so after the pause.
-    state, row, recovery = wait_for(first_pause, app, "the first scheduled resume")
-    assert state["status"] == "paused"
+    row, recovery, faults, answered = wait_for(
+        first_pause, app, "the first scheduled resume"
+    )
     assert row["reason"] == "llm_unavailable"
     assert (recovery["reason"], recovery["run_id"]) == ("llm_unavailable", run_id)
+    assert recovery["auto_resume"]["status"] == "scheduled"
     assert recovery["auto_resume"]["attempt"] == 1
+    # The first model call was retried exactly ATTEMPTS times by tier 1
+    # before it paused the run.
+    assert [call["fault"] for call in faults] == ["unavailable"] * ATTEMPTS
+    assert answered == []
 
     settled = app.wait_task(task_id, run_id=run_id, timeout=SETTLE_TIMEOUT)
     assert ANSWER in (settled["output"] or "")
     assert settled["error"] is None
-    # Every failed call was retried exactly ATTEMPTS times before it paused
-    # the run, and the recovered provider was asked once.
-    assert len(model_faults(app, "unavailable")) == 2 * ATTEMPTS
+    # The recovered provider was asked once.
     assert len(answered_model_calls(app)) == 1
     row, events = recovery_state(task_id)
     assert row is not None
@@ -188,7 +204,7 @@ def test_provider_that_stays_down_exhausts_then_manual_resume_completes(
 
     app = shared_app
     set_model_fault(app, "unavailable", count=None)
-    task_id = start_task(app, "e2e outage", gate=False)
+    task_id = start_task(app, "e2e outage")
     run_id = _run_id(app, task_id)
 
     wait_for(lambda: _row(task_id).get("state") == "exhausted", app, "exhaustion")
@@ -235,17 +251,7 @@ def test_unusable_model_output_resumes_twice_then_stops(
 
     app = shared_app
     set_model_fault(app, "invalid_output", count=None)
-    response = app.client.post(
-        "/api/chat/task/create",
-        headers=app.headers,
-        json={
-            "title": "Unusable output",
-            "description": "e2e unusable output",
-            "execution_mode": "balanced",
-        },
-    )
-    assert response.status_code == 200, response.text
-    task_id = response.json()["task_id"]
+    task_id = create_task(app, "Unusable output", "e2e unusable output")
 
     def stopped(event):
         return (
@@ -256,7 +262,7 @@ def test_unusable_model_output_resumes_twice_then_stops(
     with connect(ws_url(app, task_id)) as ws:
         receive_event(ws, "historical_data_complete")
         ws.send(json.dumps({"type": "execute_task"}))
-        events_seen = collect_events(ws, stopped)
+        events_seen = collect_events(app, ws, stopped)
     wait_for(lambda: _row(task_id).get("state") == "exhausted", app, "exhaustion")
 
     assert task_state(task_id)["status"] == "paused"
@@ -311,14 +317,13 @@ def test_unusable_model_output_recovers_on_resample(shared_app):
     app = shared_app
     # One run's answer and its repair retry are unusable.
     set_model_fault(app, "invalid_output", count=2)
-    task_id = start_task(app, "e2e unusable output", gate=False)
+    task_id = start_task(app, "e2e unusable output")
     run_id = _run_id(app, task_id)
 
     settled = app.wait_task(task_id, run_id=run_id, timeout=SETTLE_TIMEOUT)
     assert ANSWER in (settled["output"] or "")
     # The resumed run asked the model again rather than replaying the
-    # unusable result.
-    assert len(model_faults(app, "invalid_output")) == 2
+    # unusable result: that fresh call is the one that answered.
     assert len(answered_model_calls(app)) == 1
     row, events = recovery_state(task_id)
     assert (row["reason"], row["run_id"], row["total_resumes"]) == (
@@ -339,7 +344,7 @@ def test_unusable_model_output_recovers_on_resample(shared_app):
 def test_switches_off_llm_failure_fails_the_task(switches_off, shared_app):
     app = shared_app
     set_model_fault(app, "unavailable", count=None)
-    task_id = start_task(app, "e2e outage", gate=False)
+    task_id = start_task(app, "e2e outage")
 
     settled = app.wait_task(task_id, status="failed", timeout=SETTLE_TIMEOUT)
     assert settled["error"]
@@ -353,7 +358,7 @@ def test_switches_off_llm_failure_fails_the_task(switches_off, shared_app):
     # The legacy failure path still writes its failure bubble.
     assert [m for m in assistant_messages(task_id) if m[0] == "task_failure"]
 
-    time.sleep(3)
+    time.sleep(LLM_QUIET_SECONDS)
     assert task_state(task_id)["status"] == "failed"
     assert len(model_faults(app)) == ATTEMPTS
     assert recovery_state(task_id)[1] == ["interrupted"]

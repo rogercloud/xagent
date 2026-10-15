@@ -661,8 +661,6 @@ def recovery_state(task_id: int) -> tuple[dict[str, Any] | None, list[str]]:
             "run_id": row.run_id,
             "total_resumes": row.total_resumes,
             "no_progress_resumes": row.no_progress_resumes,
-            "paused_state_version": row.paused_state_version,
-            "next_attempt_at": row.next_attempt_at,
         }, events
 
 
@@ -687,42 +685,51 @@ def ws_url(app, task_id: int) -> str:
     )
 
 
-def start_task(app, description: str = "e2e:gate", *, gate: bool = True) -> int:
-    """An owner's internal balanced task, executed over the WebSocket.
-
-    With ``gate`` the description must make the first model call wait for
-    ``model-release``; this returns once that call has started.
-    """
-    from websockets.sync.client import connect
-
+def create_task(app, title: str, description: str) -> int:
+    """An owner's internal balanced task, not yet executed."""
     response = app.client.post(
         "/api/chat/task/create",
         headers=app.headers,
         json={
-            "title": "Auto resume",
+            "title": title,
             "description": description,
             "execution_mode": "balanced",
         },
     )
     assert response.status_code == 200, response.text
-    task_id = response.json()["task_id"]
+    return response.json()["task_id"]
+
+
+def start_task(app, description: str = "e2e:gate") -> int:
+    """An owner's internal balanced task, executed over the WebSocket.
+
+    A gated description (``e2e:gate``) makes the first model call wait for
+    ``model-release``; this then returns once that call has started.
+    """
+    from websockets.sync.client import connect
+
+    task_id = create_task(app, "Auto resume", description)
     with connect(ws_url(app, task_id)) as ws:
         receive_event(ws, "historical_data_complete")
         ws.send(json.dumps({"type": "execute_task"}))
         receive_event(ws, "execution_started")
-    if gate:
+    if "e2e:gate" in description:
         wait_for(lambda: (app.root / "model-entered").exists(), app, "model call")
     return task_id
 
 
-def collect_events(ws, until, timeout: float = 45) -> list[dict[str, Any]]:
+# Long enough for several automatic resumes with their backoff and jitter.
+COLLECT_EVENTS_TIMEOUT = 45
+
+
+def collect_events(app, ws, until) -> list[dict[str, Any]]:
     """Events up to and including the first one ``until`` accepts.
 
     Unlike :func:`receive_event` this tolerates ``error`` events: a failed
     model call may surface one before the run pauses.
     """
     events: list[dict[str, Any]] = []
-    deadline = time.monotonic() + timeout
+    deadline = time.monotonic() + COLLECT_EVENTS_TIMEOUT
     while (remaining := deadline - time.monotonic()) > 0:
         try:
             event = json.loads(ws.recv(timeout=remaining))
@@ -731,7 +738,7 @@ def collect_events(ws, until, timeout: float = 45) -> list[dict[str, Any]]:
         events.append(event)
         if until(event):
             return events
-    pytest.fail(f"Timed out collecting events: {events}")
+    pytest.fail(f"Timed out collecting events: {events}\n{app.diagnostics()}")
 
 
 # ---------------------------------------------------------------- model faults

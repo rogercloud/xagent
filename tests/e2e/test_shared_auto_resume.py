@@ -300,11 +300,13 @@ def test_later_scheduled_tick_supersedes_the_killed_one(shared_app):
 
 
 @pytest.mark.parametrize(
-    "infra_pause", [None, "false"], ids=["infra-default", "infra-off"]
+    "infra_pause", [None, "true"], ids=["infra-default", "infra-on"]
 )
 def test_switch_off_leaves_a_killed_run_paused(shared_app, infra_pause):
-    # Lease expiry is recorded whatever the infrastructure-failure pause
-    # switch says (E10b-ii); only automatic resume decides what happens next.
+    # Unset, the infrastructure-failure pause switch follows automatic resume
+    # (off). Explicitly on, it changes nothing here (E10b-ii): lease expiry
+    # is recorded either way, and with automatic resume off it waits for the
+    # user.
     app = shared_app
     switches = {"XAGENT_TASK_AUTO_RESUME_ENABLED": "false"}
     if infra_pause is not None:
