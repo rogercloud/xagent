@@ -82,11 +82,9 @@ from .ops_signals import (
 )
 from .task_auto_recovery import (
     AUTO_RESUME_DISABLED_DETAIL,
-    CHANNEL_HOLD_PENDING_DETAIL,
     PLANNED_RECOVERY_EVENTS,
     TASK_INTERRUPTION_PAUSED_TRIGGER_ERROR,
     auto_recovery_eligibility,
-    auto_resume_schedulable,
     is_auto_resume_command_id,
 )
 from .task_auto_recovery_policy import (
@@ -206,8 +204,8 @@ def public_auto_resume_view(
     it, and that action announced itself. ``manual`` reached from an
     announced state (the sweeper or the guard closing a scheduled or
     dispatched row) is ``stopped``: ``disabled`` for a switched-off executor,
-    else ``ineligible`` (a channel task or a reason with no policy -- either
-    way automatic resume will not act on the task). Callers decide whether a
+    else ``ineligible`` (a reason with no policy: automatic resume will not
+    act on the task). Callers decide whether a
     transition is announced at all; a recorded ``manual`` is not.
     """
 
@@ -233,6 +231,70 @@ def public_auto_resume_view(
             format_datetime_for_api(next_attempt_at) if status == "scheduled" else None
         ),
     }
+
+
+def current_auto_resume_view(
+    task: Task, row: TaskAutoRecovery
+) -> dict[str, Any] | None:
+    """The ``auto_resume`` a task read reports for ``row``, or ``None``.
+
+    The ``task_recovery_update`` notice for the row's current state, computed
+    from the row alone (no query), and only at the sweeper's fence
+    (:func:`_fence_mismatch`). ``attempt`` is derived as at record time
+    (:meth:`RecordedInterruption.from_row`); ``stale`` and ``disabled`` are
+    never announced (:func:`public_auto_resume_view`).
+
+    Every ``manual`` and ``ineligible`` reads as ``None``. Recording one
+    announces nothing, and the same state reached later -- ``manual``
+    (``auto_resume_disabled``) by the switch-off drain or the claim guard,
+    ``ineligible`` at dispatch -- was announced ``stopped``, but the row
+    cannot tell the two apart. Nor is a give-up past a rolled-back resume
+    shown: its notice names a later version than the row's fence.
+
+    Invariant: a row that reads as ``None`` here (``manual``, ``ineligible``)
+    never returns to ``scheduled`` at the same fence; scheduling it again
+    must advance ``state_version``. Any later writer (a channel ``/stop``
+    cancel, the interaction gate) must keep this, or a client would discard
+    a live ``scheduled`` notice as older than the ``None`` it read.
+
+    Ordering, for clients merging reads with live notices: a later
+    ``(run_id, state_version)`` wins, as between live notices. Within one
+    fence ``state_version`` does not move, so order by ``k(status,
+    attempt)``: ``(attempt, 0)`` for ``resuming``, ``(attempt - 1, 1)`` for
+    ``scheduled`` and ``(attempt, 2)`` for ``stopped``. It strictly
+    increases along a fence's transitions (``scheduled`` -> ``resuming`` ->
+    ``scheduled`` -> ... -> ``stopped``); equal keys (a postponed
+    ``scheduled``) keep the later arrival, and ``stopped`` is the fence's
+    last word.
+
+    Terminal ``None``: only ``auto_recovery`` present with ``auto_resume:
+    None`` at the fence a client holds ends that fence's notices (a state
+    never announced, or one of the stops above), so the client drops the
+    notice it holds. A whole ``auto_recovery: None`` (a failed read, or a
+    rolled-back resume before its claim moves the row to the new fence)
+    says nothing about automatic resume: the client keeps its notice until
+    the fence changes.
+
+    Never cached on its own: the sweeper's transitions do not write
+    ``tasks``, so every read computes it afresh or keys its cache on it.
+    """
+
+    if _fence_mismatch(task, row) is not None:
+        return None
+    state = str(row.state)
+    # Also recorded, unannounced; indistinguishable from the later ones.
+    if state in (
+        TaskAutoRecoveryState.MANUAL.value,
+        TaskAutoRecoveryState.INELIGIBLE.value,
+    ):
+        return None
+    return public_auto_resume_view(
+        state,
+        state_detail=row.state_detail,
+        reason=str(row.reason),
+        attempt=RecordedInterruption.from_row(row).attempt,
+        next_attempt_at=row.next_attempt_at,
+    )
 
 
 @dataclass(frozen=True)
@@ -415,9 +477,9 @@ def _row_cas(
 
 
 # Each terminal state's event and TriggerRun error. A dispatch-time
-# ``manual`` (a reason with no policy, a channel task) is the task being out
-# of automatic recovery's reach, recorded as an ``ineligible`` event whose
-# detail names the state; a disabled switch passes its own event and error.
+# ``manual`` (a reason with no policy) is the task being out of automatic
+# recovery's reach, recorded as an ``ineligible`` event whose detail names
+# the state; a disabled switch passes its own event and error.
 # ``stale`` never fails a TriggerRun.
 _STOPS: dict[TaskAutoRecoveryState, tuple[TaskRecoveryEventType, str | None]] = {
     TaskAutoRecoveryState.EXHAUSTED: (
@@ -685,16 +747,6 @@ def _process_due_candidate_no_commit(
             from_state=_SCHEDULED,
             at="dispatch",
             state_detail=eligibility.detail,
-        )
-    if not auto_resume_schedulable(eligibility.kind):
-        return _give_up_no_commit(
-            db,
-            task,
-            row,
-            TaskAutoRecoveryState.MANUAL,
-            from_state=_SCHEDULED,
-            at="dispatch",
-            state_detail=CHANNEL_HOLD_PENDING_DETAIL,
         )
     if scheduled_trigger_superseded(db, task):
         return _give_up_no_commit(
@@ -1855,7 +1907,9 @@ CHANNEL_HOLD_CLOCK_GRACE_SECONDS = 60
 
 
 def _hold_snapshot(db: Session, task_id: int) -> Any:
-    """The task, its recovery row and the row's dispatched command, read once.
+    """The task, its recovery row and the row's dispatched command, read once,
+    with whether any RESUME of the task (automatic or not) is still queued or
+    running.
 
     One statement on purpose: under PostgreSQL's READ COMMITTED two reads
     could straddle a resume that was interrupted and recorded again, pairing
@@ -1872,6 +1926,16 @@ def _hold_snapshot(db: Session, task_id: int) -> Any:
         .correlate(TaskAutoRecovery)
         .scalar_subquery()
     )
+    resume_in_flight = (
+        select(TaskExecutionCommand.id)
+        .where(
+            TaskExecutionCommand.task_id == Task.id,
+            TaskExecutionCommand.kind == TaskCommandKind.RESUME.value,
+            TaskExecutionCommand.status.in_((COMMAND_PENDING, COMMAND_PROCESSING)),
+        )
+        .correlate(Task)
+        .exists()
+    )
     return db.execute(
         select(
             Task.status,
@@ -1883,6 +1947,7 @@ def _hold_snapshot(db: Session, task_id: int) -> Any:
             TaskAutoRecovery.paused_state_version,
             TaskAutoRecovery.interrupted_at,
             command_status.label("dispatch_status"),
+            resume_in_flight.label("resume_in_flight"),
         )
         .select_from(Task)
         .outerjoin(TaskAutoRecovery, TaskAutoRecovery.task_id == Task.id)
@@ -1953,6 +2018,29 @@ def channel_reply_waits_for_auto_resume(
     if snap.status != TaskStatus.PAUSED or snap.run_id != run_id:
         return True
     return _auto_resume_holds(snap, run_id=run_id, now=now)
+
+
+def resume_hand_off_can_complete(db: Session, task: Task, *, now: datetime) -> bool:
+    """Whether the resume ``task`` is handing off (PAUSED, ``resume_requested``)
+    can still start its run, so a new channel turn should wait (busy).
+
+    True while a RESUME command of the task (automatic or a person's) is still
+    queued or running, or while an automatic resume of its run still holds
+    the channel reply (``_auto_resume_holds``: within the channel window and
+    its grace). Otherwise the hand-off is stranded -- its command ended but
+    the resumed run never took the lease -- and refusing every turn would
+    strand the channel with it. One read, no locks; the caller holds the task
+    row lock.
+    """
+
+    snap = _hold_snapshot(db, int(task.id))
+    if snap is None:
+        return False
+    if snap.resume_in_flight:
+        return True
+    return snap.run_id is not None and _auto_resume_holds(
+        snap, run_id=str(snap.run_id), now=now
+    )
 
 
 def supersede_pending_auto_resume_no_commit(
