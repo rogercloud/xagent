@@ -582,6 +582,7 @@ def _give_up_no_commit(
     stop: tuple[TaskRecoveryEventType, str | None] | None = None,
     fenced: bool | None = None,
     log_level: int = logging.WARNING,
+    counter: str = "xagent.task.auto_resume.gave_up",
 ) -> _CandidateResult:
     """Stop automatic recovery of ``row`` in ``new_state``; no commit.
 
@@ -596,7 +597,8 @@ def _give_up_no_commit(
     to start: like any user pause, its run stays RUNNING until a later run
     settles it (#2177), and deleting the task fails it. ``stop`` overrides
     the state's ``(event, TriggerRun error)``; ``log_level`` that of the
-    give-up's log line.
+    give-up's log line, and ``counter`` the metric it is counted on (a
+    person's cancel is not a system give-up).
     """
 
     from .task_orchestrator import sync_trigger_run_status
@@ -659,7 +661,7 @@ def _give_up_no_commit(
         )
         return _CandidateResult(_Outcome.STALE)
     increment_counter(
-        "xagent.task.auto_resume.gave_up",
+        counter,
         attributes={"outcome": new_state.value, "operation": at},
     )
     logger.log(
@@ -2285,10 +2287,10 @@ def cancel_pending_auto_resume_no_commit(
         stop=_CANCELLED_STOP,
         fenced=True,
         log_level=logging.INFO,
+        counter="xagent.task.auto_resume.cancelled",
     )
     if result.outcome is not _Outcome.GAVE_UP:
         raise RuntimeError(f"auto-resume row of task {task.id} moved under a cancel")
-    increment_counter("xagent.task.auto_resume.cancelled", attributes={"operation": at})
     return AutoResumeCancel(
         cancelled=True,
         run_id=str(row.run_id),

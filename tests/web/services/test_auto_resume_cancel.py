@@ -297,6 +297,25 @@ def test_nothing_pending_is_left_alone(factory, seed):
 # --------------------------------------------------------------------------
 
 
+def test_a_cancel_counts_as_a_cancel_not_a_give_up(factory, monkeypatch):
+    counted: list[tuple[str, dict[str, Any]]] = []
+    monkeypatch.setattr(
+        task_auto_resume,
+        "increment_counter",
+        lambda name, attributes=None: counted.append((name, attributes or {})),
+    )
+    tid = _seeded(factory)
+
+    assert _cancel(factory, tid).cancelled
+
+    assert counted == [
+        (
+            "xagent.task.auto_resume.cancelled",
+            {"outcome": "manual", "operation": AT},
+        )
+    ]
+
+
 @pytest.mark.parametrize(
     ("seed", "fence"),
     [
