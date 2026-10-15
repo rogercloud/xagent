@@ -32,7 +32,7 @@ from xagent.web.models.user import User
 from xagent.web.services import task_command_transport as transport
 
 REVISION = "20261015_task_cmd_claimable_id"
-DOWN_REVISION = "20261014_task_cmd_claimable_kind"
+DOWN_REVISION = "20261015_sync_xero_mcp_app"
 TABLE = "task_execution_commands"
 INDEX = "ix_task_commands_claimable_id"
 INDEX_COLUMNS = ("id",)
