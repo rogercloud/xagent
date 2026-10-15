@@ -37,6 +37,10 @@ nothing waits for the switch to come back: the tick drains ``scheduled``
 rows to ``manual(auto_resume_disabled)`` and closes ``dispatched`` rows whose
 command already ended the same way, failing their TriggerRun; a command
 still queued is dropped by the claim-time guard.
+
+A person can stop a pending resume
+(:func:`cancel_pending_auto_resume_no_commit`), which moves the version like
+a superseding turn.
 """
 
 from __future__ import annotations
@@ -82,6 +86,7 @@ from .ops_signals import (
 )
 from .task_auto_recovery import (
     AUTO_RESUME_DISABLED_DETAIL,
+    AUTO_RESUME_USER_CANCELLED_DETAIL,
     PLANNED_RECOVERY_EVENTS,
     TASK_INTERRUPTION_PAUSED_TRIGGER_ERROR,
     auto_recovery_eligibility,
@@ -145,6 +150,10 @@ TASK_AUTO_RESUME_DISABLED_TRIGGER_ERROR = (
     "Task paused after a system interruption; automatic resume is disabled. "
     "Manual resume is required."
 )
+TASK_AUTO_RESUME_CANCELLED_TRIGGER_ERROR = (
+    "Task paused after a system interruption; automatic resume was cancelled. "
+    "Manual resume is required."
+)
 
 # Module-level so tests can seed it; drawn only by housekeeping reschedules.
 _AUTO_RESUME_RNG = random.Random()
@@ -204,8 +213,9 @@ def public_auto_resume_view(
     it, and that action announced itself. ``manual`` reached from an
     announced state (the sweeper or the guard closing a scheduled or
     dispatched row) is ``stopped``: ``disabled`` for a switched-off executor,
-    else ``ineligible`` (a reason with no policy: automatic resume will not
-    act on the task). Callers decide whether a
+    ``cancelled`` when a person stopped automatic resume, else
+    ``ineligible`` (a reason with no policy: automatic resume will not act
+    on the task). Callers decide whether a
     transition is announced at all; a recorded ``manual`` is not.
     """
 
@@ -216,10 +226,11 @@ def public_auto_resume_view(
     elif state in _STOP_REASONS:
         status, stop_reason = "stopped", _STOP_REASONS[state]
     elif state == TaskAutoRecoveryState.MANUAL.value:
-        status, stop_reason = (
-            "stopped",
-            "disabled" if state_detail == AUTO_RESUME_DISABLED_DETAIL else "ineligible",
-        )
+        status = "stopped"
+        stop_reason = {
+            AUTO_RESUME_DISABLED_DETAIL: "disabled",
+            AUTO_RESUME_USER_CANCELLED_DETAIL: "cancelled",
+        }.get(state_detail or "", "ineligible")
     else:
         return None
     return {
@@ -244,18 +255,30 @@ def current_auto_resume_view(
     (:meth:`RecordedInterruption.from_row`); ``stale`` and ``disabled`` are
     never announced (:func:`public_auto_resume_view`).
 
-    Every ``manual`` and ``ineligible`` reads as ``None``. Recording one
-    announces nothing, and the same state reached later -- ``manual``
-    (``auto_resume_disabled``) by the switch-off drain or the claim guard,
-    ``ineligible`` at dispatch -- was announced ``stopped``, but the row
-    cannot tell the two apart. Nor is a give-up past a rolled-back resume
-    shown: its notice names a later version than the row's fence.
+    Every ``manual`` and ``ineligible`` reads as ``None``, except ``manual``
+    (``user_cancelled``). Recording one announces nothing, and the same state
+    reached later -- ``manual`` (``auto_resume_disabled``) by the switch-off
+    drain or the claim guard, ``ineligible`` at dispatch -- was announced
+    ``stopped``, but the row cannot tell the two apart. Nor is a give-up past
+    a rolled-back resume shown: its notice names a later version than the
+    row's fence. ``manual`` (``user_cancelled``) is the one ``manual`` that
+    can be told apart: only a person's cancel
+    (:func:`cancel_pending_auto_resume_no_commit`) writes it, never a
+    recording, and in the same transaction it moves the version and the row
+    to that new fence, so the row reads ``stopped`` / ``cancelled`` exactly
+    as the cancel announced it.
 
     Invariant: a row that reads as ``None`` here (``manual``, ``ineligible``)
     never returns to ``scheduled`` at the same fence; scheduling it again
-    must advance ``state_version``. Any later writer (a channel ``/stop``
-    cancel, the interaction gate) must keep this, or a client would discard
-    a live ``scheduled`` notice as older than the ``None`` it read.
+    must advance ``state_version``. Any later writer (the interaction gate)
+    must keep this, or a client would discard a live ``scheduled`` notice as
+    older than the ``None`` it read. ``manual`` (``user_cancelled``) keeps it
+    too, and reads ``stopped``, the last word of the fence the cancel
+    created: only three writers ever write ``scheduled`` -- recording an
+    interruption (always at the larger version its settlement wrote),
+    housekeeping's reschedule and the rolled-back claim's re-fence (both
+    only out of ``dispatched``) -- so nothing schedules that row again at
+    its fence.
 
     Ordering, for clients merging reads with live notices: a later
     ``(run_id, state_version)`` wins, as between live notices. Within one
@@ -282,10 +305,11 @@ def current_auto_resume_view(
     if _fence_mismatch(task, row) is not None:
         return None
     state = str(row.state)
-    # Also recorded, unannounced; indistinguishable from the later ones.
-    if state in (
-        TaskAutoRecoveryState.MANUAL.value,
-        TaskAutoRecoveryState.INELIGIBLE.value,
+    # Also recorded, unannounced; indistinguishable from the later ones. A
+    # cancel is never recorded and always announced at the row's fence.
+    if state == TaskAutoRecoveryState.INELIGIBLE.value or (
+        state == TaskAutoRecoveryState.MANUAL.value
+        and row.state_detail != AUTO_RESUME_USER_CANCELLED_DETAIL
     ):
         return None
     return public_auto_resume_view(
@@ -511,6 +535,10 @@ _STOPS: dict[TaskAutoRecoveryState, tuple[TaskRecoveryEventType, str | None]] = 
 _DISABLED_STOP = (
     TaskRecoveryEventType.SKIPPED_DISABLED,
     TASK_AUTO_RESUME_DISABLED_TRIGGER_ERROR,
+)
+_CANCELLED_STOP = (
+    TaskRecoveryEventType.SKIPPED_USER_INTENT,
+    TASK_AUTO_RESUME_CANCELLED_TRIGGER_ERROR,
 )
 
 
@@ -2105,3 +2133,141 @@ def supersede_pending_auto_resume_no_commit(
     )
     increment_counter("xagent.task.auto_resume.superseded_by_turn")
     return True
+
+
+# --------------------------------------------------------------------------
+# Cancel by a person
+# --------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class AutoResumeCancel:
+    """What :func:`cancel_pending_auto_resume_no_commit` did."""
+
+    cancelled: bool
+    # Nothing to keep: the caller rolls back (a write may already be staged)
+    # and may read again.
+    raced: bool = False
+    run_id: str | None = None
+    # The task's version after the cancel; also the row's new fence.
+    state_version: int | None = None
+    notice: RecoveryNotice | None = None
+
+
+_NOTHING_TO_CANCEL = AutoResumeCancel(cancelled=False)
+_CANCEL_RACED = AutoResumeCancel(cancelled=False, raced=True)
+
+
+def _auto_resume_pending(db: Session, task: Task, row: TaskAutoRecovery | None) -> bool:
+    """Whether an automatic resume of ``task``'s paused run may still start.
+
+    At the fence a ``scheduled`` row will be dispatched and a ``dispatched``
+    one is queued, running, or about to be rescheduled by housekeeping. Off
+    the fence only a dispatch whose command is still live can resume the run
+    (a retry after a rolled-back resume, two versions on); anything else is
+    closed by the sweeper or housekeeping without resuming. A hand-off in
+    progress (``resume_requested``) is past cancelling.
+    """
+
+    if (
+        row is None
+        or task.status != TaskStatus.PAUSED
+        or task.control_state != TaskControlState.PAUSED.value
+        or task.run_id is None
+        or row.run_id != task.run_id
+        or row.state not in (_SCHEDULED.value, _DISPATCHED.value)
+    ):
+        return False
+    if int(task.state_version or 0) == int(row.paused_state_version):
+        return True
+    if row.state != _DISPATCHED.value or row.last_command_id is None:
+        return False
+    status = db.execute(
+        select(TaskExecutionCommand.status).where(
+            TaskExecutionCommand.task_id == task.id,
+            TaskExecutionCommand.command_id == row.last_command_id,
+        )
+    ).scalar_one_or_none()
+    return status in (COMMAND_PENDING, COMMAND_PROCESSING)
+
+
+def cancel_pending_auto_resume_no_commit(
+    db: Session, task: Task, *, at: str
+) -> AutoResumeCancel:
+    """A person stops the automatic resume ``task``'s paused run waits for;
+    no commit.
+
+    Caller: holds the ``tasks`` row lock (FOR UPDATE); lock order is the
+    module's, ``tasks`` then the recovery row, then reads of commands. Every
+    write is a compare-and-swap (SQLite ignores the row locks); ``raced``
+    means one lost after an earlier write was staged, so the caller must
+    roll back, and may read again.
+
+    Moves ``state_version`` so that an automatic RESUME already claimed --
+    even one past the claim guard -- cannot make its RESUME_REQUESTED
+    transition, fenced on the version it admitted from: it defers, and the
+    guard skips the retry (the row no longer names it), completing it as
+    ``auto_skipped``. The row moves to the new version (its fence) and rests
+    in ``manual(user_cancelled)``, announced and read as ``stopped`` /
+    ``cancelled``; nothing schedules a ``manual`` row again at that fence.
+    A RUNNING TriggerRun fails with the cancel message. Queued admissions
+    are left alone: a RESUME waiting in one completes as ``auto_skipped``
+    once admitted.
+    """
+
+    row = db.get(
+        TaskAutoRecovery, int(task.id), with_for_update=True, populate_existing=True
+    )
+    if not _auto_resume_pending(db, task, row):
+        return _NOTHING_TO_CANCEL
+    assert row is not None
+    from_state = TaskAutoRecoveryState(row.state)
+    fence = int(task.state_version or 0)
+    bumped = _rowcount(
+        db.execute(
+            update(Task)
+            .where(
+                Task.id == task.id,
+                Task.run_id == task.run_id,
+                Task.state_version == task.state_version,
+                task_status_predicate.eq(TaskStatus.PAUSED),
+                Task.control_state == TaskControlState.PAUSED.value,
+            )
+            .values(state_version=func.coalesce(Task.state_version, 0) + 1)
+            .execution_options(synchronize_session=False)
+        )
+    )
+    if bumped != 1:
+        return _CANCEL_RACED
+    moved = _rowcount(
+        db.execute(
+            update(TaskAutoRecovery)
+            .where(*_row_cas(row, from_state, fenced=False))
+            .values(paused_state_version=fence + 1)
+            .execution_options(synchronize_session=False)
+        )
+    )
+    if moved != 1:
+        return _CANCEL_RACED
+    db.refresh(task)
+    db.refresh(row)
+    result = _give_up_no_commit(
+        db,
+        task,
+        row,
+        TaskAutoRecoveryState.MANUAL,
+        from_state=from_state,
+        at=at,
+        state_detail=AUTO_RESUME_USER_CANCELLED_DETAIL,
+        event_detail={"from": from_state.value, "fence": fence},
+        stop=_CANCELLED_STOP,
+        fenced=True,
+    )
+    if result.outcome is not _Outcome.GAVE_UP:
+        return _CANCEL_RACED
+    return AutoResumeCancel(
+        cancelled=True,
+        run_id=str(row.run_id),
+        state_version=fence + 1,
+        notice=result.notice,
+    )
