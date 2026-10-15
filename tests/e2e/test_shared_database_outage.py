@@ -209,6 +209,8 @@ def _lease_state(task_id: int) -> dict:
 
 
 def _dispatcher_failure_lines(app) -> dict[str, int]:
+    # Coupled to the log text in task_command_transport's dispatcher worker,
+    # which exports no constant for it.
     return {
         path.name: path.read_text().count(
             "component=task-command-dispatcher command dispatch failed"
@@ -220,27 +222,33 @@ def _dispatcher_failure_lines(app) -> dict[str, int]:
 def test_database_unreachable_past_lease_ttl_resumes_after_recovery(
     pg_shared_app, pg_link
 ):
-    from xagent.web.services.task_command_transport import DISPATCHER_CONCURRENCY
+    from xagent.web.services.task_command_transport import (
+        DISPATCHER_CONCURRENCY,
+        DISPATCHER_FAILURE_LOG_INTERVAL_SECONDS,
+    )
 
     app = pg_shared_app
     task_id = start_task(app, "e2e:gate")
     run_id = _run_id(app, task_id)
 
     pg_link.cut()
+    cut_at = time.monotonic()
     # The answer's checkpoint and the settlement after it both fail.
     _release_model(app)
 
     def lease_lapsed():
         state = _lease_state(task_id)
-        # Nobody could write: the run keeps its lease, never FAILED and never
-        # an ownerless RUNNING.
-        assert state["status"] == "running", state
-        assert state["runner_id"] is not None, state
+        # Nobody could write: the run still holds its lease and is not FAILED.
+        if state["status"] != "running" or state["runner_id"] is None:
+            pytest.fail(
+                f"Lease not held during the outage: {state}\n{app.diagnostics()}"
+            )
         expires = state["lease_expires_at"]
         return expires < datetime.now(timezone.utc) - timedelta(seconds=1)
 
     wait_for(lease_lapsed, app, "the lease to lapse", timeout=30)
     pg_link.restore()
+    outage_seconds = time.monotonic() - cut_at
 
     settled = app.wait_task(task_id, run_id=run_id, timeout=SETTLE_TIMEOUT)
     assert ANSWER in (settled["output"] or "")
@@ -248,8 +256,9 @@ def test_database_unreachable_past_lease_ttl_resumes_after_recovery(
     assert len(model_calls(app)) == 2
     row, events = recovery_state(task_id)
     assert row is not None
-    # A real outage settles once, while the database is still down, so the
-    # lease TTL (not the failed write) records the interruption.
+    # Pins today's behaviour: settlement is attempted once, while the
+    # database is still down, so the lease TTL (not the failed write)
+    # records the interruption.
     assert (row["reason"], row["run_id"], row["total_resumes"]) == (
         "lease_expired",
         run_id,
@@ -259,8 +268,10 @@ def test_database_unreachable_past_lease_ttl_resumes_after_recovery(
     assert len(auto_resume_commands(task_id)) == 1
     _assert_answered_once(task_id)
 
-    # Each dispatcher worker logs a failing claim at most once a minute, and
-    # the worker host's dispatcher did see the outage.
+    # Each dispatcher worker logs a failing claim at most once per interval,
+    # and the worker host's dispatcher did see the outage. The bound holds
+    # only while the outage fits in one interval.
+    assert outage_seconds < DISPATCHER_FAILURE_LOG_INTERVAL_SECONDS
     lines = _dispatcher_failure_lines(app)
     worker_lines = [n for name, n in lines.items() if name.startswith("worker-")]
     assert worker_lines and all(

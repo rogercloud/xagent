@@ -546,8 +546,8 @@ def open_shared_app(
     monkeypatch.setenv("XAGENT_TRIGGER_DISPATCHER_INTERVAL_SECONDS", "1")
     monkeypatch.setenv("XAGENT_TRIGGER_DISPATCHER_STARTUP_JITTER_SECONDS", "0")
     monkeypatch.setenv("XAGENT_FILE_STORAGE_STARTUP_SYNC_ENABLED", "false")
+    init_db()
     try:
-        init_db()
         with get_session_local()() as db:
             user = User(username="e2e-owner", password_hash="unused", is_admin=True)
             db.add(user)

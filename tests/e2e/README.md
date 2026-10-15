@@ -56,9 +56,12 @@ tier-1 retry layer, with that many attempts, in front of the provider; other
 modules leave it unset and see single attempts.
 
 The PostgreSQL cases use the `postgres_url` fixture (`postgres_harness.py`):
-with `XAGENT_TEST_POSTGRES_URL` set to a server the tests may create databases
-on, each test gets a fresh database there, dropped afterwards; otherwise it
-starts a PostgreSQL 17 container, which needs Docker.
+with `XAGENT_TEST_POSTGRES_URL` set, each test gets a fresh database on that
+server, dropped afterwards, so its role needs CREATEDB and the server must be
+PostgreSQL 13 or newer (setup fails with a message saying so otherwise);
+without it the fixture starts a PostgreSQL 17 container, which needs Docker.
+Either way these tests carry the `docker` marker and run only with
+`--run-special`.
 
 In `test_shared_channels.py`, the bot callbacks and their event bridge run in
 pytest's process. Spawned web/worker hosts have channel ingress disabled, so
