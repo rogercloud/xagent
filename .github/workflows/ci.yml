@@ -827,6 +827,12 @@ jobs:
               tests/e2e/test_shared_happy_paths.py
               tests/e2e/test_shared_gmail.py
               tests/e2e/test_shared_network_recovery.py
+          - shard: auto-resume
+            paths: >-
+              tests/e2e/test_shared_auto_resume.py
+              tests/e2e/test_shared_channel_auto_resume.py
+              tests/e2e/test_shared_provider_outage.py
+              tests/e2e/test_shared_database_outage.py
           - shard: rest
             paths: >-
               tests/e2e
@@ -834,6 +840,10 @@ jobs:
               --ignore=tests/e2e/test_shared_happy_paths.py
               --ignore=tests/e2e/test_shared_gmail.py
               --ignore=tests/e2e/test_shared_network_recovery.py
+              --ignore=tests/e2e/test_shared_auto_resume.py
+              --ignore=tests/e2e/test_shared_channel_auto_resume.py
+              --ignore=tests/e2e/test_shared_provider_outage.py
+              --ignore=tests/e2e/test_shared_database_outage.py
 
     services:
       redis:
