@@ -222,8 +222,10 @@ def test_sdk_task_connection_lost_mid_checkpoint_fails(pg_shared_app):
     )
     assert events == ["interrupted"]
     assert auto_resume_commands(task_id) == []
-    ((hits,),) = _execute("SELECT last_value FROM e2e_write_fault_hits")
-    assert hits == 1
+    # Fired exactly once: is_called tells one nextval() from none.
+    assert _execute("SELECT last_value, is_called FROM e2e_write_fault_hits") == [
+        (1, True)
+    ]
 
 
 # --------------------------------------------------------------------------

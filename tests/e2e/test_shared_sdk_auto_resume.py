@@ -10,6 +10,7 @@ polling a PAUSED task for good.
 
 from __future__ import annotations
 
+import json
 import time
 
 import pytest
@@ -72,6 +73,20 @@ def poll_until_final(app, task_id: int, headers) -> tuple[dict, list[str]]:
     pytest.fail(f"SDK task stayed {seen}\n{app.diagnostics()}")
 
 
+def replayed_events(app, task_id: int, headers) -> list[tuple[str, dict]]:
+    """``(event, data)`` of the SSE stream replayed for a finished task."""
+    response = app.client.get(f"/v1/chat/tasks/{task_id}/events", headers=headers)
+    assert response.status_code == 200, response.text
+    frames = []
+    for block in response.text.split("\n\n"):
+        fields = dict(
+            line.split(": ", 1) for line in block.splitlines() if ": " in line
+        )
+        if "event" in fields:
+            frames.append((fields["event"], json.loads(fields.get("data", "{}"))))
+    return frames
+
+
 def test_sdk_task_resumes_after_its_worker_is_killed(shared_app):
     app = shared_app
     task_id, run_id, headers = create_sdk_task(app, "e2e:gate")
@@ -89,13 +104,19 @@ def test_sdk_task_resumes_after_its_worker_is_killed(shared_app):
     assert view["status"] == "completed", view
     assert ANSWER in (view["output"] or ""), view
     assert view["error"] is None, view
-    events = app.client.get(f"/v1/chat/tasks/{task_id}/events", headers=headers)
-    assert events.status_code == 200, events.text
-    assert "event: task.completed" in events.text
-    assert ANSWER in events.text
+    frames = replayed_events(app, task_id, headers)
+    assert ("task.completed", "completed") in [(e, d.get("status")) for e, d in frames]
+    assert ANSWER in json.dumps(frames)
+    # The replay shows the caller no failure and no pause either.
+    assert not [
+        (event, data)
+        for event, data in frames
+        if data.get("status") == "failed"
+        or (data.get("step") or {}).get("status") == "failed"
+        or data.get("status") == "paused"
+    ], frames
 
-    settled = app.wait_task(task_id, run_id=run_id, timeout=SETTLE_TIMEOUT)
-    assert settled["run_id"] == run_id
+    app.wait_task(task_id, run_id=run_id, timeout=SETTLE_TIMEOUT)
     # The killed call and the resumed one: nothing ran twice.
     assert len(model_calls(app)) == 2
     row, recovery_events = recovery_state(task_id)
@@ -119,6 +140,10 @@ def test_sdk_task_fails_on_a_provider_outage_without_pausing(shared_app):
     assert view["status"] == "failed", view
     assert view["error"], view
     assert task_state(task_id)["run_id"] == run_id
+    frames = replayed_events(app, task_id, headers)
+    assert ("task.completed", "failed") in [(e, d.get("status")) for e, d in frames]
+    # Nothing in the replay says the run paused or came back.
+    assert {d["status"] for e, d in frames if e == "task.status"} <= {"failed"}, frames
     # One model call, retried by tier 1 only, and never resumed.
     assert len(model_faults(app, "unavailable")) == ATTEMPTS
     row, events = recovery_state(task_id)
