@@ -17,6 +17,7 @@ from tests.e2e.shared_execution_harness import (
     SETTLE_TIMEOUT,
     assistant_messages,
     auto_resume_commands,
+    create_sdk_task,
     model_calls,
     open_shared_app,
     recovery_state,
@@ -188,6 +189,41 @@ def test_connection_lost_mid_checkpoint_pauses_and_resumes(pg_shared_app):
     # The fault fired once, and a later checkpoint of the task went through.
     ((hits,),) = _execute("SELECT last_value FROM e2e_write_fault_hits")
     assert hits >= 2
+
+
+def test_sdk_task_connection_lost_mid_checkpoint_fails(pg_shared_app):
+    """An SDK caller only polls the status: its run fails, never pauses."""
+    from xagent.core.agent.checkpoint import CHECKPOINT_EVENT_TYPE
+
+    app = pg_shared_app
+    checkpoint = str(CHECKPOINT_EVENT_TYPE)
+    _execute(*_DROP_CONNECTION_ON_CHECKPOINT)
+    task_id, run_id, _headers = create_sdk_task(app, "e2e:gate")
+    wait_for(lambda: (app.root / "model-entered").exists(), app, "model call")
+    _execute(
+        "INSERT INTO e2e_write_fault (task_id, event_type)"
+        " VALUES (:task_id, :event_type)",
+        task_id=task_id,
+        event_type=checkpoint,
+    )
+    _release_model(app)
+
+    settled = app.wait_task(
+        task_id, status="failed", run_id=run_id, timeout=SETTLE_TIMEOUT
+    )
+    assert "CheckpointPersistenceError" in (settled["error"] or ""), settled
+    assert len(model_calls(app)) == 1
+    row, events = recovery_state(task_id)
+    assert row is not None
+    assert (row["state"], row["state_detail"], row["reason"]) == (
+        "manual",
+        None,
+        "persistence_failure",
+    )
+    assert events == ["interrupted"]
+    assert auto_resume_commands(task_id) == []
+    ((hits,),) = _execute("SELECT last_value FROM e2e_write_fault_hits")
+    assert hits == 1
 
 
 # --------------------------------------------------------------------------
