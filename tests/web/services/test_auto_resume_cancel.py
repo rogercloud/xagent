@@ -21,12 +21,14 @@ import pytest
 import sqlalchemy as sa
 
 from tests.web.services.task_database_shared import engine as engine_fixture
+from tests.web.services.task_database_shared import task_id as task_id_fixture
 from tests.web.services.test_channel_reply_hold import (
     CID,
     PV,
     RUN,
     _auto_resume,
     _postgresql_only,
+    _recovery_row,
     _seed,
     _wait_for_a_lock_waiter,
 )
@@ -35,7 +37,16 @@ from tests.web.services.test_channel_reply_hold import handler as handler_fixtur
 from tests.web.services.test_channel_reply_hold import (
     short_lock_timeout as short_lock_timeout_fixture,
 )
+from tests.web.services.test_resumed_trigger_run_projection import (
+    _finalize,
+    _resume,
+    _trigger_run,
+    _trigger_run_state,
+)
 from tests.web.services.test_task_auto_resume import _trigger
+from tests.web.services.test_task_execution_event_writer import (
+    canonical as canonical_fixture,
+)
 from xagent.core.agent.interruption import InterruptionReason
 from xagent.web.models.database import get_engine, get_session_local
 from xagent.web.models.task import Task, TaskStatus
@@ -53,11 +64,9 @@ from xagent.web.services.task_auto_recovery import (
     record_interruption_no_commit,
 )
 from xagent.web.services.task_auto_resume import (
-    TASK_AUTO_RESUME_CANCELLED_TRIGGER_ERROR,
     AutoResumeCancel,
     cancel_pending_auto_resume_no_commit,
     check_auto_resume_claim_sync,
-    public_auto_resume_view,
     run_auto_resume_tick,
     select_next_candidate_for_update,
     supersede_pending_auto_resume_no_commit,
@@ -69,11 +78,14 @@ from xagent.web.services.task_lease_service import utc_now
 from xagent.web.services.task_settlement_report import RecordedInterruption
 
 engine = engine_fixture
+task_id = task_id_fixture
+canonical = canonical_fixture
 factory = factory_fixture
 handler = handler_fixture
 short_lock_timeout = short_lock_timeout_fixture
 
 NOTHING = AutoResumeCancel(cancelled=False)
+AT = "channel_stop"
 
 
 @pytest.fixture(autouse=True)
@@ -83,11 +95,30 @@ def _quiet_dispatcher(monkeypatch):
     )
 
 
-def _seeded(factory, *, state_detail: str | None = None, **seed: Any) -> int:
+def _seeded(
+    factory,
+    *,
+    state_detail: str | None = None,
+    user_command_after: bool = False,
+    **seed: Any,
+) -> int:
     with factory() as db:
         tid = _seed(db, **seed)
         if state_detail is not None:
             db.get(TaskAutoRecovery, tid).state_detail = state_detail
+        if user_command_after:
+            # A person's command reached the task after the dispatch.
+            db.add(
+                TaskExecutionCommand(
+                    task_id=tid,
+                    actor_user_id=db.get(Task, tid).user_id,
+                    command_id="user-pause-1",
+                    kind="pause",
+                    payload={},
+                    target_run_id=RUN,
+                    status="completed",
+                )
+            )
         db.commit()
     return tid
 
@@ -101,7 +132,7 @@ def _locked(db, tid: int) -> Task:
 def _cancel(factory, tid: int) -> AutoResumeCancel:
     """The caller's transaction: lock the task, cancel, commit or roll back."""
     with factory() as db:
-        result = cancel_pending_auto_resume_no_commit(db, _locked(db, tid), at="test")
+        result = cancel_pending_auto_resume_no_commit(db, _locked(db, tid), at=AT)
         if result.cancelled:
             db.commit()
         else:
@@ -128,7 +159,8 @@ def _command_status(factory, tid: int) -> str:
     with factory() as db:
         return db.scalars(
             sa.select(TaskExecutionCommand.status).where(
-                TaskExecutionCommand.task_id == tid
+                TaskExecutionCommand.task_id == tid,
+                TaskExecutionCommand.command_id == CID,
             )
         ).one()
 
@@ -163,6 +195,24 @@ _NOT_PENDING = [
         )
         for s in ("completed", "failed")
     ],
+    # Off the fence a live command still pending is only a retry after the
+    # resume it rolled back: two versions on, nothing else since.
+    *[
+        pytest.param(
+            {**_DISPATCHED, "command_status": "pending", "version": PV + gap},
+            id=f"live_command_{gap}_versions_on",
+        )
+        for gap in (1, 3)
+    ],
+    pytest.param(
+        {
+            **_DISPATCHED,
+            "command_status": "pending",
+            "version": PV + 2,
+            "user_command_after": True,
+        },
+        id="live_command_after_a_user_command",
+    ),
     pytest.param(
         {
             **_DISPATCHED,
@@ -218,13 +268,26 @@ def test_a_pending_resume_is_cancelled(factory, seed, fence):
     )
 
 
+def _unwritten(db, tid: int, version: int) -> None:
+    """Nothing staged in ``db``: no pending ORM change, nothing flushed."""
+    assert not db.dirty and not db.new
+    assert db.scalar(sa.select(Task.state_version).where(Task.id == tid)) == version
+    assert not db.scalars(
+        sa.select(TaskRecoveryEvent.id).where(TaskRecoveryEvent.task_id == tid)
+    ).all()
+
+
 @pytest.mark.parametrize("seed", _NOT_PENDING)
 def test_nothing_pending_is_left_alone(factory, seed):
     tid = _seeded(factory, **seed)
     before = _state(factory, tid)
 
-    # Not raced: a hand-off is not cancellable, rather than a lost CAS.
-    assert _cancel(factory, tid) == NOTHING
+    with factory() as db:
+        result = cancel_pending_auto_resume_no_commit(db, _locked(db, tid), at=AT)
+        # Not raced: a hand-off is not cancellable, rather than a lost CAS.
+        assert result == NOTHING
+        _unwritten(db, tid, before[0])
+        db.commit()
 
     assert _state(factory, tid) == before
 
@@ -246,7 +309,7 @@ def test_nothing_pending_is_left_alone(factory, seed):
         ),
     ],
 )
-def test_a_cancel_stops_the_row_and_the_trigger_run(factory, seed, fence):
+def test_a_cancel_stops_the_row_and_leaves_the_trigger_run(factory, seed, fence):
     with factory() as db:
         tid = _seed(db, **seed)
         row = db.get(TaskAutoRecovery, tid)
@@ -286,16 +349,25 @@ def test_a_cancel_stops_the_row_and_the_trigger_run(factory, seed, fence):
             RUN,
         )
         assert event.detail == {
-            "at": "test",
+            "at": AT,
             "state": "manual",
             "state_detail": "user_cancelled",
             "from": from_state,
-            "fence": fence,
+            "task_version": fence,
+            "paused_state_version": PV,
         }
+        # As after a person's pause (#2177): the run resumed by hand ends it.
         run = db.get(TriggerRun, run_id)
-        assert run.status == TriggerRunStatus.FAILED.value
-        assert run.error_message == TASK_AUTO_RESUME_CANCELLED_TRIGGER_ERROR
-        assert db.get(TriggerRun, ended_id).error_message == "earlier"
+        assert (run.status, run.error_message, run.finished_at) == (
+            TriggerRunStatus.RUNNING.value,
+            None,
+            None,
+        )
+        ended = db.get(TriggerRun, ended_id)
+        assert (ended.status, ended.error_message) == (
+            TriggerRunStatus.FAILED.value,
+            "earlier",
+        )
 
         view = current_auto_recovery_view(db, task)
     notice = result.notice
@@ -320,21 +392,45 @@ def test_a_cancel_stops_the_row_and_the_trigger_run(factory, seed, fence):
     )
 
 
-@pytest.mark.parametrize(
-    ("detail", "stop_reason"),
-    [
-        ("user_cancelled", "cancelled"),
-        ("auto_resume_disabled", "disabled"),
-        (None, "ineligible"),
-        ("interaction_pending", "ineligible"),
-    ],
-)
-def test_a_manual_stop_names_why(detail, stop_reason):
-    view = public_auto_resume_view(
-        "manual", state_detail=detail, reason="x", attempt=1, next_attempt_at=None
+def test_a_resume_by_hand_after_a_cancel_settles_the_trigger_run(
+    canonical, monkeypatch
+):
+    monkeypatch.setattr(
+        "xagent.web.services.task_execution.get_session_local",
+        lambda: get_session_local(),
     )
-    assert view is not None
-    assert (view["status"], view["stop_reason"]) == ("stopped", stop_reason)
+    factory, tid = canonical
+    with factory() as db:
+        task = db.get(Task, tid)
+        task.status, task.control_state = TaskStatus.PAUSED, "paused"
+        task.run_id, task.state_version = RUN, PV
+        _recovery_row(db, tid, RUN, PV, state="scheduled", interrupted_ago=60)
+        db.commit()
+    run_id = _trigger_run(factory, tid, TriggerRunStatus.RUNNING)
+
+    assert _cancel(factory, tid).cancelled
+    assert _trigger_run_state(factory, run_id) == (
+        TriggerRunStatus.RUNNING.value,
+        None,
+        False,
+    )
+
+    lease = _resume(factory, tid)
+    _finalize(
+        factory,
+        tid,
+        lease,
+        status="completed",
+        success=True,
+        output="the answer",
+        result={"status": "completed", "success": True, "output": "the answer"},
+    )
+
+    assert _trigger_run_state(factory, run_id) == (
+        TriggerRunStatus.COMPLETED.value,
+        None,
+        True,
+    )
 
 
 # --------------------------------------------------------------------------
@@ -465,7 +561,7 @@ def test_a_later_interruption_is_recorded_at_a_later_fence(factory):
 
 
 # --------------------------------------------------------------------------
-# C7. SQLite: a lost compare-and-swap is raced and rolls back whole
+# C7. SQLite: a lost compare-and-swap is raced and writes nothing
 # --------------------------------------------------------------------------
 
 
@@ -496,15 +592,16 @@ def test_a_dispatch_that_commits_first_is_raced_then_cancelled(factory, monkeypa
         row = other.get(TaskAutoRecovery, tid)
         row.state, row.last_command_id = "dispatched", CID
 
-    _interleave(monkeypatch, dispatch)
-    with factory() as db:
-        raced = cancel_pending_auto_resume_no_commit(db, _locked(db, tid), at="test")
-        db.rollback()
-    assert (raced.cancelled, raced.raced) == (False, True)
-    # The version bump staged before the lost row CAS is gone with it.
+    with monkeypatch.context() as patch:
+        _interleave(patch, dispatch)
+        with factory() as db:
+            raced = cancel_pending_auto_resume_no_commit(db, _locked(db, tid), at=AT)
+            assert (raced.cancelled, raced.raced) == (False, True)
+            # Raced means nothing was written: the caller may retry as is.
+            _unwritten(db, tid, PV)
+            db.commit()
     assert _state(factory, tid) == (PV, ("dispatched", None), PV, [])
 
-    monkeypatch.undo()
     result = _cancel(factory, tid)
 
     assert result.cancelled
@@ -522,10 +619,11 @@ def test_a_version_moved_first_is_raced_without_a_write(factory, monkeypatch):
 
     _interleave(monkeypatch, move)
     with factory() as db:
-        raced = cancel_pending_auto_resume_no_commit(db, _locked(db, tid), at="test")
-        db.rollback()
+        raced = cancel_pending_auto_resume_no_commit(db, _locked(db, tid), at=AT)
+        assert raced.raced
+        _unwritten(db, tid, PV + 1)
+        db.commit()
 
-    assert raced.raced
     assert _state(factory, tid) == (PV + 1, ("scheduled", None), PV, [])
 
 
@@ -571,7 +669,7 @@ def _cancel_in_thread(tid: int, outcome: dict[str, Any]) -> threading.Thread:
         try:
             with get_session_local()() as db:
                 outcome["result"] = cancel_pending_auto_resume_no_commit(
-                    db, _locked(db, tid), at="test"
+                    db, _locked(db, tid), at=AT
                 )
                 db.commit()
         except BaseException as exc:  # pragma: no cover - reported below
@@ -623,7 +721,7 @@ def test_postgresql_sweeper_skips_a_task_a_cancel_holds(factory, short_lock_time
     cancelling = get_session_local()()
     try:
         assert cancel_pending_auto_resume_no_commit(
-            cancelling, _locked(cancelling, tid), at="test"
+            cancelling, _locked(cancelling, tid), at=AT
         ).cancelled
         with get_session_local()() as sweeper:
             assert (
@@ -671,7 +769,7 @@ def test_postgresql_claim_guard_waits_for_a_cancel_without_deadlock(
     thread = threading.Thread(target=guard)
     try:
         assert cancel_pending_auto_resume_no_commit(
-            cancelling, _locked(cancelling, tid), at="test"
+            cancelling, _locked(cancelling, tid), at=AT
         ).cancelled
         thread.start()
         with get_session_local()() as monitor:

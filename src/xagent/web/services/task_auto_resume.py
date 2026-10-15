@@ -150,10 +150,6 @@ TASK_AUTO_RESUME_DISABLED_TRIGGER_ERROR = (
     "Task paused after a system interruption; automatic resume is disabled. "
     "Manual resume is required."
 )
-TASK_AUTO_RESUME_CANCELLED_TRIGGER_ERROR = (
-    "Task paused after a system interruption; automatic resume was cancelled. "
-    "Manual resume is required."
-)
 
 # Module-level so tests can seed it; drawn only by housekeeping reschedules.
 _AUTO_RESUME_RNG = random.Random()
@@ -211,12 +207,12 @@ def public_auto_resume_view(
     Counters, ``state_detail``, ``last_error`` and command ids stay
     server-side. ``stale`` is not announced: a person's own action produced
     it, and that action announced itself. ``manual`` reached from an
-    announced state (the sweeper or the guard closing a scheduled or
-    dispatched row) is ``stopped``: ``disabled`` for a switched-off executor,
-    ``cancelled`` when a person stopped automatic resume, else
-    ``ineligible`` (a reason with no policy: automatic resume will not act
-    on the task). Callers decide whether a
-    transition is announced at all; a recorded ``manual`` is not.
+    announced state (a scheduled or dispatched row) is ``stopped``:
+    ``disabled`` when the sweeper or the guard closed it for a switched-off
+    executor, ``cancelled`` when a person cancelled the pending resume, else
+    ``ineligible`` (a reason with no policy: automatic resume will not act on
+    the task). Callers decide whether a transition is announced at all; a
+    recorded ``manual`` is not.
     """
 
     if state == _SCHEDULED.value:
@@ -536,9 +532,11 @@ _DISABLED_STOP = (
     TaskRecoveryEventType.SKIPPED_DISABLED,
     TASK_AUTO_RESUME_DISABLED_TRIGGER_ERROR,
 )
-_CANCELLED_STOP = (
+# No TriggerRun error: a person's cancel leaves the run RUNNING, as a
+# person's pause does (#2177); the resumed run's settlement ends it.
+_CANCELLED_STOP: tuple[TaskRecoveryEventType, str | None] = (
     TaskRecoveryEventType.SKIPPED_USER_INTENT,
-    TASK_AUTO_RESUME_CANCELLED_TRIGGER_ERROR,
+    None,
 )
 
 
@@ -583,19 +581,22 @@ def _give_up_no_commit(
     event_detail: dict[str, Any] | None = None,
     stop: tuple[TaskRecoveryEventType, str | None] | None = None,
     fenced: bool | None = None,
+    log_level: int = logging.WARNING,
 ) -> _CandidateResult:
     """Stop automatic recovery of ``row`` in ``new_state``; no commit.
 
     The CAS re-checks the fence except for ``stale``, which exists because
     the fence no longer holds; ``fenced`` overrides that for a caller that
-    has already established why the fence moved. TriggerRun: a give-up fails
-    a PENDING/RUNNING run with the state's message; ``stale`` only mirrors a
+    has already established why the fence moved. TriggerRun: a give-up with
+    an error fails the task's PENDING/RUNNING runs with it (a ``stop``
+    without one, a person's cancel, leaves them); ``stale`` only mirrors a
     task that already ended, since otherwise a person resumed or changed it
     and that run's own settlement reports the real outcome. That includes a
     task left paused on the same run, as after a user's resume that failed
     to start: like any user pause, its run stays RUNNING until a later run
     settles it (#2177), and deleting the task fails it. ``stop`` overrides
-    the state's ``(event, TriggerRun error)``.
+    the state's ``(event, TriggerRun error)``; ``log_level`` that of the
+    give-up's log line.
     """
 
     from .task_orchestrator import sync_trigger_run_status
@@ -661,7 +662,8 @@ def _give_up_no_commit(
         "xagent.task.auto_resume.gave_up",
         attributes={"outcome": new_state.value, "operation": at},
     )
-    logger.warning(
+    logger.log(
+        log_level,
         "component=auto-resume task_id=%s run_id=%s reason=%s state=%s "
         "attempt=%s next_attempt_at=None state_detail=%s",
         row.task_id,
@@ -2145,8 +2147,8 @@ class AutoResumeCancel:
     """What :func:`cancel_pending_auto_resume_no_commit` did."""
 
     cancelled: bool
-    # Nothing to keep: the caller rolls back (a write may already be staged)
-    # and may read again.
+    # Lost a compare-and-swap; nothing was written, so the caller may read
+    # again and retry.
     raced: bool = False
     run_id: str | None = None
     # The task's version after the cancel; also the row's new fence.
@@ -2162,11 +2164,14 @@ def _auto_resume_pending(db: Session, task: Task, row: TaskAutoRecovery | None) 
     """Whether an automatic resume of ``task``'s paused run may still start.
 
     At the fence a ``scheduled`` row will be dispatched and a ``dispatched``
-    one is queued, running, or about to be rescheduled by housekeeping. Off
-    the fence only a dispatch whose command is still live can resume the run
-    (a retry after a rolled-back resume, two versions on); anything else is
-    closed by the sweeper or housekeeping without resuming. A hand-off in
-    progress (``resume_requested``) is past cancelling.
+    one is queued, running, or about to be rescheduled by housekeeping
+    (whatever its command's status). Off the fence only one dispatch can
+    still resume the run: a retry after the resume this command rolled back
+    (:func:`_rolled_back_by_this_claim`: two versions on, no other command
+    since), while the command is queued or running. A missing or ended
+    command there means nothing is pending: housekeeping or the guard closes
+    the row without resuming. A hand-off in progress (``resume_requested``)
+    is past cancelling.
     """
 
     if (
@@ -2188,7 +2193,9 @@ def _auto_resume_pending(db: Session, task: Task, row: TaskAutoRecovery | None) 
             TaskExecutionCommand.command_id == row.last_command_id,
         )
     ).scalar_one_or_none()
-    return status in (COMMAND_PENDING, COMMAND_PROCESSING)
+    return status in (COMMAND_PENDING, COMMAND_PROCESSING) and (
+        _rolled_back_by_this_claim(db, task, row, str(row.last_command_id))
+    )
 
 
 def cancel_pending_auto_resume_no_commit(
@@ -2197,11 +2204,16 @@ def cancel_pending_auto_resume_no_commit(
     """A person stops the automatic resume ``task``'s paused run waits for;
     no commit.
 
-    Caller: holds the ``tasks`` row lock (FOR UPDATE); lock order is the
-    module's, ``tasks`` then the recovery row, then reads of commands. Every
-    write is a compare-and-swap (SQLite ignores the row locks); ``raced``
-    means one lost after an earlier write was staged, so the caller must
-    roll back, and may read again.
+    Caller: holds the ``tasks`` row lock, and ``task`` reflects that locked
+    read (selected ``FOR UPDATE``, or refreshed after it); lock order is the
+    module's, ``tasks`` then the recovery row, then reads of commands.
+    ``at`` names the caller (e.g. ``channel_stop``) in the event, the log
+    and the metrics. ``raced``: the first write's compare-and-swap, which
+    also re-checks the recovery row as read, lost (SQLite ignores the row
+    locks), and nothing was written; the caller may read again and retry.
+    Once it lands nothing else can move either row -- the locks on
+    PostgreSQL, the write lock it took on SQLite -- so a later write that
+    misses raises instead. On any exception the caller rolls back.
 
     Moves ``state_version`` so that an automatic RESUME already claimed --
     even one past the claim guard -- cannot make its RESUME_REQUESTED
@@ -2210,9 +2222,10 @@ def cancel_pending_auto_resume_no_commit(
     ``auto_skipped``. The row moves to the new version (its fence) and rests
     in ``manual(user_cancelled)``, announced and read as ``stopped`` /
     ``cancelled``; nothing schedules a ``manual`` row again at that fence.
-    A RUNNING TriggerRun fails with the cancel message. Queued admissions
-    are left alone: a RESUME waiting in one completes as ``auto_skipped``
-    once admitted.
+    A TriggerRun stays RUNNING, as after a person's pause (#2177): the run
+    that is later resumed by hand settles it. Queued admissions are left
+    alone: a RESUME waiting in one completes as ``auto_skipped`` once
+    admitted.
     """
 
     row = db.get(
@@ -2222,7 +2235,11 @@ def cancel_pending_auto_resume_no_commit(
         return _NOTHING_TO_CANCEL
     assert row is not None
     from_state = TaskAutoRecoveryState(row.state)
-    fence = int(task.state_version or 0)
+    task_version = int(task.state_version or 0)
+    paused_state_version = int(row.paused_state_version)
+    row_as_read = select(TaskAutoRecovery.task_id).where(
+        *_row_cas(row, from_state, fenced=False)
+    )
     bumped = _rowcount(
         db.execute(
             update(Task)
@@ -2232,6 +2249,7 @@ def cancel_pending_auto_resume_no_commit(
                 Task.state_version == task.state_version,
                 task_status_predicate.eq(TaskStatus.PAUSED),
                 Task.control_state == TaskControlState.PAUSED.value,
+                row_as_read.exists(),
             )
             .values(state_version=func.coalesce(Task.state_version, 0) + 1)
             .execution_options(synchronize_session=False)
@@ -2243,12 +2261,12 @@ def cancel_pending_auto_resume_no_commit(
         db.execute(
             update(TaskAutoRecovery)
             .where(*_row_cas(row, from_state, fenced=False))
-            .values(paused_state_version=fence + 1)
+            .values(paused_state_version=task_version + 1)
             .execution_options(synchronize_session=False)
         )
     )
     if moved != 1:
-        return _CANCEL_RACED
+        raise RuntimeError(f"auto-resume row of task {task.id} moved under a cancel")
     db.refresh(task)
     db.refresh(row)
     result = _give_up_no_commit(
@@ -2259,15 +2277,21 @@ def cancel_pending_auto_resume_no_commit(
         from_state=from_state,
         at=at,
         state_detail=AUTO_RESUME_USER_CANCELLED_DETAIL,
-        event_detail={"from": from_state.value, "fence": fence},
+        event_detail={
+            "from": from_state.value,
+            "task_version": task_version,
+            "paused_state_version": paused_state_version,
+        },
         stop=_CANCELLED_STOP,
         fenced=True,
+        log_level=logging.INFO,
     )
     if result.outcome is not _Outcome.GAVE_UP:
-        return _CANCEL_RACED
+        raise RuntimeError(f"auto-resume row of task {task.id} moved under a cancel")
+    increment_counter("xagent.task.auto_resume.cancelled", attributes={"operation": at})
     return AutoResumeCancel(
         cancelled=True,
         run_id=str(row.run_id),
-        state_version=fence + 1,
+        state_version=task_version + 1,
         notice=result.notice,
     )
