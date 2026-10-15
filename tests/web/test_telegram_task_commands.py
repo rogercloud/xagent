@@ -1248,3 +1248,146 @@ def test_stop_signals_new_preparation_despite_retained_shared_turn() -> None:
     previous.request_stop.assert_called_once()
     assert bot._consume_user_stop_request(101)
     assert not bot.user_message_queues
+
+
+# --------------------------------------------------------------------------
+# /stop asks the database first (channel_stop), from every entry point
+# --------------------------------------------------------------------------
+
+_STOP_ENTRIES = [
+    pytest.param("cmd_stop", "/stop", id="command_stop"),
+    pytest.param("cmd_stop", "/pause", id="command_pause"),
+    pytest.param("handle_message", "stop", id="text_stop"),
+    pytest.param("handle_message", "停止", id="text_chinese"),
+]
+_STOPPED = "Stopped the current run. Send another message to continue here, or use /new for a fresh task."
+_CANCELLED = "Stopped. The interrupted run will not resume automatically. Send another message to continue here, or use /new for a fresh task."
+
+
+@pytest.fixture
+def stop_bot(monkeypatch):
+    from unittest.mock import AsyncMock, Mock
+
+    from aiogram import Dispatcher, types
+
+    from xagent.web.channels import batch_control
+    from xagent.web.services.channel_stop import ChannelStopOutcome, ChannelStopResult
+
+    bot = _bot(9)
+    bot.instance_id = "test"
+    bot._started_at = None
+    bot._menu_generation = "current"
+    bot.bot = Mock()
+    bot.dp = Dispatcher()
+    bot._register_handlers()
+    bot.active_tasks = {123: 45}
+    events: list[tuple[str, object]] = []
+
+    async def answer(self, text, **kwargs):
+        events.append(("reply", text))
+
+    monkeypatch.setattr(types.Message, "answer", answer)
+    monkeypatch.setattr(
+        batch_control, "get_shared_task_execution_enabled", lambda: True
+    )
+    stop = AsyncMock(return_value=ChannelStopResult(ChannelStopOutcome.ACTIVE, 45))
+    monkeypatch.setattr(batch_control, "stop_channel_task", stop)
+    deliver = AsyncMock(side_effect=lambda *args: events.append(("deliver", args)))
+    monkeypatch.setattr(batch_control, "deliver_channel_result", deliver)
+    handlers = {h.callback.__name__: h.callback for h in bot.dp.message.handlers}
+    return SimpleNamespace(bot=bot, stop=stop, events=events, handlers=handlers)
+
+
+async def _send_stop(stop_bot, handler: str, text: str) -> None:
+    from aiogram import types
+
+    message = types.Message(
+        message_id=1,
+        date=datetime.now(timezone.utc),
+        chat=types.Chat(id=123, type="private"),
+        from_user=types.User(id=123, is_bot=False, first_name="Sender"),
+        text=text,
+    )
+    await stop_bot.handlers[handler](message)
+
+
+def _retained(bot):
+    from unittest.mock import Mock
+
+    from xagent.web.services.channel_runtime import SelectedChannelTask
+    from xagent.web.services.shared_channel_execution import SharedChannelTurn
+
+    turn = SharedChannelTurn(SelectedChannelTask(1, 45, False, 9, "123", None, 0), None)
+    turn.request_stop = Mock(return_value=True)
+    bot.user_active_executions[123] = (45, turn)
+    return turn
+
+
+def _db_outcome(stop_bot, outcome, *, held=None, error=None) -> None:
+    from xagent.web.services.channel_stop import ChannelStopResult
+
+    stop_bot.stop.return_value = ChannelStopResult(outcome, 45, held)
+    stop_bot.stop.side_effect = error
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("handler", "text"), _STOP_ENTRIES)
+async def test_stop_that_cancels_a_resume_replies_then_delivers(
+    stop_bot, handler, text
+):
+    from xagent.web.services.channel_stop import ChannelStopOutcome
+
+    turn = _retained(stop_bot.bot)
+    stop_bot.bot.user_message_queues[123] = ["queued"]
+    _db_outcome(stop_bot, ChannelStopOutcome.CANCELLED, held=11)
+
+    await _send_stop(stop_bot, handler, text)
+
+    stop_bot.stop.assert_awaited_once_with(
+        channel_id=9, external_user_id="123", task_id=45, pause_awaited_run=False
+    )
+    turn.request_stop.assert_not_called()
+    assert not stop_bot.bot.user_message_queues
+    assert stop_bot.events == [
+        ("reply", _CANCELLED),
+        ("deliver", (11, stop_bot.bot._deliver_shared_result)),
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("handler", "text"), _STOP_ENTRIES)
+@pytest.mark.parametrize(
+    ("outcome", "retained", "reply", "in_memory"),
+    [
+        pytest.param("idle", True, "No active run to stop.", False, id="idle"),
+        pytest.param("pause_queued", True, _STOPPED, True, id="pause_queued"),
+        pytest.param("active", True, _STOPPED, True, id="active_tracked"),
+        pytest.param("active", False, "No active run to stop.", False, id="active"),
+    ],
+)
+async def test_stop_replies_by_what_the_database_found(
+    stop_bot, handler, text, outcome, retained, reply, in_memory
+):
+    from xagent.web.services.channel_stop import ChannelStopOutcome
+
+    turn = _retained(stop_bot.bot) if retained else None
+    _db_outcome(stop_bot, ChannelStopOutcome(outcome))
+
+    await _send_stop(stop_bot, handler, text)
+
+    assert stop_bot.stop.await_args.kwargs["pause_awaited_run"] is not retained
+    if turn is not None:
+        assert turn.request_stop.called is in_memory
+    assert stop_bot.events == [("reply", reply)]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("handler", "text"), _STOP_ENTRIES)
+async def test_an_unauthorized_stop_behaves_as_before(stop_bot, handler, text):
+    from xagent.web.services.channel_runtime import ChannelAuthorizationError
+
+    _db_outcome(stop_bot, None, error=ChannelAuthorizationError("not allowed"))
+
+    await _send_stop(stop_bot, handler, text)
+
+    assert stop_bot.events == [("reply", "No active run to stop.")]

@@ -3,13 +3,37 @@
 import asyncio
 import logging
 from collections.abc import Coroutine
+from enum import Enum
 from typing import Any, Generic, TypeVar, cast
 
+from ...config import get_shared_task_execution_enabled
+from ..services.channel_delivery import ChannelDelivery, deliver_channel_result
+from ..services.channel_runtime import (
+    ChannelAuthorizationError,
+    ChannelConfigurationError,
+)
+from ..services.channel_stop import ChannelStopOutcome, stop_channel_task
 from ..services.db_runtime import cancel_and_drain_async_task
 from ..services.shared_channel_execution import SharedChannelTurn
 
 logger = logging.getLogger(__name__)
 _Key = TypeVar("_Key", int, str)
+
+
+class StopReply(str, Enum):
+    CANCELLED = "cancelled"  # the paused run will not resume automatically
+    STOPPED = "stopped"  # today's "Stopped the current run..."
+    NOTHING = "nothing"  # "No active run to stop."
+
+
+def _selected_task_id(selected: object) -> int | None:
+    """The persisted task selection as a task id; ``None`` for none or a
+    fresh conversation (``-1``)."""
+    try:
+        task_id = int(cast(Any, selected))
+    except (TypeError, ValueError):
+        return None
+    return task_id if task_id > 0 else None
 
 
 class BatchChannelControl(Generic[_Key]):
@@ -22,6 +46,7 @@ class BatchChannelControl(Generic[_Key]):
     user_preparing_executions: set[_Key]
     user_stop_events: dict[_Key, asyncio.Event]
     user_conversation_generations: dict[_Key, int]
+    channel_id: int | None = None
 
     def _initialize_batch_control(self) -> None:
         self.user_message_queues = {}
@@ -35,6 +60,11 @@ class BatchChannelControl(Generic[_Key]):
         raise NotImplementedError
 
     def _active_trace_handlers(self) -> dict[_Key, Any]:
+        raise NotImplementedError
+
+    async def _deliver_shared_result(
+        self, delivery: ChannelDelivery, result: dict[str, Any]
+    ) -> None:
         raise NotImplementedError
 
     def _prune_idle_user_state(self, user_id: _Key) -> None:
@@ -71,6 +101,71 @@ class BatchChannelControl(Generic[_Key]):
             reason=f"{self.control_label} stop requested",
             discard_output=False,
         )
+
+    def _has_live_conversation(self, user_id: _Key) -> bool:
+        return (
+            user_id in self.user_active_executions
+            or bool(self.user_message_queues.get(user_id))
+            or user_id in self.user_preparing_executions
+        )
+
+    def _drop_pending_input(self, user_id: _Key) -> bool:
+        """Drop queued input and stop a turn being prepared; leave accepted runs."""
+        queued = self.user_message_queues.pop(user_id, None)
+        preparing = user_id in self.user_preparing_executions
+        if preparing:
+            self._request_user_stop(user_id)
+        return bool(queued) or preparing
+
+    async def _handle_stop_request(
+        self, user_id: _Key, *, external_user_id: str, task_id: int | None
+    ) -> tuple[StopReply, int | None]:
+        """/stop: the database first, then the in-memory stop when it still
+        has something to stop. Returns the reply and the START whose held
+        reply the stop released (deliver it after replying)."""
+        result = None
+        if (
+            get_shared_task_execution_enabled()
+            and self.channel_id is not None
+            and task_id is not None
+        ):
+            try:
+                result = await stop_channel_task(
+                    channel_id=self.channel_id,
+                    external_user_id=external_user_id,
+                    task_id=task_id,
+                    pause_awaited_run=not self._has_live_conversation(user_id),
+                )
+            except (ChannelAuthorizationError, ChannelConfigurationError):
+                result = None
+            except Exception:
+                logger.exception("Channel stop could not read task %s", task_id)
+                result = None
+        if result is not None:
+            if result.outcome is ChannelStopOutcome.CANCELLED:
+                # A retained turn's stop would queue a PAUSE the paused run
+                # ignores; only the input not yet accepted is dropped.
+                self._drop_pending_input(user_id)
+                return StopReply.CANCELLED, result.held_command_db_id
+            if result.outcome is ChannelStopOutcome.IDLE:
+                dropped = self._drop_pending_input(user_id)
+                return (StopReply.STOPPED if dropped else StopReply.NOTHING), None
+            if result.outcome is ChannelStopOutcome.PAUSE_QUEUED:
+                self._stop_current_conversation(user_id)
+                return StopReply.STOPPED, None
+        stopped = self._stop_current_conversation(user_id)
+        return (StopReply.STOPPED if stopped else StopReply.NOTHING), None
+
+    async def _deliver_released_reply(self, command_db_id: int | None) -> None:
+        """Best effort; the recovery loop delivers it otherwise."""
+        if command_db_id is None:
+            return
+        try:
+            await deliver_channel_result(command_db_id, self._deliver_shared_result)
+        except Exception:
+            logger.exception(
+                "Released channel reply %s not delivered now", command_db_id
+            )
 
     def _request_current_conversation_stop(
         self, user_id: _Key, *, reason: str, discard_output: bool = True
