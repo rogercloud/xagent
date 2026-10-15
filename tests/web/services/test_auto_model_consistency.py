@@ -53,7 +53,7 @@ def env(monkeypatch, tmp_path):
     factory = sessionmaker(bind=engine, expire_on_commit=False)
     db = factory()
 
-    monkeypatch.setattr(database, "_SessionLocal", lambda: db)
+    monkeypatch.setattr(database, "_SessionLocal", factory)
     monkeypatch.setattr(admin_users, "get_session_local", lambda: factory)
     monkeypatch.setattr(builder_chat_runtime, "get_session_local", lambda: factory)
     monkeypatch.setattr(model_service, "_visible_user_ids_hook", None)

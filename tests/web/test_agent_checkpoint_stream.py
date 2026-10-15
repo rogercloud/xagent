@@ -577,13 +577,6 @@ async def test_paused_replay_event_embeds_known_control_state(monkeypatch) -> No
     user_id = int(task.user_id)
     db.close()
 
-    def get_test_db() -> Iterator[Session]:
-        session = SessionLocal()
-        try:
-            yield session
-        finally:
-            session.close()
-
     sent_events: list[dict] = []
 
     async def send_personal_message(event: dict, websocket: object) -> None:
@@ -690,13 +683,6 @@ async def test_historical_replay_detaches_before_slow_network_send(
         db.commit()
         owner_id = int(owner.id)
         task_id = int(task.id)
-
-    def get_test_db() -> Iterator[Session]:
-        session = SessionLocal()
-        try:
-            yield session
-        finally:
-            session.close()
 
     event_loop_thread = threading.get_ident()
     cache_threads: list[int] = []
@@ -842,13 +828,6 @@ def test_historical_replay_does_not_backfill_legacy_file_outputs(
             )
         )
         db.commit()
-
-    def get_test_db() -> Iterator[Session]:
-        session = SessionLocal()
-        try:
-            yield session
-        finally:
-            session.close()
 
     put_observations: list[int] = []
     original_put_file = FsspecFileStorage.put_file
@@ -3785,13 +3764,6 @@ def test_websocket_trace_handler_dedupes_prior_user_message_turn_id(
     finally:
         db.close()
 
-    def get_test_db() -> Iterator[Session]:
-        session = SessionLocal()
-        try:
-            yield session
-        finally:
-            session.close()
-
     monkeypatch.setattr("xagent.web.models.database._SessionLocal", SessionLocal)
 
     handler = TaskEventTraceHandler(task_id)
@@ -3982,13 +3954,6 @@ async def test_broadcast_payload_is_unchanged_for_an_attached_audience(
         )
         db.commit()
     db.close()
-
-    def get_test_db() -> Iterator[Session]:
-        session = SessionLocal()
-        try:
-            yield session
-        finally:
-            session.close()
 
     monkeypatch.setattr("xagent.web.models.database._SessionLocal", SessionLocal)
 
@@ -4639,13 +4604,6 @@ async def test_late_attach_replays_events_skipped_while_unattached(
     user_id = int(task.user_id)
     db.close()
 
-    def get_test_db() -> Iterator[Session]:
-        session = SessionLocal()
-        try:
-            yield session
-        finally:
-            session.close()
-
     monkeypatch.setattr("xagent.web.models.database._SessionLocal", SessionLocal)
 
     local_manager = ConnectionManager()
@@ -4796,10 +4754,10 @@ async def test_skipped_frames_are_recoverable_through_the_real_persistence_path(
     both real handlers, one real database session, and the same replay
     function the websocket endpoints call after registering a connection.
 
-    Two details are load bearing. ``DatabaseTraceHandler`` binds ``get_db``
-    at import time, so patching ``xagent.web.models.database.get_db`` alone
-    does not reach it; the replay reader imports it inside the function body
-    and does. And the event is deliberately not a checkpoint: replay filters
+    Two details are load bearing. Patching ``database._SessionLocal`` reaches
+    both readers: ``DatabaseTraceHandler``, which binds the real ``get_db`` at
+    import time, and the replay reader, which imports it inside the function
+    body. And the event is deliberately not a checkpoint: replay filters
     checkpoint rows out on two separate mechanisms, so a checkpoint would
     prove nothing about this change.
     """
@@ -4808,15 +4766,7 @@ async def test_skipped_frames_are_recoverable_through_the_real_persistence_path(
     user_id = int(task.user_id)
     db.close()
 
-    def get_test_db() -> Iterator[Session]:
-        session = SessionLocal()
-        try:
-            yield session
-        finally:
-            session.close()
-
     monkeypatch.setattr("xagent.web.models.database._SessionLocal", SessionLocal)
-    monkeypatch.setattr("xagent.web.services.trace_handlers.get_db", get_test_db)
 
     empty_manager = ConnectionManager()
     monkeypatch.setattr(
@@ -5083,13 +5033,6 @@ async def test_historical_replay_skips_audit_only_trace_events(monkeypatch) -> N
     finally:
         db.close()
 
-    def get_test_db() -> Iterator[Session]:
-        session = SessionLocal()
-        try:
-            yield session
-        finally:
-            session.close()
-
     sent_events: list[dict] = []
 
     async def send_personal_message(event: dict, websocket: object) -> None:
@@ -5170,13 +5113,6 @@ async def test_historical_replay_promotes_workforce_delegation_summary(
     finally:
         db.close()
 
-    def get_test_db() -> Iterator[Session]:
-        session = SessionLocal()
-        try:
-            yield session
-        finally:
-            session.close()
-
     sent_events: list[dict] = []
 
     async def send_personal_message(event: dict, websocket: object) -> None:
@@ -5251,13 +5187,6 @@ async def test_historical_replay_includes_child_trace_for_non_workforce_task(
     finally:
         db.close()
 
-    def get_test_db() -> Iterator[Session]:
-        session = SessionLocal()
-        try:
-            yield session
-        finally:
-            session.close()
-
     sent_events: list[dict] = []
 
     async def send_personal_message(event: dict, websocket: object) -> None:
@@ -5322,13 +5251,6 @@ async def test_historical_replay_skips_checkpoint_rows_before_streaming(
     finally:
         db.close()
 
-    def get_test_db() -> Iterator[Session]:
-        session = SessionLocal()
-        try:
-            yield session
-        finally:
-            session.close()
-
     sent_events: list[dict] = []
 
     async def send_personal_message(event: dict, websocket: object) -> None:
@@ -5380,13 +5302,6 @@ async def test_historical_replay_marks_assistant_chat_history_for_chat_display(
         db.commit()
     finally:
         db.close()
-
-    def get_test_db() -> Iterator[Session]:
-        session = SessionLocal()
-        try:
-            yield session
-        finally:
-            session.close()
 
     sent_events: list[dict] = []
 
@@ -5471,13 +5386,6 @@ async def test_historical_replay_orders_equal_timestamps_by_id(
         db.commit()
     finally:
         db.close()
-
-    def get_test_db() -> Iterator[Session]:
-        session = SessionLocal()
-        try:
-            yield session
-        finally:
-            session.close()
 
     sent_events: list[dict] = []
 
@@ -5570,13 +5478,6 @@ async def test_historical_replay_uses_turn_id_before_legacy_content_dedupe(
     finally:
         db.close()
 
-    def get_test_db() -> Iterator[Session]:
-        session = SessionLocal()
-        try:
-            yield session
-        finally:
-            session.close()
-
     sent_events: list[dict] = []
 
     async def send_personal_message(event: dict, websocket: object) -> None:
@@ -5662,13 +5563,6 @@ async def test_historical_replay_dedupes_file_only_turns_by_turn_id(
         db.commit()
     finally:
         db.close()
-
-    def get_test_db() -> Iterator[Session]:
-        session = SessionLocal()
-        try:
-            yield session
-        finally:
-            session.close()
 
     sent_events: list[dict] = []
 
