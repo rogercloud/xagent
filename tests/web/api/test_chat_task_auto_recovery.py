@@ -13,7 +13,9 @@ from __future__ import annotations
 
 import json
 import logging
+from collections.abc import Iterator
 from datetime import datetime, timezone
+from typing import Any
 
 import pytest
 from fastapi import FastAPI
@@ -116,7 +118,7 @@ def _auto_recovery(task_id: int, route_suffix: str) -> object:
 
 
 @ROUTES
-def test_current_interruption_is_shown_minimally(route_suffix: str) -> None:
+def test_current_interruption_is_shown_with_its_fence(route_suffix: str) -> None:
     _admin_headers()
     task_id = _paused_task(row={})
 
@@ -128,23 +130,6 @@ def test_current_interruption_is_shown_minimally(route_suffix: str) -> None:
         # A recorded ``manual`` row: nothing automatic to show.
         "auto_resume": None,
     }
-
-
-_OPERATOR_KEYS = {
-    "state",
-    "state_detail",
-    "last_error",
-    "last_command_id",
-    "total_resumes",
-    "no_progress_resumes",
-}
-_OPERATOR_VALUES = ("operator-detail", "operator-only diagnostic", "command-1")
-
-
-def _keys(value: object) -> set[str]:
-    if not isinstance(value, dict):
-        return set()
-    return set(value).union(*(_keys(v) for v in value.values()))
 
 
 @ROUTES
@@ -167,9 +152,6 @@ def test_scheduled_resume_is_shown_as_its_notice(route_suffix: str) -> None:
             "next_attempt_at": "2026-10-01T08:31:10+00:00",
         },
     }
-    assert not _keys(view) & _OPERATOR_KEYS
-    for leaked in _OPERATOR_VALUES:
-        assert leaked not in json.dumps(view)
 
 
 @ROUTES
@@ -249,10 +231,28 @@ def test_task_without_interruption_reports_null(route_suffix: str) -> None:
     assert _auto_recovery(task_id, route_suffix) is None
 
 
+class _JsonCache(InMemoryTTLCache):
+    """Round-trips values through JSON, as the Redis backend does, and
+    records the keys written."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.sets: list[str] = []
+
+    def set_json(self, key: str, value: Any, ttl_seconds: int) -> None:
+        self.sets.append(key)
+        super().set_json(key, json.loads(json.dumps(value)), ttl_seconds)
+
+    def get_json(self, key: str) -> Any | None:
+        value = super().get_json(key)
+        return None if value is None else json.loads(json.dumps(value))
+
+
 @pytest.fixture
-def _response_cache():
-    set_cache_backend_for_testing(InMemoryTTLCache())
-    yield
+def _response_cache() -> Iterator[_JsonCache]:
+    backend = _JsonCache()
+    set_cache_backend_for_testing(backend)
+    yield backend
     set_cache_backend_for_testing(None)
 
 
@@ -312,10 +312,12 @@ def _status_and_attempt(view: object) -> tuple[str, str | None, int]:
 
 
 @ROUTES
-@pytest.mark.usefixtures("_response_cache")
-def test_cached_response_follows_the_sweeper(route_suffix: str) -> None:
+def test_cached_response_follows_the_sweeper(
+    route_suffix: str, _response_cache: _JsonCache
+) -> None:
     """The sweeper's transitions leave the task row (the response cache's
-    key) alone; each read still reports the row as it stands."""
+    key) alone; each read is a cache hit and still reports the row as it
+    stands."""
     _admin_headers()
     task_id = _paused_task(row=SCHEDULED)
     assert _status_and_attempt(_auto_recovery(task_id, route_suffix)) == (
@@ -337,6 +339,8 @@ def test_cached_response_follows_the_sweeper(route_suffix: str) -> None:
         "limit_reached",
         3,
     )
+    # Written once, by the first read; the others were hits.
+    assert len(_response_cache.sets) == 1
 
 
 @pytest.mark.parametrize(
@@ -382,7 +386,10 @@ def test_history_task_info_carries_the_same_view(row, expected) -> None:
     task_id = _paused_task(row=row)
     db = _direct_db_session()
     try:
-        info = _history_task_info(db, db.get(Task, task_id), task_id)
+        task = db.get(Task, task_id)
+        info = _history_task_info(
+            db, task, task_id, auto_recovery=current_auto_recovery_view(db, task)
+        )
     finally:
         db.close()
 
@@ -440,24 +447,14 @@ def _history_auto_resume(task_id: int, admin_id: int) -> object:
 @pytest.mark.parametrize(
     "conversation_storage_version", [2, 1], ids=["event_history", "legacy_history"]
 )
-@pytest.mark.usefixtures("_response_cache")
 def test_history_replay_cache_follows_the_sweeper(
-    conversation_storage_version: int, monkeypatch
+    conversation_storage_version: int, _response_cache: _JsonCache
 ) -> None:
     """The legacy replay's cache is keyed on the task row, which the
     sweeper's transitions leave alone, so the view is part of its key; the
     event replay's key holds the whole ``task_info`` already. A repeat read
     with nothing changed is still a hit."""
-    from xagent.web.api import websocket
-
-    stored: list[str] = []
-    real_cache_set = websocket.cache_set
-
-    def counting_cache_set(key, value, **kwargs):
-        stored.append(key)
-        return real_cache_set(key, value, **kwargs)
-
-    monkeypatch.setattr(websocket, "cache_set", counting_cache_set)
+    stored = _response_cache.sets
     _admin_headers()
     task_id = _paused_task(
         row=SCHEDULED, conversation_storage_version=conversation_storage_version

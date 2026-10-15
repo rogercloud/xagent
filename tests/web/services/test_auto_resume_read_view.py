@@ -37,6 +37,7 @@ from xagent.web.services.task_auto_recovery import (
 )
 from xagent.web.services.task_auto_resume import (
     RecoveryNotice,
+    check_auto_resume_claim_sync,
     current_auto_resume_view,
     public_auto_resume_view,
     recorded_notice,
@@ -403,6 +404,47 @@ def test_each_transition_reads_as_its_notice_in_increasing_order(factory):
     assert keys == sorted(set(keys)), keys
 
 
+def test_a_rolled_back_resume_reads_as_its_claims_notice_at_the_new_fence(
+    factory,
+):
+    """``resume_task`` wrote RESUME_REQUESTED, failed to start and wrote
+    PAUSED back: two versions on. Until the command's retry claims it the
+    row keeps its old fence and the whole view is hidden; the claim moves
+    the row to the new fence and schedules it again, and the read follows."""
+    task_id, _recorded, _now = _record(factory)
+    resuming = _tick(factory, task_id, _due(factory, task_id))
+    _assert_reads_as(factory, task_id, resuming)
+    with factory() as db:
+        db.get(Task, task_id).state_version = PV + 2
+        command = db.scalars(
+            sa.select(TaskExecutionCommand).where(
+                TaskExecutionCommand.task_id == task_id
+            )
+        ).one()
+        command_id, payload = command.command_id, command.payload["auto_resume"]
+        db.commit()
+    assert _read(factory, task_id) is None
+
+    decision = check_auto_resume_claim_sync(
+        task_id=task_id,
+        command_id=command_id,
+        auto_resume=payload,
+        status=TaskStatus.PAUSED,
+        control_state="paused",
+        run_id=RUN,
+        state_version=PV + 2,
+        attempt_count=2,
+    )
+
+    assert decision.why == "rolled_back"
+    (notice,) = decision.notices
+    assert (notice.state_version, notice.auto_resume["status"]) == (
+        PV + 2,
+        "scheduled",
+    )
+    _assert_reads_as(factory, task_id, notice)
+
+
 def test_a_stop_straight_from_scheduled_orders_after_it(factory):
     """A give-up from ``scheduled`` reports the resumes made, not the next."""
     task_id, recorded, now = _record(factory)
@@ -536,5 +578,6 @@ def test_postgresql_read_does_not_wait_for_a_sweeper_holding_the_rows(factory, e
         holder.close()
 
     (view,) = result
+    assert view is not None, "read waited on a row lock"
     # The committed state, not the holder's uncommitted one.
     assert view["auto_resume"]["status"] == "scheduled"

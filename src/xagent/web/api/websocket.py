@@ -2055,17 +2055,12 @@ def _add_interruption_reason(
         status_event["interruption_reason"] = auto_recovery["reason"]
 
 
-# ``_history_task_info`` reads the view itself unless given one.
-_COMPUTE = object()
-
-
 def _history_task_info(
-    db: Any, task: Any, task_id: int, *, auto_recovery: Any = _COMPUTE
+    db: Any, task: Any, task_id: int, *, auto_recovery: dict[str, Any] | None
 ) -> dict[str, Any]:
+    """``auto_recovery`` is ``current_auto_recovery_view`` for ``task``, read
+    by the caller so a cache can key on it."""
     from ..models.agent import Agent
-
-    if auto_recovery is _COMPUTE:
-        auto_recovery = current_auto_recovery_view(db, task)
 
     # Determine is_dag from agent config if agent_id exists
     is_dag = None
@@ -2137,7 +2132,9 @@ def _load_event_historical_stream_snapshot(
 
     task_id = int(task.id)
     horizon = display_horizon(db, task_id)
-    info = _history_task_info(db, task, task_id)
+    info = _history_task_info(
+        db, task, task_id, auto_recovery=current_auto_recovery_view(db, task)
+    )
     state = task_control_snapshot(task).as_dict()
     active_run_id = (
         db.query(Task.run_id)
@@ -2228,7 +2225,9 @@ def _load_event_historical_stream_snapshot(
     current_state = task_control_snapshot(task).as_dict()
     state_changed = current_state != state
     if state_changed:
-        info = _history_task_info(db, task, task_id)
+        info = _history_task_info(
+            db, task, task_id, auto_recovery=current_auto_recovery_view(db, task)
+        )
         events[0] = info
     if task.status in {TaskStatus.PAUSED, TaskStatus.WAITING_FOR_USER}:
         kind, default = _waiting_or_paused_event_fields(task.status)
