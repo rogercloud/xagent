@@ -66,7 +66,6 @@ class ChannelStopOutcome(str, Enum):
 @dataclass(frozen=True)
 class ChannelStopResult:
     outcome: ChannelStopOutcome
-    task_id: int | None = None
     # The START whose held reply the cancel released: deliver it now.
     held_command_db_id: int | None = None
     notices: tuple[RecoveryNotice, ...] = ()
@@ -162,6 +161,26 @@ def _awaits_reply(db: Session, task: Task, channel_id: int) -> bool:
     )
 
 
+def _pause_queued(db: Session, task: Task) -> bool:
+    """A pause of ``task``'s current run is already requested or queued."""
+
+    if task.control_state == TaskControlState.PAUSE_REQUESTED.value:
+        return True
+    return (
+        db.execute(
+            select(TaskExecutionCommand.id)
+            .where(
+                TaskExecutionCommand.task_id == task.id,
+                TaskExecutionCommand.kind == TaskCommandKind.PAUSE.value,
+                TaskExecutionCommand.target_run_id == task.run_id,
+                TaskExecutionCommand.status.not_in(COMMAND_TERMINAL),
+            )
+            .limit(1)
+        ).first()
+        is not None
+    )
+
+
 def _stop_once_no_commit(
     db: Session,
     *,
@@ -200,16 +219,16 @@ def _stop_once_no_commit(
         )
         notices = (cancel.notice,) if cancel.notice is not None else ()
         return (
-            ChannelStopResult(ChannelStopOutcome.CANCELLED, task_id, held, notices),
+            ChannelStopResult(ChannelStopOutcome.CANCELLED, held, notices),
             False,
         )
 
     if _idle(db, task):
-        return ChannelStopResult(ChannelStopOutcome.IDLE, task_id), False
+        return ChannelStopResult(ChannelStopOutcome.IDLE), False
 
     if pause_awaited_run and _awaits_reply(db, task, channel_id):
-        if task.control_state == TaskControlState.PAUSE_REQUESTED.value:
-            return ChannelStopResult(ChannelStopOutcome.PAUSE_QUEUED, task_id), False
+        if _pause_queued(db, task):
+            return ChannelStopResult(ChannelStopOutcome.PAUSE_QUEUED), False
         if task.status == TaskStatus.RUNNING or (
             task.status == TaskStatus.PAUSED
             and task.control_state == TaskControlState.RESUME_REQUESTED.value
@@ -224,9 +243,9 @@ def _stop_once_no_commit(
                 payload={},
                 target_run_id=str(task.run_id),
             )
-            return ChannelStopResult(ChannelStopOutcome.PAUSE_QUEUED, task_id), True
+            return ChannelStopResult(ChannelStopOutcome.PAUSE_QUEUED), True
 
-    return ChannelStopResult(ChannelStopOutcome.ACTIVE, task_id), False
+    return ChannelStopResult(ChannelStopOutcome.ACTIVE), False
 
 
 def stop_channel_task_sync(
@@ -238,8 +257,16 @@ def stop_channel_task_sync(
     ``_load_channel_owner_sync``. A lost compare-and-swap (SQLite) is read
     again, at most three times; after that the ingress falls back to its
     in-memory stop (ACTIVE). Only a cancel or a staged PAUSE commits.
+
+    ``pause_awaited_run`` (the ingress tracks no turn of the sender) pauses
+    a RUNNING run, or a resume still handing off, whose START reply this
+    channel awaits. A PENDING task -- its START queued, not yet admitted --
+    is not paused: the PAUSE would target a run that has not started. That
+    is ACTIVE, and the ingress's in-memory stop handles it.
     """
 
+    result = ChannelStopResult(ChannelStopOutcome.ACTIVE)
+    staged = False
     for _ in range(_ATTEMPTS):
         with get_session_local()() as db:
             attempt = _stop_once_no_commit(
@@ -257,17 +284,15 @@ def stop_channel_task_sync(
                 db.commit()
             else:
                 db.rollback()
-        if staged:
-            notify_task_command_dispatcher()
-        increment_counter(
-            "xagent.channel.stop", attributes={"outcome": result.outcome.value}
-        )
-        return result
-    logger.warning("Channel stop of task %s kept losing a race", task_id)
+        break
+    else:
+        logger.warning("Channel stop of task %s kept losing a race", task_id)
+    if staged:
+        notify_task_command_dispatcher()
     increment_counter(
-        "xagent.channel.stop", attributes={"outcome": ChannelStopOutcome.ACTIVE.value}
+        "xagent.channel.stop", attributes={"outcome": result.outcome.value}
     )
-    return ChannelStopResult(ChannelStopOutcome.ACTIVE, task_id)
+    return result
 
 
 async def stop_channel_task(

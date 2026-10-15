@@ -162,10 +162,7 @@ async def test_a_stop_cancels_the_resume_and_releases_the_reply_once(
     )
 
     assert result.outcome is ChannelStopOutcome.CANCELLED
-    assert (result.task_id, result.held_command_db_id) == (
-        channel.task_id,
-        channel.command_id,
-    )
+    assert result.held_command_db_id == channel.command_id
     (notice,) = result.notices
     assert (notice.run_id, notice.state_version) == (
         channel.run_id,
@@ -340,9 +337,21 @@ def test_a_task_with_nothing_to_stop_is_idle(channel, case):
     assert _snapshot(channel) == before
 
 
-@pytest.mark.parametrize("kind", ["start", "resume", "message"])
-def test_an_unfinished_run_command_is_active(channel, kind):
+@pytest.mark.parametrize(
+    ("kind", "status"),
+    [
+        ("start", None),
+        ("resume", None),
+        ("resume_input", None),
+        ("message", None),
+        ("start", "completed"),
+        ("start", "failed"),
+    ],
+)
+def test_an_unfinished_run_command_is_active(channel, kind, status):
     _record(channel, state="expired")
+    if status is not None:
+        _set_task(channel, status=TaskStatus(status), control_state=status)
     with get_session_local()() as db:
         db.add(
             TaskExecutionCommand(
@@ -360,6 +369,18 @@ def test_an_unfinished_run_command_is_active(channel, kind):
 
     assert _stop(channel).outcome is ChannelStopOutcome.ACTIVE
     assert _snapshot(channel) == before
+
+
+def test_a_cancel_with_the_reply_already_sent_releases_nothing(channel):
+    _record(channel)
+    with get_session_local()() as db:
+        db.get(TaskChannelDelivery, channel.command_id).status = "delivered"
+        db.commit()
+
+    result = _stop(channel)
+
+    assert result.outcome is ChannelStopOutcome.CANCELLED
+    assert result.held_command_db_id is None
 
 
 def test_a_second_stop_finds_nothing_to_stop(channel):
@@ -389,7 +410,9 @@ def test_a_running_awaited_run_is_paused(channel, _environment):
     _environment.assert_called_once()
 
 
-@pytest.mark.parametrize("case", ["tracked_turn", "web_run", "reply_sent"])
+@pytest.mark.parametrize(
+    "case", ["tracked_turn", "web_run", "reply_sent", "other_channel"]
+)
 def test_a_run_the_chat_does_not_await_is_left_to_the_ingress(
     channel, _environment, case
 ):
@@ -400,6 +423,20 @@ def test_a_run_the_chat_does_not_await_is_left_to_the_ingress(
     elif case == "reply_sent":
         with get_session_local()() as db:
             db.get(TaskChannelDelivery, channel.command_id).status = "delivered"
+            db.commit()
+    elif case == "other_channel":
+        # The reply is awaited, but by another channel of the owner.
+        with get_session_local()() as db:
+            other = UserChannel(
+                user_id=db.get(Task, channel.task_id).user_id,
+                channel_type="feishu",
+                channel_name="other",
+                config={},
+                is_active=True,
+            )
+            db.add(other)
+            db.flush()
+            db.get(TaskChannelDelivery, channel.command_id).channel_id = other.id
             db.commit()
 
     result = _stop(channel, pause_awaited_run=case != "tracked_turn")
@@ -425,12 +462,42 @@ def test_a_hand_off_is_paused_only_while_it_can_complete(
     assert len(_pauses(channel)) == int(outcome is ChannelStopOutcome.PAUSE_QUEUED)
 
 
-def test_a_pause_already_requested_is_not_queued_again(channel, _environment):
-    _set_task(channel, status=TaskStatus.RUNNING, control_state="pause_requested")
+@pytest.mark.parametrize(
+    ("earlier", "staged"),
+    [
+        pytest.param("pause_requested", False, id="pause_requested"),
+        pytest.param("pending", False, id="pause_pending"),
+        pytest.param("processing", False, id="pause_processing"),
+        pytest.param("completed", True, id="pause_done"),
+        pytest.param("other_run", True, id="pause_of_another_run"),
+    ],
+)
+def test_a_pause_already_queued_is_not_queued_again(
+    channel, _environment, earlier, staged
+):
+    control_state = "pause_requested" if earlier == "pause_requested" else "running"
+    _set_task(channel, status=TaskStatus.RUNNING, control_state=control_state)
+    if earlier != "pause_requested":
+        with get_session_local()() as db:
+            db.add(
+                TaskExecutionCommand(
+                    task_id=channel.task_id,
+                    actor_user_id=db.get(Task, channel.task_id).user_id,
+                    command_id="stop:earlier",
+                    kind="pause",
+                    payload={},
+                    target_run_id="older-run"
+                    if earlier == "other_run"
+                    else channel.run_id,
+                    status="pending" if earlier == "other_run" else earlier,
+                )
+            )
+            db.commit()
+    before = len(_pauses(channel))
 
     assert _stop(channel).outcome is ChannelStopOutcome.PAUSE_QUEUED
-    assert not _pauses(channel)
-    _environment.assert_not_called()
+    assert len(_pauses(channel)) == before + int(staged)
+    assert _environment.called is staged
 
 
 # --------------------------------------------------------------------------

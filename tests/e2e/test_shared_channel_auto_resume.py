@@ -403,7 +403,8 @@ async def test_channel_stop_while_scheduled_cancels_the_resume(shared_app, ingre
     )
     await asyncio.wait_for(ingress.bot._handle_control("sender", stop, "/stop"), 30)
 
-    # The /stop reply, then M1 told once that its run stopped.
+    # The /stop reply and M1's "stopped" reply, once each (their order is
+    # best effort: the recovery loop may deliver M1 first).
     assert _count(ingress.sent, "will not resume automatically") == 1
     assert _count(ingress.sent, INTERRUPTED_USER_MESSAGE) == 1
     (start,) = _starts(task_id)

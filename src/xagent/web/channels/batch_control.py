@@ -26,7 +26,19 @@ class StopReply(str, Enum):
     NOTHING = "nothing"  # "No active run to stop."
 
 
-def _selected_task_id(selected: object) -> int | None:
+def stop_reply_text(stop: StopReply, *, new_hint: str) -> str:
+    """The /stop reply; ``new_hint`` is how the bot names /new."""
+    return {
+        StopReply.CANCELLED: "Stopped. The interrupted run will not resume "
+        f"automatically. Send another message to continue here, or {new_hint} "
+        "for a fresh task.",
+        StopReply.STOPPED: "Stopped the current run. Send another message to "
+        f"continue here, or {new_hint} for a fresh task.",
+        StopReply.NOTHING: "No active run to stop.",
+    }[stop]
+
+
+def selected_task_id(selected: object) -> int | None:
     """The persisted task selection as a task id; ``None`` for none or a
     fresh conversation (``-1``)."""
     try:
@@ -102,13 +114,6 @@ class BatchChannelControl(Generic[_Key]):
             discard_output=False,
         )
 
-    def _has_live_conversation(self, user_id: _Key) -> bool:
-        return (
-            user_id in self.user_active_executions
-            or bool(self.user_message_queues.get(user_id))
-            or user_id in self.user_preparing_executions
-        )
-
     def _drop_pending_input(self, user_id: _Key) -> bool:
         """Drop queued input and stop a turn being prepared; leave accepted runs."""
         queued = self.user_message_queues.pop(user_id, None)
@@ -134,7 +139,9 @@ class BatchChannelControl(Generic[_Key]):
                     channel_id=self.channel_id,
                     external_user_id=external_user_id,
                     task_id=task_id,
-                    pause_awaited_run=not self._has_live_conversation(user_id),
+                    # Only a tracked turn is stopped in memory; queued or
+                    # preparing input is no turn of the awaited run.
+                    pause_awaited_run=user_id not in self.user_active_executions,
                 )
             except (ChannelAuthorizationError, ChannelConfigurationError):
                 result = None

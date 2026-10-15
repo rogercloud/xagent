@@ -12,7 +12,6 @@ from xagent.web.channels.feishu import bot as module
 from xagent.web.services.channel_input_acceptance import AcceptedChannelInput
 from xagent.web.services.channel_runtime import (
     ChannelAuthorizationError,
-    ChannelConfigurationError,
     SelectedChannelTask,
 )
 from xagent.web.services.channel_stop import ChannelStopOutcome, ChannelStopResult
@@ -61,7 +60,7 @@ def bot(monkeypatch, tmp_path):
     monkeypatch.setattr(
         batch_control,
         "stop_channel_task",
-        AsyncMock(return_value=ChannelStopResult(ChannelStopOutcome.ACTIVE, 45)),
+        AsyncMock(return_value=ChannelStopResult(ChannelStopOutcome.ACTIVE)),
     )
     monkeypatch.setattr(batch_control, "deliver_channel_result", AsyncMock())
     return instance
@@ -662,130 +661,61 @@ async def test_startup_filter_preserves_controls_but_allows_shared_retries(
 
 
 # --------------------------------------------------------------------------
-# /stop asks the database first (channel_stop)
+# /stop wiring (the outcome matrix: tests/web/test_channel_stop_control.py)
 # --------------------------------------------------------------------------
-
-STOPPED = "Stopped the current run. Send another message to continue here, or /new for a fresh task."
-NOTHING = "No active run to stop."
-CANCELLED = "Stopped. The interrupted run will not resume automatically. Send another message to continue here, or /new for a fresh task."
-
-
-def _retained_turn(bot):
-    turn = SharedChannelTurn(
-        SelectedChannelTask(5, 45, False, 7, "sender", None, 0), None
-    )
-    turn.request_stop = Mock(return_value=True)
-    bot.user_active_executions["sender"] = (45, turn)
-    return turn
-
-
-def _db_stop(monkeypatch, outcome=None, *, held=None, error=None):
-    stop = AsyncMock(
-        return_value=ChannelStopResult(outcome, 45, held),
-        side_effect=error,
-    )
-    monkeypatch.setattr(batch_control, "stop_channel_task", stop)
-    return stop
 
 
 @pytest.mark.asyncio
-async def test_stop_that_cancels_a_resume_replies_then_delivers_the_reply(
-    bot, monkeypatch
+@pytest.mark.parametrize(
+    ("outcome", "held", "reply"),
+    [
+        pytest.param(
+            ChannelStopOutcome.CANCELLED,
+            11,
+            "Stopped. The interrupted run will not resume automatically. Send "
+            "another message to continue here, or /new for a fresh task.",
+            id="cancelled",
+        ),
+        pytest.param(
+            ChannelStopOutcome.PAUSE_QUEUED,
+            None,
+            "Stopped the current run. Send another message to continue here, "
+            "or /new for a fresh task.",
+            id="pause_queued",
+        ),
+        pytest.param(
+            ChannelStopOutcome.IDLE, None, "No active run to stop.", id="idle"
+        ),
+    ],
+)
+@pytest.mark.parametrize("command", ["/stop", "/pause"])
+async def test_stop_replies_then_delivers_the_released_reply(
+    bot, monkeypatch, command, outcome, held, reply
 ):
-    turn = _retained_turn(bot)
-    bot.user_message_queues["sender"] = [message("queued")]
-    stop = _db_stop(monkeypatch, ChannelStopOutcome.CANCELLED, held=11)
+    stop = AsyncMock(return_value=ChannelStopResult(outcome, held))
+    monkeypatch.setattr(batch_control, "stop_channel_task", stop)
     events = []
     bot._send_text.side_effect = lambda chat, text: events.append(("reply", text))
     batch_control.deliver_channel_result.side_effect = lambda *args: events.append(
         ("deliver", args)
     )
 
-    await control(bot, "/stop")
+    await control(bot, command)
 
     stop.assert_awaited_once_with(
-        channel_id=7, external_user_id="sender", task_id=45, pause_awaited_run=False
+        channel_id=7, external_user_id="sender", task_id=45, pause_awaited_run=True
     )
-    # The retained turn's stop would queue a PAUSE the paused run ignores.
-    turn.request_stop.assert_not_called()
-    assert "sender" not in bot.user_message_queues
-    assert events == [
-        ("reply", CANCELLED),
-        ("deliver", (11, bot._deliver_shared_result)),
-    ]
+    assert events[0] == ("reply", reply)
+    assert events[1:] == (
+        [("deliver", (held, bot._deliver_shared_result))] if held else []
+    )
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("queued", [False, True])
-async def test_stop_with_nothing_running_says_so(bot, monkeypatch, queued):
-    turn = _retained_turn(bot)
-    if queued:
-        bot.user_message_queues["sender"] = [message("queued")]
-    _db_stop(monkeypatch, ChannelStopOutcome.IDLE)
-
-    await control(bot, "/stop")
-
-    turn.request_stop.assert_not_called()
-    assert "sender" not in bot.user_message_queues
-    assert bot._send_text.await_args.args[1] == (STOPPED if queued else NOTHING)
-    batch_control.deliver_channel_result.assert_not_awaited()
-
-
-@pytest.mark.asyncio
-async def test_stop_that_queued_a_pause_stops_the_conversation(bot, monkeypatch):
-    _db_stop(monkeypatch, ChannelStopOutcome.PAUSE_QUEUED)
-    stop_current = Mock(return_value=False)
-    bot._stop_current_conversation = stop_current
-
-    await control(bot, "/pause")
-
-    stop_current.assert_called_once_with("sender")
-    assert bot._send_text.await_args.args[1] == STOPPED
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("outcome", "error"),
-    [
-        pytest.param(ChannelStopOutcome.ACTIVE, None, id="active"),
-        pytest.param(ChannelStopOutcome.UNAVAILABLE, None, id="unavailable"),
-        pytest.param(None, RuntimeError("db down"), id="error"),
-        pytest.param(None, ChannelAuthorizationError("no"), id="unauthorized"),
-        pytest.param(None, ChannelConfigurationError("no"), id="unconfigured"),
-    ],
-)
-@pytest.mark.parametrize("retained", [False, True])
-async def test_stop_falls_back_to_the_in_memory_stop(
-    bot, monkeypatch, outcome, error, retained
-):
-    turn = _retained_turn(bot) if retained else None
-    stop = _db_stop(monkeypatch, outcome, error=error)
-
-    await control(bot, "/stop")
-
-    stop.assert_awaited_once()
-    assert stop.await_args.kwargs["pause_awaited_run"] is not retained
-    if turn is not None:
-        turn.request_stop.assert_called_once()
-    assert bot._send_text.await_args.args[1] == (STOPPED if retained else NOTHING)
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("case", ["not_shared", "new_conversation", "no_channel"])
-async def test_stop_without_a_shared_selected_task_skips_the_database(
-    bot, monkeypatch, case
-):
-    if case == "not_shared":
-        monkeypatch.setattr(
-            batch_control, "get_shared_task_execution_enabled", lambda: False
-        )
-    elif case == "new_conversation":
-        bot.active_tasks["sender"] = "-1"
-    else:
-        bot.channel_id = None
-        monkeypatch.setattr(module, "authorize_channel_sender", AsyncMock())
+async def test_stop_in_a_new_conversation_skips_the_database(bot):
+    bot.active_tasks["sender"] = "-1"
 
     await control(bot, "/stop")
 
     batch_control.stop_channel_task.assert_not_awaited()
-    assert bot._send_text.await_args.args[1] == NOTHING
+    assert bot._send_text.await_args.args[1] == "No active run to stop."

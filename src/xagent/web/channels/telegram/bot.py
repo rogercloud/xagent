@@ -104,7 +104,11 @@ from ...services.uploaded_file_store import (
     compensate_staged_uploaded_files,
     stage_uploaded_file_from_local_path,
 )
-from ..batch_control import BatchChannelControl, StopReply, _selected_task_id
+from ..batch_control import (
+    BatchChannelControl,
+    selected_task_id,
+    stop_reply_text,
+)
 from .handler import TelegramTraceHandler
 from .utils import (
     CancelledDelivery,
@@ -631,15 +635,9 @@ class TelegramBotInstance(BatchChannelControl[int]):
         stop, held = await self._handle_stop_request(
             user_id,
             external_user_id=str(user_id),
-            task_id=_selected_task_id(self.active_tasks.get(user_id)),
+            task_id=selected_task_id(self.active_tasks.get(user_id)),
         )
-        await message.answer(
-            {
-                StopReply.CANCELLED: "Stopped. The interrupted run will not resume automatically. Send another message to continue here, or use /new for a fresh task.",
-                StopReply.STOPPED: "Stopped the current run. Send another message to continue here, or use /new for a fresh task.",
-                StopReply.NOTHING: "No active run to stop.",
-            }[stop]
-        )
+        await message.answer(stop_reply_text(stop, new_hint="use /new"))
         await self._deliver_released_reply(held)
 
     def _switch_lock_for_user(self, user_id: int) -> asyncio.Lock:
