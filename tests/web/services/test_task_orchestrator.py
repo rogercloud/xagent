@@ -4538,6 +4538,26 @@ async def test_shutdown_cancel_settles_preview_task(db_session, monkeypatch) -> 
 
 
 @pytest.mark.asyncio
+async def test_shutdown_cancel_does_not_retain_a_row_another_writer_settled(
+    db_session, monkeypatch
+) -> None:
+    """A row that already left RUNNING (a pause that landed while the host was
+    going down) is not left under the cancelled run's lease."""
+    user, task, payload, lease = _shutdown_handoff_fixture(
+        db_session, monkeypatch, turn_id="turn-shutdown-already-paused"
+    )
+    task.status = TaskStatus.PAUSED
+    db_session.commit()
+
+    await _run_cancelled_turn(task, user, payload, lease)
+
+    stored = _stored_task(db_session, int(task.id))
+    assert stored.status == TaskStatus.PAUSED
+    assert stored.runner_id is None
+    assert stored.lease_attempt_id is None
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("switch", [None, "false"])
 async def test_shutdown_cancel_settles_when_switch_off(
     db_session, monkeypatch, switch
