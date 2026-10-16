@@ -3968,6 +3968,70 @@ describe("useWebSocket normalized connections", () => {
         expect(hook.result.current.connectionPhase).toBe("lost")
       })
 
+      it.each([
+        ["a transport error", (socket: MockWebSocket) => socket.triggerError()],
+        ["an abnormal closure", (socket: MockWebSocket) => socket.triggerClose(1006)],
+        ["a handshake timeout", () => vi.advanceTimersByTime(10_000)],
+      ] as const)("gives a first connection lost to %s another try", (_name, fail) => {
+        const hook = mountChat()
+        act(() => {
+          fail(socketAt(0))
+        })
+        advance(60_000)
+        expect(MockWebSocket.instances).toHaveLength(1)
+        expect(hook.result.current.connectionPhase).toBe("lost")
+
+        act(() => window.dispatchEvent(new Event("online")))
+
+        expect(MockWebSocket.instances).toHaveLength(2)
+        expect(hook.result.current.connectionPhase).toBe("reconnecting")
+        act(() => socketAt(1).open())
+        expect(hook.result.current.connectionPhase).toBe("connected")
+
+        // Once opened, the key gets the ordinary back-off.
+        act(() => socketAt(1).triggerClose(1006))
+        expectReconnectAfter(1_000)
+      })
+
+      it("keeps a first connection lost again until the next event", () => {
+        const hook = mountChat()
+        act(() => socketAt(0).triggerError())
+
+        act(() => setVisibility("visible"))
+        act(() => socketAt(1).triggerError())
+        advance(60_000)
+
+        expect(MockWebSocket.instances).toHaveLength(2)
+        expect(hook.result.current.connectionPhase).toBe("lost")
+        act(() => setVisibility("visible"))
+        expect(MockWebSocket.instances).toHaveLength(3)
+      })
+
+      it.each([
+        ["closed normally", (socket: MockWebSocket) => socket.triggerClose(1000, "")],
+        ["was denied access", (socket: MockWebSocket) => socket.triggerClose(4003, "Access denied")],
+      ] as const)("does not retry a first connection that %s", (_name, close) => {
+        const hook = mountChat()
+        act(() => close(socketAt(0)))
+
+        act(() => setVisibility("visible"))
+        act(() => window.dispatchEvent(new Event("online")))
+
+        expect(MockWebSocket.instances).toHaveLength(1)
+        expect(hook.result.current.connectionPhase).toBe("lost")
+      })
+
+      it("does not retry after the caller disconnected", () => {
+        const hook = mountChat()
+        act(() => socketAt(0).triggerError())
+        act(() => hook.result.current.disconnect())
+
+        act(() => window.dispatchEvent(new Event("online")))
+
+        expect(MockWebSocket.instances).toHaveLength(1)
+        expect(hook.result.current.connectionPhase).toBe("idle")
+      })
+
       it("replaces a connection whose dead timer a background tab held back", () => {
         mountChat()
         act(() => socketAt(0).open())

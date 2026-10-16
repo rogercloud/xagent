@@ -538,6 +538,10 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
   const loginGenerationRef = useRef(0)
   const loginPrincipalRef = useRef<WebSocketConnection | null>(normalizedConnection)
   const lifecycleEndedRef = useRef(false)
+  // The cycle ended on a first connection that failed in transit. The back-off
+  // does not retry it, but the page becoming visible or the network coming
+  // back does.
+  const unopenedLossRef = useRef(false)
   const stoppedByCallerRef = useRef(false)
   const autoConnectRef = useRef(autoConnect)
   const connectRef = useRef<() => void>(() => undefined)
@@ -621,6 +625,7 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
   const invalidateLifecycle = useCallback(() => {
     lifecycleEpochRef.current++
     lifecycleEndedRef.current = false
+    unopenedLossRef.current = false
     clearRetryTimers()
   }, [clearRetryTimers])
 
@@ -796,9 +801,12 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
 
   // Only a key that opened during this mount is retried, never a first connection.
   const scheduleReconnect = useCallback((owner: SocketOwner) => {
-    if (!openedKeysRef.current.has(owner.connectionKey)) return
     if (isSessionConnection(owner.connection) || !owner.connection.taskId) return
     if (!canApplyRetiredOwnerPolicy(owner)) return
+    if (!openedKeysRef.current.has(owner.connectionKey)) {
+      unopenedLossRef.current = true
+      return
+    }
     const attempt = ++reconnectAttemptsRef.current
     scheduleRetry(
       () => connectRef.current(),
@@ -850,8 +858,9 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
   }, [isCurrentOwner, retireDeadOwner, withPhaseSync])
 
   // A page that becomes visible again or a network that comes back online
-  // retries once now instead of waiting out a back-off of up to five minutes.
-  // A failure continues the back-off where it was.
+  // retries once now instead of waiting out a back-off of up to five minutes,
+  // and gives a first connection that failed in transit another try. A
+  // failure continues the back-off where it was.
   const retryNow = useCallback(() => {
     if (!mountedRef.current) return
     const owner = socketOwnerRef.current
@@ -876,6 +885,14 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
       clearTimeout(timer)
       retry.fire()
       return
+    }
+    if (
+      unopenedLossRef.current
+      && lifecycleEndedRef.current
+      && !stoppedByCallerRef.current
+      && !socketOwnerRef.current
+    ) {
+      connectRef.current()
     }
   }, [retireDeadOwner])
 
@@ -1023,6 +1040,7 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
     }
 
     isConnectingRef.current = true
+    unopenedLossRef.current = false
     try {
       // Test if the URL is valid before creating WebSocket
       if (!connection.url.startsWith('ws://') && !connection.url.startsWith('wss://')) {
