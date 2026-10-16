@@ -799,7 +799,9 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
     retryTimersRef.current.set(timer, { lifecycleEpoch, attemptEpoch, fire })
   }, [isCurrentLifecycle, syncPhase])
 
-  // Only a key that opened during this mount is retried, never a first connection.
+  // Only a key that opened during this mount is retried on a timer. A first
+  // connection that failed in transit is only recorded, so that the page
+  // becoming visible or the network coming back can try it again.
   const scheduleReconnect = useCallback((owner: SocketOwner) => {
     if (isSessionConnection(owner.connection) || !owner.connection.taskId) return
     if (!canApplyRetiredOwnerPolicy(owner)) return
