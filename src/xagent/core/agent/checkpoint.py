@@ -301,7 +301,14 @@ def checkpoint_tool_call_in_flight(checkpoint: dict[str, Any] | None) -> bool:
 
     A ReAct state's pending calls are planned after ``after_llm`` and started
     after ``before_tool``/``before_tool_batch``; nothing in the state itself
-    tells the two apart, so the checkpoint label does. The label belongs to
+    tells the two apart, so the checkpoint label does. Control tools are the
+    exception: a control segment (``send_message`` and the other
+    ``kind == "control"`` calls) runs with no checkpoint before it, so while
+    one is being handled the latest checkpoint is still ``after_llm`` (or the
+    previous ``after_tool``) and this returns False. A run stopped after a
+    ``send_message`` was delivered but before its status checkpoint is
+    therefore resumed and delivers the message again; that window is short,
+    and closing it needs a checkpoint before the control segment. The label belongs to
     whichever state wrote the checkpoint: the only ReAct state outside a DAG
     (Auto nests one), or the DAG step named by ``metadata.active_step_id``.
     Another DAG step that still lists pending calls ran concurrently and its

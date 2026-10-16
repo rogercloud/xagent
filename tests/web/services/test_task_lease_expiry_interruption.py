@@ -1753,3 +1753,20 @@ def test_record_time_limits_stop_a_continued_episode(
         recorded = _record_again(db, task, reason=reason)
         assert recorded.state == "exhausted"
         assert recorded.next_attempt_at is None
+
+
+@pytest.mark.parametrize("case", ["superseded", "expired"])
+def test_tool_in_flight_only_holds_a_resume_that_would_be_scheduled(factory, case):
+    # A verdict that already stops automatic resume keeps its own state.
+    task_id, _ = _scheduled_trigger_task(
+        factory,
+        later_run=case == "superseded",
+        snapshot_fields=_react_snapshot("before_tool", pending=True),
+    )
+    if case == "expired":
+        _lapse(factory, task_id, ago=86_400 + 60)
+
+    assert _recover() == 1
+
+    _, row, _ = _state(factory, task_id)
+    assert (row.state, row.state_detail) == (case, None)

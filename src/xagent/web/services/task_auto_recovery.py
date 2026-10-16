@@ -288,8 +288,9 @@ def record_interruption_no_commit(
     It rests in ``manual`` instead, with ``state_detail`` saying why, when
     automatic resume is switched off (``auto_resume_disabled``) and when the
     supersede check fails (``supersede_check_failed``; the row is still
-    written), and when ``tool_call_in_flight`` says resuming would repeat a
-    tool call that may already have run (``tool_in_flight``). A reason
+    written). A row that would be ``scheduled`` rests in ``manual`` with
+    ``tool_in_flight`` when ``tool_call_in_flight`` says resuming would repeat
+    a tool call that may already have run; the other verdicts stand. A reason
     without a policy (a user pause, an unknown input outcome) stays plain
     ``manual``.
     """
@@ -369,9 +370,7 @@ def record_interruption_no_commit(
         else None
     )
     if plannable and state is TaskAutoRecoveryState.MANUAL:
-        if tool_call_in_flight:
-            state_detail = TOOL_IN_FLIGHT_DETAIL
-        elif not enabled:
+        if not enabled:
             state_detail = AUTO_RESUME_DISABLED_DETAIL
         elif superseded is None:
             state_detail = SUPERSEDE_CHECK_FAILED_DETAIL
@@ -392,7 +391,15 @@ def record_interruption_no_commit(
                 rng=task_auto_resume._AUTO_RESUME_RNG,
             )
             state = auto_resume_recovery_state(verdict.outcome)
-            row.next_attempt_at = verdict.next_attempt_at
+            if state is TaskAutoRecoveryState.SCHEDULED and tool_call_in_flight:
+                # Only a resume that would actually be dispatched is held;
+                # every other verdict already stops automatic resume.
+                state, state_detail = (
+                    TaskAutoRecoveryState.MANUAL,
+                    TOOL_IN_FLIGHT_DETAIL,
+                )
+            else:
+                row.next_attempt_at = verdict.next_attempt_at
         row.state = state.value
         row.state_detail = state_detail
 
