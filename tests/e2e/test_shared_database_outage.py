@@ -191,14 +191,14 @@ def test_connection_lost_mid_checkpoint_pauses_and_resumes(pg_shared_app):
     assert hits >= 2
 
 
-def test_sdk_task_connection_lost_mid_checkpoint_fails(pg_shared_app):
-    """An SDK caller only polls the status: its run fails, never pauses."""
+def test_sdk_task_connection_lost_mid_checkpoint_resumes(pg_shared_app):
+    """An SDK run pauses on the lost write like any other and is resumed."""
     from xagent.core.agent.checkpoint import CHECKPOINT_EVENT_TYPE
 
     app = pg_shared_app
     checkpoint = str(CHECKPOINT_EVENT_TYPE)
     _execute(*_DROP_CONNECTION_ON_CHECKPOINT)
-    task_id, run_id, _headers = create_sdk_task(app, "e2e:gate")
+    task_id, run_id, headers = create_sdk_task(app, "e2e:gate")
     wait_for(lambda: (app.root / "model-entered").exists(), app, "model call")
     _execute(
         "INSERT INTO e2e_write_fault (task_id, event_type)"
@@ -208,24 +208,21 @@ def test_sdk_task_connection_lost_mid_checkpoint_fails(pg_shared_app):
     )
     _release_model(app)
 
-    settled = app.wait_task(
-        task_id, status="failed", run_id=run_id, timeout=SETTLE_TIMEOUT
-    )
-    assert "CheckpointPersistenceError" in (settled["error"] or ""), settled
-    assert len(model_calls(app)) == 1
+    settled = app.wait_task(task_id, run_id=run_id, timeout=SETTLE_TIMEOUT)
+    assert ANSWER in (settled["output"] or "")
+    assert len(model_calls(app)) == 2
     row, events = recovery_state(task_id)
     assert row is not None
-    assert (row["state"], row["state_detail"], row["reason"]) == (
-        "manual",
-        None,
+    assert (row["reason"], row["run_id"], row["total_resumes"]) == (
         "persistence_failure",
+        run_id,
+        1,
     )
-    assert events == ["interrupted"]
-    assert auto_resume_commands(task_id) == []
-    # Fired exactly once: is_called tells one nextval() from none.
-    assert _execute("SELECT last_value, is_called FROM e2e_write_fault_hits") == [
-        (1, True)
-    ]
+    assert events == ONE_RESUME
+    assert len(auto_resume_commands(task_id)) == 1
+    response = app.client.get(f"/v1/chat/tasks/{task_id}", headers=headers)
+    assert response.status_code == 200, response.text
+    assert response.json()["status"] == "completed", response.json()
 
 
 # --------------------------------------------------------------------------
