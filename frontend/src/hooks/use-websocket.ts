@@ -24,9 +24,63 @@ interface RecentMessage {
 // The server's HEARTBEAT_INTERVAL_SECONDS fits into it twice, and widget.js
 // SESSION_STABLE_CONNECTION_MS is twice this value.
 export const DEAD_AFTER_MS = 30_000
-const RECONNECT_DELAYS_MS = [1000, 2000, 4000, 8000, 15000]
+
+// Reconnects never give up: a release restarts the backend for minutes, and a
+// page left open across it must come back without a refresh. The delay grows
+// by 1.5x from one second to a five-minute cap, so a page notices the end of
+// an outage within about half the outage's length.
+export const RECONNECT_BASE_DELAY_MS = 1_000
+export const RECONNECT_MAX_DELAY_MS = 300_000
+const RECONNECT_BACKOFF_FACTOR = 1.5
 const RECONNECT_JITTER = 0.2
-const MAX_RECONNECT_ATTEMPTS = RECONNECT_DELAYS_MS.length
+
+// `attempt` is 1-based; `random` is a value in [0, 1). Whole milliseconds.
+export const reconnectDelayMs = (attempt: number, random: number): number => {
+  const step = Math.max(0, attempt - 1)
+  const nominal = Math.min(
+    RECONNECT_MAX_DELAY_MS,
+    RECONNECT_BASE_DELAY_MS * RECONNECT_BACKOFF_FACTOR ** step,
+  )
+  return Math.round(nominal * (1 - RECONNECT_JITTER + 2 * RECONNECT_JITTER * random))
+}
+
+// A server that is draining closes with 1012 (Service Restart) or with this
+// reason, asking the client to come back on another instance.
+export const RECONNECT_CLOSE_REASON = "reconnect"
+
+// Closes that a new connection would only repeat: protocol and policy errors.
+const PERMANENT_CLOSE_CODES = new Set([1002, 1003, 1007, 1008, 1010, 1015])
+// Application codes (4000-4999) are permanent unless listed here. 4008 is the
+// public chat's connection rate limit, which the back-off itself respects.
+const RETRYABLE_APPLICATION_CLOSE_CODES = new Set([4008])
+
+export type CloseDisposition =
+  // The other side meant to close (1000); nothing to recover.
+  | "intentional"
+  // 4001: refresh the access token, then connect again.
+  | "reauthenticate"
+  // Access denied, task unavailable, protocol or policy errors.
+  | "permanent"
+  // Abnormal closure (1006), server restart (1001, 1011-1014) and the rest.
+  | "retry"
+
+export const classifyClose = (
+  event: Pick<CloseEvent, "code" | "reason">,
+): CloseDisposition => {
+  if (event.code === 1000) {
+    return event.reason === RECONNECT_CLOSE_REASON ? "retry" : "intentional"
+  }
+  if (event.code === 4001) return "reauthenticate"
+  if (PERMANENT_CLOSE_CODES.has(event.code)) return "permanent"
+  if (
+    event.code >= 4000
+    && event.code <= 4999
+    && !RETRYABLE_APPLICATION_CLOSE_CODES.has(event.code)
+  ) {
+    return "permanent"
+  }
+  return "retry"
+}
 
 export type ConnectionPhase = "idle" | "connecting" | "connected" | "reconnecting" | "lost"
 
@@ -338,6 +392,8 @@ interface OwnerRetirementOptions {
 interface ScheduledRetry {
   lifecycleEpoch: number
   attemptEpoch: number
+  // Runs the retry now; the caller has already cleared the timer.
+  fire: () => void
 }
 
 export interface UseWebSocketOptions {
@@ -724,7 +780,7 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
     lifecycleEpoch: number,
     attemptEpoch: number,
   ) => {
-    const timer = setTimeout(() => {
+    const fire = () => {
       retryTimersRef.current.delete(timer)
       syncPhase() // even a stale timer changed the facts by removing itself
       if (
@@ -733,8 +789,9 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
       ) return
       callback()
       syncPhase()
-    }, delay)
-    retryTimersRef.current.set(timer, { lifecycleEpoch, attemptEpoch })
+    }
+    const timer = setTimeout(fire, delay)
+    retryTimersRef.current.set(timer, { lifecycleEpoch, attemptEpoch, fire })
   }, [isCurrentLifecycle, syncPhase])
 
   // Only a key that opened during this mount is retried, never a first connection.
@@ -742,12 +799,10 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
     if (!openedKeysRef.current.has(owner.connectionKey)) return
     if (isSessionConnection(owner.connection) || !owner.connection.taskId) return
     if (!canApplyRetiredOwnerPolicy(owner)) return
-    if (reconnectAttemptsRef.current >= MAX_RECONNECT_ATTEMPTS) return
     const attempt = ++reconnectAttemptsRef.current
-    const jitter = 1 - RECONNECT_JITTER + 2 * RECONNECT_JITTER * Math.random()
     scheduleRetry(
       () => connectRef.current(),
-      RECONNECT_DELAYS_MS[attempt - 1] * jitter,
+      reconnectDelayMs(attempt, Math.random()),
       owner.lifecycleEpoch,
       owner.attemptEpoch,
     )
@@ -793,6 +848,50 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
     }
     arm(DEAD_AFTER_MS)
   }, [isCurrentOwner, retireDeadOwner, withPhaseSync])
+
+  // A page that becomes visible again or a network that comes back online
+  // retries once now instead of waiting out a back-off of up to five minutes.
+  // A failure continues the back-off where it was.
+  const retryNow = useCallback(() => {
+    if (!mountedRef.current) return
+    const owner = socketOwnerRef.current
+    if (owner) {
+      // Background tabs throttle timers, so the dead timer may not have fired.
+      const lastFrameAt = owner.lastFrameAt ?? owner.openedAt
+      if (
+        !owner.heartbeatEnabled
+        || lastFrameAt === null
+        || Date.now() - lastFrameAt < DEAD_AFTER_MS
+      ) return
+      retireDeadOwner(owner, "WebSocket connection stopped delivering frames.")
+      if (socketOwnerRef.current) return
+    }
+    const lifecycleEpoch = lifecycleEpochRef.current
+    const attemptEpoch = attemptEpochRef.current
+    for (const [timer, retry] of retryTimersRef.current) {
+      if (
+        retry.lifecycleEpoch !== lifecycleEpoch
+        || retry.attemptEpoch !== attemptEpoch
+      ) continue
+      clearTimeout(timer)
+      retry.fire()
+      return
+    }
+  }, [retireDeadOwner])
+
+  useEffect(() => {
+    if (typeof window === "undefined") return
+    const onVisibilityChange = withPhaseSync(() => {
+      if (document.visibilityState === "visible") retryNow()
+    })
+    const onOnline = withPhaseSync(retryNow)
+    document.addEventListener("visibilitychange", onVisibilityChange)
+    window.addEventListener("online", onOnline)
+    return () => {
+      document.removeEventListener("visibilitychange", onVisibilityChange)
+      window.removeEventListener("online", onOnline)
+    }
+  }, [retryNow, withPhaseSync])
 
   useIsomorphicLayoutEffect(() => {
     mountedRef.current = true
@@ -1044,8 +1143,8 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
         notifyDisconnect(owner)
         if (!canApplyRetiredOwnerPolicy(owner)) return
 
-        // Handle authentication errors (4001 = Authentication required)
-        if (event.code === 4001) {
+        const disposition = classifyClose(event)
+        if (disposition === "reauthenticate") {
           if (owner.connection.credentialOwner.kind !== "auth-context") {
             reportPermanentFailure(owner, new Error("Authentication failed"))
             return
@@ -1103,16 +1202,20 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
           return
         }
 
-        if (event.code === 4003) {
-          reportPermanentFailure(owner, new Error(event.reason || "Access denied"))
+        if (disposition === "permanent") {
+          reportPermanentFailure(
+            owner,
+            new Error(
+              event.reason
+              || (event.code === 4003
+                ? "Access denied"
+                : `WebSocket closed with code ${event.code}`),
+            ),
+          )
           return
         }
 
-        // A clean close is intentional. Every other code, including an
-        // abnormal closure (1006), is a lost connection.
-        if (event.code === 1000) {
-          return
-        }
+        if (disposition === "intentional") return
 
         scheduleReconnect(owner)
       })
@@ -1143,7 +1246,7 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
         owner.lastFrameAt = receivedAt
         owner.framesReceived += 1
         owner.firstFrameAt ??= receivedAt
-        // Traffic spanning a full dead window earns a fresh reconnect budget.
+        // Traffic spanning a full dead window restarts the back-off.
         if (owner.heartbeatEnabled && receivedAt - owner.firstFrameAt >= DEAD_AFTER_MS) {
           reconnectAttemptsRef.current = 0
         }
@@ -1865,7 +1968,7 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
     const connectionKey = connectionRef.current
       ? connectionKeyFor(connectionRef.current)
       : null
-    // The budget belongs to the key: a same-key credential refresh keeps it.
+    // The back-off belongs to the key: a same-key credential refresh keeps it.
     if (connectionKey !== lastConnectionKeyRef.current) {
       reconnectAttemptsRef.current = 0
       lastConnectionKeyRef.current = connectionKey
@@ -1874,9 +1977,8 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
       if (
         connectionKey !== null
         && openedKeysRef.current.has(connectionKey)
-        && reconnectAttemptsRef.current < MAX_RECONNECT_ATTEMPTS
       ) {
-        // Replacing a connection on an opened key spends one slot.
+        // Replacing a connection on an opened key counts as one attempt.
         reconnectAttemptsRef.current++
       }
       connect()
