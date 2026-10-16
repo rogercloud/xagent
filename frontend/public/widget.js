@@ -4,11 +4,23 @@
   var host = new URL(scriptTag.src).origin;
 
   var SESSION_TIMEOUT_MS = 5000;          // constants appendix #16
+  // Transport failures (a rejected fetch, a timed-out attempt, an uncoded 5xx)
+  // are retried without a limit, so a widget left open across a backend
+  // restart recovers instead of ending in a terminal state. The delay grows by
+  // 1.5x from one second to a five-minute cap with +/-20% jitter, the same
+  // back-off as the chat page's WebSocket (use-websocket reconnectDelayMs).
+  // Retrying past the server's 30 s idempotency window is safe: an attempt
+  // that never reached the server is simply served, and one that did gets a
+  // final verdict (grant_already_used, reconnect_invalid) rather than a
+  // second session. Known error codes stay final; rate limits keep their own
+  // small budget.
   var SESSION_RETRY_POLICY = {
-    maxAttempts: 4,
     maxRateLimitRetries: 2,
-    retryDelays: [1000, 2000, 4000],
-    deadlineMs: 30000
+    maxRateLimitWaitMs: 30000,
+    baseDelayMs: 1000,
+    backoffFactor: 1.5,
+    maxDelayMs: 300000,
+    jitter: 0.2
   };
   var SESSION_RETRY_AFTER_FALLBACK_MS = 1000;
   var SESSION_REFRESH_THRESHOLD_MS = 60000;
@@ -47,23 +59,58 @@
     return new DOMException('session request superseded', 'AbortError');
   }
 
-  function sessionDelay(ms, signal) {
+  // A wake cuts every subscribed delay short, e.g. when the page becomes
+  // visible again or the network comes back.
+  function createSessionWake() {
+    var waiters = [];
+    return {
+      subscribe: function (callback) {
+        waiters.push(callback);
+        return function () {
+          var index = waiters.indexOf(callback);
+          if (index !== -1) waiters.splice(index, 1);
+        };
+      },
+      fire: function () {
+        var current = waiters;
+        waiters = [];
+        current.forEach(function (callback) { callback(); });
+      }
+    };
+  }
+
+  function sessionDelay(ms, signal, wake) {
     return new Promise(function (resolve, reject) {
       if (signal.aborted) {
         reject(sessionAbortError());
         return;
       }
-      var timer = setTimeout(function () {
-        signal.removeEventListener('abort', onAbort);
-        resolve();
-      }, ms);
-      function onAbort() {
+      var unsubscribe = wake ? wake.subscribe(finish) : null;
+      var timer = setTimeout(finish, ms);
+      function cleanup() {
         clearTimeout(timer);
         signal.removeEventListener('abort', onAbort);
+        if (unsubscribe) unsubscribe();
+      }
+      function finish() {
+        cleanup();
+        resolve();
+      }
+      function onAbort() {
+        cleanup();
         reject(sessionAbortError());
       }
       signal.addEventListener('abort', onAbort, { once: true });
     });
+  }
+
+  // `attempt` is 1-based; `random` is a value in [0, 1). Whole milliseconds.
+  function sessionRetryDelayMs(policy, attempt, random) {
+    var nominal = Math.min(
+      policy.maxDelayMs,
+      policy.baseDelayMs * Math.pow(policy.backoffFactor, Math.max(0, attempt - 1))
+    );
+    return Math.round(nominal * (1 - policy.jitter + 2 * policy.jitter * random));
   }
 
   function isPlainSessionErrorObject(value) {
@@ -121,81 +168,52 @@
 
   function createRetryLineage() {
     return {
-      startedAt: Date.now(),
-      attempts: 0,
       transportRetries: 0,
-      rateLimited: 0,
-      lastRetryCode: 'network_unavailable'
+      rateLimited: 0
     };
   }
 
-  function exhaustedRetryResult(code) {
-    return {
-      ok: false,
-      status: 0,
-      data: null,
-      syntheticCode: code || 'network_unavailable'
-    };
-  }
-
-  // Every request counts against the supplied total-attempt and absolute-deadline
-  // lineage. Exchange owns its lineage at controller scope so bfcache can
-  // replace a network operation without minting a new grant budget.
-  function withRetry(makeRequest, policy, signal, onRetry, lineage) {
+  // The lineage carries the back-off position and the rate-limit budget across
+  // operations. Exchange owns its lineage at controller scope so bfcache can
+  // replace a network operation without restarting the back-off.
+  function withRetry(makeRequest, policy, signal, onRetry, lineage, wake) {
     var retry = lineage || createRetryLineage();
 
-    function remainingMs() {
-      return Math.max(0, policy.deadlineMs - (Date.now() - retry.startedAt));
-    }
-
-    function giveUp(result, error, code) {
-      if (error) throw error;
-      return result || exhaustedRetryResult(code || retry.lastRetryCode);
-    }
-
-    function retryAfter(wait, result, error, code) {
-      retry.lastRetryCode = code;
-      if (retry.attempts >= policy.maxAttempts || wait >= remainingMs()) {
-        return giveUp(result, error, code);
-      }
+    function retryAfter(wait, code, retryWake) {
       if (onRetry) onRetry(code);
-      return sessionDelay(wait, signal).then(run);
+      return sessionDelay(wait, signal, retryWake).then(run);
     }
 
-    function retryTransportOrGiveUp(result, error) {
-      if (retry.transportRetries >= policy.retryDelays.length) {
-        return giveUp(result, error, 'network_unavailable');
-      }
-      var wait = policy.retryDelays[retry.transportRetries];
+    // Never gives up. A wake runs the next attempt at once; if it fails, the
+    // back-off continues where it was.
+    function retryTransport() {
       retry.transportRetries += 1;
-      return retryAfter(wait, result, error, 'network_unavailable');
+      var wait = sessionRetryDelayMs(policy, retry.transportRetries, Math.random());
+      return retryAfter(wait, 'network_unavailable', wake);
     }
 
     function run() {
       if (signal.aborted) return Promise.reject(sessionAbortError());
-      if (retry.attempts >= policy.maxAttempts) {
-        return Promise.resolve(exhaustedRetryResult(retry.lastRetryCode));
-      }
-      var requestTimeoutMs = Math.min(SESSION_TIMEOUT_MS, remainingMs());
-      if (requestTimeoutMs <= 0) {
-        return Promise.resolve(exhaustedRetryResult(retry.lastRetryCode));
-      }
-      retry.attempts += 1;
-      return makeRequest(requestTimeoutMs).then(function (result) {
+      return makeRequest(SESSION_TIMEOUT_MS).then(function (result) {
         if (signal.aborted) throw sessionAbortError();
         var code = sessionErrorEnvelope(result).code;
         if (code === 'rate_limited') {
-          if (retry.rateLimited >= policy.maxRateLimitRetries) return result;
+          var wait = retryAfterMs(result);
+          if (retry.rateLimited >= policy.maxRateLimitRetries ||
+              wait >= policy.maxRateLimitWaitMs) {
+            return result;
+          }
           retry.rateLimited += 1;
-          return retryAfter(retryAfterMs(result), result, null, 'rate_limited');
+          // The server asked for this wait; a wake does not shorten it.
+          return retryAfter(wait, 'rate_limited', null);
         }
         if (!isKnownSessionErrorCode(code) && result.status >= 500) {
-          return retryTransportOrGiveUp(result, null);
+          return retryTransport();
         }
         return result;
       }, function (error) {
         if (signal.aborted) throw error;
-        return retryTransportOrGiveUp(null, error);
+        return retryTransport();
       });
     }
 
@@ -1159,7 +1177,8 @@
       awaitedDeliveryId: null,
       invalidatedDeliveryId: null,
       stableDeliveryId: null,
-      stabilityTimer: null
+      stabilityTimer: null,
+      wake: createSessionWake()
     };
 
     function attach(iframe) {
@@ -1168,6 +1187,8 @@
       window.addEventListener('message', onMessage);
       window.addEventListener('pageshow', onPageShow);
       window.addEventListener('pagehide', onPageHide);
+      window.addEventListener('online', onOnline);
+      document.addEventListener('visibilitychange', onVisibilityChange);
       state.observer = new MutationObserver(onDomMutation);
       // documentElement, not body: see panelRemovalObserver's identical
       // reasoning above -- a full <body> replacement never mutates the old
@@ -1222,10 +1243,23 @@
       window.removeEventListener('message', onMessage);
       window.removeEventListener('pageshow', onPageShow);
       window.removeEventListener('pagehide', onPageHide);
+      window.removeEventListener('online', onOnline);
+      document.removeEventListener('visibilitychange', onVisibilityChange);
       if (state.observer) state.observer.disconnect();
       state.observer = null;
       state.iframe = null;
       state.ready = false;
+    }
+
+    // A page that becomes visible again or a network that comes back online
+    // retries a waiting transport failure now instead of waiting out a
+    // back-off of up to five minutes.
+    function onOnline() {
+      state.wake.fire();
+    }
+
+    function onVisibilityChange() {
+      if (document.visibilityState === 'visible') state.wake.fire();
     }
 
     // Capture exactly which operations the browser freezes. A later pageshow
@@ -1438,11 +1472,9 @@
     }
 
     function classifySessionFailure(result) {
-      var syntheticCode = ownSessionErrorString(result, 'syntheticCode');
-      if (syntheticCode) return { code: syntheticCode, reason: null };
       var envelope = sessionErrorEnvelope(result);
       if (isKnownSessionErrorCode(envelope.code)) return envelope;
-      if (result.status >= 500) return { code: 'network_unavailable', reason: null };
+      // An uncoded 5xx never gets here: withRetry keeps retrying it.
       return { code: 'unexpected_error', reason: null };
     }
 
@@ -1504,7 +1536,7 @@
         return res.json().catch(function (error) {
           // A complete non-JSON response is a protocol error handled from its
           // HTTP status. Body-stream failures and aborts remain transport
-          // failures so withRetry can apply the bounded retry policy.
+          // failures so withRetry can apply the transport back-off.
           if (error && error.name === 'SyntaxError') return null;
           throw error;
         }).then(function (data) {
@@ -1569,7 +1601,7 @@
         return postJson(url, body, timeoutMs, signal);
       }, SESSION_RETRY_POLICY, signal, function (code) {
         if (!signal.aborted) recordRetry(code);
-      }, retryLineage);
+      }, retryLineage, state.wake);
     }
 
     function exchange() {
