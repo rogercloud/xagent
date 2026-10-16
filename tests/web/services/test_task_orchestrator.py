@@ -4467,7 +4467,9 @@ async def test_user_cancel_during_shutdown_still_settles(
 async def test_shutdown_cancel_settles_sources_auto_recovery_excludes(
     db_session, monkeypatch, source
 ) -> None:
-    """Callers that own their stop protocol still get a terminal state now."""
+    """Callers that own their stop protocol, and SDK callers that only read
+    the status (automatic recovery would resume an SDK task after a crash),
+    still get a terminal state now."""
     user, task, payload, lease = _shutdown_handoff_fixture(
         db_session,
         monkeypatch,

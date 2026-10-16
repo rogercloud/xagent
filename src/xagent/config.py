@@ -569,8 +569,9 @@ def get_shutdown_handoff_enabled() -> bool:
     is eligible for automatic recovery keeps its lease instead: lease
     recovery pauses it once the lease expires and automatic resume picks it
     up, exactly as after a crash. Only takes effect while
-    :func:`get_task_auto_resume_enabled` is on. Channel tasks and the
-    sources automatic recovery excludes still fail immediately.
+    :func:`get_task_auto_resume_enabled` is on. Channel tasks, status-only
+    (SDK) tasks and the sources automatic recovery excludes still fail
+    immediately.
 
     Priority:
         1. XAGENT_SHUTDOWN_HANDOFF_ENABLED environment variable
