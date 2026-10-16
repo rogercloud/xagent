@@ -323,7 +323,7 @@ jobs:
       # validating those outputs must not be skippable by them.
       - name: Run CI contract tests
         shell: bash
-        run: python3 -m uv run python -m pytest tests/test_ci_summary_contract.py -q
+        run: python3 -m uv run python -m pytest tests/test_ci_summary_contract.py tests/test_e2e_ci_shards_contract.py -q
 
   pytest-fast:
     name: Pytest Fast (${{ matrix.name }})
