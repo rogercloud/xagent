@@ -2185,6 +2185,78 @@ describe("widget session mode", () => {
   })
 
   it.each([
+    ["a timed-out attempt", "timeout", 10_000],
+    ["an uncoded 504", "504", 10_000],
+    ["an uncoded 502", "502", 57_665],
+  ] as const)("waits for the next attempt after %s late in an outage", async (_case, failure, nextDelay) => {
+    vi.useFakeTimers()
+    // Ten refused connections push the back-off to 38.4 s; the eleventh
+    // attempt fails as `failure` at 113.3 s.
+    fetchMock.mockImplementation((_url: string, init: RequestInit) => {
+      const call = fetchMock.mock.calls.length
+      if (call <= 10 || call > 11) return Promise.reject(new TypeError("Failed to fetch"))
+      if (failure === "504") return Promise.resolve(new Response("<html>gateway timeout</html>", { status: 504 }))
+      if (failure === "502") return Promise.resolve(new Response("<html>bad gateway</html>", { status: 502 }))
+      return new Promise<Response>((_resolve, reject) => {
+        ;(init.signal as AbortSignal).addEventListener(
+          "abort",
+          () => reject(new DOMException("aborted", "AbortError")),
+          { once: true },
+        )
+      })
+    })
+    runWidget({ "data-encrypted-context": GRANT })
+    await vi.advanceTimersByTimeAsync(113_331)
+    expect(fetchMock).toHaveBeenCalledTimes(11)
+    if (failure === "timeout") await vi.advanceTimersByTimeAsync(5_000)
+
+    await vi.advanceTimersByTimeAsync(nextDelay - 1)
+    expect(fetchMock).toHaveBeenCalledTimes(11)
+    await vi.advanceTimersByTimeAsync(1)
+    expect(fetchMock).toHaveBeenCalledTimes(12)
+
+    // A refused connection afterwards resumes the long back-off.
+    await vi.advanceTimersByTimeAsync(86_497)
+    expect(fetchMock).toHaveBeenCalledTimes(12)
+    await vi.advanceTimersByTimeAsync(1)
+    expect(fetchMock).toHaveBeenCalledTimes(13)
+  })
+
+  it("points at CSP and CORS once when fetches keep being rejected", async () => {
+    vi.useFakeTimers()
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => undefined)
+    fetchMock.mockRejectedValue(new TypeError("Failed to fetch"))
+    runWidget({ "data-encrypted-context": GRANT })
+
+    // Attempts at 0, 1, 2.5, 4.75, 8.125 and 13.188 s; the sixth is the first
+    // to fail after five retries.
+    await vi.advanceTimersByTimeAsync(13_187)
+    expect(warnSpy).not.toHaveBeenCalledWith(expect.stringContaining("Content-Security-Policy"))
+    await vi.advanceTimersByTimeAsync(1)
+    const hint = `Xagent Widget: session requests keep failing before reaching ${HOST}; `
+      + "if the backend is up, check that the page's Content-Security-Policy connect-src "
+      + "and CORS allow it [network_unavailable]."
+    expect(warnSpy).toHaveBeenCalledWith(hint)
+
+    await vi.advanceTimersByTimeAsync(120_000)
+    expect(warnSpy.mock.calls.filter(([message]) => message === hint)).toHaveLength(1)
+  })
+
+  it("does not point at CSP and CORS for server errors", async () => {
+    vi.useFakeTimers()
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => undefined)
+    fetchMock.mockImplementation(() => Promise.resolve(
+      new Response("<html>bad gateway</html>", { status: 502 }),
+    ))
+    runWidget({ "data-encrypted-context": GRANT })
+
+    await vi.advanceTimersByTimeAsync(120_000)
+
+    expect(warnSpy).toHaveBeenCalled()
+    expect(warnSpy).not.toHaveBeenCalledWith(expect.stringContaining("Content-Security-Policy"))
+  })
+
+  it.each([
     ["the page becomes visible", () => {
       Object.defineProperty(document, "visibilityState", { configurable: true, value: "visible" })
       document.dispatchEvent(new Event("visibilitychange"))

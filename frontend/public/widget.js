@@ -12,15 +12,22 @@
   // Retrying past the server's 30 s idempotency window is safe: an attempt
   // that never reached the server is simply served, and one that did gets a
   // final verdict (grant_already_used, reconnect_invalid) rather than a
-  // second session. Known error codes stay final; rate limits keep their own
-  // small budget.
+  // second session. The exception is an attempt that may have reached a live
+  // server without its answer reaching us -- one that timed out, or a 504: the
+  // next attempt then waits at most maxDelayAfterTimeoutMs, so that 5 s
+  // timeout + wait + 5 s request stays inside the window and can still replay
+  // the answer. Known error codes stay final; rate limits keep their own small
+  // budget.
   var SESSION_RETRY_POLICY = {
     maxRateLimitRetries: 2,
     maxRateLimitWaitMs: 30000,
     baseDelayMs: 1000,
     backoffFactor: 1.5,
     maxDelayMs: 300000,
-    jitter: 0.2
+    maxDelayAfterTimeoutMs: 10000,
+    jitter: 0.2,
+    // After this many transport retries, a rejected fetch logs the CSP/CORS hint.
+    unreachableHintAfter: 5
   };
   var SESSION_RETRY_AFTER_FALLBACK_MS = 1000;
   var SESSION_REFRESH_THRESHOLD_MS = 60000;
@@ -169,7 +176,8 @@
   function createRetryLineage() {
     return {
       transportRetries: 0,
-      rateLimited: 0
+      rateLimited: 0,
+      unreachableHintLogged: false
     };
   }
 
@@ -186,10 +194,26 @@
 
     // Never gives up. A wake runs the next attempt at once; if it fails, the
     // back-off continues where it was.
-    function retryTransport() {
+    function retryTransport(mayHaveReachedServer) {
       retry.transportRetries += 1;
       var wait = sessionRetryDelayMs(policy, retry.transportRetries, Math.random());
+      if (mayHaveReachedServer) wait = Math.min(wait, policy.maxDelayAfterTimeoutMs);
       return retryAfter(wait, 'network_unavailable', wake);
+    }
+
+    // A fetch the browser rejects outright looks the same whether the backend
+    // is down or the host page blocks the request (CSP connect-src, CORS),
+    // and only the first goes away on its own. Say so once per lineage.
+    function noteRejectedFetch(error) {
+      if (!error || error.name !== 'TypeError' || retry.unreachableHintLogged) return;
+      if (retry.transportRetries < policy.unreachableHintAfter) return;
+      retry.unreachableHintLogged = true;
+      logSession(
+        'warn',
+        'session requests keep failing before reaching ' + host +
+          '; if the backend is up, check that the page\'s Content-Security-Policy connect-src and CORS allow it',
+        'network_unavailable'
+      );
     }
 
     function run() {
@@ -208,12 +232,14 @@
           return retryAfter(wait, 'rate_limited', null);
         }
         if (!isKnownSessionErrorCode(code) && result.status >= 500) {
-          return retryTransport();
+          return retryTransport(result.status === 504);
         }
         return result;
       }, function (error) {
         if (signal.aborted) throw error;
-        return retryTransport();
+        noteRejectedFetch(error);
+        // The operation signal is live, so an AbortError is the request timeout.
+        return retryTransport(Boolean(error) && error.name === 'AbortError');
       });
     }
 
@@ -1474,7 +1500,7 @@
     function classifySessionFailure(result) {
       var envelope = sessionErrorEnvelope(result);
       if (isKnownSessionErrorCode(envelope.code)) return envelope;
-      // An uncoded 5xx never gets here: withRetry keeps retrying it.
+      // A 5xx without a known code never gets here: withRetry keeps retrying it.
       return { code: 'unexpected_error', reason: null };
     }
 
