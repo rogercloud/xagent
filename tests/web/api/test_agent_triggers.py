@@ -617,7 +617,8 @@ def test_mark_trigger_run_started_keeps_a_run_the_task_already_settled() -> None
         trigger = (
             db.query(AgentTrigger).filter(AgentTrigger.id == start.trigger_id).one()
         )
-        trigger.last_error = "boom"
+        # An earlier run's start failure: this run's start succeeded.
+        trigger.last_error = "TaskTurnError: earlier run"
         db.commit()
     finally:
         db.close()
@@ -634,7 +635,7 @@ def test_mark_trigger_run_started_keeps_a_run_the_task_already_settled() -> None
         assert run.error_message == "boom"
         assert run.finished_at is not None
         assert trigger.last_run_at is not None
-        assert trigger.last_error == "boom"
+        assert trigger.last_error is None
     finally:
         db.close()
 

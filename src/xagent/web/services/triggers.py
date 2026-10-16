@@ -1807,7 +1807,7 @@ def _mark_trigger_run_started(start: _PreparedTriggerStart) -> None:
         # and settle this run before this thread gets here. Never move a
         # settled run back to running: it would keep its finished_at and stay
         # "running" for good, since the run is settled only once.
-        result = db.execute(
+        db.execute(
             update(TriggerRun)
             .where(TriggerRun.id == start.run_id)
             .where(
@@ -1822,9 +1822,10 @@ def _mark_trigger_run_started(start: _PreparedTriggerStart) -> None:
             )
             .execution_options(synchronize_session=False)
         )
+        # The start succeeded either way. last_error records start failures
+        # only (_mark_run_failed), so whatever it holds is an earlier run's.
         setattr(trigger, "last_run_at", started_at)
-        if _rowcount(result) == 1:
-            setattr(trigger, "last_error", None)
+        setattr(trigger, "last_error", None)
         db.add(trigger)
         db.commit()
     finally:
