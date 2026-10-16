@@ -16,7 +16,7 @@ def _selected(paths: str) -> set[str]:
             ignored.add(arg.removeprefix("--ignore="))
         elif (ROOT / arg).is_dir():
             selected.update(
-                p.relative_to(ROOT).as_posix() for p in (ROOT / arg).glob("test_*.py")
+                p.relative_to(ROOT).as_posix() for p in (ROOT / arg).rglob("test_*.py")
             )
         else:
             selected.add(arg)
@@ -28,7 +28,7 @@ def test_every_e2e_file_is_in_exactly_one_shard():
     shards = workflow["jobs"]["e2e"]["strategy"]["matrix"]["include"]
     counts = Counter(path for shard in shards for path in _selected(shard["paths"]))
     files = {
-        p.relative_to(ROOT).as_posix() for p in (ROOT / "tests/e2e").glob("test_*.py")
+        p.relative_to(ROOT).as_posix() for p in (ROOT / "tests/e2e").rglob("test_*.py")
     }
     assert set(counts) == files
     assert {path: n for path, n in counts.items() if n != 1} == {}
