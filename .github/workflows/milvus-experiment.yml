@@ -1,0 +1,82 @@
+name: Milvus CI experiment
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [codex/optimize-milvus-ci]
+
+permissions:
+  contents: read
+
+jobs:
+  benchmark:
+    name: Milvus experiment (${{ matrix.arm }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        arm: [serial, a, b]
+    env:
+      MILVUS_URI: http://localhost:19530
+      XAGENT_REQUIRE_MILVUS: "1"
+      DEEPDOC_CACHE_PATH: .cache/deepdoc
+      DEEPDOC_MODEL_HOME: ${{ github.workspace }}/.cache/deepdoc
+      DEEPDOC_NLTK_DATA_DIR: ${{ github.workspace }}/.cache/deepdoc/nltk_data
+      DEEPDOC_TIKTOKEN_CACHE_DIR: ${{ github.workspace }}/.cache/deepdoc/tiktoken_cache
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Start Milvus standalone
+        shell: bash
+        run: |
+          set -e
+          touch .env
+          trap 'rm -f .env' EXIT
+          printf 'services:\n  milvus:\n    ports:\n      - "19530:19530"\n' > "$RUNNER_TEMP/milvus-ports.yml"
+          export COMPOSE_FILE="docker-compose.yml:docker/docker-compose.milvus.yml:$RUNNER_TEMP/milvus-ports.yml"
+          echo "COMPOSE_FILE=$COMPOSE_FILE" >> "$GITHUB_ENV"
+          docker compose config --images milvus | xargs .github/scripts/docker-pull-retry.sh
+          docker compose up -d --wait --wait-timeout 300 milvus
+
+      - name: Install the same test environment
+        shell: bash
+        run: |
+          set -e
+          if ! command -v uv >/dev/null 2>&1; then
+            python3 -m pip install --user uv
+          fi
+          python3 -m uv venv --python 3.12
+          python3 -m uv sync --extra milvus
+
+      - name: Run Milvus tests with matching coverage instrumentation
+        shell: bash
+        env:
+          BENCHMARK_ARM: ${{ matrix.arm }}
+        run: |
+          set -e
+          mkdir -p "$RUNNER_TEMP/milvus-benchmark"
+          PYTHONPATH="$GITHUB_WORKSPACE/.github/scripts" python3 -m uv run python -m pytest \
+            tests/core/tools/core/RAG_tools tests/web/api/test_kb_milvus_rollback.py tests/web_integration \
+            -m milvus -v --durations=0 \
+            -p milvus_benchmark --milvus-benchmark-arm="$BENCHMARK_ARM" \
+            --milvus-benchmark-output="$RUNNER_TEMP/milvus-benchmark" \
+            --junitxml="$RUNNER_TEMP/milvus-benchmark/$BENCHMARK_ARM-junit.xml" \
+            --cov=src/xagent --cov-branch \
+            --cov-report="json:$RUNNER_TEMP/milvus-benchmark/$BENCHMARK_ARM-coverage.json"
+
+      - name: Upload test manifests, outcomes and branch coverage
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: milvus-experiment-${{ matrix.arm }}
+          path: ${{ runner.temp }}/milvus-benchmark/
+          if-no-files-found: error
+
+      - name: Show Milvus logs
+        if: failure()
+        shell: bash
+        run: |
+          touch .env
+          docker compose logs --tail 200 milvus-etcd milvus-minio milvus
