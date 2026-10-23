@@ -89,7 +89,7 @@ prove that every ReAct/DAG crash window is already recoverable by a new reader.
 | `protocol_event_id` | Existing runtime/outbound protocol identity | Preserve on real-time and historical conversion; distinct from event UUID |
 | `turn_id` | Accepted user-turn occurrence | Link acceptance/application/current input; do not deduplicate by text |
 | `assistant_message_id` | One assistant tool-call batch | Group calls before contiguous tool results |
-| `tool_attempt_id` | One execution attempt | Pair start/result, reject blind re-execution of unknown effects |
+| `tool_attempt_id` | One execution attempt | Pair start/result, reject blind re-execution of unknown effects. A resumed tool interaction's settlement pair (`settlement_delivery`) keeps the original attempt and batch, is written by the resuming run, and supersedes the attempt's result; its start is not another call |
 | `run_id`, snapshot execution ID, `scope_id` | Different lifecycle partitions | Validate together; do not substitute one for another |
 | `TaskChatMessage.id` | Legacy transcript row coordinate | Remains legacy; never cast to sequence |
 | `TaskInteractionRequest.resume_event_id` | Protocol identity of recovery anchor | B can resolve `payload.protocol_event_id` with task/run/execution checks; current reader still uses Trace PK |
