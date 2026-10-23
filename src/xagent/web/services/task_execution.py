@@ -3517,29 +3517,37 @@ async def execute_resume_background(
             )
 
     async def record_accepted_delivery() -> None:
-        """Record a durably accepted turn whose resume did not proceed."""
+        """Record a durably accepted turn whose resume did not proceed.
+
+        The marker and its notice finish before a cancellation that arrives
+        meanwhile propagates; see ``fail_deferred_delivery``.
+        """
         nonlocal delivery_accepted_unrecorded
         if not delivery_accepted_unrecorded:
             return
         delivery_accepted_unrecorded = False
-        if delivery_turn_id is not None:
-            try:
-                await run_db_io_cancellation_safe(
-                    lambda: mark_user_message_delivery_sync(
+
+        async def record() -> None:
+            if delivery_turn_id is not None:
+                try:
+                    await run_db_io_cancellation_safe(
+                        lambda: mark_user_message_delivery_sync(
+                            task_id,
+                            delivery_turn_id,
+                            DELIVERY_DISPATCHED,
+                        )
+                    )
+                except Exception:
+                    logger.warning(
+                        "delivery marker failed after an interrupted accepted "
+                        "deferred message for task %s turn %s",
                         task_id,
                         delivery_turn_id,
-                        DELIVERY_DISPATCHED,
+                        exc_info=True,
                     )
-                )
-            except Exception:
-                logger.warning(
-                    "delivery marker failed after an interrupted accepted "
-                    "deferred message for task %s turn %s",
-                    task_id,
-                    delivery_turn_id,
-                    exc_info=True,
-                )
-        await notify_deferred_delivery(True)
+            await notify_deferred_delivery(True)
+
+        await drain_async_task_cancellation_safe(asyncio.create_task(record()))
 
     async def mark_deferred_delivery_failed() -> bool:
         """Persist a failed delivery without amplifying pool exhaustion."""
@@ -3570,6 +3578,21 @@ async def execute_resume_background(
                 exc_info=True,
             )
             return False
+
+    async def fail_deferred_delivery(message: str | None = None, **notice: Any) -> None:
+        """Persist a failed or unknown delivery, then tell the client.
+
+        A canceller may cancel again while the write commits: cancel_task's
+        bounded wait does when the write outlasts it. Once the outcome is
+        durable the client must still hear it, so the write and its notice
+        finish before that cancellation propagates.
+        """
+
+        async def settle() -> None:
+            if await mark_deferred_delivery_failed():
+                await notify_deferred_delivery(False, message, **notice)
+
+        await drain_async_task_cancellation_safe(asyncio.create_task(settle()))
 
     try:
         preacquired_resources = (
@@ -4259,8 +4282,7 @@ async def execute_resume_background(
         )
     except TaskLeaseLostError:
         if delivery_outcome_unknown:
-            if await mark_deferred_delivery_failed():
-                await notify_deferred_delivery(False)
+            await fail_deferred_delivery()
         await record_accepted_delivery()
         defer_db_cleanup_to_ttl_recovery = lease is not None and not lease_released
         logger.warning(
@@ -4273,14 +4295,12 @@ async def execute_resume_background(
         logger.info(f"V2 resume background task {task_id} cancelled")
         await record_accepted_delivery()
         if delivery_turn_id is not None and not delivery_was_dispatched:
-            if await mark_deferred_delivery_failed():
-                await notify_deferred_delivery(
-                    False,
-                    client_error_message(ClientErrorCode.MESSAGE_DELIVERY_FAILED),
-                    error_code=ClientErrorCode.MESSAGE_DELIVERY_FAILED,
-                    retry_with_new_id=True,
-                    rejection_outcome="not_accepted",
-                )
+            await fail_deferred_delivery(
+                client_error_message(ClientErrorCode.MESSAGE_DELIVERY_FAILED),
+                error_code=ClientErrorCode.MESSAGE_DELIVERY_FAILED,
+                retry_with_new_id=True,
+                rejection_outcome="not_accepted",
+            )
         raise
     except Exception as e:
         error_message = str(e)
@@ -4322,8 +4342,7 @@ async def execute_resume_background(
             )
             return
         elif delivery_outcome_unknown:
-            if await mark_deferred_delivery_failed():
-                await notify_deferred_delivery(False)
+            await fail_deferred_delivery()
         elif isinstance(e, _DeferredInjectionRejectedRetryableError):
             # Nothing was written for this message, so it is never failed or
             # resumed for. A fence left by an earlier uncertain input keeps the
@@ -4347,14 +4366,12 @@ async def execute_resume_background(
                 e.fenced,
             )
             if delivery_turn_id is not None and not delivery_was_dispatched:
-                if await mark_deferred_delivery_failed():
-                    await notify_deferred_delivery(
-                        False,
-                        client_error_message(ClientErrorCode.MESSAGE_DELIVERY_FAILED),
-                        error_code=ClientErrorCode.MESSAGE_DELIVERY_FAILED,
-                        retry_with_new_id=True,
-                        rejection_outcome="not_accepted",
-                    )
+                await fail_deferred_delivery(
+                    client_error_message(ClientErrorCode.MESSAGE_DELIVERY_FAILED),
+                    error_code=ClientErrorCode.MESSAGE_DELIVERY_FAILED,
+                    retry_with_new_id=True,
+                    rejection_outcome="not_accepted",
+                )
         elif (
             isinstance(e, (CheckpointUnavailableError, CheckpointAccessRefusedError))
             and lease is not None
@@ -4382,14 +4399,12 @@ async def execute_resume_background(
                 exc_info=True,
             )
             if delivery_turn_id is not None and not delivery_was_dispatched:
-                if await mark_deferred_delivery_failed():
-                    await notify_deferred_delivery(
-                        False,
-                        client_error_message(ClientErrorCode.MESSAGE_DELIVERY_FAILED),
-                        error_code=ClientErrorCode.MESSAGE_DELIVERY_FAILED,
-                        retry_with_new_id=True,
-                        rejection_outcome="not_accepted",
-                    )
+                await fail_deferred_delivery(
+                    client_error_message(ClientErrorCode.MESSAGE_DELIVERY_FAILED),
+                    error_code=ClientErrorCode.MESSAGE_DELIVERY_FAILED,
+                    retry_with_new_id=True,
+                    rejection_outcome="not_accepted",
+                )
         else:
             logger.error(
                 "V2 resume background task %s failed: %s",
@@ -4409,13 +4424,11 @@ async def execute_resume_background(
                 fallback=CLIENT_SAFE_TASK_FAILURE,
             )
             if delivery_turn_id is not None and not delivery_was_dispatched:
-                if await mark_deferred_delivery_failed():
-                    await notify_deferred_delivery(
-                        False,
-                        CLIENT_SAFE_VALIDATION_ERROR,
-                        retry_with_new_id=True,
-                        rejection_outcome="not_accepted",
-                    )
+                await fail_deferred_delivery(
+                    CLIENT_SAFE_VALIDATION_ERROR,
+                    retry_with_new_id=True,
+                    rejection_outcome="not_accepted",
+                )
             current_snapshot = None
             if (
                 lease is None

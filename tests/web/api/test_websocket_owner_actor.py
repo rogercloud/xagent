@@ -13,6 +13,7 @@ import asyncio
 import logging
 import re
 import threading
+import time
 from collections.abc import Callable
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
@@ -6524,13 +6525,16 @@ async def test_deferred_not_accepted_real_runner_is_never_failed_or_resumed(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("slow_outcome_write", [False, True], ids=["fast", "slow"])
 @pytest.mark.parametrize("canceller", ["a2a", "external", "internal"])
 async def test_explicit_cancel_wins_over_uncertain_deferred_injection(
-    db_session, canceller
+    db_session, canceller, slow_outcome_write
 ) -> None:
     """An explicit stop fails the task; only a non-explicit cancel pauses it.
 
-    Either way the uncertain delivery stays outcome_unknown.
+    Either way the uncertain delivery stays outcome_unknown, and the client
+    hears it even when the write outlasts cancel_task's wait, which then
+    cancels the resume again.
     """
     from xagent.web.models.agent import Agent
     from xagent.web.services.a2a_task_cancel import cancel_a2a_task
@@ -6558,9 +6562,21 @@ async def test_explicit_cancel_wins_over_uncertain_deferred_injection(
         resume_execution_by_id=AsyncMock(),
     )
     notify = AsyncMock()
+    mark = task_execution_service.mark_user_message_delivery_sync
+
+    def mark_delivery(task_id, turn_id, status, *args, **kwargs):
+        if slow_outcome_write and status == DELIVERY_OUTCOME_UNKNOWN:
+            time.sleep(1.0)
+        return mark(task_id, turn_id, status, *args, **kwargs)
+
     manager = task_execution_service.BackgroundTaskManager()
     try:
-        with patch.object(task_execution_service, "background_task_manager", manager):
+        with (
+            patch.object(task_execution_service, "background_task_manager", manager),
+            patch.object(
+                task_execution_service, "mark_user_message_delivery_sync", mark_delivery
+            ),
+        ):
             assert (
                 manager.try_reserve_resume(
                     int(task.id), expected_run_id=task_execution_service.ANY_RESUME_RUN
