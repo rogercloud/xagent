@@ -1,15 +1,18 @@
 from __future__ import annotations
 
+import json
+from dataclasses import replace
+
 import pytest
 
 from tests.core.agent.test_react import FakeLLM, SettlementApprovalTool
 from tests.web.services.test_task_execution_event_writer import (
     canonical as canonical_fixture,
 )
+from tests.web.services.test_task_execution_event_writer import engine as engine_fixture
 from tests.web.services.test_task_execution_event_writer import (
-    engine as engine_fixture,
+    facts,
 )
-from tests.web.services.test_task_execution_event_writer import facts
 from tests.web.services.test_task_execution_event_writer import (
     task_id as task_id_fixture,
 )
@@ -17,131 +20,162 @@ from xagent.core.agent import ExecutionContext, ReActPattern
 from xagent.core.agent.checkpoint import TraceCheckpointStore
 from xagent.core.agent.runtime import PatternRuntime
 from xagent.core.tools.user_interaction import ToolInteractionSettlement
+from xagent.web.models.task import Task, TaskStatus
 from xagent.web.services.task_event_context_service import load_task_event_context
 from xagent.web.services.task_event_display import load_event_display_snapshot
+from xagent.web.services.task_lease_service import (
+    acquire_task_lease,
+    bind_task_lease_context,
+)
 from xagent.web.tracing import ExecutionEventTraceAdapter, create_task_tracer
 
 canonical = canonical_fixture
 engine = engine_fixture
 task_id = task_id_fixture
 
+WAITING = {"success": False, "status": "waiting_for_user"}
+
 
 def _tool_call(call_id: str, name: str, arguments: str) -> dict:
     return {"id": call_id, "function": {"name": name, "arguments": arguments}}
 
 
-@pytest.mark.asyncio
-async def test_resumed_tool_interaction_settlement_is_readable_on_next_turn(
-    canonical,
-):
-    """A V2 task must read its history after a tool interaction settles."""
-
-    factory, task_id = canonical
+def _runtime(task_id: int) -> PatternRuntime:
     tracer = create_task_tracer(task_id)
     tracer.handlers = [
         h for h in tracer.handlers if isinstance(h, ExecutionEventTraceAdapter)
     ]
-    runtime = PatternRuntime(tracer=TraceCheckpointStore(tracer))
+    return PatternRuntime(tracer=TraceCheckpointStore(tracer))
+
+
+def _new_run(factory, task_id):
+    """Claim the next run of the task, as a resume after a pause does."""
+    with factory() as db:
+        task = db.get(Task, task_id)
+        if task.status == TaskStatus.RUNNING:
+            task.status = TaskStatus.WAITING_FOR_USER
+            db.commit()
+        lease = acquire_task_lease(db, task_id, new_run=True)
+    assert lease is not None
+    return lease
+
+
+def _settlement_facts(rows):
+    return [
+        row
+        for row in rows
+        if row.kind.startswith("tool_execution_")
+        and row.payload["data"].get("settlement_delivery") is True
+    ]
+
+
+@pytest.mark.parametrize(
+    "settlement",
+    [
+        ToolInteractionSettlement.succeeded(
+            {"success": True, "post_urn": "urn:li:share:123"}
+        ),
+        ToolInteractionSettlement.rejected(error="The user declined to publish."),
+    ],
+    ids=["succeeded", "rejected"],
+)
+@pytest.mark.asyncio
+async def test_resumed_tool_interaction_settlement_is_readable_on_next_turn(
+    canonical, settlement
+):
+    """A V2 task must read its history after a tool interaction settles."""
+
+    factory, task_id = canonical
     context = ExecutionContext(system_prompt="Publish")
     context.add_user_message("Publish the post.", metadata={"turn_id": "turn-1"})
     pattern = ReActPattern(max_iterations=3)
-    waiting = await pattern.run(
-        context=context,
-        tools=[SettlementApprovalTool()],
-        llm=FakeLLM(
-            [
-                {
-                    "tool_calls": [
-                        _tool_call(
-                            "publish-call", "approval_gate", '{"expression":"go"}'
-                        )
-                    ]
-                }
-            ]
-        ),
-        runtime=runtime,
-    )
+    with bind_task_lease_context(_new_run(factory, task_id)):
+        waiting = await pattern.run(
+            context=context,
+            tools=[SettlementApprovalTool()],
+            llm=FakeLLM(
+                [
+                    {
+                        "tool_calls": [
+                            _tool_call(
+                                "publish-call", "approval_gate", '{"expression":"go"}'
+                            )
+                        ]
+                    }
+                ]
+            ),
+            runtime=_runtime(task_id),
+        )
     assert waiting["status"] == "waiting_for_user"
 
+    # The resume rebuilds the pattern from its checkpointed state.
+    resumed_pattern = ReActPattern(max_iterations=3)
+    resumed_pattern.load_state(json.loads(json.dumps(pattern.get_state())))
     context.add_user_message("Approve", metadata={"turn_id": "turn-2"})
-    resumed = await pattern.run(
-        context=context,
-        tools=[
-            SettlementApprovalTool(
-                resume_result=ToolInteractionSettlement.succeeded(
-                    {"success": True, "post_urn": "urn:li:share:123"}
-                )
-            )
-        ],
-        llm=FakeLLM(
-            [
-                {
-                    "tool_calls": [
-                        _tool_call(
-                            "final-call",
-                            "final_answer",
-                            '{"response_language":"English",'
-                            '"answer":"Published.","outcome":"completed"}',
-                        )
-                    ]
-                }
-            ]
-        ),
-        runtime=runtime,
-    )
+    with bind_task_lease_context(_new_run(factory, task_id)):
+        resumed = await resumed_pattern.run(
+            context=context,
+            tools=[SettlementApprovalTool(resume_result=settlement)],
+            llm=FakeLLM(
+                [
+                    {
+                        "tool_calls": [
+                            _tool_call(
+                                "final-call",
+                                "final_answer",
+                                '{"response_language":"English",'
+                                '"answer":"Done.","outcome":"completed"}',
+                            )
+                        ]
+                    }
+                ]
+            ),
+            runtime=_runtime(task_id),
+        )
     assert resumed["success"] is True
 
     with factory() as db:
-        settlement = [
+        rows = facts(db, task_id)
+        settled = _settlement_facts(rows)
+        original = [
             row
-            for row in facts(db, task_id)
-            if row.kind.startswith("tool_execution_")
-            and row.payload["data"].get("settlement_delivery") is True
+            for row in rows
+            if row.kind.startswith("tool_execution_") and row not in settled
         ]
-        # The settlement pair is committed under the original attempt.
-        assert [row.kind for row in settlement] == [
+        # The settlement pair belongs to the original attempt, from a later run.
+        assert [row.kind for row in settled] == [
             "tool_execution_start",
-            "tool_execution_end",
+            "tool_execution_end"
+            if settlement.status == "succeeded"
+            else "tool_execution_failed",
         ]
-        original = next(
-            row
-            for row in facts(db, task_id)
-            if row.kind == "tool_execution_start" and row not in settlement
+        assert {row.tool_attempt_id for row in settled} == {original[0].tool_attempt_id}
+        assert {row.assistant_message_id for row in settled} == {
+            original[0].assistant_message_id
+        }
+        assert {row.run_id for row in settled}.isdisjoint(
+            {row.run_id for row in original}
         )
-        assert {row.tool_attempt_id for row in settlement} == {
-            original.tool_attempt_id
-        }
-        assert {row.assistant_message_id for row in settlement} == {
-            original.assistant_message_id
-        }
         # The next turn sees one call whose observation is the settled result.
         loaded = load_task_event_context(db, task_id)
         calls = [m for m in loaded.messages if m.get("tool_calls")]
         assert [c["id"] for m in calls for c in m["tool_calls"]] == ["publish-call"]
         [observation] = [m for m in loaded.messages if m["role"] == "tool"]
-        assert observation["raw_result"]["post_urn"] == "urn:li:share:123"
+        assert observation["raw_result"] == settled[-1].payload["data"]["result"]
+        assert observation["raw_result"] != WAITING
         load_event_display_snapshot(db, task_id)
 
 
-@pytest.mark.asyncio
-async def test_settlement_trace_replay_is_idempotent(canonical):
-    """A settlement trace replayed after its facts committed adds none."""
-
-    factory, task_id = canonical
-    tracer = create_task_tracer(task_id)
-    tracer.handlers = [
-        h for h in tracer.handlers if isinstance(h, ExecutionEventTraceAdapter)
-    ]
-    runtime = PatternRuntime(tracer=TraceCheckpointStore(tracer))
-    pattern = ReActPattern()
+async def _waiting_call(factory, task_id, pattern):
+    """Commit a waiting tool attempt in its own run; return its ledger row."""
     [call] = pattern._normalize_tool_calls(
         [{"id": "gate-call", "function": {"name": "approval_gate", "arguments": "{}"}}]
     )
     call.update(tool_attempt_id="attempt-1", assistant_message_id="batch-1")
-    await runtime.on_tool_start(tool_call=call)
-    await runtime.on_tool_end(
-        tool_call=call, result={"success": False, "status": "waiting_for_user"}
-    )
+    with bind_task_lease_context(_new_run(factory, task_id)):
+        runtime = _runtime(task_id)
+        await runtime.on_tool_start(tool_call=call)
+        await runtime.on_tool_end(tool_call=call, result=WAITING)
     pattern._record_tool_call(
         call,
         status="completed",
@@ -150,21 +184,59 @@ async def test_settlement_trace_replay_is_idempotent(canonical):
         settlement_trace_pending=True,
     )
     [record] = pattern.tool_ledger.values()
-    for _ in range(2):
-        await pattern._trace_tool_interaction_settlement(
-            record=record,
-            status="succeeded",
-            result={"success": True},
-            error=None,
-            runtime=runtime,
-        )
+    return record
+
+
+async def _trace_settlement(pattern, record, task_id):
+    await pattern._trace_tool_interaction_settlement(
+        record=record,
+        status="succeeded",
+        result={"success": True},
+        error=None,
+        runtime=_runtime(task_id),
+    )
+
+
+@pytest.mark.asyncio
+async def test_settlement_replay_from_a_later_run_is_idempotent(canonical):
+    """A replay after a lost commit ack, in another run, adds no facts."""
+
+    factory, task_id = canonical
+    pattern = ReActPattern()
+    record = await _waiting_call(factory, task_id, pattern)
+    with bind_task_lease_context(_new_run(factory, task_id)):
+        await _trace_settlement(pattern, record, task_id)
     with factory() as db:
-        rows = facts(db, task_id)
-    assert [row.kind for row in rows] == [
-        "tool_execution_start",
-        "tool_execution_end",
-        "tool_execution_start",
-        "tool_execution_end",
-    ]
-    assert {row.tool_attempt_id for row in rows} == {"attempt-1"}
-    assert not pattern.tool_ledger[next(iter(pattern.tool_ledger))].settlement_trace_pending
+        committed = [row.event_id for row in facts(db, task_id)]
+    assert len(committed) == 4
+
+    # The ack was lost: the ledger still owes the settlement trace.
+    pattern.tool_ledger[pattern._ledger_key(record)] = record
+    with bind_task_lease_context(_new_run(factory, task_id)):
+        await _trace_settlement(pattern, record, task_id)
+    with factory() as db:
+        assert [row.event_id for row in facts(db, task_id)] == committed
+    assert not pattern.tool_ledger[pattern._ledger_key(record)].settlement_trace_pending
+
+
+@pytest.mark.asyncio
+async def test_settlement_from_a_ledger_without_identity_stays_unreadable(
+    canonical,
+):
+    """Ledgers checkpointed before the identity was kept fail closed."""
+
+    factory, task_id = canonical
+    pattern = ReActPattern()
+    record = replace(
+        await _waiting_call(factory, task_id, pattern),
+        tool_attempt_id=None,
+        assistant_message_id=None,
+    )
+    with bind_task_lease_context(_new_run(factory, task_id)):
+        await _trace_settlement(pattern, record, task_id)
+    with factory() as db:
+        assert {
+            row.tool_attempt_id for row in _settlement_facts(facts(db, task_id))
+        } == {None}
+        with pytest.raises(ValueError, match="no attempt/batch identity"):
+            load_task_event_context(db, task_id)

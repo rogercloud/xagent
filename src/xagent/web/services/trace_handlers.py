@@ -1094,7 +1094,7 @@ class DatabaseTraceHandler(BaseTraceHandler):
                 attempt = data.get("tool_attempt_id")
                 # A resumed interaction settles the original attempt in a later
                 # run. Its pair gets its own identity under that attempt.
-                settlement = bool(attempt) and data.get("settlement_delivery") is True
+                settlement = data.get("settlement_delivery") is True
                 fact_type = (
                     f"settlement:{event_type_str}" if settlement else event_type_str
                 )

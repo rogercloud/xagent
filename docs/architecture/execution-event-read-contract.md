@@ -385,6 +385,11 @@ sanitization, formatting and model token-compaction pipeline instead of the old
 240-character Trace preview. No tool is invoked to reconstruct history. A start
 without an outcome is explicitly unknown, including its external effect; this
 model observation does not relax B's refusal to resume an unknown effect.
+A resumed tool interaction's settlement pair carries the original attempt and
+batch: its start declares nothing new, and its outcome, committed by the
+resuming run, replaces the attempt's earlier `waiting_for_user` observation in
+place. Settlement facts without that identity (ledgers checkpointed before the
+identity was kept) are rejected rather than paired by provider call id.
 Question outbounds supply their transcript content. Failed/cancelled settlements
 supply one outcome instead of a safe failure placeholder plus another summary.
 Normal waiting, paused and interrupted settlements do not add a failure outcome,

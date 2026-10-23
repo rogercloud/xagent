@@ -373,8 +373,9 @@ def _covered_facts_still_used(
     """Covered facts a native summary's suffix still projects.
 
     Inputs accepted before the floor but applied after it, and every start and
-    outcome of a tool batch with any start or outcome after it. Selection reads
-    identity columns only; the projection still validates what it uses.
+    outcome of a tool batch with any start or outcome after it. Covered facts
+    are selected by identity columns; a settlement start in the already loaded
+    suffix is not a declaration. The projection still validates what it uses.
 
     This mirrors the pre-floor facts ``_project`` consumes for a native floor.
     Changing which of them the projection uses requires updating this function;
@@ -671,7 +672,7 @@ def _project(
                     f"Tool event has no attempt/batch identity (task_id={event.task_id}, event_id={event.event_id})"
                 )
             if event.kind == "tool_execution_start":
-                if _settles_attempt(event):
+                if data.get("settlement_delivery") is True:
                     continue
                 starts[str(event.tool_attempt_id)] = event
                 batches.setdefault(str(event.assistant_message_id), []).append(event)
