@@ -20,7 +20,7 @@ from xagent.core.agent import ExecutionContext, ReActPattern
 from xagent.core.agent.checkpoint import TraceCheckpointStore
 from xagent.core.agent.runtime import PatternRuntime
 from xagent.core.tools.user_interaction import ToolInteractionSettlement
-from xagent.web.models.task import Task, TaskStatus
+from xagent.web.models.task import Task, TaskStatus, TraceEvent
 from xagent.web.services.task_event_context_service import load_task_event_context
 from xagent.web.services.task_event_display import load_event_display_snapshot
 from xagent.web.services.task_lease_service import (
@@ -197,9 +197,12 @@ async def _trace_settlement(pattern, record, task_id):
     )
 
 
+@pytest.mark.parametrize("end_committed", [True, False], ids=["both", "start_only"])
 @pytest.mark.asyncio
-async def test_settlement_replay_from_a_later_run_is_idempotent(canonical):
-    """A replay after a lost commit ack, in another run, adds no facts."""
+async def test_settlement_replay_from_a_later_run_is_idempotent(
+    canonical, end_committed
+):
+    """A replay in another run adds only the settlement facts still missing."""
 
     factory, task_id = canonical
     pattern = ReActPattern()
@@ -207,15 +210,39 @@ async def test_settlement_replay_from_a_later_run_is_idempotent(canonical):
     with bind_task_lease_context(_new_run(factory, task_id)):
         await _trace_settlement(pattern, record, task_id)
     with factory() as db:
+        rows = facts(db, task_id)
+        assert len(rows) == 4
+        if not end_committed:
+            # Only the settlement start committed before the run lost it.
+            end = rows[-1]
+            db.query(TraceEvent).filter(
+                TraceEvent.task_id == task_id,
+                TraceEvent.event_id == end.payload["protocol_event_id"],
+            ).delete()
+            db.delete(end)
+            db.commit()
         committed = [row.event_id for row in facts(db, task_id)]
-    assert len(committed) == 4
 
-    # The ack was lost: the ledger still owes the settlement trace.
+    # The ledger still owes the settlement trace.
     pattern.tool_ledger[pattern._ledger_key(record)] = record
     with bind_task_lease_context(_new_run(factory, task_id)):
         await _trace_settlement(pattern, record, task_id)
     with factory() as db:
-        assert [row.event_id for row in facts(db, task_id)] == committed
+        rows = facts(db, task_id)
+        assert [row.event_id for row in rows][: len(committed)] == committed
+        assert [row.kind for row in _settlement_facts(rows)] == [
+            "tool_execution_start",
+            "tool_execution_end",
+        ]
+        # A replayed end comes from yet another run than its settlement start.
+        start, end = _settlement_facts(rows)
+        assert (start.run_id != end.run_id) is not end_committed
+        [observation] = [
+            m
+            for m in load_task_event_context(db, task_id).messages
+            if m["role"] == "tool"
+        ]
+        assert observation["raw_result"] == {"success": True}
     assert not pattern.tool_ledger[pattern._ledger_key(record)].settlement_trace_pending
 
 

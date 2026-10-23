@@ -59,19 +59,6 @@ def _data(event: TaskExecutionEvent) -> dict[str, Any]:
     return data
 
 
-def _settles_attempt(event: TaskExecutionEvent) -> bool:
-    """Whether a tool fact is a resumed interaction's settlement.
-
-    Its start repeats the original call and is not a new declaration; its
-    outcome replaces the original attempt's result. An unreadable payload is
-    not a settlement; ``_project`` rejects it when it uses the fact.
-    """
-    try:
-        return _data(event).get("settlement_delivery") is True
-    except ValueError:
-        return False
-
-
 def _coordinate(value: Any, event: TaskExecutionEvent) -> tuple[int, str]:
     if not isinstance(value, dict) or value.get("scope_id") != "root":
         raise ValueError(
@@ -373,9 +360,8 @@ def _covered_facts_still_used(
     """Covered facts a native summary's suffix still projects.
 
     Inputs accepted before the floor but applied after it, and every start and
-    outcome of a tool batch with any start or outcome after it. Covered facts
-    are selected by identity columns; a settlement start in the already loaded
-    suffix is not a declaration. The projection still validates what it uses.
+    outcome of a tool batch with any start or outcome after it. Selection reads
+    identity columns only; the projection still validates what it uses.
 
     This mirrors the pre-floor facts ``_project`` consumes for a native floor.
     Changing which of them the projection uses requires updating this function;
@@ -391,11 +377,7 @@ def _covered_facts_still_used(
         column=TaskExecutionEvent.turn_id,
         values=turns,
     )
-    suffix_starts = [
-        e
-        for e in suffix
-        if e.kind == "tool_execution_start" and not _settles_attempt(e)
-    ]
+    suffix_starts = [e for e in suffix if e.kind == "tool_execution_start"]
     started = {e.tool_attempt_id for e in suffix_starts}
     unmatched = {
         e.tool_attempt_id
@@ -716,11 +698,13 @@ def _project(
             data = _data(start)
             end = outcomes.get(str(start.tool_attempt_id))
             if end is not None:
-                # A settlement is delivered by the run that resumed the call.
+                # A resumed interaction's settlement replaces the waiting
+                # outcome; the run that resumed the call commits it.
+                settles = _data(end).get("settlement_delivery") is True
                 if (
                     end.sequence <= start.sequence
                     or end.assistant_message_id != start.assistant_message_id
-                    or (end.run_id != start.run_id and not _settles_attempt(end))
+                    or (end.run_id != start.run_id and not settles)
                 ):
                     raise ValueError(
                         f"Tool outcome does not match its start (task_id={task_id}, event_id={end.event_id}, start_event_id={start.event_id})"
