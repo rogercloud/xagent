@@ -216,6 +216,10 @@ __all__ = [
 
 logger = logging.getLogger(__name__)
 
+# A deferred delivery's notice is sent even while its resume is being
+# cancelled; a client that stops reading must not hold the canceller longer.
+_DEFERRED_DELIVERY_NOTICE_TIMEOUT_SECONDS = 5.0
+
 
 _pause_accepted_task_ids: set[int] = set()
 
@@ -3487,26 +3491,27 @@ async def execute_resume_background(
         if delivery_notifier is None:
             return
         try:
-            if delivery_outcome_unknown:
+            async with asyncio.timeout(_DEFERRED_DELIVERY_NOTICE_TIMEOUT_SECONDS):
+                if delivery_outcome_unknown:
+                    await delivery_notifier(
+                        turn_id=delivery_turn_id,
+                        accepted=False,
+                        message=client_error_message(
+                            ClientErrorCode.MESSAGE_OUTCOME_UNKNOWN
+                        ),
+                        error_code=ClientErrorCode.MESSAGE_OUTCOME_UNKNOWN.value,
+                        retry_with_new_id=False,
+                        rejection_outcome="outcome_unknown",
+                    )
+                    return
                 await delivery_notifier(
                     turn_id=delivery_turn_id,
-                    accepted=False,
-                    message=client_error_message(
-                        ClientErrorCode.MESSAGE_OUTCOME_UNKNOWN
-                    ),
-                    error_code=ClientErrorCode.MESSAGE_OUTCOME_UNKNOWN.value,
-                    retry_with_new_id=False,
-                    rejection_outcome="outcome_unknown",
+                    accepted=accepted,
+                    message=message,
+                    error_code=error_code.value if error_code is not None else None,
+                    retry_with_new_id=retry_with_new_id,
+                    rejection_outcome=rejection_outcome,
                 )
-                return
-            await delivery_notifier(
-                turn_id=delivery_turn_id,
-                accepted=accepted,
-                message=message,
-                error_code=error_code.value if error_code is not None else None,
-                retry_with_new_id=retry_with_new_id,
-                rejection_outcome=rejection_outcome,
-            )
         except Exception:
             # Delivery state is durable; a disconnected client will retry the
             # same id and recover the result from that state.
@@ -3579,18 +3584,30 @@ async def execute_resume_background(
             )
             return False
 
-    async def fail_deferred_delivery(message: str | None = None, **notice: Any) -> None:
+    async def fail_deferred_delivery(
+        message: str | None = None,
+        *,
+        error_code: ClientErrorCode | None = None,
+        retry_with_new_id: bool = False,
+        rejection_outcome: Literal["not_accepted", "outcome_unknown"] | None = None,
+    ) -> None:
         """Persist a failed or unknown delivery, then tell the client.
 
-        A canceller may cancel again while the write commits: cancel_task's
-        bounded wait does when the write outlasts it. Once the outcome is
-        durable the client must still hear it, so the write and its notice
-        finish before that cancellation propagates.
+        A canceller may cancel again while the write commits: cancel_task
+        re-cancels once its wait times out. Once the outcome is durable the
+        client must still hear it, so the write and its notice finish before
+        that cancellation propagates.
         """
 
         async def settle() -> None:
             if await mark_deferred_delivery_failed():
-                await notify_deferred_delivery(False, message, **notice)
+                await notify_deferred_delivery(
+                    False,
+                    message,
+                    error_code=error_code,
+                    retry_with_new_id=retry_with_new_id,
+                    rejection_outcome=rejection_outcome,
+                )
 
         await drain_async_task_cancellation_safe(asyncio.create_task(settle()))
 
@@ -4046,7 +4063,11 @@ async def execute_resume_background(
                         task_id,
                         delivery_turn_id,
                     )
-            await notify_deferred_delivery(True)
+            # The turn is accepted and the cancel branch has nothing left to
+            # announce for it, so a cancel must not cut this notice short.
+            await drain_async_task_cancellation_safe(
+                asyncio.create_task(notify_deferred_delivery(True))
+            )
 
         # Resume is now durable: lease acquisition committed RUNNING. Do not
         # announce it earlier from the WebSocket request handler.
