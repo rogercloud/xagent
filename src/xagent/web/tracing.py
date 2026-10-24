@@ -19,7 +19,8 @@ from ..core.agent.trace import (
 )
 from ..core.tracing import create_agent_tracer
 from .models.user import User
-from .services.trace_handlers import DatabaseTraceHandler
+from .services.db_write_retry import retry_db_write_async
+from .services.trace_handlers import DatabaseTraceHandler, _CommitState
 
 
 class EphemeralCheckpointTraceHandler(BaseTraceHandler):
@@ -167,8 +168,16 @@ class ExecutionEventTraceAdapter(DatabaseTraceHandler):
     async def commit_event(self, event: CoreTraceEvent) -> None:
         required = event.require_persisted
         event.require_persisted = True
+        # A retryable failure may have committed. Every attempt reruns the
+        # whole transaction for this same event, so its fact identity is
+        # unchanged and a committed first attempt replays instead of
+        # appending again. Backoff runs outside the trace runtime's slot.
+        commit_state = _CommitState()
         try:
-            await self._save_to_database(event)
+            await retry_db_write_async(
+                lambda: self._save_to_database(event, commit_state=commit_state),
+                site="trace_fact",
+            )
         except Exception as exc:
             raise ExecutionEventPersistenceError(
                 "Conversation event commit failed"
