@@ -335,6 +335,12 @@ async def test_settlement_commit_failure_stops_the_run_until_it_replays(
         assert _settlement_facts(rows) == []
         state = next(row for row in reversed(rows) if row.kind == "recovery_state")
         pattern_state = state.payload["data"]["snapshot"]["pattern_state"]
+    # The delivery was checkpointed before its trace: nothing is left to
+    # deliver, and the settled row still owes the trace.
+    assert pattern_state["pending_tool_interaction_responses"] == []
+    assert [
+        row["settlement_trace_pending"] for row in pattern_state["tool_ledger"].values()
+    ] == [True]
 
     # The database recovers; the resumed run replays the owed settlement.
     monkeypatch.setattr(task_execution_event_writer, "append_fact_no_commit", append)
@@ -348,6 +354,8 @@ async def test_settlement_commit_failure_stops_the_run_until_it_replays(
             runtime=_runtime(task_id),
         )
     assert result["success"] is True
+    # The resume callback ran once: the replay does not dispatch again.
+    assert len(tool.resume_calls) == 1
     with factory() as db:
         assert [row.kind for row in _settlement_facts(facts(db, task_id))] == [
             "tool_execution_start",

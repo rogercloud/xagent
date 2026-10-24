@@ -25,10 +25,7 @@ from xagent.core.agent import (
     ToolCallInterrupted,
     ToolCallRecord,
 )
-from xagent.core.agent.checkpoint import (
-    CheckpointPersistenceError,
-    ExecutionEventPersistenceError,
-)
+from xagent.core.agent.checkpoint import CheckpointPersistenceError
 from xagent.core.agent.context import execution as execution_module
 from xagent.core.agent.context.execution import CLOCK_TIMEZONE_METADATA_KEY
 from xagent.core.agent.pattern.final_answer_stream import ReActFinalAnswerStreamer
@@ -10396,21 +10393,18 @@ async def test_run_replays_pending_settlement_traces_at_entry(mocker: Any) -> No
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("strict", [False, True], ids=["tracer_error", "fact_commit"])
-async def test_settlement_trace_failure_keeps_the_trace_owed(
-    strict: bool, caplog: pytest.LogCaptureFixture
+async def test_settlement_tracer_failure_keeps_the_trace_owed_and_the_run_going(
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """Only a failed execution-event commit stops the run; both stay owed."""
+    """A tracer failure that is not a fact commit is logged, not raised.
 
-    error = (
-        ExecutionEventPersistenceError("fact commit failed")
-        if strict
-        else RuntimeError("tracer failed")
-    )
+    A failed fact commit raises instead; see
+    test_resumed_settlement_fact_failure_remains_replayable.
+    """
 
     class FailingTracer:
         async def trace_event(self, *_: Any, **__: Any) -> None:
-            raise error
+            raise RuntimeError("tracer failed")
 
     pattern = ReActPattern()
     [call] = pattern._normalize_tool_calls(
@@ -10432,13 +10426,9 @@ async def test_settlement_trace_failure_keeps_the_trace_owed(
         runtime=PatternRuntime(execution_id="settle", tracer=FailingTracer()),
     )
 
-    if strict:
-        with pytest.raises(ExecutionEventPersistenceError):
-            await settle
-    else:
-        with caplog.at_level(logging.WARNING):
-            await settle
-        assert "settlement trace event failed" in caplog.text
+    with caplog.at_level(logging.WARNING):
+        await settle
+    assert "settlement trace event failed" in caplog.text
     assert pattern._tool_record_for_call(call).settlement_trace_pending
 
 
@@ -13858,6 +13848,11 @@ async def test_resumed_settlement_fact_failure_remains_replayable(
             context=context,
             runtime=runtime,
         )
+    runtime.checkpoint.assert_awaited_once()
+    assert runtime.checkpoint.await_args.args == (
+        "tool_interaction_response_delivered",
+    )
+    assert pattern.pending_tool_interaction_responses == []
     assert failed_action in attempted
     assert len(tool.resume_calls) == 1
     record = pattern._record_for_tool_call_id("call-1")
