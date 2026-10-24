@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional, cast
 
-from sqlalchemy import func, update
+from sqlalchemy import func, text, update
 from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.orm import Session
 
@@ -46,6 +46,7 @@ from ...web.models.task import Task, TaskStatus
 from ...web.models.task import TraceEvent as DatabaseTraceEvent
 from ...web.models.task_interaction import TaskInteractionRequest
 from ...web.services.db_runtime import drain_async_task_cancellation_safe
+from ...web.services.db_write_retry import is_retryable_database_error
 from ...web.services.interaction_rollout import (
     COUNTER_CHECKPOINT_READ_PARTITION_WIDENED,
     increment_counter,
@@ -108,7 +109,7 @@ CHECKPOINT_SCAN_MAX_PAGES = 50
 
 
 @dataclass
-class _CommitState:
+class CommitState:
     """What one ``commit_event`` call has staged across its retry attempts.
 
     A retryable failure may still have committed, so the next attempt must
@@ -118,6 +119,21 @@ class _CommitState:
     """
 
     start_event_id: str | None = None
+    # 1 for the first attempt; set by commit_event before each attempt.
+    attempt: int = 0
+
+
+# A rerun's first statement waits for the task row lock. After a dropped
+# connection the server may still hold it in an abandoned transaction, so a
+# rerun waits a bounded time and then fails as a retryable lock timeout.
+_RERUN_LOCK_TIMEOUT = "5s"
+
+
+def _retryable_commit_failure(
+    error: BaseException, commit_state: CommitState | None
+) -> bool:
+    """Whether ``commit_event`` may run this V2 fact write again."""
+    return commit_state is not None and is_retryable_database_error(error)
 
 
 @dataclass(frozen=True)
@@ -252,7 +268,7 @@ class DatabaseTraceHandler(BaseTraceHandler):
         await self._save_to_database(event)
 
     async def _save_to_database(
-        self, event: CoreTraceEvent, *, commit_state: _CommitState | None = None
+        self, event: CoreTraceEvent, *, commit_state: CommitState | None = None
     ) -> None:
         """Save trace event to database."""
         try:
@@ -277,6 +293,19 @@ class DatabaseTraceHandler(BaseTraceHandler):
                 attributes={"outcome": "succeeded"},
             )
         except Exception as e:
+            if _retryable_commit_failure(e, commit_state):
+                # commit_event may run this write again; its retry counter
+                # and final error report the outcome of the whole write.
+                increment_performance_counter(
+                    "xagent.trace.database.writes",
+                    attributes={"outcome": "retryable_failed"},
+                )
+                logger.warning(
+                    "Trace event commit attempt failed for task %s: %s",
+                    self.task_id,
+                    e,
+                )
+                raise
             increment_performance_counter(
                 "xagent.trace.database.writes",
                 attributes={"outcome": "failed"},
@@ -1027,7 +1056,7 @@ class DatabaseTraceHandler(BaseTraceHandler):
         return dict(snapshot)
 
     def _sync_save_to_database(
-        self, event: CoreTraceEvent, *, commit_state: _CommitState | None = None
+        self, event: CoreTraceEvent, *, commit_state: CommitState | None = None
     ) -> None:
         """Synchronous database save operation (runs in thread pool)."""
         # Create database session
@@ -1039,7 +1068,7 @@ class DatabaseTraceHandler(BaseTraceHandler):
             db.close()
 
     def _prepare_async_trace_transaction(
-        self, event: CoreTraceEvent, *, commit_state: _CommitState | None = None
+        self, event: CoreTraceEvent, *, commit_state: CommitState | None = None
     ) -> Callable[[Session], None]:
         from .task_event_trace_handler import get_event_type_mapping
         from .trace_event_staging import prepare_trace_payload
@@ -1068,7 +1097,7 @@ class DatabaseTraceHandler(BaseTraceHandler):
         event: CoreTraceEvent,
         *,
         prepared: PreparedTracePayload | None = None,
-        commit_state: _CommitState | None = None,
+        commit_state: CommitState | None = None,
     ) -> None:
         """Save trace event in unified format to database."""
         from .task_event_trace_handler import get_event_type_mapping
@@ -1096,6 +1125,15 @@ class DatabaseTraceHandler(BaseTraceHandler):
                 )
                 from .task_execution_event_writer import append_fact_no_commit
 
+                if (
+                    commit_state is not None
+                    and commit_state.attempt > 1
+                    and db.get_bind().dialect.name == "postgresql"
+                ):
+                    db.execute(
+                        text("SELECT set_config('lock_timeout', :lock, true)"),
+                        {"lock": _RERUN_LOCK_TIMEOUT},
+                    )
                 lock_task_execution_events_no_commit(db, self.task_id)
                 lease = current_task_lease()
                 if lease is not None:
@@ -1156,10 +1194,9 @@ class DatabaseTraceHandler(BaseTraceHandler):
                             return
                     elif event_type_str == "tool_execution_start":
                         rows = {
-                            (key, event_id)
-                            for key, event_id in db.query(
-                                TaskExecutionEvent.idempotency_key,
-                                TaskExecutionEvent.event_id,
+                            event_id
+                            for (event_id,) in db.query(
+                                TaskExecutionEvent.event_id
                             ).filter(
                                 TaskExecutionEvent.task_id == self.task_id,
                                 TaskExecutionEvent.scope_id
@@ -1174,10 +1211,7 @@ class DatabaseTraceHandler(BaseTraceHandler):
                         )
                         # The only row this call may find is the start its own
                         # earlier attempt inserted before losing the commit ack.
-                        if rows and (
-                            own_start is None
-                            or rows != {(f"tool:{attempt}:{fact_type}", own_start)}
-                        ):
+                        if rows - {own_start}:
                             # Until event-based recovery reconciles the attempt,
                             # do not re-execute a possibly completed external
                             # effect.
@@ -1398,7 +1432,9 @@ class DatabaseTraceHandler(BaseTraceHandler):
             logger.error(f"Failed to save trace event to database: {e}")
             raise
         except Exception as e:
-            logger.error(f"Failed to save trace event to database: {e}")
+            # A retryable V2 attempt is reported once, by _save_to_database.
+            if not _retryable_commit_failure(e, commit_state):
+                logger.error(f"Failed to save trace event to database: {e}")
             db.rollback()
             raise
 

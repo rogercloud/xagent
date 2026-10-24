@@ -8,6 +8,7 @@ second one or run a tool twice.
 from __future__ import annotations
 
 import asyncio
+import logging
 import sqlite3
 import uuid
 from collections.abc import Callable
@@ -51,7 +52,7 @@ from xagent.web.services.task_lease_service import (
     acquire_task_lease,
     bind_task_lease_context,
 )
-from xagent.web.services.trace_handlers import DatabaseTraceHandler, _CommitState
+from xagent.web.services.trace_handlers import CommitState, DatabaseTraceHandler
 from xagent.web.tracing import ExecutionEventTraceAdapter, create_task_tracer
 
 canonical = canonical_fixture
@@ -140,23 +141,25 @@ def fail_commits(
     monkeypatch,
     target: Callable[[Session], bool],
     *,
-    committed: bool,
+    committed: bool | list[bool],
     times: int = 1,
     error: Callable[[], Exception] = invalidated,
     between: Callable[[], None] | None = None,
 ) -> list[Exception]:
     """Fail the first ``times`` matching commits, after or before COMMIT.
 
+    ``committed`` may give each failure its own outcome, in order.
     ``between`` runs after each failed transaction has committed or rolled
     back, i.e. between two attempts, outside the writer's locks.
     """
     raised: list[Exception] = []
     original = Session.commit
+    outcomes = committed if isinstance(committed, list) else [committed] * times
 
     def commit(self):
-        if len(raised) >= times or not target(self):
+        if len(raised) >= len(outcomes) or not target(self):
             return original(self)
-        if committed:
+        if outcomes[len(raised)]:
             original(self)
         else:
             self.rollback()
@@ -245,13 +248,18 @@ def tool_facts(db, task_id):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("kind", ["tool_execution_start", "tool_execution_end"])
-async def test_lost_tool_ack_runs_the_tool_once(canonical, monkeypatch, kind):
+async def test_lost_tool_ack_runs_the_tool_once(
+    canonical, trace_runtime, monkeypatch, kind
+):
     from tests.core.agent.test_react import FakeTool
 
     factory, task_id = canonical
     raised = fail_commits(monkeypatch, holds_fact(kind), committed=True)
     tool = FakeTool()
-    result = await react_call(task_id, tool)
+    try:
+        result = await react_call(task_id, tool)
+    finally:
+        await trace_runtime.close()
     assert result["success"]
     assert len(raised) == 1
     assert len(tool.calls) == 1
@@ -331,20 +339,29 @@ def tool_end(task_id: int, attempt: str) -> TraceEvent:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("claim", ["none", "other", "own-with-end"])
-async def test_start_guard_accepts_only_this_calls_own_start(canonical, claim):
+async def test_start_guard_accepts_only_this_calls_own_start(
+    canonical, trace_runtime, claim
+):
+    try:
+        await _check_start_guard(canonical, claim)
+    finally:
+        await trace_runtime.close()
+
+
+async def _check_start_guard(canonical, claim):
     factory, task_id = canonical
     adapter = ExecutionEventTraceAdapter(task_id)
     first = tool_start(task_id, "attempt1")
     first.require_persisted = True
-    state = _CommitState()
+    state = CommitState()
     await adapter._save_to_database(first, commit_state=state)
     assert state.start_event_id is not None
     if claim == "none":
-        retry = _CommitState()
+        retry = CommitState()
     elif claim == "other":
-        retry = _CommitState(start_event_id=str(uuid.uuid4()))
+        retry = CommitState(start_event_id=str(uuid.uuid4()))
     else:
-        retry = _CommitState(start_event_id=state.start_event_id)
+        retry = CommitState(start_event_id=state.start_event_id)
         await adapter.commit_event(tool_end(task_id, "attempt1"))
     second = tool_start(task_id, "attempt1")
     second.require_persisted = True
@@ -355,7 +372,7 @@ async def test_start_guard_accepts_only_this_calls_own_start(canonical, claim):
         rerun = tool_start(task_id, "attempt1")
         rerun.require_persisted = True
         await adapter._save_to_database(
-            rerun, commit_state=_CommitState(start_event_id=state.start_event_id)
+            rerun, commit_state=CommitState(start_event_id=state.start_event_id)
         )
         assert rerun.id == first.id
     with factory() as db:
@@ -488,8 +505,14 @@ async def test_cancellation_during_backoff_stops_retrying(
 
 
 @pytest.mark.asyncio
-async def test_v1_handler_does_not_retry(canonical, monkeypatch, attempts):
+async def test_v1_task_writes_are_not_retried(canonical, monkeypatch, attempts):
     factory, task_id = canonical
+    with factory() as db:
+        db.get(Task, task_id).conversation_storage_version = 1
+        db.commit()
+    tracer = create_task_tracer(task_id)
+    # No fact writer: the V2 commit path, and its retries, never runs.
+    assert tracer.event_writer is None
     raised = fail_commits(
         monkeypatch,
         lambda db: any(
@@ -498,11 +521,13 @@ async def test_v1_handler_does_not_retry(canonical, monkeypatch, attempts):
         ),
         committed=False,
     )
-    event = task_start(task_id)
-    event.require_persisted = True
-    with pytest.raises(OperationalError) as caught:
-        await DatabaseTraceHandler(task_id)._save_to_database(event)
-    assert caught.value is raised[0]
+    with pytest.raises(RuntimeError):
+        await tracer.trace_event(
+            TraceEventType(TraceScope.TASK, TraceAction.START, TraceCategory.GENERAL),
+            task_id=str(task_id),
+            require_persisted=True,
+        )
+    assert len(raised) == 1
     assert len(attempts) == 1
     with factory() as db:
         assert db.query(StoredTraceEvent).count() == 0
@@ -553,3 +578,108 @@ async def test_compaction_lost_ack_keeps_the_first_watermark(canonical, monkeypa
         assert summaries[0].payload["transcript_watermark"] == expected
         assert summaries[0].payload["data"] == data
         assert projections(db, str(event.id)) == 1
+
+
+@pytest.mark.asyncio
+async def test_start_rolled_back_then_lost_ack_admits_only_the_second_insert(
+    canonical, monkeypatch, attempts
+):
+    factory, task_id = canonical
+    # Attempt 1 rolls back, attempt 2 commits but loses its ack, attempt 3
+    # must recognise attempt 2's row, not attempt 1's, as this call's own.
+    raised = fail_commits(
+        monkeypatch,
+        holds_fact("tool_execution_start"),
+        committed=[False, True],
+    )
+    await ExecutionEventTraceAdapter(task_id).commit_event(
+        tool_start(task_id, "attempt1")
+    )
+    assert len(raised) == 2
+    assert len(attempts) == 3
+    with factory() as db:
+        assert [row.kind for row in tool_facts(db, task_id)] == ["tool_execution_start"]
+
+
+def settlement_start(task_id: int, attempt: str) -> TraceEvent:
+    event = tool_start(task_id, attempt)
+    event.data = {**event.data, "settlement_delivery": True}
+    return event
+
+
+@pytest.mark.asyncio
+async def test_lost_settlement_ack_replays_the_settlement_fact(
+    canonical, monkeypatch, attempts
+):
+    factory, task_id = canonical
+    adapter = ExecutionEventTraceAdapter(task_id)
+    await adapter.commit_event(tool_start(task_id, "attempt1"))
+    await adapter.commit_event(tool_end(task_id, "attempt1"))
+    raised = fail_commits(monkeypatch, holds_fact(), committed=True)
+    event = settlement_start(task_id, "attempt1")
+    await adapter.commit_event(event)
+    assert len(raised) == 1
+    with factory() as db:
+        rows = tool_facts(db, task_id)
+        assert [row.idempotency_key for row in rows] == [
+            "tool:attempt1:tool_execution_start",
+            "tool:attempt1:tool_execution_end",
+            "tool:attempt1:settlement:tool_execution_start",
+        ]
+        assert projections(db, str(event.id)) == 1
+
+
+@pytest.mark.asyncio
+async def test_rerun_waits_a_bounded_time_for_the_task_lock(
+    canonical, engine, monkeypatch, attempts
+):
+    if engine.dialect.name != "postgresql":
+        pytest.skip("lock_timeout is a PostgreSQL setting")
+    from xagent.web.services import trace_handlers
+    from xagent.web.services.task_execution_event_store import (
+        lock_task_execution_events_no_commit,
+    )
+
+    factory, task_id = canonical
+    monkeypatch.setattr(trace_handlers, "_RERUN_LOCK_TIMEOUT", "200ms")
+    holder = factory()
+
+    def abandon_lock():
+        # A dropped connection's transaction can keep the task row locked.
+        lock_task_execution_events_no_commit(holder, task_id)
+
+    fail_commits(monkeypatch, holds_fact(), committed=False, between=abandon_lock)
+    try:
+        with pytest.raises(ExecutionEventPersistenceError) as caught:
+            await asyncio.wait_for(
+                ExecutionEventTraceAdapter(task_id).commit_event(task_start(task_id)),
+                timeout=10,
+            )
+    finally:
+        holder.rollback()
+        holder.close()
+    # Both reruns gave up on the lock instead of waiting for it indefinitely.
+    assert len(attempts) == 3
+    assert getattr(caught.value.__cause__.orig, "pgcode", None) == "55P03"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("times", [1, 10], ids=["recovered", "exhausted"])
+async def test_retried_attempts_warn_and_only_a_failed_write_errors(
+    canonical, monkeypatch, caplog, times
+):
+    factory, task_id = canonical
+    fail_commits(monkeypatch, holds_fact(), committed=False, times=times)
+    with caplog.at_level(logging.WARNING):
+        try:
+            await ExecutionEventTraceAdapter(task_id).commit_event(task_start(task_id))
+        except ExecutionEventPersistenceError:
+            assert times == 10
+    errors = [r.getMessage() for r in caplog.records if r.levelno >= logging.ERROR]
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert warnings
+    if times == 1:
+        assert errors == []
+    else:
+        assert len(errors) == 1
+        assert "after retries" in errors[0]
