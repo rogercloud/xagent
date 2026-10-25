@@ -6,6 +6,7 @@ import pytest
 from fastapi import FastAPI
 
 from xagent.web import app as app_module
+from xagent.web import runtime_telemetry
 
 
 @pytest.fixture
@@ -216,7 +217,7 @@ def test_runtime_performance_monitor_stays_off_without_exporter(
 ) -> None:
     test_app = FastAPI()
     monkeypatch.setattr(
-        app_module,
+        runtime_telemetry,
         "initialize_runtime_performance_telemetry",
         lambda: False,
     )
@@ -234,17 +235,17 @@ async def test_runtime_performance_monitor_registers_gauges_once_and_stops(
     registered: list[str] = []
     shutdown_calls: list[bool] = []
     monkeypatch.setattr(
-        app_module,
+        runtime_telemetry,
         "initialize_runtime_performance_telemetry",
         lambda: True,
     )
     monkeypatch.setattr(
-        app_module,
+        runtime_telemetry,
         "register_observable_gauge",
         lambda metric, *_args, **_kwargs: registered.append(metric),
     )
     monkeypatch.setattr(
-        app_module,
+        runtime_telemetry,
         "shutdown_runtime_performance_telemetry",
         lambda: shutdown_calls.append(True),
     )

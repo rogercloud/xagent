@@ -300,3 +300,40 @@ async def test_event_loop_monitor_and_tracer_export_without_payload_content() ->
                 await monitor
         runtime_performance.disable()
         provider.shutdown()
+
+
+def _attribute_keys_in_source() -> dict[str, list[str]]:
+    """Literal ``attributes={...}`` keys passed anywhere under ``src/xagent``."""
+    import ast
+    from pathlib import Path
+
+    keys: dict[str, list[str]] = {}
+    # src/xagent: this module lives in src/xagent/core.
+    root = Path(runtime_metrics.__file__).resolve().parents[1]
+    for path in root.rglob("*.py"):
+        for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
+            if not isinstance(node, ast.Call):
+                continue
+            for keyword in node.keywords:
+                if keyword.arg != "attributes" or not isinstance(
+                    keyword.value, ast.Dict
+                ):
+                    continue
+                for key in keyword.value.keys:
+                    if isinstance(key, ast.Constant) and isinstance(key.value, str):
+                        keys.setdefault(key.value, []).append(
+                            f"{path.relative_to(root)}:{key.lineno}"
+                        )
+    return keys
+
+
+def test_every_metric_attribute_key_in_source_is_exported() -> None:
+    """An unlisted key is dropped silently at export, so list it or rename it."""
+    keys = _attribute_keys_in_source()
+    assert "outcome" in keys  # the scan itself works
+    unlisted = {
+        key: sites
+        for key, sites in keys.items()
+        if key not in runtime_metrics._ALLOWED_ATTRIBUTE_KEYS
+    }
+    assert unlisted == {}
