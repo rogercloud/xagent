@@ -8,9 +8,11 @@ envelope, never append a second message or publish twice.
 from __future__ import annotations
 
 import logging
+from copy import deepcopy
 from unittest.mock import AsyncMock
 
 import pytest
+import sqlalchemy as sa
 from sqlalchemy.exc import IntegrityError, OperationalError
 
 from tests.web.services.test_task_execution_event_writer import (
@@ -60,7 +62,7 @@ def outbound(canonical, monkeypatch):
     original = task_execution._persist_agent_outbound_event
 
     def persist(task_id, event, **kwargs):
-        attempts.append(dict(event))
+        attempts.append(deepcopy(event))
         return original(task_id, event, **kwargs)
 
     monkeypatch.setattr(task_execution, "_persist_agent_outbound_event", persist)
@@ -87,8 +89,8 @@ def final_answer() -> dict:
     return {
         "type": "final_answer_end",
         "content": "hello",
-        "stream_id": "stream-1",
-        "message_id": "final-answer-1",
+        "stream_id": "stream1",
+        "message_id": "final_answer_1",
     }
 
 
@@ -248,6 +250,11 @@ def accept_input(canonical, monkeypatch):
     return factory, task_id, run, attempts
 
 
+def any_commit(db) -> bool:
+    # The acceptance transaction is the only commit these tests make.
+    return True
+
+
 def accepted_inputs(db, task_id):
     return [fact for fact in facts(db, task_id) if fact.kind == "input_accepted"]
 
@@ -258,7 +265,7 @@ async def test_existing_input_rerun_keeps_one_accepted_fact(
     accept_input, monkeypatch, committed
 ):
     factory, task_id, run, attempts = accept_input
-    raised = fail_commits(monkeypatch, holds_fact(), committed=committed)
+    raised = fail_commits(monkeypatch, any_commit, committed=committed)
     await run()
     assert len(raised) == 1
     assert len(attempts) == 2
@@ -274,11 +281,15 @@ async def test_existing_input_lease_replaced_between_attempts_is_not_retried(
     factory, task_id, run, attempts = accept_input
 
     def replace_lease():
-        with factory() as db:
-            db.get(Task, task_id).lease_attempt_id = "replacement"
-            db.commit()
+        # A Core transaction, so the patched Session.commit does not fail it.
+        with factory.kw["bind"].begin() as connection:
+            connection.execute(
+                sa.update(Task)
+                .where(Task.id == task_id)
+                .values(lease_attempt_id="replacement")
+            )
 
-    fail_commits(monkeypatch, holds_fact(), committed=False, between=replace_lease)
+    fail_commits(monkeypatch, any_commit, committed=False, between=replace_lease)
     with pytest.raises(TaskLeaseLostError):
         await run()
     assert len(attempts) == 2
@@ -291,7 +302,7 @@ async def test_existing_input_exhausted_retries_raise_the_database_error(
     accept_input, monkeypatch
 ):
     factory, task_id, run, attempts = accept_input
-    raised = fail_commits(monkeypatch, holds_fact(), committed=False, times=3)
+    raised = fail_commits(monkeypatch, any_commit, committed=False, times=3)
     with pytest.raises(OperationalError) as caught:
         await run()
     assert len(attempts) == 3
