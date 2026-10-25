@@ -134,7 +134,7 @@ async def test_replayed_tool_message_rerun_starts_from_the_original_event(
 ):
     """The replay branch rewrites the event before its COMMIT fails."""
     factory, task_id, published, attempts = outbound
-    raised = fail_commits(monkeypatch, holds_fact(), committed=[True, False], times=2)
+    raised = fail_commits(monkeypatch, holds_fact(), committed=[True, False])
     await task_execution.make_agent_outbound_handler(task_id, authoritative=True)(
         tool_message()
     )
@@ -143,6 +143,27 @@ async def test_replayed_tool_message_rerun_starts_from_the_original_event(
     assert attempts[0] == attempts[1] == attempts[2]
     with factory() as db:
         assert len(facts(db, task_id)) == 1
+    published.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("payload", [question, tool_message])
+async def test_leased_outbound_rerun_after_lost_ack_relocks_its_lease(
+    outbound, monkeypatch, payload
+):
+    factory, task_id, published, attempts = outbound
+    with factory() as db:
+        lease = acquire_task_lease(db, task_id, new_run=True)
+    raised = fail_commits(monkeypatch, holds_fact(), committed=True)
+    with bind_task_lease_context(lease):
+        await task_execution.make_agent_outbound_handler(task_id, authoritative=True)(
+            payload()
+        )
+    assert len(raised) == 1
+    assert len(attempts) == 2
+    with factory() as db:
+        (fact,) = facts(db, task_id)
+        assert fact.run_id == lease.run_id
     published.assert_awaited_once()
 
 

@@ -1015,15 +1015,14 @@ async def _persist_authoritative_outbound_event(
     """Persist an authoritative outbound event, rerunning transient failures.
 
     A retryable failure may have committed. Each attempt writes a fresh copy
-    of the original event, so its protocol id and payload are unchanged and a
-    committed attempt replays its fact and chat row instead of appending
-    again. The persist rewrites the event it is given before COMMIT; only the
-    attempt that succeeds is copied back into ``event``.
+    of ``event``, so its protocol id and payload are unchanged and a committed
+    attempt replays its fact and chat row instead of appending again. Some
+    branches rewrite the event they are given before COMMIT, so ``event`` is
+    left alone until an attempt succeeds and is then replaced by its copy.
     """
-    original = deepcopy(event)
 
     async def attempt() -> Dict[str, Any]:
-        candidate = deepcopy(original)
+        candidate = deepcopy(event)
         await run_db_io_cancellation_safe(
             lambda: _persist_agent_outbound_event(
                 task_id, candidate, authoritative=True
