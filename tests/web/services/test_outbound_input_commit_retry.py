@@ -7,6 +7,7 @@ envelope, never append a second message or publish twice.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from copy import deepcopy
 from unittest.mock import AsyncMock
@@ -36,7 +37,7 @@ from xagent.core.agent.checkpoint import ExecutionEventPersistenceError
 from xagent.web.models.chat_message import TaskChatMessage
 from xagent.web.models.task import Task
 from xagent.web.models.task import TraceEvent as StoredTraceEvent
-from xagent.web.services import task_execution, task_orchestrator
+from xagent.web.services import db_write_retry, task_execution, task_orchestrator
 from xagent.web.services.task_lease_service import (
     TaskLeaseLostError,
     acquire_task_lease,
@@ -257,9 +258,9 @@ def accept_input(canonical, monkeypatch):
     attempts: list[None] = []
     original = task_orchestrator._accept_existing_event_input_sync
 
-    def accept(*args):
+    def accept(*args, **kwargs):
         attempts.append(None)
-        return original(*args)
+        return original(*args, **kwargs)
 
     monkeypatch.setattr(task_orchestrator, "_accept_existing_event_input_sync", accept)
 
@@ -330,3 +331,58 @@ async def test_existing_input_exhausted_retries_raise_the_database_error(
     assert caught.value is raised[-1]
     with factory() as db:
         assert accepted_inputs(db, task_id) == []
+
+
+@pytest.fixture
+def abandoned_task_lock(canonical, engine, monkeypatch):
+    """Hold the task row lock from between two attempts, as a dropped
+    connection's abandoned transaction can."""
+    if engine.dialect.name != "postgresql":
+        pytest.skip("lock_timeout is a PostgreSQL setting")
+    from xagent.web.services.task_execution_event_store import (
+        lock_task_execution_events_no_commit,
+    )
+
+    factory, task_id = canonical
+    monkeypatch.setattr(db_write_retry, "_RERUN_LOCK_TIMEOUT", "200ms")
+    holder = factory()
+    yield lambda: lock_task_execution_events_no_commit(holder, task_id)
+    holder.rollback()
+    holder.close()
+
+
+def lock_timed_out(error: BaseException) -> bool:
+    return getattr(getattr(error, "orig", None), "pgcode", None) == "55P03"
+
+
+@pytest.mark.asyncio
+async def test_outbound_rerun_waits_a_bounded_time_for_the_task_lock(
+    outbound, abandoned_task_lock, monkeypatch
+):
+    factory, task_id, published, attempts = outbound
+    fail_commits(
+        monkeypatch, holds_fact(), committed=False, between=abandoned_task_lock
+    )
+    with pytest.raises(ExecutionEventPersistenceError) as caught:
+        await asyncio.wait_for(
+            task_execution.make_agent_outbound_handler(task_id, authoritative=True)(
+                question()
+            ),
+            timeout=10,
+        )
+    # Both reruns gave up on the lock instead of waiting for it indefinitely.
+    assert len(attempts) == 3
+    assert lock_timed_out(caught.value.__cause__)
+    published.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_existing_input_rerun_waits_a_bounded_time_for_the_task_lock(
+    accept_input, abandoned_task_lock, monkeypatch
+):
+    factory, task_id, run, attempts = accept_input
+    fail_commits(monkeypatch, any_commit, committed=False, between=abandoned_task_lock)
+    with pytest.raises(OperationalError) as caught:
+        await asyncio.wait_for(run(), timeout=10)
+    assert len(attempts) == 3
+    assert lock_timed_out(caught.value)

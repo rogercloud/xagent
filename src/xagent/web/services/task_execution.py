@@ -150,7 +150,10 @@ from .db_runtime import (
     propagate_deferred_cancellation,
     run_db_io_cancellation_safe,
 )
-from .db_write_retry import retry_db_write_async
+from .db_write_retry import (
+    bound_rerun_lock_wait_no_commit,
+    retry_db_write_async,
+)
 from .execution_result_projection import (
     FailedResultPresentation,
     completion_outcome_for_status,
@@ -772,9 +775,16 @@ def _outbound_message_business_payload(data: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _persist_agent_outbound_event(
-    task_id: int, event: Dict[str, Any], *, authoritative: bool = False
+    task_id: int,
+    event: Dict[str, Any],
+    *,
+    authoritative: bool = False,
+    rerun: bool = False,
 ) -> None:
-    """Persist agent outbound events and durable waiting prompts."""
+    """Persist agent outbound events and durable waiting prompts.
+
+    ``rerun`` marks a retry of an authoritative write that failed transiently.
+    """
 
     from ..models.task import Task as DatabaseTask
     from ..models.task import TraceEvent as DatabaseTraceEvent
@@ -786,6 +796,8 @@ def _persist_agent_outbound_event(
     try:
         from .task_lease_service import current_task_lease
 
+        if rerun:
+            bound_rerun_lock_wait_no_commit(db)
         lease = current_task_lease()
         if authoritative and event.get("type") == "final_answer_delta":
             # Chunks are ephemeral; complete answers and stream boundaries are
@@ -1021,11 +1033,16 @@ async def _persist_authoritative_outbound_event(
     left alone until an attempt succeeds and is then replaced by its copy.
     """
 
+    attempts = 0
+
     async def attempt() -> Dict[str, Any]:
+        nonlocal attempts
+        attempts += 1
         candidate = deepcopy(event)
+        rerun = attempts > 1
         await run_db_io_cancellation_safe(
             lambda: _persist_agent_outbound_event(
-                task_id, candidate, authoritative=True
+                task_id, candidate, authoritative=True, rerun=rerun
             )
         )
         return candidate
