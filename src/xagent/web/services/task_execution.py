@@ -150,6 +150,7 @@ from .db_runtime import (
     propagate_deferred_cancellation,
     run_db_io_cancellation_safe,
 )
+from .db_write_retry import retry_db_write_async
 from .execution_result_projection import (
     FailedResultPresentation,
     completion_outcome_for_status,
@@ -1008,6 +1009,33 @@ def _reconcile_streamed_final_answer(task_id: int, content: str) -> str:
         db.close()
 
 
+async def _persist_authoritative_outbound_event(
+    task_id: int, event: Dict[str, Any]
+) -> None:
+    """Persist an authoritative outbound event, rerunning transient failures.
+
+    A retryable failure may have committed. Each attempt writes a fresh copy
+    of the original event, so its protocol id and payload are unchanged and a
+    committed attempt replays its fact and chat row instead of appending
+    again. The persist rewrites the event it is given before COMMIT; only the
+    attempt that succeeds is copied back into ``event``.
+    """
+    original = deepcopy(event)
+
+    async def attempt() -> Dict[str, Any]:
+        candidate = deepcopy(original)
+        await run_db_io_cancellation_safe(
+            lambda: _persist_agent_outbound_event(
+                task_id, candidate, authoritative=True
+            )
+        )
+        return candidate
+
+    persisted = await retry_db_write_async(attempt, site="outbound")
+    event.clear()
+    event.update(persisted)
+
+
 def make_agent_outbound_handler(task_id: int, *, authoritative: bool = False) -> Any:
     """Create a web bridge for agent agent-to-user messages."""
 
@@ -1032,11 +1060,7 @@ def make_agent_outbound_handler(task_id: int, *, authoritative: bool = False) ->
                 payload_type, task_id, dict(payload)
             )
             if authoritative:
-                await run_db_io_cancellation_safe(
-                    lambda: _persist_agent_outbound_event(
-                        task_id, final_answer_event, authoritative=True
-                    )
-                )
+                await _persist_authoritative_outbound_event(task_id, final_answer_event)
             await publish_task_event(final_answer_event, task_id)
             return None
 
@@ -1060,11 +1084,12 @@ def make_agent_outbound_handler(task_id: int, *, authoritative: bool = False) ->
             },
             event_id=payload.get("event_id"),
         )
-        await run_db_io_cancellation_safe(
-            lambda: _persist_agent_outbound_event(
-                task_id, event, authoritative=authoritative
+        if authoritative:
+            await _persist_authoritative_outbound_event(task_id, event)
+        else:
+            await run_db_io_cancellation_safe(
+                lambda: _persist_agent_outbound_event(task_id, event)
             )
-        )
         await publish_task_event(event, task_id)
         return cast(Dict[str, Any], event["data"]) if authoritative else None
 

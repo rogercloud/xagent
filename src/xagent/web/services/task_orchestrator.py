@@ -90,6 +90,7 @@ from .db_runtime import (
     is_database_pool_timeout,
     run_db_io_cancellation_safe,
 )
+from .db_write_retry import retry_db_write_async
 from .external_task_cancel import (
     EXTERNAL_TASK_SOURCE,
     EXTERNAL_TURN_INTERRUPTED_MESSAGE,
@@ -1201,6 +1202,24 @@ def _accept_existing_event_input_sync(
             },
         )
         db.commit()
+
+
+async def _accept_existing_event_input(
+    lease: TaskLease, task_owner_user_id: int, payload: TaskTurnPayload
+) -> None:
+    """Record a local V2 execute input, rerunning transient failures.
+
+    The fact's key and payload are fixed by the turn, so a rerun after a lost
+    acknowledgement replays the committed fact instead of appending another.
+    """
+    await retry_db_write_async(
+        lambda: run_db_io_cancellation_safe(
+            lambda: _accept_existing_event_input_sync(
+                lease, task_owner_user_id, payload
+            )
+        ),
+        site="input_accept",
+    )
 
 
 def reserve_task_start_no_commit(
@@ -2560,10 +2579,8 @@ def _schedule_bg(
                         # Local execute has no START acceptance transaction.
                         # Its prior-history snapshot is already fixed; persist
                         # this input under the exact lease before runtime starts.
-                        await run_db_io_cancellation_safe(
-                            lambda: _accept_existing_event_input_sync(
-                                lease, task_owner_user_id, payload
-                            )
+                        await _accept_existing_event_input(
+                            lease, task_owner_user_id, payload
                         )
 
                     scope = await run_db_io_cancellation_safe(
