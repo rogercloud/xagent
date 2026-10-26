@@ -144,22 +144,32 @@ event-read budget consumption or exhaustion. Further signals will be added.
 GET /api/admin/execution-events/tasks/{task_id}
 ```
 
-Admin users only: 403 `Admin access required` otherwise, 404 for an unknown
-task, 503 when the database cannot be read (the response never substitutes
-zeros). It is read-only and never returns event payloads, `error_message` or
-other free text, so it is safe to use from a support ticket without database
-access. All queries are filtered by task id and use aggregates over columns;
+Admin users only: 401 without a valid token, 403 `Admin access required` for
+a non-admin, 404 for an unknown task, 503 when the database cannot be read
+(the response never substitutes zeros). It is read-only and never returns
+event payloads, the task's `error_message`, the auto-recovery `last_error` or
+the recovery events' `detail`; for the two error columns it reports only
+whether they are set. The one free-text field left is `degradations`, whose
+details are operator messages written by the platform and can name a task
+id. All queries are filtered by task id and use aggregates over columns;
 every list is bounded and has a `truncated` flag.
+
+The event sections are a snapshot at `task.conversation_event_sequence`, read
+first: an append advances it in the same transaction, so every event at or
+below it is committed, and events appended while the request runs are left
+out. `auto_recovery` is read from its own tables afterwards and can be a
+little newer. A busy task therefore looks consistent within one response but
+moves between two requests.
 
 | Section | What it tells you |
 | --- | --- |
 | `storage` | `v2` or `v1`. A V1 task returns the same shape with empty event sections. |
 | `task` | `status`, `control_state`, `run_id`, `state_version`; `conversation_event_sequence` (the committed sequence horizon: readers ignore events above it); lease fields `runner_id`, `lease_attempt_id`, `lease_expires_at`, `last_heartbeat_at`. A non-null `lease_attempt_id` does not prove the run is alive; compare `lease_expires_at` and `last_heartbeat_at` with the current time. `has_error_message` says only whether the task carries an error text. |
-| `events` | Total, min/max sequence, latest `occurred_at`, and counts per (`scope_id`, `kind`), at most 200 groups. An append advances the horizon in the same transaction, so normally `max_sequence` equals `task.conversation_event_sequence` and, with `min_sequence` 1, `total` equals `max_sequence`; a mismatch is unexpected and worth escalating. |
+| `events` | Total, min/max sequence, latest `occurred_at`, and counts per (`scope_id`, `kind`), at most 200 groups, all at or below the snapshot horizon. Events are never deleted and sequences are allocated without gaps, so `max_sequence` equals `task.conversation_event_sequence` and `total` equals `max_sequence`; a difference within one response means the log itself is damaged and is worth escalating. |
 | `runs` | Per `run_id` (including `null`): event count, sequence range, and `settled`, true when an `execution_settled` fact exists for that run. Latest 20 by max sequence. An earlier run with `settled` false never wrote a settlement fact. |
 | `recovery_states` | Per scope, the highest sequence of a `recovery_state` fact (the checkpoint). Compare with `events.max_sequence` to see how much was written after the last checkpoint. |
 | `open_tool_attempts` | Attempts (per scope) with a `tool_execution_start` fact and no `tool_execution_end` or `tool_execution_failed` fact, the same test the recovery reader uses to decide that no outcome was committed. Shows attempt id, scope, run, start sequence and the kinds seen, newest first, up to 100, plus `open_count`. |
-| `auto_recovery` | The task's automatic-recovery row (`last_error` cut to 200 characters) and the latest 20 recovery events (type, reason, attempt, timestamps; the free-form `detail` is omitted). |
+| `auto_recovery` | The task's automatic-recovery row (`has_last_error` only; the text is the run's own error, the same content as `error_message`) and the latest 20 recovery events (type, reason, attempt, timestamps; the free-form `detail` is omitted). |
 | `degradations` | `active_degradations()` of the process that served the request only. |
 
 ### What an open tool attempt means

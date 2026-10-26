@@ -23,6 +23,7 @@ from xagent.web.auth_dependencies import get_current_user
 from xagent.web.models.database import get_db
 from xagent.web.models.task import Task, TaskStatus
 from xagent.web.models.task_auto_recovery import TaskAutoRecovery, TaskRecoveryEvent
+from xagent.web.models.task_execution_event import TaskExecutionEvent
 from xagent.web.services import execution_event_diagnostics as diagnostics_module
 from xagent.web.services.execution_event_diagnostics import (
     task_execution_event_diagnostics,
@@ -243,8 +244,10 @@ def test_open_tool_attempts_follow_the_recovery_reader_definition(engine, task_i
             run="r2",
             attempt="D",
         )
-        # A settlement start with no end of any kind stays open.
-        fact(db, task_id, "tool_execution_start", "tool:E:start", run="r1", attempt="E")
+        # A settlement start with no end of any kind stays open. The original
+        # run id sorts after the settlement run's, so the reported run must
+        # come from the start row, not from an aggregate over run ids.
+        fact(db, task_id, "tool_execution_start", "tool:E:start", run="r9", attempt="E")
         fact(
             db,
             task_id,
@@ -286,7 +289,7 @@ def test_open_tool_attempts_follow_the_recovery_reader_definition(engine, task_i
         {
             "tool_attempt_id": "E",
             "scope_id": "root",
-            "run_id": "r1",
+            "run_id": "r9",
             "start_sequence": 8,
             "kinds": ["tool_execution_start"],
         },
@@ -350,7 +353,7 @@ def test_lists_report_truncation(engine, task_id, monkeypatch):
     assert result["events"]["total"] == 8
 
 
-def test_auto_recovery_state_events_and_last_error_truncation(engine, task_id):
+def test_auto_recovery_state_events_and_only_whether_last_error_is_set(engine, task_id):
     with Session(engine) as db:
         db.add(
             TaskAutoRecovery(
@@ -366,7 +369,7 @@ def test_auto_recovery_state_events_and_last_error_truncation(engine, task_id):
                 total_resumes=2,
                 next_attempt_at=T0,
                 last_command_id="cmd-1",
-                last_error="x" * 300 + SENTINEL,
+                last_error=f"{SENTINEL} Bearer sk-not-a-real-token",
             )
         )
         db.add(TaskRecoveryEvent(task_id=task_id, run_id="r1", event="interrupted"))
@@ -390,7 +393,9 @@ def test_auto_recovery_state_events_and_last_error_truncation(engine, task_id):
     assert state["reason"] == "runner_lost"
     assert state["state_detail"] == "backoff"
     assert (state["no_progress_resumes"], state["total_resumes"]) == (1, 2)
-    assert state["last_error"] == "x" * 200
+    # The run's error text is the same content as error_message: hidden.
+    assert state["has_last_error"] is True
+    assert "last_error" not in state
     assert [e["event"] for e in result["events"]] == ["scheduled", "interrupted"]
     assert result["events"][0]["attempt"] == 1
     assert "detail" not in result["events"][0]
@@ -427,7 +432,7 @@ def test_payload_content_never_appears_in_the_response(engine, task_id):
                 paused_state_version=1,
                 interrupted_at=T0,
                 episode_started_at=T0,
-                last_error="connection reset",
+                last_error=f"{SENTINEL} connection reset",
             )
         )
         db.add(
@@ -502,3 +507,55 @@ def test_degradations_are_reported_for_this_process(engine, task_id):
         clear_degradation("checkpoint_load_unavailable")
 
     assert "checkpoint_load_unavailable" in result["degradations"]
+
+
+def test_event_sections_read_a_snapshot_at_the_task_horizon(engine, task_id):
+    """Events above the horizon read first belong to a later snapshot.
+
+    Each append advances the horizon in its own transaction, so a row above
+    the horizon read by the request is one committed after that read. It is
+    simulated here by inserting rows without advancing the horizon.
+    """
+    with Session(engine) as db:
+        make_v2(db, task_id)
+        fact(db, task_id, "tool_execution_start", "tool:A:start", run="r1", attempt="A")
+        db.commit()
+        horizon = db.get(Task, task_id).conversation_event_sequence
+        for offset, (kind, key, attempt) in enumerate(
+            [
+                ("tool_execution_end", "tool:A:end", "A"),
+                ("tool_execution_start", "tool:B:start", "B"),
+                ("execution_settled", "settled:r1", None),
+                ("recovery_state", "recovery:r1", None),
+            ],
+            start=1,
+        ):
+            db.add(
+                TaskExecutionEvent(
+                    event_id=f"later-{offset}",
+                    task_id=task_id,
+                    sequence=horizon + offset,
+                    scope_id="root",
+                    run_id="r1",
+                    tool_attempt_id=attempt,
+                    idempotency_key=key,
+                    kind=kind,
+                    payload_version=1,
+                    payload={},
+                    occurred_at=T0,
+                )
+            )
+        db.commit()
+
+    result = diagnose(engine, task_id)
+
+    assert result["task"]["conversation_event_sequence"] == horizon
+    assert result["events"]["total"] == horizon
+    assert result["events"]["max_sequence"] == horizon
+    assert result["runs"]["items"][0]["settled"] is False
+    assert result["recovery_states"]["items"] == []
+    # A's end and B's start are after the snapshot: A is still open, B absent.
+    assert result["open_tool_attempts"]["open_count"] == 1
+    assert [i["tool_attempt_id"] for i in result["open_tool_attempts"]["items"]] == [
+        "A"
+    ]

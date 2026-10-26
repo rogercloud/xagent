@@ -4,8 +4,15 @@ Backs the admin diagnostic endpoint. Every query is filtered by ``task_id``
 (indexed) and selects columns or GROUP BY aggregates only: the ``payload``
 column of ``task_execution_events`` is never selected, filtered on or
 loaded, because payloads hold user messages and tool arguments/results. Free
-text on neighbouring rows (``Task.error_message``, ``task_recovery_events.detail``)
-is likewise left out, and ``task_auto_recovery.last_error`` is truncated.
+text on neighbouring rows (``Task.error_message``,
+``task_auto_recovery.last_error``, ``task_recovery_events.detail``) is
+likewise left out; only whether the error columns are set is reported.
+
+Event sections read a snapshot at the task's committed horizon
+(``Task.conversation_event_sequence``), read first: every append advances the
+horizon in the same transaction, so all events at or below it are committed
+and events appended while the request runs are excluded. The recovery rows
+are separate tables and may be slightly newer than that snapshot.
 
 Every list is bounded by an explicit limit and reports whether it was cut.
 """
@@ -39,14 +46,18 @@ MAX_RUNS = 20
 MAX_RECOVERY_STATE_SCOPES = 50
 MAX_OPEN_TOOL_ATTEMPTS = 100
 MAX_RECOVERY_EVENTS = 20
-LAST_ERROR_MAX_CHARS = 200
 
 
 def _iso(value: datetime | None) -> str | None:
     return value.isoformat() if value is not None else None
 
 
-def _event_summary(db: Session, task_id: int) -> dict[str, Any]:
+def _in_snapshot(task_id: int, horizon: int) -> Any:
+    event = TaskExecutionEvent
+    return (event.task_id == task_id) & (event.sequence <= horizon)
+
+
+def _event_summary(db: Session, task_id: int, horizon: int) -> dict[str, Any]:
     event = TaskExecutionEvent
     total, min_sequence, max_sequence, latest_occurred_at = db.execute(
         select(
@@ -54,11 +65,11 @@ def _event_summary(db: Session, task_id: int) -> dict[str, Any]:
             func.min(event.sequence),
             func.max(event.sequence),
             func.max(event.occurred_at),
-        ).where(event.task_id == task_id)
+        ).where(_in_snapshot(task_id, horizon))
     ).one()
     rows = db.execute(
         select(event.scope_id, event.kind, func.count(event.id))
-        .where(event.task_id == task_id)
+        .where(_in_snapshot(task_id, horizon))
         .group_by(event.scope_id, event.kind)
         .order_by(event.scope_id, event.kind)
         .limit(MAX_EVENT_GROUPS + 1)
@@ -76,7 +87,7 @@ def _event_summary(db: Session, task_id: int) -> dict[str, Any]:
     }
 
 
-def _runs(db: Session, task_id: int) -> dict[str, Any]:
+def _runs(db: Session, task_id: int, horizon: int) -> dict[str, Any]:
     event = TaskExecutionEvent
     max_sequence = func.max(event.sequence)
     rows = db.execute(
@@ -87,7 +98,7 @@ def _runs(db: Session, task_id: int) -> dict[str, Any]:
             max_sequence,
             func.count(event.id).filter(event.kind == SETTLEMENT_KIND),
         )
-        .where(event.task_id == task_id)
+        .where(_in_snapshot(task_id, horizon))
         .group_by(event.run_id)
         .order_by(max_sequence.desc())
         .limit(MAX_RUNS + 1)
@@ -107,11 +118,11 @@ def _runs(db: Session, task_id: int) -> dict[str, Any]:
     }
 
 
-def _recovery_states(db: Session, task_id: int) -> dict[str, Any]:
+def _recovery_states(db: Session, task_id: int, horizon: int) -> dict[str, Any]:
     event = TaskExecutionEvent
     rows = db.execute(
         select(event.scope_id, func.max(event.sequence))
-        .where(event.task_id == task_id, event.kind == RECOVERY_STATE_KIND)
+        .where(_in_snapshot(task_id, horizon), event.kind == RECOVERY_STATE_KIND)
         .group_by(event.scope_id)
         .order_by(event.scope_id)
         .limit(MAX_RECOVERY_STATE_SCOPES + 1)
@@ -125,7 +136,7 @@ def _recovery_states(db: Session, task_id: int) -> dict[str, Any]:
     }
 
 
-def _open_tool_attempts(db: Session, task_id: int) -> dict[str, Any]:
+def _open_tool_attempts(db: Session, task_id: int, horizon: int) -> dict[str, Any]:
     """Attempts with a start fact and no terminal fact, per scope.
 
     ``read_committed_tool_outcome`` raises ``UnknownToolEffectError`` for an
@@ -146,20 +157,15 @@ def _open_tool_attempts(db: Session, task_id: int) -> dict[str, Any]:
     open_total = db.scalar(
         select(func.count()).select_from(
             select(event.scope_id, event.tool_attempt_id)
-            .where(event.task_id == task_id, event.tool_attempt_id.is_not(None))
+            .where(_in_snapshot(task_id, horizon), event.tool_attempt_id.is_not(None))
             .group_by(event.scope_id, event.tool_attempt_id)
             .having(open_filter)
             .subquery()
         )
     )
     attempts = db.execute(
-        select(
-            event.scope_id,
-            event.tool_attempt_id,
-            func.min(event.run_id).filter(event.kind == TOOL_START_KIND),
-            start_sequence,
-        )
-        .where(event.task_id == task_id, event.tool_attempt_id.is_not(None))
+        select(event.scope_id, event.tool_attempt_id, start_sequence)
+        .where(_in_snapshot(task_id, horizon), event.tool_attempt_id.is_not(None))
         .group_by(event.scope_id, event.tool_attempt_id)
         .having(open_filter)
         .order_by(start_sequence.desc(), event.tool_attempt_id)
@@ -167,17 +173,29 @@ def _open_tool_attempts(db: Session, task_id: int) -> dict[str, Any]:
     ).all()
 
     kinds: dict[tuple[str, str], list[str]] = {}
+    start_runs: dict[int, str | None] = {}
     if attempts:
         kind_rows = db.execute(
             select(event.scope_id, event.tool_attempt_id, event.kind)
             .where(
-                event.task_id == task_id,
-                event.tool_attempt_id.in_([attempt for _, attempt, _, _ in attempts]),
+                _in_snapshot(task_id, horizon),
+                event.tool_attempt_id.in_([attempt for _, attempt, _ in attempts]),
             )
             .group_by(event.scope_id, event.tool_attempt_id, event.kind)
         ).all()
         for scope, attempt, kind in kind_rows:
             kinds.setdefault((scope, attempt), []).append(kind)
+        # The run of the first start, read from that row: a later run's
+        # settlement start carries the same attempt id under another run.
+        start_runs = {
+            int(sequence): run_id
+            for sequence, run_id in db.execute(
+                select(event.sequence, event.run_id).where(
+                    event.task_id == task_id,
+                    event.sequence.in_([seq for _, _, seq in attempts]),
+                )
+            ).all()
+        }
     return {
         "open_count": int(open_total or 0),
         "truncated": int(open_total or 0) > MAX_OPEN_TOOL_ATTEMPTS,
@@ -185,11 +203,11 @@ def _open_tool_attempts(db: Session, task_id: int) -> dict[str, Any]:
             {
                 "tool_attempt_id": attempt,
                 "scope_id": scope,
-                "run_id": run_id,
+                "run_id": start_runs.get(start_seq),
                 "start_sequence": start_seq,
                 "kinds": sorted(kinds.get((scope, attempt), [])),
             }
-            for scope, attempt, run_id, start_seq in attempts
+            for scope, attempt, start_seq in attempts
         ],
     }
 
@@ -214,7 +232,6 @@ def _auto_recovery(db: Session, task_id: int) -> dict[str, Any]:
     ).one_or_none()
     state: dict[str, Any] | None = None
     if row is not None:
-        last_error = row.last_error
         state = {
             "run_id": row.run_id,
             "reason": row.reason,
@@ -227,9 +244,8 @@ def _auto_recovery(db: Session, task_id: int) -> dict[str, Any]:
             "total_resumes": row.total_resumes,
             "next_attempt_at": _iso(row.next_attempt_at),
             "last_command_id": row.last_command_id,
-            "last_error": None
-            if last_error is None
-            else last_error[:LAST_ERROR_MAX_CHARS],
+            # The run's own error text, the same content as error_message.
+            "has_last_error": bool(row.last_error),
             "updated_at": _iso(row.updated_at),
         }
     # ``detail`` is documented as client-safe but is free-form JSON; the
@@ -299,6 +315,7 @@ def task_execution_event_diagnostics(
     ).one_or_none()
     if task is None:
         return None
+    horizon = int(task.conversation_event_sequence or 0)
     status = task.status
     return {
         "storage": "v2" if task.conversation_storage_version == 2 else "v1",
@@ -316,10 +333,10 @@ def task_execution_event_diagnostics(
             "last_heartbeat_at": _iso(task.last_heartbeat_at),
             "has_error_message": bool(task.has_error_message),
         },
-        "events": _event_summary(db, task_id),
-        "runs": _runs(db, task_id),
-        "recovery_states": _recovery_states(db, task_id),
-        "open_tool_attempts": _open_tool_attempts(db, task_id),
+        "events": _event_summary(db, task_id, horizon),
+        "runs": _runs(db, task_id, horizon),
+        "recovery_states": _recovery_states(db, task_id, horizon),
+        "open_tool_attempts": _open_tool_attempts(db, task_id, horizon),
         "auto_recovery": _auto_recovery(db, task_id),
         "degradations": active_degradations(),
     }
