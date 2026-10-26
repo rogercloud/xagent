@@ -94,6 +94,8 @@ DISPATCHER_MAX_INFLIGHT_PER_PROCESS = "XAGENT_DISPATCHER_MAX_INFLIGHT_PER_PROCES
 DISPATCHER_INTERACTIVE_RESERVE_PER_PROCESS = (
     "XAGENT_DISPATCHER_INTERACTIVE_RESERVE_PER_PROCESS"
 )
+DISPATCHER_FAIR_SHARE = "XAGENT_DISPATCHER_FAIR_SHARE"
+DISPATCH_ACCEPT_REQUESTED_CLASS = "XAGENT_DISPATCH_ACCEPT_REQUESTED_CLASS"
 UPLOADED_FILE_RECOVERY_INTERVAL_SECONDS = (
     "XAGENT_UPLOADED_FILE_RECOVERY_INTERVAL_SECONDS"
 )
@@ -696,6 +698,21 @@ def get_dispatcher_interactive_reserve_per_process() -> int:
     return _get_positive_int_env(
         DISPATCHER_INTERACTIVE_RESERVE_PER_PROCESS, 0, minimum=0
     )
+
+
+def get_dispatcher_fair_share_enabled() -> bool:
+    """Whether dispatch ranks tenants by the slots they hold here (default off)."""
+
+    return _get_strict_bool_env(DISPATCHER_FAIR_SHARE, False)
+
+
+def get_dispatch_accept_requested_class_enabled() -> bool:
+    """Whether a caller's declared dispatch class may decide a command's class.
+
+    Default off: a declaration is stored but never changes a command's class.
+    """
+
+    return _get_strict_bool_env(DISPATCH_ACCEPT_REQUESTED_CLASS, False)
 
 
 def get_uploaded_file_recovery_interval_seconds() -> int:
