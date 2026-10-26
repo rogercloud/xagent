@@ -18,18 +18,24 @@ import asyncio
 import enum
 import json
 import logging
+import os
 import re
+import threading
 import time
 import uuid
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Awaitable, Callable, NamedTuple, cast
 
-from sqlalchemy import and_, exists, false, or_, select, true
+from sqlalchemy import and_, exists, false, func, or_, select, text, true
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Query, Session, aliased
 
 from ...config import (
+    DISPATCHER_FAIR_SHARE,
+    get_dispatcher_fair_share_enabled,
     get_shared_task_execution_enabled,
     get_task_lease_heartbeat_seconds,
     get_task_lease_ttl_seconds,
@@ -68,6 +74,7 @@ from .task_dispatch_cap import (
     EXECUTION_OPENING_KINDS,
     DispatchCapSnapshot,
     DispatchClass,
+    TenantListingRequired,
     build_dispatch_cap_snapshot,
 )
 from .task_execution_host import consumes_task_commands
@@ -555,6 +562,7 @@ def stage_task_command(
             Task.user_id,
             Task.source,
             Task.channel_name,
+            Task.requested_dispatch_class,
             User.id.label("task_owner_row_id"),
             User.actor_subject.label("task_owner_subject"),
         )
@@ -700,6 +708,7 @@ def stage_task_command(
                 owner_user_id=int(snapshot.user_id),
                 background=reserved,
                 previous_dispatch_class=previous_dispatch_class,
+                requested_dispatch_class=snapshot.requested_dispatch_class,
             ),
         )
         changed = False
@@ -1883,6 +1892,397 @@ def _dispatcher_candidate_query(
     return query
 
 
+# The last raw value of the fair-share switch and what it parsed to.
+_fair_share_memo: tuple[str | None, bool] | None = None
+
+
+def _fair_share_enabled() -> bool:
+    """Whether dispatch ranks tenants, parsed again only when the raw value changes.
+
+    Each call reads the environment variable once. A value equal to the one the
+    last parse saw returns that parse's result without parsing or warning, so a
+    wrong value is reported once however often it is read. Threads that read a
+    new value at the same moment may each parse it, which at worst repeats the
+    warning. The dispatch policy line parses the value on its own when it changes,
+    so an invalid value is warned about there too.
+    """
+    global _fair_share_memo
+    raw = os.getenv(DISPATCHER_FAIR_SHARE)
+    memo = _fair_share_memo
+    if memo is None or memo[0] != raw:
+        memo = (raw, get_dispatcher_fair_share_enabled())
+        _fair_share_memo = memo
+    return memo[1]
+
+
+# With the fair-share switch on, a scan with room asks each of the first
+# FAIR_SHARE_TENANTS_PER_SCAN ranked tenants for the oldest command it can claim among
+# the FAIR_SHARE_WINDOW oldest queued commands of one (tenant key, dispatch class). A
+# (tenant key, class) that has none is not asked again for FAIR_SHARE_SKIP_SECONDS,
+# and every FAIR_SHARE_FALLBACK_EVERY-th counted attempt reads the queue as it always
+# did, so a command that only the full scan can reach is not left behind forever.
+FAIR_SHARE_WINDOW = 16
+FAIR_SHARE_TENANTS_PER_SCAN = 4
+FAIR_SHARE_SKIP_SECONDS = 2.0
+FAIR_SHARE_FALLBACK_EVERY = 8
+
+# The oldest queued command of each (tenant key, dispatch class), by skipping from
+# one pair to the next through ix_task_commands_claimable_fair; a scan of the queue
+# would read every queued row. Queued means pending or processing, claimable or not.
+# Only commands that open an execution count (_OPENING_KINDS_SQL): a pause or cancel
+# needs no slot, and the key it carries may be one its task no longer has, so it must
+# not make a tenant of its own. The scan still reaches it, through the step that
+# takes an older command needing no new slot.
+_OPENING_KINDS_SQL = ", ".join(f"'{kind}'" for kind in sorted(EXECUTION_OPENING_KINDS))
+_LIST_QUEUED_TENANTS_POSTGRESQL = text(
+    f"""
+    WITH RECURSIVE s(k, c, id) AS (
+      (SELECT fairness_key, dispatch_class, id FROM task_execution_commands
+        WHERE status IN ('pending', 'processing') AND kind IN ({_OPENING_KINDS_SQL})
+        ORDER BY fairness_key, dispatch_class, id LIMIT 1)
+      UNION ALL
+      SELECT n.k, n.c, n.id FROM s CROSS JOIN LATERAL (
+        SELECT fairness_key AS k, dispatch_class AS c, id
+          FROM task_execution_commands
+         WHERE status IN ('pending', 'processing')
+           AND kind IN ({_OPENING_KINDS_SQL})
+           AND (fairness_key, dispatch_class) > (s.k, s.c)
+         ORDER BY fairness_key, dispatch_class, id LIMIT 1) n)
+    SELECT k, c, id FROM s
+    """
+)
+
+
+def _list_queued_tenants(db: Session) -> dict[str, dict[str, int]]:
+    """The oldest queued command that opens an execution, per class, per tenant key."""
+    if db.get_bind().dialect.name == "postgresql":
+        rows = db.execute(_LIST_QUEUED_TENANTS_POSTGRESQL).all()
+    else:
+        rows = db.execute(
+            select(
+                TaskExecutionCommand.fairness_key,
+                TaskExecutionCommand.dispatch_class,
+                func.min(TaskExecutionCommand.id),
+            )
+            .where(
+                TaskExecutionCommand.status.in_((COMMAND_PENDING, COMMAND_PROCESSING)),
+                TaskExecutionCommand.kind.in_(sorted(EXECUTION_OPENING_KINDS)),
+            )
+            .group_by(
+                TaskExecutionCommand.fairness_key, TaskExecutionCommand.dispatch_class
+            )
+        ).all()
+    tenants: dict[str, dict[str, int]] = {}
+    for key, dispatch_class, oldest in rows:
+        tenants.setdefault(str(key), {})[str(dispatch_class)] = int(oldest)
+    return tenants
+
+
+def _tenants_in_band(
+    tenants: dict[str, dict[str, int]], cap: DispatchCapSnapshot | None
+) -> dict[str, dict[str, int]]:
+    """The tenants a scan can take a new slot for under ``cap``.
+
+    Between the batch line and the limit only interactive commands may open an
+    execution, so only the interactive class of each tenant counts and a tenant
+    without one drops out.
+    """
+    if cap is None or not cap.batch_closed:
+        return tenants
+    interactive: dict[str, dict[str, int]] = {
+        key: {DISPATCH_CLASS_INTERACTIVE: classes[DISPATCH_CLASS_INTERACTIVE]}
+        for key, classes in tenants.items()
+        if DISPATCH_CLASS_INTERACTIVE in classes
+    }
+    return interactive
+
+
+def _queued_tenant_window(key: str, dispatch_class: str) -> Any:
+    """The ids of the oldest queued commands of one tenant key and class.
+
+    The key is bounded with ``>=`` and ``<=`` rather than ``=``: with an equality
+    PostgreSQL prefers the primary-key order to the index on (key, class, id).
+    """
+    return (
+        select(TaskExecutionCommand.id)
+        .where(
+            TaskExecutionCommand.status.in_((COMMAND_PENDING, COMMAND_PROCESSING)),
+            TaskExecutionCommand.fairness_key >= key,
+            TaskExecutionCommand.fairness_key <= key,
+            TaskExecutionCommand.dispatch_class == dispatch_class,
+        )
+        .order_by(
+            TaskExecutionCommand.fairness_key,
+            TaskExecutionCommand.dispatch_class,
+            TaskExecutionCommand.id,
+        )
+        .limit(FAIR_SHARE_WINDOW)
+    )
+
+
+def _in_tenant_window(query: Query[Any], key: str, dispatch_class: str) -> Query[Any]:
+    """``query`` narrowed to the oldest queued commands of one tenant key and class."""
+    return query.filter(
+        TaskExecutionCommand.id.in_(_queued_tenant_window(key, dispatch_class))
+    )
+
+
+def _older_controls(query: Query[Any], before_id: int) -> Query[Any]:
+    """``query`` narrowed to pause and cancel commands older than ``before_id``.
+
+    ix_task_commands_claimable_kind serves it and holds claimable rows only, so it
+    reads the claimable controls, not the backlog.
+    """
+    return query.filter(
+        TaskExecutionCommand.kind.in_(sorted(CONTROL_KINDS)),
+        TaskExecutionCommand.id < before_id,
+    )
+
+
+def _older_of_tasks(
+    claimable: Callable[[], Query[Any]], before_id: int, task_ids: frozenset[int]
+) -> Query[Any]:
+    """The claimable commands of ``task_ids`` older than ``before_id``, narrowed
+    to the oldest one.
+
+    Every running task is asked for its own oldest claimable command and the
+    smallest of those ids is taken, so each task's lookup reads
+    ix_task_commands_unfinished_task in id order, and the check that a command
+    has no earlier unfinished command of its task reads that index too. The
+    command-index rows each lookup reads are its own task's unfinished
+    commands, whatever the length of the backlog or of the settled history.
+    """
+    running = aliased(Task, name="running_task")
+    oldest_of_task = (
+        claimable()
+        .filter(
+            TaskExecutionCommand.task_id == running.id,
+            TaskExecutionCommand.id < before_id,
+        )
+        .order_by(None)
+        .order_by(TaskExecutionCommand.id)
+        .limit(1)
+        .with_entities(TaskExecutionCommand.id)
+        .correlate(running)
+        .scalar_subquery()
+    )
+    oldest = (
+        select(func.min(oldest_of_task))
+        .select_from(running)
+        .where(running.id.in_(sorted(task_ids)))
+        .scalar_subquery()
+    )
+    return claimable().filter(TaskExecutionCommand.id == oldest)
+
+
+def _older_needing_no_new_slot(
+    claimable: Callable[[], Query[Any]], before_id: int, active: frozenset[int]
+) -> Any:
+    """The oldest claimable command older than ``before_id`` that needs no new slot.
+
+    That is a control of any task, or a command of a task this process already
+    runs. The two are looked up separately and the older found row is taken, so
+    the control lookup keeps its index whatever the other costs; a control of a
+    running task matches both lookups and is the same row. The second lookup is
+    not sent when the process runs no task. None when neither finds a row.
+    """
+    found = [_older_controls(claimable(), before_id).first()]
+    if active:
+        found.append(_older_of_tasks(claimable, before_id, active).first())
+    rows = [row for row in found if row is not None]
+    return min(rows, key=lambda row: row.id) if rows else None
+
+
+def _counted_tenants(
+    tenants: dict[str, dict[str, int]], skipped: frozenset[tuple[str, str]]
+) -> Mapping[str, int]:
+    """The queued tenants the tenant cap counts, each with its oldest queued id.
+
+    A tenant whose every queued class is in ``skipped`` is left out; the id is
+    the oldest across all of its classes. A new read-only view; ``tenants`` is
+    not changed.
+    """
+    return MappingProxyType(
+        {
+            key: min(classes.values())
+            for key, classes in tenants.items()
+            if any((key, name) not in skipped for name in classes)
+        }
+    )
+
+
+def _not_capped(key: str, active_ids: frozenset[int]) -> Any:
+    """The condition that leaves out the new work of the tenant ``key`` holds back.
+
+    Controls and commands of tasks in ``active_ids`` need no new slot and pass.
+    """
+    return ~and_(
+        TaskExecutionCommand.fairness_key == key,
+        TaskExecutionCommand.kind.notin_(sorted(CONTROL_KINDS)),
+        TaskExecutionCommand.task_id.notin_(sorted(active_ids)),
+    )
+
+
+class _FairState:
+    """What fair-share selection remembers between scans of one process.
+
+    Every field is guarded by ``_fair_state_lock``, which is held for memory reads
+    and writes only, never across a database call or a log line.
+    """
+
+    def __init__(self) -> None:
+        # Counted dispatch attempts, to find the fallback rounds.
+        self.attempts = 0
+        # Until when (``_fair_clock``) a (tenant key, dispatch class) is not asked.
+        self.skips: dict[tuple[str, str], float] = {}
+        # Window queries that found nothing since the diagnostics line last asked.
+        self.misses = 0
+
+
+_fair_state = _FairState()
+_fair_state_lock = threading.Lock()
+
+
+def _fair_clock() -> float:
+    return time.monotonic()
+
+
+def drain_fair_misses() -> int:
+    """The window queries that found nothing since the last call, and start again.
+
+    The diagnostics line reports the count for its window.
+    """
+    with _fair_state_lock:
+        misses = _fair_state.misses
+        _fair_state.misses = 0
+    return misses
+
+
+def _fair_live_skips() -> frozenset[tuple[str, str]]:
+    """The (tenant key, class) pairs not to ask now, dropping the lapsed ones."""
+    now = _fair_clock()
+    with _fair_state_lock:
+        skips = _fair_state.skips
+        for pair in [pair for pair, until in skips.items() if until <= now]:
+            del skips[pair]
+        return frozenset(skips)
+
+
+def _fair_record_miss(key: str, dispatch_class: str) -> None:
+    until = _fair_clock() + FAIR_SHARE_SKIP_SECONDS
+    with _fair_state_lock:
+        _fair_state.skips[(key, dispatch_class)] = until
+        _fair_state.misses += 1
+
+
+@dataclass
+class _FairAttempt:
+    """What one dispatch attempt carries from one scan to the next.
+
+    ``decided`` is set by the first scan, which counts the attempt when it has
+    room and fixes whether the attempt is a fallback round; a rescan keeps that
+    decision. A scan the presence precheck ends because no command is open
+    never reaches that decision, so it leaves ``decided`` unset. ``tenants`` is
+    the listing of the queue, taken by the first scan that ranks or that is
+    between the batch line and the limit, and reused by the rescans of the
+    same attempt.
+    """
+
+    decided: bool = False
+    fallback: bool = False
+    tenants: dict[str, dict[str, int]] | None = None
+
+
+def _new_fair_attempt() -> _FairAttempt | None:
+    """The attempt record for one dispatch attempt, or None with the switch off."""
+    return _FairAttempt() if _fair_share_enabled() else None
+
+
+def _ranks_tenants(
+    attempt: _FairAttempt, command_db_id: int | None, cap: DispatchCapSnapshot | None
+) -> bool:
+    """Whether this scan ranks tenants, counting the attempt on its first scan.
+
+    A scan for one command, or with no room, reads the queue as it always did
+    and is not counted. Otherwise the first scan counts the attempt, and every
+    FAIR_SHARE_FALLBACK_EVERY-th counted attempt is a fallback round for all its
+    scans. A scan the presence precheck already ended never calls this, so it is
+    not counted and does not set ``decided``.
+    """
+    has_room = command_db_id is None and (cap is None or not cap.closed)
+    if not attempt.decided:
+        attempt.decided = True
+        if has_room:
+            with _fair_state_lock:
+                _fair_state.attempts += 1
+                attempt.fallback = _fair_state.attempts % FAIR_SHARE_FALLBACK_EVERY == 0
+    return has_room and not attempt.fallback
+
+
+def _fair_pick(
+    db: Session,
+    attempt: _FairAttempt,
+    cap: DispatchCapSnapshot | None,
+    claimable: Callable[[], Query[Any]],
+    oldest_claimable: Callable[[], Any],
+    capped: str | None,
+    skips: Callable[[], frozenset[tuple[str, str]]],
+) -> Any:
+    """The command a scan with room takes while tenants are ranked, or None.
+
+    ``claimable()`` is the claimable query of the scan, ``oldest_claimable()`` its
+    plain lookup of the oldest row. Tenants are ranked by the slots they hold in
+    this process, then by their oldest queued command that opens an execution, and
+    the first FAIR_SHARE_TENANTS_PER_SCAN that are not skipped and not ``capped``
+    are asked in that order, the live skip table coming from ``skips()``: the
+    first with a claimable command among its window supplies the best candidate,
+    and the oldest claimable command older than that which needs no new slot
+    (``_older_needing_no_new_slot``) is taken in its place. A (tenant key, class)
+    with no claimable command in its window is missed and skipped for a while.
+    With no tenant ranked, the plain lookup decides.
+
+    The listing is taken once per attempt, so a rescan may rank a queue that has
+    moved on; at worst that costs one more window query or one more recorded miss.
+    A task the attempt already set aside (``busy``) that fills the window of a tenant
+    makes that tenant miss and be skipped, as a task that cannot be claimed does.
+    """
+    if attempt.tenants is None:
+        attempt.tenants = _list_queued_tenants(db)
+    tenants = _tenants_in_band(attempt.tenants, cap)
+    if len(tenants) <= 1:
+        return oldest_claimable()
+    skipped = skips()
+    occupancy = cap.occupancy if cap is not None else {}
+    ranked = sorted(
+        (
+            occupancy.get(key, 0),
+            min(classes.values()),
+            key,
+            [name for name in sorted(classes) if (key, name) not in skipped],
+        )
+        for key, classes in tenants.items()
+    )
+    best = None
+    for _, _, key, classes in [
+        entry for entry in ranked if entry[3] and entry[2] != capped
+    ][:FAIR_SHARE_TENANTS_PER_SCAN]:
+        hits = []
+        for dispatch_class in classes:
+            row = _in_tenant_window(claimable(), key, dispatch_class).first()
+            if row is None:
+                _fair_record_miss(key, dispatch_class)
+            else:
+                hits.append(row)
+        if hits:
+            best = min(hits, key=lambda row: row.id)
+            break
+    if best is None:
+        return oldest_claimable()
+    active = cap.active_ids if cap is not None else frozenset()
+    older = _older_needing_no_new_slot(claimable, best.id, active)
+    return best if older is None else older
+
+
 class CommandCandidate(NamedTuple):
     """The command a dispatch scan picked and what its slot decision needs."""
 
@@ -1891,12 +2291,16 @@ class CommandCandidate(NamedTuple):
     kind: TaskCommandKind
     interactive: bool
     fairness_key: str
+    # The oldest queued command id of each queued tenant the selection counted,
+    # for the slot decision; None when the selection listed no tenants.
+    queued_tenants: Mapping[str, int] | None = None
 
 
 def _find_command_candidate(
     command_db_id: int | None,
     busy_task_ids: tuple[int, ...] = (),
     cap: DispatchCapSnapshot | None = None,
+    attempt: _FairAttempt | None = None,
 ) -> CommandCandidate | None:
     """A reply to a waiting task, else the oldest command this process could claim now.
 
@@ -1915,11 +2319,24 @@ def _find_command_candidate(
     claimable, the full scan still runs, adding one indexed round trip. A
     command committed after the precheck is found by the next poll or the
     in-process notify, within the bound ``stage_task_command`` documents.
+    With the fair-share switch on, the oldest command of the first-ranked tenant
+    that has one is taken instead, and between the batch line and the limit the
+    new work of the tenant the cap holds back is left out of every query.
     """
     from ..models.database import get_session_local
 
     runner_id = get_runner_id()
     now = _utc_now()
+    capped: str | None = None
+    live_skips: frozenset[tuple[str, str]] | None = None
+
+    def skips() -> frozenset[tuple[str, str]]:
+        # One copy of the skip table per scan.
+        nonlocal live_skips
+        if live_skips is None:
+            live_skips = _fair_live_skips()
+        return live_skips
+
     with get_session_local()() as db:
 
         def first_candidate(kind: TaskCommandKind | None = None) -> Any:
@@ -1934,9 +2351,24 @@ def _find_command_candidate(
             )
             if kind is not None:
                 query = query.filter(TaskExecutionCommand.kind == kind.value)
+            if capped is not None and cap is not None:
+                query = query.filter(_not_capped(capped, cap.active_ids))
             return query.filter(
                 TaskExecutionCommand.task_id.notin_(busy_task_ids)
             ).first()
+
+        def claimable() -> Query[Any]:
+            query = _dispatcher_candidate_query(
+                db,
+                runner_id=runner_id,
+                command_db_id=None,
+                shared=True,
+                cap=cap,
+                now=now,
+            ).filter(TaskExecutionCommand.task_id.notin_(busy_task_ids))
+            if capped is not None and cap is not None:
+                query = query.filter(_not_capped(capped, cap.active_ids))
+            return query
 
         row = None
         any_reply = False
@@ -1944,6 +2376,20 @@ def _find_command_candidate(
             any_open, any_reply = db.execute(_OPEN_COMMAND_AND_REPLY_PRESENCE).one()
             if not any_open:
                 return None
+        ranking = attempt is not None and _ranks_tenants(attempt, command_db_id, cap)
+        counted: Mapping[str, int] | None = None
+        if (
+            attempt is not None
+            and command_db_id is None
+            and cap is not None
+            and cap.in_reserve_band
+        ):
+            # Between the lines the tenant cap needs the queued tenants before
+            # any query is built, replies included.
+            if attempt.tenants is None:
+                attempt.tenants = _list_queued_tenants(db)
+            counted = _counted_tenants(attempt.tenants, skips())
+            capped = cap.capped_tenant(counted)
         if any_reply:
             # A reply to a waiting task is served before any other claimable
             # command, oldest first. That deliberately includes older pause
@@ -1954,18 +2400,28 @@ def _find_command_candidate(
             # older work waiting in the same bucket. On the batch line a reply
             # classified batch is left out unless its task already runs here,
             # like any batch command. At the limit a reply that needs a new
-            # slot is not claimable, so the narrow query decides.
+            # slot is not claimable, so the narrow query decides. A reply of
+            # the tenant the cap holds back waits unless its task already runs.
             row = first_candidate(TaskCommandKind.RESUME_INPUT)
         if row is None:
-            row = first_candidate()
+            if attempt is not None and ranking:
+                row = _fair_pick(
+                    db, attempt, cap, claimable, first_candidate, capped, skips
+                )
+            else:
+                row = first_candidate()
         if row is None:
             return None
+        listed = None if attempt is None else attempt.tenants
+        if command_db_id is None and listed is not None and counted is None:
+            counted = _counted_tenants(listed, skips())
         return CommandCandidate(
             int(row.id),
             int(row.task_id),
             TaskCommandKind(row.kind),
             row.dispatch_class == DISPATCH_CLASS_INTERACTIVE,
             str(row.fairness_key),
+            counted,
         )
 
 
@@ -1996,6 +2452,9 @@ def count_claimable_task_commands(db: Session, *, runner_id: str) -> int:
     rechecks capacity under lock. Each of those checks can only turn a
     counted command away, and the cap's swap is one for one per task, so the
     result stays an upper bound on how many commands could be claimed.
+    The tenant cap's prefilter, which leaves out the new work of the tenant the
+    cap holds back between the batch line and the limit, belongs to the dispatch
+    scan only and is not applied here either.
 
     This is not a backlog depth either. Only the first unfinished command of
     each task passes, except that a cancel or pause may pass an earlier
@@ -2055,32 +2514,51 @@ async def dispatch_one_task_command(
 
     registry = get_task_coordinator_registry()
     skipped_task_ids = set(registry.busy_command_tasks())
+    attempt = _new_fair_attempt()
+    listing_rescanned = False
     while True:
         cap = build_dispatch_cap_snapshot()
         candidate = await run_db_io_cancellation_safe(
-            lambda: _find_command_candidate(command_db_id, tuple(skipped_task_ids), cap)
+            lambda: _find_command_candidate(
+                command_db_id, tuple(skipped_task_ids), cap, attempt=attempt
+            )
         )
         if candidate is None:
             return False
-        selected_id, task_id, kind, interactive, fairness_key = candidate
+        selected_id, task_id, kind, interactive, fairness_key, queued = candidate
         reservation = None
         if kind.value in EXECUTION_OPENING_KINDS:
-            reservation = background_task_manager.reserve_dispatch_slot(
-                task_id,
-                policy=cap.policy,
-                interactive=interactive,
-                fairness_key=fairness_key,
-            )
+            try:
+                reservation = background_task_manager.reserve_dispatch_slot(
+                    task_id,
+                    policy=cap.policy,
+                    interactive=interactive,
+                    fairness_key=fairness_key,
+                    queued_tenants=queued,
+                    require_listing=attempt is not None and command_db_id is None,
+                )
+            except TenantListingRequired:
+                # The snapshot this candidate was picked under sat below the
+                # batch line, so the selection listed no tenants; the process
+                # is between the lines now and the tenant cap needs the listing.
+                # Nothing was reserved, so select once more under a fresh
+                # snapshot, which lists them. The task is not set aside and the
+                # attempt is not counted again; a second miss ends the attempt.
+                if listing_rescanned:
+                    return False
+                listing_rescanned = True
+                continue
             if reservation is None:
                 # A candidate picked under a snapshot is one this process could
                 # start, so the slot is refused only when the state changed
                 # since: more tasks became active (to the batch line for a batch
-                # command, to the limit for any), or the candidate's task left
-                # the active set. An execution end signals the dispatcher, which
-                # retries then. Releasing another attempt's reservation signals
-                # nothing, so when the slot was held by an attempt that ends
-                # without starting an execution, the retry waits for the idle
-                # interval or the next notify.
+                # command, to the limit for any), the candidate's task left the
+                # active set, or the tenant cap, read from the active set now,
+                # holds the candidate's tenant back. An execution end signals
+                # the dispatcher, which retries then. Releasing another
+                # attempt's reservation signals nothing, so when the slot was
+                # held by an attempt that ends without starting an execution,
+                # the retry waits for the idle interval or the next notify.
                 return False
         try:
             coordinator = await registry.ensure(task_id)
