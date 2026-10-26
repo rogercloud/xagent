@@ -396,6 +396,32 @@ def load_event_display_snapshot(
     )
 
 
+def expected_display_frames(
+    db: Session, task_id: int, *, after_sequence: int, through_sequence: int
+) -> dict[str, int]:
+    """Wire event id -> sequence of each root display frame in a sequence range.
+
+    The range is ``(after_sequence, through_sequence]``. Sequence numbers are
+    not contiguous within it: internal kinds, other scopes and facts that
+    convert to no frame are left out. So is a fact whose display cannot be
+    built; the live path reports it as an integrity gap and sends no frame.
+    """
+    frames: dict[str, int] = {}
+    for row in load_display_facts(
+        db,
+        task_id,
+        after_sequence=after_sequence,
+        through_sequence=through_sequence,
+    ):
+        try:
+            frame = convert_display_event(row)
+        except (ValueError, AssertionError):
+            continue
+        if frame is not None:
+            frames[str(frame["event_id"])] = int(row.sequence)
+    return frames
+
+
 def load_live_display_event(
     db: Session, task_id: int, protocol_event_id: str, *, scope_id: str = "root"
 ) -> dict[str, Any] | None:

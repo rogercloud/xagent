@@ -108,8 +108,62 @@ literal format strings.
   fact. It comes with WARNING `Live display integrity gap task_id=%s
   event_id=%s` (with traceback) and a client-safe error event to the task's
   clients.
-- There is no counter for duplicate delivery or sequence gaps on client
-  reconnect. A client attaching later replays history from storage.
+- A client attaching later replays history from storage, up to a committed
+  sequence horizon. The connection is registered before the replay, so live
+  frames and the replay can overlap; the client de-duplicates by
+  `execution_sequence`.
+
+#### Replay and delivery consistency
+
+- INFO `execution_event_replay task_id=%s storage=v2
+  component=execution-events horizon=%s events=%s cache_hit=%s
+  duration_ms=%.1f`, once per V2 historical replay (initial attach and each
+  `status_request`). `horizon` is the last committed sequence the replay
+  covers, `events` the number of display events it sent, `cache_hit` whether
+  it came from the history cache, `duration_ms` the load time.
+- `xagent.websocket.replay.consistency`, attributes `outcome` and
+  `storage=v2`, once per closed V2 connection that received a replay. Each
+  socket records the display frames it was actually sent (event id and
+  sequence, no payload, at most 5000 per socket). On disconnect, a background
+  check reads the committed root-scope display events with sequence above the
+  first replay's horizon and up to the highest sequence the socket was sent,
+  and compares their event ids with the sent ones.
+  - `complete`: every such event was sent at least once (live or by a later
+    replay).
+  - `missing`: at least one was never sent. Comes with WARNING
+    `execution_event_delivery_gap task_id=%s storage=v2
+    component=execution-events horizon=%s missing=%s
+    first_missing_sequence=%s`.
+  - `duplicate`: nothing missing, but an event id was sent twice, usually a
+    live frame below the horizon that the replay sent again. Informational:
+    the client drops it. A replay the client requested again on the same
+    connection is not counted.
+  - `overflow`: the socket was sent more than 5000 display frames; recording
+    stopped and the connection is not checked.
+  Sequence gaps are expected and never counted as missing: internal kinds,
+  child scopes, audit-only facts and facts whose display could not be built
+  (reported as `integrity_gap` above) produce no frame. Events committed after
+  the last frame the socket received are outside the check, so a frame lost at
+  the very end of a connection is not detected here; the next attach replays
+  it. If the check itself cannot read the database it logs WARNING
+  `execution_event_delivery_check_failed task_id=%s storage=v2
+  component=execution-events horizon=%s error_type=%s` and emits no outcome.
+- To read them: a rising `missing` rate is the signal to act on. Take the
+  task id and `first_missing_sequence` from the WARNING and compare with the
+  admin endpoint below (the event at that sequence should be a display kind in
+  scope `root`). In shared mode, look for `task_event_bridge_gap` or
+  `publish_failed` around the same time first.
+- `xagent.task_event.bridge.frames` (shared mode, cross-process Redis
+  bridge), attribute `outcome`:
+  - `duplicate_dropped`: the receiver got a frame it had already delivered
+    and dropped it.
+  - `gap_resync`: the receiver saw a jump in a publishing host's sequence and
+    asked its clients to resync. Comes with WARNING `task_event_bridge_gap
+    task_id=%s host=%s previous_sequence=%s sequence=%s`. Bridge sequences are
+    per publishing host, so the frames in the gap may belong to other tasks.
+  - `publish_failed`: a frame could not be published (the existing WARNING
+    `Task event publication failed task_id=%s; stream requires resync`
+    names the task).
 
 ### (4) Recovery refusals
 

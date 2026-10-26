@@ -6,10 +6,13 @@ import logging
 import uuid
 import weakref
 from collections import OrderedDict
+from contextvars import ContextVar
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from functools import partial
 from pathlib import Path
+from time import perf_counter
 from typing import (
     Any,
     Dict,
@@ -98,6 +101,11 @@ from ..services.db_runtime import (
     run_db_io_cancellation_safe,
 )
 from ..services.execution_budget import budget_policy_provider
+from ..services.execution_event_signals import (
+    report_delivery_check_failure,
+    report_delivery_consistency,
+    report_replay,
+)
 from ..services.file_reference_output_service import (
     load_assistant_file_reference_records,
     reconcile_assistant_file_references,
@@ -1130,6 +1138,104 @@ class _CommandOriginRegistry:
 _command_origins = _CommandOriginRegistry()
 
 
+# V2 delivery ledger. Each socket records the display frames this process
+# actually sent to it (wire event id and execution sequence). On disconnect
+# the frames committed after the socket's replay horizon are compared with
+# what was sent. Recording stops beyond the cap, which bounds memory per
+# socket; such a connection is reported as ``overflow`` and not checked.
+_DELIVERY_LEDGER_CAP = 5000
+# Disconnect checks are background tasks. At most this many may be pending
+# (a mass disconnect drops the rest) and only a few read the database at once,
+# so the checks cannot crowd the shared worker threads.
+_DELIVERY_CHECK_PENDING_CAP = 256
+_DELIVERY_CHECK_CONCURRENCY = 2
+
+
+@dataclass(eq=False)
+class _ReplayPass:
+    """One historical replay being sent to one socket."""
+
+    horizon: int
+
+
+# Set only by the coroutine that sends a replay, so a live frame sent
+# concurrently from another task is never taken for a replay frame.
+_replay_pass: ContextVar[_ReplayPass | None] = ContextVar(
+    "xagent_websocket_replay_pass", default=None
+)
+
+
+@dataclass(eq=False)
+class _DeliveryLedger:
+    task_id: int
+    # Horizon of the first replay: every display frame committed after it
+    # must reach the socket live or through a later replay.
+    horizon: int | None = None
+    replay: _ReplayPass | None = None
+    replays: int = 0
+    sent: dict[str, int] = field(default_factory=dict)
+    max_sequence: int = 0
+    duplicates: int = 0
+    overflow: bool = False
+
+    def begin_replay(self, replay: _ReplayPass) -> None:
+        if self.replay is replay:
+            return
+        self.replay = replay
+        self.replays += 1
+        if self.horizon is None:
+            self.horizon = replay.horizon
+
+    def record(self, event_id: str, sequence: int, replay: _ReplayPass | None) -> None:
+        if self.overflow:
+            return
+        if event_id in self.sent:
+            # A repeated replay resends the history the client asked for; only
+            # a live frame or the first replay repeating an id is a duplicate.
+            if replay is None or self.replays <= 1:
+                self.duplicates += 1
+            return
+        if len(self.sent) >= _DELIVERY_LEDGER_CAP:
+            self.overflow = True
+            self.sent.clear()
+            return
+        self.sent[event_id] = sequence
+        if sequence > self.max_sequence:
+            self.max_sequence = sequence
+
+
+def _expected_display_frames_sync(
+    task_id: int, after_sequence: int, through_sequence: int
+) -> dict[str, int]:
+    from ..services.task_event_display import expected_display_frames
+
+    with get_session_local()() as db:
+        return expected_display_frames(
+            db,
+            task_id,
+            after_sequence=after_sequence,
+            through_sequence=through_sequence,
+        )
+
+
+def _report_delivery(ledger: _DeliveryLedger, expected: dict[str, int]) -> None:
+    assert ledger.horizon is not None
+    missing = [seq for event_id, seq in expected.items() if event_id not in ledger.sent]
+    if missing:
+        outcome = "missing"
+    elif ledger.duplicates:
+        outcome = "duplicate"
+    else:
+        outcome = "complete"
+    report_delivery_consistency(
+        ledger.task_id,
+        horizon=ledger.horizon,
+        outcome=outcome,
+        missing=len(missing),
+        first_missing_sequence=min(missing) if missing else None,
+    )
+
+
 class ConnectionManager:
     def __init__(self) -> None:
         # task_id -> List[WebSocket]
@@ -1141,6 +1247,11 @@ class ConnectionManager:
         # Never cleared on disconnect: a guest socket stays projected even
         # after it leaves the task registry.
         self._public_sockets: weakref.WeakSet[WebSocket] = weakref.WeakSet()
+        self._delivery_ledgers: dict[WebSocket, _DeliveryLedger] = {}
+        self._delivery_checks: set[asyncio.Task[None]] = set()
+        self._delivery_check_slots: (
+            tuple[asyncio.AbstractEventLoop, asyncio.Semaphore] | None
+        ) = None
 
     async def connect(self, websocket: WebSocket, task_id: int) -> None:
         await websocket.accept()
@@ -1159,6 +1270,8 @@ class ConnectionManager:
         current_task_id = self._connection_task_ids.get(websocket)
         if current_task_id is not None and current_task_id != task_id:
             self._remove_from_task(websocket, current_task_id)
+            # The ledger describes the previous task's stream only.
+            self._delivery_ledgers.pop(websocket, None)
         if task_id not in self.active_connections:
             self.active_connections[task_id] = []
         if websocket not in self.active_connections[task_id]:
@@ -1179,6 +1292,9 @@ class ConnectionManager:
                 pass
 
     def disconnect(self, websocket: WebSocket) -> None:
+        ledger = self._delivery_ledgers.pop(websocket, None)
+        if ledger is not None:
+            self._schedule_delivery_check(ledger)
         writer = self._writers.pop(websocket, None)
         if writer is not None:
             writer.stop()
@@ -1236,6 +1352,99 @@ class ConnectionManager:
             return json.dumps(public_audience_frame(message))
         return encoded
 
+    def _record_delivery(self, websocket: WebSocket, message: Any) -> None:
+        """Record one frame the socket accepted. O(1); V2 display frames only.
+
+        Only V2 display frames carry an integer ``execution_sequence``; the
+        public-audience projection keeps it and ``event_id`` unchanged.
+        """
+        if not isinstance(message, dict):
+            return
+        replay = _replay_pass.get()
+        sequence = message.get("execution_sequence")
+        if replay is None and type(sequence) is not int:
+            return
+        ledger = self._delivery_ledgers.get(websocket)
+        if ledger is None:
+            task_id = self._connection_task_ids.get(websocket)
+            if task_id is None:
+                return
+            ledger = self._delivery_ledgers[websocket] = _DeliveryLedger(task_id)
+        if replay is not None:
+            ledger.begin_replay(replay)
+        event_id = message.get("event_id")
+        if type(sequence) is int and isinstance(event_id, str):
+            ledger.record(event_id, sequence, replay)
+
+    def _schedule_delivery_check(self, ledger: _DeliveryLedger) -> None:
+        """Start the consistency check of a closed socket without waiting.
+
+        Never raises: it runs inside ``disconnect``.
+        """
+        try:
+            if ledger.horizon is None:
+                # No V2 replay reached this socket: nothing defines its range.
+                return
+            if ledger.overflow:
+                report_delivery_consistency(
+                    ledger.task_id, horizon=ledger.horizon, outcome="overflow"
+                )
+                return
+            if ledger.max_sequence <= ledger.horizon:
+                # Nothing was committed and sent after the replay.
+                _report_delivery(ledger, {})
+                return
+            if len(self._delivery_checks) >= _DELIVERY_CHECK_PENDING_CAP:
+                logger.debug(
+                    "Delivery check skipped task_id=%s: too many pending checks",
+                    ledger.task_id,
+                )
+                return
+            loop = asyncio.get_running_loop()
+            check = loop.create_task(self._check_delivery(ledger))
+            self._delivery_checks.add(check)
+            check.add_done_callback(self._delivery_checks.discard)
+        except Exception:
+            # No running loop (a synchronous caller) or a reporting failure:
+            # observability must not change disconnect handling.
+            return
+
+    def _delivery_check_semaphore(self) -> asyncio.Semaphore:
+        loop = asyncio.get_running_loop()
+        if (
+            self._delivery_check_slots is None
+            or self._delivery_check_slots[0] is not loop
+        ):
+            self._delivery_check_slots = (
+                loop,
+                asyncio.Semaphore(_DELIVERY_CHECK_CONCURRENCY),
+            )
+        return self._delivery_check_slots[1]
+
+    async def _check_delivery(self, ledger: _DeliveryLedger) -> None:
+        assert ledger.horizon is not None
+        horizon = ledger.horizon
+        try:
+            async with self._delivery_check_semaphore():
+                expected = await run_db_io_cancellation_safe(
+                    lambda: _expected_display_frames_sync(
+                        ledger.task_id, horizon, ledger.max_sequence
+                    )
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            report_delivery_check_failure(ledger.task_id, horizon=horizon, error=exc)
+            return
+        _report_delivery(ledger, expected)
+
+    async def stop_delivery_checks(self) -> None:
+        """Cancel pending disconnect checks and wait for them to finish."""
+        pending = list(self._delivery_checks)
+        for check in pending:
+            check.cancel()
+        await asyncio.gather(*pending, return_exceptions=True)
+
     async def send_personal_message(self, message: dict, websocket: WebSocket) -> None:
         versioned_message = await _with_current_task_control_state(message)
         if self._is_public_audience(websocket):
@@ -1246,11 +1455,13 @@ class ConnectionManager:
             await cast(asyncio.Future[None], delivery)
         else:
             await websocket.send_text(json.dumps(versioned_message))
+        self._record_delivery(websocket, versioned_message)
 
     async def deliver_shared_event(self, message: dict[str, Any], task_id: int) -> None:
         encoded = json.dumps(message)
         connections = self.connections_for_task(task_id)
         public_encoded = self._public_encoding(message, encoded, connections)
+        recordable = type(message.get("execution_sequence")) is int
         for connection in connections:
             writer = self._writers.get(connection)
             if writer is None:
@@ -1263,7 +1474,12 @@ class ConnectionManager:
                     writer.enqueue(
                         public_encoded
                         if self._is_public_audience(connection)
-                        else encoded
+                        else encoded,
+                        on_sent=(
+                            partial(self._record_delivery, connection, message)
+                            if recordable
+                            else None
+                        ),
                     )
                 except ConnectionError:
                     self.disconnect(connection)
@@ -1353,6 +1569,7 @@ class ConnectionManager:
                         if self._is_public_audience(connection)
                         else encoded_message
                     )
+                    self._record_delivery(connection, versioned_message)
                     increment_performance_counter("xagent.websocket.messages.sent")
                 except (
                     BrokenResourceError,
@@ -2164,6 +2381,11 @@ class _HistoricalStreamSnapshot:
     """A complete, detached historical replay ready for network delivery."""
 
     events: tuple[dict[str, Any], ...]
+    # V2 only: the committed sequence the replay covers, whether it came from
+    # the history cache, and how many display events it carries.
+    horizon: int | None = None
+    cache_hit: bool = False
+    display_events: int = 0
 
 
 def _add_interruption_reason(
@@ -2282,7 +2504,15 @@ def _load_event_historical_stream_snapshot(
     cache_key = web_task_history_key(task_id)
     cached = cache_get(cache_key) if release_db_connection_if_clean(db) else None
     if isinstance(cached, dict) and cached.get("event_version") == version:
-        return _HistoricalStreamSnapshot(events=tuple(cached["events"]))
+        cached_events = tuple(cached["events"])
+        return _HistoricalStreamSnapshot(
+            events=cached_events,
+            horizon=horizon,
+            cache_hit=True,
+            display_events=sum(
+                1 for event in cached_events if "execution_sequence" in event
+            ),
+        )
 
     snapshot = load_event_display_snapshot(
         db,
@@ -2382,7 +2612,9 @@ def _load_event_historical_stream_snapshot(
             {"event_version": version, "events": detached},
             ttl_seconds=task_cache_ttl_seconds(),
         )
-    return _HistoricalStreamSnapshot(events=tuple(detached))
+    return _HistoricalStreamSnapshot(
+        events=tuple(detached), horizon=horizon, display_events=len(converted)
+    )
 
 
 def _load_historical_stream_snapshot_sync(
@@ -2962,6 +3194,7 @@ async def send_historical_data_as_stream(
     """Send one detached historical snapshot in stream-event order."""
 
     try:
+        started = perf_counter()
         snapshot = await run_db_io_cancellation_safe(
             lambda: _load_historical_stream_snapshot_sync(
                 task_id,
@@ -2971,8 +3204,23 @@ async def send_historical_data_as_stream(
         )
         if snapshot is None:
             return
-        for event in snapshot.events:
-            await manager.send_personal_message(deepcopy(event), websocket)
+        replay_token = None
+        if snapshot.horizon is not None:
+            report_replay(
+                task_id,
+                horizon=snapshot.horizon,
+                events=snapshot.display_events,
+                cache_hit=snapshot.cache_hit,
+                duration_ms=(perf_counter() - started) * 1000,
+            )
+            # Marks these sends as one replay pass in the delivery ledger.
+            replay_token = _replay_pass.set(_ReplayPass(snapshot.horizon))
+        try:
+            for event in snapshot.events:
+                await manager.send_personal_message(deepcopy(event), websocket)
+        finally:
+            if replay_token is not None:
+                _replay_pass.reset(replay_token)
     except (ValueError, KeyError, TypeError) as e:
         logger.error(f"Data format error sending historical data stream: {e}")
         error_event = create_stream_event(
