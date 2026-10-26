@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import logging
 from copy import deepcopy
 from typing import Any, TypeVar
 
@@ -26,18 +25,6 @@ from .task_lease_service import current_task_lease, task_lease_attempt_predicate
 
 _E = TypeVar("_E", bound=BaseException)
 
-# Normal fencing (another owner took over, or the task finished) is routine;
-# a refusal that needs an operator is a warning; unreadable facts are errors.
-_REFUSAL_LEVELS = {
-    "lease_mismatch": logging.INFO,
-    "task_ended": logging.INFO,
-    "task_missing": logging.INFO,
-    "page_limit": logging.WARNING,
-    "unknown_tool_effect": logging.WARNING,
-    "unavailable": logging.WARNING,
-    "corrupt": logging.ERROR,
-}
-
 
 def _refused(
     error: _E,
@@ -50,7 +37,8 @@ def _refused(
 ) -> _E:
     """Report a refusal where it is first raised, then hand the error back.
 
-    Nothing between this module's raise points and its callers reports again.
+    Nothing in this module reports a refusal again as it propagates. Callers
+    outside it report only refusals they raise or convert themselves.
     """
     report_recovery_refusal(
         reader,
@@ -58,7 +46,6 @@ def _refused(
         task_id=task_id,
         run_id=run_id,
         tool_attempt_id=tool_attempt_id,
-        level=_REFUSAL_LEVELS[outcome],
     )
     return error
 
@@ -95,6 +82,7 @@ def check_recovery_owner(db: Session, task_id: int) -> None:
                 "owner_check",
                 "lease_mismatch",
                 task_id=task_id,
+                run_id=lease.run_id,
             )
         query = query.where(
             Task.runner_id == lease.runner_id,
@@ -111,6 +99,7 @@ def check_recovery_owner(db: Session, task_id: int) -> None:
             # Without a lease the query is by id alone: the task row is gone.
             "task_missing" if lease is None else "lease_mismatch",
             task_id=task_id,
+            run_id=lease.run_id if lease is not None else None,
         )
     # Coordinator cancellation can settle a task without releasing its lease.
     # This live status check also covers settlements committed after horizon H.
@@ -120,6 +109,7 @@ def check_recovery_owner(db: Session, task_id: int) -> None:
             "owner_check",
             "task_ended",
             task_id=task_id,
+            run_id=lease.run_id if lease is not None else None,
         )
 
 

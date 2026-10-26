@@ -91,8 +91,12 @@ class ExecutionEventTraceAdapter(DatabaseTraceHandler):
                 CHECKPOINT_LOAD_UNAVAILABLE,
                 f"task {self.task_id}: execution-event checkpoint read failed",
             )
+            lease = current_task_lease()
             report_recovery_refusal(
-                "checkpoint", "unavailable", task_id=self.task_id, level=logging.WARNING
+                "checkpoint",
+                "unavailable",
+                task_id=self.task_id,
+                run_id=lease.run_id if lease is not None else None,
             )
             raise CheckpointUnavailableError(
                 "Execution-event checkpoint read could not complete"
@@ -103,21 +107,44 @@ class ExecutionEventTraceAdapter(DatabaseTraceHandler):
     def _task_has_run_tagged_checkpoint(self, db: Any) -> bool:
         from sqlalchemy import select
 
+        from ..core.agent.checkpoint import CheckpointUnavailableError
         from .models.task_execution_event import TaskExecutionEvent
-
-        return (
-            db.scalar(
-                select(TaskExecutionEvent.id)
-                .where(
-                    TaskExecutionEvent.task_id == self.task_id,
-                    TaskExecutionEvent.scope_id == "root",
-                    TaskExecutionEvent.kind == "recovery_state",
-                    TaskExecutionEvent.run_id.is_not(None),
-                )
-                .limit(1)
-            )
-            is not None
+        from .services.ops_signals import (
+            CHECKPOINT_LOAD_UNAVAILABLE,
+            register_degradation,
         )
+
+        # Mirrors the base probe's failure handling: a DB error must surface
+        # as an incomplete read, never as "no tagged row" and never as a raw
+        # driver exception that the caller would report a second time.
+        try:
+            return (
+                db.scalar(
+                    select(TaskExecutionEvent.id)
+                    .where(
+                        TaskExecutionEvent.task_id == self.task_id,
+                        TaskExecutionEvent.scope_id == "root",
+                        TaskExecutionEvent.kind == "recovery_state",
+                        TaskExecutionEvent.run_id.is_not(None),
+                    )
+                    .limit(1)
+                )
+                is not None
+            )
+        except Exception as exc:
+            register_degradation(
+                CHECKPOINT_LOAD_UNAVAILABLE,
+                f"task {self.task_id}: checkpoint partition probe failed",
+            )
+            logger.error(
+                "task %s: run-tagged checkpoint probe failed",
+                self.task_id,
+                exc_info=True,
+            )
+            raise CheckpointUnavailableError(
+                f"task {self.task_id}: could not determine whether a "
+                "run-tagged checkpoint exists"
+            ) from exc
 
     def _sync_load_latest_checkpoint_unguarded(
         self, db: Any, execution_id: str, partition: Any
@@ -150,6 +177,10 @@ class ExecutionEventTraceAdapter(DatabaseTraceHandler):
             read_committed_tool_outcome,
         )
 
+        # The lease context is a contextvar; read it here, not in the worker
+        # thread that runs ``load``.
+        lease = current_task_lease()
+
         def load() -> dict[str, Any] | None:
             from sqlalchemy.exc import SQLAlchemyError
 
@@ -163,16 +194,18 @@ class ExecutionEventTraceAdapter(DatabaseTraceHandler):
                         task_id=self.task_id,
                         scope_id=self.build_id or "root",
                         tool_call=tool_call,
+                        run_id=lease.run_id if lease is not None else None,
                     )
                     check_recovery_owner(db, self.task_id)
                     return result
             except SQLAlchemyError as exc:
+                attempt_id = tool_call.get("tool_attempt_id")
                 report_recovery_refusal(
                     "tool_outcome",
                     "unavailable",
                     task_id=self.task_id,
-                    tool_attempt_id=str(tool_call.get("tool_attempt_id") or "") or None,
-                    level=logging.WARNING,
+                    run_id=lease.run_id if lease is not None else None,
+                    tool_attempt_id=str(attempt_id) if attempt_id else None,
                 )
                 raise CheckpointUnavailableError(
                     "Committed tool outcome read could not complete"

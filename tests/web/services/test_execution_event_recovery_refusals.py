@@ -155,6 +155,7 @@ def test_owner_check_lease_bound_to_another_task(canonical, caplog, metric_reade
         outcome="lease_mismatch",
         level=logging.INFO,
         task_id=tid + 1,
+        run_id=lease.run_id,
     )
 
 
@@ -176,6 +177,7 @@ def test_owner_check_lease_lost_to_another_owner(canonical, caplog, metric_reade
         outcome="lease_mismatch",
         level=logging.INFO,
         task_id=tid,
+        run_id=lease.run_id,
     )
 
 
@@ -221,6 +223,7 @@ def test_owner_check_task_ended(canonical, caplog, metric_reader, status, leased
         outcome="task_ended",
         level=logging.INFO,
         task_id=tid,
+        run_id=lease.run_id if lease is not None else None,
     )
 
 
@@ -700,12 +703,14 @@ async def test_stale_lease_is_reported_once_per_read(canonical, caplog, metric_r
         outcome="lease_mismatch",
         level=logging.INFO,
         task_id=tid,
+        run_id=lease.run_id,
     )
     caplog.clear()
     with bind_task_lease_context(lease):
         with pytest.raises(CheckpointAccessRefusedError):
             await store.load_committed_tool_outcome(call("attempt-s"))
     assert len(records(caplog)) == 1
+    assert f"run_id={lease.run_id} " in records(caplog)[0].getMessage()
     assert refusal_counts(metric_reader) == {
         key(operation="owner_check", outcome="lease_mismatch", storage="v2"): 2
     }
@@ -801,6 +806,121 @@ async def test_database_failure_during_tool_outcome_read_is_unavailable_once(
     )
 
 
+@pytest.mark.asyncio
+async def test_adapter_tool_outcome_refusal_carries_the_bound_run_id(
+    canonical, caplog, metric_reader
+):
+    factory, tid = canonical
+    caplog.set_level(logging.INFO)
+    with factory() as db:
+        lease = acquire_task_lease(db, tid, new_run=True)
+    store = TraceCheckpointStore(tracer_for(tid))
+    with bind_task_lease_context(lease):
+        await PatternRuntime(tracer=store).on_tool_start(tool_call=call("attempt-r1"))
+        with pytest.raises(UnknownToolEffectError):
+            await store.load_committed_tool_outcome(call("attempt-r1"))
+    assert_one(
+        caplog,
+        metric_reader,
+        reader="tool_outcome",
+        outcome="unknown_tool_effect",
+        level=logging.WARNING,
+        task_id=tid,
+        run_id=lease.run_id,
+        tool_attempt_id="attempt-r1",
+    )
+
+
+@pytest.mark.asyncio
+async def test_adapter_unavailable_reports_carry_the_bound_run_id(
+    canonical, caplog, metric_reader, monkeypatch
+):
+    factory, tid = canonical
+    caplog.set_level(logging.INFO)
+    with factory() as db:
+        lease = acquire_task_lease(db, tid, new_run=True)
+    store = TraceCheckpointStore(tracer_for(tid))
+    monkeypatch.setattr(recovery, "read_committed_tool_outcome", failing_read)
+    with bind_task_lease_context(lease):
+        with pytest.raises(CheckpointUnavailableError):
+            await store.load_committed_tool_outcome(call("attempt-r2"))
+    assert_one(
+        caplog,
+        metric_reader,
+        reader="tool_outcome",
+        outcome="unavailable",
+        level=logging.WARNING,
+        task_id=tid,
+        run_id=lease.run_id,
+        tool_attempt_id="attempt-r2",
+    )
+
+
+@pytest.mark.asyncio
+async def test_adapter_checkpoint_unavailable_carries_the_bound_run_id(
+    canonical, caplog, metric_reader, monkeypatch
+):
+    factory, tid = canonical
+    caplog.set_level(logging.INFO)
+    with factory() as db:
+        lease = acquire_task_lease(db, tid, new_run=True)
+    store = TraceCheckpointStore(tracer_for(tid))
+    monkeypatch.setattr(recovery, "read_event_checkpoint", failing_read)
+    with bind_task_lease_context(lease):
+        with pytest.raises(CheckpointUnavailableError):
+            await store.load_latest_checkpoint("execution")
+    assert_one(
+        caplog,
+        metric_reader,
+        reader="checkpoint",
+        outcome="unavailable",
+        level=logging.WARNING,
+        task_id=tid,
+        run_id=lease.run_id,
+    )
+
+
+@pytest.mark.asyncio
+async def test_widened_read_with_failing_probe_reports_one_refusal(
+    canonical, caplog, metric_reader, monkeypatch
+):
+    """A failed staleness probe after a corrupt verdict is not a second refusal."""
+    factory, tid = canonical
+    caplog.set_level(logging.INFO)
+    # An untagged (legacy) checkpoint: the lease-bound reader below widens.
+    await save_checkpoint(tid, execution_id=str(tid))
+    with factory() as db:
+        set_payload_version(db, tid)
+        lease = acquire_task_lease(db, tid, new_run=True)
+    probes: list[int] = []
+    original_scalar = Session.scalar
+
+    def scalar(self, statement, *args, **kwargs):
+        if "run_id IS NOT NULL" in str(statement):
+            probes.append(1)
+            if len(probes) > 1:
+                raise OperationalError(
+                    "SELECT", {"param": SENTINEL}, RuntimeError(f"offline {SENTINEL}")
+                )
+        return original_scalar(self, statement, *args, **kwargs)
+
+    monkeypatch.setattr(Session, "scalar", scalar)
+    store = TraceCheckpointStore(tracer_for(tid))
+    with bind_task_lease_context(lease):
+        with pytest.raises(CheckpointUnavailableError) as raised:
+            await store.load_latest_checkpoint(str(tid))
+    assert len(probes) == 2
+    assert isinstance(raised.value.__cause__, OperationalError)
+    assert_one(
+        caplog,
+        metric_reader,
+        reader="checkpoint",
+        outcome="corrupt",
+        level=logging.ERROR,
+        task_id=tid,
+    )
+
+
 # ------------------------------------------------------------ the reporter
 
 
@@ -825,7 +945,9 @@ def test_report_logs_the_documented_line(caplog, metric_reader):
         run_id="run-7",
         tool_attempt_id="attempt-7",
     )
-    report_recovery_refusal("owner_check", "task_ended", task_id=8, level=logging.INFO)
+    report_recovery_refusal("owner_check", "task_ended", task_id=8)
+    report_recovery_refusal("checkpoint", "corrupt", task_id=9)
+    report_recovery_refusal("checkpoint", "an_unlisted_outcome", task_id=10)
     lines = [(r.levelno, r.getMessage()) for r in records(caplog)]
     assert lines == [
         (
@@ -839,8 +961,21 @@ def test_report_logs_the_documented_line(caplog, metric_reader):
             "execution_event_recovery_refused task_id=8 run_id=- storage=v2 "
             "component=execution-events reader=owner_check outcome=task_ended",
         ),
+        (
+            logging.ERROR,
+            "execution_event_recovery_refused task_id=9 run_id=- storage=v2 "
+            "component=execution-events reader=checkpoint outcome=corrupt",
+        ),
+        (
+            logging.WARNING,
+            "execution_event_recovery_refused task_id=10 run_id=- storage=v2 "
+            "component=execution-events reader=checkpoint "
+            "outcome=an_unlisted_outcome",
+        ),
     ]
     assert refusal_counts(metric_reader) == {
         key(operation="tool_outcome", outcome="unknown_tool_effect", storage="v2"): 1,
         key(operation="owner_check", outcome="task_ended", storage="v2"): 1,
+        key(operation="checkpoint", outcome="corrupt", storage="v2"): 1,
+        key(operation="checkpoint", outcome="an_unlisted_outcome", storage="v2"): 1,
     }

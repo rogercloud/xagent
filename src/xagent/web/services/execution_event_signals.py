@@ -9,6 +9,8 @@ ids appear in logs only, never as metric attributes.
 
 ``report_commit_failure`` covers failed event commits;
 ``report_recovery_refusal`` covers recovery reads that refuse to resume a task.
+Its counter counts refused reads, including classification probes, so it is
+neither a per-task nor a per-resume count; see that helper for known gaps.
 """
 
 from __future__ import annotations
@@ -23,6 +25,16 @@ logger = logging.getLogger(__name__)
 
 COMMIT_FAILURE_COUNTER = "xagent.execution_event.commit.failures"
 RECOVERY_REFUSAL_COUNTER = "xagent.execution_event.recovery.refusals"
+
+_REFUSAL_LEVELS = {
+    "lease_mismatch": logging.INFO,
+    "task_ended": logging.INFO,
+    "task_missing": logging.INFO,
+    "page_limit": logging.WARNING,
+    "unknown_tool_effect": logging.WARNING,
+    "unavailable": logging.WARNING,
+    "corrupt": logging.ERROR,
+}
 
 
 def _failure_type(error: BaseException) -> str:
@@ -83,7 +95,6 @@ def report_recovery_refusal(
     task_id: int,
     run_id: str | None = None,
     tool_attempt_id: str | None = None,
-    level: int = logging.WARNING,
 ) -> None:
     """Report one V2 recovery read that refused to resume a task.
 
@@ -92,8 +103,26 @@ def report_recovery_refusal(
     that become metric attributes. Call it where the refusal is first raised
     or converted, once per refusal, never again as it propagates. Never
     raises, so a failure to report cannot mask the refusal itself.
+
+    The log level follows the outcome: normal fencing (another owner took
+    over, or the task already ended) is routine and logs at INFO, a refusal
+    that needs an operator logs at WARNING, and unreadable facts log at
+    ERROR. Unlisted outcomes default to WARNING.
+
+    The counter counts refused READS, not tasks and not resumes.
+    Classification probes read the same facts as a resume (the lease recovery
+    sweep, settlement classification, auto-recovery decisions), so one stuck
+    task can count once per sweep for as long as it stays unresumable.
+
+    Known gap: refusals raised by the shared ``DatabaseTraceHandler`` base on
+    the V2 root checkpoint path (``_root_checkpoint_read_partition``:
+    lease/run mismatch, ``active_run``, ``superseded_legacy``, a missing task
+    without a lease; the stale-widening check; a failed run-tagged probe;
+    session checkout) and the setup-time corrupt check in
+    ``task_setup_snapshot.py`` are not reported by this signal yet.
     """
     try:
+        level = _REFUSAL_LEVELS.get(outcome, logging.WARNING)
         increment_counter(
             RECOVERY_REFUSAL_COUNTER,
             attributes={"operation": reader, "outcome": outcome, "storage": "v2"},
