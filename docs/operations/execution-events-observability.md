@@ -27,15 +27,12 @@ Set the same variables for every process that should report: the web
 process and the worker processes (`XAGENT_TASK_EXECUTION_ROLE=worker`, or the
 workers started by the `combined` launcher, which inherit the environment).
 
-Current limitation: the exporter is initialised in the web application's
-startup only (`start_runtime_performance_monitor` in `xagent.web.app`). The
-standalone worker entrypoint (`xagent.web.worker`) does not initialise it, so
-a worker process that has these variables set still exports nothing, and the
-counters that worker-side code increments (trace writes, write retries) go to
-a no-op meter. In shared mode, execute-side signals are therefore available
-today only from the logs of the worker processes. Check the startup log of
-each process for `Runtime performance telemetry OTLP export is enabled`; a
-process that does not print it is not exporting.
+Both the web application and the worker entrypoint (`xagent.web.worker`)
+start the exporter. In a split deployment the workers record the
+execution-side counters (trace writes, write retries), so configure export on
+them, not only on web processes. Check the startup log of each process for
+`Runtime performance telemetry OTLP export is enabled`; a process that does
+not print it is not exporting.
 
 ### Per-minute `runtime diagnostics` log line
 
@@ -43,7 +40,7 @@ Every app process (`combined` or `web` role) and every worker logs one INFO
 line per 60 s window, with no switch:
 
 ```
-runtime diagnostics role=worker pid=4242 window_s=60.0 inflight=1 resume_inflight=0 started_1m=2 finished_1m=1 ok=1 failed=0 cancelled=0 gate_held_s=0.0 slot_tenants=1 slot_top=1 loop_lag_max_ms=12.3 loop_lag_samples=0
+runtime diagnostics role=worker pid=4242 window_s=60.0 inflight=1 resume_inflight=0 started_1m=2 finished_1m=1 ok=1 failed=0 cancelled=0 gate_held_s=0.0 slot_tenants=1 slot_top=1 loop_lag_max_ms=12.3 loop_lag_samples=0 degradations=-
 ```
 
 A pid that stops appearing for two windows is gone or has a blocked event
@@ -58,7 +55,9 @@ task's stored status. Field definitions are in
 `degradations` list of signal names. It is unauthenticated, so names only; the
 detail strings (which can name a task) are in the logs and in the admin
 endpoint below. The registry is per process: `/health` on the web process says
-nothing about the workers.
+nothing about the workers. A worker's active degradations appear, names only,
+at the end of its per-minute `runtime diagnostics` line (`degradations=`, `-`
+when none).
 
 ## 2. Existing signals by problem class
 
