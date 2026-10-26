@@ -1,11 +1,14 @@
-"""Operator signals for V2 execution-event writes.
+"""Operator signals for V2 execution-event writes and recovery reads.
 
 Each helper emits two kinds of signal for one occurrence: a single structured
 log line that locates the task (and the tool attempt where relevant), and a
 metric with bounded attributes for rates. Neither carries payload content or
 exception text; exception messages can embed user data, so only type names,
-identifiers, SQLSTATEs and numbers are reported. Task ids appear in logs only,
-never as metric attributes.
+identifiers, SQLSTATEs, bounded reason names and numbers are reported. Task
+ids appear in logs only, never as metric attributes.
+
+``report_commit_failure`` covers failed event commits;
+``report_recovery_refusal`` covers recovery reads that refuse to resume a task.
 """
 
 from __future__ import annotations
@@ -19,6 +22,7 @@ from .db_write_retry import cause_links, database_sqlstate
 logger = logging.getLogger(__name__)
 
 COMMIT_FAILURE_COUNTER = "xagent.execution_event.commit.failures"
+RECOVERY_REFUSAL_COUNTER = "xagent.execution_event.recovery.refusals"
 
 
 def _failure_type(error: BaseException) -> str:
@@ -67,6 +71,42 @@ def report_commit_failure(
             message += " tool_attempt_id=%s"
             args.append(tool_attempt_id)
         logger.error(message, *args)
+    except Exception:
+        # Observability must never change the behavior of the measured path.
+        return
+
+
+def report_recovery_refusal(
+    reader: str,
+    outcome: str,
+    *,
+    task_id: int,
+    run_id: str | None = None,
+    tool_attempt_id: str | None = None,
+    level: int = logging.WARNING,
+) -> None:
+    """Report one V2 recovery read that refused to resume a task.
+
+    ``reader`` names the read (``owner_check``, ``checkpoint``,
+    ``tool_outcome``) and ``outcome`` why it refused; both are bounded names
+    that become metric attributes. Call it where the refusal is first raised
+    or converted, once per refusal, never again as it propagates. Never
+    raises, so a failure to report cannot mask the refusal itself.
+    """
+    try:
+        increment_counter(
+            RECOVERY_REFUSAL_COUNTER,
+            attributes={"operation": reader, "outcome": outcome, "storage": "v2"},
+        )
+        message = (
+            "execution_event_recovery_refused task_id=%s run_id=%s storage=v2 "
+            "component=execution-events reader=%s outcome=%s"
+        )
+        args: list[object] = [task_id, run_id or "-", reader, outcome]
+        if tool_attempt_id:
+            message += " tool_attempt_id=%s"
+            args.append(tool_attempt_id)
+        logger.log(level, message, *args)
     except Exception:
         # Observability must never change the behavior of the measured path.
         return

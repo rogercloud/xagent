@@ -21,7 +21,10 @@ from ..core.agent.trace import (
 from ..core.tracing import create_agent_tracer
 from .models.user import User
 from .services.db_write_retry import retry_db_write_async
-from .services.execution_event_signals import report_commit_failure
+from .services.execution_event_signals import (
+    report_commit_failure,
+    report_recovery_refusal,
+)
 from .services.task_lease_service import current_task_lease
 from .services.trace_handlers import CommitState, DatabaseTraceHandler
 
@@ -87,6 +90,9 @@ class ExecutionEventTraceAdapter(DatabaseTraceHandler):
             register_degradation(
                 CHECKPOINT_LOAD_UNAVAILABLE,
                 f"task {self.task_id}: execution-event checkpoint read failed",
+            )
+            report_recovery_refusal(
+                "checkpoint", "unavailable", task_id=self.task_id, level=logging.WARNING
             )
             raise CheckpointUnavailableError(
                 "Execution-event checkpoint read could not complete"
@@ -161,6 +167,13 @@ class ExecutionEventTraceAdapter(DatabaseTraceHandler):
                     check_recovery_owner(db, self.task_id)
                     return result
             except SQLAlchemyError as exc:
+                report_recovery_refusal(
+                    "tool_outcome",
+                    "unavailable",
+                    task_id=self.task_id,
+                    tool_attempt_id=str(tool_call.get("tool_attempt_id") or "") or None,
+                    level=logging.WARNING,
+                )
                 raise CheckpointUnavailableError(
                     "Committed tool outcome read could not complete"
                 ) from exc
