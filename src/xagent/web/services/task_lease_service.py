@@ -613,14 +613,15 @@ def run_has_unknown_tool_effect(db: Session, lease: TaskLease) -> bool:
 
 
 def log_unknown_tool_effect_settlement(task_id: int, run_id: str | None) -> None:
-    """The operator signal of a run settled as an unknown tool effect."""
+    """The operator signal of a run settled as an unknown tool effect.
 
-    logger.warning(
-        "Task %s run %s settles as an unknown tool effect (verdict %s)",
-        task_id,
-        run_id,
-        CheckpointRecoveryVerdict.UNKNOWN_TOOL_EFFECT.value,
-    )
+    Only the V2 event-log checkpoint read yields this verdict, so the storage
+    is always ``v2``. Call it once per task settled.
+    """
+
+    from .execution_event_signals import report_unknown_outcome
+
+    report_unknown_outcome("tool_effect", task_id=task_id, run_id=run_id, storage="v2")
 
 
 def resolve_checkpoint_recovery_with_data(

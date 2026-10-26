@@ -94,7 +94,7 @@ from .db_write_retry import (
     bound_rerun_lock_wait_no_commit,
     retry_db_write_async,
 )
-from .execution_event_signals import report_commit_failure
+from .execution_event_signals import report_commit_failure, report_unknown_outcome
 from .external_task_cancel import (
     EXTERNAL_TASK_SOURCE,
     EXTERNAL_TURN_INTERRUPTED_MESSAGE,
@@ -1584,6 +1584,21 @@ def _claim_turn_no_commit(
     return _ClaimedTurn(**vars(accepted), task_lease=lease)
 
 
+def _report_turn_commit_unknown(
+    task_id: int, payload: TaskTurnPayload, claimed: _PreparedTurn | None
+) -> None:
+    """Report one turn acceptance whose COMMIT outcome could not be resolved.
+
+    No storage version is in scope at the raise sites, so it is ``unknown``.
+    """
+    report_unknown_outcome(
+        "turn_commit",
+        task_id=task_id,
+        run_id=(claimed.run_id or None) if claimed is not None else None,
+        ref=payload.turn_id,
+    )
+
+
 def _begin_turn_atomic_sync(
     task_id: int,
     task_owner_user_id: int,
@@ -1655,6 +1670,7 @@ def _begin_turn_atomic_sync(
             ):
                 invalidate_task_cache_best_effort(task_id)
                 return result
+            _report_turn_commit_unknown(task_id, payload, result)
             raise TaskTurnCommitOutcomeUnknown(
                 task_id, payload.turn_id
             ) from commit_error
@@ -1810,6 +1826,7 @@ def commit_claimed_turn_or_reconcile(
             claimed=claimed,
         ):
             return
+        _report_turn_commit_unknown(task_id, payload, claimed)
         raise TaskTurnCommitOutcomeUnknown(task_id, payload.turn_id) from commit_error
 
 
@@ -2730,6 +2747,11 @@ def _schedule_bg(
                     # checkpoint. Settling here would fail a run that may be
                     # resumable; keep the lease and let TTL recovery decide.
                     defer_settlement_to_ttl_recovery = True
+                    report_unknown_outcome(
+                        "settlement_deferred",
+                        task_id=task_id,
+                        run_id=lease.run_id if lease is not None else run_id,
+                    )
                     logger.error(
                         "task_id=%s component=settlement interrupted run's "
                         "checkpoint unresolvable; retaining lease for TTL "
@@ -2942,6 +2964,15 @@ def _schedule_bg(
                         # Preserve the concrete lease on failure. Its TTL is the
                         # recovery path; clearing it here would create an ownerless
                         # RUNNING row and permit an overlapping execution.
+                        if isinstance(settle_err, InterruptionSettlementDeferred):
+                            # Raised by the settlement itself, not by the run
+                            # (which skips settlement when it defers), so it is
+                            # a different occurrence from the one above.
+                            report_unknown_outcome(
+                                "settlement_deferred",
+                                task_id=task_id,
+                                run_id=lease.run_id,
+                            )
                         logger.error(
                             "task %s lease settlement failed: %s; "
                             "retaining lease for TTL recovery",

@@ -214,7 +214,7 @@ async def test_lost_tool_result_settles_as_unknown_effect(
     from xagent.web.services.client_error_messages import CLIENT_SAFE_TASK_FAILURE
 
     monkeypatch.setenv("XAGENT_TASK_INFRA_FAILURE_PAUSE_ENABLED", pause_switch)
-    caplog.set_level("WARNING", logger="xagent.web.services.task_lease_service")
+    caplog.set_level("WARNING", logger="xagent.web.services.execution_event_signals")
     factory, tid = canonical
     with factory() as db:
         lease = acquire_task_lease(db, tid, new_run=True)
@@ -237,13 +237,15 @@ async def test_lost_tool_result_settles_as_unknown_effect(
     assert "Conversation event commit failed" not in str(published)
     assert TASK_UNKNOWN_TOOL_EFFECT_SETTLEMENT_ERROR not in str(published)
     _assert_client_safe_failure_transcript(factory, tid)
+    # The operator signal is one structured line per settlement; the
+    # unknown-outcome tests cover it in full.
     assert [
         record.getMessage()
         for record in caplog.records
-        if "unknown tool effect" in record.getMessage()
+        if record.getMessage().startswith("execution_event_outcome_unknown ")
     ] == [
-        f"Task {tid} run {lease.run_id} settles as an unknown tool effect "
-        "(verdict unknown_tool_effect)"
+        f"execution_event_outcome_unknown task_id={tid} run_id={lease.run_id} "
+        "storage=v2 component=execution-events kind=tool_effect ref=-"
     ]
 
 

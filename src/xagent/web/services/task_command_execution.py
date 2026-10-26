@@ -106,6 +106,7 @@ from .db_runtime import (
     is_database_pool_timeout,
     run_db_io_cancellation_safe,
 )
+from .execution_event_signals import report_unknown_outcome
 from .external_task_cancel import (
     EXTERNAL_CANCEL_BROADCAST_REJECTION_REASONS,
     EXTERNAL_COMMAND_SCOPE,
@@ -869,6 +870,13 @@ def _claim_user_message_delivery_isolated(
                     expected_run_id=expected_run_id,
                     expected_status=expected_status,
                 ):
+                    # No storage version is in scope here: reported as unknown.
+                    report_unknown_outcome(
+                        "command_commit",
+                        task_id=task_id,
+                        run_id=expected_run_id,
+                        ref=turn_id,
+                    )
                     raise _TaskCommandCommitOutcomeUnknown(
                         f"live delivery {turn_id} has an unknown commit outcome"
                     ) from commit_error
@@ -1290,6 +1298,12 @@ def _prepare_task_message_sync(
                     expected_run_id=routing.run_id,
                     expected_status=TaskStatus.RUNNING,
                 ):
+                    report_unknown_outcome(
+                        "command_commit",
+                        task_id=routing.task_id,
+                        run_id=routing.run_id,
+                        ref=turn_id,
+                    )
                     raise _TaskCommandCommitOutcomeUnknown(
                         f"created task turn {turn_id} has an unknown commit outcome"
                     ) from commit_error
