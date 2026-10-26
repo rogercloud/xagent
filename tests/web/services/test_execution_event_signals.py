@@ -8,6 +8,7 @@ exported, so an attribute outside the exporter's allowed keys fails here.
 from __future__ import annotations
 
 import logging
+
 import pytest
 from sqlalchemy.exc import IntegrityError, OperationalError
 
@@ -16,10 +17,12 @@ from tests.web.services.test_outbound_input_commit_retry import (
 )
 from tests.web.services.test_outbound_input_commit_retry import (
     any_commit,
-    question,
 )
 from tests.web.services.test_outbound_input_commit_retry import (
     outbound as outbound_fixture,
+)
+from tests.web.services.test_outbound_input_commit_retry import (
+    question,
 )
 from tests.web.services.test_task_execution_event_writer import (
     canonical as canonical_fixture,
@@ -31,13 +34,15 @@ from tests.web.services.test_task_execution_event_writer import (
 from tests.web.services.test_trace_fact_commit_retry import (
     fail_commits,
     holds_fact,
-    tool_end,
-    tool_start,
 )
 from tests.web.services.test_trace_fact_commit_retry import (
     immediate_retries as immediate_retries_fixture,
 )
-from tests.web.services.test_trace_fact_commit_retry import task_start
+from tests.web.services.test_trace_fact_commit_retry import (
+    task_start,
+    tool_end,
+    tool_start,
+)
 from xagent.core.agent.checkpoint import ExecutionEventPersistenceError
 from xagent.core.agent.trace import (
     TraceAction,
@@ -436,6 +441,34 @@ async def test_terminal_failure_commit_failure_is_reported(
             storage="v2",
         ): 1
     }
+
+
+@pytest.mark.asyncio
+async def test_terminal_failure_read_after_commit_is_not_a_commit_failure(
+    canonical, monkeypatch, caplog, metric_reader
+):
+    """The fact committed; failing to read the reply loses no write."""
+    factory, task_id = canonical
+    with factory() as db:
+        task = db.get(Task, task_id)
+        task.status = TaskStatus.RUNNING
+        task.runner_id = None
+        task.run_id = "run-terminal"
+        db.commit()
+
+    def unreadable(*_args, **_kwargs):
+        raise OperationalError("SELECT", {}, Exception("connection lost"))
+
+    monkeypatch.setattr(task_execution, "_task_error_payload", unreadable)
+    with caplog.at_level(logging.DEBUG):
+        with pytest.raises(ExecutionEventPersistenceError):
+            task_execution._terminal_task_error_payload(
+                task_id, "boom", expected_run_id="run-terminal"
+            )
+    with factory() as db:
+        assert db.get(Task, task_id).status == TaskStatus.FAILED
+    assert failure_lines(caplog) == []
+    assert failures(metric_reader) == {}
 
 
 # ------------------------------------------------------------ writes counter

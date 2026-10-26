@@ -591,6 +591,9 @@ def _terminal_task_error_payload(
     SessionLocal = get_session_local()
     db = SessionLocal()
     canonical = False
+    # Set once the write has committed or was skipped; a failure after that
+    # (reading the payload to return) did not lose a fact.
+    write_settled = False
     try:
         from .task_execution_event_writer import uses_execution_events
 
@@ -630,6 +633,7 @@ def _terminal_task_error_payload(
         result = db.execute(statement.execution_options(synchronize_session=False))
         if int(getattr(result, "rowcount", 0) or 0) != 1:
             db.rollback()
+            write_settled = True
             current_payload = _task_error_payload(
                 db,
                 task_id,
@@ -677,6 +681,7 @@ def _terminal_task_error_payload(
                 db.refresh(task)
                 stage_result_fact_no_commit(db, task, {"error": message})
             db.commit()
+        write_settled = True
         return _task_error_payload(
             db,
             task_id,
@@ -688,13 +693,14 @@ def _terminal_task_error_payload(
         if canonical:
             from ...core.agent.checkpoint import ExecutionEventPersistenceError
 
-            report_commit_failure(
-                "terminal_failure",
-                exc,
-                task_id=task_id,
-                run_id=expected_run_id,
-                retried=False,
-            )
+            if not write_settled:
+                report_commit_failure(
+                    "terminal_failure",
+                    exc,
+                    task_id=task_id,
+                    run_id=expected_run_id,
+                    retried=False,
+                )
             raise ExecutionEventPersistenceError(
                 "Terminal failure event commit failed"
             ) from exc
