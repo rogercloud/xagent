@@ -428,20 +428,30 @@ def trigger_error_for_recorded(
     return default
 
 
-async def publish_recovery_notices(notices: Iterable[RecoveryNotice]) -> None:
-    """Broadcast committed notices; best effort, a failure is only logged."""
+async def publish_recovery_notices(
+    notices: Iterable[RecoveryNotice],
+) -> tuple[dict[str, Any], ...]:
+    """Broadcast committed notices; best effort, a failure is only logged.
+
+    Returns each notice's message as built for the broadcast (timestamp
+    included), whether or not that broadcast went through.
+    """
 
     from .task_events import publish_task_event
 
+    messages: list[dict[str, Any]] = []
     for notice in notices:
+        message = notice.message()
+        messages.append(message)
         try:
-            await publish_task_event(notice.message(), notice.task_id)
+            await publish_task_event(message, notice.task_id)
         except Exception:
             logger.warning(
                 "task_recovery_update committed but broadcast failed for task %s",
                 notice.task_id,
                 exc_info=True,
             )
+    return tuple(messages)
 
 
 # --------------------------------------------------------------------------

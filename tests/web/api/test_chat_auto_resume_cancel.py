@@ -26,6 +26,7 @@ from xagent.web.models.database import get_db, get_session_local
 from xagent.web.models.task import Task, TaskStatus
 from xagent.web.models.task_auto_recovery import TaskAutoRecovery, TaskRecoveryEvent
 from xagent.web.models.user import User
+from xagent.web.services import task_events, task_orchestrator
 from xagent.web.services import web_auto_resume_cancel as web_cancel
 from xagent.web.services.hot_path_cache import (
     InMemoryTTLCache,
@@ -72,7 +73,7 @@ def published(monkeypatch) -> list[dict[str, Any]]:
             row = db.get(TaskAutoRecovery, task_id)
             messages.append({**message, "_row": (row.state, row.state_detail)})
 
-    monkeypatch.setattr(web_cancel, "publish_task_event", publish)
+    monkeypatch.setattr(task_events, "publish_task_event", publish)
     return messages
 
 
@@ -287,7 +288,7 @@ def test_an_admin_cancels_another_users_task(bob, published):
         db.close()
 
 
-def test_a_task_gone_before_the_lock_reads_404(bob, monkeypatch):
+def test_a_service_answering_missing_reads_404(bob, monkeypatch):
     task_id = _task()
 
     async def gone(**_kwargs):
@@ -298,6 +299,28 @@ def test_a_task_gone_before_the_lock_reads_404(bob, monkeypatch):
     monkeypatch.setattr("xagent.web.api.chat.cancel_auto_resume_for_web", gone)
 
     assert _post(task_id, bob).status_code == 404
+
+
+def test_a_task_expired_between_the_check_and_the_lock_reads_410(bob, monkeypatch):
+    """Retention purged the task after the unlocked check: its owner is told
+    it expired, as GET would."""
+    task_id = _task()
+    attempt = web_cancel._cancel_once_no_commit
+
+    def purged_first(db, **kwargs):
+        purge = _direct_db_session()
+        try:
+            purge.query(TaskAutoRecovery).filter_by(task_id=task_id).delete()
+            purge.query(Task).filter_by(id=task_id).delete()
+            purge.commit()
+        finally:
+            purge.close()
+        insert_tombstone(task_id=task_id, user_id=_user_id("bob"))
+        return attempt(db, **kwargs)
+
+    monkeypatch.setattr(web_cancel, "_cancel_once_no_commit", purged_first)
+
+    assert_task_expired(_post(task_id, bob), task_id)
 
 
 # --------------------------------------------------------------------------
@@ -383,10 +406,51 @@ def test_a_cancel_that_keeps_racing_reads_409_task_busy(bob, published, monkeypa
 
 
 @pytest.mark.parametrize(
-    "body", [{"run_id": RUN_ID, "state_version": 7}, {"run_id": "r" * 65}]
+    "body",
+    [{"run_id": RUN_ID, "state_version": 7}, {"run_id": "r" * 65}, {"run_id": ""}],
+    ids=["unknown_field", "run_id_too_long", "run_id_empty"],
 )
 def test_an_invalid_body_reads_422(bob, body):
     task_id = _task()
 
     assert _post(task_id, bob, body).status_code == 422
     assert _row(task_id) == ("scheduled", None, STATE_VERSION)
+
+
+def test_a_failing_cancel_reads_500_and_writes_nothing(bob, published, monkeypatch):
+    task_id = _task()
+
+    def failing(db, task, **_kwargs):
+        # A write staged before the failure must not be kept.
+        db.query(Task).filter_by(id=task.id).update({"state_version": 99})
+        raise RuntimeError("cancel failed")
+
+    monkeypatch.setattr(web_cancel, "cancel_pending_auto_resume_no_commit", failing)
+
+    response = _post(task_id, bob)
+
+    assert response.status_code == 500
+    assert "cancel failed" not in response.text
+    assert _row(task_id) == ("scheduled", None, STATE_VERSION)
+    assert published == []
+
+
+def test_a_failed_cache_drop_still_answers_the_cancel(bob, published, monkeypatch):
+    """After the commit only best-effort work runs: the person is still told
+    the cancel happened, with its notice, and it is broadcast."""
+    task_id = _task()
+
+    def failing(_task_id):
+        raise RuntimeError("cache down")
+
+    monkeypatch.setattr(task_orchestrator, "invalidate_task_cache", failing)
+
+    response = _post(task_id, bob)
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["outcome"] == "cancelled"
+    assert body["state_version"] == STATE_VERSION + 1
+    (message,) = published
+    message.pop("_row")
+    assert body["notice"] == message

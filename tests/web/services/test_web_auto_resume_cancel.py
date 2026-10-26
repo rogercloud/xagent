@@ -19,6 +19,8 @@ from unittest.mock import AsyncMock
 
 import pytest
 import sqlalchemy as sa
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
 
 from tests.web.services.channel_delivery_shared import (
     database_url as database_url_fixture,
@@ -46,7 +48,9 @@ from tests.web.services.test_channel_reply_hold import (
     short_lock_timeout as short_lock_timeout_fixture,
 )
 from tests.web.services.test_task_auto_resume import _trigger
-from xagent.web.models.database import get_session_local
+from xagent.web.api.chat import chat_router
+from xagent.web.auth_dependencies import get_current_user
+from xagent.web.models.database import get_db, get_session_local
 from xagent.web.models.task import Task, TaskStatus
 from xagent.web.models.task_auto_recovery import (
     TaskAutoRecovery,
@@ -57,9 +61,21 @@ from xagent.web.models.task_channel_delivery import TaskChannelDelivery
 from xagent.web.models.task_command import TaskExecutionCommand
 from xagent.web.models.trigger import TriggerRun, TriggerRunStatus
 from xagent.web.models.user import User
-from xagent.web.services import channel_delivery, task_auto_resume
+from xagent.web.services import (
+    channel_delivery,
+    channel_stop,
+    task_auto_resume,
+    task_events,
+)
 from xagent.web.services import web_auto_resume_cancel as web_cancel
+from xagent.web.services.channel_stop import ChannelStopOutcome, stop_channel_task_sync
 from xagent.web.services.execution_result_projection import interrupted_channel_result
+from xagent.web.services.hot_path_cache import (
+    InMemoryTTLCache,
+    cache_set,
+    set_cache_backend_for_testing,
+    web_task_detail_key,
+)
 from xagent.web.services.task_auto_resume import (
     AutoResumeCancel,
     cancel_pending_auto_resume_no_commit,
@@ -447,7 +463,7 @@ async def test_the_message_returned_is_the_one_published_after_the_commit(
             row = db.get(TaskAutoRecovery, task_id)
             published.append((message, task_id, (row.state, row.state_detail)))
 
-    monkeypatch.setattr(web_cancel, "publish_task_event", publish)
+    monkeypatch.setattr(task_events, "publish_task_event", publish)
 
     result = await cancel_auto_resume_for_web(
         task_id=tid, actor_user_id=_owner(factory, tid), actor_is_admin=False
@@ -473,7 +489,7 @@ async def test_the_message_returned_is_the_one_published_after_the_commit(
 async def test_a_failed_broadcast_keeps_the_cancel(factory, invalidated, monkeypatch):
     tid = _seeded(factory)
     monkeypatch.setattr(
-        web_cancel, "publish_task_event", AsyncMock(side_effect=RuntimeError("down"))
+        task_events, "publish_task_event", AsyncMock(side_effect=RuntimeError("down"))
     )
 
     result = await cancel_auto_resume_for_web(
@@ -481,7 +497,66 @@ async def test_a_failed_broadcast_keeps_the_cancel(factory, invalidated, monkeyp
     )
 
     assert result.outcome is Outcome.CANCELLED
+    # The response still carries the notice it could not broadcast.
+    assert result.messages[0]["state_version"] == PV + 1
     assert _state(factory, tid)[1] == ("manual", "user_cancelled")
+
+
+# --------------------------------------------------------------------------
+# W5b. The answer is the task the outcome was decided on
+# --------------------------------------------------------------------------
+
+
+def test_a_failed_snapshot_of_a_cancel_writes_nothing(
+    factory, invalidated, monkeypatch
+):
+    """The snapshot is the last read before the commit: when it fails the
+    cancel rolls back, so a committed cancel always reaches its broadcast."""
+    tid = _seeded(factory)
+    before = _state(factory, tid)
+    snapshot = web_cancel._task_snapshot
+
+    def failing(db, task):
+        if db.get(TaskAutoRecovery, tid).state == "manual":
+            raise RuntimeError("read failed")
+        return snapshot(db, task)
+
+    monkeypatch.setattr(web_cancel, "_task_snapshot", failing)
+
+    with pytest.raises(RuntimeError, match="read failed"):
+        _cancel(factory, tid)
+
+    _assert_unwritten(factory, tid, before, invalidated)
+
+
+def test_an_answer_is_read_before_the_lock_is_released(
+    factory, invalidated, monkeypatch
+):
+    """Once the lock is gone another writer may move the task on (here: a
+    later interruption schedules a resume again); the answer still describes
+    what ``already_cancelled`` was decided on."""
+    tid = _seeded(factory)
+    assert _cancel(factory, tid).outcome is Outcome.CANCELLED
+    sessions = get_session_local()
+
+    def reschedule(_session) -> None:
+        with sessions() as other:
+            row = other.get(TaskAutoRecovery, tid)
+            row.state, row.state_detail = "scheduled", None
+            other.commit()
+
+    def factory_with_a_writer():
+        session = sessions()
+        sa.event.listen(session, "after_rollback", reschedule, once=True)
+        return session
+
+    monkeypatch.setattr(web_cancel, "get_session_local", lambda: factory_with_a_writer)
+
+    result = _cancel(factory, tid)
+
+    assert result.outcome is Outcome.ALREADY_CANCELLED
+    assert result.task["auto_recovery"]["auto_resume"].items() >= STOPPED.items()
+    assert _state(factory, tid)[1] == ("scheduled", None)
 
 
 # --------------------------------------------------------------------------
@@ -493,23 +568,63 @@ def _aware(value: datetime) -> datetime:
     return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
 
 
+def _chat_client(owner_id: int) -> TestClient:
+    app = FastAPI()
+    app.include_router(chat_router)
+
+    def db():
+        with get_session_local()() as session:
+            yield session
+
+    def owner():
+        with get_session_local()() as session:
+            user = session.get(User, owner_id)
+            session.expunge(user)
+            return user
+
+    app.dependency_overrides[get_db] = db
+    app.dependency_overrides[get_current_user] = owner
+    return TestClient(app, raise_server_exceptions=False)
+
+
+@pytest.fixture
+def response_cache():
+    backend = InMemoryTTLCache()
+    set_cache_backend_for_testing(backend)
+    yield backend
+    set_cache_backend_for_testing(None)
+
+
 @pytest.mark.asyncio
-async def test_a_channel_tasks_held_reply_is_released_as_interrupted(
-    channel, monkeypatch
+async def test_a_channel_tasks_held_reply_is_released_through_the_route(
+    channel, monkeypatch, response_cache
 ):
     _record(channel)
     sender = AsyncMock()
     # The hold: a delivery attempt leaves the reply pending for 30s.
     assert not await channel_delivery.deliver_channel_result(channel.command_id, sender)
-    monkeypatch.setattr(web_cancel, "invalidate_task_cache_best_effort", lambda _: None)
+    published: list[dict[str, Any]] = []
+
+    async def publish(message, _task_id):
+        published.append(message)
+
+    monkeypatch.setattr(task_events, "publish_task_event", publish)
+    key = web_task_detail_key(channel.task_id)
+    cache_set(key, {"stale": True}, ttl_seconds=60)
     with get_session_local()() as db:
         owner = int(db.get(Task, channel.task_id).user_id)
 
-    result = cancel_auto_resume_for_web_sync(
-        task_id=channel.task_id, actor_user_id=owner, actor_is_admin=False
+    response = _chat_client(owner).post(
+        f"/api/chat/task/{channel.task_id}/auto-resume/cancel",
+        json={"run_id": channel.run_id},
     )
 
-    assert result.outcome is Outcome.CANCELLED
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["outcome"] == "cancelled"
+    assert body["notice"] == published[0]
+    assert body["notice"]["state_version"] == channel.version + 1
+    assert response_cache.get_json(key) is None
     with get_session_local()() as db:
         start = db.get(TaskExecutionCommand, channel.command_id)
         assert (start.result or {}).get(
@@ -520,6 +635,78 @@ async def test_a_channel_tasks_held_reply_is_released_as_interrupted(
         assert _aware(delivery.available_at) <= datetime.now(timezone.utc)
     assert await channel_delivery.deliver_channel_result(channel.command_id, sender)
     assert sender.await_args.args[1] == interrupted_channel_result()
+
+
+def _web_cancel(ch) -> Any:
+    with get_session_local()() as db:
+        owner = int(db.get(Task, ch.task_id).user_id)
+    return cancel_auto_resume_for_web_sync(
+        task_id=ch.task_id, actor_user_id=owner, actor_is_admin=False
+    )
+
+
+def _channel_stop(ch) -> Any:
+    return stop_channel_task_sync(
+        channel_id=ch.channel_id,
+        external_user_id="sender",
+        task_id=ch.task_id,
+        pause_awaited_run=False,
+    )
+
+
+@pytest.mark.parametrize("first", ["web", "channel_stop"])
+def test_a_web_cancel_and_a_channel_stop_cancel_once(channel, monkeypatch, first):
+    monkeypatch.setattr(web_cancel, "invalidate_task_cache_best_effort", lambda _: None)
+    _record(channel)
+
+    if first == "web":
+        assert _web_cancel(channel).outcome is Outcome.CANCELLED
+        assert _channel_stop(channel).outcome is not ChannelStopOutcome.CANCELLED
+    else:
+        assert _channel_stop(channel).outcome is ChannelStopOutcome.CANCELLED
+        assert _web_cancel(channel).outcome is Outcome.ALREADY_CANCELLED
+
+    with get_session_local()() as db:
+        assert int(db.get(Task, channel.task_id).state_version) == channel.version + 1
+        assert (
+            db.scalar(
+                sa.select(sa.func.count(TaskRecoveryEvent.id)).where(
+                    TaskRecoveryEvent.event == "skipped_user_intent"
+                )
+            )
+            == 1
+        )
+
+
+def test_postgresql_a_web_cancel_waits_for_a_channel_stop(
+    channel, monkeypatch, short_lock_timeout
+):
+    _postgresql_only()
+    monkeypatch.setattr(web_cancel, "invalidate_task_cache_best_effort", lambda _: None)
+    _record(channel)
+    outcome: dict[str, Any] = {}
+
+    def web() -> None:
+        try:
+            outcome["result"] = _web_cancel(channel)
+        except BaseException as exc:  # pragma: no cover - reported below
+            outcome["error"] = exc
+
+    thread = threading.Thread(target=web)
+
+    def hook_then_wait(db, task, *, at):
+        result = cancel_pending_auto_resume_no_commit(db, task, at=at)
+        thread.start()
+        with get_session_local()() as monitor:
+            _wait_for_a_lock_waiter(monitor)
+        return result
+
+    monkeypatch.setattr(
+        channel_stop, "cancel_pending_auto_resume_no_commit", hook_then_wait
+    )
+
+    assert _channel_stop(channel).outcome is ChannelStopOutcome.CANCELLED
+    assert _joined(thread, outcome).outcome is Outcome.ALREADY_CANCELLED
 
 
 # --------------------------------------------------------------------------
@@ -671,3 +858,28 @@ def test_postgresql_a_resume_by_hand_handing_off_first_wins(
     assert result.outcome is Outcome.RESUME_IN_PROGRESS
     assert _state(factory, tid) == (PV + 1, ("scheduled", None), PV, [])
     assert invalidated == []
+
+
+def test_postgresql_a_double_click_cancels_once(
+    factory, invalidated, monkeypatch, short_lock_timeout
+):
+    _postgresql_only()
+    tid = _seeded(factory)
+    outcome: dict[str, Any] = {}
+    second = _cancel_in_thread(factory, tid, outcome)
+    started: list[int] = []
+
+    def start_the_second_click() -> None:
+        if started:
+            return
+        started.append(1)
+        second.start()
+        with get_session_local()() as monitor:
+            _wait_for_a_lock_waiter(monitor)
+
+    _while_cancelling(monkeypatch, start_the_second_click)
+
+    assert _cancel(factory, tid).outcome is Outcome.CANCELLED
+    assert _joined(second, outcome).outcome is Outcome.ALREADY_CANCELLED
+    assert len(_events(factory, tid)) == 1
+    assert invalidated == [tid]

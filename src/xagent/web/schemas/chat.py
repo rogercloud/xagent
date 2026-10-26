@@ -270,7 +270,7 @@ class AutoResumeCancelRequest(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    run_id: Optional[str] = Field(default=None, max_length=64)
+    run_id: Optional[str] = Field(default=None, min_length=1, max_length=64)
 
 
 class AutoResumeCancelResponse(BaseModel):

@@ -26,8 +26,11 @@ from ..models.task import Task, TaskStatus
 from .channel_stop import settle_channel_reply_after_cancel_no_commit
 from .db_runtime import run_db_io_cancellation_safe
 from .task_auto_recovery import current_auto_recovery_view, is_status_only_source
-from .task_auto_resume import RecoveryNotice, cancel_pending_auto_resume_no_commit
-from .task_events import publish_task_event
+from .task_auto_resume import (
+    RecoveryNotice,
+    cancel_pending_auto_resume_no_commit,
+    publish_recovery_notices,
+)
 from .task_execution_controller import TaskControlState
 from .task_orchestrator import invalidate_task_cache_best_effort
 
@@ -48,18 +51,14 @@ class WebAutoResumeCancelOutcome(str, Enum):
     RACED = "raced"  # every attempt lost a compare-and-swap
 
 
-_UNANSWERED = frozenset(
-    {WebAutoResumeCancelOutcome.MISSING, WebAutoResumeCancelOutcome.NOT_CANCELLABLE}
-)
-
-
 @dataclass(frozen=True)
 class WebAutoResumeCancelResult:
     outcome: WebAutoResumeCancelOutcome
-    # The task as it stands once the transaction ended: status,
-    # control_state, run_id, state_version and auto_recovery, as GET reads
-    # them. ``None`` for MISSING / NOT_CANCELLABLE / RACED, or a task gone
-    # since.
+    # The task the outcome was decided on, read under its lock (a cancel's
+    # own writes included): status, control_state, run_id, state_version and
+    # auto_recovery, as GET reads them. ``None`` exactly when no task was
+    # answered for: MISSING (no such task the caller may change),
+    # NOT_CANCELLABLE and RACED.
     task: dict[str, Any] | None = None
     notices: tuple[RecoveryNotice, ...] = ()
     # The ``task_recovery_update`` messages published for ``notices``, the
@@ -89,7 +88,9 @@ def _cancel_once_no_commit(
     if is_status_only_source(task.source):
         return _result(WebAutoResumeCancelOutcome.NOT_CANCELLABLE)
     if expected_run_id is not None and task.run_id != expected_run_id:
-        return _result(WebAutoResumeCancelOutcome.NOT_PENDING)
+        return WebAutoResumeCancelResult(
+            WebAutoResumeCancelOutcome.NOT_PENDING, task=_task_snapshot(db, task)
+        )
 
     cancel = cancel_pending_auto_resume_no_commit(
         db, task, at=_AT, actor_user_id=actor_user_id
@@ -98,45 +99,47 @@ def _cancel_once_no_commit(
         return None
     if cancel.cancelled:
         if task.channel_id is not None:
-            held = settle_channel_reply_after_cancel_no_commit(
+            settle_channel_reply_after_cancel_no_commit(
                 db,
                 task_id=task_id,
                 run_id=str(cancel.run_id),
                 channel_id=int(task.channel_id),
             )
-            logger.debug(
-                "Web auto-resume cancel of task %s released held reply %s",
-                task_id,
-                held,
-            )
         notices = (cancel.notice,) if cancel.notice is not None else ()
         return WebAutoResumeCancelResult(
-            WebAutoResumeCancelOutcome.CANCELLED, notices=notices
+            WebAutoResumeCancelOutcome.CANCELLED,
+            task=_task_snapshot(db, task),
+            notices=notices,
         )
 
+    snapshot = _task_snapshot(db, task)
     if (
         task.status == TaskStatus.PAUSED
         and task.control_state == TaskControlState.RESUME_REQUESTED.value
     ):
-        return _result(WebAutoResumeCancelOutcome.RESUME_IN_PROGRESS)
-    auto_resume = (current_auto_recovery_view(db, task) or {}).get("auto_resume")
-    if (
+        outcome = WebAutoResumeCancelOutcome.RESUME_IN_PROGRESS
+    elif _stopped_by_a_cancel(snapshot["auto_recovery"]):
+        outcome = WebAutoResumeCancelOutcome.ALREADY_CANCELLED
+    else:
+        outcome = WebAutoResumeCancelOutcome.NOT_PENDING
+    return WebAutoResumeCancelResult(outcome, task=snapshot)
+
+
+def _stopped_by_a_cancel(view: dict[str, Any] | None) -> bool:
+    auto_resume = (view or {}).get("auto_resume")
+    return (
         auto_resume is not None
         and auto_resume.get("status") == "stopped"
         and auto_resume.get("stop_reason") == "cancelled"
-    ):
-        return _result(WebAutoResumeCancelOutcome.ALREADY_CANCELLED)
-    return _result(WebAutoResumeCancelOutcome.NOT_PENDING)
+    )
 
 
-def _task_snapshot(db: Session, task_id: int) -> dict[str, Any] | None:
-    """The task as the next GET reads it; plain data, nothing attached."""
+def _task_snapshot(db: Session, task: Task) -> dict[str, Any]:
+    """``task`` as the next GET reads it, plain data. Taken under the lock,
+    before the commit or rollback, so it is what the outcome was decided on
+    (a cancel's own writes included) and nothing fallible runs between a
+    committed cancel and its broadcast."""
 
-    task = db.execute(
-        select(Task).where(Task.id == task_id).execution_options(populate_existing=True)
-    ).scalar_one_or_none()
-    if task is None:
-        return None
     status = task.status
     return {
         "status": status.value if hasattr(status, "value") else str(status),
@@ -176,16 +179,12 @@ def cancel_auto_resume_for_web_sync(
             if attempt is None:
                 db.rollback()
                 continue
-            cancelled = attempt.outcome is WebAutoResumeCancelOutcome.CANCELLED
-            if cancelled:
+            if attempt.outcome is WebAutoResumeCancelOutcome.CANCELLED:
                 db.commit()
                 invalidate_task_cache_best_effort(task_id)
             else:
                 db.rollback()
             result = attempt
-            if attempt.outcome not in _UNANSWERED:
-                result = replace(attempt, task=_task_snapshot(db, task_id))
-                db.rollback()
         break
     else:
         logger.warning(
@@ -197,17 +196,6 @@ def cancel_auto_resume_for_web_sync(
     return result
 
 
-async def _publish(message: dict[str, Any], task_id: int) -> None:
-    try:
-        await publish_task_event(message, task_id)
-    except Exception:
-        logger.warning(
-            "task_recovery_update committed but broadcast failed for task %s",
-            task_id,
-            exc_info=True,
-        )
-
-
 async def cancel_auto_resume_for_web(
     *,
     task_id: int,
@@ -216,8 +204,7 @@ async def cancel_auto_resume_for_web(
     expected_run_id: str | None = None,
 ) -> WebAutoResumeCancelResult:
     """:func:`cancel_auto_resume_for_web_sync` off the loop, then its notices
-    published. Each message is built once, so the one broadcast and the one
-    returned (``messages``) are the same dict, timestamp included."""
+    published; ``messages`` are the very dicts broadcast, timestamp included."""
 
     result = await run_db_io_cancellation_safe(
         lambda: cancel_auto_resume_for_web_sync(
@@ -229,7 +216,5 @@ async def cancel_auto_resume_for_web(
     )
     if not result.notices:
         return result
-    messages = tuple(notice.message() for notice in result.notices)
-    for notice, message in zip(result.notices, messages):
-        await _publish(message, notice.task_id)
+    messages = await publish_recovery_notices(result.notices)
     return replace(result, messages=messages)

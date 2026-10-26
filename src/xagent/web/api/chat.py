@@ -1423,9 +1423,8 @@ async def cancel_task_auto_resume(
             },
         )
     if result.task is None:
-        # Deleted (or out of reach) since the check above.
+        # Deleted (or out of reach) since the check above: never returns.
         await asyncio.to_thread(_raise_task_expired_or_not_found, db, user, task_id)
-    assert result.task is not None
     return AutoResumeCancelResponse(
         task_id=task_id,
         outcome=result.outcome.value,
