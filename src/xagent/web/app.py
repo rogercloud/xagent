@@ -1731,7 +1731,11 @@ def start_runtime_performance_monitor(app_instance: FastAPI) -> None:
     existing = getattr(app_instance.state, "runtime_performance_task", None)
     if existing is not None and not existing.done():
         return
-    app_instance.state.runtime_performance_task = start_process_runtime_telemetry()
+    from .api.websocket import manager
+
+    app_instance.state.runtime_performance_task = start_process_runtime_telemetry(
+        websocket_connections=manager.connection_count
+    )
 
 
 async def stop_runtime_performance_monitor(app_instance: FastAPI) -> None:

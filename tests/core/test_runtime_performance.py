@@ -303,7 +303,13 @@ async def test_event_loop_monitor_and_tracer_export_without_payload_content() ->
 
 
 def _attribute_keys_in_source() -> dict[str, list[str]]:
-    """Literal ``attributes={...}`` keys passed anywhere under ``src/xagent``."""
+    """``attributes=`` keys passed anywhere under ``src/xagent``.
+
+    Covers a dict literal passed directly and a name bound to a dict literal
+    in the same module (``attributes = {...}`` then ``attributes=attributes``).
+    Keys built any other way, such as from a parameter or with
+    ``dict(...)``, are not seen.
+    """
     import ast
     from pathlib import Path
 
@@ -311,26 +317,45 @@ def _attribute_keys_in_source() -> dict[str, list[str]]:
     # src/xagent: this module lives in src/xagent/core.
     root = Path(runtime_metrics.__file__).resolve().parents[1]
     for path in root.rglob("*.py"):
-        for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        bound: dict[str, list[ast.Dict]] = {}
+        for node in ast.walk(tree):
+            if (
+                isinstance(node, ast.Assign)
+                and isinstance(node.value, ast.Dict)
+                and len(node.targets) == 1
+                and isinstance(node.targets[0], ast.Name)
+            ):
+                bound.setdefault(node.targets[0].id, []).append(node.value)
+        for node in ast.walk(tree):
             if not isinstance(node, ast.Call):
                 continue
             for keyword in node.keywords:
-                if keyword.arg != "attributes" or not isinstance(
-                    keyword.value, ast.Dict
-                ):
+                if keyword.arg != "attributes":
                     continue
-                for key in keyword.value.keys:
-                    if isinstance(key, ast.Constant) and isinstance(key.value, str):
-                        keys.setdefault(key.value, []).append(
-                            f"{path.relative_to(root)}:{key.lineno}"
-                        )
+                if isinstance(keyword.value, ast.Dict):
+                    dicts = [keyword.value]
+                elif isinstance(keyword.value, ast.Name):
+                    dicts = bound.get(keyword.value.id, [])
+                else:
+                    continue
+                for literal in dicts:
+                    for key in literal.keys:
+                        if isinstance(key, ast.Constant) and isinstance(key.value, str):
+                            keys.setdefault(key.value, []).append(
+                                f"{path.relative_to(root)}:{key.lineno}"
+                            )
     return keys
 
 
 def test_every_metric_attribute_key_in_source_is_exported() -> None:
     """An unlisted key is dropped silently at export, so list it or rename it."""
     keys = _attribute_keys_in_source()
-    assert "outcome" in keys  # the scan itself works
+    # The scan itself works, for both a literal and a name bound to one.
+    assert any(
+        site.startswith("web/services/task_admission_observation.py")
+        for site in keys["outcome"]
+    )
     unlisted = {
         key: sites
         for key, sites in keys.items()

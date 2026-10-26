@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections.abc import Callable
 
 from ..core.runtime_performance import (
     initialize_runtime_performance_telemetry,
@@ -22,8 +23,13 @@ from ..core.runtime_performance import (
 logger = logging.getLogger(__name__)
 
 
-def start_process_runtime_telemetry() -> asyncio.Task[None] | None:
+def start_process_runtime_telemetry(
+    *, websocket_connections: Callable[[], int] | None = None
+) -> asyncio.Task[None] | None:
     """Enable OTLP export, register process gauges and sample loop lag.
+
+    ``websocket_connections`` is given only by a process that serves task
+    WebSockets; a worker serves none and registers no connection gauge.
 
     Returns the lag sampler, or ``None`` when telemetry is disabled or could
     not start. Never raises: telemetry is observational and must not block a
@@ -34,7 +40,6 @@ def start_process_runtime_telemetry() -> asyncio.Task[None] | None:
         if not initialize_runtime_performance_telemetry():
             return None
 
-        from .api.websocket import manager
         from .services.task_execution import background_task_manager
 
         register_observable_gauge(
@@ -49,12 +54,13 @@ def start_process_runtime_telemetry() -> asyncio.Task[None] | None:
             unit="{task}",
             description="Current local resume coordinators",
         )
-        register_observable_gauge(
-            "xagent.websocket.connections",
-            manager.connection_count,
-            unit="{connection}",
-            description="Current task WebSocket connections",
-        )
+        if websocket_connections is not None:
+            register_observable_gauge(
+                "xagent.websocket.connections",
+                websocket_connections,
+                unit="{connection}",
+                description="Current task WebSocket connections",
+            )
         return start_event_loop_lag_monitor()
     except Exception:
         shutdown_runtime_performance_telemetry()
