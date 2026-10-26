@@ -123,6 +123,9 @@ class ClientErrorCode(StrEnum):
     # (``release_hold``); nothing was accepted, and the same request may be
     # sent again shortly.
     EXECUTION_PAUSED = "execution_paused"
+    # A task whose caller only reads its status (an SDK task): a cancelled
+    # automatic resume would leave that caller waiting on a pause forever.
+    AUTO_RESUME_NOT_CANCELLABLE = "auto_resume_not_cancellable"
 
 
 def client_error_message(code: ClientErrorCode) -> str:
@@ -202,6 +205,10 @@ def client_error_message(code: ClientErrorCode) -> str:
         ClientErrorCode.EXECUTION_PAUSED: (
             "New work is briefly paused for a service update. "
             "Nothing was started; please try again in a moment."
+        ),
+        ClientErrorCode.AUTO_RESUME_NOT_CANCELLABLE: (
+            "Automatic resume of a task created through the API cannot be "
+            "cancelled here."
         ),
     }[code]
 

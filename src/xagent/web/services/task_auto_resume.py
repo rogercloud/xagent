@@ -2382,7 +2382,7 @@ def supersede_pending_auto_resume_for_append_no_commit(db: Session, task: Task) 
 
 
 def cancel_pending_auto_resume_no_commit(
-    db: Session, task: Task, *, at: str
+    db: Session, task: Task, *, at: str, actor_user_id: int | None = None
 ) -> AutoResumeCancel:
     """A person stops the automatic resume ``task``'s paused run waits for;
     no commit.
@@ -2391,7 +2391,8 @@ def cancel_pending_auto_resume_no_commit(
     read (selected ``FOR UPDATE``, or refreshed after it); lock order is the
     module's, ``tasks`` then the recovery row, then reads of commands.
     ``at`` names the caller (e.g. ``channel_stop``) in the event, the log
-    and the metrics. ``raced``: the first write's compare-and-swap, which
+    and the metrics; ``actor_user_id``, when given, the person who cancelled
+    (an admin may cancel another user's task), in the event. ``raced``: the first write's compare-and-swap, which
     also re-checks the recovery row as read, lost (SQLite ignores the row
     locks), and nothing was written; the caller may read again and retry.
     Once it lands nothing else can move either row -- the locks on
@@ -2464,6 +2465,7 @@ def cancel_pending_auto_resume_no_commit(
             "from": from_state.value,
             "task_version": task_version,
             "paused_state_version": paused_state_version,
+            **({} if actor_user_id is None else {"actor_user_id": actor_user_id}),
         },
         stop=_CANCELLED_STOP,
         fenced=True,
