@@ -8,8 +8,8 @@ identifiers, SQLSTATEs and numbers are reported. Task ids appear in logs only,
 never as metric attributes.
 
 Reads of the event log are measured by ``measure_execution_event_read``: the
-cost of each of the four read purposes (model context, display, reconnect
-replay, recovery) grows with history. Optional budgets
+cost of each of the five operations (model context, display, reconnect replay,
+checkpoint recovery, tool outcome) grows with history. Optional budgets
 (``XAGENT_EXECUTION_EVENT_READ_*_BUDGETS*``) only report; they never refuse or
 truncate a read.
 """
@@ -23,6 +23,7 @@ import time
 from collections.abc import Callable, Generator, Mapping
 from contextlib import contextmanager
 from contextvars import ContextVar
+from dataclasses import dataclass
 
 from ...config import (
     EXECUTION_EVENT_READ_DEFAULT_BUDGET_KEY,
@@ -94,14 +95,12 @@ def report_commit_failure(
         return
 
 
+@dataclass(slots=True)
 class ExecutionEventReadMeasurement:
     """Row count and outcome of one read, set by the reader as it learns them."""
 
-    __slots__ = ("rows", "outcome")
-
-    def __init__(self, outcome: str | None = None) -> None:
-        self.rows: int | None = None
-        self.outcome = outcome
+    rows: int | None = None
+    outcome: str | None = None
 
 
 # Set while a measured read is running in this context (thread or task), so a
@@ -152,7 +151,7 @@ def _record_execution_event_read(
     measurement: ExecutionEventReadMeasurement,
     duration_ms: float,
 ) -> None:
-    attributes = {"operation": operation}
+    attributes = {"operation": operation, "storage": "v2"}
     if measurement.outcome:
         attributes["outcome"] = measurement.outcome
     observe_value(READ_DURATION_METRIC, duration_ms, unit="ms", attributes=attributes)
@@ -171,14 +170,18 @@ def _record_execution_event_read(
         operation,
     )
     exceeded = []
-    if rows is not None and row_budget is not None and rows > row_budget:
-        exceeded.append("rows")
-    if duration_budget is not None and duration_ms > duration_budget:
-        exceeded.append("duration")
+    # A cache-hit reconnect replays a stored snapshot and never reads the event
+    # log, so the budgets (which guard event-log reads) do not apply; its
+    # histograms above are still recorded.
+    if measurement.outcome != "cache_hit":
+        if rows is not None and row_budget is not None and rows > row_budget:
+            exceeded.append("rows")
+        if duration_budget is not None and duration_ms > duration_budget:
+            exceeded.append("duration")
     for kind in exceeded:
         increment_counter(
             READ_BUDGET_EXCEEDED_COUNTER,
-            attributes={"operation": operation, "outcome": kind},
+            attributes={"operation": operation, "outcome": kind, "storage": "v2"},
         )
     if exceeded:
         # One line per exceeded read. Identifiers and numbers only: never
@@ -201,21 +204,34 @@ def measure_execution_event_read(
     operation: str,
     *,
     task_id: int,
-    outcome: str | None = None,
 ) -> Generator[ExecutionEventReadMeasurement, None, None]:
     """Measure one whole V2 execution-event read (every page, once per call).
 
-    The caller sets ``measurement.rows`` from a list the reader already built,
-    and ``measurement.outcome`` when the read has more than one shape. On exit
-    the duration and, if set, the row count are recorded and compared with the
-    operation's optional budgets, which only report. If the read raises, the
-    duration is still recorded and the error propagates unchanged; rows are
-    recorded only if the reader had set them. Never raises itself, never
-    changes what the reader returns, and works in any thread: no event loop is
-    involved. Nested inside another measured read it records nothing, so the
-    outer operation owns the whole cost.
+    ``rows`` is what the operation read or produced, set by the reader from a
+    list it already built:
+
+    - ``model``: model events loaded.
+    - ``display``: display facts loaded.
+    - ``reconnect``: frames replayed to the client (the info frame, the
+      converted events, and the completion and status frames). Its duration
+      includes cache I/O and projection work, not just database time.
+    - ``checkpoint``: ``recovery_state`` rows scanned. Pending-tool outcome
+      reads nested inside it are not counted in rows, but their time is in
+      the duration.
+    - ``tool_outcome``: rows read.
+
+    A reader may also set ``measurement.outcome`` when the read has more than
+    one shape (reconnect: ``loaded`` or ``cache_hit``). A ``cache_hit`` replay
+    never reads the event log, so it is recorded in the histograms but never
+    compared with the budgets. On exit the duration and, if set, the row count
+    are recorded and compared with the operation's optional budgets, which only
+    report. If the read raises, the duration is still recorded and the error
+    propagates unchanged; rows are recorded only if the reader had set them.
+    Never raises itself, never changes what the reader returns, and works in
+    any thread: no event loop is involved. Nested inside another measured read
+    it records nothing, so the outer operation owns the whole cost.
     """
-    measurement = ExecutionEventReadMeasurement(outcome)
+    measurement = ExecutionEventReadMeasurement()
     if _READ_MEASUREMENT_ACTIVE.get():
         yield measurement
         return
@@ -225,10 +241,7 @@ def measure_execution_event_read(
         yield measurement
     finally:
         duration_ms = (time.perf_counter() - started) * 1_000.0
-        try:
-            _READ_MEASUREMENT_ACTIVE.reset(token)
-        except ValueError:
-            _READ_MEASUREMENT_ACTIVE.set(False)
+        _READ_MEASUREMENT_ACTIVE.reset(token)
         try:
             _record_execution_event_read(operation, task_id, measurement, duration_ms)
         except Exception:

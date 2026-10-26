@@ -1366,10 +1366,7 @@ def _parse_execution_event_read_budgets(env_var: str, raw: str) -> Mapping[str, 
 
 
 def _get_execution_event_read_budgets(env_var: str) -> Mapping[str, int]:
-    raw = os.getenv(env_var)
-    if raw is None or not raw.strip():
-        return _parse_execution_event_read_budgets(env_var, "")
-    return _parse_execution_event_read_budgets(env_var, raw)
+    return _parse_execution_event_read_budgets(env_var, os.getenv(env_var) or "")
 
 
 def get_execution_event_read_row_budgets() -> Mapping[str, int]:

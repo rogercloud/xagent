@@ -8,7 +8,10 @@ reader's result never changes.
 
 from __future__ import annotations
 
+import contextvars
 import logging
+import threading
+from contextlib import contextmanager
 from typing import Any
 
 import pytest
@@ -84,6 +87,21 @@ def no_budgets_by_default(monkeypatch):
     signals._reported_invalid_budget_configs.clear()
     yield
     signals._reported_invalid_budget_configs.clear()
+
+
+def attrs(**attributes: str) -> tuple[tuple[str, str], ...]:
+    """Exported attributes of a read signal: always tagged ``storage=v2``."""
+    return key(storage="v2", **attributes)
+
+
+@contextmanager
+def measurement_suppressed():
+    """Run reads without recording a point, as if nested in a measured read."""
+    token = signals._READ_MEASUREMENT_ACTIVE.set(True)
+    try:
+        yield
+    finally:
+        signals._READ_MEASUREMENT_ACTIVE.reset(token)
 
 
 def histogram(reader, name: str) -> dict[tuple[tuple[str, str], ...], Any]:
@@ -239,7 +257,9 @@ class Readers:
             )
 
     def reconnect_unmeasured(self):
-        with self.factory() as db:
+        # The snapshot builder also loads display facts, a measured read of its
+        # own; suppress it so the baseline leaves no point behind.
+        with self.factory() as db, measurement_suppressed():
             task = db.get(Task, self.tid)
             return list(
                 websocket._build_event_historical_stream_snapshot(
@@ -296,11 +316,23 @@ def readers(seeded, monkeypatch):
     return Readers(factory, tid, monkeypatch)
 
 
+# The reconnect replay of the seeded history: the info frame, one converted
+# event per displayed fact (input, answer, tool start, tool end) and the
+# completion frame. Counted from the seed, not from the reader's own result.
+RECONNECT_FRAMES = [
+    "task_info",
+    "user_message",
+    "agent_message",
+    "tool_execution_start",
+    "tool_execution_end",
+    "historical_data_complete",
+]
+
 # operation, reader method, expected row count of the seeded history
 READERS = [
     ("model", "model", 4),
     ("display", "display", 4),
-    ("reconnect", "reconnect", None),
+    ("reconnect", "reconnect", len(RECONNECT_FRAMES)),
     ("checkpoint", "checkpoint", 2),
     ("tool_outcome", "tool_outcome", 2),
 ]
@@ -325,16 +357,19 @@ def test_reader_records_duration_and_rows(
         assert result == "execution"
     if reader == "tool_outcome":
         assert result == {"result": SENTINEL, "error": None}
-    # The reconnect replay's size is what the client receives.
-    expected = len(result) if reader == "reconnect" else rows
+    if reader == "reconnect":
+        # The replay is exactly the frames the client receives.
+        assert [event.get("event_type", event["type"]) for event in result] == (
+            RECONNECT_FRAMES
+        )
 
     durations = histogram(metric_reader, DURATION)
     row_points = histogram(metric_reader, ROWS)
     # Reconnect carries its outcome; the others have no second shape.
     attributes = (
-        key(operation=operation, outcome="loaded")
+        attrs(operation=operation, outcome="loaded")
         if operation == "reconnect"
-        else key(operation=operation)
+        else attrs(operation=operation)
     )
     # The nested display-facts read is part of reconnect, not a second point,
     # and the nested tool-outcome reads are part of checkpoint.
@@ -342,7 +377,7 @@ def test_reader_records_duration_and_rows(
     assert set(row_points) == {attributes}
     assert durations[attributes].count == 1
     assert row_points[attributes].count == 1
-    assert row_points[attributes].sum == expected
+    assert row_points[attributes].sum == rows
     assert durations[attributes].sum >= 0
     assert exported(metric_reader, EXCEEDED) == {}
 
@@ -377,19 +412,49 @@ def test_seeded_row_counts_are_what_the_history_holds(readers):
         assert count(db, "recovery_state") == 2
         assert count(db, "tool_execution_start", "tool_execution_end") == 2
     assert len(readers.display_unmeasured()) == 4
+    # Four displayed facts plus the info and completion frames.
+    assert len(readers.reconnect_unmeasured()) == 4 + 2
 
 
 def test_reconnect_reports_cache_hit_and_loaded(readers, metric_reader):
     readers.reconnect()
     readers.reconnect()
     durations = histogram(metric_reader, DURATION)
-    loaded = key(operation="reconnect", outcome="loaded")
-    hit = key(operation="reconnect", outcome="cache_hit")
+    loaded = attrs(operation="reconnect", outcome="loaded")
+    hit = attrs(operation="reconnect", outcome="cache_hit")
     assert set(durations) == {loaded, hit}
     assert durations[loaded].count == durations[hit].count == 1
     rows = histogram(metric_reader, ROWS)
     # The replay is the same size from the cache as from the database.
     assert rows[loaded].sum == rows[hit].sum > 0
+
+
+def test_cache_hit_reconnect_is_measured_but_never_over_budget(
+    readers, metric_reader, caplog, monkeypatch
+):
+    # A cache hit replays a stored snapshot and does not read the event log, so
+    # the budgets guarding event-log reads must not fire for it.
+    monkeypatch.setattr(signals, "time", Clock(step=0.25))  # each read: 250 ms
+    monkeypatch.setenv(ROW_ENV, "reconnect=1")
+    monkeypatch.setenv(DURATION_ENV, "reconnect=100")
+
+    readers.reconnect()  # loaded: over both budgets
+    assert exported(metric_reader, EXCEEDED) == {
+        attrs(operation="reconnect", outcome="rows"): 1,
+        attrs(operation="reconnect", outcome="duration"): 1,
+    }
+    assert len(budget_warnings(caplog)) == 1
+
+    readers.reconnect()  # cache hit: same size, same duration, no new report
+    assert exported(metric_reader, EXCEEDED) == {
+        attrs(operation="reconnect", outcome="rows"): 1,
+        attrs(operation="reconnect", outcome="duration"): 1,
+    }
+    assert len(budget_warnings(caplog)) == 1
+    # Still measured.
+    hit = attrs(operation="reconnect", outcome="cache_hit")
+    assert histogram(metric_reader, DURATION)[hit].count == 1
+    assert histogram(metric_reader, ROWS)[hit].sum == len(RECONNECT_FRAMES)
 
 
 @pytest.mark.parametrize("operation,reader,rows", READERS)
@@ -404,18 +469,17 @@ def test_row_budget_below_count_reports_once_and_changes_nothing(
         result = getattr(readers, reader)()
 
     assert comparable(result) == baseline
-    expected = len(result) if reader == "reconnect" else rows
     warnings = budget_warnings(caplog)
     assert len(warnings) == 1
     message = warnings[0].getMessage()
     assert message.startswith(
         f"execution_event_read_budget_exceeded task_id={readers.tid} storage=v2 "
-        f"component=execution-events operation={operation} rows={expected} "
+        f"component=execution-events operation={operation} rows={rows} "
         "duration_ms="
     )
     assert message.endswith(" budget_rows=1 budget_ms=-")
     assert exported(metric_reader, EXCEEDED) == {
-        key(operation=operation, outcome="rows"): 1
+        attrs(operation=operation, outcome="rows"): 1
     }
     assert SENTINEL not in caplog.text
 
@@ -427,7 +491,7 @@ def test_default_star_budget_applies_to_unlisted_operations(
     readers.display()
     readers.tool_outcome()
     assert exported(metric_reader, EXCEEDED) == {
-        key(operation="tool_outcome", outcome="rows"): 1
+        attrs(operation="tool_outcome", outcome="rows"): 1
     }
     assert len(budget_warnings(caplog)) == 1
 
@@ -440,7 +504,7 @@ def test_row_budget_at_or_above_count_does_not_report(
     assert exported(metric_reader, EXCEEDED) == {}
     assert budget_warnings(caplog) == []
     # The measurement itself is still there.
-    assert key(operation="tool_outcome") in histogram(metric_reader, ROWS)
+    assert attrs(operation="tool_outcome") in histogram(metric_reader, ROWS)
 
 
 @pytest.mark.parametrize("operation,reader,rows", READERS)
@@ -474,7 +538,7 @@ def test_duration_budget_reports_without_a_row_budget(
     result = readers.tool_outcome()
     assert result["result"] == SENTINEL
     assert exported(metric_reader, EXCEEDED) == {
-        key(operation="tool_outcome", outcome="duration"): 1
+        attrs(operation="tool_outcome", outcome="duration"): 1
     }
     (warning,) = budget_warnings(caplog)
     message = warning.getMessage()
@@ -489,8 +553,8 @@ def test_both_budgets_exceeded_is_one_warning_two_counters(
     monkeypatch.setenv(ROW_ENV, "*=1")
     readers.tool_outcome()
     assert exported(metric_reader, EXCEEDED) == {
-        key(operation="tool_outcome", outcome="rows"): 1,
-        key(operation="tool_outcome", outcome="duration"): 1,
+        attrs(operation="tool_outcome", outcome="rows"): 1,
+        attrs(operation="tool_outcome", outcome="duration"): 1,
     }
     assert len(budget_warnings(caplog)) == 1
 
@@ -514,8 +578,8 @@ def test_nested_reads_are_measured_once_as_the_outer_operation(readers, metric_r
     readers.checkpoint()
     readers.reconnect()
     assert set(histogram(metric_reader, DURATION)) == {
-        key(operation="checkpoint"),
-        key(operation="reconnect", outcome="loaded"),
+        attrs(operation="checkpoint"),
+        attrs(operation="reconnect", outcome="loaded"),
     }
 
 
@@ -529,7 +593,7 @@ def test_reader_that_raises_still_records_duration_and_reraises(readers, metric_
                 execution_id="execution",
                 run_id=None,
             )
-    assert histogram(metric_reader, DURATION)[key(operation="checkpoint")].count == 1
+    assert histogram(metric_reader, DURATION)[attrs(operation="checkpoint")].count == 1
     # The reader never learned a row count, so none is recorded.
     assert histogram(metric_reader, ROWS) == {}
 
@@ -552,11 +616,13 @@ def test_expected_refusal_keeps_the_rows_it_read(readers, metric_reader):
                     "assistant_message_id": "other",
                 },
             )
-    assert histogram(metric_reader, DURATION)[key(operation="tool_outcome")].count == 1
-    assert histogram(metric_reader, ROWS)[key(operation="tool_outcome")].sum == 1
+    assert (
+        histogram(metric_reader, DURATION)[attrs(operation="tool_outcome")].count == 1
+    )
+    assert histogram(metric_reader, ROWS)[attrs(operation="tool_outcome")].sum == 1
 
 
-def test_helper_reraises_the_same_error_object_and_survives_bad_budgets(
+def test_helper_reraises_the_same_error_object_after_recording_and_reporting(
     metric_reader, caplog, monkeypatch
 ):
     monkeypatch.setenv(ROW_ENV, "model=1")
@@ -566,7 +632,7 @@ def test_helper_reraises_the_same_error_object_and_survives_bad_budgets(
             read.rows = 10
             raise error
     assert raised.value is error
-    assert histogram(metric_reader, DURATION)[key(operation="model")].count == 1
+    assert histogram(metric_reader, DURATION)[attrs(operation="model")].count == 1
     (warning,) = budget_warnings(caplog)
     assert "task_id=5" in warning.getMessage()
     assert SENTINEL not in caplog.text
@@ -604,7 +670,9 @@ def test_invalid_budget_config_logs_once_and_the_read_still_succeeds(
     assert any(DURATION_ENV in message for message in invalid)
     assert budget_warnings(caplog) == []
     assert exported(metric_reader, EXCEEDED) == {}
-    assert histogram(metric_reader, DURATION)[key(operation="tool_outcome")].count == 4
+    assert (
+        histogram(metric_reader, DURATION)[attrs(operation="tool_outcome")].count == 4
+    )
 
     # A different invalid value is a new configuration problem.
     monkeypatch.setenv(ROW_ENV, "tool_outcome=-1")
@@ -632,7 +700,7 @@ def test_valid_duration_budget_still_applies_when_the_row_budget_is_invalid(
     monkeypatch.setenv(DURATION_ENV, "*=100")
     readers.tool_outcome()
     assert exported(metric_reader, EXCEEDED) == {
-        key(operation="tool_outcome", outcome="duration"): 1
+        attrs(operation="tool_outcome", outcome="duration"): 1
     }
 
 
@@ -653,22 +721,26 @@ def test_sentinel_never_reaches_any_signal(readers, metric_reader, caplog, monke
 def test_measurement_works_in_a_worker_thread_and_nesting_is_per_context(
     readers, metric_reader
 ):
-    import threading
-
     box: dict[str, Any] = {}
 
     def run():
         box["value"] = readers.tool_outcome()
 
+    def run_in_fresh_context():
+        # Python 3.14 free-threaded builds start threads in a copy of the
+        # caller's context; a fresh one keeps this test about nesting per
+        # context on every build.
+        contextvars.Context().run(run)
+
     # Reads inside a measured read on another thread are independent: the
     # suppression is per context, not process-wide.
     with measure_execution_event_read("model", task_id=readers.tid) as read:
-        thread = threading.Thread(target=run)
+        thread = threading.Thread(target=run_in_fresh_context)
         thread.start()
         thread.join()
         read.rows = 1
     assert box["value"]["result"] == SENTINEL
     assert set(histogram(metric_reader, DURATION)) == {
-        key(operation="model"),
-        key(operation="tool_outcome"),
+        attrs(operation="model"),
+        attrs(operation="tool_outcome"),
     }
