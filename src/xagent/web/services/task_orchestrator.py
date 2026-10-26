@@ -137,13 +137,14 @@ from .task_lease_service import (
     fail_and_release_task_lease_no_commit,
     get_runner_id,
     lock_task_lease_for_settlement_no_commit,
+    log_unknown_tool_effect_settlement,
     pause_and_release_task_lease_no_commit,
     release_task_lease,
-    run_has_unknown_tool_effect,
     run_task_lease_heartbeat,
     run_while_task_lease_owned,
     stop_task_lease_heartbeat,
     task_lease_attempt_predicate,
+    unknown_tool_effect_of_run,
     utc_now,
     validate_preacquired_task_lease_isolated,
 )
@@ -1585,7 +1586,7 @@ def _claim_turn_no_commit(
 
 
 def _report_turn_commit_unknown(
-    task_id: int, payload: TaskTurnPayload, claimed: _PreparedTurn | None
+    task_id: int, payload: TaskTurnPayload, claimed: _PreparedTurn
 ) -> None:
     """Report one turn acceptance whose COMMIT outcome could not be resolved.
 
@@ -1594,7 +1595,7 @@ def _report_turn_commit_unknown(
     report_unknown_outcome(
         "turn_commit",
         task_id=task_id,
-        run_id=(claimed.run_id or None) if claimed is not None else None,
+        run_id=claimed.run_id or None,
         ref=payload.turn_id,
     )
 
@@ -2102,18 +2103,33 @@ def settle_task_lease_isolated(
                         error_message=error_message,
                     )
                 if failed:
+                    # Reported only once this settlement has committed.
+                    unknown_tool_effect = (
+                        decision is not None
+                        and decision.outcome
+                        is InterruptionOutcome.FAIL_UNKNOWN_TOOL_EFFECT
+                    )
+                    unknown_tool_attempt_id = (
+                        decision.unknown_tool_attempt_id
+                        if decision is not None
+                        else None
+                    )
                     # The fenced UPDATE bypassed the identity map, and the
                     # decision may have loaded this row before it.
                     settle_db.expire_all()
                     task = settle_db.query(Task).filter(Task.id == lease.task_id).one()
-                    if (
-                        classify_unknown_tool_effect
+                    unknown = (
+                        unknown_tool_effect_of_run(settle_db, lease)
+                        if classify_unknown_tool_effect
                         and (
                             decision is None
                             or decision.outcome is InterruptionOutcome.LEGACY
                         )
-                        and run_has_unknown_tool_effect(settle_db, lease)
-                    ):
+                        else None
+                    )
+                    if unknown is not None:
+                        unknown_tool_effect = True
+                        unknown_tool_attempt_id = unknown.tool_attempt_id
                         error_message = TASK_UNKNOWN_TOOL_EFFECT_SETTLEMENT_ERROR
                         setattr(task, "error_message", error_message)
                         if decision is not None:
@@ -2157,6 +2173,10 @@ def settle_task_lease_isolated(
                         else {}
                     )
                     settle_db.commit()
+                    if unknown_tool_effect:
+                        log_unknown_tool_effect_settlement(
+                            lease.task_id, lease.run_id, unknown_tool_attempt_id
+                        )
                     if report is not None:
                         report.control_state = dict(event_state)
                     invalidate_task_cache_best_effort(lease.task_id)

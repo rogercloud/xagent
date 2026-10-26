@@ -7,6 +7,7 @@ from typing import Any, Callable
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+import sqlalchemy as sa
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session
 
@@ -28,6 +29,7 @@ from xagent.core.agent.checkpoint import (
     TraceCheckpointStore,
 )
 from xagent.web.models.task import Task, TaskStatus
+from xagent.web.models.task_execution_event import TaskExecutionEvent
 from xagent.web.services import task_execution_event_recovery as event_recovery
 from xagent.web.services import task_orchestrator as orchestrator
 from xagent.web.services.managed_task_lease import start_managed_task_lease
@@ -237,15 +239,23 @@ async def test_lost_tool_result_settles_as_unknown_effect(
     assert "Conversation event commit failed" not in str(published)
     assert TASK_UNKNOWN_TOOL_EFFECT_SETTLEMENT_ERROR not in str(published)
     _assert_client_safe_failure_transcript(factory, tid)
-    # The operator signal is one structured line per settlement; the
-    # unknown-outcome tests cover it in full.
+    # The operator signal is one structured line per settlement, naming the
+    # attempt; the unknown-outcome tests cover it in full.
+    with factory() as db:
+        (attempt,) = db.scalars(
+            sa.select(TaskExecutionEvent.tool_attempt_id).where(
+                TaskExecutionEvent.task_id == tid,
+                TaskExecutionEvent.kind == "tool_execution_start",
+            )
+        )
     assert [
         record.getMessage()
         for record in caplog.records
         if record.getMessage().startswith("execution_event_outcome_unknown ")
     ] == [
         f"execution_event_outcome_unknown task_id={tid} run_id={lease.run_id} "
-        "storage=v2 component=execution-events kind=tool_effect ref=-"
+        "storage=v2 component=execution-events kind=tool_effect ref="
+        f"{attempt}"
     ]
 
 
@@ -876,13 +886,13 @@ def test_settle_of_already_terminal_row_skips_classification(canonical, monkeypa
         db.get(Task, tid).status = TaskStatus.COMPLETED
         db.commit()
     reads: list[Any] = []
-    original = orchestrator.run_has_unknown_tool_effect
+    original = orchestrator.unknown_tool_effect_of_run
 
     def classify(db, lease_):
         reads.append(lease_)
         return original(db, lease_)
 
-    monkeypatch.setattr(orchestrator, "run_has_unknown_tool_effect", classify)
+    monkeypatch.setattr(orchestrator, "unknown_tool_effect_of_run", classify)
     assert not settle_task_lease_isolated(
         lease,
         error_message="setup/run error: RuntimeError: boom",
@@ -899,14 +909,14 @@ def _count_classification_reads(monkeypatch) -> list[int]:
     from xagent.web.services import task_lease_service
 
     reads: list[int] = []
-    original = task_lease_service._resolve_event_checkpoint_recovery
+    original = task_lease_service._resolve_event_checkpoint_recovery_with_data
 
     def resolve(db, *, task_id, run_id):
         reads.append(task_id)
         return original(db, task_id=task_id, run_id=run_id)
 
     monkeypatch.setattr(
-        task_lease_service, "_resolve_event_checkpoint_recovery", resolve
+        task_lease_service, "_resolve_event_checkpoint_recovery_with_data", resolve
     )
     return reads
 

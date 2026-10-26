@@ -73,9 +73,10 @@ class TaskLeaseRecovery:
 
     status: TaskStatus
     pause: LeaseRecoveryPause | None = None
-    # The run was failed as an unknown tool effect; reported once its
-    # transaction commits.
+    # The run was failed as an unknown tool effect (on this attempt, when
+    # known); reported once its transaction commits.
     unknown_tool_effect: bool = False
+    unknown_tool_attempt_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -397,6 +398,7 @@ def stage_task_lease_recovery_no_commit(
             unknown_tool_effect=(
                 verdict is CheckpointRecoveryVerdict.UNKNOWN_TOOL_EFFECT
             ),
+            unknown_tool_attempt_id=resolution.tool_attempt_id,
         )
     return TaskLeaseRecovery(
         next_status,
@@ -458,7 +460,9 @@ def _record_recovered_task_lease(
 
     if recovered.unknown_tool_effect:
         # Once per task, after the transaction that settled it committed.
-        log_unknown_tool_effect_settlement(candidate.task_id, candidate.run_id)
+        log_unknown_tool_effect_settlement(
+            candidate.task_id, candidate.run_id, recovered.unknown_tool_attempt_id
+        )
     invalidate_task_cache_best_effort(candidate.task_id)
     logger.warning(
         "Recovered expired task lease: task=%s status=%s runner=%s run=%s",
