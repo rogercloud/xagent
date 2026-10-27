@@ -12,7 +12,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from functools import partial
 from pathlib import Path
-from time import perf_counter
+from time import monotonic, perf_counter
 from typing import (
     Any,
     Dict,
@@ -1138,30 +1138,36 @@ class _CommandOriginRegistry:
 _command_origins = _CommandOriginRegistry()
 
 
-# V2 delivery ledger. Each socket records the display frames this process
-# actually sent to it (wire event id and execution sequence). On disconnect
-# the frames committed after the socket's replay horizon are compared with
-# what was sent. Recording stops beyond the cap, which bounds memory per
-# socket; such a connection is reported as ``overflow`` and not checked.
+# V2 delivery ledger. A socket that receives a V2 replay records the display
+# frames this process actually sent to it after the replay horizon (wire event
+# id, execution sequence and local send time). On disconnect the committed
+# frames after the horizon are compared with what was sent. Recording stops
+# beyond the cap, which bounds memory per socket; such a connection is
+# reported as ``overflow`` and not checked.
 _DELIVERY_LEDGER_CAP = 5000
+# Producers can deliver frames out of sequence order: the trace handler hops
+# to a worker thread after its fact commits, so sequence 11 may be sent before
+# sequence 10. A frame is only taken as the end of the checked range once it
+# was sent at least this long before the disconnect, measured on this
+# process's monotonic clock; earlier-sequenced frames still in flight then
+# have had this long to arrive. ``occurred_at`` is not used: it is producer
+# time (possibly another host's clock) and not comparable with the disconnect.
+_DELIVERY_REORDER_GRACE_SECONDS = 5.0
 # Disconnect checks are background tasks. At most this many may be pending
-# (a mass disconnect drops the rest) and only a few read the database at once,
-# so the checks cannot crowd the shared worker threads.
+# (a mass disconnect drops the rest as ``skipped``) and only a few read the
+# database at once, so the checks cannot crowd the shared worker threads.
 _DELIVERY_CHECK_PENDING_CAP = 256
 _DELIVERY_CHECK_CONCURRENCY = 2
 
 
-@dataclass(eq=False)
-class _ReplayPass:
-    """One historical replay being sent to one socket."""
-
-    horizon: int
+def _delivery_clock() -> float:
+    return monotonic()
 
 
 # Set only by the coroutine that sends a replay, so a live frame sent
 # concurrently from another task is never taken for a replay frame.
-_replay_pass: ContextVar[_ReplayPass | None] = ContextVar(
-    "xagent_websocket_replay_pass", default=None
+_replay_pass: ContextVar[bool] = ContextVar(
+    "xagent_websocket_replay_pass", default=False
 )
 
 
@@ -1169,39 +1175,59 @@ _replay_pass: ContextVar[_ReplayPass | None] = ContextVar(
 class _DeliveryLedger:
     task_id: int
     # Horizon of the first replay: every display frame committed after it
-    # must reach the socket live or through a later replay.
+    # must reach the socket live or through a later replay. Unknown while the
+    # first replay is still loading; frames sent meanwhile are kept and the
+    # ones at or below the horizon are pruned once it is known.
     horizon: int | None = None
-    replay: _ReplayPass | None = None
-    replays: int = 0
-    sent: dict[str, int] = field(default_factory=dict)
+    # Wire event id -> (sequence, local send time of its first delivery).
+    sent: dict[str, tuple[int, float]] = field(default_factory=dict)
+    # Ids sent at least once outside a replay or reconcile pass.
+    live: set[str] = field(default_factory=set)
     max_sequence: int = 0
     duplicates: int = 0
     overflow: bool = False
 
-    def begin_replay(self, replay: _ReplayPass) -> None:
-        if self.replay is replay:
+    def begin_replay(self, horizon: int) -> None:
+        if self.horizon is not None:
             return
-        self.replay = replay
-        self.replays += 1
-        if self.horizon is None:
-            self.horizon = replay.horizon
+        self.horizon = horizon
+        for event_id in [i for i, (seq, _) in self.sent.items() if seq <= horizon]:
+            del self.sent[event_id]
+            self.live.discard(event_id)
+        self.max_sequence = max((seq for seq, _ in self.sent.values()), default=0)
 
-    def record(self, event_id: str, sequence: int, replay: _ReplayPass | None) -> None:
-        if self.overflow:
+    def record(self, event_id: str, sequence: int, *, live: bool, now: float) -> None:
+        if self.overflow or (self.horizon is not None and sequence <= self.horizon):
+            # The replay covers everything up to the horizon; an overlapping
+            # live frame there is expected and not tracked.
             return
         if event_id in self.sent:
-            # A repeated replay resends the history the client asked for; only
-            # a live frame or the first replay repeating an id is a duplicate.
-            if replay is None or self.replays <= 1:
-                self.duplicates += 1
+            # Replays and reconcile passes resend frames on purpose; only the
+            # same frame sent live twice is a duplicate.
+            if live:
+                if event_id in self.live:
+                    self.duplicates += 1
+                else:
+                    self.live.add(event_id)
             return
         if len(self.sent) >= _DELIVERY_LEDGER_CAP:
             self.overflow = True
             self.sent.clear()
+            self.live.clear()
             return
-        self.sent[event_id] = sequence
+        self.sent[event_id] = (sequence, now)
+        if live:
+            self.live.add(event_id)
         if sequence > self.max_sequence:
             self.max_sequence = sequence
+
+    def checked_through(self, cutoff: float) -> int:
+        """Highest sequence sent no later than ``cutoff``, else the horizon."""
+        assert self.horizon is not None
+        return max(
+            (seq for seq, sent_at in self.sent.values() if sent_at <= cutoff),
+            default=self.horizon,
+        )
 
 
 def _expected_display_frames_sync(
@@ -1252,6 +1278,8 @@ class ConnectionManager:
         self._delivery_check_slots: (
             tuple[asyncio.AbstractEventLoop, asyncio.Semaphore] | None
         ) = None
+        # Set at shutdown so later disconnects schedule no database read.
+        self._delivery_checks_stopped = False
 
     async def connect(self, websocket: WebSocket, task_id: int) -> None:
         await websocket.accept()
@@ -1267,10 +1295,15 @@ class ConnectionManager:
         """
         if public_audience:
             self._public_sockets.add(websocket)
+        # A registration after ``stop_delivery_checks`` belongs to a new app
+        # lifespan (this module-level manager outlives one, e.g. across test
+        # clients); disconnects are checked again from then on.
+        self._delivery_checks_stopped = False
         current_task_id = self._connection_task_ids.get(websocket)
         if current_task_id is not None and current_task_id != task_id:
             self._remove_from_task(websocket, current_task_id)
-            # The ledger describes the previous task's stream only.
+            # The ledger describes the previous task's stream only; a replay
+            # of the new task starts a new one.
             self._delivery_ledgers.pop(websocket, None)
         if task_id not in self.active_connections:
             self.active_connections[task_id] = []
@@ -1352,29 +1385,58 @@ class ConnectionManager:
             return json.dumps(public_audience_frame(message))
         return encoded
 
-    def _record_delivery(self, websocket: WebSocket, message: Any) -> None:
+    def start_delivery_ledger(self, websocket: WebSocket, task_id: int) -> None:
+        """Start recording a registered socket's frames before its replay loads.
+
+        Called before the replay reads its horizon, so a live frame committed
+        after the horizon and sent while the replay is still loading is
+        recorded too. Only replayed sockets get a ledger.
+        """
+        if self._connection_task_ids.get(websocket) != task_id:
+            return
+        if websocket not in self._delivery_ledgers:
+            self._delivery_ledgers[websocket] = _DeliveryLedger(task_id)
+
+    def begin_delivery_replay(self, websocket: WebSocket, horizon: int | None) -> None:
+        """Fix the ledger's horizon from a loaded V2 replay.
+
+        ``None`` (a V1 replay, or none could be loaded) drops a ledger that
+        no V2 replay has defined yet.
+        """
+        ledger = self._delivery_ledgers.get(websocket)
+        if ledger is None:
+            return
+        if horizon is not None:
+            ledger.begin_replay(horizon)
+        elif ledger.horizon is None:
+            del self._delivery_ledgers[websocket]
+
+    def _record_delivery(
+        self, websocket: WebSocket, message: Any, *, live: bool = True
+    ) -> None:
         """Record one frame the socket accepted. O(1); V2 display frames only.
 
         Only V2 display frames carry an integer ``execution_sequence``; the
-        public-audience projection keeps it and ``event_id`` unchanged.
+        public-audience projection keeps it, ``event_id`` and ``task_id``
+        unchanged. ``live`` is false for replay and reconcile passes, which
+        resend frames on purpose. Never raises: delivery must not depend on
+        this bookkeeping.
         """
-        if not isinstance(message, dict):
-            return
-        replay = _replay_pass.get()
-        sequence = message.get("execution_sequence")
-        if replay is None and type(sequence) is not int:
-            return
-        ledger = self._delivery_ledgers.get(websocket)
-        if ledger is None:
-            task_id = self._connection_task_ids.get(websocket)
-            if task_id is None:
+        try:
+            ledger = self._delivery_ledgers.get(websocket)
+            if ledger is None or not isinstance(message, dict):
                 return
-            ledger = self._delivery_ledgers[websocket] = _DeliveryLedger(task_id)
-        if replay is not None:
-            ledger.begin_replay(replay)
-        event_id = message.get("event_id")
-        if type(sequence) is int and isinstance(event_id, str):
-            ledger.record(event_id, sequence, replay)
+            sequence = message.get("execution_sequence")
+            event_id = message.get("event_id")
+            if (
+                type(sequence) is not int
+                or not isinstance(event_id, str)
+                or message.get("task_id") != ledger.task_id
+            ):
+                return
+            ledger.record(event_id, sequence, live=live, now=_delivery_clock())
+        except Exception:
+            return
 
     def _schedule_delivery_check(self, ledger: _DeliveryLedger) -> None:
         """Start the consistency check of a closed socket without waiting.
@@ -1382,26 +1444,37 @@ class ConnectionManager:
         Never raises: it runs inside ``disconnect``.
         """
         try:
-            if ledger.horizon is None:
-                # No V2 replay reached this socket: nothing defines its range.
+            if self._delivery_checks_stopped or ledger.horizon is None:
+                # Shutting down, or no V2 replay defined this socket's range.
                 return
             if ledger.overflow:
                 report_delivery_consistency(
                     ledger.task_id, horizon=ledger.horizon, outcome="overflow"
                 )
                 return
-            if ledger.max_sequence <= ledger.horizon:
-                # Nothing was committed and sent after the replay.
-                _report_delivery(ledger, {})
+            through = ledger.checked_through(
+                _delivery_clock() - _DELIVERY_REORDER_GRACE_SECONDS
+            )
+            if through <= ledger.horizon:
+                # Nothing after the horizon was sent before the grace window:
+                # there is nothing to compare.
+                report_delivery_consistency(
+                    ledger.task_id,
+                    horizon=ledger.horizon,
+                    outcome="duplicate" if ledger.duplicates else "idle",
+                )
                 return
             if len(self._delivery_checks) >= _DELIVERY_CHECK_PENDING_CAP:
                 logger.debug(
                     "Delivery check skipped task_id=%s: too many pending checks",
                     ledger.task_id,
                 )
+                report_delivery_consistency(
+                    ledger.task_id, horizon=ledger.horizon, outcome="skipped"
+                )
                 return
             loop = asyncio.get_running_loop()
-            check = loop.create_task(self._check_delivery(ledger))
+            check = loop.create_task(self._check_delivery(ledger, through))
             self._delivery_checks.add(check)
             check.add_done_callback(self._delivery_checks.discard)
         except Exception:
@@ -1421,25 +1494,24 @@ class ConnectionManager:
             )
         return self._delivery_check_slots[1]
 
-    async def _check_delivery(self, ledger: _DeliveryLedger) -> None:
+    async def _check_delivery(self, ledger: _DeliveryLedger, through: int) -> None:
         assert ledger.horizon is not None
         horizon = ledger.horizon
         try:
             async with self._delivery_check_semaphore():
                 expected = await run_db_io_cancellation_safe(
                     lambda: _expected_display_frames_sync(
-                        ledger.task_id, horizon, ledger.max_sequence
+                        ledger.task_id, horizon, through
                     )
                 )
-        except asyncio.CancelledError:
-            raise
         except Exception as exc:
             report_delivery_check_failure(ledger.task_id, horizon=horizon, error=exc)
             return
         _report_delivery(ledger, expected)
 
     async def stop_delivery_checks(self) -> None:
-        """Cancel pending disconnect checks and wait for them to finish."""
+        """Cancel pending disconnect checks, wait for them, schedule no more."""
+        self._delivery_checks_stopped = True
         pending = list(self._delivery_checks)
         for check in pending:
             check.cancel()
@@ -1455,9 +1527,17 @@ class ConnectionManager:
             await cast(asyncio.Future[None], delivery)
         else:
             await websocket.send_text(json.dumps(versioned_message))
-        self._record_delivery(websocket, versioned_message)
+        self._record_delivery(websocket, versioned_message, live=not _replay_pass.get())
 
-    async def deliver_shared_event(self, message: dict[str, Any], task_id: int) -> None:
+    async def deliver_shared_event(
+        self, message: dict[str, Any], task_id: int, *, live: bool = True
+    ) -> None:
+        """Queue one frame for every shared-mode socket of a task.
+
+        ``live`` is false for a reconcile pass, which resends settlement
+        frames on purpose; the delivery ledger does not count those as
+        duplicates.
+        """
         encoded = json.dumps(message)
         connections = self.connections_for_task(task_id)
         public_encoded = self._public_encoding(message, encoded, connections)
@@ -1476,7 +1556,12 @@ class ConnectionManager:
                         if self._is_public_audience(connection)
                         else encoded,
                         on_sent=(
-                            partial(self._record_delivery, connection, message)
+                            partial(
+                                self._record_delivery,
+                                connection,
+                                message,
+                                live=live,
+                            )
                             if recordable
                             else None
                         ),
@@ -1493,17 +1578,21 @@ class ConnectionManager:
             await asyncio.gather(self._stream_reconciler, return_exceptions=True)
             self._stream_reconciler = None
 
-    async def _reconcile_streams(self) -> None:
+    async def _reconcile_streams_once(self) -> None:
         from ..services.task_stream_snapshot import load_task_stream_snapshots
 
+        task_ids = list(self.active_connections)
+        snapshots = await run_db_io_cancellation_safe(
+            lambda: load_task_stream_snapshots(task_ids)
+        )
+        for snapshot in snapshots:
+            # Settlement display frames are re-sent every pass by design.
+            await self.deliver_shared_event(snapshot, snapshot["task_id"], live=False)
+
+    async def _reconcile_streams(self) -> None:
         while True:
             try:
-                task_ids = list(self.active_connections)
-                snapshots = await run_db_io_cancellation_safe(
-                    lambda: load_task_stream_snapshots(task_ids)
-                )
-                for snapshot in snapshots:
-                    await self.deliver_shared_event(snapshot, snapshot["task_id"])
+                await self._reconcile_streams_once()
             except asyncio.CancelledError:
                 raise
             except Exception:
@@ -1569,7 +1658,6 @@ class ConnectionManager:
                         if self._is_public_audience(connection)
                         else encoded_message
                     )
-                    self._record_delivery(connection, versioned_message)
                     increment_performance_counter("xagent.websocket.messages.sent")
                 except (
                     BrokenResourceError,
@@ -1597,6 +1685,9 @@ class ConnectionManager:
                     # Remove disconnected connection but preserve error propagation
                     self.disconnect(connection)
                     raise
+                else:
+                    # Outside the try: bookkeeping never changes delivery.
+                    self._record_delivery(connection, versioned_message)
 
 
 # Global connection manager
@@ -3195,13 +3286,22 @@ async def send_historical_data_as_stream(
 
     try:
         started = perf_counter()
-        snapshot = await run_db_io_cancellation_safe(
-            lambda: _load_historical_stream_snapshot_sync(
-                task_id,
-                actor_user_id=int(user.id),
-                actor_is_admin=bool(user.is_admin),
+        # Before the horizon is read: live frames committed after it may be
+        # sent while the replay loads, and must be recorded.
+        manager.start_delivery_ledger(websocket, task_id)
+        snapshot = None
+        try:
+            snapshot = await run_db_io_cancellation_safe(
+                lambda: _load_historical_stream_snapshot_sync(
+                    task_id,
+                    actor_user_id=int(user.id),
+                    actor_is_admin=bool(user.is_admin),
+                )
             )
-        )
+        finally:
+            manager.begin_delivery_replay(
+                websocket, None if snapshot is None else snapshot.horizon
+            )
         if snapshot is None:
             return
         replay_token = None
@@ -3214,7 +3314,7 @@ async def send_historical_data_as_stream(
                 duration_ms=(perf_counter() - started) * 1000,
             )
             # Marks these sends as one replay pass in the delivery ledger.
-            replay_token = _replay_pass.set(_ReplayPass(snapshot.horizon))
+            replay_token = _replay_pass.set(True)
         try:
             for event in snapshot.events:
                 await manager.send_personal_message(deepcopy(event), websocket)

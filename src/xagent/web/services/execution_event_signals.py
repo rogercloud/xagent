@@ -108,7 +108,21 @@ def report_delivery_consistency(
 ) -> None:
     """Report the delivery check of one closed V2 connection.
 
-    ``outcome`` is ``complete``, ``missing``, ``duplicate`` or ``overflow``.
+    ``outcome`` is one of:
+
+    - ``complete``, ``missing``: the committed display frames after the
+      replay horizon were compared with the frames sent. Only frames whose
+      live delivery is unconditional are expected (accepted inputs and
+      assistant chat messages are not), and the range ends at the highest
+      sequence sent at least the reorder grace period before the disconnect.
+      ``complete`` says nothing about frames committed after that point.
+    - ``duplicate``: nothing missing, but the same frame after the horizon
+      was sent live twice. Replay and reconcile passes are not counted.
+    - ``idle``: nothing after the horizon was sent before the grace window,
+      so there was nothing to compare.
+    - ``skipped``: too many checks were pending; this one never ran.
+    - ``overflow``: the socket was sent more frames than the ledger keeps.
+
     A WARNING locates the task only when committed display events were not
     sent; duplicates are informational because clients de-duplicate them.
     """
