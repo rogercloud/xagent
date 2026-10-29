@@ -306,12 +306,16 @@ DERIVE = {
 }
 ALLOWLIST = {
     ("POST", "/v1/chat/tasks"),
+    ("DELETE", "/v1/chat/tasks/{task_id}"),
     ("POST", "/v1/chat/tasks/{task_id}/messages"),
     ("POST", "/v1/chat/tasks/{task_id}/reply"),
+    ("POST", "/v1/chat/tasks/{task_id}/cancel-question"),
     ("POST", "/v1/workforces/{workforce_id}/runs"),
 }
 EXCLUDE = {
     ("POST", "/v1/chat/files"),
+    ("GET", "/v1/chat/files/{file_id}/download"),
+    ("GET", "/v1/chat/tasks/{task_id}/files"),
     ("GET", "/v1/chat/tasks/{task_id}/steps"),
     ("GET", "/v1/me"),
     ("GET", "/v1/templates"),
