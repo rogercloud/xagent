@@ -136,10 +136,12 @@ class ExecutionEventTraceAdapter(DatabaseTraceHandler):
                 CHECKPOINT_LOAD_UNAVAILABLE,
                 f"task {self.task_id}: checkpoint partition probe failed",
             )
+            # Type only: a driver message or statement parameters can carry
+            # task content.
             logger.error(
-                "task %s: run-tagged checkpoint probe failed",
+                "task %s: run-tagged checkpoint probe failed: %s",
                 self.task_id,
-                exc_info=True,
+                type(exc).__name__,
             )
             raise CheckpointUnavailableError(
                 f"task {self.task_id}: could not determine whether a "

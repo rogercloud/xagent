@@ -919,6 +919,12 @@ async def test_widened_read_with_failing_probe_reports_one_refusal(
         level=logging.ERROR,
         task_id=tid,
     )
+    # No record, tracebacks included, renders the probe error's content.
+    assert any(
+        "run-tagged checkpoint probe failed: OperationalError" in r.getMessage()
+        for r in caplog.records
+    )
+    assert SENTINEL not in caplog.text
 
 
 # ------------------------------------------------------------ the reporter
