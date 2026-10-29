@@ -19,12 +19,14 @@ which is also used by the WebSocket UI path so both transports share
 one state machine.
 """
 
+import asyncio
+import logging
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
-from typing import Any, NoReturn, Optional, cast
+from typing import Any, Literal, NoReturn, Optional, cast
 
 from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
-from fastapi.responses import StreamingResponse
+from fastapi.responses import Response, StreamingResponse
 from pydantic import TypeAdapter
 from sqlalchemy import func
 from sqlalchemy.orm import Session
@@ -34,16 +36,21 @@ from ....core.tools.adapters.vibe.connector_runtime import ConnectorRuntimeError
 from ...config import is_allowed_file
 from ...models.database import get_session_local
 from ...models.task import Task, TaskStatus, TraceEvent
+from ...models.uploaded_file import UploadedFile
 from ...schemas.v1 import (
     AppendMessageRequest,
     AppendMessageResponse,
+    CancelQuestionResponse,
     CreateTaskRequest,
     CreateTaskResponse,
+    DeleteTaskResponse,
     PendingInteraction,
     PublicStep,
     ReplyRequest,
     ReplyResponse,
     StepsResponse,
+    TaskFileInfo,
+    TaskFilesResponse,
     TaskInfoResponse,
     UploadedFileInfo,
     UploadFilesResponse,
@@ -63,7 +70,17 @@ from ...services.hot_path_cache import (
 from ...services.managed_file_ref import (
     DurableStorageOperationError,
 )
+from ...services.prompt_context import validate_signed_prompt_context
 from ...services.task_auto_resume import TerminalView, status_only_terminal_view
+from ...services.task_delete import (
+    TaskDeleteBusy,
+    TaskDeleteSnapshot,
+    TaskExtensionCleanupRejected,
+    commit_task_deletion,
+    finish_task_deletion,
+    task_delete_snapshot,
+    task_is_active_for_delete,
+)
 from ...services.task_execution_controller import TaskControlState
 from ...services.task_interaction_read import get_pending_interaction_question
 from ...services.task_orchestrator import (
@@ -71,10 +88,17 @@ from ...services.task_orchestrator import (
     TaskTurnFileBindingError,
     TaskTurnNotFoundError,
 )
+from ...services.uploaded_file_store import (
+    UploadedFileVersionSnapshot,
+    snapshot_uploaded_file_version,
+)
+from ...utils.db_timezone import normalize_datetime_from_db
 from . import _events_stream
 from ._step_mapping import map_trace_events_to_public_steps
 from .deps import ApiKeyPrincipal, get_principal_from_api_key, record_key_usage
 from .errors import V1ApiError, V1ErrorCode, raise_for_turn_rejection
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
@@ -254,6 +278,15 @@ def _raise_v1_file_binding_error(exc: TaskTurnFileBindingError) -> NoReturn:
     ) from exc
 
 
+def _validate_prompt_context(prompt_context: dict[str, Any] | None) -> None:
+    if prompt_context is None:
+        return
+    try:
+        validate_signed_prompt_context(prompt_context)
+    except ValueError as exc:
+        raise V1ApiError(V1ErrorCode.INVALID_INPUT, 422, message=str(exc)) from exc
+
+
 def _raise_v1_connector_runtime_error(exc: ConnectorRuntimeError) -> NoReturn:
     try:
         code = V1ErrorCode(exc.code)
@@ -341,6 +374,7 @@ async def create_chat_task(
             exception message stays out of the response.
     """
     agent_identity = principal.agent
+    _validate_prompt_context(request.prompt_context)
     if agent_identity is None or request.agent_id != agent_identity.id:
         raise V1ApiError(V1ErrorCode.AGENT_NOT_FOUND, 404)
 
@@ -356,6 +390,8 @@ async def create_chat_task(
             ),
             timezone=request.timezone,
             requested_dispatch_class=request.dispatch_class,
+            requested_priority=request.priority,
+            prompt_context=request.prompt_context,
         )
     except task_start_service.TaskStartRejected as exc:
         _raise_start_rejection(exc)
@@ -499,6 +535,119 @@ def _resolve_task_or_404(task_id: int, principal: ApiKeyPrincipal, db: Session) 
         )
     except task_start_service.TaskStartRejected as exc:
         _raise_start_rejection(exc)
+
+
+# A task an executor may still be writing to is refused rather than deleted
+# out from under it; a finished/paused/waiting task is deletable.
+def _raise_if_task_active_for_delete(db: Session, task: Task) -> None:
+    if task_is_active_for_delete(db, task):
+        raise V1ApiError(
+            V1ErrorCode.TASK_BUSY,
+            409,
+            message=(
+                "Task is running or has queued work; wait for it to finish before "
+                "deleting it."
+            ),
+        )
+
+
+def _load_task_delete_snapshot(
+    task_id: int,
+    principal: ApiKeyPrincipal,
+) -> TaskDeleteSnapshot:
+    """Authorize and guard one task inside a worker-owned short Session."""
+
+    SessionLocal = get_session_local()
+    with SessionLocal() as db:
+        task = _resolve_task_or_404(task_id, principal, db)
+        _raise_if_task_active_for_delete(db, task)
+        return task_delete_snapshot(task)
+
+
+def _task_file_source(file_record: UploadedFile) -> Literal["output", "upload"]:
+    # ``workspace_category`` is set by workspace registration; uploads leave
+    # it NULL, so anything but the output category is an attachment.
+    return "output" if file_record.workspace_category == "output" else "upload"
+
+
+def _list_chat_task_files_sync(
+    task_id: int, principal: ApiKeyPrincipal
+) -> TaskFilesResponse:
+    SessionLocal = get_session_local()
+    with SessionLocal() as db:
+        task = _resolve_task_or_404(task_id, principal, db)
+        records = (
+            db.query(UploadedFile)
+            .filter(UploadedFile.task_id == int(task.id))
+            .order_by(UploadedFile.created_at.asc(), UploadedFile.id.asc())
+            .all()
+        )
+        files: list[TaskFileInfo] = []
+        for record in records:
+            if (
+                record.detached_reason is not None
+                or record.storage_status == "compensating"
+            ):
+                continue
+            created_at = (
+                normalize_datetime_from_db(record.created_at)
+                if record.created_at is not None
+                else None
+            )
+            files.append(
+                TaskFileInfo(
+                    file_id=str(record.file_id),
+                    filename=str(record.filename),
+                    file_size=int(record.file_size or 0),
+                    mime_type=record.mime_type,
+                    created_at=created_at,
+                    source=_task_file_source(record),
+                )
+            )
+        return TaskFilesResponse(files=files)
+
+
+def _load_download_file_snapshot(
+    file_id: str, principal: ApiKeyPrincipal
+) -> UploadedFileVersionSnapshot:
+    """Authorize one SDK download and detach its storage metadata.
+
+    Task-bound files require the task to be reachable through this key (the
+    same scope every other v1 task route uses). A never-attached upload is
+    allowed only to the user who uploaded it. Every refusal is a 404 so file
+    existence is not disclosed.
+    """
+
+    SessionLocal = get_session_local()
+    with SessionLocal() as db:
+        record = db.query(UploadedFile).filter(UploadedFile.file_id == file_id).first()
+        if (
+            record is None
+            or record.detached_reason is not None
+            or record.storage_status == "compensating"
+        ):
+            raise V1ApiError(V1ErrorCode.FILE_NOT_FOUND, 404)
+        if record.task_id is not None:
+            try:
+                _resolve_task_or_404(int(record.task_id), principal, db)
+            except V1ApiError as exc:
+                raise V1ApiError(V1ErrorCode.FILE_NOT_FOUND, 404) from exc
+        elif int(record.user_id) != principal.owner_user_id:
+            raise V1ApiError(V1ErrorCode.FILE_NOT_FOUND, 404)
+        return snapshot_uploaded_file_version(record)
+
+
+def _raise_v1_file_download_error(exc: HTTPException) -> NoReturn:
+    if exc.status_code >= 500:
+        _raise_v1_storage_unavailable(exc)
+    if exc.status_code == 409:
+        raise V1ApiError(
+            V1ErrorCode.INTERNAL_ERROR,
+            409,
+            message="File integrity verification failed. Please re-upload this file.",
+        ) from exc
+    # 403 (path containment) and 404 both stay non-disclosing on the SDK surface.
+    raise V1ApiError(V1ErrorCode.FILE_NOT_FOUND, 404) from exc
 
 
 def _load_task_info_snapshot(
@@ -849,6 +998,13 @@ async def append_message_to_task(
             (use ``reply`` instead).
         500: any other unexpected error (V1 envelope via global handler).
     """
+    _validate_prompt_context(request.prompt_context)
+    if request.prompt_context is not None and principal.workforce is not None:
+        raise V1ApiError(
+            V1ErrorCode.INVALID_INPUT,
+            422,
+            message="prompt_context is not supported for workforce keys.",
+        )
     try:
         started = await task_start_service.append_sdk_turn(
             task_id=task_id,
@@ -861,6 +1017,7 @@ async def append_message_to_task(
             connector_runtime_context=tuple(
                 item.model_dump() for item in request.connector_runtime_context or ()
             ),
+            prompt_context=request.prompt_context,
         )
     except task_start_service.TaskStartRejected as exc:
         _raise_start_rejection(exc)
@@ -919,6 +1076,158 @@ async def reply_to_waiting_task(
     from .task_reply import reply_to_task
 
     return await reply_to_task(task_id=task_id, request=request, principal=principal)
+
+
+@router.delete("/chat/tasks/{task_id}", response_model=DeleteTaskResponse)
+async def delete_chat_task(
+    task_id: int,
+    principal: ApiKeyPrincipal = Depends(get_principal_from_api_key),
+) -> DeleteTaskResponse:
+    """Delete one SDK task and everything tied to it.
+
+    The task is resolved through the same ownership rule as
+    ``GET /v1/chat/tasks/{task_id}``: a task of another agent, another
+    user's agent, or a nonexistent id all answer the same 404. A task
+    that is executing, holds an unexpired execution lease, or has an
+    accepted command still queued answers 409 ``task_busy`` instead of
+    being deleted out from under its executor; wait for it to finish
+    and retry. The final re-check runs under a row lock, which is
+    effective on PostgreSQL only; SQLite leaves a small window between
+    the check and the delete.
+
+    The owned rows (trace events/blobs/checkpoints, chat messages, DAG
+    executions, interaction requests, connector runtime context, runtime
+    extension bindings), the uploaded-file bindings, and the workspace
+    are removed through the same helper the Web UI delete uses. External
+    cleanup that fails is recorded as a retryable obligation, never a
+    half state reported as success: ``workspace_cleanup_pending`` and
+    ``external_cleanup_pending`` in the response say whether anything is
+    still owed. Deleting twice answers 404.
+
+    Raises:
+        V1ApiError 401: missing / invalid / revoked key.
+        V1ApiError 404: task missing or not owned by the calling key.
+        V1ApiError 409: ``task_busy`` -- running or queued, retry after it ends.
+        V1ApiError 410: ``task_expired`` for a retention-expired task.
+        V1ApiError 503: a bound runtime extension could not release its
+            state; the task was not deleted.
+    """
+    snapshot = await run_db_io_cancellation_safe(
+        lambda: _load_task_delete_snapshot(task_id, principal)
+    )
+    try:
+        committed = await commit_task_deletion(snapshot, refuse_if_active=True)
+    except TaskDeleteBusy as exc:
+        raise V1ApiError(
+            V1ErrorCode.TASK_BUSY,
+            409,
+            message=(
+                "Task became active during deletion; wait for it to finish "
+                "before deleting it."
+            ),
+        ) from exc
+    except TaskExtensionCleanupRejected as exc:
+        raise V1ApiError(
+            V1ErrorCode.INTERNAL_ERROR,
+            503,
+            message="Runtime extension cleanup failed; the task was not deleted.",
+        ) from exc
+    if committed is None:
+        raise V1ApiError(V1ErrorCode.TASK_NOT_FOUND, 404)
+
+    # The rows are committed as gone: detach this task's WebSocket
+    # connections before the next await, then stop any in-process executor and
+    # close the sockets before the workspace is reclaimed, as the Web UI
+    # delete does. The guards above refuse a task that is leased or has queued
+    # work, so this only reaches executors that started in the window the
+    # pre-checks cannot close. The cleanup runs as its own task and is
+    # shielded, so a cancelled request cannot leave sockets detached but open.
+    from ...services.task_execution import background_task_manager
+    from ..websocket import manager as websocket_manager
+
+    connections = websocket_manager.detach_task_connections(task_id)
+
+    async def _cleanup_runtime_state() -> None:
+        await background_task_manager.cancel_task(task_id, timeout_seconds=0.05)
+        for connection in connections:
+            try:
+                await connection.close()
+            except Exception:
+                logger.warning("Failed to close WebSocket connection", exc_info=True)
+
+    await asyncio.shield(asyncio.create_task(_cleanup_runtime_state()))
+    outcome = await finish_task_deletion(committed)
+    await record_key_usage(str(principal.key.key_prefix))
+    return DeleteTaskResponse(
+        task_id=task_id,
+        workspace_cleanup_pending=outcome.workspace_cleanup_pending,
+        external_cleanup_pending=outcome.external_cleanup_pending,
+    )
+
+
+@router.post(
+    "/chat/tasks/{task_id}/cancel-question",
+    status_code=202,
+    response_model=CancelQuestionResponse,
+)
+async def cancel_waiting_task_question(
+    task_id: int,
+    principal: ApiKeyPrincipal = Depends(get_principal_from_api_key),
+) -> CancelQuestionResponse:
+    """Abandon the pending question on a ``waiting_for_user`` task.
+
+    Reuses ``GET``'s ownership rule (another agent's task, another user's
+    agent, a missing id, or a non-SDK task all answer 404). The pending
+    interaction row is terminated rather than deleted, the paused run is
+    finalized to ``completed``, and the same task then accepts
+    ``POST /v1/chat/tasks/{id}/messages`` (fresh connector context, same
+    conversation). Repeating the call on the already-cancelled run returns
+    the same 202 body; any other non-waiting state answers 409.
+
+    A concurrent ``POST .../reply`` that claimed the answer slot first makes
+    this answer 409 ``task_busy``. Once this endpoint wins, a reply that
+    admitted against the old waiting state can still answer 409
+    ``task_busy`` when its own compare-and-swap loses; one that reads the
+    task afterwards answers 409 ``no_pending_interaction``.
+
+    Raises:
+        V1ApiError 401: missing / invalid / revoked key.
+        V1ApiError 404: task missing, not owned by the key, or not SDK-created.
+        V1ApiError 409: ``task_busy`` while a reply is in flight;
+            ``task_not_waiting`` for any other non-waiting state.
+        V1ApiError 410: ``task_expired`` for a retention-expired task.
+    """
+    from ...services.task_question_cancel import (
+        TaskQuestionCancelBusy,
+        TaskQuestionCancelNotWaiting,
+        cancel_task_question,
+    )
+
+    try:
+        result = await cancel_task_question(
+            task_id=task_id,
+            scope=_sdk_task_scope(principal),
+        )
+    except task_start_service.TaskStartRejected as exc:
+        _raise_start_rejection(exc)
+    except TaskQuestionCancelBusy as exc:
+        raise V1ApiError(
+            V1ErrorCode.TASK_BUSY,
+            409,
+            message="A reply is already in flight for this task; retry later.",
+        ) from exc
+    except TaskQuestionCancelNotWaiting as exc:
+        raise V1ApiError(V1ErrorCode.TASK_NOT_WAITING, 409) from exc
+    except TaskTurnError as exc:
+        raise_for_turn_rejection(exc.reason)
+
+    await record_key_usage(str(principal.key.key_prefix))
+    return CancelQuestionResponse(
+        task_id=result.task_id,
+        status=result.status,
+        run_id=result.run_id,
+        state_version=result.state_version,
+    )
 
 
 @router.get("/chat/tasks/{task_id}", response_model=TaskInfoResponse)
@@ -1004,6 +1313,53 @@ async def get_chat_task_steps(
     return await run_db_io_cancellation_safe(
         lambda: _get_chat_task_steps_sync(task_id, principal)
     )
+
+
+@router.get("/chat/tasks/{task_id}/files", response_model=TaskFilesResponse)
+async def get_chat_task_files(
+    task_id: int,
+    principal: ApiKeyPrincipal = Depends(get_principal_from_api_key),
+) -> TaskFilesResponse:
+    """List the files bound to a task.
+
+    Covers both files the agent produced in the task workspace and files
+    attached to one of its turns. Authorization is the same task scope every
+    other ``/v1/chat/tasks/{task_id}/*`` route uses.
+
+    Raises:
+        V1ApiError 401: missing / invalid / revoked key.
+        V1ApiError 404: task missing or not accessible with this key.
+        V1ApiError 410: the task was expired by the retention policy.
+    """
+    return await run_db_io_cancellation_safe(
+        lambda: _list_chat_task_files_sync(task_id, principal)
+    )
+
+
+@router.get("/chat/files/{file_id}/download", response_model=None)
+async def download_chat_file(
+    file_id: str,
+    principal: ApiKeyPrincipal = Depends(get_principal_from_api_key),
+) -> Response:
+    """Download one file as an attachment.
+
+    A task-bound file is served only when its task is reachable through this
+    key; an unbound upload only to the user who uploaded it. Failures use the
+    stable v1 error envelope and answer 404 rather than 403.
+    """
+    from ..files import build_registered_file_download_response
+
+    snapshot = await run_db_io_cancellation_safe(
+        lambda: _load_download_file_snapshot(file_id, principal)
+    )
+    try:
+        return await build_registered_file_download_response(
+            snapshot,
+            owner_user_id=int(snapshot.user_id),
+            disposition="attachment",
+        )
+    except HTTPException as exc:
+        _raise_v1_file_download_error(exc)
 
 
 @router.get("/chat/tasks/{task_id}/events")
