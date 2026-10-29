@@ -1,4 +1,5 @@
-"""Operator signals for V2 execution-event writes and recovery reads.
+"""Operator signals for execution-event writes, unknown outcomes and recovery
+reads.
 
 Each helper emits two kinds of signal for one occurrence: a single structured
 log line that locates the task (and the tool attempt where relevant), and a
@@ -7,7 +8,13 @@ exception text; exception messages can embed user data, so only type names,
 identifiers, SQLSTATEs, bounded reason names and numbers are reported. Task
 ids appear in logs only, never as metric attributes.
 
-``report_commit_failure`` covers failed event commits;
+``report_commit_failure`` covers failed event commits.
+``report_unknown_outcome`` covers cases where the system does not know whether
+something durable happened (a tool's external effect, a turn or command
+acceptance, a finalize whose acknowledgement was lost, a settlement deferred
+to lease recovery). One of its kinds, ``finalize_ack_reconciled``, is a
+confirmed success counted for visibility only: alerts on the unknown-outcome
+counter must exclude it.
 ``report_recovery_refusal`` covers recovery reads that refuse to resume a task.
 Its counter counts refused reads, including classification probes, so it is
 neither a per-task nor a per-resume count; see that helper for known gaps.
@@ -24,6 +31,7 @@ from .db_write_retry import cause_links, database_sqlstate
 logger = logging.getLogger(__name__)
 
 COMMIT_FAILURE_COUNTER = "xagent.execution_event.commit.failures"
+UNKNOWN_OUTCOME_COUNTER = "xagent.execution_event.unknown_outcomes"
 RECOVERY_REFUSAL_COUNTER = "xagent.execution_event.recovery.refusals"
 
 _REFUSAL_LEVELS = {
@@ -139,3 +147,52 @@ def report_recovery_refusal(
     except Exception:
         # Observability must never change the behavior of the measured path.
         return
+
+
+def report_unknown_outcome(
+    kind: str,
+    *,
+    task_id: int,
+    run_id: str | None = None,
+    ref: str | None = None,
+    storage: str = "unknown",
+    level: int = logging.WARNING,
+) -> None:
+    """Report one case where it is unknown whether something durable happened.
+
+    ``kind`` names the case and is the counter's ``operation`` attribute, so
+    it must stay a small fixed set: ``tool_effect``, ``turn_commit``,
+    ``command_commit``, ``finalize_ack_unresolved``,
+    ``resume_finalize_unreconciled``, ``settlement_deferred`` -- and
+    ``finalize_ack_reconciled``, which is not unknown but a confirmed success
+    (the read-back proved a lost acknowledgement's COMMIT applied), reported
+    at INFO and counted for visibility only: alerts on this counter must
+    exclude it. ``storage`` is ``v1``, ``v2`` or ``unknown``; ``turn_commit``,
+    ``command_commit`` and ``settlement_deferred`` report ``unknown`` because
+    the storage version is not in scope where they occur. ``ref`` is an
+    identifier only (a turn id, a command id, a tool attempt id), never
+    text. Call it once per occurrence. Never raises, so a failure to report
+    cannot change the path being measured.
+    """
+    # Observability must never change the behavior of the measured path.
+    # Two independent guards: a failing metric must not suppress the log line.
+    try:
+        increment_counter(
+            UNKNOWN_OUTCOME_COUNTER,
+            attributes={"operation": kind, "storage": storage},
+        )
+    except Exception:
+        pass
+    try:
+        logger.log(
+            level,
+            "execution_event_outcome_unknown task_id=%s run_id=%s storage=%s "
+            "component=execution-events kind=%s ref=%s",
+            task_id,
+            run_id or "-",
+            storage,
+            kind,
+            ref or "-",
+        )
+    except Exception:
+        pass

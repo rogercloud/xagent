@@ -722,7 +722,7 @@ async def test_lease_sweeper_classification_reports_the_refusal_once(
 ):
     from xagent.web.services.task_lease_service import (
         CheckpointRecoveryVerdict,
-        _resolve_event_checkpoint_recovery,
+        _resolve_event_checkpoint_recovery_with_data,
     )
 
     factory, tid = canonical
@@ -739,10 +739,10 @@ async def test_lease_sweeper_classification_reports_the_refusal_once(
             tracer=TraceCheckpointStore(tracer_for(tid))
         ).on_tool_start(tool_call=call("attempt-w"))
     with factory() as db:
-        verdict = _resolve_event_checkpoint_recovery(
+        resolution = _resolve_event_checkpoint_recovery_with_data(
             db, task_id=tid, run_id=lease.run_id
         )
-    assert verdict is CheckpointRecoveryVerdict.UNKNOWN_TOOL_EFFECT
+    assert resolution.verdict is CheckpointRecoveryVerdict.UNKNOWN_TOOL_EFFECT
     assert_one(
         caplog,
         metric_reader,

@@ -27,7 +27,7 @@ Design notes:
 from datetime import datetime
 from typing import Any, Dict, List, Literal, Optional
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, StrictInt
 
 from .agent import PromptContextFieldDeclaration, PromptContextFieldList
 
@@ -103,6 +103,20 @@ class CreateTaskRequest(BaseModel):
         ),
     )
     message: MessageBody = Field(..., description="First user message of the task.")
+    prompt_context: Optional[Dict[str, Any]] = Field(
+        default=None,
+        description=(
+            "Trusted reference data stored on the task and replayed on every "
+            "turn until an append replaces or clears it. Keys must match "
+            "``^[A-Za-z_][A-Za-z0-9_.-]{0,63}$`` and values must be strings, "
+            "finite numbers, or booleans. Values are passed through without "
+            "the agent's field whitelist and stamped signed. The size limit "
+            "is 4096 UTF-8 bytes of the rendered form: JSON with sorted keys, "
+            "default separators (``, `` and ``: ``), non-ASCII kept as-is, and "
+            "backticks escaped to ``\\u0060`` (six bytes); a client measuring "
+            "compact JSON undercounts."
+        ),
+    )
     metadata: Optional[Dict[str, Any]] = Field(
         default=None,
         description=(
@@ -125,6 +139,19 @@ class CreateTaskRequest(BaseModel):
             "the deployment honors the request is its own setting; the "
             "response's 'dispatch_class' shows the class the start command "
             "was given."
+        ),
+    )
+    priority: Optional[StrictInt] = Field(
+        default=None,
+        ge=-10,
+        le=10,
+        description=(
+            "Priority of this task's commands, an integer from -10 to 10; "
+            "higher goes first. Omit it or send null for 0. It takes effect "
+            "only where the deployment dispatches fairly across accounts, and "
+            "only orders commands of the same account and the same dispatch "
+            "class. Messages appended to the task and manual resumes inherit "
+            "it."
         ),
     )
     timezone: Optional[str] = Field(
@@ -157,6 +184,37 @@ class UploadFilesResponse(BaseModel):
     """
 
     files: List[UploadedFileInfo]
+
+
+TaskFileSource = Literal["output", "upload"]
+
+
+class TaskFileInfo(BaseModel):
+    """One file bound to a task, as listed by ``GET .../tasks/{id}/files``."""
+
+    file_id: str
+    filename: str
+    file_size: int
+    mime_type: Optional[str] = None
+    created_at: Optional[datetime] = None
+    source: TaskFileSource = Field(
+        ...,
+        description=(
+            "``output`` for a file the agent produced in the task workspace; "
+            "``upload`` for a file attached to the task. Derived from the "
+            "stored workspace category, so it is ``upload`` when that "
+            "category is absent or is not ``output``."
+        ),
+    )
+
+
+class TaskFilesResponse(BaseModel):
+    """``GET /v1/chat/tasks/{task_id}/files`` response body."""
+
+    files: List[TaskFileInfo] = Field(
+        default_factory=list,
+        description="Files bound to the task, oldest first.",
+    )
 
 
 class RuntimeKeyResponse(BaseModel):
@@ -342,6 +400,17 @@ class AppendMessageRequest(BaseModel):
         ),
     )
     message: MessageBody = Field(..., description="Next user message in the task.")
+    prompt_context: Optional[Dict[str, Any]] = Field(
+        default=None,
+        description=(
+            "Trusted reference data stored on the task. A non-empty object "
+            "fully replaces the stored context for this and later turns; an "
+            "empty object clears it so later turns carry none; omitted or null "
+            "replays the stored value. Not accepted with a workforce key. Key "
+            "and value rules, signing and the 4096-byte limit (measured on the "
+            "rendered JSON, not compact JSON) are the same as on task create."
+        ),
+    )
     metadata: Optional[Dict[str, Any]] = Field(
         default=None,
         description="Free-form correlation data passed through unchanged.",
@@ -511,6 +580,48 @@ class ReplyResponse(BaseModel):
         ..., description="Monotonic version of the task control state."
     )
     control_state: str = Field(..., description="Detailed task control state.")
+
+
+class DeleteTaskResponse(BaseModel):
+    """``DELETE /v1/chat/tasks/{task_id}`` -> 200 response.
+
+    The rows are gone when this is returned. The two flags say whether the
+    workspace or any other external resource (runtime-extension state, a
+    workspace that could not be removed) is still owed to the retry driver.
+    """
+
+    task_id: int = Field(..., description="The deleted task's id.")
+    workspace_cleanup_pending: bool = Field(
+        ..., description="The task workspace is still on disk and owed cleanup."
+    )
+    external_cleanup_pending: bool = Field(
+        ...,
+        description="The workspace or runtime-extension state is still owed cleanup.",
+    )
+
+
+class CancelQuestionResponse(BaseModel):
+    """``POST /v1/chat/tasks/{task_id}/cancel-question`` -> 202 response.
+
+    The pending question was abandoned (not answered, not deleted), the
+    paused run was closed, and the task now accepts an append. Repeating
+    the call on the same cancelled run returns this same shape.
+    """
+
+    task_id: int = Field(..., description="Existing task primary key.")
+    status: str = Field(
+        ...,
+        description=(
+            "Task status after cancellation: 'completed' (the waiting run is "
+            "closed so the next turn can be appended)."
+        ),
+    )
+    run_id: Optional[str] = Field(
+        ..., description="The run whose pending question was cancelled."
+    )
+    state_version: int = Field(
+        ..., description="Monotonic version of the task control state."
+    )
 
 
 class CreateWorkforceRunRequest(BaseModel):

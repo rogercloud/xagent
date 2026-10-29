@@ -334,7 +334,8 @@ def read_committed_tool_outcome(
             if data.get("interrupted") is True:
                 raise refused(
                     UnknownToolEffectError(
-                        "Interrupted tool attempt has no confirmed result"
+                        "Interrupted tool attempt has no confirmed result",
+                        tool_attempt_id=str(tool_call["tool_attempt_id"]),
                     ),
                     "unknown_tool_effect",
                 )
@@ -354,7 +355,8 @@ def read_committed_tool_outcome(
     if outcome is None:
         raise refused(
             UnknownToolEffectError(
-                "Tool attempt started without a committed result; automatic replay is unsafe"
+                "Tool attempt started without a committed result; automatic replay is unsafe",
+                tool_attempt_id=str(tool_call["tool_attempt_id"]),
             ),
             "unknown_tool_effect",
         )
