@@ -383,6 +383,47 @@ def test_reader_records_duration_and_rows(
     assert exported(metric_reader, EXCEEDED) == {}
 
 
+def test_agent_execution_summary_rows_are_a_display_read(canonical, metric_reader):
+    from xagent.web.services.task_agent_execution import load_agent_execution_detail
+
+    factory, tid = canonical
+    with factory() as db:
+        fact(
+            db,
+            tid,
+            "react_task_start",
+            "child",
+            {
+                "source": "xagent-agent-tool-child",
+                "worker_task_id": "child-scope",
+                "agent_name": "Worker",
+            },
+            scope_id="child-scope",
+        )
+        for key_, worker in (
+            ("summary-1", "child-scope"),
+            ("summary-2", "child-scope"),
+            ("other", "other-scope"),
+        ):
+            fact(
+                db,
+                tid,
+                "task_update_general",
+                key_,
+                {"event_type": "workforce_delegation_start", "worker_task_id": worker},
+            )
+        db.commit()
+    with factory() as db:
+        task = db.get(Task, tid)
+        detail = load_agent_execution_detail(db, task, "child-scope")
+    assert detail["agent_name"] == "Worker"
+
+    point = histogram(metric_reader, ROWS)[attrs(operation="display")]
+    # One child-scope fact, then the agent's two root-scope summary rows.
+    assert point.count == 2
+    assert point.sum == 1 + 2
+
+
 def test_seeded_row_counts_are_what_the_history_holds(readers):
     # Guards the expected counts above against drifting seed data.
     from sqlalchemy import func, select

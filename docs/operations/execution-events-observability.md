@@ -177,12 +177,15 @@ literal format strings.
 
 ### (5) Read budget
 
-- Every V2 event-log read is measured as `xagent.execution_event.read.duration`
-  (ms) and `xagent.execution_event.read.rows`, attributes `operation`,
-  `storage="v2"` and, for `reconnect`, `outcome` (`cache_hit` or `loaded`).
-  Operations and what `rows` counts:
+- The main V2 event-log readers listed below are measured as
+  `xagent.execution_event.read.duration` (ms) and
+  `xagent.execution_event.read.rows`, attributes `operation`, `storage="v2"`
+  and, for `reconnect`, `outcome` (`cache_hit` or `loaded`). Other event-log
+  queries (point lookups, the admin diagnostics endpoint and smaller readers)
+  are not measured. Operations and what `rows` counts:
   - `model`: model-context events loaded;
-  - `display`: display facts loaded;
+  - `display`: display facts loaded, and for a delegated agent's detail the
+    root-scope summary rows of that agent (a read of its own);
   - `reconnect`: frames replayed to a client (its duration includes cache I/O
     and projection work);
   - `checkpoint`: recovery-state rows scanned (nested tool-outcome reads add
