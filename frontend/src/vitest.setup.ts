@@ -1,17 +1,8 @@
 import "@testing-library/jest-dom/vitest"
 import { beforeEach, vi } from "vitest"
 
-// Vitest copies jsdom's window properties onto the global through accessors
-// whose setter keeps the last assigned value for good. React 18's dev build
-// assigns window.event while it dispatches a React event handler, so the first
-// fireEvent.click otherwise stays in window.event for the rest of a test file.
-// React reads window.event to prioritize updates made outside its own event
-// dispatch, and would then treat every later promise callback or timer update
-// as a discrete click: a sync render that jumps ahead of default-priority
-// updates and hides missing act()/waitFor() in tests. Read the live jsdom value
-// instead, and let an assignment replace the property the way the browser's
-// [Replaceable] window.event does, so React's restore of the saved descriptor
-// undoes it.
+// Without this, the first fireEvent.click stays in window.event for the whole
+// file, and React runs later async updates as sync, hiding missing act()/waitFor().
 const jsdomWindow = (globalThis as { jsdom?: { window: Window } }).jsdom?.window
 if (jsdomWindow) {
   Object.defineProperty(globalThis, "event", {

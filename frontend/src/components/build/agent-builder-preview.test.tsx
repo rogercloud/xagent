@@ -189,6 +189,13 @@ let previewState: {
 describe("AgentBuilder preview", () => {
   const originalWebSocket = globalThis.WebSocket
 
+  const expectSectionHighlighted = (section: string, highlighted: boolean) => {
+    const label = section === "mcp" ? "tools.mcp.dialog.connector" : `builds.configForm.${section}.label`
+    const element = screen.getByText(label, { selector: "label" }).closest(".transition-all")
+    expect(element).not.toBeNull()
+    expect(element?.classList.contains("border-primary/30")).toBe(highlighted)
+  }
+
   beforeEach(() => {
     storedToolCategories = ["ssh"]
     putBody = undefined
@@ -566,12 +573,6 @@ describe("AgentBuilder preview", () => {
 
   describe("configuration completion", () => {
     const configStep = () => screen.getByRole("button", { name: /builds.editor.stepGuide.configure/ })
-    const expectSectionHighlighted = (section: string, highlighted: boolean) => {
-      const label = section === "mcp" ? "tools.mcp.dialog.connector" : `builds.configForm.${section}.label`
-      const element = screen.getByText(label, { selector: "label" }).closest(".transition-all")
-      expect(element).not.toBeNull()
-      expect(element?.classList.contains("border-primary/30")).toBe(highlighted)
-    }
 
     it("allows a model-only agent without optional tools, skills, or connections", async () => {
       storedToolCategories = []
@@ -1228,11 +1229,7 @@ describe("AgentBuilder preview", () => {
       const button = await screen.findByText("send-preview-message")
       // A click before the default model loads hits the no-model guard and rejects into
       // previewSendErrorMock, so wait until the model section is no longer flagged.
-      await waitFor(() => {
-        const modelSection = screen.getByText("builds.configForm.model.label", { selector: "label" })
-          .closest(".transition-all")
-        expect(modelSection).not.toHaveClass("border-primary/30")
-      })
+      await waitFor(() => expectSectionHighlighted("model", false))
       fireEvent.click(button)
       await waitFor(() => expect(pendingCreates).toHaveLength(1))
     }
