@@ -2402,9 +2402,11 @@ def cancel_pending_auto_resume_no_commit(
     module's, ``tasks`` then the recovery row, then reads of commands.
     ``at`` names the caller (e.g. ``channel_stop``) in the event, the log
     and the metrics; ``actor_user_id``, when given, the person who cancelled
-    (an admin may cancel another user's task), in the event. ``raced``: the first write's compare-and-swap, which
-    also re-checks the recovery row as read, lost (SQLite ignores the row
-    locks), and nothing was written; the caller may read again and retry.
+    (an admin may cancel another user's task), in the event.
+
+    ``raced``: the first write's compare-and-swap, which also re-checks the
+    recovery row as read, lost (SQLite ignores the row locks), and nothing
+    was written; the caller may read again and retry.
     Once it lands nothing else can move either row -- the locks on
     PostgreSQL, the write lock it took on SQLite -- so a later write that
     misses raises instead. On any exception the caller rolls back.

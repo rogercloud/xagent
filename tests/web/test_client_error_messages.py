@@ -129,6 +129,9 @@ def test_client_error_codes_have_fixed_safe_fallbacks() -> None:
             "Automatic resume of a task created through the API cannot be "
             "cancelled here."
         ),
+        "auto_resume_cancel_raced": (
+            "The task changed while cancelling its automatic resume; please try again."
+        ),
     }
 
 

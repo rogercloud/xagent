@@ -5,7 +5,7 @@ The task's owner or an admin may; anyone else reads 404 and an expired task
 410, as for ``GET /api/chat/task/{id}``. A settled answer is 200 with an
 ``outcome`` and the task as GET reads it; an SDK task is 409
 ``auto_resume_not_cancellable`` and a cancel that kept losing a race 409
-``task_busy``. A cancel's ``notice`` is the message broadcast, and the task's
+``auto_resume_cancel_raced``. A cancel's ``notice`` is the message broadcast, and the task's
 cached responses are dropped so the next GET reads the new fence.
 """
 
@@ -390,7 +390,7 @@ def test_an_sdk_task_is_not_cancellable(bob, published):
     assert published == []
 
 
-def test_a_cancel_that_keeps_racing_reads_409_task_busy(bob, published, monkeypatch):
+def test_a_cancel_that_keeps_racing_reads_409_cancel_raced(bob, published, monkeypatch):
     task_id = _task()
     monkeypatch.setattr(
         web_cancel,
@@ -401,7 +401,7 @@ def test_a_cancel_that_keeps_racing_reads_409_task_busy(bob, published, monkeypa
     response = _post(task_id, bob)
 
     assert response.status_code == 409
-    assert response.json()["detail"]["code"] == "task_busy"
+    assert response.json()["detail"]["code"] == "auto_resume_cancel_raced"
     assert _row(task_id) == ("scheduled", None, STATE_VERSION)
 
 

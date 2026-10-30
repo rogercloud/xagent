@@ -1298,7 +1298,7 @@ async def cancel_task_auto_resume(
     The task's owner or an admin, as for ``GET /task/{id}``; anyone else
     reads 404 and an expired task 410. A settled answer is 200 with its
     ``outcome``; an SDK task is 409 ``auto_resume_not_cancellable`` and a
-    cancel that kept losing a race 409 ``task_busy`` (retry).
+    cancel that kept losing a race 409 ``auto_resume_cancel_raced`` (retry).
     """
 
     def _visible_sync() -> None:
@@ -1332,14 +1332,10 @@ async def cancel_task_auto_resume(
             detail={"code": code.value, "message": client_error_message(code)},
         )
     if result.outcome is WebAutoResumeCancelOutcome.RACED:
+        code = ClientErrorCode.AUTO_RESUME_CANCEL_RACED
         raise HTTPException(
             status_code=409,
-            detail={
-                "code": ClientErrorCode.TASK_BUSY.value,
-                "message": (
-                    "Task changed while cancelling its automatic resume; please retry."
-                ),
-            },
+            detail={"code": code.value, "message": client_error_message(code)},
         )
     if result.task is None:
         # Deleted (or out of reach) since the check above: never returns.
