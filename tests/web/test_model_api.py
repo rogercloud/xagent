@@ -616,6 +616,25 @@ async def test_validate_provider_model_listing_honors_caller_supplied_timeout():
         )
 
 
+def test_xinference_tts_models_route_is_removed():
+    """An anonymous caller must not make the server fetch a caller-supplied URL.
+
+    The route took ``base_url`` without authentication (xorbitsai/xagent#3444)
+    and had no callers, so it was removed rather than guarded.
+    """
+    with patch(
+        "xagent.core.model.tts.xinference.XinferenceTTS.list_available_models",
+        return_value=[],
+    ) as list_models:
+        response = client.get(
+            "/api/models/xinference/tts-models",
+            params={"base_url": "http://xinference.example.com:9997"},
+        )
+
+    assert response.status_code == 404
+    list_models.assert_not_called()
+
+
 class TestModelAPI:
     """Test model management API endpoints"""
 
@@ -688,14 +707,25 @@ class TestModelAPI:
         # Legacy clients may still send a strategy, but configured Auto now always
         # uses xrouter's single-model "auto" policy.
         assert data["strategy"] == "balanced"
+        assert data["mode"] == "routing"
         assert data["auto_model"]["model_provider"] == "router"
         assert data["auto_model"]["model_name"] == "auto"
         assert data["auto_model"]["can_delete"] is False
         assert "vision" not in data["auto_model"]["abilities"]
-        assert {candidate["routing_model_id"] for candidate in data["candidates"]} == {
+        assert [candidate["routing_model_id"] for candidate in data["candidates"]] == [
             "openai/gpt-5.5",
             "deepseek/deepseek-v4-flash",
-        }
+        ]
+
+        db = next(get_db())
+        try:
+            config = (
+                db.query(AutoModelConfig).filter_by(user_id=regular_user["id"]).one()
+            )
+            assert config.mode == "routing"
+            assert [candidate.position for candidate in config.candidates] == [0, 1]
+        finally:
+            db.close()
 
         get_response = client.get("/api/models/auto-config", headers=regular_headers)
         assert get_response.status_code == 200
@@ -724,17 +754,36 @@ class TestModelAPI:
                     "fallback_model_id": second.json()["id"],
                     "candidates": [
                         {
-                            "target_model_id": first.json()["id"],
-                            "routing_model_id": "openai/gpt-5.5",
-                        },
-                        {
                             "target_model_id": second.json()["id"],
                             "routing_model_id": "deepseek/deepseek-v4-flash",
+                        },
+                        {
+                            "target_model_id": first.json()["id"],
+                            "routing_model_id": "openai/gpt-5.5",
                         },
                     ],
                 },
             )
         assert update_response.status_code == 200
+        expected_updated_profiles = [
+            "deepseek/deepseek-v4-flash",
+            "openai/gpt-5.5",
+        ]
+        assert [
+            candidate["routing_model_id"]
+            for candidate in update_response.json()["candidates"]
+        ] == expected_updated_profiles
+        db = next(get_db())
+        try:
+            config = (
+                db.query(AutoModelConfig).filter_by(user_id=regular_user["id"]).one()
+            )
+            assert [
+                (candidate.routing_model_id, candidate.position)
+                for candidate in config.candidates
+            ] == list(zip(expected_updated_profiles, [0, 1], strict=True))
+        finally:
+            db.close()
         defaults_after_update = client.get(
             "/api/models/user-default", headers=regular_headers
         )
@@ -782,8 +831,8 @@ class TestModelAPI:
             assert isinstance(llm, RouterLLM)
             assert llm.model_name == "auto"
             assert llm._candidate_models == (
-                "openai/gpt-5.5",
                 "deepseek/deepseek-v4-flash",
+                "openai/gpt-5.5",
             )
             assert llm._fallback_model == "deepseek/deepseek-v4-flash"
             downstream = llm._downstream_resolver("openai/gpt-5.5")
@@ -902,6 +951,7 @@ class TestModelAPI:
                     config_id=config.id,
                     routing_model_id="openai/gpt-5.5",
                     target_model_id=target.id,
+                    position=0,
                 )
             )
             db.commit()
@@ -974,6 +1024,358 @@ class TestModelAPI:
         )
 
         assert response.status_code == 422
+
+    @staticmethod
+    def _sequential_targets(sample_model_data):
+        """Tuas DeepSeek, Tuas GLM, and official DeepSeek as separate endpoints."""
+        return [
+            {
+                **sample_model_data,
+                "model_id": "tuas-deepseek",
+                "model_name": "deepseek-v4.1-flash",
+                "api_key": "tuas-key",
+                "base_url": "https://tuas.example/v1",
+                "context_window": 128_000,
+            },
+            {
+                **sample_model_data,
+                "model_id": "tuas-glm",
+                "model_name": "glm-5.3",
+                "api_key": "tuas-key",
+                "base_url": "https://tuas.example/v1",
+                "context_window": 200_000,
+            },
+            {
+                **sample_model_data,
+                "model_id": "official-deepseek",
+                "model_name": "deepseek-chat",
+                "api_key": "deepseek-key",
+                "base_url": "https://api.deepseek.example/v1",
+                "context_window": 1_000_000,
+                "abilities": ["chat", "tool_calling", "vision"],
+            },
+        ]
+
+    @staticmethod
+    def _sequential_catalog():
+        class Catalog:
+            @staticmethod
+            def known_model_ids():
+                return ("deepseek/deepseek-v4.1-flash", "z-ai/glm-5.3")
+
+            @staticmethod
+            def get(_profile_id):
+                return SimpleNamespace(input_modalities=("text",))
+
+        return Catalog()
+
+    def test_auto_config_persists_sequential_failover_order(
+        self, test_db, regular_user, regular_headers, sample_model_data, monkeypatch
+    ):
+        from xagent.core.model.chat.basic.router import RouterLLM
+        from xagent.web.services.llm_utils import UserAwareModelStorage
+
+        targets = self._sequential_targets(sample_model_data)
+        target_ids = []
+        for target in targets:
+            created = client.post("/api/models/", json=target, headers=regular_headers)
+            assert created.status_code == 200
+            target_ids.append(created.json()["id"])
+        monkeypatch.setattr(
+            "xagent.web.services.auto_model_service.load_router_profile_catalog",
+            self._sequential_catalog,
+        )
+        profiles = [
+            "deepseek/deepseek-v4.1-flash",
+            "z-ai/glm-5.3",
+            "deepseek/deepseek-v4.1-flash",
+        ]
+
+        response = client.put(
+            "/api/models/auto-config",
+            headers=regular_headers,
+            json={
+                "mode": "sequential_failover",
+                "candidates": [
+                    {"target_model_id": target_id, "routing_model_id": profile}
+                    for target_id, profile in zip(target_ids, profiles, strict=True)
+                ],
+            },
+        )
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["mode"] == "sequential_failover"
+        assert data["fallback_model_id"] is None
+        assert [
+            (item["target_model_id"], item["routing_model_id"])
+            for item in data["candidates"]
+        ] == list(zip(target_ids, profiles, strict=True))
+        loaded = client.get("/api/models/auto-config", headers=regular_headers)
+        assert loaded.json()["mode"] == "sequential_failover"
+        assert loaded.json()["candidates"] == data["candidates"]
+
+        db = next(get_db())
+        try:
+            config = (
+                db.query(AutoModelConfig).filter_by(user_id=regular_user["id"]).one()
+            )
+            assert config.mode == "sequential_failover"
+            assert [
+                (candidate.target_model_id, candidate.position)
+                for candidate in config.candidates
+            ] == list(zip(target_ids, [0, 1, 2], strict=True))
+
+            # Hydration must not need the profile catalog in sequential mode;
+            # each candidate carries its saved endpoint's own identity.
+            monkeypatch.setattr(
+                "xagent.web.services.auto_model_service.load_router_profile_catalog",
+                Mock(side_effect=AssertionError("catalog not needed")),
+            )
+            llm = UserAwareModelStorage(db).get_llm_by_id(
+                data["auto_model"]["model_id"], regular_user["id"]
+            )
+            assert isinstance(llm, RouterLLM)
+            assert llm.uses_sequential_failover
+            assert llm._fallback_model is None
+            candidates = list(llm._candidate_models)
+            assert len(candidates) == 3
+            assert [llm._profile_id(candidate) for candidate in candidates] == profiles
+            assert [llm._input_modalities(candidate) for candidate in candidates] == [
+                ("text",),
+                ("text",),
+                ("text", "image"),
+            ]
+            resolved = [llm._downstream_resolver(candidate) for candidate in candidates]
+            assert [
+                (
+                    downstream.model_id,
+                    downstream.model_name,
+                    downstream.base_url,
+                    downstream.api_key,
+                    downstream.context_window,
+                )
+                for downstream in resolved
+            ] == [
+                (
+                    target["model_id"],
+                    target["model_name"],
+                    target["base_url"],
+                    target["api_key"],
+                    target["context_window"],
+                )
+                for target in targets
+            ]
+            # A candidate that can still move on gets the short failover budget;
+            # sequential mode has no fallback, so the router decides who is last.
+            for candidate in candidates:
+                limited = llm._downstream_resolver(candidate, limit_attempts=True)
+                assert limited._retry_wrapper.budget.failover_max_attempts == 2
+        finally:
+            db.close()
+
+    def test_auto_config_mode_switch_on_existing_config(
+        self, test_db, regular_headers, sample_model_data, monkeypatch
+    ):
+        ids = [
+            client.post(
+                "/api/models/",
+                json={**sample_model_data, "model_id": f"switch-{index}"},
+                headers=regular_headers,
+            ).json()["id"]
+            for index in range(2)
+        ]
+        monkeypatch.setattr(
+            "xagent.web.services.auto_model_service.load_router_profile_catalog",
+            self._sequential_catalog,
+        )
+
+        def save(mode: str, order: list[int]):
+            return client.put(
+                "/api/models/auto-config",
+                headers=regular_headers,
+                json={
+                    "mode": mode,
+                    "candidates": [
+                        {
+                            "target_model_id": target_id,
+                            "routing_model_id": profile,
+                        }
+                        for target_id, profile in zip(
+                            order,
+                            ("deepseek/deepseek-v4.1-flash", "z-ai/glm-5.3"),
+                            strict=True,
+                        )
+                    ],
+                },
+            )
+
+        assert save("routing", ids).json()["mode"] == "routing"
+        switched = save("sequential_failover", ids[::-1])
+        assert switched.status_code == 200
+        assert switched.json()["mode"] == "sequential_failover"
+        assert [item["target_model_id"] for item in switched.json()["candidates"]] == (
+            ids[::-1]
+        )
+        reloaded = client.get("/api/models/auto-config", headers=regular_headers)
+        assert reloaded.json()["mode"] == "sequential_failover"
+        assert save("routing", ids).json()["mode"] == "routing"
+
+    @pytest.mark.parametrize(
+        ("mode", "same_target", "fallback", "message"),
+        [
+            (
+                "sequential_failover",
+                False,
+                True,
+                "does not accept fallback_model_id",
+            ),
+            (
+                "sequential_failover",
+                True,
+                False,
+                "Each saved model can only appear once",
+            ),
+            ("routing", False, False, "Each routing profile can only appear once"),
+        ],
+    )
+    def test_auto_config_mode_specific_validation(
+        self,
+        test_db,
+        regular_user,
+        regular_headers,
+        sample_model_data,
+        mode,
+        same_target,
+        fallback,
+        message,
+    ):
+        first = client.post(
+            "/api/models/", json=sample_model_data, headers=regular_headers
+        ).json()["id"]
+        second = client.post(
+            "/api/models/",
+            json={**sample_model_data, "model_id": "another-model"},
+            headers=regular_headers,
+        ).json()["id"]
+        payload: dict[str, Any] = {
+            "mode": mode,
+            "candidates": [
+                {"target_model_id": first, "routing_model_id": "openai/gpt-5.5"},
+                {
+                    "target_model_id": first if same_target else second,
+                    "routing_model_id": "openai/gpt-5.5",
+                },
+            ],
+        }
+        if fallback:
+            payload["fallback_model_id"] = first
+
+        response = client.put(
+            "/api/models/auto-config", headers=regular_headers, json=payload
+        )
+
+        assert response.status_code == 422
+        assert message in response.text
+
+    @pytest.mark.parametrize(
+        "payload",
+        [
+            {"mode": "sequential_failover", "candidates": []},
+            {
+                "mode": "priority",
+                "candidates": [
+                    {"target_model_id": 1, "routing_model_id": "openai/gpt-5.5"}
+                ],
+            },
+        ],
+    )
+    def test_auto_config_rejects_invalid_sequential_payload(
+        self, test_db, regular_headers, payload
+    ):
+        response = client.put(
+            "/api/models/auto-config", headers=regular_headers, json=payload
+        )
+
+        assert response.status_code == 422
+
+    def test_sequential_auto_rejects_inaccessible_target(
+        self,
+        test_db,
+        admin_headers,
+        regular_headers,
+        sample_model_data,
+        monkeypatch,
+    ):
+        own = client.post(
+            "/api/models/", json=sample_model_data, headers=regular_headers
+        ).json()["id"]
+        foreign = client.post(
+            "/api/models/",
+            json={**sample_model_data, "model_id": "admin-private"},
+            headers=admin_headers,
+        ).json()["id"]
+        monkeypatch.setattr(
+            "xagent.web.services.auto_model_service.load_router_profile_catalog",
+            self._sequential_catalog,
+        )
+
+        response = client.put(
+            "/api/models/auto-config",
+            headers=regular_headers,
+            json={
+                "mode": "sequential_failover",
+                "candidates": [
+                    {
+                        "target_model_id": own,
+                        "routing_model_id": "deepseek/deepseek-v4.1-flash",
+                    },
+                    {
+                        "target_model_id": foreign,
+                        "routing_model_id": "deepseek/deepseek-v4.1-flash",
+                    },
+                ],
+            },
+        )
+
+        assert response.status_code == 400
+        assert str(foreign) in response.text
+
+    def test_sequential_target_abilities_edit_skips_profile_match(
+        self, test_db, regular_headers, sample_model_data, monkeypatch
+    ):
+        target = client.post(
+            "/api/models/", json=sample_model_data, headers=regular_headers
+        ).json()
+        monkeypatch.setattr(
+            "xagent.web.services.auto_model_service.load_router_profile_catalog",
+            self._sequential_catalog,
+        )
+        saved = client.put(
+            "/api/models/auto-config",
+            headers=regular_headers,
+            json={
+                "mode": "sequential_failover",
+                "candidates": [
+                    {
+                        "target_model_id": target["id"],
+                        "routing_model_id": "deepseek/deepseek-v4.1-flash",
+                    }
+                ],
+            },
+        )
+        assert saved.status_code == 200
+
+        # The text-only profile would reject a vision endpoint in routing mode,
+        # but sequential candidates take modalities from the saved target.
+        response = client.put(
+            f"/api/models/{target['id']}",
+            headers=regular_headers,
+            json={"abilities": ["chat", "tool_calling", "vision"]},
+        )
+
+        assert response.status_code == 200
+        assert "vision" in response.json()["abilities"]
 
     def test_test_connection_embedding_uses_embedding_adapter(
         self, test_db, regular_user, regular_headers
@@ -1958,6 +2360,7 @@ class TestModelAPI:
                 config_id=config.id,
                 routing_model_id="openai/gpt-5.5",
                 target_model_id=target.id,
+                position=0,
             )
             db.add(candidate)
             db.commit()
