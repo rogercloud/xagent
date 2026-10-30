@@ -222,13 +222,13 @@ class TaskEventBridge:
                 report_bridge_frame("duplicate_dropped")
                 return
             if previous is not None and sequence != previous + 1:
+                await self._status("stream_resync_required")
                 report_bridge_gap(
-                    body["task_id"],
+                    body.get("task_id"),
                     host=host,
                     previous_sequence=previous,
                     sequence=sequence,
                 )
-                await self._status("stream_resync_required")
             self._seen[host] = sequence
             self._seen.move_to_end(host)
             while len(self._seen) > 4096:

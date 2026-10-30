@@ -190,9 +190,10 @@ literal format strings.
     horizon; recording stopped and the connection is not checked.
   Sequence gaps are expected and never counted as missing: internal kinds,
   child scopes, audit-only facts and facts whose display could not be built
-  (reported as `integrity_gap` above) produce no frame. A connection moved to
-  another task drops its record. If the check itself cannot read the
-  database it logs WARNING `execution_event_delivery_check_failed task_id=%s
+  (on the live path a `ValueError` there is reported as `integrity_gap`
+  above) produce no frame. A connection moved to another task drops its
+  record. If the check itself fails, for example because the database cannot
+  be read, it logs WARNING `execution_event_delivery_check_failed task_id=%s
   storage=v2 component=execution-events horizon=%s error_type=%s` and emits
   no outcome. Checks stop at shutdown.
 - To read them: a rising `missing` rate is the signal to act on. Take the
@@ -208,6 +209,8 @@ literal format strings.
     asked its clients to resync. Comes with WARNING `task_event_bridge_gap
     task_id=%s host=%s previous_sequence=%s sequence=%s`. Bridge sequences are
     per publishing host, so the frames in the gap may belong to other tasks.
+    Each receiving host counts the gap it sees, so one lost frame counts once
+    per receiver, and a burst right after a Redis resubscribe is expected.
   - `publish_failed`: a frame could not be published (the existing WARNING
     `Task event publication failed task_id=%s; stream requires resync`
     names the task).

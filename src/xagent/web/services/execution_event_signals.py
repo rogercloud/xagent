@@ -298,7 +298,7 @@ def report_bridge_frame(outcome: str) -> None:
 
 
 def report_bridge_gap(
-    task_id: int, *, host: str, previous_sequence: int, sequence: int
+    task_id: int | None, *, host: str, previous_sequence: int, sequence: int
 ) -> None:
     """Count and locate one bridge sequence gap that forces a client resync.
 

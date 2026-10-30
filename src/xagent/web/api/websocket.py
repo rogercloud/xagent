@@ -1183,8 +1183,8 @@ class _DeliveryLedger:
     sent: dict[str, tuple[int, float]] = field(default_factory=dict)
     # Ids sent at least once outside a replay or reconcile pass.
     live: set[str] = field(default_factory=set)
-    max_sequence: int = 0
-    duplicates: int = 0
+    # Ids sent live more than once.
+    duplicated: set[str] = field(default_factory=set)
     overflow: bool = False
 
     def begin_replay(self, horizon: int) -> None:
@@ -1194,7 +1194,7 @@ class _DeliveryLedger:
         for event_id in [i for i, (seq, _) in self.sent.items() if seq <= horizon]:
             del self.sent[event_id]
             self.live.discard(event_id)
-        self.max_sequence = max((seq for seq, _ in self.sent.values()), default=0)
+            self.duplicated.discard(event_id)
 
     def record(self, event_id: str, sequence: int, *, live: bool, now: float) -> None:
         if self.overflow or (self.horizon is not None and sequence <= self.horizon):
@@ -1206,7 +1206,7 @@ class _DeliveryLedger:
             # same frame sent live twice is a duplicate.
             if live:
                 if event_id in self.live:
-                    self.duplicates += 1
+                    self.duplicated.add(event_id)
                 else:
                     self.live.add(event_id)
             return
@@ -1214,12 +1214,11 @@ class _DeliveryLedger:
             self.overflow = True
             self.sent.clear()
             self.live.clear()
+            self.duplicated.clear()
             return
         self.sent[event_id] = (sequence, now)
         if live:
             self.live.add(event_id)
-        if sequence > self.max_sequence:
-            self.max_sequence = sequence
 
     def checked_through(self, cutoff: float) -> int:
         """Highest sequence sent no later than ``cutoff``, else the horizon."""
@@ -1249,7 +1248,7 @@ def _report_delivery(ledger: _DeliveryLedger, expected: dict[str, int]) -> None:
     missing = [seq for event_id, seq in expected.items() if event_id not in ledger.sent]
     if missing:
         outcome = "missing"
-    elif ledger.duplicates:
+    elif ledger.duplicated:
         outcome = "duplicate"
     else:
         outcome = "complete"
@@ -1461,7 +1460,7 @@ class ConnectionManager:
                 report_delivery_consistency(
                     ledger.task_id,
                     horizon=ledger.horizon,
-                    outcome="duplicate" if ledger.duplicates else "idle",
+                    outcome="duplicate" if ledger.duplicated else "idle",
                 )
                 return
             if len(self._delivery_checks) >= _DELIVERY_CHECK_PENDING_CAP:
@@ -1541,7 +1540,6 @@ class ConnectionManager:
         encoded = json.dumps(message)
         connections = self.connections_for_task(task_id)
         public_encoded = self._public_encoding(message, encoded, connections)
-        recordable = type(message.get("execution_sequence")) is int
         for connection in connections:
             writer = self._writers.get(connection)
             if writer is None:
@@ -1555,15 +1553,8 @@ class ConnectionManager:
                         public_encoded
                         if self._is_public_audience(connection)
                         else encoded,
-                        on_sent=(
-                            partial(
-                                self._record_delivery,
-                                connection,
-                                message,
-                                live=live,
-                            )
-                            if recordable
-                            else None
+                        on_sent=partial(
+                            self._record_delivery, connection, message, live=live
                         ),
                     )
                 except ConnectionError:

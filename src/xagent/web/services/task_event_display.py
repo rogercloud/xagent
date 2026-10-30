@@ -417,8 +417,9 @@ def expected_display_frames(
     Only facts whose frame is always sent live are expected. The range is
     ``(after_sequence, through_sequence]``. Sequence numbers are not
     contiguous within it: internal kinds, other scopes and facts that convert
-    to no frame are left out. So is a fact whose display cannot be built; the
-    live path reports it as an integrity gap and sends no frame. Kinds whose
+    to no frame are left out. So is a fact whose display cannot be built for
+    any reason; the live path sends no frame for it either (a ``ValueError``
+    is reported there as an integrity gap). Kinds whose
     live frame is conditional are left out as well, see
     ``_CONDITIONAL_LIVE_KINDS``.
     """
@@ -433,7 +434,8 @@ def expected_display_frames(
             continue
         try:
             frame = convert_display_event(row)
-        except (ValueError, AssertionError):
+        except Exception:
+            # One unconvertible fact must not abort the whole check.
             continue
         if frame is not None:
             frames[str(frame["event_id"])] = int(row.sequence)

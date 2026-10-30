@@ -36,7 +36,11 @@ from tests.web.services.test_task_execution_event_writer import (
 from xagent.web.api import websocket as websocket_api
 from xagent.web.api.websocket import ConnectionManager, _HistoricalStreamSnapshot
 from xagent.web.models.task import Task
-from xagent.web.services import task_event_bridge, task_stream_snapshot
+from xagent.web.services import (
+    task_event_bridge,
+    task_event_display,
+    task_stream_snapshot,
+)
 from xagent.web.services.hot_path_cache import (
     InMemoryTTLCache,
     set_cache_backend_for_testing,
@@ -48,6 +52,7 @@ from xagent.web.services.task_event_display import (
     load_live_display_event,
 )
 from xagent.web.services.task_execution_event_writer import append_fact_no_commit
+from xagent.web.services.task_socket_writer import TaskSocketWriter
 
 canonical = canonical_fixture
 engine = engine_fixture
@@ -295,7 +300,10 @@ async def test_replay_and_live_frames_covering_everything_are_complete(
     await manager.broadcast_to_task(live_frame(rows_by_key["live-3"]), task_id)
     ledger = manager._delivery_ledgers[socket]
     assert ledger.horizon == horizon_of(rows)
-    assert ledger.max_sequence == rows_by_key["live-3"].sequence
+    assert set(ledger.sent) == {
+        live_frame(rows_by_key[name])["event_id"]
+        for name in ("live-1", "live-2", "live-3")
+    }
 
     caplog.set_level(logging.INFO)
     await close(manager, socket, clock)
@@ -498,6 +506,9 @@ async def test_live_frames_during_the_first_replay_load_are_recorded(
         )
     )
     await asyncio.to_thread(loading.wait, CHECK_TIMEOUT)
+    # Sent live twice while the horizon is unknown: the replay covers it, so
+    # it is no duplicate once the horizon prunes it.
+    await manager.broadcast_to_task(live_frame(rows_by_key["before"]), task_id)
     await manager.broadcast_to_task(live_frame(rows_by_key["before"]), task_id)
     await manager.broadcast_to_task(live_frame(rows_by_key["live-1"]), task_id)
     release.set()
@@ -507,7 +518,8 @@ async def test_live_frames_during_the_first_replay_load_are_recorded(
     assert ledger.horizon == horizon_of(rows)
     assert set(ledger.sent) == {live_frame(rows_by_key["live-1"])["event_id"]}
     sent_ids = [frame.get("event_id") for frame in socket.frames]
-    assert sent_ids.count(live_frame(rows_by_key["before"])["event_id"]) == 2
+    assert sent_ids.count(live_frame(rows_by_key["before"])["event_id"]) == 3
+    assert not ledger.duplicated
     for name in ("live-2", "live-3"):
         await manager.broadcast_to_task(live_frame(rows_by_key[name]), task_id)
 
@@ -533,6 +545,75 @@ async def test_live_frame_sent_twice_is_duplicate_without_warning(
 
     assert outcome(metric_reader, "duplicate")
     assert not signal_lines(caplog, "execution_event_delivery_gap")
+
+
+@pytest.mark.asyncio
+async def test_live_duplicate_inside_the_grace_window_is_reported(
+    canonical, manager, clock, monkeypatch, metric_reader
+):
+    factory, task_id = canonical
+    rows = write_history(factory, task_id)
+    socket = Socket()
+    await connect_and_replay(manager, monkeypatch, factory, task_id, rows, socket)
+    frame = live_frame(by_key(rows)["live-1"])
+    await manager.broadcast_to_task(frame, task_id)
+    await manager.broadcast_to_task(frame, task_id)
+
+    # Disconnect at once: no frame is outside the grace window yet, so there
+    # is no range to compare, but the duplicate is still known.
+    manager.disconnect(socket)
+    await settle_checks(manager)
+
+    assert not manager._delivery_checks
+    assert outcome(metric_reader, "duplicate")
+
+
+class ReplayBlockingSocket(Socket):
+    """Holds the first replay frame until released."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.replaying = asyncio.Event()
+        self.resume = asyncio.Event()
+
+    async def send_text(self, text: str) -> None:
+        if websocket_api._replay_pass.get() and not self.replaying.is_set():
+            self.replaying.set()
+            await self.resume.wait()
+        await super().send_text(text)
+
+
+@pytest.mark.asyncio
+async def test_live_frames_sent_during_the_replay_send_are_live(
+    canonical, manager, clock, monkeypatch, metric_reader
+):
+    """Only the replay coroutine's own sends are replay sends.
+
+    A live frame sent from another coroutine while the replay is sending is
+    live, so sending it twice there is a duplicate.
+    """
+    factory, task_id = canonical
+    rows = write_history(factory, task_id)
+    socket = ReplayBlockingSocket()
+    manager.register_connection(socket, task_id)
+    replaying = asyncio.create_task(
+        replay(
+            monkeypatch,
+            socket,
+            task_id,
+            replay_snapshot(factory, task_id, horizon_of(rows)),
+        )
+    )
+    await asyncio.wait_for(socket.replaying.wait(), timeout=CHECK_TIMEOUT)
+    frame = live_frame(by_key(rows)["live-1"])
+    await manager.send_personal_message(frame, socket)
+    await manager.send_personal_message(frame, socket)
+    socket.resume.set()
+    await asyncio.wait_for(replaying, timeout=CHECK_TIMEOUT)
+
+    ledger = manager._delivery_ledgers[socket]
+    assert ledger.live == {frame["event_id"]}
+    assert ledger.duplicated == {frame["event_id"]}
 
 
 @pytest.mark.asyncio
@@ -645,6 +726,31 @@ async def test_frame_built_by_the_live_path_matches_the_expected_id(
     assert outcome(metric_reader, "complete")
 
 
+def test_unconvertible_fact_is_left_out_of_the_expected_frames(canonical, monkeypatch):
+    factory, task_id = canonical
+    rows = write_history(factory, task_id)
+    rows_by_key = by_key(rows)
+    convert = task_event_display.convert_display_event
+
+    def flaky(row):
+        if row.idempotency_key == "live-2":
+            raise TypeError("cannot serialize")
+        return convert(row)
+
+    monkeypatch.setattr(task_event_display, "convert_display_event", flaky)
+    with factory() as db:
+        expected = expected_display_frames(
+            db,
+            task_id,
+            after_sequence=horizon_of(rows),
+            through_sequence=rows_by_key["live-3"].sequence,
+        )
+    assert expected == {
+        live_frame(rows_by_key[name])["event_id"]: rows_by_key[name].sequence
+        for name in ("live-1", "live-3")
+    }
+
+
 @pytest.mark.asyncio
 async def test_shared_mode_records_frames_when_the_writer_sends_them(
     canonical, manager, clock, shared, monkeypatch, metric_reader
@@ -658,13 +764,14 @@ async def test_shared_mode_records_frames_when_the_writer_sends_them(
     await manager.deliver_shared_event(live_frame(rows_by_key["live-1"]), task_id)
     # Queued is not sent: nothing is recorded until the writer sends.
     ledger = manager._delivery_ledgers[socket]
-    assert ledger.max_sequence < rows_by_key["live-1"].sequence
+    assert not ledger.sent
     # A personal message waits for the writer, so live-1 is sent by now.
     await manager.send_personal_message(live_frame(rows_by_key["live-2"]), socket)
-    assert ledger.max_sequence == rows_by_key["live-2"].sequence
+    assert set(ledger.sent) == {
+        live_frame(rows_by_key[name])["event_id"] for name in ("live-1", "live-2")
+    }
     await manager.deliver_shared_event(live_frame(rows_by_key["live-3"]), task_id)
     await drain(manager, socket)
-    assert ledger.max_sequence == rows_by_key["live-3"].sequence
     assert set(ledger.sent) == {
         live_frame(rows_by_key[name])["event_id"]
         for name in ("live-1", "live-2", "live-3")
@@ -703,6 +810,25 @@ async def test_reconcile_resends_are_not_duplicates(
     await asyncio.gather(writer.task, return_exceptions=True)
 
     assert outcome(metric_reader, "complete")
+
+
+@pytest.mark.asyncio
+async def test_failing_send_callback_never_stops_the_writer():
+    socket = Socket()
+    writer = TaskSocketWriter(socket, disconnect=lambda: None)
+
+    def broken():
+        raise RuntimeError("ledger bug")
+
+    writer.enqueue(json.dumps({"event_id": "e1"}), on_sent=broken)
+    await asyncio.wait_for(
+        writer.enqueue(json.dumps({"event_id": "e2"}), acknowledge=True),
+        timeout=CHECK_TIMEOUT,
+    )
+    assert [frame["event_id"] for frame in socket.frames] == ["e1", "e2"]
+    assert not writer.closed
+    writer.stop()
+    await asyncio.gather(writer.task, return_exceptions=True)
 
 
 @pytest.mark.asyncio
@@ -1160,6 +1286,37 @@ async def test_bridge_counts_duplicates_and_gaps_by_ids_only(
         "sequence": "4",
     }
     assert SENTINEL not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_bridge_gap_signal_never_blocks_the_resync(bridge, caplog, metric_reader):
+    statuses = []
+
+    async def deliver(message, task_id):
+        return None
+
+    async def status(kind):
+        statuses.append(kind)
+
+    bridge.deliver = deliver
+    bridge.stream_status = status
+    body = {
+        "version": 1,
+        "kind": "event",
+        "host": "worker-1",
+        "sequence": 1,
+        "task_id": 42,
+        "message": {"type": "heartbeat"},
+    }
+    await bridge._receive(body)
+    gapped = {key: value for key, value in body.items() if key != "task_id"}
+    with pytest.raises(KeyError):
+        await bridge._receive({**gapped, "sequence": 3})
+    await bridge.close()
+
+    assert statuses == ["stream_resync_required"]
+    assert bridge._seen["worker-1"] == 3
+    assert bridge_frames(metric_reader) == {key(outcome="gap_resync"): 1}
 
 
 @pytest.mark.asyncio
