@@ -306,6 +306,7 @@ class Readers:
                 scope_id="root",
                 tool_call=TOOL_CALL,
                 through_sequence=None,
+                run_id=None,
                 read=ExecutionEventReadMeasurement(),
             )
 
