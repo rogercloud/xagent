@@ -615,10 +615,14 @@ describe("AgentBuilder preview", () => {
       })
       render(<AgentBuilder />)
       await screen.findByDisplayValue("Template agent")
+      // The name lands before the default model and MCP catalog settle; requirements are only
+      // highlighted once both have.
+      await waitFor(() => {
+        expectSectionHighlighted("model", false)
+        expectSectionHighlighted("knowledgeBase", category === "knowledge")
+        expectSectionHighlighted("mcp", category === "mcp:missing-connector")
+      })
       expect(configStep().querySelector("svg")).toBeNull()
-      expectSectionHighlighted("model", false)
-      expectSectionHighlighted("knowledgeBase", category === "knowledge")
-      expectSectionHighlighted("mcp", category === "mcp:missing-connector")
       expectSectionHighlighted("skills", false)
       expectSectionHighlighted("tools", false)
     })
@@ -1222,11 +1226,15 @@ describe("AgentBuilder preview", () => {
 
     const sendPreview = async () => {
       const button = await screen.findByText("send-preview-message")
-      // A click before the default model loads hits the no-model guard, so retry until one reaches task/create.
+      // A click before the default model loads hits the no-model guard and rejects into
+      // previewSendErrorMock, so wait until the model section is no longer flagged.
       await waitFor(() => {
-        if (pendingCreates.length === 0) fireEvent.click(button)
-        expect(pendingCreates).toHaveLength(1)
+        const modelSection = screen.getByText("builds.configForm.model.label", { selector: "label" })
+          .closest(".transition-all")
+        expect(modelSection).not.toHaveClass("border-primary/30")
       })
+      fireEvent.click(button)
+      await waitFor(() => expect(pendingCreates).toHaveLength(1))
     }
 
     const settle = (fn: () => void) =>

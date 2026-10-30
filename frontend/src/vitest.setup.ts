@@ -1,6 +1,28 @@
 import "@testing-library/jest-dom/vitest"
 import { beforeEach, vi } from "vitest"
 
+// Vitest copies jsdom's window properties onto the global through accessors
+// whose setter keeps the last assigned value for good. React 18's dev build
+// assigns window.event while it dispatches a React event handler, so the first
+// fireEvent.click otherwise stays in window.event for the rest of a test file.
+// React reads window.event to prioritize updates made outside its own event
+// dispatch, and would then treat every later promise callback or timer update
+// as a discrete click: a sync render that jumps ahead of default-priority
+// updates and hides missing act()/waitFor() in tests. Read the live jsdom value
+// instead, and let an assignment replace the property the way the browser's
+// [Replaceable] window.event does, so React's restore of the saved descriptor
+// undoes it.
+const jsdomWindow = (globalThis as { jsdom?: { window: Window } }).jsdom?.window
+if (jsdomWindow) {
+  Object.defineProperty(globalThis, "event", {
+    configurable: true,
+    get: () => jsdomWindow.event,
+    set: (value: unknown) => {
+      Object.defineProperty(globalThis, "event", { configurable: true, writable: true, value })
+    },
+  })
+}
+
 // jsdom does not implement blob URL APIs; InlineFilePreview authenticated image
 // previews rely on them in tests that assert blob: src values or spy on revoke.
 URL.createObjectURL = vi.fn(
