@@ -291,7 +291,7 @@ def finalize_managed_task_lease_result(
     return confirm()
 
 
-def _finalize_managed_task_lease_result_sync(
+def finalize_managed_task_lease_result_sync(
     lease: TaskLease,
     *,
     status: TaskStatus,
@@ -301,12 +301,16 @@ def _finalize_managed_task_lease_result_sync(
     message_type: str = ASSISTANT_RESPONSE_MESSAGE_TYPE,
     error_message: str | None = None,
     execution_result: Mapping[str, Any] | None = None,
+    completion: tuple[int, dict[str, Any]] | None = None,
+    settle_interruption: bool = False,
+    report: SettlementReport | None = None,
 ) -> bool:
     """Finalize in owned Sessions, confirming a lost acknowledgement.
 
     A COMMIT whose acknowledgement was lost is read back by its result
     fact's witness (``run_with_commit_witness_sync``): applied, it returns
-    ``True``; not applied, it is rerun. The errors raised are the same.
+    ``True`` and fills ``report`` as a committed pause does; not applied, it
+    is rerun. The errors raised are the same.
     """
     from ..models.database import get_session_local
 
@@ -324,6 +328,9 @@ def _finalize_managed_task_lease_result_sync(
                 message_type=message_type,
                 error_message=error_message,
                 execution_result=execution_result,
+                completion=completion,
+                settle_interruption=settle_interruption,
+                report=report,
                 attempt=attempt,
             )
 
@@ -349,7 +356,7 @@ async def finalize_managed_task_lease_result_isolated(
     """Settle one exact managed lease using a worker-owned short Session."""
 
     return await run_db_io_cancellation_safe(
-        lambda: _finalize_managed_task_lease_result_sync(
+        lambda: finalize_managed_task_lease_result_sync(
             lease,
             status=status,
             assistant_content=assistant_content,
@@ -364,7 +371,7 @@ async def finalize_managed_task_lease_result_isolated(
 
 def _release_managed_task_lease_sync(lease: TaskLease) -> bool:
     """Release in owned Sessions, confirming a lost acknowledgement as
-    ``_finalize_managed_task_lease_result_sync`` does."""
+    ``finalize_managed_task_lease_result_sync`` does."""
     from ..models.database import get_session_local
 
     def attempt_release(attempt: CommitAttempt) -> bool:

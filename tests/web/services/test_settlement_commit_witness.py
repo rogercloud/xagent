@@ -11,6 +11,8 @@ is set, on PostgreSQL.
 from __future__ import annotations
 
 import logging
+from typing import Any
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 from sqlalchemy.exc import OperationalError
@@ -34,9 +36,15 @@ from tests.web.services.test_persistence_failure_pause import (
     _assistant_lines,
     _checkpoint,
     _persistence_interruption,
+    _prepare_run,
+    _projected_task,
     _settle,
     _settled_facts,
     _start_run,
+)
+from tests.web.services.test_provider_failure_pause import (
+    LLM_RESULT,
+    _completed_channel_command,
 )
 from tests.web.services.test_task_execution_event_writer import (
     canonical as canonical_fixture,
@@ -49,14 +57,28 @@ from tests.web.services.test_trace_fact_commit_retry import (
     fail_commits,
     invalidated,
 )
+from tests.web.services.test_turn_runtime_settled_hook import (
+    drive_channel_background,
+)
+from xagent.core.agent.interruption import InterruptionReason
 from xagent.web.models.task import Task, TaskStatus
+from xagent.web.models.task_command import TaskExecutionCommand
 from xagent.web.services import db_write_retry
 from xagent.web.services import managed_task_lease as managed
 from xagent.web.services import task_execution_event_writer
 from xagent.web.services import task_orchestrator as orchestrator
+from xagent.web.services.channel_runtime import (
+    _ChannelTaskClaimSnapshot,
+    _compensate_channel_task_claim_sync,
+)
+from xagent.web.services.execution_result_projection import (
+    interrupted_channel_result,
+    project_execution_result_for_channel,
+)
 from xagent.web.services.task_execution_event_store import (
     lock_task_execution_events_no_commit,
 )
+from xagent.web.services.task_settlement_report import SettlementReport
 
 canonical = canonical_fixture
 engine = engine_fixture
@@ -339,7 +361,7 @@ def test_a_failed_managed_settlement_commit_is_reconciled(
     fail_commits(monkeypatch, settles, committed=committed)
 
     if path == "finalize":
-        settled = managed._finalize_managed_task_lease_result_sync(
+        settled = managed.finalize_managed_task_lease_result_sync(
             lease,
             status=TaskStatus.COMPLETED,
             assistant_content="done",
@@ -371,9 +393,97 @@ def test_a_managed_lost_ack_without_the_read_back_is_not_confirmed(
     )
     fail_commits(monkeypatch, settles, committed=True)
 
-    assert not managed._finalize_managed_task_lease_result_sync(
+    assert not managed.finalize_managed_task_lease_result_sync(
         lease, status=TaskStatus.COMPLETED, assistant_content="done"
     )
+    assert len(_settled_facts(factory, tid)) == 1
+
+
+# ------------------------------------------------------- the shared channel
+
+
+@pytest.mark.parametrize("committed", [True, False], ids=["lost-ack", "rolled-back"])
+def test_a_failed_shared_channel_pause_commit_is_reconciled(
+    canonical, settles, monkeypatch, read_backs, committed
+):
+    """The shared channel leaf's settlement (``execute_channel_background``):
+    a paused result is reported and its channel result stored once."""
+    factory, _tid = canonical
+    ids = _projected_task(factory)
+    lease = _prepare_run(factory, ids)
+    command_id, durable_result = _completed_channel_command(factory, ids, lease)
+    projection = project_execution_result_for_channel(dict(LLM_RESULT))
+    report = SettlementReport()
+    fail_commits(monkeypatch, settles, committed=committed)
+
+    assert managed.finalize_managed_task_lease_result_sync(
+        lease,
+        status=projection.task_status,
+        assistant_content=projection.transcript_content,
+        turn_id=ids["turn_id"],
+        interactions=projection.interactions,
+        message_type=projection.message_type,
+        error_message=projection.diagnostic_error,
+        execution_result=dict(LLM_RESULT),
+        completion=(command_id, durable_result),
+        settle_interruption=True,
+        report=report,
+    )
+
+    assert read_backs == [committed]
+    # What ``execute_channel_background`` hands ``publish_settlement_pause``.
+    assert report.paused
+    assert report.paused_for is InterruptionReason.LLM_UNAVAILABLE
+    assert report.control_state["run_id"] == lease.run_id
+    _assert_paused(factory, ids["task"], lease, reason="llm_unavailable")
+    (fact,) = _settled_facts(factory, ids["task"])
+    assert fact["status"] == "paused"
+    with factory() as db:
+        result = db.get(TaskExecutionCommand, command_id).result
+    assert result["channel_result"] == interrupted_channel_result()
+
+
+async def test_the_shared_channel_leaf_settles_through_the_witness_driver(
+    monkeypatch,
+):
+    """``execute_channel_background`` settles in owned Sessions through
+    ``finalize_managed_task_lease_result_sync``, with everything the call
+    above reconciles."""
+    calls: list[dict[str, Any]] = []
+
+    def witnessed(lease, **kwargs):
+        calls.append(kwargs)
+        return True
+
+    monkeypatch.setattr(managed, "finalize_managed_task_lease_result_sync", witnessed)
+    run_db_io = AsyncMock(return_value=True)
+    await drive_channel_background(Mock(), "normal", monkeypatch, run_db_io=run_db_io)
+    # The leaf's last off-loop call is its settlement.
+    finalize = run_db_io.await_args_list[-1].args[0]
+    assert finalize()
+    (kwargs,) = calls
+    assert kwargs["completion"] == (1, {})
+    assert kwargs["settle_interruption"] is True
+    assert isinstance(kwargs["report"], SettlementReport)
+
+
+@pytest.mark.parametrize("committed", [True, False], ids=["lost-ack", "rolled-back"])
+def test_a_failed_channel_claim_compensation_commit_is_reconciled(
+    canonical, settles, monkeypatch, read_backs, committed
+):
+    factory, tid = canonical
+    lease = _start_run(factory, tid)
+    fail_commits(monkeypatch, settles, committed=committed)
+
+    assert _compensate_channel_task_claim_sync(
+        _ChannelTaskClaimSnapshot(user_id=1, task_id=tid, is_new_task=True, lease=lease)
+    )
+
+    assert read_backs == [committed]
+    with factory() as db:
+        task = db.get(Task, tid)
+        assert task.status == TaskStatus.FAILED
+        assert task.runner_id is None
     assert len(_settled_facts(factory, tid)) == 1
 
 
