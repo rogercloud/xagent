@@ -154,7 +154,8 @@ literal format strings.
   Frames at or below the horizon are not recorded; the replay covers them.
   On disconnect, a background check reads the committed root-scope display
   events above the horizon and up to the end of the checked range, and
-  compares their event ids with the sent ones.
+  compares their event ids with the sent ones. That read is measured as a
+  `display` read (see (5)).
   - The checked range ends at the highest sequence sent at least 5 seconds
     before the disconnect, on this process's monotonic clock. Producers can
     send frames out of sequence order (the trace handler hops to a worker
@@ -265,7 +266,10 @@ literal format strings.
   are not measured. Operations and what `rows` counts:
   - `model`: model-context events loaded;
   - `display`: display facts loaded, and for a delegated agent's detail the
-    root-scope summary rows of that agent (a read of its own);
+    root-scope summary rows of that agent (a read of its own). The background
+    delivery check run when a V2 socket closes (see (3)) is also a `display`
+    read, counting every root display fact in its range, so a `display`
+    budget can be exceeded by that check rather than by a user-facing read;
   - `reconnect`: frames replayed to a client (its duration includes cache I/O
     and projection work);
   - `checkpoint`: recovery-state rows scanned (nested tool-outcome reads add
