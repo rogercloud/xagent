@@ -137,17 +137,19 @@ import { PublicAgentChatPage } from "./public-agent-chat-page"
 // still pending, and ends that conversation. Read the live jsdom value instead,
 // and let an assignment replace the property the way the browser's
 // [Replaceable] window.event does, so React's restore of the saved descriptor
-// undoes it.
+// undoes it. Fail loudly if the jsdom instance is not exposed, rather than
+// silently falling back to the pinned value.
 const jsdomWindow = (globalThis as { jsdom?: { window: Window } }).jsdom?.window
-if (jsdomWindow) {
-  Object.defineProperty(globalThis, "event", {
-    configurable: true,
-    get: () => jsdomWindow.event,
-    set: (value: unknown) => {
-      Object.defineProperty(globalThis, "event", { configurable: true, writable: true, value })
-    },
-  })
+if (!jsdomWindow) {
+  throw new Error("globalThis.jsdom is missing; cannot read the live window.event")
 }
+Object.defineProperty(globalThis, "event", {
+  configurable: true,
+  get: () => jsdomWindow.event,
+  set: (value: unknown) => {
+    Object.defineProperty(globalThis, "event", { configurable: true, writable: true, value })
+  },
+})
 
 const successfulAgentAuth = {
   access_token: "public-access-token",
