@@ -2,10 +2,17 @@
 
 A V2 execution fact is committed under a fixed identity, so a transient
 database failure (deadlock, lock timeout, dropped connection) can be answered
-by running the same write again instead of aborting the run. The driver here
-retries only the database write it is handed: callers must make that
-operation an idempotent rerun under the same fact identity, and must treat a
-retryable failure as possibly committed.
+by running the same write again instead of aborting the run. The drivers here
+retry only the database write they are handed, and treat a retryable
+failure as possibly committed:
+
+- ``retry_db_write_async`` reruns the write as is; callers make
+  that operation an idempotent rerun under the same fact identity.
+- ``run_with_commit_witness_sync`` is for fenced writes (settlements), whose
+  rerun after an applied COMMIT would miss its own fence. The attempt
+  records the witness of the result fact it staged; after a retryable error
+  the witness is read back, and only an attempt proven not to have
+  committed is rerun.
 
 Exhaustion re-raises the last error unchanged, so the callers' existing
 failure handling (``ExecutionEventPersistenceError`` -> runner abort ->

@@ -2133,7 +2133,8 @@ def settle_task_lease_isolated(
     first read back by its result fact's witness
     (``run_with_commit_witness_sync``): a lost acknowledgement whose COMMIT
     applied returns ``True`` as if it had been acknowledged, and one that
-    did not apply is rerun. The errors raised are the same.
+    did not apply is rerun. The exception types are unchanged; after reruns
+    the last attempt's error is raised.
     """
     return run_with_commit_witness_sync(
         lambda attempt: _settle_task_lease_attempt(

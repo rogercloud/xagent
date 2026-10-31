@@ -310,7 +310,8 @@ def finalize_managed_task_lease_result_sync(
     A COMMIT whose acknowledgement was lost is read back by its result
     fact's witness (``run_with_commit_witness_sync``): applied, it returns
     ``True`` and fills ``report`` as a committed pause does; not applied, it
-    is rerun. The errors raised are the same.
+    is rerun. The exception types are unchanged; after reruns the last
+    attempt's error is raised.
     """
     from ..models.database import get_session_local
 

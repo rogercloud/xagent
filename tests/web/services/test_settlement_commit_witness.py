@@ -15,18 +15,25 @@ from typing import Any
 from unittest.mock import AsyncMock, Mock
 
 import pytest
-from sqlalchemy.exc import OperationalError
+from sqlalchemy.exc import IntegrityError, OperationalError
 
 from tests.web.services.test_execution_event_signals import (
     metric_reader as metric_reader_fixture,
+)
+from tests.web.services.test_execution_event_unknown_outcomes import (
+    ATTEMPT,
 )
 from tests.web.services.test_execution_event_unknown_outcomes import (
     _capture as _capture_fixture,
 )
 from tests.web.services.test_execution_event_unknown_outcomes import (
     _deadlock,
+    _run_with_unknown_tool,
+    _settle_unknown_tool_effect,
     assert_none,
     assert_one,
+    fields,
+    records,
 )
 from tests.web.services.test_persistence_failure_pause import (
     AUTO_RESUME_SWITCH,
@@ -77,6 +84,9 @@ from xagent.web.services.execution_result_projection import (
 )
 from xagent.web.services.task_execution_event_store import (
     lock_task_execution_events_no_commit,
+)
+from xagent.web.services.task_lease_service import (
+    TASK_UNKNOWN_TOOL_EFFECT_SETTLEMENT_ERROR,
 )
 from xagent.web.services.task_settlement_report import SettlementReport
 
@@ -318,6 +328,52 @@ def test_a_legacy_settlement_is_not_retried(canonical, monkeypatch, settle_attem
 
     assert caught.value is raised[0]
     assert settle_attempts == [1]
+
+
+def test_a_non_retryable_settlement_commit_error_is_not_retried(
+    canonical, settles, monkeypatch, settle_attempts, read_backs
+):
+    """With a witness, a non-retryable commit error still propagates as
+    before: it is neither read back nor rerun."""
+    factory, tid = canonical
+    lease = _start_run(factory, tid)
+    raised = fail_commits(
+        monkeypatch,
+        settles,
+        committed=False,
+        error=lambda: IntegrityError("COMMIT", {}, Exception("constraint")),
+    )
+
+    with pytest.raises(IntegrityError) as caught:
+        _settle(lease)
+
+    assert caught.value is raised[0]
+    assert settle_attempts == [1]
+    assert read_backs == []
+
+
+@pytest.mark.parametrize("path", ["settle_decided", "settle_classified"])
+async def test_a_lost_ack_settlement_reports_the_tool_effect_once(
+    canonical, settles, monkeypatch, settle_attempts, read_backs, caplog, path
+):
+    """The confirmed COMMIT's post-commit step runs once: its unknown tool
+    effect is reported once, after the reconciliation."""
+    factory, tid = canonical
+    lease = await _run_with_unknown_tool(factory, tid)
+    fail_commits(monkeypatch, settles, committed=True)
+
+    settled, _report = _settle_unknown_tool_effect(path, factory, tid, lease)
+
+    assert settled
+    assert settle_attempts == [1]
+    assert read_backs == [True]
+    with factory() as db:
+        assert db.get(Task, tid).error_message == (
+            TASK_UNKNOWN_TOOL_EFFECT_SETTLEMENT_ERROR
+        )
+    outcomes = [fields(r.getMessage()) for r in records(caplog)]
+    assert [o["kind"] for o in outcomes] == ["settlement_ack_reconciled", "tool_effect"]
+    assert outcomes[1]["ref"] == ATTEMPT
 
 
 # ----------------------------------------------------------- the pause branch
